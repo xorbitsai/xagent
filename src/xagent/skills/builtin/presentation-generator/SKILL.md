@@ -1,0 +1,752 @@
+---
+name: presentation
+description: |
+  Create, read, or edit PowerPoint .pptx files: slide decks from scratch,
+  content extraction, templates, speaker notes, combining or splitting decks.
+  Not for posters, images, or social graphics.
+when_to_use: |
+  The user asks for a deck, slides, a presentation, Google Slides, PPT/PPTX,
+  or names a .pptx file. Use pptx-editorial instead when magazine-grade
+  editorial styling is wanted.
+---
+
+# Presentation Generator
+
+Generate PowerPoint presentations using JavaScript code with the pptxgenjs library.
+
+## Google Slides output
+
+When the requested output is Google Slides, this skill is the local deck
+creation step, not the final delivery step:
+
+1. Generate and inspect the designed local PPTX in the workspace.
+2. Call `google_slides_import_pptx` with that PPTX path to convert it into an
+   editable native Google Slides presentation.
+   Treat `validation_failed` as a failed delivery; it means the conversion
+   changed the slide count, dropped text, or left a blank slide.
+3. Call `google_slides_get_presentation` to verify slide count and text before
+   returning the Google Slides link.
+
+Do not build a new outlined deck with repeated `google_slides_create_presentation`
+and `google_slides_add_slide` calls. Those tools are for explicitly requested
+simple text/layout edits and do not preserve visual design.
+
+For simple Google Slides layout edits, when
+`google_slides_create_presentation` returns a `default_slide_id` (it is `null`
+when there is no default page to replace), pass it to the first
+`google_slides_add_slide` call. Unless the user specified a different first
+slide, make that first slide the cover (`layout="TITLE"` with the deck title).
+Calls may run in separate MCP processes; without the id the connector only
+removes a sole page that has no elements at all, so a default page with
+placeholders stays as the first slide. `google_slides_create_presentation`
+writes the deck title into that page when it can, so it then reads as a
+title-only cover: do not add a second cover in that case. An empty page in a
+multi-page deck is preserved. Pass `preserve_blank_slide=true` when that sole
+page is intentional.
+`google_slides_add_slide` only supports layouts with title/body placeholders;
+use `google_slides_batch_update` directly for blank/custom slides.
+
+When using `google_slides_batch_update` after `google_slides_create_presentation`,
+the connector cannot infer the default page across MCP processes. Include a
+`deleteObject` request for the returned `default_slide_id`, when one is
+returned, after creating the first content page, or use
+`google_slides_add_slide` with that ID.
+
+## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
+
+**YOU MUST FOLLOW THESE RULES - NO EXCEPTIONS:**
+
+1. **ONLY use the 4 predefined themes below** (NOVA, ORBIT, PULSE, MINIMA)
+2. **NEVER create custom color variables** like `const colorAccent = "0078D7"`
+3. **NEVER use hardcoded hex values** in your code - always reference `theme.xxx`
+4. **ALWAYS include the `#` prefix** in hex colors (e.g., `#EF4444` not `EF4444`)
+5. **Slide 0 (first slide) MUST also be created via `const slide = pres.addSlide()`** and use `theme.cover` - first slide is the cover with dark/high-contrast background
+6. **Slides 1+ MUST use `theme.content`** - all other slides use light/readable background
+
+**WRONG:**
+```javascript
+const colorAccent = "0078D7";  // ❌ WRONG - custom color
+slide1.addText("Title", { color: "363636" });  // ❌ WRONG - hardcoded hex
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };  // ❌ WRONG - cover on non-first slide
+```
+
+**CORRECT:**
+```javascript
+const theme = {
+  cover: {
+    background: '#0A0F1C',
+    title: '#FFFFFF',
+    subtitle: '#94A3B8',
+    accent: '#7C3AED'
+  },
+  content: {
+    background: '#F6F7FB',
+    primary: '#0A0F1C',
+    secondary: '#5B6475',
+    accent: '#7C3AED',
+    text: '#0A0F1C'
+  }
+};
+// Slide 0 (cover) — pptxgenjs requires addSlide() for the FIRST slide too
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText("Title", { color: theme.cover.title });
+
+// Slide 1+ — call pres.addSlide() to get each new slide
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText("Content", { color: theme.content.primary });
+```
+
+---
+
+## Execution Rules
+
+**CRITICAL: MANDATORY constraints for stable presentation generation:**
+
+1. **USE PREDEFINED THEMES ONLY**: You MUST use one of the 4 predefined themes (NOVA, ORBIT, PULSE, MINIMA) from the "Predefined Themes" section below. NEVER define custom colors or use hardcoded hex values like `"003366"` or `color: "FF0000"`.
+
+2. **Theme Object Format**: Always define theme as:
+   ```javascript
+   const theme = {
+     background: '#XXXXXX',
+     primary: '#XXXXXX',
+     secondary: '#XXXXXX',
+     accent: '#XXXXXX',
+     text: '#XXXXXX'
+   };
+   ```
+   Then reference colors as `theme.background`, `theme.primary`, etc.
+
+3. **Slide Creation**: ALWAYS call `pres.addSlide()` before adding content to ANY slide, including the FIRST one. Capture its return value: `const slide = pres.addSlide();` then call `slide.addText(...)`, `slide.background = {...}`, `slide.addImage(...)`, etc. Calling `pres.addText(...)` or setting `pres.background` directly on the presentation object will throw `pres.addText is not a function`.
+
+4. **Font Consistency**: Keep font sizes consistent: titles 40-56pt, subtitles 24-32pt, body text 16-20pt
+
+5. **Slide Bounds**: Never position elements outside 10 x 7.5 inch slide area (x: 0-10, y: 0-7.5)
+
+6. **Layout Simplicity**: Prefer clean, simple layouts over dense or decorative designs
+
+7. **Theme Selection**: Choose theme based on presentation context (see Theme Selection Guide below)
+
+8. **Visual Hierarchy**: Slides must follow clear visual hierarchy: Title → Section Heading → Body → Accent Highlight. Avoid mixing too many font sizes on a single slide.
+
+9. **Image Sizing**: ALWAYS specify both width AND height, or use sizing to ensure images stay within bounds:
+   - Use `w` and `h` together to control exact dimensions
+   - Or use `sizing: { type: 'contain', w: 8, h: 5 }` to fit within bounds while maintaining aspect ratio
+   - NEVER use only `w` or only `h` without the other - image may overflow
+   - Keep images within content area: x: 0-10, y: 0-7.5 inches
+
+10. **Handle Execution Failures Honestly**: `execute_javascript_code` returns
+    `{ success, output, error }`. When `success` is `false` (or `error` is
+    non-empty), the script aborted before `writeFile` and **no .pptx was
+    created**. You MUST:
+    - Tell the user the generation failed and quote the `error` message.
+    - NOT claim the presentation was generated. NOT emit a `[name.pptx]()`
+      link to a file that does not exist.
+    - Fix the JavaScript and retry (most failures are validation errors from
+      pptxgenjs — `addTable` row shape, missing slide handle, malformed
+      options object — see "Data Table" below for the table pattern).
+
+## Layout Zones
+
+For consistent slide layouts:
+
+| Zone | X/Y Range | Purpose |
+|------|-----------|---------|
+| Safe content area | x: 0.5-9.5, y: 0.5-7 | Main content, images, data |
+| Title area | y: 0.5 - 1.5 | Slide titles and headings |
+| Content area | y: 1.5 - 5.5 | Main content, bullets, data |
+| Footer area | y: 6.0 - 7.0 | Footer text, page numbers, notes |
+
+**Note**: Title slides may use vertically centered positioning (y ≈ 3). All other slides must follow layout zones.
+
+## Theme Selection Guide
+
+| Context | Recommended Theme | Why |
+|---------|------------------|-----|
+| Strategy / AI narrative / Investor deck | **NOVA** | Large titles, generous whitespace, authoritative feel |
+| Technical deep dive / Architecture / Dev | **ORBIT** | Dark background, strong contrast, clean technical aesthetic |
+| Metrics-heavy / Growth / Business performance | **PULSE** | Bold KPI emphasis, high-contrast numbers, data-focused |
+| Founder story / Brand / Minimalist | **MINIMA** | Extremely clean, typography-driven, minimal decoration |
+
+**Default**: Use NOVA if context is unclear or not specified.
+
+## Predefined Themes
+
+All presentations MUST use one of these themes.
+
+**Each theme has TWO variants:**
+- **Cover (slide 0)**: Dark background, high visual impact, emotional
+- **Content (slides 1+)**: Light background, clean, readable
+
+| Theme | Positioning | Cover Colors | Content Colors | Style |
+|-------|------------|-------------|----------------|-------|
+| **NOVA** (Default) | Strategy / AI / Investor | `bg: #0A0F1C`, `title: #FFFFFF`, `accent: #7C3AED` | `bg: #F6F7FB`, `primary: #0A0F1C`, `accent: #7C3AED` | Dark cover, light content |
+| **ORBIT** | Technical / Architecture / Dev | `bg: #0B1220`, `title: #F1F5F9`, `accent: #22D3EE` | `bg: #0F172A`, `primary: #F1F5F9`, `accent: #22D3EE` | Dark cover, lighter dark content |
+| **PULSE** | Metrics / Growth / Performance | `bg: #111827`, `title: #FFFFFF`, `accent: #EF4444` | `bg: #FFFFFF`, `primary: #111827`, `accent: #EF4444` | Dark cover, white content |
+| **MINIMA** | Founder / Brand / Minimalist | `bg: #111111`, `title: #FFFFFF` | `bg: #FAFAFA`, `primary: #111111`, `accent: #000000` | Black cover, off-white content |
+
+### Color Reference Table
+
+| Purpose | NOVA Cover | NOVA Content | ORBIT Cover | ORBIT Content |
+|---------|-----------|--------------|-------------|----------------|
+| Background | `#0A0F1C` | `#F6F7FB` | `#0B1220` | `#0F172A` |
+| Title/Primary | `#FFFFFF` | `#0A0F1C` | `#F1F5F9` | `#F1F5F9` |
+| Subtitle/Secondary | `#94A3B8` | `#5B6475` | `#94A3B8` | `#94A3B8` |
+| Accent | `#7C3AED` | `#7C3AED` | `#22D3EE` | `#22D3EE` |
+| Text | - | `#0A0F1C` | - | `#F1F5F9` |
+
+| Purpose | PULSE Cover | PULSE Content | MINIMA Cover | MINIMA Content |
+|---------|-------------|---------------|--------------|-----------------|
+| Background | `#111827` | `#FFFFFF` | `#111111` | `#FAFAFA` |
+| Title/Primary | `#FFFFFF` | `#111827` | `#FFFFFF` | `#111111` |
+| Subtitle/Secondary | `#9CA3AF` | `#6B7280` | `#999999` | `#777777` |
+| Accent | `#EF4444` | `#EF4444` | `#FFFFFF` | `#000000` |
+| Success | - | `#10B981` | - | - |
+| Warning | - | `#F59E0B` | - | - |
+| Secondary | `#5B6475` | `#94A3B8` | `#6B7280` | `#777777` |
+| Accent | `#7C3AED` | `#22D3EE` | `#EF4444` | `#000000` |
+| Success | - | `#34D399` | `#10B981` | - |
+| Warning | - | - | `#F59E0B` | - |
+| Highlight | `#22D3EE` | - | - | - |
+
+### Theme Code Templates (Copy & Use)
+
+**IMPORTANT**: Each theme has TWO variants - Cover (slide 0) and Content (slides 1+).
+
+**NOVA Theme** (Strategy / AI / Investor):
+```javascript
+const theme = {
+  // Cover slide (slide 0) - dark, high impact
+  cover: {
+    background: '#0A0F1C',
+    title: '#FFFFFF',
+    subtitle: '#94A3B8',
+    accent: '#7C3AED'
+  },
+  // Content slides (slides 1+) - light, readable
+  content: {
+    background: '#F6F7FB',
+    primary: '#0A0F1C',
+    secondary: '#5B6475',
+    accent: '#7C3AED',
+    text: '#0A0F1C'
+  }
+};
+```
+
+**ORBIT Theme** (Technical / Architecture / Dev):
+```javascript
+const theme = {
+  // Cover slide (slide 0) - dark, tech aesthetic
+  cover: {
+    background: '#0B1220',
+    title: '#F1F5F9',
+    subtitle: '#94A3B8',
+    accent: '#22D3EE'
+  },
+  // Content slides (slides 1+) - slightly lighter dark
+  content: {
+    background: '#0F172A',
+    primary: '#F1F5F9',
+    secondary: '#94A3B8',
+    accent: '#22D3EE',
+    success: '#34D399',
+    text: '#F1F5F9'
+  }
+};
+```
+
+**PULSE Theme** (Metrics / Growth / Performance):
+```javascript
+const theme = {
+  // Cover slide (slide 0) - dark, bold
+  cover: {
+    background: '#111827',
+    title: '#FFFFFF',
+    subtitle: '#9CA3AF',
+    accent: '#EF4444'
+  },
+  // Content slides (slides 1+) - light, clean
+  content: {
+    background: '#FFFFFF',
+    primary: '#111827',
+    secondary: '#6B7280',
+    accent: '#EF4444',
+    success: '#10B981',
+    warning: '#F59E0B',
+    text: '#111827'
+  }
+};
+```
+
+**MINIMA Theme** (Founder / Brand / Minimalist):
+```javascript
+const theme = {
+  // Cover slide (slide 0) - pure black & white
+  cover: {
+    background: '#111111',
+    title: '#FFFFFF',
+    subtitle: '#999999',
+    accent: '#FFFFFF'
+  },
+  // Content slides (slides 1+) - off-white, clean
+  content: {
+    background: '#FAFAFA',
+    primary: '#111111',
+    secondary: '#777777',
+    accent: '#000000',
+    text: '#111111'
+  }
+};
+```
+
+**Usage Example**:
+```javascript
+const pres = new PptxGenJS();
+
+// Slide 0: Cover (use theme.cover)
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+
+// Slide 1+: Content (use theme.content)
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+});
+```
+
+## Quick Start
+
+**IMPORTANT**: You MUST use one of the predefined themes (NOVA, ORBIT, PULSE, MINIMA) below. Never define custom colors or use hardcoded hex values.
+
+**CRITICAL**: Slide 0 (cover) uses `theme.cover`, all other slides use `theme.content`.
+
+```javascript
+execute_javascript_code("""
+const PptxGenJS = require('pptxgenjs');
+
+const theme = {
+  cover: {
+    background: '#0A0F1C',
+    title: '#FFFFFF',
+    subtitle: '#94A3B8',
+    accent: '#7C3AED'
+  },
+  content: {
+    background: '#F6F7FB',
+    primary: '#0A0F1C',
+    secondary: '#5B6475',
+    accent: '#7C3AED',
+    text: '#0A0F1C'
+  }
+};
+
+const pres = new PptxGenJS();
+
+// Slide 0: Cover slide (use theme.cover)
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText('My Presentation', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+
+// Slide 1: Content slide (use theme.content)
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+});
+
+pres.writeFile({ fileName: 'my_presentation.pptx' });
+""", packages='pptxgenjs')
+```
+
+**Note**: Generated files are automatically saved to the workspace output directory.
+
+## Core Slide Patterns
+
+### Cover + Content Slides (NOVA - Strategy Deck)
+
+```javascript
+const pres = new PptxGenJS();
+
+const theme = {
+  cover: {
+    background: '#0A0F1C',
+    title: '#FFFFFF',
+    subtitle: '#94A3B8',
+    accent: '#7C3AED'
+  },
+  content: {
+    background: '#F6F7FB',
+    primary: '#0A0F1C',
+    secondary: '#5B6475',
+    accent: '#7C3AED',
+    text: '#0A0F1C'
+  }
+};
+
+// Slide 0: Cover (dark background, white title)
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.cover.background };
+slide1.addText('Annual Report 2024', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.cover.title });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.cover.subtitle });
+
+// Slide 1: Content (light background, readable)
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.content.background };
+slide2.addText('Key Points', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.content.primary });
+['Point 1', 'Point 2', 'Point 3'].forEach((text, i) => {
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+});
+
+pres.writeFile({ fileName: 'strategy.pptx' });
+```
+
+### Content Slide with Bullets (ORBIT - Technical)
+
+```javascript
+const pres = new PptxGenJS();
+
+const theme = {
+  cover: {
+    background: '#0B1220',
+    title: '#F1F5F9',
+    subtitle: '#94A3B8',
+    accent: '#22D3EE'
+  },
+  content: {
+    background: '#0F172A',
+    primary: '#F1F5F9',
+    secondary: '#94A3B8',
+    accent: '#22D3EE',
+    success: '#34D399',
+    text: '#F1F5F9'
+  }
+};
+
+// Content slide
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.content.background };
+slide1.addText('System Architecture', { x: 1, y: 0.8, fontSize: 48, bold: true, color: theme.content.primary });
+
+const bullets = [
+  'Microservices architecture',
+  'Event-driven communication',
+  'Scalable infrastructure'
+];
+
+bullets.forEach((text, i) => {
+  slide1.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.content.text, bullet: true });
+});
+
+pres.writeFile({ fileName: 'technical.pptx' });
+```
+
+### Metrics Slide (PULSE - Business Performance)
+
+```javascript
+const pres = new PptxGenJS();
+
+const theme = {
+  cover: {
+    background: '#111827',
+    title: '#FFFFFF',
+    subtitle: '#9CA3AF',
+    accent: '#EF4444'
+  },
+  content: {
+    background: '#FFFFFF',
+    primary: '#111827',
+    secondary: '#6B7280',
+    accent: '#EF4444',
+    success: '#10B981',
+    warning: '#F59E0B',
+    text: '#111827'
+  }
+};
+
+// Content slide with metrics
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.content.background };
+slide1.addText('Q4 Key Metrics', { x: 1, y: 0.8, fontSize: 52, bold: true, color: theme.content.primary });
+
+const metrics = [
+  { label: 'Revenue', value: '$1.5M', color: theme.content.success },
+  { label: 'Growth', value: '+25%', color: theme.content.accent },
+  { label: 'Customers', value: '86', color: theme.content.warning }
+];
+
+metrics.forEach((metric, i) => {
+  const x = 1 + (i % 3) * 3;
+  const y = 2.5 + Math.floor(i / 3) * 2;
+  slide1.addText(metric.label, { x, y: y, fontSize: 16, color: theme.content.secondary });
+  slide1.addText(metric.value, { x, y: y + 0.4, fontSize: 36, bold: true, color: metric.color });
+});
+
+pres.writeFile({ fileName: 'metrics.pptx' });
+```
+
+### Minimalist Content (MINIMA - Founder Story)
+
+```javascript
+const pres = new PptxGenJS();
+
+const theme = {
+  background: '#FAFAFA',
+  primary: '#111111',
+  secondary: '#777777',
+  accent: '#000000',
+  text: '#111111'
+};
+
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.background };
+
+slide1.addText('Our Journey', { x: 1, y: 0.8, fontSize: 56, bold: true, color: theme.primary });
+
+['Founded in 2020', 'Team of 10', 'Bootstrapped'].forEach((text, i) => {
+  slide1.addText(text, { x: 1, y: 2.5 + i * 0.8, fontSize: 20, color: theme.text });
+});
+
+pres.writeFile({ fileName: 'minimal.pptx' });
+```
+
+### Multi-Slide Presentation (NOVA - Strategy Context)
+
+```javascript
+const pres = new PptxGenJS();
+
+const theme = {
+  background: '#F6F7FB',
+  primary: '#0A0F1C',
+  secondary: '#5B6475',
+  accent: '#7C3AED',
+  highlight: '#22D3EE',
+  text: '#0A0F1C'
+};
+
+// Slide 1: Title
+const slide1 = pres.addSlide();
+slide1.background = { color: theme.background };
+slide1.addText('Strategic Vision 2025', { x: 1, y: 3, fontSize: 64, bold: true, color: theme.primary });
+slide1.addText('Company Name', { x: 1, y: 4.2, fontSize: 28, color: theme.secondary });
+
+// Slide 2: Content
+const slide2 = pres.addSlide();
+slide2.background = { color: theme.background };
+slide2.addText('Key Initiatives', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
+['AI Platform Launch', 'Market Expansion', 'Team Growth'].forEach((text, i) => {
+  slide2.addText(text, { x: 1, y: 2 + i * 0.7, fontSize: 18, color: theme.text, bullet: true });
+});
+
+// Slide 3: Metrics
+const slide3 = pres.addSlide();
+slide3.background = { color: theme.background };
+slide3.addText('Performance Targets', { x: 1, y: 0.8, fontSize: 44, bold: true, color: theme.primary });
+slide3.addText('Revenue: $5M', { x: 1, y: 2.5, fontSize: 28, color: theme.accent });
+slide3.addText('Growth: 150%', { x: 5, y: 2.5, fontSize: 28, color: theme.highlight });
+
+pres.writeFile({ fileName: 'strategy.pptx' });
+```
+
+### Data Table (NOVA - Case Breakdown)
+
+**`slide.addTable(rows, options)`** — `rows` MUST be an array of *rows*, and each
+row MUST be an array of *cells*. A cell is either a plain string OR
+`{ text, options }`. Anything else triggers
+`addTable: 'rows' should be an array of cells!`, the script aborts before
+`writeFile`, and **no .pptx is produced**.
+
+To add a table you need a slide handle. Capture the slide returned by
+`pres.addSlide()` so you can call `slide.addTable(...)` on it.
+
+```javascript
+const PptxGenJS = require('pptxgenjs');
+const pres = new PptxGenJS();
+
+const theme = {
+  cover: { background: '#0A0F1C', title: '#FFFFFF', subtitle: '#94A3B8', accent: '#7C3AED' },
+  content: { background: '#F6F7FB', primary: '#0A0F1C', secondary: '#5B6475', accent: '#7C3AED', text: '#0A0F1C' }
+};
+
+// Slide 0: Cover — capture the slide handle, then call slide.* methods
+// (pres.addText / pres.background do not exist; only slide objects have these).
+const cover = pres.addSlide();
+cover.background = { color: theme.cover.background };
+cover.addText('Outbreak Report', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
+
+// Slide 1: Content with table — capture another slide handle
+const slide = pres.addSlide();
+slide.background = { color: theme.content.background };
+slide.addText('Case Breakdown', { x: 0.5, y: 0.4, fontSize: 32, bold: true, color: theme.content.primary });
+
+// Header cells use { text, options }; body cells are plain strings.
+// Colors are routed through the theme: light text on the accent fill — no
+// hardcoded hex values.
+const headerStyle = {
+  bold: true,
+  color: theme.content.background,
+  fill: { color: theme.content.accent },
+};
+const rows = [
+  [
+    { text: 'Case', options: headerStyle },
+    { text: 'Status', options: headerStyle },
+    { text: 'Outcome', options: headerStyle },
+    { text: 'Location', options: headerStyle },
+  ],
+  ['Case 1', 'Probable',  'Deceased 11 Apr',    'Argentina'],
+  ['Case 2', 'Confirmed', 'Deceased 26 Apr',    'South Africa'],
+  ['Case 3', 'Confirmed', 'Hospitalised (ICU)', 'South Africa'],
+];
+
+slide.addTable(rows, {
+  x: 0.5, y: 1.2, w: 9,
+  colW: [1.5, 1.8, 3.0, 2.7],
+  fontSize: 12,
+  color: theme.content.text,
+  border: { type: 'solid', pt: 1, color: theme.content.secondary },
+});
+
+pres.writeFile({ fileName: 'case_breakdown.pptx' });
+```
+
+**Wrong shapes that hard-error and abort the script** (raise
+`'rows' should be an array of cells!`; no `.pptx` is produced; the tool
+returns `success: false`):
+
+```javascript
+// ❌ Flat array of strings — pptxgenjs expects rows[i] to be an array.
+slide.addTable(['A', 'B', 'C'], opts);
+
+// ❌ Building rows by appending cell objects without wrapping each row in [...].
+const flat = [];
+for (const r of data) flat.push({ text: r.name }, { text: r.value });
+slide.addTable(flat, opts);
+```
+
+**Wrong shapes that only WARN and still produce a (broken) `.pptx`** — these are
+more dangerous because the script finishes, `writeFile` succeeds, and the tool
+returns `success: true`, but the table content is malformed. pptxgenjs prints
+the warning to stdout/stderr without throwing:
+
+```javascript
+// ⚠️ A row position holds something that isn't a row array — e.g. a bare cell
+//   object mixed in with proper row arrays. pptxgenjs logs:
+//     "addTable: tableRows has a bad row. A row should be an array of cells.
+//      You provided: { text: 'C' }"
+//   The malformed row is dropped from the rendered table, but no error is
+//   raised and writeFile completes.
+slide.addTable([['ok'], { text: 'C' }], opts);
+```
+
+After every `execute_javascript_code` call that uses `addTable`, you MUST scan
+the tool's `output` for any line starting with `addTable:`. If one is present,
+treat the table as broken even when `success: true` — re-run with the row
+shape corrected (every row wrapped in `[...]`) instead of telling the user the
+deck rendered cleanly.
+
+## Working with Images
+
+When adding images to presentations, use relative paths (code runs in workspace/output directory):
+
+```javascript
+const pres = new PptxGenJS();
+const fs = require('fs');
+
+// Slide with image
+const slide1 = pres.addSlide();
+slide1.addText('Revenue Chart', { x: 0.5, y: 0.8, fontSize: 40, bold: true, color: theme.content.primary });
+
+// Check if image exists
+if (fs.existsSync('revenue_chart.png')) {
+  // GOOD: Specify both w and h to control exact dimensions
+  slide1.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
+
+  // BETTER: Use sizing: 'contain' to fit within bounds while maintaining aspect ratio
+  // slide1.addImage({ path: 'revenue_chart.png', x: 1, y: 1.5, sizing: { type: 'contain', w: 8, h: 4.5 } });
+} else {
+  slide1.addText('Image not available: revenue_chart.png', { x: 1, y: 3, fontSize: 18, color: theme.content.secondary || theme.content.warning });
+}
+
+pres.writeFile({ fileName: 'with_image.pptx' });
+```
+
+**Image Sizing Best Practices:**
+
+| Method | When to Use | Example |
+|--------|-------------|---------|
+| `w: 8, h: 4.5` | Exact dimensions needed | `{ x: 1, y: 2, w: 8, h: 4 }` |
+| `sizing: { type: 'contain', w: 8, h: 5 }` | Maintain aspect ratio, fit in bounds | `{ x: 1, y: 1.5, sizing: { type: 'contain', w: 8, h: 5 } }` |
+| `sizing: { type: 'cover', w: 8, h: 5 }` | Fill bounds, crop if needed | `{ x: 1, y: 1.5, sizing: { type: 'cover', w: 8, h: 5 } }` |
+
+**WRONG - May overflow slide:**
+```javascript
+// ❌ Only width - height depends on aspect ratio, may exceed slide bounds
+const slide1 = pres.addSlide();
+slide1.addImage({ path: 'chart.png', x: 1, y: 2, w: 9 });
+
+// ❌ Only height - width may exceed slide width
+slide1.addImage({ path: 'photo.png', x: 1, y: 1, h: 6 });
+```
+
+**CORRECT - Stay within bounds:**
+```javascript
+// ✅ Both w and h specified
+const slide1 = pres.addSlide();
+slide1.addImage({ path: 'chart.png', x: 1, y: 1.5, w: 8, h: 4.5 });
+
+// ✅ Using contain with max bounds
+slide1.addImage({ path: 'photo.png', x: 0.5, y: 1, sizing: { type: 'contain', w: 9, h: 6 } });
+```
+
+**Important Notes:**
+- Use relative paths like `'revenue_chart.png'` - code runs in workspace/output directory
+- Supported formats: PNG, JPG, JPEG, GIF, PDF
+- Keep images within safe area: x: 0.5-9.5, y: 0.5-7 inches
+- Use `sizing: { type: 'contain' }` when you want to preserve aspect ratio
+- Use `sizing: { type: 'cover' }` when you want to fill the entire area
+
+## Working with Existing Presentations
+
+### Read Presentation Structure
+
+```
+read_pptx("presentation.pptx", extract_text=False)
+```
+
+Returns:
+```json
+{
+  "slide_count": 5,
+  "slides": [
+    {"index": 0, "filename": "slide1.xml", "hidden": false}
+  ],
+  "titles": ["Title", "Content", "Summary", "Q&A", "Thank You"]
+}
+```
+
+### Extract Text Content
+
+```
+read_pptx("presentation.pptx", extract_text=True)
+```
+
+Returns all text content from the presentation.
+
+## Available Tools
+
+| Tool | Purpose |
+|-------|---------|
+| `execute_javascript_code` | Generate presentations using JavaScript (use packages='pptxgenjs') |
+| `read_pptx` | Extract content/structure from existing PPTX files |
+| `unpack_pptx` | Extract PPTX files to directory for inspection/learning from templates |
+| `pack_pptx` | Package directory back into PPTX file after manual editing |
+| `clean_pptx` | Clean orphaned files from unpacked PPTX directory |

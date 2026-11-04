@@ -1,0 +1,1212 @@
+import asyncio
+import contextvars
+import json
+import logging
+import os
+import threading
+import uuid
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
+
+import httpx
+
+from ...public_http import (
+    create_owned_sync_sdk_client,
+    create_public_model_async_client,
+)
+from ..error import retry_on
+from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..stream_deadline import await_before_deadline
+from ..timeout_config import TimeoutConfig
+from ..token_context import add_token_usage, extract_cached_input_tokens
+from ..types import ChunkType, StreamChunk
+from .base import BaseLLM
+
+ZhipuAiClient: "type[_ZhipuAiClient] | None"
+try:
+    from zai import ZhipuAiClient as _ZhipuAiClient
+except ImportError:
+    # Fallback for when zai SDK is not available
+    ZhipuAiClient = None
+else:
+    ZhipuAiClient = _ZhipuAiClient
+
+logger = logging.getLogger(__name__)
+
+
+def _close_stream_response(stream: Any) -> None:
+    """Close a zai stream's HTTP response from the producer thread, best effort."""
+    close = getattr(getattr(stream, "response", None), "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing Zhipu stream response failed (%s)", type(exc).__name__)
+
+
+def _zhipu_stream_tool_calls(
+    accumulated_tool_calls: Dict[str, Dict],
+) -> List[Dict[str, Any]]:
+    tool_calls_list: List[Dict[str, Any]] = []
+    for tool_call in accumulated_tool_calls.values():
+        function_payload: Dict[str, Any] = {
+            "name": tool_call.get("name", ""),
+            "arguments": tool_call.get("arguments", ""),
+        }
+        item: Dict[str, Any] = {
+            "id": tool_call.get("id", ""),
+            "type": "function",
+            "function": function_payload,
+        }
+        index = tool_call.get("index")
+        if isinstance(index, int):
+            item["index"] = index
+        tool_calls_list.append(item)
+    return tool_calls_list
+
+
+class ZhipuLLM(BaseLLM):
+    """
+    Zhipu AI LLM client using the official Zhipu SDK.
+    Supports GLM-4.5 with thinking mode and all Zhipu API features.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "glm-4.5",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        default_temperature: Optional[float] = None,
+        default_max_tokens: Optional[int] = None,
+        timeout: float = 180.0,
+        thinking_mode: Optional[bool] = None,
+        abilities: Optional[List[str]] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
+    ):
+        self._model_name = model_name
+        self.api_key = (
+            api_key or os.getenv("ZHIPU_API_KEY") or os.getenv("OPENAI_API_KEY")
+        )
+        self.base_url = base_url or os.getenv("ZHIPU_BASE_URL")
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.timeout = timeout
+        self.thinking_mode = thinking_mode
+        self.timeout_config = timeout_config or TimeoutConfig()
+
+        # Determine abilities based on model name or explicit configuration
+        if abilities:
+            self._abilities = abilities
+        else:
+            # Auto-detect abilities based on model name
+            self._abilities = ["chat", "tool_calling"]
+            if any(
+                vision_keyword in model_name.lower()
+                for vision_keyword in ["glm-4v", "glm-4.5v", "glm-4.6v", "vision"]
+            ):
+                self._abilities.append("vision")
+            if self.supports_thinking_mode:
+                self._abilities.append("thinking_mode")
+
+        # Initialize the Zhipu client
+        self._client: Optional[Any] = None
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name/identifier."""
+        return self._model_name
+
+    @property
+    def abilities(self) -> List[str]:
+        """Get the list of abilities supported by this Zhipu LLM implementation."""
+        return self._abilities
+
+    @property
+    def supports_native_video_input(self) -> bool:
+        """Return whether the configured GLM visual model accepts video input."""
+        if super().supports_native_video_input:
+            return True
+        if not self.has_ability("vision"):
+            return False
+
+        model_name = self._model_name.lower()
+        return model_name.startswith(("glm-4v-plus-0111", "glm-4.5v", "glm-4.6v"))
+
+    def build_native_video_content(
+        self,
+        video_url: str,
+        *,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> Dict[str, Any]:
+        """Build Zhipu's ``video_url`` part, including raw local Base64."""
+        _ = start_time, end_time
+        if video_url.startswith("data:video/") and "," in video_url:
+            video_url = video_url.split(",", 1)[1]
+        return {"type": "video_url", "video_url": {"url": video_url}}
+
+    def _ensure_client(self) -> None:
+        """Ensure the Zhipu client is initialized."""
+        if self._client is None:
+            if ZhipuAiClient is None:
+                raise RuntimeError(
+                    "zai SDK is not installed. Please install it with: pip install zai-sdk"
+                )
+            self._client = create_owned_sync_sdk_client(
+                ZhipuAiClient,
+                timeout=self.timeout,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                # Retry policy lives in the shared RetryWrapper only. The zai
+                # SDK defaults to three retries of its own, so left alone this
+                # client would issue four requests inside every attempt we
+                # make. See ``OpenAICompatibleLLM._ensure_client``.
+                max_retries=0,
+            )
+
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Perform a chat completion or trigger tool call.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification (e.g., {"type": "json_object"})
+            thinking: Thinking mode configuration (e.g., {"type": "disabled"})
+            **kwargs: Additional parameters to pass to the Zhipu API
+
+        Returns:
+            - If normal text reply: return string
+            - If tool call triggered: return dict with type "tool_call" and tool_calls list
+
+        Raises:
+            RuntimeError: If the API call fails
+        """
+        self._ensure_client()
+        assert self._client is not None
+
+        # Prepare the completion parameters
+        completion_params = {
+            "model": self._model_name,
+            "messages": self._sanitize_unicode_content(
+                self._strip_internal_message_keys(messages)
+            ),
+            "max_tokens": max_tokens or self.default_max_tokens,
+            "stream": False,  # We handle streaming separately if needed
+            **kwargs,
+        }
+
+        if temperature is not None:
+            completion_params["temperature"] = temperature
+        elif self.default_temperature is not None:
+            completion_params["temperature"] = self.default_temperature
+
+        # Add thinking mode if specified (parameter takes precedence over instance setting)
+        if thinking is not None:
+            completion_params["thinking"] = thinking
+        elif self.thinking_mode is not None:
+            thinking_type = "enabled" if self.thinking_mode else "disabled"
+            completion_params["thinking"] = {"type": thinking_type}
+
+        # Add tools if provided
+        if tools:
+            completion_params["tools"] = tools
+            if tool_choice:
+                completion_params["tool_choice"] = (
+                    "auto" if tool_choice == "required" else tool_choice
+                )
+
+        # Add response format if provided
+        if response_format:
+            completion_params["response_format"] = response_format
+
+        try:
+            # Debug: Log the request parameters
+            logger.debug("Zhipu API request parameters:")
+            logger.debug(f"  - model: {completion_params.get('model')}")
+            logger.debug(
+                f"  - messages count: {len(completion_params.get('messages', []))}"
+            )
+            logger.debug(f"  - tools provided: {'tools' in completion_params}")
+            logger.debug(f"  - tool_choice: {completion_params.get('tool_choice')}")
+            logger.debug(f"  - thinking: {completion_params.get('thinking')}")
+            logger.debug(f"  - temperature: {completion_params.get('temperature')}")
+
+            # Make the API call in a thread pool since the SDK might be synchronous
+            if self._client is None:
+                raise RuntimeError("Zhipu client is not initialized")
+
+            # Debug: Log before API call
+            logger.debug("Making Zhipu API call...")
+
+            try:
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
+                # reach the SDK thread.
+                response = await asyncio.to_thread(
+                    lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
+                )
+                logger.debug(
+                    f"Zhipu API call completed, response type: {type(response)}"
+                )
+            except Exception as executor_error:
+                logger.error(
+                    f"Executor task failed: {type(executor_error).__name__}: {executor_error}"
+                )
+                raise executor_error
+
+            # Check if response is None
+            if response is None:
+                logger.error("Zhipu API returned None response")
+                raise RuntimeError("Zhipu API returned None response")
+
+            # Check if response has choices
+            if not hasattr(response, "choices") or not response.choices:
+                logger.error(f"Zhipu API response missing choices: {response}")
+                raise RuntimeError("Zhipu API response missing choices")
+
+            # Record token usage
+            if hasattr(response, "usage"):
+                usage = response.usage
+                input_tokens = getattr(usage, "prompt_tokens", 0) or getattr(
+                    usage, "input_tokens", 0
+                )
+                output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
+                    usage, "output_tokens", 0
+                )
+                add_token_usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    model=self._model_name,
+                    model_id=self.model_id,
+                    call_type="chat",
+                    cached_input_tokens=extract_cached_input_tokens(usage),
+                )
+
+            # Extract the choice
+            choice = response.choices[0]
+            message = choice.message
+
+            # Debug: Print response structure
+            logger.debug(f"Zhipu response choice: {choice}")
+            logger.debug(f"Zhipu response message: {message}")
+            logger.debug(
+                f"Choice finish_reason: {getattr(choice, 'finish_reason', 'N/A')}"
+            )
+            logger.debug(f"Message tool_calls: {getattr(message, 'tool_calls', 'N/A')}")
+            logger.debug(f"Message content: {message.content}")
+            logger.debug(f"Message content type: {type(message.content)}")
+
+            # Check for tool calls - handle both glm-4.5-air and glm-4.5 formats
+            tool_calls = None
+
+            # Try to access tool_calls directly first (glm-4.5 style)
+            try:
+                # Access choice.message.tool_calls directly
+                if hasattr(choice, "message") and hasattr(choice.message, "tool_calls"):
+                    tool_calls = choice.message.tool_calls
+                    if tool_calls:
+                        logger.debug(
+                            f"Found tool_calls via direct access: {len(tool_calls)}"
+                        )
+            except Exception as e:
+                logger.debug(f"Error accessing tool_calls directly: {e}")
+
+            # Fallback: Check through message object
+            if tool_calls is None:
+                # Format 1: Direct tool_calls attribute (glm-4.5-air style)
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    tool_calls = message.tool_calls
+                    logger.debug(
+                        f"Found tool_calls in message (glm-4.5-air style): {len(tool_calls)}"
+                    )
+                # Format 2: Tool calls in choice with finish_reason "tool_calls" (glm-4.5 style)
+                elif (
+                    hasattr(choice, "finish_reason")
+                    and choice.finish_reason == "tool_calls"
+                ):
+                    if hasattr(message, "tool_calls") and message.tool_calls:
+                        tool_calls = message.tool_calls
+                        logger.debug(
+                            f"Found tool_calls with finish_reason (glm-4.5 style): {len(tool_calls)}"
+                        )
+                    else:
+                        logger.debug(
+                            "finish_reason is 'tool_calls' but no tool_calls found in message"
+                        )
+
+            logger.debug(f"Final tool_calls result: {tool_calls}")
+
+            # Debug: Print tool_calls structure if found
+            if tool_calls:
+                logger.debug(f"Tool calls structure: {tool_calls}")
+                for i, tool_call in enumerate(tool_calls):
+                    logger.debug(f"Tool call {i}: {tool_call}")
+                    if hasattr(tool_call, "function"):
+                        logger.debug(f"Tool call {i} function: {tool_call.function}")
+                        if hasattr(tool_call.function, "name"):
+                            logger.debug(
+                                f"Tool call {i} name: {tool_call.function.name}"
+                            )
+                        if hasattr(tool_call.function, "arguments"):
+                            logger.debug(
+                                f"Tool call {i} arguments: {tool_call.function.arguments}"
+                            )
+
+            if tool_calls:
+                # Convert Zhipu tool calls to ReAct format
+                for tool_call in tool_calls:
+                    tool_name = tool_call.function.name
+                    try:
+                        # Parse arguments as JSON
+                        args = json.loads(tool_call.function.arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+
+                    # Return ReAct-compatible tool call format
+                    return {
+                        "type": "tool_call",
+                        "tool_calls": [
+                            {
+                                "id": getattr(
+                                    tool_call, "id", f"call_{uuid.uuid4().hex}"
+                                ),
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps(args),
+                                },
+                                "type": "function",
+                            }
+                        ],
+                        "raw": response.model_dump()
+                        if hasattr(response, "model_dump")
+                        else str(response),
+                    }
+
+            # Handle text content
+            content = message.content
+
+            # Handle None or empty content when no tool calls
+            if not content or not content.strip():
+                logger.warning("LLM returned None/empty content. Details:")
+                logger.warning(
+                    f"  - finish_reason: {getattr(choice, 'finish_reason', 'N/A')}"
+                )
+                logger.warning(f"  - has tool_calls: {tool_calls is not None}")
+                logger.warning(
+                    f"  - tool_calls count: {len(tool_calls) if tool_calls else 0}"
+                )
+                logger.warning(f"  - message attributes: {dir(message)}")
+
+                # If there are no tool calls and no content, this is an error
+                if not tool_calls:
+                    raise RuntimeError(
+                        f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
+                    )
+                else:
+                    logger.info(
+                        "None/empty content but tool calls present, this is expected behavior"
+                    )
+
+            return content
+
+        except Exception as e:
+            # Handle any errors
+            logger.error("Zhipu API exception details:")
+            logger.error(f"  - Exception type: {type(e).__name__}")
+            logger.error(f"  - Exception message: {str(e)}")
+            logger.error(f"  - Exception args: {e.args}")
+            raise RuntimeError(f"Zhipu API error: {str(e)}") from e
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """
+        Stream chat completion with timeout controls and token tracking.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification
+            thinking: Thinking mode configuration
+            **kwargs: Additional parameters to pass to the Zhipu API
+
+        Yields:
+            StreamChunk objects with streaming response data
+
+        Raises:
+            RuntimeError: If the API call fails
+            LLMTimeoutError: First token or token interval deadline expired
+        """
+        self._ensure_client()
+        assert self._client is not None
+
+        # Accumulated content and tool calls
+        current_content = ""
+        accumulated_tool_calls: Dict[str, Dict] = {}
+
+        # Prepare the completion parameters
+        completion_params = {
+            "model": self._model_name,
+            "messages": self._sanitize_unicode_content(
+                self._strip_internal_message_keys(messages)
+            ),
+            "max_tokens": max_tokens or self.default_max_tokens,
+            "stream": True,  # Enable streaming
+            **kwargs,
+        }
+
+        if temperature is not None:
+            completion_params["temperature"] = temperature
+        elif self.default_temperature is not None:
+            completion_params["temperature"] = self.default_temperature
+
+        # Add thinking mode if specified
+        if thinking is not None:
+            completion_params["thinking"] = thinking
+        elif self.thinking_mode is not None:
+            thinking_type = "enabled" if self.thinking_mode else "disabled"
+            completion_params["thinking"] = {"type": thinking_type}
+
+        # Add tools if provided
+        if tools:
+            completion_params["tools"] = tools
+            if tool_choice:
+                completion_params["tool_choice"] = (
+                    "auto" if tool_choice == "required" else tool_choice
+                )
+
+        # Add response format if provided
+        if response_format:
+            completion_params["response_format"] = response_format
+
+        # Set once the consumer stops waiting: a deadline expiring, an error,
+        # or the caller closing the stream (``aclose()`` or the async
+        # generator being finalized). The producer then stops reading and
+        # closes the response instead of draining the rest of the stream into
+        # a queue nobody reads. It only sees the signal before the request and
+        # between events: a producer already waiting for the next event keeps
+        # its executor thread until zai yields one or the read times out (300 s
+        # by default). SSE comment keepalives are dropped inside zai without
+        # reaching this check and reset the read timeout, so against a
+        # provider that sends them the wait is unbounded. Closing the response
+        # from the event loop cannot cut the read short, since httpcore's sync
+        # close does not shut the socket down (#3097).
+        stop_producer = threading.Event()
+
+        try:
+            # Create a queue to bridge the synchronous stream to async generator
+            queue: asyncio.Queue[Union[Dict[str, Any], Exception, None]] = (
+                asyncio.Queue()
+            )
+
+            # Get the event loop in the main thread before spawning the worker thread
+            loop = asyncio.get_event_loop()
+
+            def enqueue(item: Union[Dict[str, Any], Exception, None]) -> bool:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, item)
+                except RuntimeError:
+                    # The loop is closed, so nobody is left to read the item.
+                    stop_producer.set()
+                    return False
+                return True
+
+            def stream_producer() -> None:
+                """
+                Consume the synchronous Zhipu stream and put chunks into the queue.
+                This runs in a separate thread to avoid blocking the event loop.
+                """
+                stream = None
+                try:
+                    if self._client is None:
+                        raise RuntimeError("Zhipu client is not initialized")
+                    # The thread may start only after the consumer gave up,
+                    # for example when the executor is saturated: do not send
+                    # a request nobody will read.
+                    if stop_producer.is_set():
+                        return
+
+                    stream = self._client.chat.completions.create(**completion_params)
+                    if stop_producer.is_set():
+                        return
+
+                    for chunk in stream:
+                        if stop_producer.is_set():
+                            return
+                        # Convert chunk to dict to avoid threading issues
+                        chunk_dict: Dict[str, Any] = {}
+
+                        if hasattr(chunk, "choices") and chunk.choices:
+                            choice = chunk.choices[0]
+                            choice_dict: Dict[str, Any] = {}
+
+                            if hasattr(choice, "delta"):
+                                delta = choice.delta
+                                delta_dict: Dict[str, Any] = {}
+
+                                if hasattr(delta, "content") and delta.content:
+                                    delta_dict["content"] = delta.content
+
+                                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                                    tool_calls_list: List[Dict[str, Any]] = []
+                                    for tool_call in delta.tool_calls:
+                                        tool_call_dict: Dict[str, Any] = {
+                                            "id": getattr(tool_call, "id", None),
+                                        }
+                                        index = getattr(tool_call, "index", None)
+                                        if isinstance(index, int):
+                                            tool_call_dict["index"] = index
+
+                                        if hasattr(tool_call, "function"):
+                                            func = tool_call.function
+                                            func_dict: Dict[str, Any] = {}
+
+                                            if hasattr(func, "name") and func.name:
+                                                func_dict["name"] = func.name
+                                            if (
+                                                hasattr(func, "arguments")
+                                                and func.arguments
+                                            ):
+                                                func_dict["arguments"] = func.arguments
+
+                                            tool_call_dict["function"] = func_dict
+
+                                        tool_calls_list.append(tool_call_dict)
+
+                                    delta_dict["tool_calls"] = tool_calls_list
+
+                                choice_dict["delta"] = delta_dict
+
+                            if (
+                                hasattr(choice, "finish_reason")
+                                and choice.finish_reason
+                            ):
+                                choice_dict["finish_reason"] = choice.finish_reason
+
+                            chunk_dict["choices"] = [choice_dict]
+
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage = chunk.usage
+                            usage_dict: Dict[str, Any] = {
+                                "prompt_tokens": getattr(usage, "prompt_tokens", 0)
+                                or getattr(usage, "input_tokens", 0),
+                                "completion_tokens": getattr(
+                                    usage, "completion_tokens", 0
+                                )
+                                or getattr(usage, "output_tokens", 0),
+                            }
+                            # Preserve cache telemetry across the dict
+                            # conversion in OpenAI shape so the consumer's
+                            # extract_cached_input_tokens still sees it.
+                            cached = extract_cached_input_tokens(usage)
+                            if cached:
+                                usage_dict["prompt_tokens_details"] = {
+                                    "cached_tokens": cached
+                                }
+                            chunk_dict["usage"] = usage_dict
+
+                        # Put chunk in queue using the event loop from main thread
+                        # A closed loop means nobody reads further events.
+                        if not enqueue(chunk_dict):
+                            return
+
+                    # Signal end of stream with sentinel value
+                    enqueue(None)
+
+                except Exception as exc:
+                    # Put exception in queue so it can be raised in the async context
+                    enqueue(exc)
+
+                finally:
+                    # Idempotent: a fully read response is already closed, and
+                    # one abandoned or failed mid-stream is released here.
+                    if stream is not None:
+                        _close_stream_response(stream)
+
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent (#3058). The producer sends the request, so the
+            # first-token deadline also covers opening the stream.
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            # Start the producer thread. The SDK runs there, so it gets the
+            # caller's context (as asyncio.to_thread would give it): context
+            # variables such as log-scoping state apply to its records too.
+            producer_task = loop.run_in_executor(
+                None, contextvars.copy_context().run, stream_producer
+            )
+
+            # Consume chunks from the queue as they arrive (true streaming)
+            first_chunk = True
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_chunk:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                chunk_dict = await await_before_deadline(
+                    queue.get(), deadline=deadline, timeout_message=timeout_message
+                )
+
+                # Check for end of stream sentinel
+                if chunk_dict is None:
+                    break
+
+                # Check if an exception was put in the queue
+                if isinstance(chunk_dict, Exception):
+                    raise chunk_dict
+                first_chunk = False
+
+                # Process the chunk data
+                if chunk_dict.get("choices"):
+                    choice = chunk_dict["choices"][0]
+                    delta = choice.get("delta")
+
+                    if delta:
+                        # Check for content
+                        if delta.get("content"):
+                            text = delta["content"]
+                            current_content += text
+                            yield StreamChunk(
+                                type=ChunkType.TOKEN,
+                                content=current_content,
+                                delta=text,
+                                raw=chunk_dict,
+                            )
+
+                        # Check for tool calls
+                        if delta.get("tool_calls"):
+                            saw_tool_call_delta = False
+                            for tool_call in delta["tool_calls"]:
+                                tool_id = tool_call.get("id")
+                                index = tool_call.get("index")
+
+                                # Initialize tool call if not exists
+                                if not tool_id and isinstance(index, int):
+                                    for (
+                                        existing_id,
+                                        existing_tool_call,
+                                    ) in accumulated_tool_calls.items():
+                                        if existing_tool_call.get("index") == index:
+                                            tool_id = existing_id
+                                            break
+                                if not tool_id and len(accumulated_tool_calls) == 1:
+                                    tool_id = next(iter(accumulated_tool_calls.keys()))
+                                if tool_id and tool_id not in accumulated_tool_calls:
+                                    accumulated_tool_calls[tool_id] = {
+                                        "id": tool_id,
+                                        "index": index
+                                        if isinstance(index, int)
+                                        else None,
+                                        "name": "",
+                                        "arguments": "",
+                                    }
+
+                                # Update tool call info
+                                if tool_id:
+                                    saw_tool_call_delta = True
+                                    func = tool_call.get("function")
+                                    if func:
+                                        if func.get("name"):
+                                            accumulated_tool_calls[tool_id]["name"] = (
+                                                func["name"]
+                                            )
+                                        if func.get("arguments"):
+                                            accumulated_tool_calls[tool_id][
+                                                "arguments"
+                                            ] += func["arguments"]
+                                    if isinstance(index, int):
+                                        accumulated_tool_calls[tool_id]["index"] = index
+
+                            if saw_tool_call_delta:
+                                yield StreamChunk(
+                                    type=ChunkType.TOOL_CALL,
+                                    tool_calls=_zhipu_stream_tool_calls(
+                                        accumulated_tool_calls
+                                    ),
+                                    raw=chunk_dict,
+                                )
+
+                    # Check for finish reason
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason:
+                        # Yield tool calls if accumulated
+                        if accumulated_tool_calls:
+                            yield StreamChunk(
+                                type=ChunkType.TOOL_CALL,
+                                tool_calls=_zhipu_stream_tool_calls(
+                                    accumulated_tool_calls
+                                ),
+                                finish_reason=finish_reason,
+                                raw=chunk_dict,
+                            )
+                        else:
+                            yield StreamChunk(
+                                type=ChunkType.END,
+                                finish_reason=finish_reason,
+                                raw=chunk_dict,
+                            )
+
+                # Check for usage information
+                if chunk_dict.get("usage"):
+                    usage = chunk_dict["usage"]
+                    input_tokens = usage.get("prompt_tokens", 0)
+                    output_tokens = usage.get("completion_tokens", 0)
+
+                    cached_tokens = extract_cached_input_tokens(usage)
+
+                    # Record token usage
+                    add_token_usage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        model=self._model_name,
+                        model_id=self.model_id,
+                        call_type="stream_chat",
+                        cached_input_tokens=cached_tokens,
+                    )
+
+                    # Yield usage chunk
+                    usage_dict = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    }
+                    if cached_tokens:
+                        usage_dict["cached_input_tokens"] = cached_tokens
+                    yield StreamChunk(
+                        type=ChunkType.USAGE,
+                        usage=usage_dict,
+                        raw=chunk_dict,
+                    )
+
+            await producer_task
+
+        except LLMTimeoutError:
+            # Re-raise timeout errors for retry
+            raise
+
+        except TimeoutError:
+            # Re-raise timeout errors for retry
+            raise LLMRetryableError("Streaming timeout exceeded")
+
+        except Exception as e:
+            # Streaming swallowed every provider failure into an ERROR chunk,
+            # so the shared RetryWrapper never saw one and the zai SDK's own
+            # budget (three retries) was the only cover a streaming call had.
+            # That budget is now zero (see ``_ensure_client``), so a transient
+            # failure has to raise for the wrapper to retry it. Classified by
+            # the same predicate the wrapper uses, so producer and consumer
+            # cannot drift; permanent failures keep the ERROR chunk.
+            if retry_on(e):
+                raise LLMRetryableError(f"Zhipu streaming API error: {str(e)}") from e
+
+            logger.error(f"Zhipu streaming API error: {str(e)}")
+            yield StreamChunk(
+                type=ChunkType.ERROR,
+                content=f"Zhipu streaming API error: {str(e)}",
+                raw=e,
+            )
+
+        finally:
+            stop_producer.set()
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        """
+        Check if this Zhipu LLM supports thinking mode.
+
+        Returns:
+            bool: True since Zhipu GLM-4.5 supports thinking mode
+        """
+        return True
+
+    async def vision_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Perform a vision-aware chat completion for Zhipu models that support vision.
+        This method handles multimodal messages with image content.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+                      Content can be a string or list of multimodal content items
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification
+            thinking: Thinking mode configuration
+            **kwargs: Additional parameters to pass to the Zhipu API
+
+        Returns:
+            - If normal text reply: return string
+            - If tool call triggered: return dict with type "tool_call" and tool_calls list
+
+        Raises:
+            RuntimeError: If the model doesn't support vision or the API call fails
+        """
+        if not self.has_ability("vision"):
+            raise RuntimeError(
+                f"Model {self._model_name} does not support vision capabilities"
+            )
+
+        self._ensure_client()
+        assert self._client is not None
+
+        # Prepare the completion parameters
+        completion_params = {
+            "model": self._model_name,
+            "messages": self._sanitize_unicode_content(
+                self._strip_internal_message_keys(messages)
+            ),
+            "temperature": temperature or self.default_temperature,
+            "max_tokens": max_tokens or self.default_max_tokens,
+            "stream": False,  # We handle streaming separately if needed
+            **kwargs,
+        }
+
+        # Add thinking mode if specified (parameter takes precedence over instance setting)
+        if thinking is not None:
+            completion_params["thinking"] = thinking
+        elif self.thinking_mode is not None:
+            thinking_type = "enabled" if self.thinking_mode else "disabled"
+            completion_params["thinking"] = {"type": thinking_type}
+
+        # Add tools if provided
+        if tools:
+            completion_params["tools"] = tools
+            if tool_choice:
+                completion_params["tool_choice"] = (
+                    "auto" if tool_choice == "required" else tool_choice
+                )
+
+        # Add response format if provided
+        if response_format:
+            completion_params["response_format"] = response_format
+
+        try:
+            # Debug: Log the request parameters
+            logger.debug("Zhipu Vision API request parameters:")
+            logger.debug(f"  - model: {completion_params.get('model')}")
+            logger.debug(
+                f"  - messages count: {len(completion_params.get('messages', []))}"
+            )
+            logger.debug(f"  - tools provided: {'tools' in completion_params}")
+            logger.debug(f"  - tool_choice: {completion_params.get('tool_choice')}")
+            logger.debug(f"  - thinking: {completion_params.get('thinking')}")
+            logger.debug(f"  - temperature: {completion_params.get('temperature')}")
+
+            # Make the API call in a thread pool since the SDK might be synchronous
+            if self._client is None:
+                raise RuntimeError("Zhipu client is not initialized")
+
+            # Debug: Log before API call
+            logger.debug("Making Zhipu Vision API call...")
+
+            try:
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
+                # reach the SDK thread.
+                response = await asyncio.to_thread(
+                    lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
+                )
+                logger.debug(
+                    f"Zhipu Vision API call completed, response type: {type(response)}"
+                )
+            except Exception as executor_error:
+                logger.error(
+                    f"Executor task failed: {type(executor_error).__name__}: {executor_error}"
+                )
+                raise executor_error
+
+            # Check if response is None
+            if response is None:
+                logger.error("Zhipu Vision API returned None response")
+                raise RuntimeError("Zhipu Vision API returned None response")
+
+            # Check if response has choices
+            if not hasattr(response, "choices") or not response.choices:
+                logger.error(f"Zhipu Vision API response missing choices: {response}")
+                raise RuntimeError("Zhipu Vision API response missing choices")
+
+            # Record token usage
+            if hasattr(response, "usage"):
+                usage = response.usage
+                input_tokens = getattr(usage, "prompt_tokens", 0) or getattr(
+                    usage, "input_tokens", 0
+                )
+                output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
+                    usage, "output_tokens", 0
+                )
+                add_token_usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    model=self._model_name,
+                    model_id=self.model_id,
+                    call_type="vision_chat",
+                    cached_input_tokens=extract_cached_input_tokens(usage),
+                )
+
+            # Extract the choice
+            choice = response.choices[0]
+            message = choice.message
+
+            # Debug: Print response structure
+            logger.debug(f"Zhipu Vision response choice: {choice}")
+            logger.debug(f"Zhipu Vision response message: {message}")
+            logger.debug(
+                f"Choice finish_reason: {getattr(choice, 'finish_reason', 'N/A')}"
+            )
+            logger.debug(f"Message tool_calls: {getattr(message, 'tool_calls', 'N/A')}")
+            logger.debug(f"Message content: {message.content}")
+            logger.debug(f"Message content type: {type(message.content)}")
+
+            # Check for tool calls - handle both glm-4.5-air and glm-4.5 formats
+            tool_calls = None
+
+            # Try to access tool_calls directly first (glm-4.5 style)
+            try:
+                # Access choice.message.tool_calls directly
+                if hasattr(choice, "message") and hasattr(choice.message, "tool_calls"):
+                    tool_calls = choice.message.tool_calls
+                    if tool_calls:
+                        logger.debug(
+                            f"Found tool_calls via direct access: {len(tool_calls)}"
+                        )
+            except Exception as e:
+                logger.debug(f"Error accessing tool_calls directly: {e}")
+
+            # Fallback: Check through message object
+            if tool_calls is None:
+                # Format 1: Direct tool_calls attribute (glm-4.5-air style)
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    tool_calls = message.tool_calls
+                    logger.debug(
+                        f"Found tool_calls in message (glm-4.5-air style): {len(tool_calls)}"
+                    )
+                # Format 2: Tool calls in choice with finish_reason "tool_calls" (glm-4.5 style)
+                elif (
+                    hasattr(choice, "finish_reason")
+                    and choice.finish_reason == "tool_calls"
+                ):
+                    if hasattr(message, "tool_calls") and message.tool_calls:
+                        tool_calls = message.tool_calls
+                        logger.debug(
+                            f"Found tool_calls with finish_reason (glm-4.5 style): {len(tool_calls)}"
+                        )
+                    else:
+                        logger.debug(
+                            "finish_reason is 'tool_calls' but no tool_calls found in message"
+                        )
+
+            logger.debug(f"Final tool_calls result: {tool_calls}")
+
+            # Debug: Print tool_calls structure if found
+            if tool_calls:
+                logger.debug(f"Tool calls structure: {tool_calls}")
+                for i, tool_call in enumerate(tool_calls):
+                    logger.debug(f"Tool call {i}: {tool_call}")
+                    if hasattr(tool_call, "function"):
+                        logger.debug(f"Tool call {i} function: {tool_call.function}")
+                        if hasattr(tool_call.function, "name"):
+                            logger.debug(
+                                f"Tool call {i} name: {tool_call.function.name}"
+                            )
+                        if hasattr(tool_call.function, "arguments"):
+                            logger.debug(
+                                f"Tool call {i} arguments: {tool_call.function.arguments}"
+                            )
+
+            if tool_calls:
+                # Convert Zhipu tool calls to ReAct format
+                for tool_call in tool_calls:
+                    tool_name = tool_call.function.name
+                    try:
+                        # Parse arguments as JSON
+                        args = json.loads(tool_call.function.arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+
+                    # Return ReAct-compatible tool call format
+                    return {
+                        "type": "tool_call",
+                        "tool_calls": [
+                            {
+                                "id": getattr(
+                                    tool_call, "id", f"call_{uuid.uuid4().hex}"
+                                ),
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps(args),
+                                },
+                                "type": "function",
+                            }
+                        ],
+                        "raw": response.model_dump()
+                        if hasattr(response, "model_dump")
+                        else str(response),
+                    }
+
+            # Handle text content
+            content = message.content
+
+            # Debug: Log detailed information about None content
+            if content is None:
+                logger.warning("Zhipu Vision LLM returned None content. Details:")
+                logger.warning(
+                    f"  - finish_reason: {getattr(choice, 'finish_reason', 'N/A')}"
+                )
+                logger.warning(f"  - has tool_calls: {tool_calls is not None}")
+                logger.warning(
+                    f"  - tool_calls count: {len(tool_calls) if tool_calls else 0}"
+                )
+                logger.warning(f"  - message attributes: {dir(message)}")
+
+                # If there are no tool calls and no content, return empty string instead of error
+                # This allows React pattern to handle the gracefully
+                if not tool_calls:
+                    logger.warning(
+                        "No tool calls and None content, returning empty string"
+                    )
+                    return ""
+                else:
+                    logger.info(
+                        "None content but tool calls present, this is expected behavior"
+                    )
+
+            return content
+
+        except Exception as e:
+            # Handle any errors
+            logger.error("Zhipu Vision API exception details:")
+            logger.error(f"  - Exception type: {type(e).__name__}")
+            logger.error(f"  - Exception message: {str(e)}")
+            logger.error(f"  - Exception args: {e.args}")
+            raise RuntimeError(f"Zhipu Vision API error: {str(e)}") from e
+
+    async def close(self) -> None:
+        """Close the Zhipu client and cleanup resources."""
+        client = self._client
+        self._client = None
+        close = getattr(client, "close", None)
+        if callable(close):
+            await asyncio.to_thread(close)
+
+    async def __aenter__(self) -> "ZhipuLLM":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    @staticmethod
+    async def list_available_models(
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Fetch available models from Zhipu AI using their SDK.
+
+        Args:
+            api_key: Zhipu API key
+            base_url: Base URL for Zhipu API (optional).
+                - If not provided, uses official Zhipu API: https://open.bigmodel.cn/v1
+                - If provided, uses the specified endpoint
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
+
+        Returns:
+            List of available models with their information
+
+        Example:
+            >>> # Use official Zhipu API
+            >>> models = await ZhipuLLM.list_available_models("your-api-key")
+
+            >>> # Use custom endpoint/proxy
+            >>> models = await ZhipuLLM.list_available_models(
+            ...     "your-api-key",
+            ...     base_url="https://my-proxy.com/v1"
+            ... )
+        """
+        # Use official Zhipu API if base_url not provided
+        if not base_url:
+            base_url = "https://open.bigmodel.cn/v1"
+
+        try:
+            # The pinned zai SDK has no model catalog API. Use the guarded
+            # OpenAI-compatible endpoint without constructing an unused SDK.
+            url = base_url.rstrip("/") + "/models"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            async with create_public_model_async_client(timeout=30.0) as http_client:
+                response = await http_client.get(url, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+            models = [
+                {
+                    "id": model.get("id"),
+                    "created": model.get("created"),
+                    "owned_by": "zhipu",
+                }
+                for model in data.get("data", [])
+            ]
+            models.sort(key=lambda model: model.get("created") or 0, reverse=True)
+            return models
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error fetching Zhipu models: {e.response.status_code}")
+            if e.response.status_code == 401:
+                raise ValueError("Invalid API key") from e
+            raise
+        except Exception as e:
+            logger.error(f"Failed to fetch Zhipu models: {e}")
+            if raise_on_error:
+                raise
+            return []

@@ -1,0 +1,2249 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import inspect
+import logging
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+from typing import Any, cast
+from uuid import uuid4
+
+from ...config import (
+    COMPACT_THRESHOLD_DEFAULT,
+    get_compact_threshold_default,
+)
+from ..context_materializer import WorkspaceContextReferenceResolver
+from ..context_ref import CONTEXT_REFS_KEY, ContextReference
+from ..file_ref import build_file_id_ref
+from ..inline_file_delivery import InlineFileDelivery
+from ..model.chat.exceptions import ModelProviderError
+from ..model.chat.token_context import token_usage_observer
+from ..model.intent import enter_goal, exit_goal
+from ..task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
+from ..workspace import WorkspaceManager
+from .attachments import build_image_context_references
+from .budget import (
+    BudgetPolicyProvider,
+    ExecutionBudget,
+    ExecutionBudgetPolicy,
+    active_execution_budget,
+    budget_warning_handler,
+    default_execution_budget_policy,
+)
+from .checkpoint import (
+    CheckpointCorruptError,
+    CheckpointPersistenceError,
+    ExecutionEventPersistenceError,
+    can_read_checkpoints,
+    read_latest_checkpoint_payload,
+)
+from .context import ContextManager, ExecutionContext
+from .context.execution import (
+    ACCEPTED_TURN_IDS_METADATA_KEY,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    MODEL_CONTEXT_WATERMARK_METADATA_KEY,
+    TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    context_checkpoint_gate,
+    derive_compact_threshold,
+)
+from .context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    reconcile_execution_memory_retrieval_cache,
+)
+from .interruption import (
+    INTERRUPTION_REASON_KEY,
+    classify_run_failure,
+    classify_run_result,
+    interruption_reason_value,
+)
+from .language import reset_output_language_to_request_context
+from .result import (
+    extract_assistant_message,
+    normalize_tool_failure_code,
+    set_assistant_message,
+)
+from .runtime import (
+    THRESHOLD_WARNING_KEY_PREFIX,
+    ExecutionInterrupted,
+    PatternRuntime,
+    compact_model_key,
+    load_pattern_checkpoint,
+    warn_once_per_model,
+    warn_restored_compact_threshold,
+)
+
+logger = logging.getLogger(__name__)
+
+# ``ACCEPTED_TURN_IDS_METADATA_KEY`` (defined in ``context.execution`` so child
+# contexts can drop it) holds the turn ids of the user messages this execution
+# has durably accepted, as a list of ``[turn_id, digest]`` pairs (oldest
+# first) where digest hashes the accepted execution text ("" when only
+# acceptance is known). Context
+# compaction drops old messages but never ``context.metadata``, so this record
+# is what recognises a retried turn after its message was compacted away. It is
+# written into the same context snapshot as the message it records, so it
+# becomes durable in the very checkpoint that accepts the turn. A list rather
+# than a mapping because checkpoints may land in PostgreSQL JSONB, which does
+# not keep object key order, and eviction needs the acceptance order.
+#
+# Scope: the record lives in one checkpoint lineage. A retry the host routes
+# into a fresh run (execute/start without resume) starts a new context with no
+# record; de-duplicating that case is the job of the host's delivery rows.
+# Engine-owned: never seeded by callers.
+# Retries of one turn arrive within a delivery retry window, not hundreds of
+# turns later, so the most recent ids suffice. The bound caps this record's
+# share of every checkpoint (~80 bytes per entry); it does not bound the
+# traced-turn-id list, which tracing keeps unbounded as before.
+MAX_ACCEPTED_TURN_IDS = 1024
+# Mirrors ``core.agent.tracing.TRACE_TURN_IDS_KEY`` (not imported: cycle). On a
+# checkpoint written before the accepted record existed, these ids seed the
+# record (acceptance known, content not); once the record exists they are no
+# longer consulted for de-duplication.
+_TRACED_TURN_IDS_METADATA_KEY = "_user_message_trace_turn_ids"
+
+# Metadata keys the engine writes as run facts. Client input reaches
+# ``context.metadata`` verbatim through two surfaces -- the top-level metadata
+# dict and the nested request_context -- so both are filtered at the single
+# merge point rather than defended again at each reader. The restored branch of
+# that merge point reaches neither surface: it carries only the modality
+# preference over and drops the rest of the current run's metadata, so no client
+# key reaches a context rebuilt from a checkpoint.
+RESERVED_ENGINE_METADATA_KEYS = frozenset(
+    {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+        ACCEPTED_TURN_IDS_METADATA_KEY,
+        _TRACED_TURN_IDS_METADATA_KEY,
+        MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    }
+)
+
+# Current execution policy is authoritative over checkpointed copies of these
+# two server-owned fields. Besides keeping a resumed run's status current, this
+# upgrades historical checkpoints that may contain an unvetted host diagnostic
+# to the caller-safe value supplied by the current web policy before the next
+# checkpoint is persisted.
+RESUME_AUTHORITATIVE_METADATA_KEYS = (
+    "memory_available",
+    "memory_availability_reason",
+)
+
+
+@dataclass
+class ExecutionControl:
+    """In-memory control state for an active execution."""
+
+    runtime: PatternRuntime
+    task: str | None
+
+
+class UserMessageInjectionOutcome(str, Enum):
+    """Result of an injection, forwarded unchanged by the service layers.
+
+    FRESH and REPLAY confirm a durable turn; NOT_POSTED means no usable
+    context. OUTCOME_UNKNOWN means neither acceptance nor rejection can be
+    established. It must be handled explicitly before testing truthiness,
+    without treating it as permission to inject again.
+
+    An unknown write fences this context until an explicit deferred input or
+    resume reloads durable state after the old run has ended.
+    REJECTED_RETRYABLE is returned while that fence is up: this attempt wrote
+    nothing, so the message was not accepted and may be resent under a new
+    id. Unlike NOT_POSTED it must not be deferred, since deferral resumes the
+    fenced run. It is truthy, so handle it before any truthiness test.
+
+    Service layers do not interpret these values themselves: they pass the
+    returned value, the recorded attempt evidence and any escaped error to
+    ``classify_injection``.
+    """
+
+    NOT_POSTED = ""
+    POSTED_FRESH = "posted_fresh"
+    POSTED_REPLAY = "posted_replay"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+    REJECTED_RETRYABLE = "rejected_retryable"
+
+
+@dataclass
+class UserMessageInjectionAttempt:
+    """Acceptance evidence shared with the lease guard's child task.
+
+    This is scoped to one delivery, not a durable receipt or an execution flag.
+    The runner records it before any post-acceptance callbacks can fail.
+    """
+
+    outcome: UserMessageInjectionOutcome = UserMessageInjectionOutcome.NOT_POSTED
+
+
+_injection_attempt: ContextVar[UserMessageInjectionAttempt | None] = ContextVar(
+    "user_message_injection_attempt", default=None
+)
+
+
+@contextmanager
+def track_user_message_injection() -> Iterator[UserMessageInjectionAttempt]:
+    attempt = UserMessageInjectionAttempt()
+    token = _injection_attempt.set(attempt)
+    try:
+        yield attempt
+    finally:
+        _injection_attempt.reset(token)
+
+
+def _record_injection_outcome(outcome: UserMessageInjectionOutcome) -> None:
+    attempt = _injection_attempt.get()
+    if attempt is not None:
+        attempt.outcome = outcome
+
+
+@dataclass(frozen=True)
+class UserMessageInjectionResult:
+    """Bundles the execution context an injection attempt produced (or
+    found already holding the answered turn) with what kind of write, if
+    any, produced it.
+
+    ``context`` may be absent for NOT_POSTED or OUTCOME_UNKNOWN; every layer
+    downstream of the registry drops the raw context and forwards only
+    ``outcome``, since nothing past that boundary reads the context
+    object itself today.
+    """
+
+    context: ExecutionContext | None
+    outcome: UserMessageInjectionOutcome
+
+
+class UserMessageInjectionRejectedError(RuntimeError):
+    """An authoritative read proved that the attempted turn did not land.
+
+    Callers do not branch on this type directly: ``classify_injection`` maps
+    it to ``NOT_ACCEPTED_RETRYABLE``. Unlike ``REJECTED_RETRYABLE`` the
+    context is not fenced, since the read-back settled the only write.
+    """
+
+
+class UserMessageInjectionConflictError(ValueError):
+    """The turn identity conflicts with an existing message, before any write."""
+
+
+class InjectionDisposition(str, Enum):
+    """What one injection attempt means for the input it carried.
+
+    ``classify_injection`` is the only place that derives it; each service
+    path maps a disposition onto its own protocol and task lifecycle.
+
+    ACCEPTED: the turn is durable. A later error or cancellation cannot undo
+    that and must not be reported as unknown or failed.
+    DEFER: no usable live context and nothing was written; the input may be
+    handed to a later owner.
+    NOT_ACCEPTED_RETRYABLE: nothing was written, proven either by a fenced
+    rejection or by an authoritative read-back. The sender may resend under a
+    new id. Never defer it and never resume a fenced run for it.
+    UNKNOWN: a write started and acceptance cannot be established. Never
+    reinject or resume automatically.
+    FAILED_BEFORE_WRITE: an error escaped before any write started; the
+    caller keeps its existing handling for that error.
+    """
+
+    ACCEPTED = "accepted"
+    DEFER = "defer"
+    NOT_ACCEPTED_RETRYABLE = "not_accepted_retryable"
+    UNKNOWN = "unknown"
+    FAILED_BEFORE_WRITE = "failed_before_write"
+
+
+_ACCEPTED_INJECTION_OUTCOMES = frozenset(
+    {
+        UserMessageInjectionOutcome.POSTED_FRESH,
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+    }
+)
+
+
+def classify_injection(
+    attempt_outcome: UserMessageInjectionOutcome,
+    posted: UserMessageInjectionOutcome | None = None,
+    error: BaseException | None = None,
+) -> InjectionDisposition:
+    """Classify one attempt from its recorded evidence and how it ended.
+
+    ``attempt_outcome`` is ``UserMessageInjectionAttempt.outcome`` read after
+    the call settled. Pass ``posted`` when the call returned and ``error``
+    when it raised (including cancellation). Recorded acceptance wins over
+    any later error, because it is recorded only after the durable write.
+    """
+    if attempt_outcome in _ACCEPTED_INJECTION_OUTCOMES:
+        return InjectionDisposition.ACCEPTED
+    if error is not None:
+        if isinstance(error, UserMessageInjectionRejectedError):
+            return InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+        if attempt_outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+            return InjectionDisposition.UNKNOWN
+        if attempt_outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+            return InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+        return InjectionDisposition.FAILED_BEFORE_WRITE
+    outcome = attempt_outcome if posted is None else posted
+    if not isinstance(outcome, UserMessageInjectionOutcome):
+        raise TypeError(f"Unexpected injection outcome {outcome!r}")
+    if outcome in _ACCEPTED_INJECTION_OUTCOMES:
+        return InjectionDisposition.ACCEPTED
+    if outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
+        return InjectionDisposition.UNKNOWN
+    if outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE:
+        return InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+    return InjectionDisposition.DEFER
+
+
+class AgentRunner:
+    """Execute an agent by materializing an execution context and invoking patterns."""
+
+    def __init__(
+        self,
+        agent: Any,
+        *,
+        workspace_manager: WorkspaceManager | None = None,
+        memory_manager: Any | None = None,
+        tracer: Any | None = None,
+        callbacks: list[Any] | None = None,
+        context_manager: ContextManager | None = None,
+        workspace_base_dir: str = "workspace",
+        workspace_enabled: bool = True,
+        scope_segments: tuple[str, ...] = (),
+        outbound_message_handler: Any | None = None,
+        budget_policy_provider: BudgetPolicyProvider | None = None,
+    ) -> None:
+        self.agent = agent
+        self.workspace_manager = workspace_manager or WorkspaceManager()
+        self.memory_manager = memory_manager
+        self.tracer = tracer
+        self.callbacks = callbacks or []
+        self.context_manager = context_manager or ContextManager()
+        self.workspace_base_dir = workspace_base_dir
+        self.workspace_enabled = workspace_enabled
+        self.scope_segments = scope_segments
+        self.outbound_message_handler = outbound_message_handler
+        self.budget_policy_provider = budget_policy_provider
+        self._active_controls: dict[str, ExecutionControl] = {}
+
+    async def run(
+        self,
+        task: str | None,
+        user_id: str | None = None,
+        execution_id: str | None = None,
+        *,
+        session_id: str | None = None,
+        workspace_id: str | None = None,
+        allowed_external_dirs: list[str] | None = None,
+        base_dir: str | None = None,
+        resume: bool = False,
+        checkpoint: dict[str, Any] | None = None,
+        runtime: PatternRuntime | None = None,
+        interrupt_checker: Any | None = None,
+        outbound_message_handler: Any | None = None,
+        streaming_handler: Any | None = None,
+        extra_tools: list[Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
+        task_context_refs: tuple[ContextReference, ...] = (),
+    ) -> dict[str, Any]:
+        execution_id = execution_id or str(uuid4())
+        checkpoint = checkpoint or (
+            await self._load_latest_checkpoint(execution_id) if resume else None
+        )
+        if (
+            resume
+            and checkpoint is not None
+            and not isinstance(checkpoint.get("context"), dict)
+        ):
+            raise CheckpointCorruptError(
+                "Resume checkpoint exists but carries no execution context."
+            )
+        if task is None:
+            task = self._resolve_task(
+                task=task,
+                checkpoint=checkpoint,
+                execution_id=execution_id,
+            )
+        # The context is cached from here on. A failure before the run's own
+        # ``try`` below would otherwise leave a cached context that looks
+        # live (``run_finishing`` false) although no run will ever consume it.
+        context: ExecutionContext | None = None
+        try:
+            if checkpoint and isinstance(checkpoint.get("context"), dict):
+                reset_output_language_to_request_context(checkpoint)
+                context = ExecutionContext.from_dict(checkpoint["context"])
+                warn_restored_compact_threshold(
+                    context, getattr(self.agent, "llm", None)
+                )
+                self._merge_context_metadata(context, metadata, restored=True)
+                self.context_manager.set_context(context)
+                execution_id = context.execution_id
+                workspace = None
+            else:
+                context, workspace = await self._build_context(
+                    task=task,
+                    execution_id=execution_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    workspace_id=workspace_id,
+                    allowed_external_dirs=allowed_external_dirs,
+                    base_dir=base_dir,
+                    metadata=metadata,
+                )
+                replay_messages = initial_messages or []
+                if (
+                    replay_messages
+                    and str(replay_messages[0].get("role") or "").strip() == "assistant"
+                ):
+                    # A task's persisted history can begin with an
+                    # assistant-role message today only via a marketplace Hire
+                    # flow's seeded persona greeting - there is no other path
+                    # that persists an assistant row before any user message.
+                    # Anthropic's Messages API (and every claude_compatible
+                    # provider routed through it) rejects a request whose first
+                    # message isn't role "user", so correct it once here,
+                    # before this history is ever replayed into context. This
+                    # is deliberately not done in get_messages_for_llm(), which
+                    # also serves truncated windows and tool-call/tool-result
+                    # pairs that legitimately start mid-conversation.
+                    context.add_user_message(
+                        "(conversation start)",
+                        metadata={"_xagent_synthetic": "leading_user_turn"},
+                    )
+                for message in replay_messages:
+                    role = str(message.get("role") or "").strip()
+                    content = str(message.get("content") or "").strip()
+                    context_refs = message.get(
+                        CONTEXT_REFS_KEY, message.get("context_refs", ())
+                    )
+                    if not role:
+                        continue
+                    if not (
+                        content
+                        or context_refs
+                        or message.get("tool_calls")
+                        or role == "tool"
+                    ):
+                        continue
+                    if (
+                        role == "tool"
+                        and message.get("tool_name") is not None
+                        and "raw_result" in message
+                    ):
+                        # Replay through add_tool_result so it gets the same
+                        # sanitization/formatting and metadata (raw_result,
+                        # tool_name) as a live tool observation would.
+                        context.add_tool_result(
+                            tool_name=str(message["tool_name"]),
+                            result=message["raw_result"],
+                            tool_call_id=message.get("tool_call_id"),
+                            context_refs=context_refs,
+                        )
+                    elif role == "assistant" and message.get("tool_calls"):
+                        context.add_assistant_message(
+                            content,
+                            tool_calls=message["tool_calls"],
+                            context_refs=context_refs,
+                        )
+                    else:
+                        context.add_message(
+                            role,
+                            content,
+                            context_refs=context_refs,
+                            tool_calls=message.get("tool_calls"),
+                            tool_call_id=message.get("tool_call_id"),
+                        )
+                if task:
+                    initial = context.add_user_message(
+                        task,
+                        metadata=self._initial_user_message_metadata(context),
+                        context_refs=task_context_refs,
+                    )
+                    self._record_accepted_turn(context, initial)
+
+            # A runner registered by post_user_message before the host installed
+            # its handler would otherwise resume handler-less (#1328); an
+            # explicit handler passed to the resumed run wins over the
+            # constructor-time one. Passing None here means "inherit the
+            # constructor-time handler," not "clear it"; no caller clears a
+            # handler today, so there is deliberately no sentinel for that.
+            runtime = runtime or PatternRuntime(
+                tracer=self.tracer,
+                execution_id=execution_id,
+                interrupt_checker=interrupt_checker,
+                outbound_message_handler=(
+                    outbound_message_handler
+                    if outbound_message_handler is not None
+                    else self.outbound_message_handler
+                ),
+            )
+            if self.workspace_enabled and runtime.context_ref_resolver is None:
+                if workspace is None:
+                    workspace_base = base_dir or self.workspace_base_dir
+                    if context.workspace_path:
+                        workspace_base = str(Path(context.workspace_path).parent)
+                    workspace = await asyncio.to_thread(
+                        self.workspace_manager.get_or_create_workspace,
+                        base_dir=workspace_base,
+                        task_id=context.workspace_id or workspace_id or execution_id,
+                        allowed_external_dirs=allowed_external_dirs,
+                        scope_segments=self.scope_segments,
+                    )
+                    if inspect.isawaitable(workspace):
+                        workspace = await workspace
+                runtime.context_ref_resolver = WorkspaceContextReferenceResolver(
+                    workspace
+                )
+            if workspace is not None and callable(
+                getattr(workspace, "register_delivery_file", None)
+            ):
+                runtime.inline_file_delivery = InlineFileDelivery(workspace)
+            context_checkpoint_gate(context).run_finishing = False
+            self._active_controls[execution_id] = ExecutionControl(
+                runtime=runtime,
+                task=task,
+            )
+        except BaseException:
+            if context is not None:
+                self._abandon_unstarted_context(execution_id, context)
+            raise
+
+        # Establish the user's request as the turn's goal. The "auto" model
+        # routes on this rather than on the scaffolded sub-prompt a given LLM
+        # call carries; finer units (DAG steps) override it with their own goal.
+        goal_token = enter_goal(task)
+
+        # Nested runners inherit the active allowance. Only the outer owner
+        # resolves policy and subscribes to provider usage, avoiding double counts.
+        inherited_budget = active_execution_budget.get()
+        runtime.budget_owner = inherited_budget is None
+        budget_token = None
+        usage_token = None
+        warning_token = None
+
+        try:
+            if inherited_budget is None:
+                policy = (
+                    self.budget_policy_provider()
+                    if self.budget_policy_provider is not None
+                    else default_execution_budget_policy()
+                )
+                if inspect.isawaitable(policy):
+                    policy = await policy
+                policy = ExecutionBudgetPolicy.model_validate(policy)
+                turn_id = next(
+                    (
+                        self._message_turn_id(message) or ""
+                        for message in reversed(context.messages)
+                        if message.role == "user"
+                    ),
+                    "",
+                )
+                budget = (
+                    ExecutionBudget.model_validate(context.execution_budget)
+                    if context.execution_budget is not None
+                    else None
+                )
+                previous_turn_finished = budget is not None and (
+                    budget.closed
+                    or (checkpoint or {}).get("status")
+                    in {"completed", "failed", "max_iterations"}
+                )
+                if budget is None or (
+                    previous_turn_finished and turn_id and turn_id != budget.turn_id
+                ):
+                    budget = ExecutionBudget(policy=policy, turn_id=turn_id)
+                else:
+                    budget.tighten(policy)
+                context.execution_budget = budget.checkpoint_state()
+                budget_token = active_execution_budget.set(budget)
+                usage_token = token_usage_observer.set(budget.record_usage)
+                from .language import effective_output_language
+
+                runtime.budget_warning_language = effective_output_language(context)
+                warning_token = budget_warning_handler.set(runtime._send_budget_warning)
+            await self._dispatch_callback(
+                "on_run_start",
+                runner=self,
+                context=context,
+                resume=resume,
+                checkpoint=checkpoint,
+            )
+
+            patterns = list(getattr(self.agent, "patterns", []))
+            if not patterns:
+                result = {
+                    "success": False,
+                    "error": "Agent has no execution patterns configured.",
+                    "execution_id": execution_id,
+                    "context": context,
+                }
+                await self._finish_run(context, result, runtime=runtime)
+                return result
+
+            tools = [*getattr(self.agent, "tools", []), *(extra_tools or [])]
+            pattern_errors: list[dict[str, Any]] = []
+            # The model-provider failure a pattern raised, kept so a run with
+            # exactly one pattern can report it on the result (see below).
+            sole_model_error: ModelProviderError | None = None
+            teardown_status: str | None = "failed"
+
+            try:
+                await self._setup_tools(tools, task_id=execution_id)
+                for pattern in patterns:
+                    load_pattern_checkpoint(pattern, checkpoint)
+                    self._reconcile_memory_retrieval_cache(
+                        context,
+                        pattern,
+                        metadata,
+                    )
+                    teardown_status = "failed"
+                    try:
+                        result = await pattern.run(
+                            **self._build_pattern_kwargs(
+                                pattern=pattern,
+                                task=task or "",
+                                context=context,
+                                tools=tools,
+                                runtime=runtime,
+                                streaming_handler=streaming_handler,
+                            )
+                        )
+                    except ExecutionInterrupted as exc:
+                        if runtime.budget_stopped:
+                            teardown_status = "completed"
+                            return await self._finish_budget_stop(
+                                context, runtime, pattern, workspace
+                            )
+                        teardown_status = "interrupted"
+                        normalized = {
+                            "success": False,
+                            "status": "interrupted",
+                            "error": str(exc),
+                            "execution_id": execution_id,
+                            "context": context,
+                            "pattern": pattern.__class__.__name__,
+                        }
+                        await self._finish_run(context, normalized, runtime=runtime)
+                        return normalized
+                    except CheckpointPersistenceError as exc:
+                        # A checkpoint that did not persist is not a
+                        # recoverable pattern failure: the state transition
+                        # was never durably committed. Falling through to the
+                        # next pattern would let it repeat a non-idempotent
+                        # side effect the failed pattern already performed, or
+                        # report success while the checkpoint needed for
+                        # recovery is missing. Abort the run instead, the same
+                        # way ``ExecutionInterrupted`` above leaves the loop.
+                        teardown_status = "failed"
+                        if not getattr(runtime, "pattern_error_reported", False):
+                            # The AgentPattern contract only requires
+                            # run(); a custom pattern that raises this
+                            # without calling on_pattern_error() itself
+                            # (as DAGPattern and ReActPattern already do)
+                            # would otherwise abort with no terminal
+                            # trace_error at all. Report it here, exactly
+                            # once, without letting a failure in this
+                            # fallback report mask the original
+                            # persistence error.
+                            try:
+                                await runtime.on_pattern_error(
+                                    context=context, pattern=pattern, error=exc
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "on_pattern_error failed while reporting "
+                                    "a checkpoint durability abort"
+                                )
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        teardown_status = "failed"
+                        logger.exception(
+                            "Pattern %s failed", pattern.__class__.__name__
+                        )
+                        pattern_errors.append(
+                            {
+                                "pattern": pattern.__class__.__name__,
+                                "error": str(exc),
+                                "exception_type": exc.__class__.__name__,
+                                # The exception object is only visible here;
+                                # callers see this classification instead.
+                                INTERRUPTION_REASON_KEY: interruption_reason_value(
+                                    classify_run_failure(exc)
+                                ),
+                            }
+                        )
+                        if isinstance(exc, ModelProviderError):
+                            sole_model_error = exc
+                        continue
+
+                    if runtime.budget_stopped:
+                        teardown_status = "completed"
+                        return await self._finish_budget_stop(
+                            context, runtime, pattern, workspace
+                        )
+
+                    # Normalize user-facing answer text, never tool arguments,
+                    # input files or reasoning. Streaming and buffered patterns
+                    # share this delivery owner and its registered-file cache.
+                    raw_answer = (
+                        extract_assistant_message(result)
+                        if isinstance(result, dict)
+                        else result
+                    )
+                    if isinstance(raw_answer, str):
+                        delivered_answer = await runtime.prepare_final_answer(
+                            raw_answer
+                        )
+                        if delivered_answer != raw_answer:
+                            if isinstance(result, dict):
+                                result = dict(result)
+                                set_assistant_message(result, delivered_answer)
+                            else:
+                                result = {"success": True, "output": delivered_answer}
+                            for index in range(len(context.messages) - 1, -1, -1):
+                                context_message = context.messages[index]
+                                if (
+                                    context_message.role == "assistant"
+                                    and context_message.content == raw_answer
+                                ):
+                                    context.messages[index] = replace(
+                                        context_message, content=delivered_answer
+                                    )
+                                    break
+                    normalized = self._normalize_result(
+                        result=result,
+                        pattern=pattern,
+                        context=context,
+                        execution_id=execution_id,
+                    )
+                    if normalized.get("success"):
+                        teardown_status = str(normalized.get("status") or "completed")
+                        await self._finish_run(context, normalized, runtime=runtime)
+                        return normalized
+                    normalized_status = str(
+                        normalized.get("status") or "failed"
+                    ).strip()
+                    teardown_status = normalized_status or "failed"
+                    if (
+                        normalized_status == "waiting_for_user"
+                        and normalized.get("clarification_draft") is not None
+                    ):
+                        # A pattern that hands back a question to answer must
+                        # not still have other step tasks running -- those
+                        # would keep mutating shared state (self.status,
+                        # active step bookkeeping) after this run() call has
+                        # already told the caller it is safe to resume from
+                        # a single waiting step. Only DAGPattern implements
+                        # this today; any other pattern is read as having no
+                        # live tasks (auto.py's top-level case included --
+                        # its run() cannot return while a nested DAG child
+                        # still has tasks in flight, so that path is a known,
+                        # accepted gap rather than a real miss).
+                        has_live_step_tasks = getattr(
+                            pattern, "has_live_step_tasks", None
+                        )
+                        if callable(has_live_step_tasks) and has_live_step_tasks():
+                            raise AssertionError(
+                                f"{pattern.__class__.__name__} for execution "
+                                f"{execution_id} returned a waiting_for_user "
+                                "result while it still has live step tasks."
+                            )
+                    if normalized_status in {"interrupted", "waiting_for_user"}:
+                        await self._finish_run(context, normalized, runtime=runtime)
+                        return normalized
+
+                    reason = interruption_reason_value(classify_run_result(normalized))
+                    # On the result itself, not only the entry: a single failed
+                    # pattern returns ``normalized`` directly below and the
+                    # aggregate that copies entry reasons is skipped. Only the
+                    # validated value survives; an unknown or non-string reason
+                    # the pattern set itself is dropped.
+                    if reason is not None:
+                        normalized[INTERRUPTION_REASON_KEY] = reason
+                    else:
+                        normalized.pop(INTERRUPTION_REASON_KEY, None)
+                    pattern_errors.append(
+                        {
+                            "pattern": pattern.__class__.__name__,
+                            "error": normalized.get(
+                                "error", "Pattern failed without a detailed error."
+                            ),
+                            "result": normalized,
+                            INTERRUPTION_REASON_KEY: reason,
+                        }
+                    )
+            finally:
+                await self._teardown_tools(
+                    tools,
+                    task_id=execution_id,
+                    execution_status=teardown_status,
+                )
+
+            if len(pattern_errors) == 1:
+                single_result = pattern_errors[0].get("result")
+                if isinstance(single_result, dict):
+                    await self._finish_run(context, single_result, runtime=runtime)
+                    return single_result
+
+            result = {
+                "success": False,
+                "error": f"All {len(patterns)} patterns failed or returned unsuccessful results.",
+                "pattern_errors": pattern_errors,
+                "patterns_attempted": len(patterns),
+                "execution_id": execution_id,
+                "context": context,
+            }
+            failure_codes = {
+                normalize_tool_failure_code(
+                    entry.get("result", {}).get("failure_code")
+                    if isinstance(entry.get("result"), dict)
+                    else None
+                )
+                for entry in pattern_errors
+            }
+            if len(failure_codes) == 1 and None not in failure_codes:
+                result["failure_code"] = next(iter(failure_codes))
+            # Only an interruption every pattern agrees on describes the run;
+            # a mix means at least one pattern failed for a terminal reason.
+            reasons = {entry.get(INTERRUPTION_REASON_KEY) for entry in pattern_errors}
+            if len(reasons) == 1 and None not in reasons:
+                result[INTERRUPTION_REASON_KEY] = reasons.pop()
+            # ``error`` above stays the aggregate sentence: it is what callers
+            # fall back to as the user-visible output. A lone pattern that
+            # failed on a model-provider error reports the provider details in
+            # their own keys instead. With several patterns the failure is one
+            # of many, so neither key is set.
+            if len(patterns) == 1 and sole_model_error is not None:
+                result["diagnostic_error"] = str(sole_model_error)
+                result["model_error"] = sole_model_error.structured_fields()
+            await self._finish_run(context, result, runtime=runtime)
+            return result
+        finally:
+            # Closing admission is synchronous, including cancellation/error exits.
+            # An injection already holding the gate may finish; later live inputs
+            # must use the deferred owner, which drains that gate before reloading.
+            context_checkpoint_gate(context).run_finishing = True
+            # With no run left the checkpoint is authoritative again; another
+            # process may extend it before this one sees the next input.
+            self._release_idle_context(execution_id, context)
+            runtime.discard_inline_file_streams()
+            self._active_controls.pop(execution_id, None)
+            exit_goal(goal_token)
+            if usage_token is not None:
+                token_usage_observer.reset(usage_token)
+            if budget_token is not None:
+                active_execution_budget.reset(budget_token)
+            if warning_token is not None:
+                budget_warning_handler.reset(warning_token)
+
+    async def _finish_budget_stop(
+        self,
+        context: ExecutionContext,
+        runtime: PatternRuntime,
+        pattern: Any,
+        workspace: Any,
+    ) -> dict[str, Any]:
+        """Deliver a deterministic handoff without spending more model tokens."""
+        from .language import effective_output_language
+
+        budget = active_execution_budget.get()
+        chinese = "Chinese" in effective_output_language(context)
+        answer = (
+            "本次执行已达到 token 上限，已停止继续调用。任务尚未全部完成，已有结果保留在执行记录中。"
+            if chinese
+            else "Execution stopped at the token budget limit. The task is not fully completed; existing results remain in the execution history."
+        )
+        files: list[dict[str, Any]] = []
+        if workspace is not None:
+            try:
+                if callable(getattr(workspace, "get_all_files", None)):
+                    # Command/code tools may write deliverables in the workspace
+                    # root, not only output/. Never hand over inputs or temp files.
+                    grouped = await asyncio.to_thread(workspace.get_all_files)
+                    files = [
+                        *grouped.get("output", []),
+                        *grouped.get("workspace", []),
+                    ]
+                elif callable(getattr(workspace, "get_output_files", None)):
+                    files = await asyncio.to_thread(workspace.get_output_files)
+            except Exception:
+                logger.warning(
+                    "Could not list existing budget-stop deliverables", exc_info=True
+                )
+        links = [
+            f"- [{str(item.get('filename') or 'File').replace('[', '').replace(']', '')}]({build_file_id_ref(item['file_id'])})"
+            for item in files
+            if item.get("file_id")
+            and (budget is None or item.get("modified_time", 0) >= budget.started_at)
+        ]
+        if links:
+            answer += (
+                "\n\n已有文件（不代表已完成校验）：\n"
+                if chinese
+                else "\n\nExisting files (not a claim of validation):\n"
+            ) + "\n".join(links)
+        context.add_assistant_message(answer)
+        result = {
+            "success": True,
+            "status": "completed",
+            "output": answer,
+            "completion_outcome": "partial" if links else "blocked",
+            "termination_reason": "token_budget",
+            "execution_id": context.execution_id,
+            "context": context,
+            "execution_budget": budget.model_dump() if budget is not None else None,
+        }
+        await runtime.checkpoint(
+            "execution_budget_stopped",
+            context=context,
+            pattern=pattern,
+            status="completed",
+        )
+        await self._finish_run(context, result, runtime=runtime)
+        return result
+
+    def _release_idle_context(
+        self, execution_id: str, context: ExecutionContext
+    ) -> None:
+        """Evict a context no run or injection in this process still uses.
+
+        The cache is process-wide and shared across runner instances, so
+        idleness is read from the context's own gate rather than from this
+        runner's active controls. A fenced context stays cached so later input
+        sees the fence instead of cold-starting past the uncertain write.
+        """
+        gate = context_checkpoint_gate(context)
+        if (
+            gate.run_finishing
+            and not gate.injection_uncertain
+            and gate.injections_in_flight == 0
+        ):
+            self.context_manager.discard_context(execution_id, context)
+
+    def _abandon_unstarted_context(
+        self, execution_id: str, context: ExecutionContext
+    ) -> None:
+        context_checkpoint_gate(context).run_finishing = True
+        self._release_idle_context(execution_id, context)
+
+    def pause(self, execution_id: str, reason: str | None = None) -> bool:
+        control = self._active_controls.get(execution_id)
+        if control is None:
+            return False
+        control.runtime.request_interrupt(reason or "paused by runner")
+        return True
+
+    def cancel(self, execution_id: str, reason: str | None = None) -> bool:
+        control = self._active_controls.get(execution_id)
+        if control is None:
+            return False
+        control.runtime.request_interrupt(reason or "cancelled by runner")
+        return True
+
+    async def resume(
+        self,
+        execution_id: str,
+        *,
+        task: str | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        workspace_id: str | None = None,
+        allowed_external_dirs: list[str] | None = None,
+        base_dir: str | None = None,
+        streaming_handler: Any | None = None,
+        extra_tools: list[Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        interrupt_checker: Any | None = None,
+        outbound_message_handler: Any | None = None,
+    ) -> dict[str, Any]:
+        checkpoint = await self._load_latest_checkpoint(execution_id)
+        resolved_task = self._resolve_task(
+            task=task,
+            checkpoint=checkpoint,
+            execution_id=execution_id,
+        )
+        return await self.run(
+            task=resolved_task,
+            user_id=user_id,
+            execution_id=execution_id,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            allowed_external_dirs=allowed_external_dirs,
+            base_dir=base_dir,
+            resume=True,
+            checkpoint=checkpoint,
+            streaming_handler=streaming_handler,
+            extra_tools=extra_tools,
+            metadata=metadata,
+            interrupt_checker=interrupt_checker,
+            outbound_message_handler=outbound_message_handler,
+        )
+
+    async def inject_user_message(
+        self,
+        execution_id: str,
+        message: str | None = None,
+        *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
+        request_interrupt: bool = True,
+        reason: str | None = None,
+    ) -> UserMessageInjectionResult:
+        # The context this call currently uses stays cached until the call
+        # returns, callback and watermark re-persist included; the last
+        # holder of an idle context evicts it.
+        held: list[ExecutionContext] = []
+        try:
+            return await self._inject_user_message(
+                execution_id,
+                message,
+                execution_message=execution_message,
+                display_message=display_message,
+                files=files,
+                turn_id=turn_id,
+                request_interrupt=request_interrupt,
+                reason=reason,
+                held=held,
+            )
+        finally:
+            self._release_injection_hold(execution_id, held)
+
+    def _hold_injection_context(
+        self,
+        execution_id: str,
+        held: list[ExecutionContext],
+        context: ExecutionContext,
+    ) -> None:
+        # Synchronous with the lookup that produced ``context``, so no
+        # eviction can slip in between.
+        if held and held[0] is context:
+            return
+        self._release_injection_hold(execution_id, held)
+        context_checkpoint_gate(context).injections_in_flight += 1
+        held.append(context)
+
+    def _release_injection_hold(
+        self, execution_id: str, held: list[ExecutionContext]
+    ) -> None:
+        while held:
+            previous = held.pop()
+            context_checkpoint_gate(previous).injections_in_flight -= 1
+            self._release_idle_context(execution_id, previous)
+
+    def _restore_context_from_checkpoint(
+        self, execution_id: str, checkpoint: dict[str, Any]
+    ) -> ExecutionContext:
+        if not isinstance(checkpoint.get("context"), dict):
+            raise CheckpointCorruptError(
+                "Stored checkpoint carries no execution context to restore."
+            )
+        # Migrate the payload before copying from it, so the restored
+        # context sees every change whatever the migration rewrites.
+        reset_output_language_to_request_context(checkpoint)
+        context_data = checkpoint["context"]
+        stored_id = context_data.get("execution_id")
+        if not stored_id:
+            # Restore under the key it was loaded by; a generated id
+            # would never match the cache lookup below.
+            context_data = {**context_data, "execution_id": execution_id}
+        elif stored_id != execution_id:
+            raise CheckpointCorruptError(
+                "Stored checkpoint context belongs to a different execution."
+            )
+        context = ExecutionContext.from_dict(context_data)
+        # Only a run caches its context before this lookup, so no run of this
+        # execution is live here: live input must take the deferred path.
+        context_checkpoint_gate(context).run_finishing = True
+        warn_restored_compact_threshold(context, getattr(self.agent, "llm", None))
+        return context
+
+    async def _inject_user_message(
+        self,
+        execution_id: str,
+        message: str | None,
+        *,
+        execution_message: str | None,
+        display_message: str | None,
+        files: list[dict[str, Any]] | None,
+        turn_id: str | None,
+        request_interrupt: bool,
+        reason: str | None,
+        held: list[ExecutionContext],
+    ) -> UserMessageInjectionResult:
+        while True:
+            context = self.context_manager.get_context(execution_id)
+            cold_start_checkpoint: dict[str, Any] | None = None
+            if context is None:
+                # An idle context is evicted when its last user returns, which
+                # can land between this read and publishing the result: the
+                # evicted context's final write may postdate the read. The
+                # epoch token makes such a reader discard its snapshot and
+                # read again instead of caching the stale checkpoint.
+                token = self.context_manager.begin_cold_start(execution_id)
+                checkpoint: dict[str, Any] | None = None
+                restored: ExecutionContext | None = None
+                try:
+                    checkpoint = await self._load_latest_checkpoint(execution_id)
+                    if checkpoint is not None:
+                        restored = self._restore_context_from_checkpoint(
+                            execution_id, checkpoint
+                        )
+                finally:
+                    context = self.context_manager.end_cold_start(
+                        execution_id, token, restored
+                    )
+                if context is None:
+                    if checkpoint is None:
+                        return UserMessageInjectionResult(
+                            context=None,
+                            outcome=UserMessageInjectionOutcome.NOT_POSTED,
+                        )
+                    continue
+                if context is restored:
+                    cold_start_checkpoint = checkpoint
+            self._hold_injection_context(execution_id, held, context)
+
+            # Display-vs-execution split: ``execution_message`` is the prompt
+            # the agent runtime sees (may be enriched with file refs / system
+            # context); ``display_message`` is what the chat bubble should
+            # show. Both fall back to ``message`` for legacy callers.
+            resolved_execution_message = (
+                execution_message if execution_message is not None else message
+            )
+            if resolved_execution_message is None:
+                raise ValueError(
+                    "inject_user_message requires message or execution_message"
+                )
+            if display_message is None and message is None:
+                raise ValueError(
+                    "inject_user_message requires display_message when "
+                    "execution_message is provided without legacy message"
+                )
+            resolved_display_message = (
+                display_message if display_message is not None else message
+            )
+            requested_turn_id = turn_id.strip() if turn_id and turn_id.strip() else None
+            gate = context_checkpoint_gate(context)
+            async with gate.exclusive(execution_id):
+                if self.context_manager.get_context(execution_id) is not context:
+                    continue
+                if gate.injection_uncertain:
+                    if (
+                        not request_interrupt
+                        and execution_id not in self._active_controls
+                    ):
+                        # The exclusive gate has drained the old writer. Keep the
+                        # old object fenced for callbacks still holding a reference.
+                        self.context_manager.remove_context(execution_id)
+                        continue
+                    # An earlier write is uncertain, but this attempt writes
+                    # nothing: its own outcome is a known rejection.
+                    _record_injection_outcome(
+                        UserMessageInjectionOutcome.REJECTED_RETRYABLE
+                    )
+                    return UserMessageInjectionResult(
+                        context=context,
+                        outcome=UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                    )
+                if request_interrupt and gate.run_finishing:
+                    return UserMessageInjectionResult(
+                        context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
+                    )
+                if requested_turn_id is not None:
+                    for existing in context.messages:
+                        existing_metadata = getattr(existing, "metadata", None)
+                        if (
+                            getattr(existing, "role", None) != "user"
+                            or not isinstance(existing_metadata, dict)
+                            or existing_metadata.get("turn_id") != requested_turn_id
+                        ):
+                            continue
+                        if existing.content != resolved_execution_message:
+                            raise UserMessageInjectionConflictError(
+                                "turn_id is already associated with a different user message"
+                            )
+                        return self._replay_accepted_turn(
+                            execution_id,
+                            context,
+                            request_interrupt=request_interrupt,
+                            reason=reason,
+                        )
+                    # Compaction may have dropped the message itself; the
+                    # metadata record of accepted turns survives it.
+                    accepted = self._accepted_turn_digest(context, requested_turn_id)
+                    if accepted is not None:
+                        if accepted and accepted != self._turn_content_digest(
+                            resolved_execution_message
+                        ):
+                            raise UserMessageInjectionConflictError(
+                                "turn_id is already associated with a different user message"
+                            )
+                        return self._replay_accepted_turn(
+                            execution_id,
+                            context,
+                            request_interrupt=request_interrupt,
+                            reason=reason,
+                        )
+
+                # Resolve the checkpoint-merge baseline before any context mutation
+                # below (add_user_message, pending marker) so a failed read leaves
+                # zero residue instead of an in-memory message that was never
+                # durably confirmed -- a retry after the failure must actually
+                # persist, not find a ghost confirmation from the rejected attempt.
+                # A live runtime's cached checkpoint wins over a fresh read; the
+                # cold-start read above (if this call triggered one) is reused
+                # instead of reading the same window twice.
+                control = self._active_controls.get(execution_id)
+                checkpoint_baseline: dict[str, Any] | None
+                if control is not None and control.runtime.last_checkpoint is not None:
+                    checkpoint_baseline = control.runtime.last_checkpoint
+                elif cold_start_checkpoint is not None:
+                    checkpoint_baseline = cold_start_checkpoint
+                else:
+                    checkpoint_baseline = await self._load_latest_checkpoint(
+                        execution_id
+                    )
+
+                # Attach files + display text to the new Message so they survive
+                # checkpoint round-trips: Message.metadata is serialized by
+                # ExecutionContext. The on_user_message_posted callback reads
+                # display_message back from metadata so the chat bubble shows the
+                # user-typed text rather than the LLM-augmented prompt.
+                metadata: dict[str, Any] = {"display_message": resolved_display_message}
+                if files is not None:
+                    metadata["files"] = files
+                metadata["turn_id"] = requested_turn_id or str(uuid4())
+
+                # Only messages and top-level metadata are mutated below; components
+                # and existing messages are read-only during checkpoint serialization.
+                candidate = replace(
+                    context,
+                    messages=list(context.messages),
+                    metadata=dict(context.metadata),
+                )
+                added = candidate.add_user_message(
+                    resolved_execution_message,
+                    metadata=metadata,
+                    context_refs=build_image_context_references(files),
+                )
+                # Set a "this turn is waiting to be traced" pending marker before
+                # we persist. The resume catch-up logic uses this to disambiguate
+                # an old checkpoint that pre-dates this PR (no watermark, no
+                # pending marker — should NOT replay history) from a checkpoint
+                # that crashed mid-emit (pending marker present — replay this
+                # specific turn). Without this, ``_emit_untraced_user_messages``
+                # would treat any missing-watermark checkpoint as "everything
+                # untraced" and re-render historical user messages on resume.
+                self._set_pending_user_message_marker(candidate, added)
+                self._record_accepted_turn(candidate, added)
+                # Persist BEFORE emitting the trace so the message is durable even
+                # if the trace dispatch fails — the resume path's catch-up logic
+                # in TraceEventCallback.on_run_start will replay the marked turn.
+                _record_injection_outcome(UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+                try:
+                    await self._persist_injected_context(
+                        execution_id=execution_id,
+                        context=candidate,
+                        label="user_message_injected",
+                        baseline=checkpoint_baseline,
+                    )
+                except BaseException as exc:
+                    # A cancellation can arrive after storage committed. Block stale
+                    # checkpoints before releasing the gate even when propagating it.
+                    confirmed = None
+                    # Mark before read-back too: its await can itself be cancelled.
+                    gate.injection_uncertain = True
+                    try:
+                        if isinstance(exc, Exception):
+                            confirmed = await self._confirm_injected_turn(
+                                execution_id,
+                                metadata["turn_id"],
+                                resolved_execution_message,
+                                baseline=checkpoint_baseline,
+                            )
+                    finally:
+                        if confirmed is not None:
+                            gate.injection_uncertain = False
+                        else:
+                            self.pause(execution_id, reason="injection outcome unknown")
+                    if confirmed is False:
+                        _record_injection_outcome(
+                            UserMessageInjectionOutcome.NOT_POSTED
+                        )
+                        raise UserMessageInjectionRejectedError(str(exc)) from exc
+                    if confirmed is not True:
+                        if not isinstance(exc, Exception):
+                            raise
+                        return UserMessageInjectionResult(
+                            context=context,
+                            outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+                        )
+                _record_injection_outcome(UserMessageInjectionOutcome.POSTED_FRESH)
+                context.messages.append(added)
+                self._set_pending_user_message_marker(context, added)
+                context.metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = candidate.metadata[
+                    ACCEPTED_TURN_IDS_METADATA_KEY
+                ]
+            break
+        # Preserve callback-before-interrupt ordering on success, but never
+        # skip the interruption when tracing or watermark persistence cancels.
+        try:
+            # Snapshot the watermark BEFORE the callback so we can detect a
+            # change (see comment below) and persist it.
+            watermark_before = self._read_trace_watermark(context)
+            traced_turn_ids_before = self._read_traced_turn_ids(context)
+            try:
+                await self._dispatch_callback(
+                    "on_user_message_posted",
+                    runner=self,
+                    context=context,
+                    message=added,
+                    files=files,
+                )
+            except Exception:
+                # The injected-context checkpoint above is the durable acceptance
+                # boundary. Trace projection can be replayed from its pending
+                # marker, so it must not turn an accepted user message into a
+                # rejected delivery.
+                logger.warning(
+                    "user-message callback failed after injection checkpoint for %s",
+                    execution_id,
+                    exc_info=True,
+                )
+            # Re-persist when the trace callback advanced the watermark —
+            # without this a worker crash between trace emission and the next
+            # checkpoint would let the resume path replay the same user_message
+            # event because the watermark was still living only in memory.
+            # The same persist also clears the pending marker since the trace
+            # has now been emitted; doing both in one persist keeps the
+            # invariant {pending => never traced yet} on every durable state.
+            watermark_after = self._read_trace_watermark(context)
+            traced_turn_ids_after = self._read_traced_turn_ids(context)
+            if (
+                watermark_after and watermark_after != watermark_before
+            ) or traced_turn_ids_after != traced_turn_ids_before:
+                async with gate.exclusive(execution_id):
+                    if (
+                        gate.injection_uncertain
+                        or self.context_manager.get_context(execution_id) is not context
+                    ):
+                        # A later injection became uncertain during this callback,
+                        # or a newer context (a resumed run, a reload past a fence)
+                        # replaced this one. Never overwrite its durable state with
+                        # this stale object; the pending marker stays durable and
+                        # resume catch-up replays it, deduplicated by turn_id.
+                        return UserMessageInjectionResult(
+                            context=context,
+                            outcome=UserMessageInjectionOutcome.POSTED_FRESH,
+                        )
+                    try:
+                        control = self._active_controls.get(execution_id)
+                        checkpoint_baseline = (
+                            control.runtime.last_checkpoint
+                            if control is not None
+                            and control.runtime.last_checkpoint is not None
+                            else await self._load_latest_checkpoint(execution_id)
+                        )
+                        self._clear_pending_user_message_marker(context)
+                        await self._persist_injected_context(
+                            execution_id=execution_id,
+                            context=context,
+                            label="user_message_trace_watermark",
+                            baseline=checkpoint_baseline,
+                        )
+                    except Exception:
+                        # Declared swallow point: the message was already durably
+                        # accepted by the injection checkpoint above, so a failure
+                        # here (including a checkpoint read/write error) only
+                        # costs the watermark re-persist and must not turn an
+                        # accepted message into a rejected delivery. Preserve the
+                        # pending marker for resume catch-up when the trace
+                        # watermark cannot be persisted after acceptance.
+                        logger.warning(
+                            "user-message watermark checkpoint failed after injection for %s",
+                            execution_id,
+                            exc_info=True,
+                        )
+        finally:
+            if request_interrupt:
+                self.pause(execution_id, reason=reason or "new user message")
+        return UserMessageInjectionResult(
+            context=context,
+            outcome=UserMessageInjectionOutcome.POSTED_FRESH,
+        )
+
+    def _replay_accepted_turn(
+        self,
+        execution_id: str,
+        context: ExecutionContext,
+        *,
+        request_interrupt: bool,
+        reason: str | None,
+    ) -> UserMessageInjectionResult:
+        if request_interrupt:
+            self.pause(execution_id, reason=reason or "new user message")
+        _record_injection_outcome(UserMessageInjectionOutcome.POSTED_REPLAY)
+        return UserMessageInjectionResult(
+            context=context,
+            outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
+        )
+
+    @staticmethod
+    def _turn_content_digest(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _accepted_turn_entries(
+        metadata: dict[str, Any],
+    ) -> list[list[str]] | None:
+        """The accepted-turn record as fresh ``[turn_id, digest]`` lists.
+
+        None when the context carries no record (a checkpoint written before
+        it existed); malformed entries are dropped.
+        """
+        value = metadata.get(ACCEPTED_TURN_IDS_METADATA_KEY)
+        if not isinstance(value, list):
+            return None
+        return [
+            [entry[0], entry[1]]
+            for entry in value
+            if isinstance(entry, (list, tuple))
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and entry[0]
+            and isinstance(entry[1], str)
+        ]
+
+    @staticmethod
+    def _accepted_turn_digest(context: ExecutionContext, turn_id: str) -> str | None:
+        """Digest of an accepted turn's text; "" if accepted with no digest.
+
+        None means the turn is not on record. Only a context that has no
+        record yet (a legacy checkpoint) falls back to the traced turn ids,
+        which prove acceptance but not the content; once the record exists it
+        was seeded from them and is the sole authority.
+        """
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        entries = AgentRunner._accepted_turn_entries(metadata)
+        if entries is None:
+            traced = metadata.get(_TRACED_TURN_IDS_METADATA_KEY)
+            if isinstance(traced, list) and turn_id in traced:
+                return ""
+            return None
+        for recorded_id, digest in reversed(entries):
+            if recorded_id == turn_id:
+                return digest
+        return None
+
+    @staticmethod
+    def _record_accepted_turn(context: ExecutionContext, message: Any) -> None:
+        """Append ``message``'s turn id to the record on ``context.metadata``.
+
+        Rebinds a fresh list rather than mutating in place: an injection
+        candidate shares the live context's nested metadata values, and the
+        live context must not see the record before the candidate persists.
+        The first record on a context seeds itself from what the context
+        already proves accepted: traced turn ids (no digest) and user messages
+        still present (their text's digest).
+        """
+        turn_id = AgentRunner._message_turn_id(message)
+        metadata = getattr(context, "metadata", None)
+        if turn_id is None or not isinstance(metadata, dict):
+            return
+        entries = AgentRunner._accepted_turn_entries(metadata)
+        if entries is None:
+            seed: dict[str, str] = {}
+            traced = metadata.get(_TRACED_TURN_IDS_METADATA_KEY)
+            if isinstance(traced, list):
+                for traced_id in traced:
+                    if isinstance(traced_id, str) and traced_id:
+                        seed[traced_id] = ""
+            for existing in getattr(context, "messages", None) or ():
+                existing_id = AgentRunner._message_turn_id(existing)
+                if existing_id is None or getattr(existing, "role", None) != "user":
+                    continue
+                seed.pop(existing_id, None)
+                seed[existing_id] = AgentRunner._turn_content_digest(
+                    str(getattr(existing, "content", "") or "")
+                )
+            entries = [[key, value] for key, value in seed.items()]
+        entries = [entry for entry in entries if entry[0] != turn_id]
+        entries.append(
+            [
+                turn_id,
+                AgentRunner._turn_content_digest(
+                    str(getattr(message, "content", "") or "")
+                ),
+            ]
+        )
+        metadata[ACCEPTED_TURN_IDS_METADATA_KEY] = entries[-MAX_ACCEPTED_TURN_IDS:]
+
+    @staticmethod
+    def _read_trace_watermark(context: ExecutionContext) -> str | None:
+        """Read the user-message trace watermark off context metadata, if any.
+
+        Kept in-runner so we don't import the tracing module (which would
+        create a cycle) — the key is a stable contract spelled out in
+        ``core.agent.tracing.TRACE_WATERMARK_KEY``.
+        """
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("_user_message_trace_watermark")
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _read_traced_turn_ids(context: ExecutionContext) -> tuple[str, ...]:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ()
+        value = metadata.get("_user_message_trace_turn_ids")
+        if not isinstance(value, list):
+            return ()
+        return tuple(item for item in value if isinstance(item, str) and item)
+
+    @staticmethod
+    def _set_pending_user_message_marker(
+        context: ExecutionContext, message: Any
+    ) -> None:
+        """Stamp ``_pending_user_message_trace_timestamp`` on context.metadata.
+
+        Mirrored in ``core.agent.tracing.PENDING_MARKER_KEY``; kept in-runner
+        to avoid an import cycle. The timestamp is the just-added message's
+        normalized ISO-UTC timestamp so the catch-up loop can replay this
+        specific turn rather than scanning history.
+        """
+        ts = AgentRunner._message_iso_timestamp(message)
+        if ts is None:
+            return
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["_pending_user_message_trace_timestamp"] = ts
+            turn_id = AgentRunner._message_turn_id(message)
+            if turn_id:
+                metadata["_pending_user_message_trace_turn_id"] = turn_id
+
+    @staticmethod
+    def _clear_pending_user_message_marker(context: ExecutionContext) -> None:
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata.pop("_pending_user_message_trace_timestamp", None)
+            metadata.pop("_pending_user_message_trace_turn_id", None)
+
+    @staticmethod
+    def _message_turn_id(message: Any) -> str | None:
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("turn_id")
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _message_iso_timestamp(message: Any) -> str | None:
+        """ISO-UTC string of ``message.timestamp`` — same normalization the
+        tracing module uses for its watermark, kept here to avoid a cycle.
+        """
+        from datetime import datetime, timezone
+
+        ts = getattr(message, "timestamp", None)
+        if isinstance(ts, datetime):
+            aware = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+            return aware.astimezone(timezone.utc).isoformat()
+        if isinstance(ts, str) and ts:
+            return ts
+        return None
+
+    async def post_user_message(
+        self,
+        execution_id: str,
+        message: str | None = None,
+        *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
+        request_interrupt: bool = True,
+        reason: str | None = None,
+    ) -> UserMessageInjectionResult:
+        """Alias for external callers to inject a user message into an execution.
+
+        `send_message` is an agent-side tool (`agent -> user`).
+        `post_user_message` is a runner-side control API (`user/system -> execution`).
+        """
+        return await self.inject_user_message(
+            execution_id,
+            message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
+            turn_id=turn_id,
+            request_interrupt=request_interrupt,
+            reason=reason,
+        )
+
+    async def _build_context(
+        self,
+        *,
+        task: str | None,
+        execution_id: str,
+        user_id: str | None,
+        session_id: str | None,
+        workspace_id: str | None,
+        allowed_external_dirs: list[str] | None,
+        base_dir: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> tuple[ExecutionContext, Any | None]:
+        workspace = None
+        context_kwargs: dict[str, Any] = {}
+        if self.workspace_enabled:
+            workspace = await asyncio.to_thread(
+                self.workspace_manager.get_or_create_workspace,
+                base_dir=base_dir or self.workspace_base_dir,
+                task_id=workspace_id or execution_id,
+                allowed_external_dirs=allowed_external_dirs,
+                scope_segments=self.scope_segments,
+            )
+            if inspect.isawaitable(workspace):
+                workspace = await workspace
+            context_kwargs = {
+                "workspace_id": workspace.id,
+                "workspace_path": str(workspace.workspace_dir),
+                "cwd": str(workspace.workspace_dir),
+                "workspace_state": self._workspace_state(workspace),
+            }
+        context = self.context_manager.create_context(
+            execution_id=execution_id,
+            user_id=user_id,
+            session_id=session_id,
+            system_prompt=getattr(self.agent, "system_prompt", None),
+            **context_kwargs,
+        )
+        try:
+            # Snapshotted at task start. On resume the context (and this
+            # threshold) is restored verbatim from the checkpoint, so a
+            # context-window or ratio change made after checkpointing only
+            # affects newly started tasks.
+            (
+                context.compact_config.threshold,
+                context.compact_config.threshold_source,
+            ) = self._resolve_compact_threshold()
+            self._merge_context_metadata(context, metadata)
+            if task:
+                context.metadata.setdefault("task", task)
+
+            memory_session = await self._resolve_memory_session(
+                execution_id=execution_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if memory_session is not None:
+                memory_id, snapshot = memory_session
+                context.attach_memory_session(memory_id, snapshot)
+        except BaseException:
+            # ``create_context`` already cached it; see the guard in ``run``.
+            self._abandon_unstarted_context(execution_id, context)
+            raise
+
+        return context, workspace
+
+    def _merge_context_metadata(
+        self,
+        context: ExecutionContext,
+        metadata: dict[str, Any] | None,
+        *,
+        restored: bool = False,
+    ) -> None:
+        """Overlay current-run metadata on new or checkpoint-restored context."""
+
+        if metadata is None:
+            return
+        if restored:
+            # Symmetric with the fresh-context branch below: the current run's
+            # metadata is authoritative for the modality preference, so an
+            # absent key clears any checkpointed value rather than keeping it.
+            preferred_modalities = normalize_input_modalities(
+                metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
+            )
+            if preferred_modalities:
+                context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                    preferred_modalities
+                )
+            else:
+                context.metadata.pop(
+                    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+                    None,
+                )
+            # A resumed checkpoint may carry stale or legacy caller-influenced
+            # values. The resume boundary supplies these two server-owned
+            # identities from the current task row and exact execution lease.
+            #
+            # ``is not None`` rather than ``in metadata``: several resume
+            # entry points pass the key unconditionally with a None value
+            # (they have no trusted source of their own to supply). Treating
+            # that as authoritative would erase the checkpointed real source
+            # and permanently deny a pending approval that was gated under it.
+            # An absent value means "I do not know", never "there is none".
+            for key in ("task_source", "run_id"):
+                if metadata.get(key) is not None:
+                    context.metadata[key] = metadata[key]
+            for key in RESUME_AUTHORITATIVE_METADATA_KEYS:
+                if key in metadata:
+                    context.metadata[key] = metadata[key]
+                else:
+                    context.metadata.pop(key, None)
+            return
+
+        current_metadata = dict(metadata)
+        for reserved_key in RESERVED_ENGINE_METADATA_KEYS:
+            current_metadata.pop(reserved_key, None)
+        preferred_modalities = normalize_input_modalities(
+            current_metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
+        )
+        if preferred_modalities:
+            context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        else:
+            context.metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, None)
+        context.metadata.update(current_metadata)
+        request_context = metadata.get("request_context")
+        if isinstance(request_context, dict):
+            self._apply_request_context(context, request_context)
+
+    def _reconcile_memory_retrieval_cache(
+        self,
+        context: ExecutionContext,
+        pattern: Any,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        """Apply the current host policy before any resumed child can prompt."""
+
+        if (
+            metadata is None
+            or MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY not in metadata
+        ):
+            # Core SDK callers that never opted into host policy keep their
+            # legacy behavior.  Present ``None`` is distinct: it is an
+            # explicit host denial and must clear checkpointed retrieval.
+            return
+        raw_fingerprint = metadata.get(MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY)
+        trusted_fingerprint = (
+            raw_fingerprint
+            if isinstance(raw_fingerprint, str) and raw_fingerprint
+            else None
+        )
+
+        active_step_contexts: Mapping[str, dict[str, Any]] = {}
+        direct_contexts = getattr(pattern, "active_step_contexts", None)
+        if isinstance(direct_contexts, Mapping):
+            active_step_contexts = direct_contexts
+        else:
+            dag_state = getattr(pattern, "dag_state", None)
+            if isinstance(dag_state, Mapping):
+                nested_contexts = dag_state.get("active_step_contexts")
+                if isinstance(nested_contexts, Mapping):
+                    active_step_contexts = nested_contexts
+
+        reconcile_execution_memory_retrieval_cache(
+            context,
+            active_step_contexts,
+            trusted_scope_fingerprint=trusted_fingerprint,
+        )
+
+    def _resolve_compact_threshold(self) -> tuple[int, str]:
+        """Derive the context-compaction threshold from the model's context window.
+
+        When the model declares a context window, compact at
+        ``context_window * ratio`` tokens; otherwise fall back to the configured
+        default (preserving the historical 32000 behaviour) and warn once per
+        model, because that default is far too low for long-context models and
+        the resulting early compaction is otherwise invisible.
+
+        Returns the threshold and its provenance (a ``COMPACT_THRESHOLD_SOURCE_*``
+        value) for the compaction trace metadata.
+        """
+        llm = getattr(self.agent, "llm", None)
+        context_window = getattr(llm, "context_window", None)
+        # context_window is typed int | None end to end (DB Integer -> Pydantic
+        # Optional[int]); bool is not a valid value, so a plain int check suffices.
+        derived = derive_compact_threshold(context_window)
+        if derived is not None:
+            return derived
+        threshold = get_compact_threshold_default()
+        # A virtual model resolves its concrete window per call and
+        # ``prepare_llm_for_context`` recomputes the threshold then, so its
+        # missing window at task start is expected and not worth a warning.
+        if llm is not None and not callable(getattr(llm, "prepare_for_call", None)):
+            model_key = compact_model_key(llm)
+            warn_once_per_model(
+                THRESHOLD_WARNING_KEY_PREFIX + model_key,
+                "Model %s has no context_window; the context compaction "
+                "threshold falls back to %d tokens (%s). Set context_window "
+                "on the model so compaction triggers at a fraction of its "
+                "real window instead.",
+                model_key,
+                threshold,
+                COMPACT_THRESHOLD_DEFAULT,
+            )
+        return threshold, COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    def _initial_user_message_metadata(
+        self, context: ExecutionContext
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        context_metadata = (
+            context.metadata if isinstance(context.metadata, dict) else {}
+        )
+        request_context = context_metadata.get("request_context")
+
+        candidates = []
+        if isinstance(request_context, dict):
+            candidates.append(request_context)
+        candidates.append(context_metadata)
+
+        for candidate in candidates:
+            turn_id = candidate.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                metadata["turn_id"] = turn_id
+                break
+        self._ensure_user_message_turn_id(metadata)
+
+        for candidate in candidates:
+            if "display_message" in candidate:
+                display_message = candidate.get("display_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+            if "display_user_message" in candidate:
+                display_message = candidate.get("display_user_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+
+        for candidate in candidates:
+            files = candidate.get("files")
+            if isinstance(files, list):
+                metadata["files"] = files
+                break
+            attachments = candidate.get("attachments")
+            if isinstance(attachments, list):
+                metadata["files"] = attachments
+                break
+
+        return metadata
+
+    @staticmethod
+    def _ensure_user_message_turn_id(metadata: dict[str, Any]) -> str:
+        value = metadata.get("turn_id")
+        if isinstance(value, str) and value:
+            return value
+        turn_id = str(uuid4())
+        metadata["turn_id"] = turn_id
+        return turn_id
+
+    def _apply_request_context(
+        self,
+        context: ExecutionContext,
+        request_context: dict[str, Any],
+    ) -> None:
+        system_prompt = request_context.get("system_prompt")
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            prompt = system_prompt.strip()
+            if context.system_prompt and context.system_prompt.strip():
+                existing = context.system_prompt.strip()
+                if prompt not in existing:
+                    context.system_prompt = f"{existing}\n\n{prompt}"
+            else:
+                context.system_prompt = prompt
+
+        for key, value in request_context.items():
+            if (
+                key in {"system_prompt", MODEL_CONTEXT_WATERMARK_METADATA_KEY}
+                or key in RESERVED_ENGINE_METADATA_KEYS
+            ):
+                continue
+            context.metadata[key] = value
+
+    def _resolve_task(
+        self,
+        *,
+        task: str | None,
+        checkpoint: dict[str, Any] | None,
+        execution_id: str,
+    ) -> str | None:
+        if task:
+            return task
+
+        if isinstance(checkpoint, dict):
+            context_payload = checkpoint.get("context")
+            if isinstance(context_payload, dict):
+                metadata = context_payload.get("metadata")
+                if isinstance(metadata, dict):
+                    saved_task = metadata.get("task")
+                    if isinstance(saved_task, str) and saved_task:
+                        return saved_task
+                messages = context_payload.get("messages")
+                if isinstance(messages, list):
+                    for message in reversed(messages):
+                        if (
+                            isinstance(message, dict)
+                            and message.get("role") == "user"
+                            and isinstance(message.get("content"), str)
+                            and message["content"]
+                        ):
+                            content = cast(str, message["content"])
+                            return content
+
+        control = self._active_controls.get(execution_id)
+        if control is not None:
+            return control.task
+
+        return None
+
+    def _workspace_state(self, workspace: Any) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "input_dir": str(getattr(workspace, "input_dir", "")),
+            "output_dir": str(getattr(workspace, "output_dir", "")),
+            "temp_dir": str(getattr(workspace, "temp_dir", "")),
+        }
+        allowed_dirs = getattr(workspace, "allowed_external_dirs", None)
+        if allowed_dirs is not None:
+            state["allowed_external_dirs"] = [str(path) for path in allowed_dirs]
+        return state
+
+    async def _resolve_memory_session(
+        self,
+        *,
+        execution_id: str,
+        user_id: str | None,
+        session_id: str | None,
+    ) -> tuple[str | None, dict[str, Any] | None] | None:
+        if self.memory_manager is None:
+            return None
+
+        for method_name in (
+            "get_or_create_session",
+            "create_session",
+            "get_session",
+            "load_session",
+        ):
+            method = getattr(self.memory_manager, method_name, None)
+            if method is None:
+                continue
+            payload = self._call_with_supported_kwargs(
+                method,
+                execution_id=execution_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if inspect.isawaitable(payload):
+                payload = await payload
+            return self._normalize_memory_session(payload, session_id=session_id)
+
+        return None
+
+    def _normalize_memory_session(
+        self,
+        payload: Any,
+        *,
+        session_id: str | None,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        if payload is None:
+            return session_id, None
+        if isinstance(payload, tuple) and len(payload) == 2:
+            return payload[0], payload[1]
+        if isinstance(payload, str):
+            return payload, None
+        if isinstance(payload, dict):
+            resolved_id = payload.get("session_id") or payload.get("id") or session_id
+            snapshot = payload.get("snapshot")
+            if snapshot is None:
+                snapshot = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"session_id", "id"}
+                }
+            return resolved_id, snapshot
+
+        resolved_id = (
+            getattr(payload, "session_id", None)
+            or getattr(payload, "id", None)
+            or session_id
+        )
+        snapshot = getattr(payload, "snapshot", None)
+        if snapshot is None and hasattr(payload, "to_dict"):
+            snapshot = payload.to_dict()
+        return resolved_id, snapshot
+
+    def _build_pattern_kwargs(
+        self,
+        *,
+        pattern: Any,
+        task: str,
+        context: ExecutionContext,
+        tools: list[Any],
+        runtime: PatternRuntime,
+        streaming_handler: Any | None,
+    ) -> dict[str, Any]:
+        return self._call_signature_kwargs(
+            pattern.run,
+            agent=self.agent,
+            task=task,
+            context=context,
+            llm=getattr(self.agent, "llm", None),
+            compact_llm=getattr(self.agent, "compact_llm", None),
+            tools=tools,
+            tracer=self.tracer,
+            runtime=runtime,
+            callbacks=self.callbacks,
+            streaming_handler=streaming_handler,
+            memory_store=getattr(self.agent, "memory_store", None),
+            memory_tools_factory=getattr(self.agent, "memory_tools_factory", None),
+            memory_similarity_threshold=getattr(
+                self.agent, "memory_similarity_threshold", None
+            ),
+            skill_manager=getattr(self.agent, "skill_manager", None),
+            allowed_skills=getattr(self.agent, "allowed_skills", None),
+        )
+
+    async def _setup_tools(self, tools: list[Any], *, task_id: str) -> None:
+        for tool in tools:
+            setup = getattr(tool, "setup", None)
+            if not callable(setup):
+                continue
+            result = setup(task_id=task_id)
+            if inspect.isawaitable(result):
+                await result
+
+    async def _teardown_tools(
+        self,
+        tools: list[Any],
+        *,
+        task_id: str,
+        execution_status: str | None = None,
+    ) -> None:
+        for tool in reversed(tools):
+            teardown = getattr(tool, "teardown", None)
+            if not callable(teardown):
+                continue
+            try:
+                result = self._call_with_supported_kwargs(
+                    teardown,
+                    task_id=task_id,
+                    execution_status=execution_status,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "Tool teardown failed for %s", getattr(tool, "name", tool)
+                )
+
+    async def _load_latest_checkpoint(
+        self,
+        execution_id: str,
+    ) -> dict[str, Any] | None:
+        if self.tracer is None:
+            return None
+
+        payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
+        return payload if isinstance(payload, dict) else None
+
+    async def _confirm_injected_turn(
+        self,
+        execution_id: str,
+        turn_id: str,
+        message: str,
+        *,
+        baseline: dict[str, Any] | None = None,
+    ) -> bool | None:
+        """True/False only for an authoritative read; None remains uncertain.
+
+        Requires read-your-writes storage and a writer that drains pending work
+        before raising. Do not timeout the exclusive section: a surviving write
+        could otherwise race read-back and invalidate a negative confirmation.
+        The gate reports a section held past its stall interval instead.
+        """
+        if not can_read_checkpoints(self.tracer):
+            return None
+        try:
+            payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
+            if payload is None:
+                # Losing a checkpoint that was read before the write is an
+                # inconsistent store, not evidence that this turn is absent.
+                return None if baseline is not None else False
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("context"), dict
+            ):
+                return None
+            messages = payload["context"].get("messages")
+            if not isinstance(messages, list):
+                return None
+            for entry in messages:
+                if not isinstance(entry, dict):
+                    return None
+                metadata = entry.get("metadata")
+                if (
+                    entry.get("role") == "user"
+                    and isinstance(metadata, dict)
+                    and metadata.get("turn_id") == turn_id
+                ):
+                    return True if entry.get("content") == message else None
+            return False
+        except Exception:
+            logger.warning(
+                "Could not confirm injection for %s", execution_id, exc_info=True
+            )
+            return None
+
+    async def _persist_injected_context(
+        self,
+        *,
+        execution_id: str,
+        context: ExecutionContext,
+        label: str,
+        baseline: dict[str, Any] | None,
+    ) -> None:
+        if self.tracer is None:
+            return
+
+        payload = dict(baseline or {})
+        payload.update(
+            {
+                "type": "checkpoint",
+                "label": label,
+                "execution_id": execution_id,
+                "context": context.to_dict(),
+            }
+        )
+
+        checkpoint = getattr(self.tracer, "checkpoint", None)
+        if callable(checkpoint):
+            result = checkpoint(**payload)
+            if inspect.isawaitable(result):
+                await result
+            return
+
+        write_checkpoint = getattr(self.tracer, "write_checkpoint", None)
+        if callable(write_checkpoint):
+            result = write_checkpoint(payload)
+            if inspect.isawaitable(result):
+                await result
+            return
+
+    def _normalize_result(
+        self,
+        *,
+        result: Any,
+        pattern: Any,
+        context: ExecutionContext,
+        execution_id: str,
+    ) -> dict[str, Any]:
+        if isinstance(result, dict):
+            normalized = dict(result)
+        else:
+            normalized = {"success": True, "output": result}
+
+        normalized.setdefault("success", True)
+        normalized.setdefault("execution_id", execution_id)
+        normalized.setdefault("context", context)
+        normalized.setdefault("pattern", pattern.__class__.__name__)
+
+        assistant_message = extract_assistant_message(normalized)
+        if assistant_message:
+            set_assistant_message(normalized, assistant_message)
+        if assistant_message and not self._has_assistant_message(
+            context, assistant_message
+        ):
+            context.add_assistant_message(assistant_message)
+
+        return normalized
+
+    def _has_assistant_message(self, context: ExecutionContext, content: str) -> bool:
+        return any(
+            message.role == "assistant" and message.content == content
+            for message in context.messages
+        )
+
+    async def _finish_run(
+        self,
+        context: ExecutionContext,
+        result: dict[str, Any],
+        *,
+        runtime: PatternRuntime,
+    ) -> None:
+        # Drain an in-flight injection before publishing a terminal result.
+        # Once closed, late live input takes the existing deferred-post path;
+        # callbacks and tool teardown must not reopen this acceptance window.
+        gate = context_checkpoint_gate(context)
+        async with gate.shared():
+            gate.run_finishing = True
+            result["injection_outcome_unknown"] = gate.injection_uncertain
+        budget = active_execution_budget.get()
+        if budget is not None and runtime.budget_owner:
+            if result.get("status") not in {
+                "waiting_for_user",
+                "interrupted",
+                "paused",
+            }:
+                budget.closed = True
+            context.execution_budget = budget.checkpoint_state()
+        # The idle context is evicted when the run returns, so the answer the
+        # runner appended after the pattern's last checkpoint must be durable
+        # for the next input to see it. Only completed runs: a waiting or
+        # interrupted pattern's checkpoint already describes where to resume
+        # (ReAct records its message count), and the question appended here
+        # would read as an answer on a resume without a reply.
+        if result.get("success") is True:
+            try:
+                await runtime.checkpoint_context_tail("run_end_tail", context=context)
+            except ExecutionEventPersistenceError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Final context checkpoint failed for %s; the result stands",
+                    context.execution_id,
+                    exc_info=True,
+                )
+        await self._dispatch_callback(
+            "on_run_end", runner=self, context=context, result=result
+        )
+
+    async def _dispatch_callback(self, event: str, **payload: Any) -> None:
+        for callback in self.callbacks:
+            handler = getattr(callback, event, None)
+            if handler is None:
+                continue
+            maybe_coroutine = handler(**payload)
+            if inspect.isawaitable(maybe_coroutine):
+                await maybe_coroutine
+
+    def _call_with_supported_kwargs(self, fn: Any, **kwargs: Any) -> Any:
+        return fn(**self._call_signature_kwargs(fn, **kwargs))
+
+    def _call_signature_kwargs(self, fn: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return kwargs
+        parameters = signature.parameters.values()
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+            return kwargs
+        return {
+            name: value
+            for name, value in kwargs.items()
+            if name in signature.parameters
+        }

@@ -1,0 +1,377 @@
+from typing import Any, Callable, Optional
+
+from sqlalchemy.orm import Session
+
+from ...model import (
+    ChatModelConfig,
+    EmbeddingModelConfig,
+    ImageModelConfig,
+    ModelConfig,
+    MusicModelConfig,
+    RerankModelConfig,
+    SoundEffectModelConfig,
+    SpeechModelConfig,
+    VectorDBConfig,
+    VectorDBType,
+    VideoModelConfig,
+)
+from ..error import (
+    ModelNotFoundError,
+    UnsupportedModelCategoryError,
+)
+
+# (db, rows sharing the requested model_name) -> usable rows, best first.
+NameMatchScope = Callable[[Session, list[Any]], list[Any]]
+
+
+class SQLAlchemyModelHub:
+    """SQLAlchemy implementation of standalone model storage"""
+
+    def __init__(self, db_session: Session, model_class: Any):
+        """
+        Initialize SQLAlchemy model storage.
+
+        Args:
+            db_session: SQLAlchemy database session
+            model_class: Model ORM class
+        """
+        self.db = db_session
+        self.Model = model_class
+
+    def close(self) -> None:
+        """Close the underlying SQLAlchemy session."""
+        self.db.close()
+
+    def __enter__(self) -> "SQLAlchemyModelHub":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    @staticmethod
+    def _normalize_vector_db_type(raw_value: Any) -> str:
+        """Normalize vector db type values for backward compatibility."""
+        if raw_value is None:
+            return "lancedb"
+        normalized = str(getattr(raw_value, "value", raw_value)).strip().lower()
+        if not normalized:
+            return "lancedb"
+        legacy_aliases = {
+            "weaviate_local": "weaviate",  # backward compatibility
+        }
+        return legacy_aliases.get(normalized, normalized)
+
+    def _load_vector_db_config(
+        self, db_model: Any, common_fields: dict[str, Any]
+    ) -> VectorDBConfig:
+        """Build VectorDBConfig from DB row; mutates common_fields (pops abilities)."""
+        db_type_val = self._normalize_vector_db_type(db_model.model_provider)
+        try:
+            db_type = VectorDBType(db_type_val) if db_type_val else VectorDBType.LANCEDB
+        except ValueError:
+            db_type = VectorDBType.LANCEDB
+        # VectorDBConfig repurposes abilities column for config dict (ModelConfig.abilities is List[str] elsewhere).
+        config_data = common_fields.pop("abilities", {})
+        if not isinstance(config_data, dict):
+            config_data = {}
+        return VectorDBConfig(**common_fields, db_type=db_type, config=config_data)
+
+    def store(self, model: ModelConfig) -> None:
+        db_data: dict[str, Any] = {
+            "model_id": model.id,
+            "model_name": model.model_name,
+            "api_key": model.api_key,
+            "base_url": model.base_url,
+            "abilities": model.abilities,
+            "description": model.description,
+            "max_retries": model.max_retries,
+            "is_active": True,
+        }
+
+        if isinstance(model, ChatModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "temperature": model.default_temperature,
+                    "max_tokens": model.default_max_tokens,
+                    "context_window": model.context_window,
+                    "category": "llm",
+                }
+            )
+            if model.model_provider == "bedrock":
+                db_data.update(
+                    {
+                        "bedrock_region": model.bedrock_region,
+                        "bedrock_auth_mode": model.bedrock_auth_mode,
+                    }
+                )
+        elif isinstance(model, ImageModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "max_tokens": model.default_max_tokens,
+                    "category": "image",
+                }
+            )
+        elif isinstance(model, VideoModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "video",
+                }
+            )
+        elif isinstance(model, EmbeddingModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "dimension": model.dimension,
+                    "category": "embedding",
+                }
+            )
+        elif isinstance(model, RerankModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "rerank",
+                }
+            )
+        elif isinstance(model, SpeechModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "speech",
+                    "language": model.language,
+                    "voice": model.voice,
+                    "format": model.format,
+                    "sample_rate": model.sample_rate,
+                }
+            )
+        elif isinstance(model, SoundEffectModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "sound_effect",
+                }
+            )
+        elif isinstance(model, MusicModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "music",
+                }
+            )
+        elif isinstance(model, VectorDBConfig):
+            # VectorDBConfig repurposes abilities column for config dict (ModelConfig.abilities is List[str] elsewhere).
+            db_data.update(
+                {
+                    "model_provider": model.db_type.value,
+                    "category": "vector_db",
+                    "abilities": model.config,
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {type(model)}")
+
+        db_model = self.Model(**db_data)
+        self.db.add(db_model)
+        self.db.commit()
+
+    def load(
+        self,
+        model_id: str,
+        *,
+        name_match_scope: Optional[NameMatchScope] = None,
+    ) -> ModelConfig:
+        """Load an active model by ``model_id``, falling back to ``model_name``.
+
+        ``model_id`` is unique, so an exact match wins. ``model_name`` is not:
+        several rows (possibly owned by different users) can share one. The
+        fallback therefore orders the matches by primary key, and when
+        *name_match_scope* is given it receives ``(db, matches)`` and returns
+        the matches the caller may use, best first. Multi-user callers must
+        pass a scope; without one the oldest match is used.
+        """
+        db_model = (
+            self.db.query(self.Model)
+            .filter(self.Model.model_id == model_id)
+            .filter(self.Model.is_active)
+            .first()
+        )
+        if not db_model:
+            matches = (
+                self.db.query(self.Model)
+                .filter(self.Model.model_name == model_id)
+                .filter(self.Model.is_active)
+                .order_by(self.Model.id)
+                .all()
+            )
+            if matches and name_match_scope is not None:
+                matches = name_match_scope(self.db, matches)
+            db_model = matches[0] if matches else None
+        if not db_model:
+            raise ModelNotFoundError(model_id)
+
+        common = {
+            "id": db_model.model_id,
+            "model_name": db_model.model_name,
+            "api_key": db_model.api_key,
+            "base_url": db_model.base_url,
+            "abilities": db_model.abilities,
+            "description": db_model.description,
+            "max_retries": db_model.max_retries
+            if db_model.max_retries is not None
+            else 10,
+        }
+
+        if db_model.category == "llm":
+            return ChatModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+                default_temperature=db_model.temperature,
+                default_max_tokens=db_model.max_tokens,
+                context_window=db_model.context_window,
+                bedrock_region=db_model.bedrock_region,
+                bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
+            )
+        elif db_model.category == "image":
+            return ImageModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+                default_max_tokens=db_model.max_tokens,
+            )
+        elif db_model.category == "video":
+            return VideoModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
+        elif db_model.category == "embedding":
+            return EmbeddingModelConfig(
+                **common,
+                dimension=db_model.dimension,
+                model_provider=db_model.model_provider,
+            )
+        elif db_model.category == "rerank":
+            return RerankModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
+        elif db_model.category == "speech":
+            return SpeechModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+                language=db_model.language,
+                voice=db_model.voice,
+                format=db_model.format,
+                sample_rate=db_model.sample_rate,
+            )
+        elif db_model.category == "sound_effect":
+            return SoundEffectModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
+        elif db_model.category == "music":
+            return MusicModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+            )
+        elif db_model.category == "vector_db":
+            return self._load_vector_db_config(db_model, common)
+        else:
+            raise UnsupportedModelCategoryError(db_model.model_id, db_model.category)
+
+    def list(self) -> dict[str, ModelConfig]:
+        db_models = self.db.query(self.Model).filter(self.Model.is_active).all()
+        result: dict[str, ModelConfig] = {}
+
+        for db_model in db_models:
+            # Common fields for all models
+            common_fields = {
+                "id": db_model.model_id,
+                "model_name": db_model.model_name,
+                "api_key": db_model.api_key,
+                "base_url": db_model.base_url,
+                "abilities": db_model.abilities,
+                "description": db_model.description,
+                "max_retries": db_model.max_retries
+                if db_model.max_retries is not None
+                else 10,
+            }
+
+            # Create appropriate config based on category
+            config: ModelConfig | None = None
+            if db_model.category == "llm":
+                config = ChatModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                    default_temperature=db_model.temperature,
+                    default_max_tokens=db_model.max_tokens,
+                    context_window=db_model.context_window,
+                    bedrock_region=db_model.bedrock_region,
+                    bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
+                )
+            elif db_model.category == "image":
+                config = ImageModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "video":
+                config = VideoModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "embedding":
+                config = EmbeddingModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                    dimension=db_model.dimension,
+                )
+            elif db_model.category == "rerank":
+                config = RerankModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "speech":
+                config = SpeechModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                    language=db_model.language,
+                    voice=db_model.voice,
+                    format=db_model.format,
+                    sample_rate=db_model.sample_rate,
+                )
+            elif db_model.category == "sound_effect":
+                config = SoundEffectModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "music":
+                config = MusicModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "vector_db":
+                config = self._load_vector_db_config(db_model, common_fields)
+            else:
+                raise UnsupportedModelCategoryError(
+                    db_model.model_id, db_model.category
+                )
+
+            if config:
+                result[db_model.model_id] = config
+
+        return result
+
+    def exists(self, model_id: str) -> bool:
+        count = (
+            self.db.query(self.Model).filter(self.Model.model_id == model_id).count()
+        )
+        result: bool = count > 0
+        return result
+
+    def delete(self, model_id: str) -> None:
+        db_model = (
+            self.db.query(self.Model).filter(self.Model.model_id == model_id).first()
+        )
+        if db_model:
+            self.db.delete(db_model)
+            self.db.commit()

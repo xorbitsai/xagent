@@ -1,0 +1,57 @@
+name: Install script
+
+on:
+  pull_request:
+    paths:
+      - scripts/install.sh
+      - scripts/get.xagent.co/**
+      - .github/workflows/install-script.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/install.sh
+      - scripts/get.xagent.co/**
+      - .github/workflows/install-script.yml
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22" # node --test needs >=18; AbortSignal.timeout needs >=17.3
+      - name: ShellCheck
+        run: shellcheck scripts/install.sh  # pre-installed on ubuntu runners
+      - name: Test the get.xagent.co worker
+        working-directory: scripts/get.xagent.co
+        run: |
+          node --check worker.js   # ES module (package.json sets "type": "module")
+          node --test
+
+  smoke:
+    # Actually run the one-liner end to end so it can't silently rot.
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run installer and verify the command works
+        env:
+          # Isolate the tool install so the runner's env stays clean and we
+          # control where the `xagent` entry point lands.
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/xagent-bin
+        run: |
+          set -eu
+          sh scripts/install.sh
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          command -v xagent
+          xagent --help
+          tool_python="$(uv tool dir)/xagent-ai/bin/python"
+          "$tool_python" -c 'import playwright'
+          "$tool_python" -c 'import xrouter_llm'
+          "$tool_python" -c 'from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); executable = Path(manager.chromium.executable_path); manager.stop(); assert executable.is_file(), executable'

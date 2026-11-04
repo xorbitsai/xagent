@@ -1,0 +1,1086 @@
+"""
+Image generation tool for xagent
+
+This module provides image generation capabilities using pre-configured image models
+passed from the web layer.
+"""
+
+import asyncio
+import base64
+import logging
+import os
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Optional
+from urllib import parse
+
+from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
+from ...file_ref import build_workspace_file_ref, parse_file_id_ref
+from ...model.image.base import BaseImageModel
+from ...utils.media_download import (
+    describe_media_download_error,
+    download_public_media,
+    resolve_workspace_media_path,
+)
+from ...workspace import ExternalUploadStagingError, TaskWorkspace
+
+logger = logging.getLogger(__name__)
+
+
+class ImageGenerationToolCore:
+    """
+    Image generation tool that uses pre-configured image models.
+    """
+
+    # Enhanced description for generate_image tool
+    GENERATE_IMAGE_DESCRIPTION = """
+Generate high-quality images from text prompts.
+
+If the user provides source/reference images or asks to preserve the style,
+composition, identity, or layout from an existing image, use edit_image directly.
+If generate_image is called with images, it will delegate to edit_image automatically.
+
+When given a user request, rewrite and enrich the prompt into a **professional image generation prompt**:
+- Expand with **visual details** (style, composition, lighting, colors, textures, atmosphere)
+- Transform abstract concepts into **concrete visual scenes**
+- Organize designed graphics around one focal device, a clear hierarchy, and one
+  coherent production finish. Do not use vague words such as "professional" or
+  "premium" as substitutes for a specific visual idea.
+- For multiple creative directions, vary the proposition, structure, focal
+  subject, and treatment materially before varying colors or crops.
+- Text and brand handling:
+  1. The tool can generate complete designed graphics such as ads, posters,
+     banners, and cards, including typography and user-supplied copy; it is not
+     limited to producing text-free backgrounds.
+  2. Quote required copy clearly and keep unnecessary text out.
+  3. Reference images can guide product identity, visual language, palette, and
+     composition. Use only references the user supplied, the task already
+     produced, or an asset retrieved from the brand's own official source; do
+     not go looking for reference material from any other origin, and never take
+     one from the user's other tasks. A plausible-looking search result is not
+     proof that an asset is the brand's; when nothing verifiable is available,
+     ask the user for it. Pass such a reference by path, URL, or
+     file_id through the images parameter. Mentioning a reference only in the
+     prompt does not attach it to the model request.
+  4. Generated depictions are not suitable when a supplied logo, QR code,
+     certification mark, or other exact asset must remain pixel-identical.
+- For a poster, ad, banner, or social graphic, create one single final
+  composition on one continuous canvas per call. Do not generate a contact
+  sheet, moodboard, option grid, multiple versions, repeated layouts, split
+  frames, presentation mockups, or duplicated headlines unless the user
+  explicitly asks for that output format.
+- Keep designed-graphic copy sparse: normally one exact headline, at most one
+  short support line, one concise CTA, and only required fine print. Do not
+  render alternative copy, strategy labels, markdown, prompt annotations, or
+  design rationale.
+- Treat reference images as evidence of recurring brand cues, not an instruction
+  to copy every gradient, metallic effect, ribbon, swoosh, or decorative motif
+  from one campaign.
+- Use precise, concept-specific visual language rather than keyword soup.
+- Express every constraint that matters in the **positive prompt**: some
+  providers ignore negative_prompt entirely, so anything the image must show
+  or avoid needs to be stated positively in the prompt itself.
+- If you use **negative_prompt**, keep it short and quality-focused (low
+  quality, blur, distorted or misspelled text, watermarks, fake logos,
+  contact sheets, extra panels), plus at most a few exclusions this specific
+  request needs. Do not blanket-ban whole families of imagery such as people,
+  crowds, skylines, glow, or 3D as a routine list; that strips legitimate
+  content and flattens the result.
+- For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
+
+Available models (⭐[DEFAULT] marks the configured default model, ◻ marks
+transparent-background support):
+{}
+
+**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
+
+Parameters:
+- prompt (required): optimized image description with visual details
+- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024"). Defaults to a square when omitted, so for ads, posters, and social graphics always pass the placement's real dimensions or aspect_ratio explicitly instead of relying on the default.
+- width (optional): image width in pixels (use with height for desired dimensions)
+- height (optional): image height in pixels (use with width for desired dimensions)
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
+- images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
+- negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
+- transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background. Only models marked ◻ support it; the call fails on any other model. Asking for a transparent background in the prompt text does NOT work -- without this parameter the image always comes back opaque.
+- model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
+
+**IMPORTANT NOTES ON IMAGE SIZES:**
+- Different models have different size capabilities and constraints
+- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
+- **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
+- **DashScope models**: Support limited size options
+- **Xinference models**: Based on Stable Diffusion, may support more flexible dimensions
+
+Size parameter priority (highest to lowest):
+1. aspect_ratio + size (aspect_ratio determines ratio, size determines resolution bucket)
+2. width + height (desired dimensions, will be approximated to closest supported values)
+3. resolution (alternative dimension format)
+4. size (simple format)
+
+Images are automatically saved to workspace.
+    """.strip()
+
+    # Description for edit_image tool
+    EDIT_IMAGE_DESCRIPTION = """
+Edit existing images using text prompts.
+
+This tool allows you to modify existing images by describing the changes you want to make. The AI will understand your instructions and apply the requested modifications to the image.
+
+Common use cases:
+- Change objects, people, or scenes in the image
+- Modify colors, lighting, or style
+- Add or remove elements
+- Fix imperfections or enhance quality
+- Convert image style (e.g., make it look like a painting, cartoon, etc.)
+- Resize or change image dimensions
+
+Text handling in edited images:
+- **Text modifications**: If you want to change existing text in the image, clearly describe what text should be changed and what it should become
+- **New text addition**: Specify exactly what text should appear and where (e.g., "add 'Happy Birthday' text at the top")
+- **Text removal**: Request to remove specific text elements
+- **Brand fidelity**: Use supplied logos, QR codes, or trademarks as references,
+  but do not claim that a generative edit preserved them pixel-for-pixel. When
+  exact fidelity is required, explain the limitation and ask the user to arrange
+  deterministic post-processing — never present a generative edit as exact.
+
+Use only images the user supplied, the task already produced, or an asset
+retrieved from the brand's own official source; do not go looking for source or
+reference material from any other origin, and never take one from the user's
+other tasks. A plausible-looking search result is not proof that an asset is the
+brand's; when nothing verifiable is available, ask the user for it.
+
+Available models (⭐[DEFAULT] marks the configured default model, ◻ marks
+transparent-background support):
+{}
+
+**IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
+
+Parameters:
+- image_url (required): single image path/URL/file_id (supports bare `file_id`, `file:file_id`, and `file://file_id`) or a list of image paths/URLs/file_ids for multi-image editing. Local paths must be authorized by this task's workspace policy and are staged before provider access; use a FileRef for a durable user-owned upload.
+- prompt (required): description of the desired edits and changes
+- negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
+- transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene. Only models marked ◻ support it; the call fails on any other model. Asking for it in the prompt text does NOT work.
+- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
+- width (optional): image width in pixels (use with height for desired dimensions)
+- height (optional): image height in pixels (use with width for desired dimensions)
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
+- model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
+
+**IMPORTANT NOTES ON IMAGE SIZES:**
+- Different models have different size capabilities and constraints
+- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
+- **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
+- **DashScope models**: Support limited size options
+- **Xinference models**: Based on Stable Diffusion, may support more flexible dimensions
+
+Size parameter priority (highest to lowest):
+1. aspect_ratio + size (aspect_ratio determines ratio, size determines resolution bucket)
+2. width + height (desired dimensions, will be approximated to closest supported values)
+3. resolution (alternative dimension format)
+4. size (simple format)
+
+Images are automatically saved to workspace.
+    """.strip()
+
+    def __init__(
+        self,
+        image_models: Dict[str, BaseImageModel],
+        model_descriptions: Optional[Dict[str, str]] = None,
+        workspace: Optional[TaskWorkspace] = None,
+        default_generate_model: Optional[BaseImageModel] = None,
+        default_edit_model: Optional[BaseImageModel] = None,
+    ):
+        """
+        Initialize with pre-configured image models.
+
+        Args:
+            image_models: Dictionary mapping model_id to BaseImageModel instances
+            model_descriptions: Dictionary mapping model_id to description strings
+            workspace: Optional workspace for saving generated images
+            default_generate_model: Default model for image generation
+            default_edit_model: Default model for image editing
+        """
+        self._image_models = image_models
+        self._model_descriptions = model_descriptions or {}
+        self._workspace = workspace
+        self._default_generate_model = default_generate_model
+        self._default_edit_model = default_edit_model
+        self._generate_model_info_text()
+
+    def _build_image_artifacts(
+        self, image_path: Optional[str], file_id: Optional[str]
+    ) -> list[dict[str, str]]:
+        """Build display-safe image artifact metadata for a registered image."""
+        if not file_id:
+            return []
+
+        filename = Path(image_path).name if image_path else "generated_image.png"
+        mime_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".svg": "image/svg+xml",
+        }.get(Path(filename).suffix.lower(), "image/png")
+
+        return [
+            {
+                "type": "image",
+                "file_id": file_id,
+                "filename": filename,
+                "mime_type": mime_type,
+                "display": "inline",
+            }
+        ]
+
+    def _generate_model_info_text(self) -> None:
+        """Generate formatted text with available models and descriptions."""
+        if not self._image_models:
+            self._model_info_text = "No image models available"
+            self._edit_model_info_text = (
+                "No image models with edit capabilities available"
+            )
+            return
+
+        # Get default model IDs for marking
+        default_generate_id = None
+        if self._default_generate_model:
+            default_generate_id = getattr(
+                self._default_generate_model, "model_id", None
+            ) or getattr(self._default_generate_model, "model_name", None)
+
+        default_edit_id = None
+        if self._default_edit_model:
+            default_edit_id = getattr(
+                self._default_edit_model, "model_id", None
+            ) or getattr(self._default_edit_model, "model_name", None)
+
+        # Generate info for generate-capable models only (for generate_image)
+        # Put default model first, then others
+        default_model_lines = []
+        other_model_lines = []
+        for model_id, model in self._image_models.items():
+            if self._has_ability(model, "generate"):
+                description = self._model_descriptions.get(model_id, "")
+                edit_marker = " ✎" if self._has_ability(model, "edit") else ""
+                transparency_marker = " ◻" if self._supports_transparency(model) else ""
+                is_default = model_id == default_generate_id
+                default_marker = " ⭐[DEFAULT]" if is_default else ""
+
+                if description:
+                    line = f"- {model_id}: {description}{edit_marker}{transparency_marker}{default_marker}"
+                else:
+                    line = f"- {model_id}: No description available{edit_marker}{transparency_marker}{default_marker}"
+
+                if is_default:
+                    default_model_lines.append(line)
+                else:
+                    other_model_lines.append(line)
+
+        model_lines = default_model_lines + other_model_lines
+        if model_lines:
+            self._model_info_text = "\n".join(model_lines)
+        else:
+            self._model_info_text = (
+                "No image models with generate capabilities available"
+            )
+
+        # Generate info for edit-capable models only (for edit_image)
+        # Put default model first, then others
+        default_edit_lines = []
+        other_edit_lines = []
+        for model_id, model in self._image_models.items():
+            if self._has_ability(model, "edit"):
+                description = self._model_descriptions.get(model_id, "")
+                is_default = model_id == default_edit_id
+                default_marker = " ⭐[DEFAULT]" if is_default else ""
+                transparency_marker = " ◻" if self._supports_transparency(model) else ""
+
+                if description:
+                    line = f"- {model_id}: {description}{transparency_marker}{default_marker}"
+                else:
+                    line = f"- {model_id}: No description available{transparency_marker}{default_marker}"
+
+                if is_default:
+                    default_edit_lines.append(line)
+                else:
+                    other_edit_lines.append(line)
+
+        edit_model_lines = default_edit_lines + other_edit_lines
+        if edit_model_lines:
+            self._edit_model_info_text = "\n".join(edit_model_lines)
+        else:
+            self._edit_model_info_text = (
+                "No image models with edit capabilities available"
+            )
+
+    def _resolve_model_label(
+        self, image_model: Optional[BaseImageModel], model_id: Optional[str]
+    ) -> str:
+        """Best-effort identifier of the model that actually served the request."""
+        if model_id and model_id in self._image_models:
+            return model_id
+        if image_model is not None:
+            for known_id, model in self._image_models.items():
+                if model is image_model:
+                    return known_id
+            model_name = getattr(image_model, "model_name", None)
+            if model_name:
+                return str(model_name)
+        return "default"
+
+    def _get_model(self, model_id: Optional[str] = None) -> Optional[BaseImageModel]:
+        """Get image model with generate capability by ID or default model."""
+        if model_id and model_id in self._image_models:
+            model = self._image_models[model_id]
+            if self._has_ability(model, "generate"):
+                return model
+            else:
+                logger.warning(f"Model {model_id} does not support generation")
+                return None
+
+        # Use configured default generate model
+        if self._has_ability(self._default_generate_model, "generate"):
+            return self._default_generate_model
+
+        # Fallback: return first available model with generate capability
+        for model in self._image_models.values():
+            if self._has_ability(model, "generate"):
+                return model
+
+        return None
+
+    def _get_edit_model(
+        self, model_id: Optional[str] = None
+    ) -> Optional[BaseImageModel]:
+        """Get image model with edit capability by ID or default edit model."""
+        if model_id and model_id in self._image_models:
+            model = self._image_models[model_id]
+            if self._has_ability(model, "edit"):
+                return model
+            else:
+                logger.warning(f"Model {model_id} does not support editing")
+                return None
+
+        # A hand-configured default still has to declare the ability, or it
+        # reaches the provider and raises there instead of returning our error.
+        if self._has_ability(self._default_edit_model, "edit"):
+            return self._default_edit_model
+
+        # Fallback: return first available model with edit capability
+        for model in self._image_models.values():
+            if self._has_ability(model, "edit"):
+                return model
+
+        return None
+
+    @staticmethod
+    def _has_ability(model: Any, ability: str) -> bool:
+        """Capable only when the model itself declares the ability."""
+        has_ability = getattr(model, "has_ability", None)
+        return callable(has_ability) and bool(has_ability(ability))
+
+    @staticmethod
+    def _supports_transparency(model: Any) -> bool:
+        """Whether the provider can return a real alpha channel.
+
+        Read defensively through getattr for the same reason the abilities
+        probe is: models arrive wrapped in the retry proxy, and a provider
+        class written before this property existed must answer False rather
+        than raising.
+
+        Compared against True rather than coerced with bool() because the two
+        errors are not symmetric. A false negative refuses a request that would
+        have worked; a false positive forwards ``transparent_background`` to a
+        provider that splices unknown fields straight into its request payload,
+        failing the whole generation. Anything not literally True is treated as
+        unsupported.
+        """
+        return getattr(model, "supports_transparent_background", False) is True
+
+    def _available_models_summary(self) -> str:
+        entries = []
+        for model_id, model in self._image_models.items():
+            abilities = getattr(model, "abilities", None)
+            if abilities is None:
+                joined = "unknown"
+            elif not isinstance(abilities, (list, tuple)):
+                logger.warning(
+                    "Model %s reports a non-sequence abilities value of type %s",
+                    model_id,
+                    type(abilities).__name__,
+                )
+                joined = "unknown"
+            else:
+                joined = ", ".join(str(ability) for ability in abilities) or "none"
+            entries.append(f"{model_id} (abilities: {joined})")
+        return "; ".join(entries) or "none configured"
+
+    def _no_edit_model_error(self, model_id: Optional[str] = None) -> str:
+        # Each branch has to name a different way out, or the model retries the
+        # exact call it just made — the failure this whole error exists to stop.
+        if model_id and self._get_edit_model() is not None:
+            remedy = (
+                f"Model {model_id} cannot edit: retry edit_image without model_id, "
+                "or pick one listed above that has the edit ability."
+            )
+        elif self._get_model() is not None:
+            # generate_image(images=...) delegates here, so never answer that
+            # call with "use generate_image".
+            remedy = (
+                "Image editing is unavailable in this deployment: retry "
+                "generate_image without images and describe the change in the "
+                "prompt instead."
+            )
+        else:
+            remedy = (
+                "No configured model can edit or generate images: stop retrying "
+                "image tools and report that to the user."
+            )
+        return (
+            "No available image models with edit capabilities. "
+            f"Configured image models: {self._available_models_summary()}. {remedy}"
+        )
+
+    def _no_generate_model_error(self, model_id: Optional[str] = None) -> str:
+        if model_id and self._get_model() is not None:
+            remedy = (
+                f"Model {model_id} cannot generate: retry generate_image without "
+                "model_id, or pick one listed above that has the generate ability."
+            )
+        else:
+            remedy = (
+                "No configured model can generate images: stop retrying image "
+                "tools and report that to the user."
+            )
+        return (
+            "No available image models with generate capabilities. "
+            f"Configured image models: {self._available_models_summary()}. {remedy}"
+        )
+
+    def _transparency_capable_models(self) -> list[str]:
+        """Configured model ids whose provider can return an alpha channel."""
+        return [
+            model_id
+            for model_id, model in self._image_models.items()
+            if self._supports_transparency(model)
+        ]
+
+    def _no_transparency_error(self, model: Any, model_id: Optional[str]) -> str:
+        """Explain the refusal and name a way forward, or say there is none.
+
+        Without the list of capable models the caller can only retry blindly
+        against the same model, so the message has to distinguish "use a
+        different model" from "no configured model can do this at all".
+        """
+        name = model_id or getattr(model, "model_name", "the default model")
+        capable = self._transparency_capable_models()
+        if capable:
+            remedy = (
+                "Retry with model_id set to one of: " + ", ".join(sorted(capable)) + "."
+            )
+        else:
+            remedy = (
+                "No configured image model can produce a transparent background: "
+                "stop retrying, and tell the user the image will have an opaque "
+                "background unless a model that supports it is configured."
+            )
+        return (
+            f"Model {name} cannot produce a transparent background. Asking for "
+            "one in the prompt text does not work either: these providers have "
+            f"no way to emit an alpha channel. {remedy}"
+        )
+
+    def _resolve_image_path(self, image_input: str) -> str:
+        """
+        Resolve image input to appropriate format for image model.
+
+        Args:
+            image_input: Either a URL string or a local file path
+
+        Returns:
+            str: Resolved image path/URL suitable for the image model
+        """
+        # Remote URLs and inline image payloads do not read from the host
+        # filesystem, so workspace path confinement does not apply to them.
+        if image_input.startswith(("http://", "https://", "data:image/")):
+            return image_input
+
+        # Local image reads are a workspace capability, not ambient host file
+        # access. In particular, never fall back to CWD/absolute-path
+        # resolution after the workspace rejects a selector.
+        if self._workspace is None:
+            raise ValueError("Access denied: local images require a task workspace")
+
+        resolved_path = self._workspace.resolve_path_with_search(image_input)
+        workspace_path = resolve_workspace_media_path(
+            Path(resolved_path), self._workspace.workspace_dir
+        )
+
+        if not workspace_path.is_file():
+            raise FileNotFoundError(f"Local image file not found: {image_input}")
+
+        logger.info(
+            "Resolved image path inside task workspace: %s -> %s",
+            image_input,
+            workspace_path,
+        )
+        return str(workspace_path)
+
+    def _resolve_edit_image_path(
+        self, image_input: str, staged_paths: list[Path]
+    ) -> str:
+        """Stage one authorized edit input so providers cannot reopen a swap."""
+        if image_input.startswith(("http://", "https://", "data:image/")):
+            return image_input
+        if self._workspace is None:
+            return self._resolve_image_path(image_input)
+        try:
+            staged_path = self._workspace.stage_path_for_external_upload(
+                image_input,
+                max_bytes=get_max_upload_size_bytes(),
+                host_private=True,
+            )
+        except ExternalUploadStagingError:
+            raise
+        except (FileNotFoundError, ValueError) as path_error:
+            file_id = parse_file_id_ref(image_input)
+            if file_id is None:
+                if isinstance(path_error, FileNotFoundError):
+                    raise path_error
+                raise ValueError(
+                    "Access denied: local image is outside the task workspace"
+                ) from path_error
+            staged_path = self._workspace.stage_file_for_external_upload(
+                file_id,
+                max_bytes=get_max_upload_size_bytes(),
+                host_private=True,
+            )
+        staged_paths.append(staged_path)
+        return str(staged_path)
+
+    async def _resolve_edit_image_path_async(
+        self, image_input: str, staged_paths: list[Path]
+    ) -> str:
+        """Stage without blocking the event loop or leaking on cancellation."""
+        task = asyncio.create_task(
+            asyncio.to_thread(self._resolve_edit_image_path, image_input, staged_paths)
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            raise
+
+    def _normalize_image_inputs(self, image: str | list[str]) -> list[str]:
+        """Normalize image inputs to a non-empty list of strings."""
+        if isinstance(image, str):
+            if not image:
+                raise ValueError("image must be a non-empty string")
+            return [image]
+        if isinstance(image, list):
+            if not image:
+                raise ValueError("image list cannot be empty")
+            if not all(isinstance(item, str) and item for item in image):
+                raise ValueError("All image entries must be non-empty strings")
+            return image
+        raise ValueError("image must be a string or list of strings")
+
+    async def _download_image(
+        self, image_url: str, filename: Optional[str] = None, timeout: int = 30
+    ) -> str:
+        """
+        Download image from URL and save to workspace.
+
+        Args:
+            image_url: URL of the image to download
+            filename: Optional filename to save as, or save to an auto-generated filename
+            timeout: Download timeout in seconds (default: 30)
+
+        Returns:
+            Path to the saved image file
+        """
+        if not self._workspace:
+            raise ValueError("No workspace available for saving images")
+
+        # Generate filename if not provided
+        extension = ""
+        is_data_url = image_url.startswith("data:")
+        if is_data_url:
+            header, _, _ = image_url.partition(",")
+            media_type = (
+                header[5:].split(";", 1)[0] if header.startswith("data:") else ""
+            )
+            extension = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/jpg": ".jpg",
+                "image/webp": ".webp",
+            }.get(media_type, "")
+
+        if not filename:
+            # Extract file extension from URL or default to .png
+            url_path = image_url.split("?")[0]  # Remove query parameters
+            if not extension:
+                extension = os.path.splitext(url_path)[1]
+            if not extension:
+                extension = ".png"  # Default extension for generated images
+
+            filename = f"generated_image_{uuid.uuid4().hex[:8]}{extension}"
+
+        # Ensure filename is safe
+        filename = "".join(c for c in filename if c.isalnum() or c in ("-", "_", "."))
+
+        # Save to output directory
+        save_path = self._workspace.output_dir / filename
+
+        try:
+            if is_data_url:
+                header, _, data = image_url.partition(",")
+                if ";base64" in header:
+                    content = base64.b64decode(data)
+                else:
+                    content = parse.unquote_to_bytes(data)
+                with open(save_path, "wb") as f:
+                    f.write(content)
+                logger.info(f"Saved data URL image to: {save_path}")
+                return str(save_path)
+
+            local_path = None
+            if image_url.startswith("file://"):
+                parsed = parse.urlparse(image_url)
+                if parsed.scheme == "file":
+                    local_path = Path(parse.unquote(parsed.path))
+            elif not parse.urlparse(image_url).scheme:
+                local_path = Path(image_url)
+
+            if local_path is not None:
+                local_path = await asyncio.to_thread(
+                    resolve_workspace_media_path,
+                    local_path,
+                    self._workspace.workspace_dir,
+                )
+                if not await asyncio.to_thread(local_path.is_file):
+                    raise RuntimeError(
+                        "Local image path is not a file in the workspace"
+                    )
+                if local_path != await asyncio.to_thread(save_path.resolve):
+                    await asyncio.to_thread(shutil.copyfile, local_path, save_path)
+                logger.info(f"Copied local image to: {save_path}")
+                return str(save_path)
+
+            await download_public_media(
+                image_url,
+                save_path,
+                timeout=timeout,
+                max_bytes=get_media_download_max_bytes("image"),
+                media_kind="image",
+            )
+
+            logger.info(f"Downloaded image to: {save_path}")
+            return str(save_path)
+
+        except Exception as e:
+            logger.warning(
+                "Failed to download image: %s", describe_media_download_error(e)
+            )
+            raise
+
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024*1024",
+        negative_prompt: str = "",
+        model_id: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        resolution: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        images: str | list[str] | None = None,
+        transparent_background: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Generate an image using the configured image model.
+
+        Args:
+            prompt: Text prompt for image generation
+            size: Image size in format "width*height" (e.g., "1024*1024")
+            negative_prompt: Negative prompt for image generation
+            model_id: Specific model ID to use (optional, uses default if not provided)
+            width: Image width in pixels (alternative to size)
+            height: Image height in pixels (alternative to size)
+            resolution: Image resolution (e.g., "1920x1080")
+            aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            images: Optional source/reference image(s). When provided, delegate to edit_image.
+            transparent_background: Return a PNG with a real alpha channel.
+                Only models whose provider supports it can honour this; the
+                request is refused rather than silently answered with an opaque
+                image.
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            Dictionary with image generation result
+        """
+        try:
+            if images is not None:
+                return await self.edit_image(
+                    prompt=prompt,
+                    image_url=images,
+                    negative_prompt=negative_prompt,
+                    model_id=model_id,
+                    size=size,
+                    width=width,
+                    height=height,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                    transparent_background=transparent_background,
+                    **kwargs,
+                )
+
+            # Get the image model to use
+            image_model = self._get_model(model_id)
+
+            if not image_model:
+                return {
+                    "success": False,
+                    "error": self._no_generate_model_error(model_id),
+                    "image_path": None,
+                }
+
+            if transparent_background and not self._supports_transparency(image_model):
+                # Refused rather than downgraded: the caller asked for a cutout,
+                # and an opaque image returned as though it had worked is worse
+                # than an error that names a model which can do it.
+                return {
+                    "success": False,
+                    "error": self._no_transparency_error(image_model, model_id),
+                    "image_path": None,
+                }
+
+            # Build parameters for image generation
+            generate_params: dict[str, Any] = {
+                "prompt": prompt,
+                "size": size,
+                "negative_prompt": negative_prompt,
+            }
+            if transparent_background:
+                # Only forwarded to a provider that declares the capability:
+                # dashscope and xinference splice unknown kwargs straight into
+                # their request payloads, where an unexpected field is an error.
+                generate_params["transparent_background"] = True
+
+            # Add optional parameters if provided
+            if width is not None:
+                generate_params["width"] = width
+            if height is not None:
+                generate_params["height"] = height
+            if resolution is not None:
+                generate_params["resolution"] = resolution
+            if aspect_ratio is not None:
+                generate_params["aspect_ratio"] = aspect_ratio
+
+            # Add any additional kwargs
+            generate_params.update(kwargs)
+
+            # Generate the image
+            result = await image_model.generate_image(**generate_params)
+
+            # Determine the actual model used
+            actual_model_id = self._resolve_model_label(image_model, model_id)
+
+            image_url = result.get("image_url")
+            image_path = None
+            download_error = None
+            image_file_id: Optional[str] = None
+            file_ref: Optional[dict[str, Any]] = None
+
+            # Download image to workspace if workspace is available
+            if image_url and self._workspace:
+                try:
+                    with self._workspace.auto_register_files():
+                        image_path = await self._download_image(image_url)
+                    if image_path:
+                        try:
+                            file_ref = build_workspace_file_ref(
+                                workspace=self._workspace,
+                                file_path=image_path,
+                            )
+                            image_file_id = file_ref["file_id"]
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to build generated image FileRef: %s", e
+                            )
+                            image_file_id = self._workspace.get_file_id_from_path(
+                                image_path
+                            )
+                except Exception as e:
+                    download_error = describe_media_download_error(e)
+                    logger.warning(
+                        "Failed to download image to workspace: %s", download_error
+                    )
+                    # Continue execution even if download fails
+            elif image_url and not self._workspace:
+                logger.warning("No workspace available, image not saved locally")
+
+            response = {
+                "success": True,
+                "image_path": image_path,
+                "file_id": image_file_id,
+                "artifacts": self._build_image_artifacts(image_path, image_file_id),
+                "file_ref": file_ref,
+                "usage": result.get("usage", {}),
+                "task_metric": result.get("task_metric", {}),
+                "request_id": result.get("request_id"),
+                "model_used": actual_model_id,
+                "saved_to_workspace": image_path is not None,
+            }
+            if download_error is not None:
+                response["download_error"] = download_error
+            return response
+
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
+            # Determine the actual model used for error reporting
+            actual_model_id = self._resolve_model_label(
+                self._get_model(model_id), model_id
+            )
+            return {
+                "success": False,
+                "error": str(e),
+                "image_path": None,
+                "model_used": actual_model_id,
+            }
+
+    async def edit_image(
+        self,
+        prompt: str,
+        image_url: str | list[str],
+        negative_prompt: str = "",
+        model_id: Optional[str] = None,
+        size: str = "1024*1024",
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        resolution: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        transparent_background: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Edit an image using the configured image model.
+
+        Args:
+            image_url: URL/path of a single source image to edit, or list of URLs/paths
+            prompt: Text prompt describing the desired edits
+            negative_prompt: Negative prompt for image editing
+            model_id: Specific model ID to use (optional, uses first available edit-capable model if not provided)
+            size: Image size in format "width*height" (e.g., "1024*1024")
+            width: Image width in pixels (alternative to size)
+            height: Image height in pixels (alternative to size)
+            resolution: Image resolution (e.g., "1920x1080")
+            aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            transparent_background: Return a PNG with a real alpha channel, e.g.
+                to cut the subject out of its scene. Only models whose provider
+                supports it can honour this; the request is refused rather than
+                silently answered with an opaque image.
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            Dictionary with image editing result
+        """
+        staged_image_paths: list[Path] = []
+        try:
+            # Get the image model to use
+            image_model = self._get_edit_model(model_id)
+
+            if not image_model:
+                return {
+                    "success": False,
+                    "error": self._no_edit_model_error(model_id),
+                    "image_path": None,
+                }
+
+            image_inputs = self._normalize_image_inputs(image_url)
+            resolved_image_paths = []
+            for image_input in image_inputs:
+                resolved_image_paths.append(
+                    await self._resolve_edit_image_path_async(
+                        image_input, staged_image_paths
+                    )
+                )
+            logger.info(
+                f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
+            )
+
+            if transparent_background and not self._supports_transparency(image_model):
+                # See generate_image: refused rather than downgraded.
+                return {
+                    "success": False,
+                    "error": self._no_transparency_error(image_model, model_id),
+                    "image_path": None,
+                }
+
+            # Build parameters for image editing
+            edit_params: dict[str, Any] = {
+                "image_url": resolved_image_paths[0]
+                if len(resolved_image_paths) == 1
+                else resolved_image_paths,
+                "prompt": prompt,
+                "size": size,
+                "negative_prompt": negative_prompt,
+            }
+            if transparent_background:
+                # See generate_image: forwarded only where it is understood.
+                edit_params["transparent_background"] = True
+
+            # Add optional parameters if provided
+            if width is not None:
+                edit_params["width"] = width
+            if height is not None:
+                edit_params["height"] = height
+            if resolution is not None:
+                edit_params["resolution"] = resolution
+            if aspect_ratio is not None:
+                edit_params["aspect_ratio"] = aspect_ratio
+
+            # Add any additional kwargs
+            edit_params.update(kwargs)
+
+            # Edit the image
+            result = await image_model.edit_image(**edit_params)
+
+            # Determine the actual model used
+            actual_model_id = self._resolve_model_label(image_model, model_id)
+
+            edited_image_url = result.get("image_url")
+            image_path = None
+            download_error = None
+            image_file_id: Optional[str] = None
+            file_ref: Optional[dict[str, Any]] = None
+
+            # Download image to workspace if workspace is available
+            if edited_image_url and self._workspace:
+                try:
+                    # Use a different filename pattern for edited images
+                    filename = f"edited_image_{uuid.uuid4().hex[:8]}.png"
+                    with self._workspace.auto_register_files():
+                        image_path = await self._download_image(
+                            edited_image_url, filename
+                        )
+                    if image_path:
+                        try:
+                            file_ref = build_workspace_file_ref(
+                                workspace=self._workspace,
+                                file_path=image_path,
+                            )
+                            image_file_id = file_ref["file_id"]
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to build edited image FileRef: %s", e
+                            )
+                            image_file_id = self._workspace.get_file_id_from_path(
+                                image_path
+                            )
+                except Exception as e:
+                    download_error = describe_media_download_error(e)
+                    logger.warning(
+                        "Failed to download edited image to workspace: %s",
+                        download_error,
+                    )
+                    # Continue execution even if download fails
+            elif edited_image_url and not self._workspace:
+                logger.warning("No workspace available, edited image not saved locally")
+
+            response = {
+                "success": True,
+                "image_path": image_path,
+                "file_id": image_file_id,
+                "artifacts": self._build_image_artifacts(image_path, image_file_id),
+                "file_ref": file_ref,
+                "usage": result.get("usage", {}),
+                "task_metric": result.get("task_metric", {}),
+                "request_id": result.get("request_id"),
+                "model_used": actual_model_id,
+                "saved_to_workspace": image_path is not None,
+            }
+            if download_error is not None:
+                response["download_error"] = download_error
+            return response
+
+        except Exception as e:
+            logger.error(f"Image editing failed: {e}")
+            # Determine the actual model used for error reporting
+            actual_model_id = self._resolve_model_label(
+                self._get_edit_model(model_id), model_id
+            )
+            return {
+                "success": False,
+                "error": str(e),
+                "image_path": None,
+                "model_used": actual_model_id,
+            }
+        finally:
+            if self._workspace is not None:
+                for staged_path in staged_image_paths:
+                    try:
+                        self._workspace.discard_staged_external_upload(staged_path)
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up staged image edit input",
+                            exc_info=True,
+                        )
+
+    def list_available_models(self) -> Dict[str, Any]:
+        """
+        List all available image models.
+
+        Returns:
+            Dictionary with available models information including descriptions
+        """
+        try:
+            models_info = []
+            for model_id, model in self._image_models.items():
+                # When capability gating withholds every image tool this listing
+                # is the only thing left to explain why, so it has to report what
+                # each model can actually serve rather than a flat "available".
+                abilities = [
+                    ability
+                    for ability in ("generate", "edit")
+                    if self._has_ability(model, ability)
+                ]
+                model_info = {
+                    "model_id": model_id,
+                    "available": bool(abilities),
+                    "abilities": abilities,
+                    "description": self._model_descriptions.get(model_id, ""),
+                    "supports_transparent_background": self._supports_transparency(
+                        model
+                    ),
+                }
+                models_info.append(model_info)
+
+            return {
+                "success": True,
+                "models": models_info,
+                "count": len(models_info),
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to list available models: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "models": [],
+                "count": 0,
+            }

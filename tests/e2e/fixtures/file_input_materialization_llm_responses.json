@@ -1,0 +1,60 @@
+[
+  {
+    "kind": "json_text",
+    "content": {
+      "type": "tool_call",
+      "reasoning": "Read the uploaded input file."
+    }
+  },
+  {
+    "kind": "tool_call",
+    "tool_calls": [
+      {
+        "id": "call_read_uploaded_input",
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "arguments": {
+            "file_path": "source.txt",
+            "encoding": "utf-8"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "kind": "json_text",
+    "content": {
+      "type": "tool_call",
+      "reasoning": "Write an output derived from the uploaded input."
+    }
+  },
+  {
+    "kind": "tool_call",
+    "tool_calls": [
+      {
+        "id": "call_write_derived_output",
+        "type": "function",
+        "function": {
+          "name": "write_file",
+          "arguments": {
+            "file_path": "derived-from-input.txt",
+            "content": "derived from uploaded input: source from minio\n",
+            "encoding": "utf-8",
+            "create_dirs": true
+          }
+        }
+      }
+    ]
+  },
+  {
+    "kind": "json_text",
+    "content": {
+      "type": "final_answer",
+      "reasoning": "The uploaded file was read and the derived output was written.",
+      "answer": "Created derived-from-input.txt from source.txt",
+      "success": true,
+      "error": null
+    }
+  }
+]

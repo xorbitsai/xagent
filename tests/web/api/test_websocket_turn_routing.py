@@ -1,0 +1,178 @@
+import asyncio
+
+import pytest
+
+from xagent.web.models.task import TaskStatus
+from xagent.web.services.task_command_execution import _task_status_uses_live_control
+from xagent.web.services.task_execution import (
+    BackgroundTaskManager,
+    _clear_task_pause_accepted,
+    _is_task_pause_accepted,
+    _mark_task_pause_accepted,
+)
+
+
+def test_paused_task_user_message_is_not_live_control() -> None:
+    assert not _task_status_uses_live_control(TaskStatus.PAUSED)
+
+
+def test_active_task_user_messages_stay_live_control() -> None:
+    assert _task_status_uses_live_control(TaskStatus.RUNNING)
+    assert _task_status_uses_live_control(TaskStatus.WAITING_FOR_USER)
+
+
+def test_requested_control_states_route_messages_consistently() -> None:
+    assert _task_status_uses_live_control(
+        TaskStatus.PAUSED,
+        control_state="resume_requested",
+    )
+    assert not _task_status_uses_live_control(
+        TaskStatus.RUNNING,
+        control_state="pause_requested",
+    )
+
+
+def test_accepted_pause_routes_active_task_out_of_live_control() -> None:
+    assert not _task_status_uses_live_control(
+        TaskStatus.RUNNING,
+        pause_accepted=True,
+    )
+    assert not _task_status_uses_live_control(
+        TaskStatus.WAITING_FOR_USER,
+        pause_accepted=True,
+    )
+
+
+def test_terminal_and_pending_statuses_are_not_live_control() -> None:
+    assert not _task_status_uses_live_control(TaskStatus.PENDING)
+    assert not _task_status_uses_live_control(TaskStatus.COMPLETED)
+    assert not _task_status_uses_live_control(TaskStatus.FAILED)
+
+
+def test_pause_accepted_marker_can_be_cleared() -> None:
+    task_id = 12345
+    _clear_task_pause_accepted(task_id)
+
+    _mark_task_pause_accepted(task_id)
+    assert _is_task_pause_accepted(task_id)
+
+    _clear_task_pause_accepted(task_id)
+    assert not _is_task_pause_accepted(task_id)
+
+
+@pytest.mark.asyncio
+async def test_resume_coordinator_does_not_replace_task_that_it_waits_for() -> None:
+    manager = BackgroundTaskManager()
+    allow_original_to_check = asyncio.Event()
+    promoted = asyncio.Event()
+    allow_resume_to_finish = asyncio.Event()
+
+    async def original_runner() -> None:
+        await allow_original_to_check.wait()
+        await manager.wait_for_previous(7)
+
+    original = asyncio.create_task(original_runner())
+    manager.register_task(7, original)
+    assert manager.reserve_resume(7)
+
+    async def resume_runner() -> None:
+        await original
+        current = asyncio.current_task()
+        assert current is not None
+        manager.promote_resume_task(7, current)
+        promoted.set()
+        await allow_resume_to_finish.wait()
+
+    resume = asyncio.create_task(resume_runner())
+    manager.register_reserved_resume(7, resume, run_id=None)
+
+    # The original remains the active execution until it finishes, so its
+    # wait_for_previous call sees itself instead of the resume coordinator.
+    assert manager.running_tasks[7] is original
+    assert manager.resume_tasks[7] is resume
+    assert not manager.reserve_resume(7)
+
+    try:
+        allow_original_to_check.set()
+        await asyncio.wait_for(promoted.wait(), timeout=1)
+        # Check ownership while the promoted coordinator is still running;
+        # completed owners are intentionally removed by their done callback.
+        assert original.done()
+        assert not resume.done()
+        assert manager.running_tasks[7] is resume
+        assert manager.resume_tasks[7] is resume
+    finally:
+        allow_original_to_check.set()
+        allow_resume_to_finish.set()
+        await asyncio.wait_for(asyncio.gather(original, resume), timeout=1)
+
+    assert 7 not in manager.running_tasks
+    assert 7 not in manager.resume_tasks
+
+
+@pytest.mark.asyncio
+async def test_unregistered_resume_coordinator_cannot_promote_itself() -> None:
+    manager = BackgroundTaskManager()
+    current = asyncio.current_task()
+    assert current is not None
+
+    with pytest.raises(RuntimeError, match="not registered"):
+        manager.promote_resume_task(7, current)
+
+    assert 7 not in manager.running_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelling_waiter_does_not_cancel_previous_execution() -> None:
+    manager = BackgroundTaskManager()
+    previous_started = asyncio.Event()
+    allow_previous_to_finish = asyncio.Event()
+
+    async def previous_execution() -> None:
+        previous_started.set()
+        await allow_previous_to_finish.wait()
+
+    previous = asyncio.create_task(previous_execution())
+    manager.register_task(7, previous)
+    await previous_started.wait()
+
+    waiter = asyncio.create_task(manager.wait_for_previous(7))
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert not previous.done()
+    assert not previous.cancelled()
+
+    allow_previous_to_finish.set()
+    await previous
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_reports_when_live_local_work_was_cancelled() -> None:
+    manager = BackgroundTaskManager()
+    started = asyncio.Event()
+
+    async def local_execution() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(local_execution())
+    manager.register_task(7, task)
+    await started.wait()
+
+    outcome = await manager.cancel_task(7)
+
+    assert outcome.requested is True
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_reports_no_request_without_live_local_work() -> None:
+    manager = BackgroundTaskManager()
+
+    outcome = await manager.cancel_task(7)
+
+    assert outcome.requested is False

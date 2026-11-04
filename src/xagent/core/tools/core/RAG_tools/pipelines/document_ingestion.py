@@ -1,0 +1,1551 @@
+"""Document ingestion pipeline orchestrating core RAG tools."""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import logging
+import os
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+from xagent.core.model.chat.token_context import call_with_own_usage, get_token_usage
+from xagent.core.model.embedding.base import BaseEmbedding
+from xagent.core.model.model import EmbeddingModelConfig
+
+from ..chunk.chunk_document import chunk_document
+from ..core.config import (
+    DEFAULT_IMAGE_CONTEXT_SIZE,
+    DEFAULT_TABLE_CONTEXT_SIZE,
+    DEFAULT_TIKTOKEN_ENCODING,
+)
+from ..core.exceptions import (
+    DatabaseOperationError,
+    DocumentValidationError,
+    EmbeddingAdapterError,
+    RagCoreException,
+    VectorValidationError,
+)
+from ..core.schemas import (
+    ChunkEmbeddingData,
+    ChunkForEmbedding,
+    ChunkStrategy,
+    DocumentProcessingStatus,
+    EmbeddingReadResponse,
+    EmbeddingWriteResponse,
+    IngestionConfig,
+    IngestionResult,
+    IngestionStepResult,
+    ParseDocumentResponse,
+)
+from ..file.register_document import register_document
+from ..management.collection_manager import (
+    initialize_collection_embedding_sync,
+    resolve_effective_embedding_model_sync,
+    update_collection_stats_sync,
+    validate_document_processing_sync,
+)
+from ..management.status import write_ingestion_status
+from ..parse.parse_document import parse_document
+from ..progress import ProgressManager, ProgressTracker
+from ..utils.config_utils import IngestionConfigInput, coerce_ingestion_config
+from ..utils.embedding_utils import (
+    normalize_raw_embedding_to_vectors,
+    normalize_single_embedding,
+)
+from ..utils.model_resolver import resolve_embedding_adapter
+from ..utils.token_utils import get_token_counter
+from ..utils.user_scope import resolve_user_scope, user_scope_context
+from ..vector_storage.vector_manager import (
+    commit_vectors_to_db,
+    read_chunks_for_embedding,
+    write_vectors_to_db,
+)
+
+if TYPE_CHECKING:
+    from ..kb import KBPipelineCompatibilityFacade
+
+logger = logging.getLogger(__name__)
+
+_SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+_SPREADSHEET_CHUNK_SIZE_TOKENS = 512
+_SPREADSHEET_CHUNK_OVERLAP_TOKENS = 64
+
+
+def _is_spreadsheet_source(source_path: str) -> bool:
+    return Path(source_path).suffix.lower() in _SPREADSHEET_EXTENSIONS
+
+
+def _apply_spreadsheet_ingestion_safeguards(
+    cfg: IngestionConfig, source_path: str
+) -> IngestionConfig:
+    ext = Path(source_path).suffix.lower()
+    if ext not in _SPREADSHEET_EXTENSIONS:
+        return cfg
+
+    updates: Dict[str, Any] = {
+        "chunk_strategy": ChunkStrategy.RECURSIVE,
+        "use_token_count": True,
+        "embedding_use_async": True,
+    }
+
+    if (
+        cfg.chunk_size is None
+        or (cfg.use_token_count and cfg.chunk_size > _SPREADSHEET_CHUNK_SIZE_TOKENS)
+        or not cfg.use_token_count
+    ):
+        if cfg.chunk_size is None:
+            updates["chunk_size"] = _SPREADSHEET_CHUNK_SIZE_TOKENS
+        else:
+            updates["chunk_size"] = min(cfg.chunk_size, _SPREADSHEET_CHUNK_SIZE_TOKENS)
+
+    if (
+        cfg.use_token_count and cfg.chunk_overlap > _SPREADSHEET_CHUNK_OVERLAP_TOKENS
+    ) or not cfg.use_token_count:
+        updates["chunk_overlap"] = min(
+            cfg.chunk_overlap, _SPREADSHEET_CHUNK_OVERLAP_TOKENS
+        )
+
+    updated_cfg = cfg.model_copy(update=updates)
+
+    logger.info(
+        "Applied spreadsheet ingestion safeguards",
+        extra={
+            "source_path": source_path,
+            "parse_method": str(updated_cfg.parse_method),
+            "chunk_strategy": str(updated_cfg.chunk_strategy),
+            "chunk_size": updated_cfg.chunk_size,
+            "chunk_overlap": updated_cfg.chunk_overlap,
+            "use_token_count": updated_cfg.use_token_count,
+            "embedding_use_async": updated_cfg.embedding_use_async,
+            "embedding_batch_size": updated_cfg.embedding_batch_size,
+        },
+    )
+    return updated_cfg
+
+
+def _validate_spreadsheet_chunk_token_budget(
+    chunks: List[ChunkForEmbedding],
+    *,
+    encoding_name: str,
+) -> None:
+    token_counter = get_token_counter(encoding_name)
+    for chunk in chunks:
+        token_count = token_counter(chunk.text)
+        if token_count > _SPREADSHEET_CHUNK_SIZE_TOKENS:
+            raise EmbeddingAdapterError(
+                "Spreadsheet row exceeds embedding token budget",
+                details={
+                    "chunk_id": chunk.chunk_id,
+                    "doc_id": chunk.doc_id,
+                    "token_count": token_count,
+                    "max_tokens": _SPREADSHEET_CHUNK_SIZE_TOKENS,
+                },
+            )
+
+
+def _log_embedding_text_batch_stats(
+    label: str,
+    texts: List[str],
+    *,
+    batch_index: Optional[int] = None,
+) -> None:
+    """Log character-length stats for texts about to be sent to the embedding API."""
+    if not texts:
+        logger.info("[RAG][embedding] %s: empty batch", label)
+        return
+    lengths = [len(t) for t in texts]
+    suffix = f" batch_index={batch_index}" if batch_index is not None else ""
+    logger.info(
+        "[RAG][embedding] %s%s: batch_count=%s char_len min=%s max=%s sum=%s",
+        label,
+        suffix,
+        len(texts),
+        min(lengths),
+        max(lengths),
+        sum(lengths),
+    )
+
+
+def _log_pending_chunks_text_stats(label: str, chunks: List[ChunkForEmbedding]) -> None:
+    """Log stats for chunk texts loaded for embedding (pending only)."""
+    if not chunks:
+        logger.info("[RAG][embedding] %s: no pending chunks", label)
+        return
+    lengths = [len(c.text) for c in chunks]
+    ids_sample = [c.chunk_id for c in chunks[:8]]
+    logger.info(
+        "[RAG][embedding] %s: pending=%s char_len min=%s max=%s sum=%s "
+        "avg=%.1f chunk_id_sample=%s",
+        label,
+        len(chunks),
+        min(lengths),
+        max(lengths),
+        sum(lengths),
+        sum(lengths) / len(lengths),
+        ids_sample,
+    )
+
+
+def _get_pipeline_compatibility_facade() -> "KBPipelineCompatibilityFacade":
+    """Return the coordinator-owned pipeline compatibility facade."""
+    from ..kb import get_kb_coordinator
+
+    return get_kb_coordinator().pipeline_compatibility
+
+
+def run_document_ingestion(
+    collection: str,
+    source_path: str,
+    *,
+    ingestion_config: Optional[IngestionConfigInput] = None,
+    progress_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """Public entrypoint for LangGraph-compatible ingestion tooling."""
+    return _get_pipeline_compatibility_facade().run_document_ingestion(
+        collection=collection,
+        source_path=source_path,
+        ingestion_config=ingestion_config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
+    )
+
+
+def _run_document_ingestion_impl(
+    collection: str,
+    source_path: str,
+    *,
+    ingestion_config: Optional[IngestionConfigInput] = None,
+    progress_manager: Optional[Any] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """Public entrypoint for LangGraph-compatible ingestion tooling.
+
+    Accepts either a fully-specified :class:`IngestionConfig` instance or a
+    mapping payload (e.g., parsed JSON) and normalises it before invoking
+    :func:`process_document`.
+
+    Args:
+        collection: Target collection where the document should be ingested.
+        source_path: Filesystem path to the document to ingest.
+        ingestion_config: Optional configuration overrides or mapping supplied
+            by external callers. ``embedding_model_id`` may be a model-hub ID,
+            a legacy model name/alias, or omitted; ingestion resolves it to the
+            canonical model-hub ID before collection initialization.
+        progress_manager: Optional progress manager for tracking.
+        user_id: Optional user ID for ownership tracking.
+        is_admin: Optional admin override; when omitted, falls back to request scope.
+        file_id: Optional UploadedFile file_id for stable file association.
+        metadata_source_path: Optional canonical path to store in metadata while
+            reading from ``source_path``.
+        commit_gate: Optional callback invoked before canonical RAG writes.
+
+    Returns:
+        IngestionResult: Same contract as :func:`process_document`.
+    """
+    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    user_id = scope.user_id
+    is_admin = scope.is_admin
+
+    cfg = coerce_ingestion_config(ingestion_config)
+    return process_document(
+        collection,
+        source_path,
+        config=cfg,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
+    )
+
+
+@contextmanager
+def _temp_environ(updates: Dict[str, Optional[str]]) -> Iterator[None]:
+    """Temporarily set environment variables and restore afterward."""
+
+    original: Dict[str, Optional[str]] = {}
+    try:
+        for key, value in updates.items():
+            original[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _record_ingestion_status(
+    collection: str,
+    doc_id: Optional[str],
+    *,
+    status: DocumentProcessingStatus,
+    message: str,
+    parse_hash: Optional[str],
+    user_id: Optional[int] = None,
+) -> None:
+    """Persist ingestion status without impacting pipeline flow."""
+    if not doc_id:
+        return
+    try:
+        write_ingestion_status(
+            collection,
+            doc_id,
+            status=status.value,
+            message=message,
+            parse_hash=parse_hash or "",
+            user_id=user_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Unable to record ingestion status for %s/%s: %s",
+            collection,
+            doc_id,
+            exc,
+        )
+
+
+#: Tables every ingestion writes, besides the embeddings table. ``ingestion_runs``
+#: grows fastest of all: :func:`_record_ingestion_status` does a delete plus an
+#: add, so it gains two versions per run, on the failure path as well.
+#: ``collection_config`` is written by the same upload, just before and outside
+#: this pipeline (``_save_collection_config_with_snapshot``), with the same
+#: unconditional delete+add; nothing else would ever compact it.
+_INGEST_TABLES = (
+    "documents",
+    "parses",
+    "chunks",
+    "collection_config",
+    "collection_metadata",
+    "ingestion_runs",
+)
+
+
+def _compact_storage_if_needed(embedding_model_id: Optional[str]) -> None:
+    """Best-effort LanceDB compaction once an ingestion finishes, pass or fail.
+
+    Every ingestion appends one file per table and read latency scales with the
+    fragment count, so fragmented tables get merged and stale versions pruned.
+    Failed runs fragment too — they still write ``ingestion_runs`` and whatever
+    steps completed — so this runs on both paths. Scoped to the tables this
+    ingestion wrote: sweeping the whole database on every document (or every
+    crawled page) costs more than it saves. Maintenance must never fail the
+    pipeline, hence the blanket except.
+    """
+    try:
+        from ..LanceDB.model_tag_utils import embeddings_table_name, to_model_tag
+        from ..storage.factory import StorageFactory
+
+        tables = list(_INGEST_TABLES)
+        if embedding_model_id:
+            # The write path applies to_model_tag twice (CollectionHandle, then
+            # upsert_embeddings) and it is not idempotent for vendor-prefixed
+            # ids, so probe both spellings — the same compatibility trick as
+            # CollectionHandle._embedding_table_names. Missing tables are a
+            # cheap no-op in should_compact.
+            tables += [
+                embeddings_table_name(embedding_model_id),
+                embeddings_table_name(to_model_tag(embedding_model_id)),
+            ]
+        store = StorageFactory.get_factory().get_vector_index_store()
+        compacted = store.compact_tables(list(dict.fromkeys(tables)))
+        if compacted:
+            logger.info("Compacted LanceDB tables: %s", ", ".join(compacted))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LanceDB compaction skipped: %s", exc)
+
+
+async def _compute_embeddings_async(
+    chunks: List[ChunkForEmbedding],
+    embedding_adapter: BaseEmbedding,
+    embedding_config: EmbeddingModelConfig,
+    max_concurrent: int,
+    max_retries: int,
+    retry_delay: float,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> List[ChunkEmbeddingData]:
+    """Async concurrent computation of embedding vectors (for models that don't support batch processing, like text-embedding-v4).
+
+    Since some models (e.g., DashScope text-embedding-v4) don't support batch processing,
+    they can only handle individual requests. To improve efficiency, use asyncio for concurrent
+    processing of multiple individual requests instead of serial processing.
+
+    Args:
+        chunks: List of chunks to embed
+        embedding_adapter: Embedding adapter instance
+        embedding_config: Embedding model configuration
+        max_concurrent: Maximum concurrency
+        max_retries: Maximum retry attempts
+        retry_delay: Retry delay (seconds)
+
+    Returns:
+        List of embedding vector data
+    """
+    if not chunks:
+        return []
+
+    # Create semaphore to control concurrency
+    semaphore = asyncio.Semaphore(max_concurrent)
+    processed_count = 0
+
+    async def encode_single_with_retry(
+        chunk: ChunkForEmbedding,
+    ) -> Optional[ChunkEmbeddingData]:
+        """Encode a single chunk with retry mechanism.
+
+        Since some models (e.g., DashScope text-embedding-v4) don't support batch
+        processing, they can only handle individual requests. Use asyncio.to_thread to
+        execute synchronous encode calls in a thread pool, achieving async concurrent
+        processing for improved efficiency.
+        """
+        nonlocal processed_count
+        async with semaphore:
+            for retry_attempt in range(max_retries):
+                try:
+                    # Use asyncio.to_thread to execute synchronous encode call in thread pool
+                    # Since v4 doesn't support batch processing, must process individually
+                    tlen = len(chunk.text)
+                    logger.info(
+                        "[RAG][embedding] async encode_single: chunk_id=%s char_len=%s "
+                        "retry=%s/%s",
+                        chunk.chunk_id,
+                        tlen,
+                        retry_attempt + 1,
+                        max_retries,
+                    )
+                    raw_vector = await asyncio.to_thread(
+                        embedding_adapter.encode, chunk.text
+                    )
+
+                    # Unify provider response (list of float, list of lists, or list of dict with "embedding")
+                    vector = normalize_single_embedding(raw_vector)
+
+                    processed_count_local = processed_count + 1
+                    processed_count = processed_count_local
+                    if progress_callback is not None:
+                        progress_callback(processed_count_local, len(chunks))
+
+                    return ChunkEmbeddingData(
+                        doc_id=chunk.doc_id,
+                        chunk_id=chunk.chunk_id,
+                        parse_hash=chunk.parse_hash,
+                        # IMPORTANT: Use Hub model ID as the single source of truth.
+                        model=embedding_config.id,
+                        vector=vector,
+                        text=chunk.text,
+                        chunk_hash=chunk.chunk_hash,
+                        metadata=chunk.metadata,
+                    )
+                except Exception as e:
+                    if retry_attempt < max_retries - 1:
+                        # Wait and retry (with exponential backoff)
+                        await asyncio.sleep(retry_delay * (retry_attempt + 1))
+                        continue
+                    else:
+                        # All retries failed
+                        logger.warning(
+                            "Chunk %s embedding computation failed after %d retries: %s",
+                            chunk.chunk_id,
+                            max_retries,
+                            e,
+                        )
+                        processed_count_local = processed_count + 1
+                        processed_count = processed_count_local
+                        if progress_callback is not None:
+                            progress_callback(processed_count_local, len(chunks))
+                        return None
+            return None
+
+    # Execute encoding for all chunks concurrently
+    tasks = [encode_single_with_retry(chunk) for chunk in chunks]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Collect successful results
+    embeddings_data: List[ChunkEmbeddingData] = []
+    failed_count = 0
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.warning(
+                "Chunk %s processing exception: %s", chunks[i].chunk_id, result
+            )
+            failed_count += 1
+        elif result is None:
+            failed_count += 1
+        elif isinstance(result, ChunkEmbeddingData):
+            # Type guard: ensure result is ChunkEmbeddingData before appending
+            embeddings_data.append(result)
+        else:
+            # Unexpected type (should not happen, but handle gracefully)
+            logger.warning(
+                "Unexpected result type for chunk %s: %s",
+                chunks[i].chunk_id,
+                type(result),
+            )
+            failed_count += 1
+
+    if failed_count > 0:
+        logger.warning(
+            "%d out of %d chunks failed embedding computation",
+            failed_count,
+            len(chunks),
+        )
+
+    logger.info(
+        "Successfully computed %d/%d embeddings using async concurrent processing",
+        len(embeddings_data),
+        len(chunks),
+    )
+    return embeddings_data
+
+
+def _resolve_embedding_adapter(
+    config: IngestionConfig,
+) -> Tuple[EmbeddingModelConfig, BaseEmbedding]:
+    """Resolve embedding adapter with priority: explicit model_id > hub > env fallback."""
+    return resolve_embedding_adapter(
+        config.embedding_model_id,
+        api_key=config.embedding_api_key,
+        base_url=config.embedding_base_url,
+        timeout_sec=config.embedding_timeout_sec,
+    )
+
+
+def _handle_ingestion_error(
+    exc: Exception,
+    collection: str,
+    doc_id: Optional[str],
+    parse_hash: Optional[str],
+    current_step: str,
+    completed_steps: List[IngestionStepResult],
+    chunk_count: int,
+    embedding_count: int,
+    vector_count: int,
+    warnings: List[str],
+    user_id: Optional[int] = None,
+) -> IngestionResult:
+    """Unify error handling for the ingestion pipeline."""
+    logger.exception(
+        "Document ingestion pipeline failed at step '%s': %s", current_step, exc
+    )
+
+    status = "partial" if completed_steps else "error"
+    _record_ingestion_status(
+        collection,
+        doc_id,
+        status=DocumentProcessingStatus.FAILED,
+        message=str(exc),
+        parse_hash=parse_hash,
+        user_id=user_id,
+    )
+
+    return IngestionResult(
+        status=status,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        chunk_count=chunk_count if status == "partial" else 0,
+        embedding_count=embedding_count if status == "partial" else 0,
+        vector_count=vector_count if status == "partial" else 0,
+        completed_steps=completed_steps,
+        failed_step=current_step,
+        message=str(exc),
+        warnings=warnings,
+    )
+
+
+def process_document(
+    collection: str,
+    source_path: str,
+    *,
+    config: Optional[IngestionConfig] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """Execute the full ingestion pipeline for a document."""
+    return _get_pipeline_compatibility_facade().process_document(
+        collection=collection,
+        source_path=source_path,
+        config=config,
+        progress_manager=progress_manager,
+        user_id=user_id,
+        is_admin=is_admin,
+        file_id=file_id,
+        metadata_source_path=metadata_source_path,
+        commit_gate=commit_gate,
+    )
+
+
+def _process_document_impl(
+    collection: str,
+    source_path: str,
+    *,
+    config: Optional[IngestionConfig] = None,
+    progress_manager: Optional[ProgressManager] = None,
+    user_id: Optional[int] = None,
+    is_admin: bool = False,
+    file_id: Optional[str] = None,
+    metadata_source_path: Optional[str] = None,
+    commit_gate: Optional[Callable[[], None]] = None,
+) -> IngestionResult:
+    """Execute the full ingestion pipeline for a document.
+
+    This orchestration step wires together document registration, parsing,
+    chunking, embedding generation, and final vector-store updates. It is the
+    primary entry point used by both CLI tooling and higher-level services when
+    onboarding new knowledge into the RAG system.
+
+    Args:
+        collection: Logical collection name where the document and its chunks
+            will be stored. Must already exist in the vector store.
+        source_path: Absolute or workspace-relative path to the raw document on
+            disk.
+        config: Optional ingestion configuration override. When provided, any
+            unspecified fields fall back to system defaults.
+        progress_manager: Optional progress manager for tracking.
+        user_id: Optional user ID for ownership tracking.
+        is_admin: Whether the user has admin privileges.
+        file_id: Optional UploadedFile file_id for stable file association.
+        metadata_source_path: Optional canonical path to store in metadata while
+            parsing and hashing ``source_path``.
+        commit_gate: Optional callback invoked before canonical RAG writes.
+
+    Returns:
+        IngestionResult: A structured report describing the pipeline status,
+        generated identifiers (document ID, parse hash), cumulative counts, and
+        per-step metadata. The object is serialisable and intended for direct
+        API responses.
+
+    Raises:
+        DocumentValidationError: If input arguments or configuration are
+            invalid (e.g., missing file, chunk size constraints).
+        RagCoreException: If any sub-step fails; the `failed_step` field within
+            the result clarifies the exact stage.
+
+    Notes:
+        - The function aims to be idempotent: repeated runs with unchanged
+          inputs will reuse existing records when possible.
+        - Downstream API layers should surface `result.failed_step` and
+          `result.warnings` to callers for better observability.
+    """
+    cfg = _apply_spreadsheet_ingestion_safeguards(
+        coerce_ingestion_config(config),
+        source_path,
+    )
+
+    # Initialize progress tracking
+    if progress_manager is None:
+        progress_manager = ProgressManager()
+    task_id = f"ingest_{collection}_{source_path.replace('/', '_').replace('.', '_')}"
+    progress_tracker = ProgressTracker(progress_manager, task_id)
+    progress_manager.create_task(
+        task_type="ingestion",
+        task_id=task_id,
+        user_id=user_id,
+        metadata={
+            "collection": collection,
+            "source_path": source_path,
+        },
+    )
+
+    completed_steps: List[IngestionStepResult] = []
+    warnings: List[str] = []
+    doc_id: Optional[str] = None
+    parse_hash: Optional[str] = None
+    chunk_count = 0
+    embedding_count = 0
+    vector_count = 0
+    current_step = "resolve_embedding_adapter"
+    embedding_config: Optional[EmbeddingModelConfig] = None
+    embedding_adapter: Optional[BaseEmbedding] = None
+    selected_model_id: Optional[str] = None
+
+    try:
+        # Validate document processing config against collection settings
+        validate_document_processing_sync(
+            collection_name=collection,
+            file_path=source_path,
+            parsing_method=str(cfg.parse_method),
+            chunking_method=str(cfg.chunk_method),
+        )
+
+        logger.info(
+            "Step resolve_embedding_adapter started",
+            extra={"collection": collection, "source_path": source_path},
+        )
+        resolve_start = time.time()
+
+        # Resolve the effective embedding model before collection initialization.
+        # This keeps caller aliases such as "text-embedding-v4" from conflicting
+        # with collection metadata stored under the canonical model-hub ID.
+        requested_model_id = cfg.embedding_model_id
+        try:
+            selected_model_id = resolve_effective_embedding_model_sync(
+                collection, requested_model_id
+            )
+        except ValueError:
+            selected_model_id = requested_model_id
+
+        effective_cfg = cfg.model_copy(update={"embedding_model_id": selected_model_id})
+        # A bare model name resolves only among models this user may use.
+        with user_scope_context(user_id, is_admin):
+            embedding_config, embedding_adapter = _resolve_embedding_adapter(
+                effective_cfg
+            )
+        selected_model_id = (embedding_config.id or selected_model_id or "").strip()
+        cfg = effective_cfg.model_copy(update={"embedding_model_id": selected_model_id})
+
+        provider = getattr(embedding_config, "model_provider", None)
+        logger.info(
+            "Using embedding model: id=%s, name=%s, provider=%s",
+            selected_model_id,
+            embedding_config.model_name,
+            provider or "unknown",
+        )
+        resolve_elapsed = int((time.time() - resolve_start) * 1000)
+        resolve_step = IngestionStepResult(
+            name="resolve_embedding_adapter",
+            metadata={
+                "model_id": selected_model_id,
+                "elapsed_ms": resolve_elapsed,
+            },
+        )
+
+        # Step 0: Initialize collection embedding config if needed.
+        current_step = "initialize_collection"
+        logger.info(
+            "Step initialize_collection started",
+            extra={"collection": collection, "source_path": source_path},
+        )
+        init_start = time.time()
+
+        logger.info(
+            "Collection initialization: collection='%s', embedding_model_id='%s'",
+            collection,
+            selected_model_id,
+        )
+        if selected_model_id:
+            initialize_collection_embedding_sync(
+                collection_name=collection, embedding_model_id=selected_model_id
+            )
+        else:
+            # Even without embedding_model_id, ensure basic metadata exists
+            logger.info(
+                "No embedding_model_id provided for collection '%s', creating basic metadata without embedding configuration.",
+                collection,
+            )
+            from ..management.collection_manager import get_collection_sync
+
+            try:
+                # Check if metadata already exists
+                get_collection_sync(collection)
+            except ValueError:
+                # Metadata doesn't exist, create basic entry
+                update_collection_stats_sync(collection_name=collection)
+                logger.info("Created basic metadata for collection '%s'", collection)
+
+        completed_steps.append(resolve_step)
+
+        init_elapsed = int((time.time() - init_start) * 1000)
+        completed_steps.append(
+            IngestionStepResult(
+                name="initialize_collection",
+                metadata={
+                    "embedding_model_id": selected_model_id,
+                    "elapsed_ms": init_elapsed,
+                },
+            )
+        )
+        logger.info(
+            "Step initialize_collection completed",
+            extra={
+                "collection": collection,
+                "embedding_model_id": selected_model_id,
+                "elapsed_ms": init_elapsed,
+            },
+        )
+
+        # Step 1: Register document
+        current_step = "register_document"
+        logger.info(
+            "Step register_document started",
+            extra={"collection": collection, "source_path": source_path},
+        )
+        register_start = time.time()
+        with progress_tracker.track_step("register_document"):
+            if commit_gate is not None:
+                commit_gate()
+            register_result = register_document(
+                collection=collection,
+                source_path=source_path,
+                user_id=user_id,
+                file_id=file_id,
+                metadata_source_path=metadata_source_path,
+            )
+            doc_id = register_result.get("doc_id")
+            if not doc_id:
+                raise DocumentValidationError(
+                    "register_document did not return doc_id",
+                    details={"collection": collection, "source_path": source_path},
+                )
+            _record_ingestion_status(
+                collection,
+                doc_id,
+                status=DocumentProcessingStatus.RUNNING,
+                message="Document ingestion started.",
+                parse_hash=None,
+                user_id=user_id,
+            )
+        progress_manager.update_task_progress(
+            task_id=task_id,
+            metadata={
+                "doc_id": doc_id,
+            },
+        )
+        register_elapsed = int((time.time() - register_start) * 1000)
+        completed_steps.append(
+            IngestionStepResult(
+                name="register_document",
+                metadata={
+                    "doc_id": doc_id,
+                    "created": register_result.get("created"),
+                    "elapsed_ms": register_elapsed,
+                },
+            )
+        )
+        # Update total document count immediately after registration
+        try:
+            update_collection_stats_sync(
+                collection_name=collection,
+                documents_delta=1 if register_result.get("created") else 0,
+            )
+        except Exception as e:
+            logger.warning("Failed to increment total_documents: %s", e)
+
+        logger.info(
+            "Step register_document completed",
+            extra={
+                "doc_id": doc_id,
+                "doc_created": register_result.get("created"),
+                "elapsed_ms": register_elapsed,
+            },
+        )
+
+        # Step 2: Parse document
+        current_step = "parse_document"
+        logger.info(
+            "Step parse_document started",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "method": str(cfg.parse_method),
+            },
+        )
+        parse_start = time.time()
+        if commit_gate is not None:
+            commit_gate()
+        deepdoc_env: Dict[str, Optional[str]] = {}
+        if cfg.deepdoc_processing_mode:
+            deepdoc_env["DEEPDOC_PROCESSING_MODE"] = cfg.deepdoc_processing_mode
+        if cfg.deepdoc_parallel_threads is not None:
+            deepdoc_env["DEEPDOC_PARALLEL_THREADS"] = str(cfg.deepdoc_parallel_threads)
+        if cfg.deepdoc_reserve_cpu is not None:
+            deepdoc_env["DEEPDOC_RESERVE_CPU"] = str(cfg.deepdoc_reserve_cpu)
+        if cfg.deepdoc_limiter_capacity is not None:
+            deepdoc_env["DEEPDOC_LIMITER_CAPACITY"] = str(cfg.deepdoc_limiter_capacity)
+        if cfg.deepdoc_pipeline_monitor is not None:
+            deepdoc_env["DEEPDOC_PIPELINE_MONITOR"] = (
+                "1" if cfg.deepdoc_pipeline_monitor else "0"
+            )
+        if cfg.deepdoc_pipeline_s1_workers is not None:
+            deepdoc_env["DEEPDOC_PIPELINE_S1_WORKERS"] = str(
+                cfg.deepdoc_pipeline_s1_workers
+            )
+        if cfg.deepdoc_gpu_sessions is not None:
+            deepdoc_env["DEEPDOC_GPU_SESSIONS"] = str(cfg.deepdoc_gpu_sessions)
+
+        with _temp_environ(deepdoc_env):
+            with progress_tracker.track_step("parse_document") as parse_tracker:
+                parse_response = parse_document(
+                    collection=collection,
+                    doc_id=doc_id,
+                    parse_method=cfg.parse_method,
+                    params=None,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    progress_callback=parse_tracker,
+                    # Parse the physical input actually supplied to this run, not
+                    # the canonical path persisted in document metadata (which for
+                    # staged uploads is not published until ingestion succeeds).
+                    source_path_override=source_path,
+                )
+        parse_model = (
+            parse_response
+            if isinstance(parse_response, ParseDocumentResponse)
+            else ParseDocumentResponse.model_validate(parse_response)
+        )
+        parse_hash = parse_model.parse_hash
+        paragraph_count = len(parse_model.paragraphs)
+
+        if not parse_hash:
+            raise DocumentValidationError(
+                "parse_document did not return parse_hash",
+                details={"collection": collection, "doc_id": doc_id},
+            )
+        parse_elapsed = int((time.time() - parse_start) * 1000)
+
+        completed_steps.append(
+            IngestionStepResult(
+                name="parse_document",
+                metadata={
+                    "parse_hash": parse_hash,
+                    "written": parse_model.written,
+                    "paragraph_count": paragraph_count,
+                    "elapsed_ms": parse_elapsed,
+                },
+            )
+        )
+        logger.info(
+            "Step parse_document completed",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "paragraph_count": paragraph_count,
+                "elapsed_ms": parse_elapsed,
+            },
+        )
+
+        # Step 3: Chunk document
+        with progress_tracker.track_step("chunk_document"):
+            pass  # Step marked
+        current_step = "chunk_document"
+        logger.info(
+            "Step chunk_document started",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "strategy": str(cfg.chunk_strategy),
+                "chunk_size": cfg.chunk_size,
+                "chunk_overlap": cfg.chunk_overlap,
+            },
+        )
+        chunk_start = time.time()
+        chunk_response = chunk_document(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_strategy=cfg.chunk_strategy,
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            headers_to_split_on=getattr(cfg, "headers_to_split_on", None),
+            separators=getattr(cfg, "separators", None),
+            use_token_count=getattr(cfg, "use_token_count", False),
+            tiktoken_encoding=getattr(
+                cfg, "tiktoken_encoding", DEFAULT_TIKTOKEN_ENCODING
+            ),
+            enable_protected_content=getattr(cfg, "enable_protected_content", True),
+            protected_patterns=getattr(cfg, "protected_patterns", None),
+            table_context_size=getattr(
+                cfg, "table_context_size", DEFAULT_TABLE_CONTEXT_SIZE
+            ),
+            image_context_size=getattr(
+                cfg, "image_context_size", DEFAULT_IMAGE_CONTEXT_SIZE
+            ),
+            user_id=user_id,
+        )
+        chunk_count = int(chunk_response.get("chunk_count", 0))
+        chunk_elapsed = int((time.time() - chunk_start) * 1000)
+        completed_steps.append(
+            IngestionStepResult(
+                name="chunk_document",
+                metadata={
+                    "chunk_count": chunk_count,
+                    "created": chunk_response.get("created"),
+                    "elapsed_ms": chunk_elapsed,
+                },
+            )
+        )
+        logger.info(
+            "[RAG][chunk] step=chunk_document completed doc_id=%s chunk_count=%s "
+            "stats=%s config_hash_fields chunk_size=%s overlap=%s use_token_count=%s "
+            "protected=%s",
+            doc_id,
+            chunk_count,
+            chunk_response.get("stats"),
+            cfg.chunk_size,
+            cfg.chunk_overlap,
+            getattr(cfg, "use_token_count", False),
+            getattr(cfg, "enable_protected_content", True),
+        )
+        logger.info(
+            "Step chunk_document completed",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "chunk_count": chunk_count,
+                "elapsed_ms": chunk_elapsed,
+            },
+        )
+
+        # Step 4: Read chunks for embedding
+        with progress_tracker.track_step("read_chunks_for_embedding"):
+            pass  # Step marked
+        current_step = "read_chunks_for_embedding"
+        logger.info(
+            "Step read_chunks_for_embedding started",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "embedding_model": embedding_config.id,
+            },
+        )
+        read_start = time.time()
+        embedding_read_response = read_chunks_for_embedding(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            # IMPORTANT: Use Hub model ID as the single source of truth,
+            # matching the write path (embedding writes use embedding_config.id).
+            model=embedding_config.id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        read_model = (
+            embedding_read_response
+            if isinstance(embedding_read_response, EmbeddingReadResponse)
+            else EmbeddingReadResponse.model_validate(embedding_read_response)
+        )
+        chunks: List[ChunkForEmbedding] = read_model.chunks
+        pending_count = read_model.pending_count
+        if _is_spreadsheet_source(source_path):
+            _validate_spreadsheet_chunk_token_budget(
+                chunks,
+                encoding_name=cfg.tiktoken_encoding or DEFAULT_TIKTOKEN_ENCODING,
+            )
+        read_elapsed = int((time.time() - read_start) * 1000)
+
+        completed_steps.append(
+            IngestionStepResult(
+                name="read_chunks_for_embedding",
+                metadata={
+                    "total_count": len(chunks),
+                    "pending_count": pending_count,
+                    "elapsed_ms": read_elapsed,
+                },
+            )
+        )
+        logger.info(
+            "Step read_chunks_for_embedding completed",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "total_count": len(chunks),
+                "pending_count": pending_count,
+                "elapsed_ms": read_elapsed,
+            },
+        )
+        _log_pending_chunks_text_stats(
+            f"read_chunks_for_embedding doc_id={doc_id}", chunks
+        )
+
+        if pending_count == 0:
+            logger.info(
+                "No pending chunks for embedding; returning early",
+                extra={"collection": collection, "doc_id": doc_id},
+            )
+            current_step = "write_vectors_to_db"
+            commit_vectors_to_db(
+                collection=collection,
+                doc_id=doc_id,
+                parse_hash=parse_hash,
+                model=embedding_config.id,
+                commit_gate=commit_gate,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            _record_ingestion_status(
+                collection,
+                doc_id,
+                status=DocumentProcessingStatus.SUCCESS,
+                message="Document ingestion completed with no pending embeddings.",
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+            return IngestionResult(
+                status="success",
+                doc_id=doc_id,
+                parse_hash=parse_hash,
+                chunk_count=chunk_count,
+                embedding_count=0,
+                vector_count=0,
+                completed_steps=completed_steps,
+                failed_step=None,
+                message="Document ingestion completed with no pending embeddings",
+                warnings=[],
+            )
+
+        # Step 5: Compute embeddings and write
+        # Note: Some models (e.g., DashScope text-embedding-v4) do not support batch processing.
+        # When embedding_use_async is True, we use async concurrent processing instead of batch API calls.
+        # This wraps individual encode() calls with asyncio.to_thread for concurrent execution.
+        with progress_tracker.track_step(
+            "compute_embeddings",
+            total_count=pending_count,
+            message="Embedding chunks...",
+        ) as embedding_step_tracker:
+            current_step = "compute_embeddings"
+            logger.info(
+                "Step compute_embeddings started",
+                extra={
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "pending_count": pending_count,
+                    "use_async": cfg.embedding_use_async,
+                    "batch_size": cfg.embedding_batch_size
+                    if not cfg.embedding_use_async
+                    else None,
+                    # Both paths honor embedding_concurrent: the async path fans out
+                    # per-chunk encodes, the batch path fans out per-batch encodes.
+                    "concurrent": cfg.embedding_concurrent,
+                },
+            )
+            embedding_start = time.time()
+            total_embedding_count = 0
+            total_vector_count = 0
+            write_elapsed_total = 0.0
+            last_write_response: Optional[EmbeddingWriteResponse] = None
+
+            def _update_embedding_progress(current: int, total: int) -> None:
+                embedding_step_tracker.update(
+                    current_count=current,
+                    total_count=total,
+                    message=f"Embedding {current}/{total}",
+                    completed_count=current,
+                    remaining_count=max(total - current, 0),
+                )
+
+            if cfg.embedding_use_async:
+                logger.info(
+                    "Using async concurrent embedding computation (model does not support batch processing)"
+                )
+                embeddings_list = asyncio.run(
+                    _compute_embeddings_async(
+                        chunks=chunks,
+                        embedding_adapter=embedding_adapter,
+                        embedding_config=embedding_config,
+                        max_concurrent=cfg.embedding_concurrent,
+                        max_retries=cfg.max_retries,
+                        retry_delay=cfg.retry_delay,
+                        progress_callback=_update_embedding_progress,
+                    )
+                )
+                total_embedding_count = len(embeddings_list)
+
+                with progress_tracker.track_step(
+                    "write_vectors_to_db",
+                    total_count=len(embeddings_list),
+                    message="Writing vectors...",
+                ) as write_step_tracker:
+                    for batch_start in range(
+                        0, len(embeddings_list), cfg.embedding_batch_size
+                    ):
+                        embeddings_batch_async = embeddings_list[
+                            batch_start : batch_start + cfg.embedding_batch_size
+                        ]
+
+                        if not embeddings_batch_async:
+                            continue
+
+                        write_batch_start = time.time()
+                        current_step = "write_vectors_to_db"
+                        try:
+                            if commit_gate is not None:
+                                commit_gate()
+                            write_response = write_vectors_to_db(
+                                collection=collection,
+                                embeddings=embeddings_batch_async,
+                                create_index=(
+                                    batch_start + cfg.embedding_batch_size
+                                    >= len(embeddings_list)
+                                ),
+                                user_id=user_id,
+                            )
+                            last_write_response = (
+                                write_response
+                                if isinstance(write_response, EmbeddingWriteResponse)
+                                else EmbeddingWriteResponse.model_validate(
+                                    write_response
+                                )
+                            )
+                            current_step = "compute_embeddings"
+                        except Exception as exc:  # noqa: BLE001
+                            embedding_count = total_embedding_count
+                            raise DatabaseOperationError(
+                                "Failed to write embedding batch to vector store",
+                                details={
+                                    "batch_start": batch_start,
+                                    "batch_size": len(embeddings_batch_async),
+                                    "error": str(exc),
+                                },
+                            ) from exc
+                        write_elapsed_total += time.time() - write_batch_start
+                        total_vector_count += last_write_response.upsert_count
+                        written_count = min(
+                            batch_start + len(embeddings_batch_async),
+                            len(embeddings_list),
+                        )
+                        write_step_tracker.update(
+                            current_count=written_count,
+                            total_count=len(embeddings_list),
+                            message=f"Writing vectors {written_count}/{len(embeddings_list)}",
+                            written_count=written_count,
+                            remaining_count=max(
+                                len(embeddings_list) - written_count, 0
+                            ),
+                        )
+
+            else:
+                processed_batches = 0
+                # Fan the independent (network-bound) batch encodes out over a
+                # bounded thread pool (honoring embedding_concurrent; =1 restores
+                # serial), then write in original order. This materializes all
+                # vectors before writing — peak memory scales with the whole doc,
+                # fine for web pages; stream if very large docs ever land here.
+                batch_slices = [
+                    chunks[start : start + cfg.embedding_batch_size]
+                    for start in range(0, len(chunks), cfg.embedding_batch_size)
+                ]
+
+                def _encode_batch(
+                    indexed: Tuple[int, List[ChunkForEmbedding]],
+                ) -> List[List[float]]:
+                    idx, batch_chunks = indexed
+                    batch_texts = [chunk.text for chunk in batch_chunks]
+                    _log_embedding_text_batch_stats(
+                        f"compute_embeddings(batch) doc_id={doc_id}",
+                        batch_texts,
+                        batch_index=idx,
+                    )
+                    # Retry transient provider failures with linear backoff. Runs
+                    # in a worker thread, so a blocking time.sleep between attempts
+                    # is fine. A size mismatch is deterministic and stays terminal.
+                    # On exhaustion this re-raises and fails the whole document
+                    # (unlike the async path, which drops the chunk and continues);
+                    # max_retries=0 still does one attempt here, vs zero on async.
+                    attempts = max(1, cfg.max_retries)
+                    raw_vectors = None
+                    for attempt in range(attempts):
+                        try:
+                            raw_vectors = embedding_adapter.encode(batch_texts)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            if attempt >= attempts - 1:
+                                raise
+                            logger.warning(
+                                "[RAG][embedding] batch encode failed "
+                                "(batch_index=%s attempt=%s/%s): %s",
+                                idx,
+                                attempt + 1,
+                                attempts,
+                                exc,
+                            )
+                            time.sleep(cfg.retry_delay * (attempt + 1))
+                    vectors = normalize_raw_embedding_to_vectors(raw_vectors)
+                    if len(vectors) != len(batch_chunks):
+                        raise VectorValidationError(
+                            "Embedding provider returned mismatched batch size",
+                            details={
+                                "batch_index": idx,
+                                "expected": len(batch_chunks),
+                                "actual": len(vectors),
+                            },
+                        )
+                    return vectors
+
+                max_encode_workers = max(1, cfg.embedding_concurrent)
+                if len(batch_slices) > 1 and max_encode_workers > 1:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(max_encode_workers, len(batch_slices))
+                    ) as encode_pool:
+                        # map preserves input order, so vectors line up with
+                        # batches. Pool threads do not carry this context, so
+                        # each batch records its usage privately and it is
+                        # merged here, on this thread -- including for batches
+                        # that failed after the provider had already billed.
+                        outcomes = list(
+                            encode_pool.map(
+                                lambda indexed: call_with_own_usage(
+                                    _encode_batch, indexed
+                                ),
+                                enumerate(batch_slices),
+                            )
+                        )
+                    usage = get_token_usage()
+                    for batch_usage, _vectors, _error in outcomes:
+                        usage.merge(batch_usage)
+                    for _usage, _vectors, error in outcomes:
+                        if error is not None:
+                            raise error
+                    all_vectors = [vectors for _usage, vectors, _error in outcomes]
+                else:
+                    all_vectors = [
+                        _encode_batch((idx, bc)) for idx, bc in enumerate(batch_slices)
+                    ]
+
+                with progress_tracker.track_step(
+                    "write_vectors_to_db",
+                    total_count=len(chunks),
+                    message="Writing vectors...",
+                ) as write_step_tracker:
+                    for batch_index, (batch_chunks, vectors) in enumerate(
+                        zip(batch_slices, all_vectors)
+                    ):
+                        is_last_batch = batch_index == len(batch_slices) - 1
+                        embeddings_batch: List[ChunkEmbeddingData] = [
+                            ChunkEmbeddingData(
+                                doc_id=chunk.doc_id,
+                                chunk_id=chunk.chunk_id,
+                                parse_hash=chunk.parse_hash,
+                                model=embedding_config.id,
+                                vector=vector,
+                                text=chunk.text,
+                                chunk_hash=chunk.chunk_hash,
+                                metadata=chunk.metadata,
+                            )
+                            for chunk, vector in zip(batch_chunks, vectors)
+                        ]
+                        total_embedding_count += len(embeddings_batch)
+                        processed_batches += 1
+                        _update_embedding_progress(total_embedding_count, len(chunks))
+
+                        if not embeddings_batch:
+                            continue
+
+                        write_batch_start = time.time()
+                        current_step = "write_vectors_to_db"
+                        try:
+                            if commit_gate is not None:
+                                commit_gate()
+                            write_response = write_vectors_to_db(
+                                collection=collection,
+                                embeddings=embeddings_batch,
+                                create_index=is_last_batch,
+                                user_id=user_id,
+                            )
+                            last_write_response = (
+                                write_response
+                                if isinstance(write_response, EmbeddingWriteResponse)
+                                else EmbeddingWriteResponse.model_validate(
+                                    write_response
+                                )
+                            )
+                            current_step = "compute_embeddings"
+                        except Exception as exc:  # noqa: BLE001
+                            embedding_count = total_embedding_count
+                            raise DatabaseOperationError(
+                                "Failed to write embedding batch to vector store",
+                                details={
+                                    "batch_index": processed_batches - 1,
+                                    "batch_size": len(embeddings_batch),
+                                    "error": str(exc),
+                                },
+                            ) from exc
+                        write_elapsed_total += time.time() - write_batch_start
+                        total_vector_count += last_write_response.upsert_count
+                        write_step_tracker.update(
+                            current_count=total_vector_count,
+                            total_count=len(chunks),
+                            message=f"Writing vectors {total_vector_count}/{len(chunks)}",
+                            written_count=total_vector_count,
+                            remaining_count=max(len(chunks) - total_vector_count, 0),
+                        )
+
+        embedding_count = total_embedding_count
+        embedding_elapsed = int((time.time() - embedding_start) * 1000)
+
+        # Check if embedding generation failed completely
+        if chunk_count > 0 and embedding_count == 0:
+            raise EmbeddingAdapterError(
+                "Failed to generate any embeddings",
+                details={
+                    "chunk_count": chunk_count,
+                    "use_async": cfg.embedding_use_async,
+                    "embedding_model": embedding_config.model_name
+                    if embedding_config
+                    else None,
+                },
+            )
+
+        completed_steps.append(
+            IngestionStepResult(
+                name="compute_embeddings",
+                metadata={
+                    "embedding_count": embedding_count,
+                    "use_async": cfg.embedding_use_async,
+                    "batch_size": cfg.embedding_batch_size
+                    if not cfg.embedding_use_async
+                    else None,
+                    "concurrent": cfg.embedding_concurrent
+                    if cfg.embedding_use_async
+                    else None,
+                    "elapsed_ms": embedding_elapsed,
+                },
+            )
+        )
+        logger.info(
+            "Step compute_embeddings completed",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "embedding_count": embedding_count,
+                "use_async": cfg.embedding_use_async,
+                "elapsed_ms": embedding_elapsed,
+            },
+        )
+
+        vector_count = total_vector_count
+        write_elapsed_ms = int(write_elapsed_total * 1000)
+        current_step = "write_vectors_to_db"
+        commit_vectors_to_db(
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            model=embedding_config.id,
+            commit_gate=commit_gate,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        completed_steps.append(
+            IngestionStepResult(
+                name="write_vectors_to_db",
+                metadata={
+                    "vector_count": vector_count,
+                    "elapsed_ms": write_elapsed_ms,
+                },
+            )
+        )
+        final_index_status = (
+            last_write_response.index_status
+            if last_write_response is not None
+            else "skipped"
+        )
+        logger.info(
+            "Step write_vectors_to_db completed",
+            extra={
+                "collection": collection,
+                "doc_id": doc_id,
+                "vector_count": vector_count,
+                "index_status": final_index_status,
+                "elapsed_ms": write_elapsed_ms,
+            },
+        )
+        # Index build is non-fatal (vectors are written; search falls back to
+        # brute force), but a corrupted/failed index shouldn't stay buried in a
+        # status field — surface it to the caller as a warning.
+        if final_index_status in ("index_corrupted", "failed"):
+            warnings.append(
+                f"Vector index not ready (status={final_index_status}); "
+                "search will be slower until it rebuilds."
+            )
+
+        # Update collection statistics
+        try:
+            import os
+
+            document_name = os.path.basename(source_path)
+            update_collection_stats_sync(
+                collection_name=collection,
+                processed_documents_delta=1,  # Success!
+                parses_delta=1,  # One parse operation
+                chunks_delta=chunk_count,
+                embeddings_delta=vector_count,
+                document_name=document_name,
+            )
+            logger.info(
+                "Collection statistics updated",
+                extra={
+                    "collection": collection,
+                    "document_name": document_name,
+                    "parsing_method": str(cfg.parse_method),
+                    "chunking_method": str(cfg.chunk_method),
+                },
+            )
+        except Exception as stat_exc:
+            logger.warning(
+                "Failed to update collection statistics: %s",
+                stat_exc,
+                extra={"collection": collection, "doc_id": doc_id},
+            )
+            warnings.append(f"Collection statistics update failed: {stat_exc}")
+
+        _record_ingestion_status(
+            collection,
+            doc_id,
+            status=DocumentProcessingStatus.SUCCESS,
+            message="Document ingestion completed successfully.",
+            parse_hash=parse_hash,
+            user_id=user_id,
+        )
+        progress_manager.complete_task(task_id, success=True)
+        return IngestionResult(
+            status="success",
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_count=chunk_count,
+            embedding_count=embedding_count,
+            vector_count=vector_count,
+            completed_steps=completed_steps,
+            failed_step=None,
+            message="Document ingestion completed successfully",
+            warnings=warnings,
+        )
+
+    except (RagCoreException, Exception) as exc:
+        progress_manager.complete_task(task_id, success=False)
+        return _handle_ingestion_error(
+            exc=exc,
+            collection=collection,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            current_step=current_step,
+            completed_steps=completed_steps,
+            chunk_count=chunk_count,
+            embedding_count=embedding_count,
+            vector_count=vector_count,
+            warnings=warnings,
+            user_id=user_id,
+        )
+
+    finally:
+        # Failed runs fragment the tables too, and a deployment failing often is
+        # exactly the one that must not stop compacting. Never raises, so it
+        # cannot swallow either return above.
+        _compact_storage_if_needed(embedding_config.id if embedding_config else None)

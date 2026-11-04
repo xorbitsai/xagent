@@ -1,0 +1,1597 @@
+"use client"
+
+import React, { useState, useEffect, useRef } from "react"
+import * as TabsPrimitive from "@radix-ui/react-tabs"
+import { ArrowLeft, HardDrive, Search, Upload, Plus, Trash2, FileIcon, CheckCircle, XCircle, AlertCircle, Globe, Loader2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Card } from "@/components/ui/card"
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Tabs, TabsContent, TabsList } from "@/components/ui/tabs"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Select } from "@/components/ui/select"
+import { Badge } from "@/components/ui/badge"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { getApiUrl } from "@/lib/utils"
+import {
+  getBackgroundJobFailureMessage,
+  getBackgroundJobProgressMessage,
+  getBackgroundJobProgressPercent,
+  getBackgroundJobResult,
+  isBackgroundJobResponse,
+  shouldUseBackgroundJobs,
+  waitForBackgroundJob,
+} from "@/lib/background-jobs"
+import { appendIngestionConfigToFormData, normalizeIngestionConfigForFilename } from "@/lib/ingestion-form"
+import { findMatchingIngestionTask, getKBTaskProgressDetail, getKBTaskProgressPercent, KBProgressTask } from "@/lib/kb-progress"
+import {
+  buildKnowledgeBaseErrorResult,
+  getKnowledgeBaseErrorToastContent,
+  KnowledgeBaseIngestionResultLike,
+  normalizeKnowledgeBaseIngestionResult,
+} from "@/lib/kb-ingest-feedback"
+import { parseSeparatorsInput, formatSeparatorsOutput } from "@/lib/separators"
+import { useI18n } from "@/contexts/i18n-context"
+import { toast } from "@/components/ui/sonner"
+import { CollectionDocumentInfo } from "./knowledge-base-detail-helpers"
+import { KnowledgeBaseDocumentList } from "./knowledge-base-document-list"
+
+interface CollectionInfo {
+  name: string
+  documents: number
+  chunks: number
+  embeddings: number
+  parses: number
+  document_names?: string[]
+  document_metadata?: CollectionDocumentInfo[]
+  ingestion_config?: Partial<IngestionConfig>
+}
+
+interface IngestionConfig {
+  parse_method: string
+  chunk_strategy: string
+  chunk_size: number
+  chunk_overlap: number
+  separators?: string
+  embedding_model_id: string
+  embedding_batch_size: number
+  max_retries: number
+  retry_delay: number
+}
+
+interface SearchResult {
+  score: number
+  text: string
+  document: string
+  metadata?: any
+}
+
+interface SearchConfig {
+  search_type: string
+  top_k: number
+  embedding_model_id: string
+  rerank_model_id: string
+}
+
+type IngestionResult = ReturnType<typeof normalizeKnowledgeBaseIngestionResult>
+
+function getKnowledgeBaseToastCopy(
+  t: ReturnType<typeof useI18n>["t"],
+  genericTitle: string
+) {
+  return {
+    genericTitle,
+    nameUnavailableTitle: t("kb.errors.nameUnavailable"),
+    nameUnavailableDescription: t("kb.errors.nameUnavailableHint"),
+    embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
+    embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
+    rollbackTitle: t("kb.errors.rollbackFailed"),
+    rollbackDescription: t("kb.errors.rollbackFailedHint"),
+  }
+}
+
+function getStatusIcon(status: string) {
+  return status === "success"
+    ? <CheckCircle className="h-4 w-4 text-green-500" />
+    : <XCircle className="h-4 w-4 text-red-500" />
+}
+
+/** KB search API returns ``SearchPipelineResult`` (HTTP 200 even on pipeline failure). */
+interface SearchPipelineResponse {
+  status: string
+  message?: string
+  results?: SearchResult[]
+}
+
+interface WebIngestionResult {
+  status: string
+  collection: string
+  total_urls_found: number
+  pages_crawled: number
+  pages_failed: number
+  documents_created: number
+  chunks_created: number
+  embeddings_created: number
+  crawled_urls: string[]
+  failed_urls: Record<string, string>
+  message: string
+  warnings: string[]
+  elapsed_time_ms: number
+}
+
+function buildWebIngestionErrorResult(
+  collection: string,
+  message: string
+): WebIngestionResult {
+  return {
+    status: "error",
+    collection,
+    total_urls_found: 0,
+    pages_crawled: 0,
+    pages_failed: 0,
+    documents_created: 0,
+    chunks_created: 0,
+    embeddings_created: 0,
+    crawled_urls: [],
+    failed_urls: {},
+    message,
+    warnings: [],
+    elapsed_time_ms: 0,
+  }
+}
+
+export function KnowledgeBaseDetailContent({ collectionName }: { collectionName: string }) {
+  const { t } = useI18n()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [collectionInfo, setCollectionInfo] = useState<CollectionInfo | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState("files")
+
+  // Edit dialog states
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
+  const [editCollectionName, setEditCollectionName] = useState("")
+  const [isUpdating, setIsUpdating] = useState(false)
+
+  // File upload states
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([])
+  const [isUploading, setIsUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadProgressDetail, setUploadProgressDetail] = useState<string | null>(null)
+  const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
+  const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
+  const [completedUploadCount, setCompletedUploadCount] = useState(0)
+  const [isAddSourceOpen, setIsAddSourceOpen] = useState(false)
+  const [activeAddSourceMode, setActiveAddSourceMode] = useState<"web" | "file" | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const [reuploadDialogOpen, setReuploadDialogOpen] = useState(false)
+  const [existingFilenamesForReupload, setExistingFilenamesForReupload] = useState<string[]>([])
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget as Node)) {
+      return
+    }
+
+    setIsDragging(false)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setIsDragging(false)
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const files = Array.from(e.dataTransfer.files)
+      const allowedExtensions = [".pdf", ".txt", ".html", ".htm", ".md", ".doc", ".docx", ".xlsx", ".ppt", ".pptx", ".csv"]
+      const validFiles = files.filter(file => {
+        const fileName = file.name.toLowerCase()
+        return allowedExtensions.some(ext => fileName.endsWith(ext))
+      })
+
+      if (validFiles.length !== files.length) {
+        toast.error(t("kb.errors.unsupportedFileType") || "Unsupported file type")
+      }
+
+      if (validFiles.length > 0) {
+        setSelectedFiles(prev => [...prev, ...validFiles])
+        setActiveAddSourceMode("file")
+      }
+    }
+  }
+
+
+  // Web ingestion states
+  const [isWebIngesting, setIsWebIngesting] = useState(false)
+  const [webIngestionProgress, setWebIngestionProgress] = useState(0)
+  const [webIngestionResult, setWebIngestionResult] = useState<WebIngestionResult | null>(null)
+  const [webIngestionConfig, setWebIngestionConfig] = useState({
+    start_url: "",
+    max_pages: 100,
+    max_depth: 3,
+    url_patterns: "",
+    exclude_patterns: "",
+    same_domain_only: true,
+    content_selector: "",
+    remove_selectors: "",
+    concurrent_requests: 3,
+    request_delay: 1.0,
+    timeout: 30,
+    respect_robots_txt: true,
+  })
+
+  // Embedding models state
+  const [embeddingModels, setEmbeddingModels] = useState<any[]>([])
+  const [defaultEmbeddingModel, setDefaultEmbeddingModel] = useState<string | null>(null)
+  const [rerankModels, setRerankModels] = useState<any[]>([])
+
+  // Ingestion configuration
+  const [ingestionConfig, setIngestionConfig] = useState<IngestionConfig>({
+    parse_method: "default",
+    chunk_strategy: "recursive",
+    chunk_size: 1000,
+    chunk_overlap: 200,
+    separators: "",
+    embedding_model_id: "",
+    embedding_batch_size: 10,
+    max_retries: 3,
+    retry_delay: 1.0,
+  })
+  const [isSavingConfig, setIsSavingConfig] = useState(false)
+
+  // Per-KB rerank model binding (independent of ingestion config but
+  // persisted together with it via handleSaveConfig).
+  const [collectionRerankModelId, setCollectionRerankModelId] = useState<string>("")
+
+  // Search states
+  const [searchQuery, setSearchQuery] = useState("")
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([])
+  const [searching, setSearching] = useState(false)
+  const [searchConfig, setSearchConfig] = useState<SearchConfig>({
+    search_type: "hybrid",
+    top_k: 5,
+    embedding_model_id: "",
+    rerank_model_id: "",
+  })
+
+  useEffect(() => {
+    fetchCollectionInfo()
+    fetchEmbeddingModels()
+    fetchRerankModels()
+  }, [collectionName])
+
+  useEffect(() => {
+    if (!isUploading || !currentUploadFileName) return
+
+    let cancelled = false
+
+    const pollProgress = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/progress?task_type=ingestion`)
+        if (!response.ok) return
+        const data = await response.json()
+        const tasks = (data.tasks || []) as KBProgressTask[]
+        const task = findMatchingIngestionTask(tasks, collectionName, currentUploadFileName)
+        if (!task || cancelled) return
+
+        const detail = getKBTaskProgressDetail(task)
+        const taskPercent = getKBTaskProgressPercent(task)
+        if (detail) setUploadProgressDetail(detail)
+        if (typeof taskPercent === "number") {
+          const overall = ((completedUploadCount + taskPercent / 100) / Math.max(selectedFiles.length, 1)) * 100
+          setUploadProgress(Math.max(0, Math.min(100, overall)))
+        }
+      } catch {
+        // Ignore transient polling failures during upload.
+      }
+    }
+
+    pollProgress()
+    const interval = window.setInterval(pollProgress, 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [isUploading, currentUploadFileName, completedUploadCount, selectedFiles.length, collectionName])
+
+  const fetchEmbeddingModels = async () => {
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/models/?category=embedding`)
+
+      if (!response.ok) {
+        throw new Error("Failed to fetch embedding models")
+      }
+
+      const models = await response.json() || []
+      setEmbeddingModels(models)
+
+      // Get user's default embedding model
+      const defaultResponse = await apiRequest(`${getApiUrl()}/api/models/user-default`)
+      if (defaultResponse.ok) {
+        const defaultData = await defaultResponse.json()
+        if (defaultData.embedding?.model?.model_id) {
+          const defaultModelId = defaultData.embedding.model.model_id
+          setDefaultEmbeddingModel(defaultModelId)
+          // Update configs to use default model
+          setIngestionConfig(prev => ({ ...prev, embedding_model_id: defaultModelId }))
+          setSearchConfig(prev => ({ ...prev, embedding_model_id: defaultModelId }))
+        } else if (models.length > 0) {
+          // Fallback to first model if no default set
+          const firstModelId = models[0].model_id
+          setDefaultEmbeddingModel(firstModelId)
+          setIngestionConfig(prev => ({ ...prev, embedding_model_id: firstModelId }))
+          setSearchConfig(prev => ({ ...prev, embedding_model_id: firstModelId }))
+        }
+      } else if (models.length > 0) {
+        // Fallback to first model
+        const firstModelId = models[0].model_id
+        setDefaultEmbeddingModel(firstModelId)
+        setIngestionConfig(prev => ({ ...prev, embedding_model_id: firstModelId }))
+        setSearchConfig(prev => ({ ...prev, embedding_model_id: firstModelId }))
+      }
+    } catch (err) {
+      console.error("Failed to fetch embedding models:", err)
+    }
+  }
+
+  const fetchRerankModels = async () => {
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/models/?category=rerank`)
+      if (!response.ok) {
+        throw new Error("Failed to fetch rerank models")
+      }
+      const models = (await response.json()) || []
+      setRerankModels(models)
+    } catch (err) {
+      console.error("Failed to fetch rerank models:", err)
+    }
+  }
+
+  const fetchCollectionInfo = async () => {
+    try {
+      setLoading(true)
+      const response = await apiRequest(`${getApiUrl()}/api/kb/collections`)
+
+      if (!response.ok) {
+        throw new Error("Failed to fetch collection info")
+      }
+
+      const data = await response.json()
+      const collection = data.collections?.find((c: CollectionInfo) => c.name === collectionName)
+
+      if (!collection) {
+        throw new Error("Collection not found")
+      }
+
+      setCollectionInfo(collection)
+
+      // Sync per-KB rerank model binding
+      setCollectionRerankModelId(collection.rerank_model_id || "")
+
+      // Update ingestion config if saved in backend
+      if (collection.ingestion_config) {
+        const fetchedConfig = { ...collection.ingestion_config }
+        if (Array.isArray(fetchedConfig.separators)) {
+          fetchedConfig.separators = formatSeparatorsOutput(fetchedConfig.separators)
+        }
+        setIngestionConfig(prev => ({
+          ...prev,
+          ...fetchedConfig
+        }))
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Unknown error")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    setSelectedFiles(prev => [...prev, ...files])
+    setActiveAddSourceMode("file")
+  }
+
+  const removeFile = (index: number) => {
+    setSelectedFiles(prev => prev.filter((_, i) => i !== index))
+  }
+
+  const doUpload = async () => {
+    if (selectedFiles.length === 0) return
+
+    setIsUploading(true)
+    setUploadProgress(0)
+    setUploadProgressDetail(null)
+    setIngestionResults([])
+    setCompletedUploadCount(0)
+
+    try {
+      const apiUrl = getApiUrl()
+      const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const file = selectedFiles[i]
+        const formData = new FormData()
+        setCurrentUploadFileName(file.name)
+        setUploadProgressDetail(null)
+
+        formData.append("file", file)
+        formData.append("collection", collectionName)
+        appendIngestionConfigToFormData(
+          formData,
+          normalizeIngestionConfigForFilename(ingestionConfig, file.name)
+        )
+
+        const response = await apiRequest(
+          `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
+          {
+            method: "POST",
+            body: formData
+          }
+        )
+
+        const parsed = await parseApiResponse(response)
+
+        if (!response.ok) {
+          const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
+          if (errorData.status === 'error') {
+            setIngestionResults(prev => [
+              ...prev,
+              normalizeKnowledgeBaseIngestionResult(
+                errorData as unknown as KnowledgeBaseIngestionResultLike,
+                { collection: collectionName, fileName: file.name }
+              ),
+            ])
+            throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.uploadFailedFile", { name: file.name }))
+          }
+          const errorMessage = getUploadErrorMessage(response, parsed, {
+            generic: t("kb.detail.errors.uploadFailedWithName", { name: file.name }) || `Failed to upload file: ${file.name}`,
+            ...UPLOAD_ERROR_MESSAGES,
+          })
+          setIngestionResults(prev => [
+            ...prev,
+            normalizeKnowledgeBaseIngestionResult(
+              buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+              { collection: collectionName, fileName: file.name }
+            ),
+          ])
+          throw new Error(errorMessage)
+        }
+
+        const job = useBackgroundJobs && isBackgroundJobResponse(parsed.data)
+          ? await waitForBackgroundJob(apiUrl, parsed.data, (updatedJob) => {
+              const detail = getBackgroundJobProgressMessage(updatedJob)
+              const taskPercent = getBackgroundJobProgressPercent(updatedJob)
+              if (detail) setUploadProgressDetail(detail)
+              if (typeof taskPercent === "number") {
+                const overall = ((i + taskPercent / 100) / Math.max(selectedFiles.length, 1)) * 100
+                setUploadProgress(Math.max(0, Math.min(100, overall)))
+              }
+            })
+          : null
+        const result = job
+          ? getBackgroundJobResult(job)
+          : isJsonRecord(parsed.data)
+            ? parsed.data as unknown as KnowledgeBaseIngestionResultLike
+            : null
+        if (job?.status === "failed" || job?.status === "cancelled") {
+          const errorMessage = getBackgroundJobFailureMessage(
+            job,
+            t("kb.detail.errors.uploadFailedWithName", { name: file.name })
+          )
+          setIngestionResults(prev => [
+            ...prev,
+            normalizeKnowledgeBaseIngestionResult(
+              isJsonRecord(result)
+                ? result as unknown as KnowledgeBaseIngestionResultLike
+                : buildKnowledgeBaseErrorResult(collectionName, errorMessage, undefined, file.name),
+              { collection: collectionName, fileName: file.name }
+            ),
+          ])
+          throw new Error(errorMessage)
+        }
+        const ingestionResult = isJsonRecord(result)
+          ? result as unknown as KnowledgeBaseIngestionResultLike
+          : null
+        if (!ingestionResult) {
+          throw new Error(t("kb.detail.errors.uploadFailedWithName", { name: file.name }))
+        }
+        setIngestionResults(prev => [
+          ...prev,
+          normalizeKnowledgeBaseIngestionResult(
+            ingestionResult,
+            { collection: collectionName, fileName: file.name }
+          ),
+        ])
+        setCompletedUploadCount(i + 1)
+        setUploadProgress(((i + 1) / selectedFiles.length) * 100)
+      }
+
+      await fetchCollectionInfo()
+      setSelectedFiles([])
+      setUploadProgress(0)
+      setIsAddSourceOpen(false)
+      closeReuploadDialog()
+    } catch (err) {
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.uploadFailedGeneric")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric")),
+        { status: undefined, adviseRename: false }
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
+    } finally {
+      setIsUploading(false)
+      setCurrentUploadFileName(null)
+      setUploadProgressDetail(null)
+    }
+  }
+
+  const handleUpload = async () => {
+    if (selectedFiles.length === 0) {
+      toast.error(t("kb.detail.errors.pleaseSelectFiles"))
+      return
+    }
+
+    // Race between check and upload (TOCTOU): another user could upload the same file
+    // after we check. This is acceptable because the backend uses deterministic doc_id
+    // and merge_insert, so re-upload overwrites the same record and remains idempotent.
+    try {
+      const checkRes = await apiRequest(
+        `${getApiUrl()}/api/kb/collections/${encodeURIComponent(collectionName)}/documents/check`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filenames: selectedFiles.map((f) => f.name),
+          }),
+        }
+      )
+      if (!checkRes.ok) {
+        console.warn("Check API failed, proceeding with upload:", checkRes.status)
+        toast.warning(t("kb.dialog.fileUpload.checkFailedProceeding") || "Could not check for duplicates, uploading directly.")
+        await doUpload()
+        return
+      }
+      const checkData = await checkRes.json()
+      const existing: string[] = checkData.existing_filenames ?? []
+      if (existing.length > 0) {
+        setExistingFilenamesForReupload(existing)
+        setReuploadDialogOpen(true)
+        return
+      }
+      await doUpload()
+    } catch (error) {
+      console.warn("Check API failed, proceeding with upload:", error)
+      toast.warning(t("kb.dialog.fileUpload.checkFailedProceeding") || "Could not check for duplicates, uploading directly.")
+      await doUpload()
+    }
+  }
+
+  const closeReuploadDialog = () => {
+    setReuploadDialogOpen(false)
+    setExistingFilenamesForReupload([])
+  }
+
+  const handleConfirmReupload = () => {
+    closeReuploadDialog()
+    doUpload()
+  }
+
+  const handleWebIngest = async () => {
+    if (!webIngestionConfig.start_url.trim()) {
+      toast.error(t("kb.detail.errors.enterStartUrl"))
+      return
+    }
+
+    setIsWebIngesting(true)
+    setWebIngestionProgress(0)
+    setWebIngestionResult(null)
+
+    try {
+      const apiUrl = getApiUrl()
+      const useBackgroundJobs = await shouldUseBackgroundJobs(apiUrl)
+      const formData = new FormData()
+
+      formData.append("collection", collectionName)
+      formData.append("start_url", webIngestionConfig.start_url)
+      formData.append("max_pages", webIngestionConfig.max_pages.toString())
+      formData.append("max_depth", webIngestionConfig.max_depth.toString())
+      if (webIngestionConfig.url_patterns) {
+        formData.append("url_patterns", webIngestionConfig.url_patterns)
+      }
+      if (webIngestionConfig.exclude_patterns) {
+        formData.append("exclude_patterns", webIngestionConfig.exclude_patterns)
+      }
+      formData.append("same_domain_only", webIngestionConfig.same_domain_only.toString())
+      if (webIngestionConfig.content_selector) {
+        formData.append("content_selector", webIngestionConfig.content_selector)
+      }
+      if (webIngestionConfig.remove_selectors) {
+        formData.append("remove_selectors", webIngestionConfig.remove_selectors)
+      }
+      formData.append("concurrent_requests", webIngestionConfig.concurrent_requests.toString())
+      formData.append("request_delay", webIngestionConfig.request_delay.toString())
+      formData.append("timeout", webIngestionConfig.timeout.toString())
+      formData.append("respect_robots_txt", webIngestionConfig.respect_robots_txt.toString())
+
+      // Add ingestion configuration
+      appendIngestionConfigToFormData(formData, ingestionConfig)
+
+      setWebIngestionProgress(10)
+
+      const response = await apiRequest(
+        `${apiUrl}/api/kb/ingest-web${useBackgroundJobs ? "/jobs" : ""}`,
+        {
+          method: "POST",
+          body: formData
+        }
+      )
+
+      const parsed = await parseApiResponse(response)
+
+      setWebIngestionProgress(50)
+
+      if (!response.ok) {
+        const errorData = isJsonRecord(parsed.data) ? parsed.data : {}
+        if (errorData.status === 'error') {
+          setWebIngestionResult(errorData as unknown as WebIngestionResult)
+          throw new Error((typeof errorData.message === 'string' && errorData.message) || t("kb.errors.webIngestFailed"))
+        }
+        const errorMessage = getUploadErrorMessage(response, parsed, {
+          generic: t("kb.detail.errors.webImportFailed") || "Website import failed",
+          ...UPLOAD_ERROR_MESSAGES,
+        })
+        setWebIngestionResult(buildWebIngestionErrorResult(collectionName, errorMessage))
+        throw new Error(errorMessage)
+      }
+
+      const job = useBackgroundJobs && isBackgroundJobResponse(parsed.data)
+        ? await waitForBackgroundJob(apiUrl, parsed.data, (updatedJob) => {
+            const taskPercent = getBackgroundJobProgressPercent(updatedJob)
+            if (typeof taskPercent === "number") {
+              setWebIngestionProgress(Math.max(10, Math.min(100, taskPercent)))
+            }
+          })
+        : null
+      const resultData = job
+        ? getBackgroundJobResult(job)
+        : isJsonRecord(parsed.data)
+          ? parsed.data
+          : null
+      if (job?.status === "failed" || job?.status === "cancelled") {
+        const errorMessage = getBackgroundJobFailureMessage(
+          job,
+          t("kb.detail.errors.webImportFailed")
+        )
+        setWebIngestionResult(
+          isJsonRecord(resultData)
+            ? resultData as unknown as WebIngestionResult
+            : buildWebIngestionErrorResult(collectionName, errorMessage)
+        )
+        throw new Error(errorMessage)
+      }
+      const result: WebIngestionResult | null = isJsonRecord(resultData)
+        ? (resultData as unknown as WebIngestionResult)
+        : null
+      if (!result) {
+        throw new Error(t("kb.detail.errors.webImportFailed"))
+      }
+      setWebIngestionResult(result)
+      setWebIngestionProgress(100)
+      if (result.status !== "success") {
+        throw new Error(result.message || t("kb.detail.errors.webImportFailed"))
+      }
+
+      // Refresh info after successful import
+      await fetchCollectionInfo()
+
+      // Close dialog
+      setIsAddSourceOpen(false)
+
+      // Reset configuration
+      setWebIngestionConfig({
+        start_url: "",
+        max_pages: 100,
+        max_depth: 3,
+        url_patterns: "",
+        exclude_patterns: "",
+        same_domain_only: true,
+        content_selector: "",
+        remove_selectors: "",
+        concurrent_requests: 3,
+        request_delay: 1.0,
+        timeout: 30,
+        respect_robots_txt: true,
+      })
+
+    } catch (err) {
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.webImportFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed")),
+        { status: undefined, adviseRename: false }
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
+    } finally {
+      setIsWebIngesting(false)
+      setWebIngestionProgress(0)
+    }
+  }
+
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) return
+
+    setSearching(true)
+    try {
+      const formData = new FormData()
+      formData.append("collection", collectionName)
+      formData.append("query_text", searchQuery)
+      formData.append("search_type", searchConfig.search_type)
+      formData.append("top_k", searchConfig.top_k.toString())
+      formData.append("embedding_model_id", searchConfig.embedding_model_id)
+
+      if (searchConfig.rerank_model_id) {
+        formData.append("rerank_model_id", searchConfig.rerank_model_id)
+      }
+
+      const response = await apiRequest(`${getApiUrl()}/api/kb/search`, {
+        method: "POST",
+        body: formData
+      })
+
+      if (!response.ok) {
+        let message = t("kb.detail.errors.searchFailed")
+        try {
+          const errorData = await response.json()
+          const detail = errorData?.detail
+          if (typeof detail === "string") {
+            message = detail
+          } else if (Array.isArray(detail)) {
+            message = detail.map((e: { msg?: string }) => e?.msg ?? "").filter(Boolean).join("; ") || message
+          }
+          // Use friendly message when backend indicates embedding not configured (503 or message contains embedding)
+          if (response.status === 503 || /embedding|not configured|not available/i.test(message)) {
+            message = t("kb.detail.errors.embeddingNotConfigured")
+          }
+        } catch {
+          message = `${t("kb.detail.errors.searchFailed")} (HTTP ${response.status})`
+        }
+        throw new Error(message)
+      }
+
+      const result = (await response.json()) as SearchPipelineResponse
+      if (result.status === "error") {
+        setSearchResults([])
+        let message =
+          typeof result.message === "string" && result.message.trim()
+            ? result.message.trim()
+            : t("kb.detail.errors.searchFailed")
+        if (/embedding|not configured|not available/i.test(message)) {
+          message = t("kb.detail.errors.embeddingNotConfigured")
+        }
+        throw new Error(message)
+      }
+      setSearchResults(result.results || [])
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.searchFailed"))
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  const handleOpenEditDialog = () => {
+    setEditCollectionName(collectionName)
+    setIsEditDialogOpen(true)
+  }
+
+  const handleUpdateCollectionName = async () => {
+    if (!editCollectionName.trim() || editCollectionName === collectionName) {
+      setIsEditDialogOpen(false)
+      return
+    }
+
+    setIsUpdating(true)
+    try {
+      const formData = new FormData()
+      formData.append("new_name", editCollectionName)
+
+      const response = await apiRequest(`${getApiUrl()}/api/kb/collections/${encodeURIComponent(collectionName)}`, {
+        method: "PUT",
+        body: formData
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || t("kb.detail.edit.errors.renameFailed"))
+      }
+
+      const result = await response.json()
+
+      // Redirect to new URL after successful rename
+      window.location.href = `/kb/${encodeURIComponent(editCollectionName)}`
+    } catch (err) {
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.edit.errors.updateFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed")),
+        // Rename answers 409 for a taken name, a colliding storage directory and
+        // lock contention alike, so no single sentence we could substitute would
+        // be true of all three: show the one the backend actually chose.
+        { status: undefined, adviseRename: false }
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
+    } finally {
+      setIsUpdating(false)
+    }
+  }
+
+  const handleSaveConfig = async () => {
+    setIsSavingConfig(true)
+    try {
+      const payload: any = { ...ingestionConfig }
+
+      if (payload.chunk_strategy === "recursive" && typeof payload.separators === "string" && payload.separators.trim() !== "") {
+        payload.separators = parseSeparatorsInput(payload.separators)
+      } else {
+        delete payload.separators
+      }
+
+      const response = await apiRequest(`${getApiUrl()}/api/kb/collections/${encodeURIComponent(collectionName)}/config`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload)
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
+      }
+
+      // Persist per-KB rerank model binding in the same save action so the
+      // user has a single "save" button covering both ingestion settings
+      // and rerank model selection.
+      const rerankResp = await apiRequest(
+        `${getApiUrl()}/api/kb/collections/${encodeURIComponent(collectionName)}/rerank-model`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            rerank_model_id: collectionRerankModelId || null,
+          }),
+        },
+      )
+      if (!rerankResp.ok) {
+        const errorData = await rerankResp.json().catch(() => ({}))
+        throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
+      }
+
+      toast.success(t("kb.detail.success.configSaved"))
+
+      // Refresh info to ensure we're in sync
+      await fetchCollectionInfo()
+    } catch (err) {
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.saveConfigFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
+        // A 409 here means this collection is no longer visible to the caller,
+        // not that a name was just typed: show what the backend actually said.
+        { status: undefined, adviseRename: false }
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
+    } finally {
+      setIsSavingConfig(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <div className="text-center">
+          <HardDrive className="h-12 w-12 mx-auto mb-4 animate-spin text-muted-foreground" />
+          <p>{t("kb.detail.loadingDetail")}</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!collectionInfo) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <div className="text-center">
+          <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+          <p className="text-lg mb-2">{t("kb.detail.notFound")}</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full flex flex-col space-y-6">
+        {/* Main Content */}
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="lex-1 w-full">
+          <TabsList className="flex w-full justify-start rounded-none border-b bg-transparent px-6 mb-6">
+            <TabsPrimitive.Trigger
+              value="files"
+              className="flex-none relative h-10 px-4 pb-3 pt-2 font-semibold text-muted-foreground hover:text-foreground border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:text-primary transition-colors outline-none ring-0 focus-visible:ring-0"
+            >
+              {t("kb.detail.tabs.files")}
+            </TabsPrimitive.Trigger>
+            <TabsPrimitive.Trigger
+              value="search"
+              className="flex-none relative h-10 px-4 pb-3 pt-2 font-semibold text-muted-foreground hover:text-foreground border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:text-primary transition-colors outline-none ring-0 focus-visible:ring-0"
+            >
+              {t("kb.detail.tabs.search")}
+            </TabsPrimitive.Trigger>
+            <TabsPrimitive.Trigger
+              value="settings"
+              className="flex-none relative h-10 px-4 pb-3 pt-2 font-semibold text-muted-foreground hover:text-foreground border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:text-primary transition-colors outline-none ring-0 focus-visible:ring-0"
+            >
+              {t("kb.detail.tabs.settings")}
+            </TabsPrimitive.Trigger>
+          </TabsList>
+
+          {/* Files Management Tab */}
+          <TabsContent value="files" className="space-y-6 w-full">
+            {/* Uploaded Files Section */}
+            <div className="p-6 w-full">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-lg font-semibold">{t("kb.detail.files.title")}</h3>
+                <Button onClick={() => setIsAddSourceOpen(true)} size="sm">
+                  <Plus size={16} className="mr-2" />
+                  {t("kb.detail.files.addSource")}
+                </Button>
+              </div>
+
+              <KnowledgeBaseDocumentList
+                collectionInfo={collectionInfo}
+                collectionName={collectionName}
+                onRefresh={fetchCollectionInfo}
+                t={t}
+              />
+            </div>
+
+            {/* Hidden Input for File Selection */}
+            <input
+                type="file"
+                multiple
+                ref={fileInputRef}
+                accept=".pdf,.txt,.html,.htm,.md,.doc,.docx,.xlsx,.ppt,.pptx,.csv"
+                onChange={handleFileSelect}
+                className="hidden"
+                id="file-upload-detail"
+            />
+
+            {/* Upload Results Section - Full Width Below Columns */}
+            {ingestionResults.length > 0 && (
+              <Card className="p-6 w-full">
+                <h3 className="text-lg font-semibold mb-4">{t("kb.detail.process.title")}</h3>
+                <ScrollArea className="h-96">
+                  <div className="space-y-4">
+                    {ingestionResults.map((result, index) => {
+                      const documentCount = result.document_count ?? 0
+                      const chunkCount = result.chunks_count ?? 0
+                      const parseCount = result.parses_completed ?? 0
+                      const vectorCount = result.vector_count
+                      const errorMessage = result.error || result.message
+
+                      return (
+                        <div key={index} className="p-4 border rounded-lg">
+                          <div className="flex items-center gap-2 mb-2">
+                            {result.status === "success" ? (
+                              <CheckCircle className="h-4 w-4 text-green-500" />
+                            ) : (
+                              <XCircle className="h-4 w-4 text-red-500" />
+                            )}
+                            <span className="font-medium">
+                              {result.file_name || result.collection || `${t("kb.detail.process.labels.file")} ${index + 1}`}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
+                            <div>{t("kb.detail.process.labels.document")}: {documentCount}</div>
+                            <div>{t("kb.detail.process.labels.chunk")}: {chunkCount}</div>
+                            <div>{t("kb.detail.process.labels.parse")}: {parseCount}</div>
+                            <div>{t("kb.detail.process.labels.vector")}: {vectorCount}</div>
+                          </div>
+                          {result.status !== "success" && errorMessage && (
+                            <div className="mt-2 text-sm text-destructive break-all">
+                              {t("kb.detail.process.labels.error")}: {errorMessage}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </ScrollArea>
+              </Card>
+            )}
+          </TabsContent>
+
+          {/* Search Test Tab */}
+          <TabsContent value="search" className="space-y-6 w-full flex-1">
+            <div className="p-6 w-full">
+              <h3 className="text-lg font-semibold mb-4">{t("kb.detail.search.title")}</h3>
+
+              {/* Search Configuration */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <Label htmlFor="search_type">{t("kb.detail.search.typeLabel")}</Label>
+                  <Select
+                    value={searchConfig.search_type}
+                    onValueChange={(value) => setSearchConfig(prev => ({ ...prev, search_type: value }))}
+                    options={[
+                      { value: "hybrid", label: t("kb.detail.search.types.hybrid") },
+                      { value: "dense", label: t("kb.detail.search.types.dense") },
+                      { value: "sparse", label: t("kb.detail.search.types.sparse") },
+                    ]}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="top_k">{t("kb.detail.search.topKLabel")}</Label>
+                  <Input
+                    id="top_k"
+                    type="number"
+                    value={searchConfig.top_k}
+                    onChange={(e) => setSearchConfig(prev => ({ ...prev, top_k: parseInt(e.target.value) || 5 }))}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="embedding_model_id">{t("kb.detail.search.embeddingModelIdLabel")}</Label>
+                  <Select
+                    value={searchConfig.embedding_model_id}
+                    onValueChange={(value) => setSearchConfig(prev => ({ ...prev, embedding_model_id: value }))}
+                    options={embeddingModels.map((model) => ({
+                      value: model.model_id,
+                      label: model.name || model.model_id,
+                    }))}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="rerank_model_id">{t("kb.detail.search.rerankModelIdLabel")}</Label>
+                  <Select
+                    value={searchConfig.rerank_model_id}
+                    onValueChange={(value) => setSearchConfig(prev => ({ ...prev, rerank_model_id: value }))}
+                    options={[
+                      { value: "", label: t("kb.detail.search.rerankPlaceholder") || "(none)" },
+                      ...rerankModels.map((model) => ({
+                        value: model.model_id,
+                        label: model.model_name || model.name || model.model_id,
+                      })),
+                    ]}
+                  />
+                </div>
+              </div>
+
+              {/* Search Input */}
+              <div className="flex gap-2 mb-6">
+                <div className="flex-1">
+                  <Input
+                    placeholder={t("kb.detail.search.queryPlaceholder")}
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
+                  />
+                </div>
+                <Button
+                  onClick={handleSearch}
+                  disabled={!searchQuery.trim() || searching}
+                >
+                  {searching ? (
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                  ) : (
+                    <>
+                      <Search size={16} className="mr-2" />
+                      {t("kb.detail.search.searchButton")}
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              {/* Search Results */}
+              {searchResults.length > 0 && (
+                <div>
+                  <h4 className="font-medium mb-4">{t("kb.detail.search.resultsTitle", { count: searchResults.length })}</h4>
+                  <div className="space-y-4">
+                    {searchResults.map((result, index) => (
+                      <Card key={index} className="p-4">
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex items-center gap-2">
+                            <Badge variant="outline">
+                              {t("kb.detail.search.score")}: {result.score.toFixed(3)}
+                            </Badge>
+                            <Badge variant="secondary">
+                              {result.document}
+                            </Badge>
+                          </div>
+                        </div>
+                        <p className="text-sm leading-relaxed">{result.text}</p>
+                        {result.metadata && (
+                          <div className="mt-2 text-xs text-muted-foreground">
+                            <details>
+                              <summary className="cursor-pointer">{t("kb.detail.search.metadata")}</summary>
+                              <pre className="mt-1 p-2 bg-muted rounded text-xs overflow-x-auto">
+                                {JSON.stringify(result.metadata, null, 2)}
+                              </pre>
+                            </details>
+                          </div>
+                        )}
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {searchResults.length === 0 && searchQuery && !searching && (
+                <div className="text-center py-8">
+                  <Search className="h-12 w-12 mx-auto mb-3 text-muted-foreground" />
+                  <p className="text-muted-foreground">{t("kb.detail.search.noResults")}</p>
+                </div>
+              )}
+            </div>
+          </TabsContent>
+
+          {/* Index Settings Tab */}
+          <TabsContent value="settings" className="space-y-6 w-full">
+            <div className="p-6 w-full">
+              <h3 className="text-lg font-semibold mb-4">{t("kb.index.title")}</h3>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <Label htmlFor="parse_method">{t("kb.index.parseMethod")}</Label>
+                  <Select
+                    value={ingestionConfig.parse_method}
+                    onValueChange={(value) => setIngestionConfig(prev => ({ ...prev, parse_method: value }))}
+                    options={[
+                      { value: "default", label: t("kb.index.parseOptions.default") },
+                      { value: "pypdf", label: t("kb.index.parseOptions.pypdf") },
+                      { value: "pdfplumber", label: t("kb.index.parseOptions.pdfplumber") },
+                      { value: "unstructured", label: t("kb.index.parseOptions.unstructured") },
+                      { value: "pymupdf", label: t("kb.index.parseOptions.pymupdf") },
+                      { value: "deepdoc", label: t("kb.index.parseOptions.deepdoc") },
+                    ]}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="chunk_strategy">{t("kb.index.chunkStrategy")}</Label>
+                  <Select
+                    value={ingestionConfig.chunk_strategy}
+                    onValueChange={(value) => setIngestionConfig(prev => ({ ...prev, chunk_strategy: value }))}
+                    options={[
+                      { value: "recursive", label: t("kb.index.chunkOptions.recursive") },
+                      { value: "fixed_size", label: t("kb.index.chunkOptions.fixed_size") },
+                      { value: "markdown", label: t("kb.index.chunkOptions.markdown") },
+                    ]}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="chunk_size">{t("kb.index.chunkSize")}</Label>
+                  <Input
+                    id="chunk_size"
+                    type="number"
+                    value={ingestionConfig.chunk_size}
+                    onChange={(e) => setIngestionConfig(prev => ({ ...prev, chunk_size: parseInt(e.target.value) || 1000 }))}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="chunk_overlap">{t("kb.index.chunkOverlap")}</Label>
+                  <Input
+                    id="chunk_overlap"
+                    type="number"
+                    value={ingestionConfig.chunk_overlap}
+                    onChange={(e) => setIngestionConfig(prev => ({ ...prev, chunk_overlap: parseInt(e.target.value) || 200 }))}
+                  />
+                </div>
+
+                {ingestionConfig.chunk_strategy === "recursive" && (
+                  <div>
+                    <Label htmlFor="separators" title={t("kb.index.separatorsTip")}>
+                      {t("kb.index.separators")}
+                    </Label>
+                    <Input
+                      id="separators"
+                      type="text"
+                      value={ingestionConfig.separators ?? ""}
+                      onChange={(e) => setIngestionConfig(prev => ({ ...prev, separators: e.target.value }))}
+                      placeholder={t("kb.index.separatorsPlaceholder")}
+                    />
+                  </div>
+                )}
+
+                <div>
+                  <Label htmlFor="embedding_model_id_settings">{t("kb.index.embeddingModelId")}</Label>
+                  <Select
+                    value={ingestionConfig.embedding_model_id}
+                    onValueChange={(value) => setIngestionConfig(prev => ({ ...prev, embedding_model_id: value }))}
+                    options={embeddingModels.map((model) => ({ value: model.model_id, label: model.name || model.model_id }))}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="embedding_batch_size_settings">{t("kb.index.embeddingBatchSize")}</Label>
+                  <Input
+                    id="embedding_batch_size_settings"
+                    type="number"
+                    value={ingestionConfig.embedding_batch_size}
+                    onChange={(e) => setIngestionConfig(prev => ({ ...prev, embedding_batch_size: parseInt(e.target.value) || 10 }))}
+                  />
+                </div>
+
+                <div>
+                  <Label htmlFor="rerank_model_id_settings">{t("kb.index.rerankModelId")}</Label>
+                  <Select
+                    value={collectionRerankModelId}
+                    onValueChange={(value) => setCollectionRerankModelId(value)}
+                    options={[
+                      { value: "", label: t("kb.detail.search.rerankPlaceholder") || "(none)" },
+                      ...rerankModels.map((model) => ({
+                        value: model.model_id,
+                        label: model.model_name || model.name || model.model_id,
+                      })),
+                    ]}
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">{t("kb.index.rerankModelHint")}</p>
+                </div>
+              </div>
+
+              <div className="mt-6">
+                <Button onClick={handleSaveConfig} disabled={isSavingConfig}>
+                  {isSavingConfig ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      {t("kb.index.savingConfig")}
+                    </>
+                  ) : (
+                    t("kb.index.saveConfig")
+                  )}
+                </Button>
+              </div>
+            </div>
+          </TabsContent>
+        </Tabs>
+
+        {/* Re-upload confirm: file(s) already exist */}
+        <Dialog open={reuploadDialogOpen} onOpenChange={(open) => {
+          if (!open) closeReuploadDialog()
+        }}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>{t("kb.dialog.fileUpload.reuploadConfirmTitle")}</DialogTitle>
+              <DialogDescription>
+                {t("kb.dialog.fileUpload.reuploadConfirmMessage")}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="py-2">
+              <ul className="list-disc list-inside text-sm text-muted-foreground space-y-1">
+                {existingFilenamesForReupload.map((name) => (
+                  <li key={name} className="truncate" title={name}>{name}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={closeReuploadDialog}
+              >
+                {t("kb.dialog.fileUpload.reuploadConfirmCancel")}
+              </Button>
+              <Button onClick={handleConfirmReupload} disabled={isUploading}>
+                {isUploading ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    {t("kb.detail.files.uploading")}
+                  </>
+                ) : (
+                  t("kb.dialog.fileUpload.reuploadConfirmSubmit")
+                )}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        {/* Edit Collection Dialog */}
+        <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>{t("kb.detail.edit.title")}</DialogTitle>
+              <DialogDescription>
+                {t("kb.detail.edit.description")}
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-4 py-4">
+              <div>
+                <Label htmlFor="edit-collection-name">{t("kb.detail.edit.nameLabel")}</Label>
+                <Input
+                  id="edit-collection-name"
+                  value={editCollectionName}
+                  onChange={(e) => setEditCollectionName(e.target.value)}
+                  placeholder={t("kb.detail.edit.namePlaceholder")}
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setIsEditDialogOpen(false)}>
+                {t("common.cancel")}
+              </Button>
+              <Button onClick={handleUpdateCollectionName} disabled={isUpdating}>
+                {isUpdating ? t("kb.detail.edit.updating") : t("common.save")}
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        {/* Add Source Dialog */}
+        <Dialog open={isAddSourceOpen} onOpenChange={(open) => {
+          setIsAddSourceOpen(open)
+          if (!open) setActiveAddSourceMode(null)
+        }}>
+          <DialogContent className="sm:max-w-[600px]">
+            {!activeAddSourceMode ? (
+              <>
+                <DialogHeader>
+                  <DialogTitle>{t("kb.detail.files.addDialogTitle")}</DialogTitle>
+                  <DialogDescription>
+                    {t("kb.detail.files.addDialogDescription")}
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="grid grid-cols-2 gap-4 py-4">
+                  <Button
+                    variant="outline"
+                    className={`h-32 flex flex-col gap-3 hover:bg-muted/50 hover:border-primary transition-all ${
+                      isDragging ? "border-primary bg-primary/10" : ""
+                    }`}
+                    onClick={() => {
+                      fileInputRef.current?.click()
+                    }}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                  >
+                    <div className="p-3 bg-blue-100 dark:bg-blue-900/30 rounded-full">
+                      <Upload size={24} className="text-blue-600 dark:text-blue-400" />
+                    </div>
+                    <span className="font-medium">{t("kb.dialog.tabs.file")}</span>
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-32 flex flex-col gap-3 hover:bg-muted/50 hover:border-primary transition-all"
+                    onClick={() => setActiveAddSourceMode("web")}
+                  >
+                    <div className="p-3 bg-purple-100 dark:bg-purple-900/30 rounded-full">
+                      <Globe size={24} className="text-purple-600 dark:text-purple-400" />
+                    </div>
+                    <span className="font-medium">{t("kb.dialog.tabs.web")}</span>
+                  </Button>
+                </div>
+              </>
+            ) : activeAddSourceMode === "file" ? (
+              <div className="space-y-4">
+                 <div className="flex items-center gap-2 mb-2">
+                    <Button variant="ghost" size="icon" className="h-8 w-8 -ml-2" onClick={() => setActiveAddSourceMode(null)}>
+                      <ArrowLeft size={16} />
+                    </Button>
+                    <DialogTitle>{t("kb.dialog.fileUpload.title")}</DialogTitle>
+                 </div>
+
+                 {selectedFiles.length === 0 ? (
+                    <div
+                      className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer hover:bg-muted/50 transition-colors ${
+                        isDragging ? "border-primary bg-primary/10" : ""
+                      }`}
+                      onClick={() => fileInputRef.current?.click()}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
+                    >
+                      <Upload className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                      <p className="text-sm text-muted-foreground">{t("kb.dialog.fileUpload.dropOrClick")}</p>
+                      <p className="text-xs text-muted-foreground mt-2">{t("kb.dialog.fileUpload.supportedFormats")}</p>
+                    </div>
+                 ) : (
+                    <div className="space-y-4">
+                      <div className="flex justify-between items-center">
+                        <h4 className="font-medium text-sm">{t("kb.dialog.fileUpload.selectedTitle")} ({selectedFiles.length})</h4>
+                        <Button variant="ghost" size="sm" onClick={() => fileInputRef.current?.click()}>
+                          <Plus size={14} className="mr-1" />
+                          {t("kb.dialog.fileUpload.selectFiles")}
+                        </Button>
+                      </div>
+
+                      <ScrollArea className="h-48 border rounded-md p-2">
+                        <div className="space-y-2">
+                          {selectedFiles.map((file, index) => (
+                            <div key={index} className="flex items-center justify-between p-2 bg-muted/30 rounded text-sm">
+                              <span className="truncate max-w-[200px]" title={file.name}>{file.name}</span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(1)} KB</span>
+                                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => removeFile(index)}>
+                                  <XCircle size={14} />
+                                </Button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </ScrollArea>
+
+                      <Button
+                        onClick={handleUpload}
+                        disabled={isUploading}
+                        className="w-full"
+                      >
+                        {isUploading ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            {t("kb.detail.files.uploading")} ({Math.round(uploadProgress)}%)
+                          </>
+                        ) : (
+                          t("kb.detail.files.upload")
+                        )}
+                      </Button>
+                      {isUploading && uploadProgressDetail && (
+                        <p className="text-xs text-muted-foreground text-center">{uploadProgressDetail}</p>
+                      )}
+                    </div>
+                  )}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                 <div className="flex items-center gap-2 mb-2">
+                    <Button variant="ghost" size="icon" className="h-8 w-8 -ml-2" onClick={() => setActiveAddSourceMode(null)}>
+                      <ArrowLeft size={16} />
+                    </Button>
+                    <DialogTitle>{t("kb.dialog.tabs.web")}</DialogTitle>
+                 </div>
+
+                 <div className="space-y-4">
+                    <div>
+                      <Label htmlFor="dialog-start-url">{t("kb.dialog.webImport.basic.startUrl")} *</Label>
+                      <Input
+                        id="dialog-start-url"
+                        placeholder="https://help.example.com"
+                        value={webIngestionConfig.start_url}
+                        onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, start_url: e.target.value }))}
+                        className="mt-1"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <Label htmlFor="dialog-max-pages">{t("kb.dialog.webImport.basic.maxPages")}</Label>
+                          <Input
+                            id="dialog-max-pages"
+                            type="number"
+                            value={webIngestionConfig.max_pages}
+                            onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, max_pages: parseInt(e.target.value) || 100 }))}
+                            className="mt-1"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="dialog-max-depth">{t("kb.dialog.webImport.basic.crawlDepth")}</Label>
+                          <Input
+                            id="dialog-max-depth"
+                            type="number"
+                            min="1"
+                            max="10"
+                            value={webIngestionConfig.max_depth}
+                            onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, max_depth: parseInt(e.target.value) || 3 }))}
+                            className="mt-1"
+                          />
+                        </div>
+                    </div>
+
+                    <details className="text-sm">
+                      <summary className="cursor-pointer font-medium text-muted-foreground hover:text-foreground transition-colors mb-2 select-none">
+                        {t("kb.dialog.webImport.advanced.title")}
+                      </summary>
+                      <div className="space-y-4 pt-2 pl-2 border-l-2 border-muted ml-1">
+                        <div>
+                          <Label htmlFor="dialog-url-patterns">{t("kb.dialog.webImport.advanced.urlPatterns")}</Label>
+                          <Input
+                            id="dialog-url-patterns"
+                            placeholder="https://example.com/blog/*"
+                            value={webIngestionConfig.url_patterns}
+                            onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, url_patterns: e.target.value }))}
+                            className="mt-1"
+                          />
+                        </div>
+                        <div>
+                          <Label htmlFor="dialog-exclude-patterns">{t("kb.dialog.webImport.advanced.excludePatterns")}</Label>
+                          <Input
+                            id="dialog-exclude-patterns"
+                            placeholder="*.png, *.jpg"
+                            value={webIngestionConfig.exclude_patterns}
+                            onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, exclude_patterns: e.target.value }))}
+                            className="mt-1"
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <Label htmlFor="dialog-content-selector">{t("kb.dialog.webImport.advanced.contentSelector")}</Label>
+                            <Input
+                              id="dialog-content-selector"
+                              placeholder="main, article, .content"
+                              value={webIngestionConfig.content_selector}
+                              onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, content_selector: e.target.value }))}
+                              className="mt-1"
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="dialog-remove-selectors">{t("kb.dialog.webImport.advanced.removeSelectors")}</Label>
+                            <Input
+                              id="dialog-remove-selectors"
+                              placeholder="nav, footer, .ads"
+                              value={webIngestionConfig.remove_selectors}
+                              onChange={(e) => setWebIngestionConfig(prev => ({ ...prev, remove_selectors: e.target.value }))}
+                              className="mt-1"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </details>
+
+                    <Button
+                      onClick={() => handleWebIngest()}
+                      disabled={!webIngestionConfig.start_url || isWebIngesting}
+                      className="w-full mt-2"
+                    >
+                      {isWebIngesting ? (
+                         <div className="flex items-center gap-2">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            {t("kb.dialog.webImport.status.crawling")} ({Math.round(webIngestionProgress)}%)
+                         </div>
+                      ) : (
+                         t("kb.index.startImport")
+                      )}
+                    </Button>
+                    {webIngestionResult && (
+                      <Card className="p-4">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2">
+                            {getStatusIcon(webIngestionResult.status)}
+                            <span className="font-medium">
+                              {t(webIngestionResult.status === "success" ? "kb.dialog.webImport.status.success" : "kb.dialog.webImport.status.failed")}
+                            </span>
+                          </div>
+                          <p className="text-sm text-muted-foreground break-all">{webIngestionResult.message}</p>
+                        </div>
+                      </Card>
+                    )}
+                 </div>
+              </div>
+            )}
+          </DialogContent>
+        </Dialog>
+    </div>
+  )
+}

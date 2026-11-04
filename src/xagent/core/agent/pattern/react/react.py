@@ -1,0 +1,7007 @@
+"""ReAct execution pattern for the agent runtime.
+
+In-turn tool concurrency (off by default; gated by ``tool_parallel_enabled``)
+lets consecutive concurrency-safe tool calls in a single turn run as a bounded
+concurrent batch instead of strictly serially. The implementation preserves
+these invariants — referenced as I1–I6 in the code below — so that enabling the
+flag never changes observable results, only latency:
+
+- I1 (ordered backfill): tool results are written to the context in the model's
+  original tool-call order, regardless of which tool finishes first.
+- I2 (one result per call): every ``tool_call_id`` gets exactly one result,
+  including failures.
+- I3 (ledger order): ``tool_ledger`` and ``tool_call_id_index`` insertion order
+  match input order after a batch, because the consecutive-count walks read the
+  index in reverse insertion order.
+- I4 (control segment): a control tool (final_answer / send_message /
+  ask_user_question) owns its segment and never shares a concurrent batch.
+  What happens to the rest of the batch depends on the control result:
+    * final_answer with answer text finalizes the run and clears the queue;
+    * final_answer with an empty answer is rejected instead - the call gets a
+      failure result, every sibling still queued is cancelled with a result of
+      its own, and the next turn is forced back to final_answer;
+    * ask_user_question, and send_message with expect_response=True, suspend
+      for the user and discard the rest of the plan;
+    * send_message with expect_response=False returns "message_sent" and
+      execution continues with the next segment.
+  So every branch except the last ends the turn's tool execution. The reject,
+  suspend, and message branches settle every queued sibling with a result of
+  its own; the finalize branch does not - it clears the queue without
+  cancelling siblings, which is exactly why the strip removes a bundled
+  final_answer before the batch is recorded.
+
+  A batch that arrives here from a fresh LLM response carries no final_answer
+  alongside a work tool: response normalization removes it first, because its
+  answer text was written before those tools ran. That holds for fresh
+  responses only - pending_tool_calls restored from an interrupt checkpoint
+  are replayed without re-normalization, so a batch written by an earlier
+  build can still reach this loop carrying one, and takes the branches above
+  unchanged. A waiting_for_user resume is the exception: it cancels any
+  restored pending calls before the loop (legacy pre-#2216 checkpoints), so
+  the resumed turn replans instead of replaying.
+- I5 (interrupt / resume): an interrupt during a concurrent batch preserves
+  calls that already completed and leaves only interrupted calls pending. A
+  cancelled call may still have committed externally before cancellation was
+  observed, so ``concurrency_safe`` is an explicit idempotency contract as well
+  as a concurrency contract. A crash before backfill leaves the whole segment
+  pending for resume under the same contract.
+- I6 (trace pairing): tool trace spans pair START with END/ERROR by
+  ``tool_call_id`` rather than tool name, so concurrent same-name calls do not
+  cross-attribute (see ``tracing/langfuse/handler.py``).
+
+When ``tool_parallel_enabled`` is False every segment is a single serial call,
+making the loop byte-for-byte equivalent to the pre-concurrency behavior.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import difflib
+import hashlib
+import inspect
+import itertools
+import json
+import logging
+import uuid
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Callable, cast
+from uuid import uuid4
+
+from .....config import get_form_answer_continuation_enabled
+from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
+from ....file_ref import (
+    WORKSPACE_OUTPUT_FILES_TOOL_NAME,
+    final_deliverable_file_reference_instructions,
+)
+from ....model.chat.basic.base import compatible_tool_choice_for_llm
+from ....model.chat.exceptions import LLMToolProtocolError
+from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.adapters.vibe.interaction_types import (
+    CLARIFICATION_GUIDANCE,
+    DEFAULT_WAITING_INTERACTION,
+    DEGRADED_FIELDS_NOTE,
+    INTERACTION_TYPE_ALIASES,
+    INTERACTION_TYPES,
+    OPTIONS_REQUIRED_GUIDANCE,
+    SUGGESTED_VALUE_GUIDANCE,
+    degrade_options_less_pickers,
+    lacks_required_options,
+)
+from ....tools.adapters.vibe.mcp_approval_gate import (
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
+)
+from ....tools.tool_result_spill import (
+    SPILL_READ_TOOL_NAME,
+    SPILL_RESERVED_RESULT_KEY,
+    normalize_spilled_relative_path,
+    render_spill_notice,
+)
+from ....tools.user_interaction import (
+    WAITING_FOR_USER_STATUS,
+    ToolInteractionSettlement,
+    tool_result_waits_for_user,
+    user_interaction_resume_callable,
+)
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
+from ...clarification import draft_from_waiting_request
+from ...context.enrichment import (
+    IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+    enrich_context_with_memory,
+    latest_user_text,
+    pending_user_response_lifecycle,
+    pending_user_response_marker,
+)
+from ...context.execution import (
+    note_compaction_evidence_loss,
+    provider_safe_tool_name,
+    snapshot_container,
+    tool_evidence_state,
+)
+from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
+from ...context.skill_tool import build_load_skill_tool
+from ...grounding import evidence_facts, grounding_rule
+from ...language import effective_output_language, final_answer_language_rule
+from ...prompt_composition import (
+    BUILTIN_TOOL_ORIGIN,
+    CALL_KIND_DECISION,
+    CALL_KIND_MAIN,
+    CALL_KIND_PROTOCOL_RETRY,
+    PROMPT_COMPOSITION_KEY,
+    build_prompt_composition,
+)
+from ...result import (
+    CONTROL_TOOL_NAMES,
+    normalize_tool_failure_code,
+    tool_result_requires_authentication,
+    tool_result_succeeded,
+    unwrap_final_answer_content,
+)
+from ...runtime import (
+    DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
+    INTERRUPTED_DURING_LLM_STREAM_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
+    INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+    INVALID_TOOL_PROTOCOL_RETRYING_REASON,
+    NO_DELIVERABLE_FINAL_ANSWER_REASON,
+    UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON,
+    ExecutionInterrupted,
+    LLMCallInterrupted,
+    PatternRuntime,
+    ToolCallInterrupted,
+    prepare_llm_for_context,
+    resolved_llm_metadata,
+)
+from ...tool_access import connector_tool_sources, tool_access_context
+from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope
+from ..base import (
+    AgentPattern,
+    PatternResult,
+    append_user_message_preserving_turns,
+    truncate_prompt_preview,
+)
+from ..final_answer_stream import ReActFinalAnswerStreamer
+from ..partial_delivery import request_partial_delivery
+from .duplicate_write_guard import (
+    DUPLICATE_WRITE_SUPPRESSED_KEY,
+    build_suppression_envelope,
+    tool_requires_duplicate_write_guard,
+)
+from .truncation import (
+    TRUNCATED_TOOL_ARGUMENTS,
+    TRUNCATED_TOOL_ARGUMENTS_ERROR,
+    is_truncated_tool_call,
+    response_finish_reason,
+    truncated_tool_arguments_instruction,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ReActReasoningMode(str, Enum):
+    """Reasoning strategy used by ReActPattern."""
+
+    TOOL_CALLING = "tool_calling"
+    REASONING_ACTION = "reasoning_action"
+
+
+REPEATED_TOOL_DECISION_REQUESTED_STATUS = "repeated_tool_decision_requested"
+DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS = 4
+DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
+REACT_DECISION_TOOL_NAME = "react_decision"
+REACT_DECISION_FINAL_ANSWER = "final_answer"
+USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
+REACT_DECISION_TOOL_CALL = "tool_call"
+UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
+# Argument names that mark a call as one page of a larger list. A repeated run
+# of such calls has not read the whole list just because several pages came back.
+PAGINATION_ARGUMENT_NAMES = frozenset(
+    {
+        "page",
+        "page_number",
+        "pageNumber",
+        "page_token",
+        "pageToken",
+        "next_page_token",
+        "nextPageToken",
+        "cursor",
+        "offset",
+        "skip",
+        "next_skip",
+        "nextSkip",
+        "starting_after",
+        "startingAfter",
+        "page_index",
+        "pageIndex",
+        "start_at",
+        "startAt",
+    }
+)
+# Hints in the error for an unknown tool name. Close names are preferred; the
+# listing is the fallback for a name nothing resembles and stays short because
+# the model already has the full set in its tool schemas.
+TOOL_NOT_FOUND_CLOSE_CUTOFF = 0.8
+TOOL_NOT_FOUND_MAX_CLOSE_NAMES = 3
+TOOL_NOT_FOUND_MAX_LISTED_NAMES = 20
+# Bounds for the final_answer-strip warning's tool-name list. Tool names come
+# straight from the model, so the log line is shaped like the rest of this
+# module's untrusted-input logging: bounded length, escaped, never raw.
+STRIP_LOG_MAX_TOOL_NAMES = 8
+STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
+# One best-effort delivery turn after the work budget, never another work loop.
+ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
+# Stored-result reads a forced answer turn may make, counted over the whole
+# run: reads that ran (the budget) and paths that matched no stored result
+# (the reject cap) are counted apart so neither kind uses up the other.
+FORCED_ANSWER_READ_BUDGET = 3
+FORCED_ANSWER_READ_REJECT_CAP = 3
+# The observations a forced turn's refused read_tool_result calls receive.
+FORCED_ANSWER_READS_USED_UP_TEXT = (
+    "The read allowance for the final answer is used up. Answer from what you "
+    "have already read; do not state a value you did not read."
+)
+FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT = (
+    "Too many paths for the final answer did not match the stored results "
+    "listed above. Answer from what you have; do not state a value you did "
+    "not read."
+)
+FORCED_ANSWER_READ_UNLISTED_PATH_TEXT = (
+    "read_tool_result during the final answer turn is limited to the stored "
+    "results listed above. Copy one of those paths exactly. That path is not "
+    "one of them."
+)
+REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
+    "Target natural language for user-facing prose in this ReAct response, "
+    "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
+    "Follow the canonical request-language policy in the system context; do not "
+    "collapse Chinese variants into generic Chinese."
+)
+# Settlement outcomes whose write must not be retried by the model: a denial
+# ("rejected") and a possibly-executed dispatch ("dispatch_unknown"). Both
+# raise the settlement final-answer fence and both enroll their ledger record
+# in the turn-scoped duplicate-write guard. "failed" is excluded on purpose:
+# it means the write provably did not happen, so a retry is legitimate.
+_GUARDED_SETTLEMENT_STATUSES = frozenset({"rejected", "dispatch_unknown"})
+# Every terminal settlement status, i.e. the ones whose ledger record carries a
+# settlement_turn_id that the duplicate-write guard keys on.
+_SETTLED_SETTLEMENT_STATUSES = frozenset({"succeeded"}) | _GUARDED_SETTLEMENT_STATUSES
+# Ledger ``status`` values that mean the row already reached a terminal
+# outcome, so re-delivering a response for it is an idempotent replay.
+_SETTLED_ROW_STATUSES = frozenset({"completed", "failed"})
+
+
+@dataclass
+class ToolCallRecord:
+    """Serializable ledger entry for a tool call."""
+
+    tool_call_id: str
+    tool_name: str
+    args: dict[str, Any]
+    args_hash: str
+    status: str
+    # Xagent identity for one concrete invocation. ``None`` denotes a legacy
+    # checkpoint whose exact identity was never recorded; those rows retain
+    # provider-id fallback semantics rather than fabricating history.
+    invocation_id: str | None = None
+    result: Any = None
+    error: str | None = None
+    # Terminal outcome supplied by a resumable tool callback. Kept separate
+    # from ``status`` so existing completed/failed ledger readers remain
+    # backward-compatible.
+    settlement_status: str | None = None
+    # The durable turn the call ran in (see _with_runtime_turn_id). None when
+    # the embedding provides no turn tracking, and for records restored from
+    # checkpoints written before the field existed.
+    turn_id: str | None = None
+    # The turn that delivered a terminal settlement. This is separate from
+    # ``turn_id`` so the original call keeps its execution identity while the
+    # duplicate-write guard can protect the one resumed turn that follows it.
+    settlement_turn_id: str | None = None
+    # Durable obligation to emit both settlement lifecycle trace events.
+    settlement_trace_pending: bool = False
+    # The ReAct step that issued the call. Persisted so a rebuilt runtime can
+    # resume the exact gate identity instead of inventing a new execution slot.
+    step_id: str | None = None
+    # Time the model response issued this invocation. Legacy rows keep ``None``
+    # because their real invocation time cannot be reconstructed safely.
+    issued_at: float | None = None
+    # Execution-event identity of the attempt and its batch, assigned when the
+    # tracer records execution events. A resumed settlement reuses them so its
+    # facts belong to the original attempt; rows written before the fields
+    # existed keep ``None``.
+    tool_attempt_id: str | None = None
+    assistant_message_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool_call_id": self.tool_call_id,
+            "invocation_id": self.invocation_id,
+            "tool_name": self.tool_name,
+            "args": self.args,
+            "args_hash": self.args_hash,
+            "status": self.status,
+            "result": self.result,
+            "error": self.error,
+            "settlement_status": self.settlement_status,
+            "turn_id": self.turn_id,
+            "settlement_turn_id": self.settlement_turn_id,
+            "settlement_trace_pending": self.settlement_trace_pending,
+            "step_id": self.step_id,
+            "issued_at": self.issued_at,
+            "tool_attempt_id": self.tool_attempt_id,
+            "assistant_message_id": self.assistant_message_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ToolCallRecord":
+        return cls(
+            tool_call_id=str(data["tool_call_id"]),
+            tool_name=str(data["tool_name"]),
+            args=dict(data.get("args") or {}),
+            args_hash=str(data.get("args_hash", "")),
+            status=str(data.get("status", "pending")),
+            invocation_id=(
+                str(data["invocation_id"]) if data.get("invocation_id") else None
+            ),
+            result=data.get("result"),
+            error=data.get("error"),
+            settlement_status=(
+                str(data["settlement_status"])
+                if data.get("settlement_status") is not None
+                else None
+            ),
+            turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
+            settlement_turn_id=(
+                str(data["settlement_turn_id"])
+                if data.get("settlement_turn_id") is not None
+                else None
+            ),
+            settlement_trace_pending=bool(data.get("settlement_trace_pending", False)),
+            step_id=str(data["step_id"]) if data.get("step_id") else None,
+            issued_at=(
+                float(data["issued_at"]) if data.get("issued_at") is not None else None
+            ),
+            tool_attempt_id=(
+                str(data["tool_attempt_id"]) if data.get("tool_attempt_id") else None
+            ),
+            assistant_message_id=(
+                str(data["assistant_message_id"])
+                if data.get("assistant_message_id")
+                else None
+            ),
+        )
+
+
+# Every code point that Python's str.strip() or JavaScript's
+# String.prototype.trim() treats as trimmable: ECMA-262 WhiteSpace (TAB VT FF
+# ZWNBSP + Unicode Zs) and LineTerminator (LF CR LS PS), unioned with the five
+# extra code points CPython's str.strip() treats as whitespace (U+001C-U+001F,
+# U+0085).
+#
+# The table is frozen as a literal instead of derived from CPython's
+# whitespace table for two reasons: (1) this invariant runs in the direction
+# "whatever JavaScript trims, we must also trim", and CPython's whitespace
+# table shifts with the Unicode version bundled in each interpreter release;
+# (2) the normalized value is written back into item["field"], and the
+# frontend's own trim() must be a no-op on the result -- that only holds
+# while this table is a superset of the JavaScript table, which the coverage
+# test in tests/core/agent/test_react.py pins down.
+#
+# Every code point is written as an escape, never a literal: several of them
+# (U+2028/U+2029 in particular) are silently rewritten by some editors and
+# transports when they appear as literal bytes.
+_INTERACTION_TRIM_CHARS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f\x20\x85\xa0"
+    "\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)  # 30 code points
+
+
+def normalize_interaction_text(value: str) -> str:
+    """Strip every code point either Python or JavaScript treats as trimmable.
+
+    Public because modules outside this one judge interaction text against
+    the same table; ``_normalize_interaction_text`` below is the same
+    function under its earlier private name, kept for existing callers.
+
+    One pass over one union table, deliberately -- not ``value.strip()``
+    followed by a second pass over the JavaScript-only characters.
+
+    One pass is a fixed point by construction: ``str.strip(chars)`` deletes
+    from both ends up to the first character not in ``chars``, so the
+    returned value's first and last characters are, by definition, not in
+    ``chars``; stripping the same ``chars`` again is the identity. That is
+    what lets the caller write the result back into ``item["field"]`` and
+    rely on the frontend's own ``trim()`` being a no-op on it.
+
+    Two passes over two different tables would not be a fixed point: each
+    pass stops at a character its own table does not contain, and that
+    stopping point says nothing about the other table -- e.g. a value
+    starting with U+FEFF then U+001C would have the first pass halt
+    immediately on U+FEFF (Python does not treat it as space), then a second
+    pass over the JavaScript-only characters would remove U+FEFF and halt on
+    U+001C (JavaScript does not trim it), leaving U+001C behind. Do not
+    "optimize" this back into two passes.
+    """
+    return value.strip(_INTERACTION_TRIM_CHARS)
+
+
+_normalize_interaction_text = normalize_interaction_text
+
+
+def _is_non_blank_str(value: Any) -> bool:
+    """True when value is a string that stays non-empty after
+    _normalize_interaction_text -- the blankness judgment shared by option
+    label/value filtering and field-name fallback. Takes Any (not str) so
+    the isinstance check and the trim happen together, on the same value:
+    calling _normalize_interaction_text directly on a fresh dict.get(...)
+    expression defeats type-narrowing across the two calls.
+    """
+    return isinstance(value, str) and bool(_normalize_interaction_text(value))
+
+
+def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
+    """Normalize common model variants into the frontend interaction contract.
+
+    A label or value that is blank after ``_normalize_interaction_text`` is
+    treated the same as missing: the option is dropped. A field name that is
+    blank after normalization falls back to ``response_{index}``; a
+    well-formed field name is normalized and written back so the frontend's
+    own ``trim()`` is a no-op on it. A ``type`` listed in
+    ``INTERACTION_TYPE_ALIASES`` is rewritten to the canonical name the
+    frontend maps it to; any other off-contract ``type`` is left verbatim.
+    Survivors are otherwise kept verbatim.
+
+    The alias chain ``field or id or name`` intentionally keeps its raw
+    truthiness check; it is not normalization-aware. The frontend's own
+    alias chains (clarification-form.tsx, app-context-chat.tsx) make the
+    same raw-truthiness choice, and because this function always writes its
+    result back into ``item["field"]``, the frontend never evaluates its own
+    ``id``/``name`` fallback for a field this function has already resolved
+    -- so this stays consistent with the frontend regardless of which one
+    changes first.
+
+    This function does not deduplicate field names within a single call: it
+    keeps every colliding entry as its own interaction rather than dropping
+    or renaming one. Each one still goes through every other step above --
+    its field is trimmed, its options are filtered, ``actions`` is stripped
+    -- only the name collision itself is left as-is, and a warning is
+    logged. Both call sites deduplicate afterward, in the same shape
+    (append ``_2``, ``_3`` to a repeated base) but at different scope: the
+    single-tool call site (``ask_user_question`` in ``_handle_control_tool``)
+    deduplicates within that one call's own interactions only. The
+    multi-tool call site (``_pause_for_tool_results``) runs its own
+    deduplication across all tools' interactions after calling this
+    function once per tool, so a base already used by an earlier tool in
+    the same batch is not reused by a later one either.
+
+    The output never carries an ``actions`` key: ``actions`` is a model
+    alias for ``options`` (consumed above whenever ``options`` itself is
+    missing or not a list, and ``actions`` is itself a list), and leaving
+    the raw, unfiltered alias in the output would give the persisted row a
+    second, never-filtered carrier of the same option list.
+    """
+
+    if not isinstance(interactions, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for index, interaction in enumerate(interactions):
+        if not isinstance(interaction, dict):
+            continue
+
+        item = dict(interaction)
+        item_type = item.get("type")
+        if isinstance(item_type, str) and item_type in INTERACTION_TYPE_ALIASES:
+            item["type"] = INTERACTION_TYPE_ALIASES[item_type]
+        field = item.get("field") or item.get("id") or item.get("name")
+        normalized_field = (
+            _normalize_interaction_text(field) if isinstance(field, str) else ""
+        )
+        item["field"] = normalized_field or f"response_{index}"
+
+        # Widened from "options" not in item: an interaction can carry both
+        # a malformed options (present but not a list) and a well-formed
+        # actions alias, and the alias is the only place the real data
+        # lives in that shape -- narrower than "not in item" would leave
+        # the alias unconsumed and drop every option for that interaction
+        # (verified: the malformed-options-plus-actions case loses all its
+        # options under the narrower condition).
+        if not isinstance(item.get("options"), list) and isinstance(
+            item.get("actions"), list
+        ):
+            item["options"] = item["actions"]
+
+        options = item.get("options")
+        if isinstance(options, list):
+            filtered_options = [
+                {
+                    key: value
+                    for key, value in {
+                        "label": option.get("label"),
+                        "value": option.get("value"),
+                        "description": option.get("description"),
+                        "action_type": option.get("action_type"),
+                    }.items()
+                    if value is not None
+                }
+                for option in options
+                if isinstance(option, dict)
+                and _is_non_blank_str(option.get("label"))
+                and _is_non_blank_str(option.get("value"))
+            ]
+            if options and not filtered_options:
+                # All options for this interaction were blank. The
+                # interaction is still emitted (the question still goes
+                # out), so this is the only signal that it happened. This
+                # warning's payload is bounded to integer counts, never the
+                # model-controlled field name -- the same discipline
+                # STRIP_LOG_MAX_TOOL_NAMES above applies to tool names, but
+                # that is this warning's own choice, not a blanket rule for
+                # every log call in this module (several elsewhere put raw
+                # tool names or argument keys straight into the message).
+                logger.warning(
+                    "ask_user_question dropped all %d option(s) for interaction %d",
+                    len(options),
+                    index,
+                    extra={
+                        "dropped": len(options),
+                        "total": len(options),
+                        "interaction_index": index,
+                    },
+                )
+            item["options"] = filtered_options
+        elif "options" in item:
+            # options is present but neither a list nor rescued by the
+            # actions alias above -- a malformed shape this function has
+            # always left untouched, but silently: nothing signaled that
+            # it happened. Same payload discipline as the other two
+            # warnings in this function: bounded, integer-only.
+            logger.warning(
+                "ask_user_question interaction %d has a non-list options value",
+                index,
+                extra={"interaction_index": index},
+            )
+
+        # Leave only one carrier of the option list in the output. Whether
+        # or not the alias branch above used actions to seed options,
+        # item["actions"] itself is never touched by the filter step above
+        # (that step reassigns item["options"] to a new, filtered list and
+        # leaves the actions key exactly as the model gave it) -- so
+        # whatever is left under item["actions"] is always the original,
+        # unfiltered list: either the same content options was seeded
+        # from, pre-filter, or, when options was itself already a list, a
+        # completely unrelated list the filter never saw. Either way,
+        # leaving it in the output gives the persisted row a second,
+        # unfiltered carrier of option data that gets stored verbatim into
+        # task_chat_messages.interactions and replayed unchanged.
+        # Unconditional so this holds regardless of whether options ended
+        # up a list -- must run after the alias branch above, not before:
+        # popping actions first would delete the only place a malformed
+        # options's real data lives before the alias branch can consume it,
+        # dropping every option for that interaction.
+        item.pop("actions", None)
+
+        normalized.append(item)
+
+    field_counts: dict[str, int] = {}
+    for item in normalized:
+        field_counts[item["field"]] = field_counts.get(item["field"], 0) + 1
+    colliding_field_count = sum(1 for count in field_counts.values() if count > 1)
+    if colliding_field_count:
+        # Same payload discipline as the other warnings in this function:
+        # integer counts only, never the colliding field name itself.
+        logger.warning(
+            "ask_user_question interactions have %d colliding field name(s) out of %d",
+            colliding_field_count,
+            len(normalized),
+            extra={
+                "colliding_field_count": colliding_field_count,
+                "total": len(normalized),
+            },
+        )
+
+    return normalized
+
+
+def _records_advance_pagination(records: list[ToolCallRecord]) -> bool:
+    """Return whether recorded calls actually moved through pagination.
+
+    Merely repeating ``page=1`` is a stuck loop, not evidence that more pages
+    should be fetched. Compare only pagination arguments so identical requests
+    stay unmarked while page, cursor, offset and connector-specific tokens that
+    change across calls are recognised.
+    """
+
+    signatures: list[dict[str, Any]] = []
+    has_pagination_argument = False
+    for record in records:
+        args = record.args
+        if not isinstance(args, dict):
+            continue
+        signature = {
+            name: args[name] for name in PAGINATION_ARGUMENT_NAMES if name in args
+        }
+        has_pagination_argument = has_pagination_argument or bool(signature)
+        signatures.append(signature)
+    return (
+        has_pagination_argument
+        and len(signatures) >= 2
+        and any(signature != signatures[0] for signature in signatures[1:])
+    )
+
+
+def _unique_field(base_field: str, used_fields: set[str]) -> str:
+    """Suffix ``_2``/``_3``... until unused, record it, and return it."""
+
+    field = base_field
+    suffix = 2
+    while field in used_fields:
+        field = f"{base_field}_{suffix}"
+        suffix += 1
+    used_fields.add(field)
+    return field
+
+
+def _is_answerable(interaction: Any) -> bool:
+    """Whether a user handed this control could produce an answer with it.
+
+    A type outside ``INTERACTION_TYPES`` is dropped by the frontend's
+    ``normalizeInteractions``; ``connect_apps`` is the one it keeps and still
+    cannot answer, because a form whose fields are all widgets renders no
+    Submit button (``isConnectAppsOnly``, clarification-form.tsx). A picker
+    with no options survives ``_normalize_ask_user_interactions`` (which drops
+    the blank options, not the interaction) as a control with nothing to pick;
+    both publishing call sites degrade such a picker to a ``text_input``
+    (``degrade_options_less_pickers``) before the list reaches
+    ``_send_waiting_message``, so that branch fires here only for a caller
+    that skips that step. Aliases are not a third case: normalization has
+    already mapped them onto these seven. Two gaps stay open, both under the
+    embedded widget's default ``filesDisabled``: a ``file_upload`` renders
+    nothing, and an ``action_cards`` whose options are all file actions
+    renders no cards (``visibleOptions``, clarification-form.tsx).
+    """
+
+    if not isinstance(interaction, dict):
+        return False
+    interaction_type = interaction.get("type")
+    # The model is free to send an unhashable ``type`` (a list). Refused here
+    # rather than left to the membership test, which only tolerates one
+    # because ``INTERACTION_TYPES`` is a tuple -- as a set it would raise
+    # ``TypeError`` and take the whole run down.
+    if not isinstance(interaction_type, str):
+        return False
+    if interaction_type not in INTERACTION_TYPES:
+        return False
+    return not lacks_required_options(interaction)
+
+
+# The rule this implements: a model-authored ask_user_question is a form when
+# at least one of its answerable fields (see ``_is_answerable``) has a type
+# other than confirm or file_upload. Every other answerable type counts,
+# including a select_one whose options are just "Yes" and "No" and
+# action_cards; only the two types below are excluded. ``boolean`` is not
+# listed because it normalizes to confirm before this check runs.
+_NON_FORM_ANSWERABLE_TYPES = frozenset({"confirm", "file_upload"})
+
+
+@dataclass(frozen=True)
+class FormAnswerDecision:
+    """Whether this one LLM call is a form-answer turn, and whether the
+    form-answer-continuation text is applied to it.
+
+    Computed exactly once per call, at the site that builds that call's final
+    messages, so the same object both selects what ``get_messages_for_llm``
+    renders (via ``_messages_for_llm(..., form_answer_continuation=...)``)
+    and what ``trace_metadata`` reports for it -- the two can never disagree
+    about the same call.
+    """
+
+    # Whether this call could carry the text at all: the latest visible user
+    # message answers a model-authored form and the context renders a
+    # "Current user request" block (``form_answer_continuation_target``).
+    # Recorded on every main and protocol-retry call where that holds,
+    # including forced ones and with the switch off, so how often this shape
+    # occurs stays visible either way. A DAG step or a context with no
+    # current request records nothing.
+    turn: bool
+    # Whether the form-answer-continuation text was actually applied to this
+    # call: turn, plus an unforced turn and the global switch
+    # (``get_form_answer_continuation_enabled``) being on.
+    applied: bool
+
+    def trace_metadata(self) -> dict[str, bool]:
+        metadata: dict[str, bool] = {}
+        if self.turn:
+            metadata["form_answer_turn"] = True
+        if self.applied:
+            metadata["form_answer_continuation"] = True
+        return metadata
+
+
+def _form_answer_decision(
+    context: Any, *, force_final_answer: bool
+) -> FormAnswerDecision:
+    """Shared by the main loop and the protocol retry. The iteration-limit
+    delivery does not call this and does not pass ``form_answer_continuation``
+    to ``_messages_for_llm``, so it relies on that parameter's default
+    (False). A forced turn cannot call ``ask_user_question`` again, so it
+    never applies."""
+    turn = context.form_answer_continuation_target() is not None
+    applied = turn and not force_final_answer and get_form_answer_continuation_enabled()
+    return FormAnswerDecision(turn=turn, applied=applied)
+
+
+def _unavailable_tool_call_names(
+    protocol_error: dict[str, Any],
+) -> frozenset[str] | None:
+    """Names a provider refused as unavailable, or None when it does not say.
+
+    Only the structured details["tool_name"] counts. The violation's message
+    also names the call, but it is one adapter's prose and nothing promises
+    its wording.
+    """
+    details = protocol_error.get("details")
+    if not isinstance(details, dict):
+        return None
+    name = details.get("tool_name")
+    if isinstance(name, str) and name:
+        return frozenset({name})
+    return None
+
+
+class ReActPattern(AgentPattern):
+    """Minimal ReAct loop for the execution runtime."""
+
+    def __init__(
+        self,
+        llm: Any | None = None,
+        *,
+        # Intentionally high for interactive and long-running agent tasks; callers
+        # can pass a lower value when they need stricter cost or latency bounds.
+        # Reads on a forced answer turn, and reads refused there because the
+        # path is not a stored result, add iterations on top of this bound
+        # (forced_answer_extra_iterations, at most FORCED_ANSWER_READ_BUDGET +
+        # FORCED_ANSWER_READ_REJECT_CAP per run). Only forced answer turns may
+        # use them; every other turn stops at this value, which itself does
+        # not count them.
+        max_iterations: int = 200,
+        tool_choice: str | dict[str, Any] | None = "required",
+        reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
+        finalize_after_tool_result: bool = False,
+        repeated_tool_decision_after_consecutive_tool_calls: int | None = (
+            DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS
+        ),
+        repeated_tool_decision_after_consecutive_work_tool_calls: int | None = (
+            DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS
+        ),
+        tool_parallel_enabled: bool = False,
+        tool_max_concurrency: int = 3,
+        user_interaction_enabled: bool = True,
+    ) -> None:
+        self.llm = llm
+        self.max_iterations = max_iterations
+        self.tool_choice = tool_choice
+        self.reasoning_mode = ReActReasoningMode(reasoning_mode)
+        self.finalize_after_tool_result = finalize_after_tool_result
+        # In-turn tool concurrency (default off). When enabled, consecutive
+        # concurrency-safe tool calls in a single turn run as a concurrent
+        # batch bounded by ``tool_max_concurrency``.
+        self.tool_parallel_enabled = tool_parallel_enabled
+        self.tool_max_concurrency = max(1, int(tool_max_concurrency))
+        self.user_interaction_enabled = user_interaction_enabled
+        self.repeated_tool_decision_after_consecutive_tool_calls = (
+            repeated_tool_decision_after_consecutive_tool_calls
+        )
+        self.repeated_tool_decision_after_consecutive_work_tool_calls = (
+            repeated_tool_decision_after_consecutive_work_tool_calls
+        )
+        self.status = "idle"
+        self.current_iteration = 0
+        self.iteration_limit_delivery_attempted = False
+        self.last_response: Any = None
+        self.pending_tool_calls: list[dict[str, Any]] = []
+        self.pending_tool_call_content: dict[str, str] = {}
+        # One row per concrete invocation, keyed by ``_ledger_key``: the
+        # invocation id, or the provider tool-call id for a legacy row.
+        self.tool_ledger: dict[str, ToolCallRecord] = {}
+        # Provider tool-call id -> ledger key of the row that id currently
+        # resolves to. Maintained with exactly the dict operations the
+        # pre-identity ledger (keyed by provider id) used, so its order and
+        # values reproduce that ledger for every provider-keyed consumer.
+        self.tool_call_id_index: dict[str, str] = {}
+        self.force_final_answer_next = False
+        # Forced-answer read state. The two counters are per run and never
+        # reset, so a run makes at most FORCED_ANSWER_READ_BUDGET +
+        # FORCED_ANSWER_READ_REJECT_CAP forced-turn read dispositions.
+        # _forced_answer_read_open says whether the current forced turn offers
+        # read_tool_result; forced_answer_extra_iterations counts the
+        # iterations those dispositions added on top of max_iterations and is
+        # never reset either.
+        self.forced_answer_reads_used = 0
+        self.forced_answer_reads_rejected = 0
+        self._forced_answer_read_open = False
+        self.forced_answer_extra_iterations = 0
+        # See _settlement_fence_active: a one-way latch for the single turn
+        # that received a rejected / dispatch-unknown settlement.
+        self.settlement_final_answer_fence = False
+        self.settlement_fence_turn_id: str | None = None
+        self.repeated_tool_decision: dict[str, Any] | None = None
+        self.waiting_for_user_request: dict[str, Any] | None = None
+        self.pending_tool_interaction_responses: list[dict[str, Any]] = []
+        self.task_text: str | None = None
+        self.memory_input_text: str | None = None
+        self._memory_store: Any | None = None
+        self._memory_tools_factory: Any | None = None
+        self._tool_decision_groups_by_name: dict[str, str] = {}
+        self._connector_tool_sources: dict[str, str] = {}
+
+    async def run(
+        self,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        runtime = kwargs.get("runtime")
+        if runtime is None:
+            runtime = PatternRuntime(
+                execution_id=getattr(context, "execution_id", None)
+            )
+        elif getattr(runtime, "execution_id", None) is None:
+            setattr(runtime, "execution_id", getattr(context, "execution_id", None))
+
+        active_llm = llm or self.llm
+        compact_llm = kwargs.get("compact_llm")
+        if active_llm is None:
+            return PatternResult(
+                success=False,
+                error="ReActPattern requires an llm instance.",
+            ).to_dict()
+
+        await runtime.on_pattern_start(context=context, pattern=self)
+        try:
+            waiting_result = await self._resume_waiting_for_user_if_needed(
+                context=context,
+                runtime=runtime,
+                tools=tools,
+            )
+        except CheckpointPersistenceError as exc:
+            # This runs before the main try/except below, so without this
+            # handler a durability failure while checkpointing the received
+            # user response (see ``_resume_waiting_for_user_if_needed``'s
+            # ``"tool_interaction_response_received"`` checkpoint) would
+            # propagate straight past ``on_pattern_error``: no terminal
+            # ``trace_error`` would be recorded, even though the run aborts.
+            await runtime.on_pattern_error(context=context, pattern=self, error=exc)
+            raise
+        if waiting_result is not None:
+            await runtime.on_pattern_end(
+                context=context,
+                pattern=self,
+                result=waiting_result,
+            )
+            return waiting_result
+
+        if self.reasoning_mode == ReActReasoningMode.REASONING_ACTION:
+            self.status = "failed"
+            result = PatternResult(
+                success=False,
+                error=(
+                    "ReActPattern reasoning_action mode is reserved for a future "
+                    "implementation; use tool_calling mode for this release."
+                ),
+                metadata={
+                    "status": self.status,
+                    "reasoning_mode": self.reasoning_mode.value,
+                    "error_type": "not_implemented",
+                },
+            ).to_dict()
+            await runtime.on_pattern_end(context=context, pattern=self, result=result)
+            return result
+
+        try:
+            task_text = self._task_text(context)
+            memory_text = self._memory_text(context, execution_text=task_text)
+            self._memory_store = kwargs.get("memory_store")
+            self._memory_tools_factory = kwargs.get("memory_tools_factory")
+            # DAG steps skip the automatic retrieval: the root run already
+            # retrieved for the whole task, and steps can search_memory on
+            # demand.
+            if not context.metadata.get("dag_step_id"):
+                await enrich_context_with_memory(
+                    context=context,
+                    query=memory_text,
+                    category="react_memory",
+                    memory_store=self._memory_store,
+                    runtime=runtime,
+                    similarity_threshold=kwargs.get("memory_similarity_threshold"),
+                )
+            context_tools = await self._with_context_tools(
+                tools=tools,
+                context=context,
+                task_text=memory_text,
+                runtime=runtime,
+                skill_manager=kwargs.get("skill_manager"),
+                allowed_skills=kwargs.get("allowed_skills"),
+            )
+            await self._deliver_pending_tool_interaction_responses(
+                tools=context_tools,
+                context=context,
+                runtime=runtime,
+            )
+            await self._replay_unemitted_settlement_traces(runtime=runtime)
+            result = await self._run_tool_calling_loop(
+                context=context,
+                tools=context_tools,
+                llm=active_llm,
+                compact_llm=compact_llm,
+                runtime=runtime,
+            )
+        except ExecutionInterrupted as exc:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label=(
+                    "during_tool"
+                    if isinstance(exc, ToolCallInterrupted)
+                    else "during_enrichment"
+                ),
+            )
+            if interrupted is None:
+                raise
+            result = interrupted
+        except Exception as exc:
+            await runtime.on_pattern_error(context=context, pattern=self, error=exc)
+            raise
+
+        await runtime.on_pattern_end(context=context, pattern=self, result=result)
+        return result
+
+    async def _with_context_tools(
+        self,
+        *,
+        tools: list[Any],
+        context: Any,
+        task_text: str,
+        runtime: PatternRuntime,
+        skill_manager: Any | None,
+        allowed_skills: list[str] | None,
+    ) -> list[Any]:
+        """Expose the memory tool set and ``load_skill`` for this run.
+
+        Skipped when ``finalize_after_tool_result`` is set (single_call mode):
+        that mode forces a final answer after the first successful tool call,
+        so the only tool round must go to the actual task.
+        """
+        if self.finalize_after_tool_result:
+            return tools
+        if self._memory_tools_factory is None:
+            extra_tools: list[Any] = build_memory_tools(
+                memory_store=self._memory_store,
+                task=task_text,
+                runtime=runtime,
+                context=context,
+            )
+        else:
+            # Host factories are synchronous setup hooks and must not perform
+            # blocking I/O. Copy their result so adding run-local tools never
+            # mutates a list retained by the host.
+            extra_tools = list(
+                self._memory_tools_factory(
+                    memory_store=self._memory_store,
+                    task=task_text,
+                    runtime=runtime,
+                    context=context,
+                )
+            )
+            if extra_tools and hasattr(context, "metadata"):
+                context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
+        skill_tool = await build_load_skill_tool(
+            skill_manager=skill_manager,
+            context=context,
+            allowed_skills=allowed_skills,
+        )
+        if skill_tool is not None:
+            extra_tools.append(skill_tool)
+        if not extra_tools:
+            return tools
+        return [*tools, *extra_tools]
+
+    async def _run_tool_calling_loop(
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        compact_llm: Any | None,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any]:
+        self.status = "thinking"
+        self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
+        self._connector_tool_sources = connector_tool_sources(tools)
+        # Read by get_system_context to contradict skill text naming edit_image.
+        context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = (
+            "generate_image" in self._tool_decision_groups_by_name
+            and "edit_image" not in self._tool_decision_groups_by_name
+        )
+        self._tool_origins = self._tool_origin_map(tools)
+        base_tool_schemas = (
+            []
+            if self.tool_choice == "none"
+            else self._tool_schemas_with_builtin_controls(tools)
+        )
+        # base_tool_schemas never lists the stored-result reader; its schema
+        # is built here from this run's tools and added back per iteration
+        # by _tool_schemas_with_spill_read. None when the run offers no tools
+        # at all or has no reader tool, and then it is never offered.
+        spill_read_tool = (
+            None
+            if self.tool_choice == "none"
+            else next(
+                (
+                    tool
+                    for tool in tools
+                    if self._tool_name(tool) == SPILL_READ_TOOL_NAME
+                ),
+                None,
+            )
+        )
+        spill_read_schema = (
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool)
+        )
+
+        # The bound is re-read on every pass because a forced-turn read raises
+        # it for forced answer turns; every other turn, and every turn of a
+        # run that made no such read, stays within
+        # range(self.current_iteration, self.max_iterations).
+        for iteration in itertools.count(self.current_iteration):
+            if not self._within_iteration_bound(
+                iteration, runtime=runtime, context=context
+            ):
+                break
+            self.current_iteration = iteration
+            if self.pending_tool_calls:
+                self._ensure_pending_tool_call_envelope(context)
+                pending_result = await self._execute_pending_tool_calls(
+                    context=context,
+                    tools=tools,
+                    llm=llm,
+                    runtime=runtime,
+                )
+                if pending_result is not None:
+                    return pending_result
+                self.current_iteration = iteration + 1
+                self.status = "thinking"
+                continue
+
+            if self.repeated_tool_decision:
+                decision_result = await self._run_repeated_tool_decision(
+                    context=context,
+                    llm=llm,
+                    runtime=runtime,
+                )
+                if decision_result is not None:
+                    return decision_result
+
+            settlement_fence = self._settlement_fence_active(runtime)
+            force_final_answer_now = self._forced_answer_turn_now(
+                context, settlement_fence=settlement_fence
+            )
+            normal_tool_schemas = self._tool_schemas_with_spill_read(
+                base_tool_schemas, spill_read_schema, context
+            )
+            if not force_final_answer_now:
+                tool_schemas = normal_tool_schemas
+            elif settlement_fence:
+                # The settlement-fence turn explains a refused or unknown
+                # write and must not reach any tool but final_answer.
+                tool_schemas = [self._final_answer_tool_schema()]
+            else:
+                tool_schemas = self._forced_answer_tool_schemas(normal_tool_schemas)
+            self._forced_answer_read_open = force_final_answer_now and (
+                SPILL_READ_TOOL_NAME in self._schema_tool_names(tool_schemas)
+            )
+            if self._forced_answer_read_open:
+                # A forced turn that offers reads stays forced until it
+                # answers. A turn entered only through the flash-mode derived
+                # condition would otherwise drop out of it after a failed
+                # read and hand the next turn the full tool set. Latched only
+                # when reads are offered, so a run with nothing stored keeps
+                # the flag exactly as before.
+                self.force_final_answer_next = True
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="before_llm",
+            )
+            if interrupted is not None:
+                return interrupted
+
+            route_messages = self._messages_for_llm(
+                context,
+                has_tools=bool(tool_schemas),
+                force_final_answer=force_final_answer_now,
+                tool_names=self._schema_tool_names(tool_schemas),
+            )
+            call_llm = await prepare_llm_for_context(
+                llm=llm,
+                messages=route_messages,
+                context=context,
+            )
+            llm_metadata = {
+                "iteration": iteration,
+                **resolved_llm_metadata(call_llm),
+            }
+            # A forced turn's schema is down to final_answer, plus
+            # read_tool_result while this run holds stored results and both
+            # read allowances remain (never on the settlement-fence turn).
+            # Compacting here deletes the values it must answer from, and none
+            # of those tools can run the work that produced them again. Every
+            # other turn still holds its tools and can fetch a compacted-away
+            # value again. The cost is deliberate: this turn can now exceed
+            # the model's window and fail instead of answering. A turn that
+            # offers reads adds to that volume: up to FORCED_ANSWER_READ_BUDGET
+            # reads per run, each of at most SPILL_READ_MAX_CHARS characters,
+            # accumulate on the forced turns and are not compacted either.
+            if force_final_answer_now:
+                # Measures the one new failure mode this change introduces,
+                # so it carries no switch. Numbers and ids only -- never
+                # message text, a tool name, or a tool argument. The estimate
+                # counts what this turn actually sends -- the same messages
+                # and the tool schemas handed to the call below -- so it is
+                # comparable with the threshold logged beside it.
+                context_tokens = context.estimate_context_tokens(
+                    route_messages, tool_schemas
+                )
+                threshold = context.compact_config.threshold
+                logger.info(
+                    "Forced-answer turn did not compact. execution_id=%s "
+                    "iteration=%s context_tokens=%s threshold=%s "
+                    "over_threshold=%s",
+                    context.execution_id,
+                    iteration,
+                    context_tokens,
+                    threshold,
+                    context_tokens > threshold,
+                )
+            else:
+                compact_result = await runtime.compact_context_if_needed(
+                    context=context,
+                    # Fall back to the main model when no compact model is
+                    # configured. PatternRuntime skips summarization entirely
+                    # without one and drops all but the last few messages
+                    # instead, losing what the agent actually did; agent
+                    # preview and delegated sub-agents resolve the compact
+                    # slot on their own and validate only the default model,
+                    # so an empty slot is ordinary rather than exceptional.
+                    #
+                    # Substituting here, rather than defaulting the field
+                    # further up, keeps "unset" distinguishable from
+                    # "explicitly set to the main model" -- and hands
+                    # compaction the *resolved* per-call model, so a virtual
+                    # model reuses this turn's routing decision instead of
+                    # routing again on the compaction prompt, whose only user
+                    # message is the whole transcript.
+                    llm=compact_llm if compact_llm is not None else call_llm,
+                    metadata={"iteration": iteration},
+                )
+                note_compaction_evidence_loss(context, compact_result)
+
+            require_structured_final_answer = force_final_answer_now and (
+                settlement_fence or tool_evidence_state(context) != "intact"
+            )
+
+            # Computed once, after compaction (compaction can change which
+            # message is the latest visible user message), at the site that
+            # builds this call's real final messages -- not at the routing
+            # build above, whose messages are only used to pick the model.
+            form_answer_decision = _form_answer_decision(
+                context, force_final_answer=force_final_answer_now
+            )
+            llm_metadata.update(form_answer_decision.trace_metadata())
+            supports_forced_tool_choice = getattr(
+                call_llm, "supports_forced_tool_choice", True
+            )
+            messages = self._messages_for_llm(
+                context,
+                has_tools=bool(tool_schemas),
+                force_final_answer=force_final_answer_now,
+                tool_names=self._schema_tool_names(tool_schemas),
+                form_answer_continuation=form_answer_decision.applied,
+                allow_plain_text_final_answer=(
+                    not supports_forced_tool_choice and not force_final_answer_now
+                ),
+            )
+            await runtime.checkpoint("before_llm", context=context, pattern=self)
+            llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+                context,
+                messages,
+                tool_schemas,
+                call_kind=CALL_KIND_MAIN,
+                iteration=iteration,
+            )
+            await runtime.on_llm_start(
+                context=context,
+                messages=messages,
+                tools=tool_schemas or None,
+                metadata=llm_metadata,
+            )
+            answer_streamer: ReActFinalAnswerStreamer | None = None
+            protocol_retry_performed = False
+            response_already_traced = False
+            try:
+                requested_tool_choice = (
+                    "required"
+                    if force_final_answer_now
+                    else self.tool_choice
+                    if tool_schemas
+                    else None
+                )
+                effective_tool_choice = compatible_tool_choice_for_llm(
+                    call_llm, requested_tool_choice
+                )
+                llm_kwargs = {
+                    "messages": messages,
+                    "tools": tool_schemas or None,
+                    "tool_choice": effective_tool_choice,
+                }
+                if tool_schemas:
+                    answer_streamer = ReActFinalAnswerStreamer(runtime)
+                    response = await runtime.run_streaming_llm_call(
+                        call_llm,
+                        on_chunk=answer_streamer.handle_chunk,
+                        **llm_kwargs,
+                    )
+                else:
+                    response = await runtime.stream_final_answer(call_llm, **llm_kwargs)
+            except LLMCallInterrupted:
+                if answer_streamer is not None:
+                    await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="during_llm",
+                )
+                if interrupted is not None:
+                    return interrupted
+                raise
+            except LLMToolProtocolError as exc:
+                unavailable_tool_call = exc.code == "unavailable_tool_call"
+                if answer_streamer is not None:
+                    await answer_streamer.fail(
+                        UNAVAILABLE_TOOL_CALL_RESTORING_TOOLS_REASON
+                        if unavailable_tool_call
+                        else f"invalid {exc.code} tool protocol, retrying"
+                    )
+                await runtime.on_llm_error(
+                    context=context,
+                    error=exc,
+                    metadata={
+                        **llm_metadata,
+                        "phase": exc.code,
+                        "protocol_code": exc.code,
+                    },
+                )
+                if (
+                    unavailable_tool_call
+                    and not settlement_fence
+                    and iteration >= self.max_iterations
+                ):
+                    # Past max_iterations only a forced answer turn may run;
+                    # stop rather than restore the full tool set there.
+                    break
+                try:
+                    # The settlement fence outranks unavailable-tool recovery:
+                    # restoring the full tool set here is exactly the hole that
+                    # would let a denied write be retried inside the resumed
+                    # turn, so the fence keeps the narrowed schema.
+                    restore_full_tool_set = (
+                        unavailable_tool_call and not settlement_fence
+                    )
+                    (
+                        response,
+                        answer_streamer,
+                    ) = await self._retry_tool_protocol_response(
+                        context=context,
+                        llm=call_llm,
+                        runtime=runtime,
+                        iteration=iteration,
+                        tool_schemas=normal_tool_schemas,
+                        force_final_answer=(
+                            force_final_answer_now and not restore_full_tool_set
+                        ),
+                        recovery_reason=(
+                            "settlement_final_answer_required"
+                            if unavailable_tool_call and settlement_fence
+                            else exc.code
+                        ),
+                    )
+                except LLMCallInterrupted:
+                    interrupted = await self._interrupt_if_requested(
+                        runtime=runtime,
+                        context=context,
+                        label="during_llm",
+                    )
+                    if interrupted is not None:
+                        return interrupted
+                    raise
+                if restore_full_tool_set:
+                    self._release_forced_answer()
+                    force_final_answer_now = False
+                protocol_retry_performed = True
+                response_already_traced = True
+            except Exception as exc:
+                if answer_streamer is not None:
+                    await answer_streamer.fail(str(exc))
+                raise
+            self.repeated_tool_decision = None
+            self.last_response = response
+            normalized = self._normalize_llm_response(response)
+            requires_protocol_retry = self._response_requires_tool_protocol_retry(
+                normalized,
+                force_final_answer=force_final_answer_now,
+                require_structured_final_answer=(
+                    require_structured_final_answer and force_final_answer_now
+                ),
+                reject_mixed_control_calls=protocol_retry_performed,
+                allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
+            )
+            end_metadata: dict[str, Any] = dict(llm_metadata)
+            if requires_protocol_retry:
+                end_metadata.update(
+                    success=False,
+                    phase="discarded_invalid_tool_protocol",
+                )
+            if not response_already_traced:
+                await runtime.on_llm_end(
+                    context=context,
+                    response=response,
+                    metadata=end_metadata,
+                )
+            if requires_protocol_retry:
+                if protocol_retry_performed:
+                    return await self._invalid_tool_protocol_result(
+                        runtime=runtime,
+                        context=context,
+                        iteration=iteration,
+                        answer_streamer=answer_streamer,
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RECOVERY_REASON,
+                        empty_final_answer=(
+                            self._empty_final_answer_call(normalized) is not None
+                        ),
+                        response=response,
+                    )
+                if answer_streamer is not None:
+                    await answer_streamer.fail(INVALID_TOOL_PROTOCOL_RETRYING_REASON)
+                # Rejecting the whole response drops any assistant preamble it
+                # carried: the response is discarded before ``add_assistant_message``,
+                # so the retry rebuilds from context without it. Deliberate - the
+                # preamble arrived attached to a protocol violation, so it is not a
+                # vetted user-facing answer, and replaying the model's own discarded
+                # prose invites it to treat that text as already committed. The cost
+                # is that a model which keeps emitting "preamble + empty answer"
+                # fails the run without the user seeing the preamble.
+                # As in the exception path above, the settlement fence wins:
+                # a fenced turn never gets its work tools back.
+                #
+                # While this run holds stored results, a read_tool_result call
+                # on a forced turn whose read allowance ran out is retried on
+                # the same narrowed tools rather than handed the full set
+                # back; otherwise one more read call would reopen every tool.
+                # With nothing stored the reader is not on the ordinary
+                # surface either, and such a call recovers as it always did.
+                recovery_allowed_names = frozenset(
+                    self._schema_tool_names(tool_schemas)
+                )
+                if SPILL_READ_TOOL_NAME in self._schema_tool_names(normal_tool_schemas):
+                    recovery_allowed_names |= {SPILL_READ_TOOL_NAME}
+                recover_full_tool_set = (
+                    not settlement_fence
+                    and self._requires_full_tool_set_recovery(
+                        normalized,
+                        force_final_answer=force_final_answer_now,
+                        allowed_tool_names=recovery_allowed_names,
+                    )
+                )
+                if recover_full_tool_set and iteration >= self.max_iterations:
+                    # Past max_iterations only a forced answer turn may run.
+                    # Handing this one the full tool set would run ordinary
+                    # work there, so stop as the loop does at its bound.
+                    break
+                truncated = is_truncated_tool_call(response)
+                # A cut-off final_answer has its arguments dropped, so it looks
+                # empty; the truncation is the cause the retry has to address.
+                empty_final_answer = (
+                    None if truncated else self._empty_final_answer_call(normalized)
+                )
+                empty_plain_text = (
+                    False if truncated else self._empty_plain_text_response(normalized)
+                )
+                if empty_final_answer is not None:
+                    logger.warning(
+                        "ReAct final_answer carried no answer text; discarding the "
+                        "response and retrying. iteration=%s arg_keys=%s",
+                        iteration,
+                        sorted(self._tool_call_args_dict(empty_final_answer), key=str),
+                    )
+                protocol_error = get_tool_protocol_error(response)
+                if recover_full_tool_set:
+                    recovery_reason: str | None = "unavailable_tool_call"
+                elif truncated and not settlement_fence:
+                    # A fenced turn keeps its own instruction: it must not be
+                    # steered back toward work tools.
+                    recovery_reason = TRUNCATED_TOOL_ARGUMENTS
+                elif empty_final_answer is not None:
+                    recovery_reason = "empty_final_answer"
+                elif settlement_fence:
+                    recovery_reason = "settlement_final_answer_required"
+                elif protocol_error is not None:
+                    # Provider protocol errors commonly carry neither content nor
+                    # tool calls. Preserve their own repair path instead of
+                    # misclassifying the envelope as an empty plain-text reply.
+                    recovery_reason = (
+                        "malformed_tool_arguments"
+                        if protocol_error.get("code") == "malformed_tool_arguments"
+                        else None
+                    )
+                elif empty_plain_text:
+                    recovery_reason = "empty_plain_text"
+                elif require_structured_final_answer and not normalized.get(
+                    "tool_calls"
+                ):
+                    recovery_reason = "structured_final_answer_required"
+                else:
+                    recovery_reason = None
+                try:
+                    (
+                        response,
+                        answer_streamer,
+                    ) = await self._retry_tool_protocol_response(
+                        context=context,
+                        llm=call_llm,
+                        runtime=runtime,
+                        iteration=iteration,
+                        tool_schemas=normal_tool_schemas,
+                        force_final_answer=(
+                            force_final_answer_now and not recover_full_tool_set
+                        ),
+                        require_structured_final_answer=(
+                            require_structured_final_answer
+                            and not recover_full_tool_set
+                        ),
+                        recovery_reason=recovery_reason,
+                        empty_final_answer=empty_final_answer is not None,
+                    )
+                except LLMCallInterrupted:
+                    interrupted = await self._interrupt_if_requested(
+                        runtime=runtime,
+                        context=context,
+                        label="during_llm",
+                    )
+                    if interrupted is not None:
+                        return interrupted
+                    raise
+                if recover_full_tool_set:
+                    self._release_forced_answer()
+                    force_final_answer_now = False
+                self.last_response = response
+                normalized = self._normalize_llm_response(response)
+                if self._response_requires_tool_protocol_retry(
+                    normalized,
+                    force_final_answer=force_final_answer_now,
+                    require_structured_final_answer=(
+                        require_structured_final_answer and not recover_full_tool_set
+                    ),
+                    reject_mixed_control_calls=recover_full_tool_set,
+                    allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
+                ):
+                    return await self._invalid_tool_protocol_result(
+                        runtime=runtime,
+                        context=context,
+                        iteration=iteration,
+                        answer_streamer=answer_streamer,
+                        stream_failure_message=INVALID_TOOL_PROTOCOL_AFTER_RETRY_REASON,
+                        empty_final_answer=(
+                            self._empty_final_answer_call(normalized) is not None
+                        ),
+                        response=response,
+                    )
+            original_tool_calls = normalized.get("tool_calls") or []
+            kept_tool_calls, stripped_final_answers = (
+                self._strip_final_answer_bundled_with_work_tools(original_tool_calls)
+            )
+            if stripped_final_answers:
+                logger.warning(
+                    "ReAct discarding %d final_answer call(s) bundled with work "
+                    "tools; the answer text predates their results. "
+                    "iteration=%s model=%s batch_size=%d tools=[%s]",
+                    len(stripped_final_answers),
+                    iteration,
+                    llm_metadata.get("selected_model"),
+                    len(original_tool_calls),
+                    self._tool_names_for_log(original_tool_calls),
+                )
+                normalized["tool_calls"] = kept_tool_calls
+                if answer_streamer is not None:
+                    # The discarded text may already be streaming to the UI.
+                    # Nothing downstream closes that stream once the batch no
+                    # longer carries a final_answer, so close it here.
+                    await answer_streamer.fail(DISCARDED_BUNDLED_FINAL_ANSWER_REASON)
+            if force_final_answer_now and not normalized.get("tool_calls"):
+                normalized["done"] = True
+
+            assistant_content = normalized.get("content")
+            tool_calls = normalized.get("tool_calls", [])
+            if getattr(runtime.tracer, "records_execution_events", False) is True:
+                batch_id = str(uuid4())
+                for tool_call in tool_calls:
+                    tool_call["assistant_message_id"] = batch_id
+                    tool_call["tool_attempt_id"] = str(uuid4())
+            if assistant_content is not None or normalized.get("tool_calls"):
+                # A tool-protocol error response never carries tool_calls (see
+                # tool_protocol_error_response), so this guard never mistakes
+                # a protocol violation for a real tool-call turn worth saving
+                # provider state for.
+                metadata = (
+                    self._provider_state_for_context(normalized) if tool_calls else {}
+                )
+                context.add_assistant_message(
+                    assistant_content or "",
+                    tool_calls=[
+                        self._tool_call_for_context(tool_call)
+                        for tool_call in tool_calls
+                    ],
+                    **({"metadata": metadata} if metadata else {}),
+                )
+
+            if answer_streamer is not None:
+                await self._close_streamed_answer(
+                    answer_streamer=answer_streamer,
+                    assistant_content=assistant_content,
+                    tool_calls=tool_calls,
+                )
+            if tool_calls:
+                self._remember_tool_call_content(tool_calls, assistant_content)
+                self.status = "acting"
+                self.pending_tool_calls = list(tool_calls)
+                await runtime.checkpoint("after_llm", context=context, pattern=self)
+                pending_result = await self._execute_pending_tool_calls(
+                    context=context,
+                    tools=tools,
+                    llm=llm,
+                    runtime=runtime,
+                )
+                if pending_result is not None:
+                    return pending_result
+                self.current_iteration = iteration + 1
+                self.status = "thinking"
+                continue
+
+            await runtime.checkpoint("after_llm", context=context, pattern=self)
+            if normalized.get("done", True):
+                return await self._finalize_success(
+                    context=context,
+                    runtime=runtime,
+                    response=assistant_content or normalized.get("raw"),
+                )
+
+        # A DAG step cannot declare the parent task partially delivered: its
+        # dependencies and sibling results belong to the DAG's failure policy.
+        if not context.metadata.get("dag_step_id"):
+            delivery = await self._deliver_at_iteration_limit(
+                context=context, llm=llm, runtime=runtime
+            )
+            if delivery is not None:
+                return delivery
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="after_failed_iteration_limit_delivery",
+            )
+            if interrupted is not None:
+                return interrupted
+
+        self.status = "max_iterations"
+        await runtime.checkpoint("max_iterations", context=context, pattern=self)
+        failure_code = self._latest_tool_failure_code(context)
+        metadata = {
+            "iterations": self.max_iterations,
+            "status": self.status,
+            "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
+        }
+        if failure_code is not None:
+            metadata["failure_code"] = failure_code
+        return PatternResult(
+            success=False,
+            error="ReActPattern reached max iterations without a final answer.",
+            metadata=metadata,
+        ).to_dict()
+
+    async def _deliver_at_iteration_limit(
+        self, *, context: Any, llm: Any, runtime: PatternRuntime
+    ) -> dict[str, Any] | None:
+        """Offer one bounded, answer-only turn; do not relax the work budget.
+
+        Buffer the response until validated, so a refused work call or an
+        invalid protocol cannot leak an unaccepted answer into the chat stream.
+        A failed delivery leaves the original failure path intact.
+        """
+        interrupted = await self._interrupt_if_requested(
+            runtime=runtime, context=context, label="before_iteration_limit_delivery"
+        )
+        if interrupted is not None:
+            return interrupted
+        if self.iteration_limit_delivery_attempted or self.max_iterations <= 0:
+            return None
+
+        self.iteration_limit_delivery_attempted = True
+        self.status = "max_iterations"
+        await runtime.checkpoint(
+            "before_iteration_limit_delivery", context=context, pattern=self
+        )
+        # Reuse the forced-answer evidence and file-reference rules. In
+        # particular, do not compact away results when tools can no longer run.
+        messages = self._messages_for_llm(
+            context,
+            has_tools=True,
+            force_final_answer=True,
+            tool_names=["final_answer"],
+        )
+        messages[0] = {
+            **messages[0],
+            "content": (
+                f"{messages[0].get('content', '')}\n\n"
+                "The execution iteration limit has been reached. No further work "
+                "or verification is possible in this run. Call final_answer once "
+                "to hand over only results supported by the retained evidence, "
+                "including trusted links to requested deliverables already made. "
+                "Clearly state that execution stopped at the iteration limit, "
+                "what is done, what is unverified or missing, and what remains. "
+                "Do not claim full completion or promise to keep working. Set "
+                "outcome=partial if useful results exist, otherwise blocked. "
+                "Do not reproduce raw exception messages or tool payloads."
+            ),
+        }
+        messages = append_user_message_preserving_turns(
+            messages,
+            content=(
+                "Runtime notice: the work phase has now stopped at the iteration "
+                "limit. This turn is only for handing over existing results, not "
+                "for performing the outstanding work. Call only final_answer, "
+                "include existing deliverable links, and list what was not done. "
+                "No other tools are available."
+            ),
+        )
+
+        def parse_response(response: Any) -> dict[str, Any] | None:
+            normalized = self._normalize_llm_response(response)
+            calls = normalized.get("tool_calls") or []
+            if (
+                len(calls) == 1
+                and calls[0]["name"] == "final_answer"
+                and bool(self._final_answer_text(calls[0].get("args")).strip())
+            ):
+                return dict(calls[0]["args"])
+            return None
+
+        def parse_plain_text_response(response: Any) -> dict[str, Any] | None:
+            if response_finish_reason(response) in {"length", "max_tokens"}:
+                return None
+            normalized = self._normalize_llm_response(response)
+            calls = normalized.get("tool_calls") or []
+            content = normalized.get("content")
+            if not calls and isinstance(content, str) and content.strip():
+                return {
+                    "response_language": effective_output_language(context)
+                    or "Unspecified",
+                    "answer": content,
+                    "outcome": "partial",
+                }
+            return None
+
+        schema = self._final_answer_tool_schema()
+        schema["function"]["parameters"]["properties"]["outcome"]["enum"] = [
+            "partial",
+            "blocked",
+        ]
+        args = await request_partial_delivery(
+            context=context,
+            llm=llm,
+            runtime=runtime,
+            messages=messages,
+            schema=schema,
+            parse_response=parse_response,
+            parse_plain_text_response=parse_plain_text_response,
+            metadata={
+                "iteration": self.current_iteration,
+                "phase": "iteration_limit_delivery",
+            },
+            timeout=ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS,
+        )
+        if args is None:
+            return None
+
+        interrupted = await self._interrupt_if_requested(
+            runtime=runtime, context=context, label="after_iteration_limit_delivery"
+        )
+        if interrupted is not None:
+            return interrupted
+        outcome = args["outcome"]
+        answer = (
+            "Execution stopped at the iteration limit; this is not a completed task."
+            f"\n\n{self._final_answer_text(args)}"
+        )
+        context.add_assistant_message(answer)
+        result = await self._finalize_outcome(
+            context=context, runtime=runtime, response=answer, outcome=outcome
+        )
+        # success means a final response was delivered, not that the requested
+        # work succeeded; use the existing partial/blocked outcome contract.
+        result.update(
+            termination_reason="max_iterations", iterations=self.max_iterations
+        )
+        return result
+
+    async def _invalid_tool_protocol_result(
+        self,
+        *,
+        runtime: PatternRuntime,
+        context: Any,
+        iteration: int,
+        answer_streamer: ReActFinalAnswerStreamer | None,
+        stream_failure_message: str,
+        empty_final_answer: bool = False,
+        response: Any = None,
+    ) -> dict[str, Any]:
+        """Abandon the run after the one repair attempt failed.
+
+        ``response`` is the rejected last response. Its protocol code and stop
+        reason go on the result, so a call cut off at the output limit fails
+        as ``truncated_tool_arguments`` rather than as a generic violation.
+        A cut-off response also overrides the caller's ``empty_final_answer``:
+        a cut-off ``final_answer`` only looks empty because its arguments were
+        dropped, and the run did not end for lack of an answer.
+
+        ``empty_final_answer`` distinguishes "the model never produced an answer"
+        from the status's other producers (provider protocol errors, mixed
+        control calls, a tool the forced turn did not offer), whose
+        ``error`` text is the only signal a caller has. Delegated-child
+        classification reads it to avoid collapsing all four into "never
+        produced an answer" - see ``agent_tool._classify_delegated_failure``.
+        """
+
+        truncated = is_truncated_tool_call(response)
+        if truncated:
+            # A cut-off final_answer only looks empty: its arguments were dropped.
+            empty_final_answer = False
+        protocol_error = get_tool_protocol_error(response)
+        protocol_code: str | None
+        if truncated:
+            protocol_code = TRUNCATED_TOOL_ARGUMENTS
+        elif protocol_error is not None:
+            protocol_code = protocol_error.get("code")
+        else:
+            protocol_code = None
+        finish_reason = response_finish_reason(response)
+        logger.warning(
+            "ReAct failing the run after an invalid tool protocol: %s "
+            "(iteration=%s empty_final_answer=%s code=%s finish_reason=%s)",
+            stream_failure_message,
+            iteration,
+            empty_final_answer,
+            protocol_code,
+            finish_reason,
+        )
+        if answer_streamer is not None:
+            await answer_streamer.fail(stream_failure_message)
+        # The run ends here, so the forced turn no longer offers reads. The
+        # force flag keeps its value and the per-run counters are not reset.
+        self._forced_answer_read_open = False
+        await runtime.checkpoint(
+            "invalid_tool_protocol",
+            context=context,
+            pattern=self,
+            metadata={"iteration": iteration},
+        )
+        if truncated:
+            error = TRUNCATED_TOOL_ARGUMENTS_ERROR
+        elif empty_final_answer:
+            error = (
+                "The model called final_answer without an answer twice, so the "
+                "run produced no response."
+            )
+        else:
+            error = (
+                "The model returned an invalid tool protocol response "
+                "after one repair attempt."
+            )
+        metadata: dict[str, Any] = {
+            "iterations": iteration + 1,
+            "status": "invalid_tool_protocol",
+            "empty_final_answer": empty_final_answer,
+        }
+        if protocol_code:
+            metadata["protocol_code"] = protocol_code
+        if finish_reason:
+            metadata["finish_reason"] = finish_reason
+        failure_code = self._latest_tool_failure_code(context)
+        if failure_code is not None:
+            metadata["failure_code"] = failure_code
+        return PatternResult(
+            success=False,
+            error=error,
+            metadata=metadata,
+        ).to_dict()
+
+    @staticmethod
+    def _latest_tool_failure_code(context: Any) -> str | None:
+        """Return an allowlisted tool failure from the current user turn only."""
+        for message in reversed(getattr(context, "messages", [])):
+            role = getattr(message, "role", None)
+            if role == "user":
+                break
+            if role != "tool":
+                continue
+            metadata = getattr(message, "metadata", {}) or {}
+            result = metadata.get("raw_result")
+            if not isinstance(result, dict):
+                return None
+            if tool_result_succeeded(result):
+                # A later successful call supersedes an earlier classified
+                # failure in the same user turn; do not surface stale text.
+                return None
+            # The first failed tool result is authoritative, even when it
+            # carries no classified code. Do not fall through to an older
+            # failure from a different tool call.
+            return normalize_tool_failure_code(result.get("failure_code"))
+        return None
+
+    async def _close_streamed_answer(
+        self,
+        *,
+        answer_streamer: ReActFinalAnswerStreamer,
+        assistant_content: Any,
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        """Ensure a started answer stream reaches exactly one terminal event.
+
+        The branches below are R0 (nothing streamed - no-op), R1
+        (``tool_calls[0]`` is a ``final_answer`` with a non-blank answer and
+        no disabled user-interaction control tool in the batch, per
+        ``_disabled_control_tool_index`` - ``finish`` with that answer's
+        exact, unstripped text, the same text ``_handle_control_tool``
+        delivers), R2 (no tool calls, plain assistant text - ``finish`` with
+        that text) and R3 (anything else - ``fail`` with a fixed reason;
+        ``fail`` is a no-op for a stream already closed earlier in this
+        response).
+
+        Do not relax R1's first-position condition. A later ``final_answer``
+        in a mixed batch can still be delivered
+        (``_execute_pending_tool_calls`` keeps walking past e.g. a
+        ``send_message`` that expects no response), but such a batch never
+        leaves an open stream to close: ``ReActFinalAnswerStreamer``
+        permanently disables itself as soon as a non-``final_answer`` tool
+        name appears in the response, before any answer content for a
+        non-first ``final_answer`` has accumulated, so R0 applies. Relaxing
+        the condition would finish streams with candidates whose delivery
+        this method has not checked. Do not turn R3 into a ``finish`` to
+        avoid the error event it produces - that would report an undelivered
+        candidate as the completed answer.
+        """
+
+        if not answer_streamer.started:
+            return
+        if tool_calls and tool_calls[0].get("name") == "final_answer":
+            answer = self._final_answer_text(tool_calls[0].get("args"))
+            if answer.strip() and (
+                self._disabled_control_tool_index(
+                    tool_calls,
+                    user_interaction_enabled=self.user_interaction_enabled,
+                )
+                is None
+            ):
+                await answer_streamer.finish(answer)
+                return
+        if not tool_calls and assistant_content is not None:
+            await answer_streamer.finish(str(assistant_content))
+            return
+        await answer_streamer.fail(NO_DELIVERABLE_FINAL_ANSWER_REASON)
+
+    def _messages_for_llm(
+        self,
+        context: Any,
+        *,
+        has_tools: bool,
+        force_final_answer: bool = False,
+        tool_names: list[str] | None = None,
+        form_answer_continuation: bool = False,
+        allow_plain_text_final_answer: bool = False,
+    ) -> list[dict[str, Any]]:
+        messages = list(
+            context.get_messages_for_llm(
+                form_answer_continuation=form_answer_continuation
+            )
+        )
+        if force_final_answer:
+            # One body with switched phrases: hand-written duplicates would
+            # drift, and the weaker copy lands on the turn that invents a
+            # value. The outcome rule stays a conditional, because a removed
+            # observation is not a removed action -- a write whose result
+            # message was dropped still happened. A summary standing above
+            # says to re-query the source, which this turn cannot do; the
+            # sentence right after it in that summary -- report the value as
+            # unavailable -- is the branch a forced turn lands on. The third
+            # branch states that the engine cannot tell, because a payload
+            # written before the marker existed supports neither answer.
+            state = tool_evidence_state(context)
+            if state == "intact":
+                source_phrase = " using the accumulated conversation and tool results"
+                outcome_rule = (
+                    "Set outcome=completed only when "
+                    "every requested action or verification succeeded; otherwise set "
+                    "outcome=partial or outcome=blocked and say what remains. "
+                )
+            elif state == "removed":
+                source_phrase = ""
+                outcome_rule = (
+                    "Do not rest an outcome=completed claim on an observation "
+                    "that was removed; set outcome=partial when part of the "
+                    "request is still answerable from what remains and "
+                    "outcome=blocked when none of it is. "
+                )
+            else:
+                source_phrase = ""
+                outcome_rule = (
+                    "Do not rest an outcome=completed claim on an observation "
+                    "you cannot read in this context; set outcome=partial when "
+                    "part of the request is still answerable from what you can "
+                    "read and outcome=blocked when none of it is. "
+                )
+            evidence_facts_text = evidence_facts(state)
+            # The read sentences follow what this turn actually sends: the
+            # reader and its stored-result list when it is offered, the
+            # used-up sentence when an allowance ran out on a turn that would
+            # otherwise offer it, and nothing otherwise, which is the prompt
+            # a run with nothing stored gets.
+            if SPILL_READ_TOOL_NAME in (tool_names or []):
+                read_instruction = self._forced_answer_read_instruction(context)
+                tool_rule = (
+                    "Do not call any tool other than final_answer and "
+                    "read_tool_result, and do not output tool-call markup as "
+                    "plain text. "
+                )
+            else:
+                # The used-up sentence belongs only to a turn whose reads were
+                # withheld by the allowance. The settlement-fence turn never
+                # offers reads, so its prompt stays exactly as before whatever
+                # the counters say; _settlement_fence_active has already
+                # synced the fence flag with this turn.
+                # The sentence names the allowance that ran out, checked in
+                # the order a refused call is judged: the read allowance
+                # first, then the reject allowance.
+                read_instruction = ""
+                if not self.settlement_final_answer_fence:
+                    if self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                        read_instruction = f"{FORCED_ANSWER_READS_USED_UP_TEXT} "
+                    elif (
+                        self.forced_answer_reads_rejected
+                        >= FORCED_ANSWER_READ_REJECT_CAP
+                    ):
+                        read_instruction = f"{FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT} "
+                tool_rule = (
+                    "Do not call any other tool and do not output "
+                    "tool-call markup as plain text. "
+                )
+            delivery_rule = (
+                "Produce the final user-facing answer by calling the final_answer "
+                f"control tool exactly once{source_phrase}. "
+            )
+            instruction = (
+                delivery_rule + f"{evidence_facts_text}"
+                f"{read_instruction}"
+                f"{tool_rule}{outcome_rule}"
+                "If a "
+                "previous ask_user_question narrowed the request to a selected "
+                "subset of items or resources, the final answer must cover only "
+                "that subset — leave out anything outside it even if an earlier "
+                "tool call already returned data about it. "
+                f"{grounding_rule(can_call_tools=False)}\n\n"
+                f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+                f"{final_answer_language_rule()}"
+            )
+        elif has_tools:
+            active_tool_names = tool_names or []
+            available_tools = ", ".join(active_tool_names) or "(none)"
+            can_lookup_output_files = (
+                WORKSPACE_OUTPUT_FILES_TOOL_NAME in active_tool_names
+            )
+            clock_zone = context.clock_zone()
+            current_date = (
+                context.created_at.astimezone(clock_zone or timezone.utc)
+                .date()
+                .isoformat()
+            )
+            clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
+            missing_information_instruction = (
+                "If a tool needs missing information from the user, including a "
+                "fact-carrying argument value (one that asserts a real-world "
+                "fact) the user has not provided, call "
+                "ask_user_question; do not ask the question as plain assistant "
+                "text and do not fill the value in yourself. When the user answers "
+                "an ask_user_question that asked which items or resources to act on "
+                "by selecting a subset of the offered options, that selection is the "
+                "complete scope for that work: do not include unselected options, "
+                "even ones that are already accessible or that fit the original "
+                "request. "
+                if self.user_interaction_enabled
+                else "If missing user information prevents completion, including a "
+                "fact-carrying argument value (one that asserts a real-world fact) "
+                "the user has not provided, do not ask "
+                "the user or attempt an unavailable interaction tool; finish with "
+                "outcome=blocked and explain what is missing. "
+            )
+            clarification_instruction = (
+                "Request clarification only when missing information prevents "
+                "correct or authorized work or the user explicitly asked to be "
+                "consulted. "
+                if self.user_interaction_enabled
+                else "User interaction is disabled. If the user explicitly asked "
+                "to choose and that choice is still pending, do not select for "
+                "them; finish with outcome=blocked and explain that the required "
+                "user choice cannot be obtained in this run. "
+            )
+            completion_rule = (
+                "When the current task is complete, call the final_answer tool "
+                "exactly once instead of calling another work tool or returning "
+                "plain assistant text. "
+                if not allow_plain_text_final_answer
+                else "When the current task is complete, prefer calling the "
+                "final_answer tool exactly once so the completion outcome is "
+                "explicit. You may return plain assistant text only when the task "
+                "is fully complete and that text is the complete final user-facing "
+                "answer. Never use plain assistant text for a progress update, a "
+                "preamble, a partial result, a blocked outcome, or an explanation "
+                "of missing information; use final_answer with the appropriate "
+                "outcome for a terminal partial or blocked response. "
+            )
+            instruction = (
+                "Use available tools when the user asks you to generate, compute, run, "
+                "execute, inspect, read, write, or otherwise produce a concrete result "
+                "that a tool can determine. After a successful tool call, base the "
+                "final answer on the latest tool result instead of repeating the same "
+                f"tool work. {completion_rule}Never put final_answer in the same response "
+                "as any other tool call: run the work tools first, then answer on a "
+                "later turn from their results. Do not write assistant text in the "
+                "same response as a work tool call; call the tool directly. "
+                f"{clarification_instruction}"
+                "For nonessential presentation choices, "
+                "including an unspecified output format, choose a sensible "
+                "default and deliver the supported work without pausing unless "
+                "the user explicitly asked to choose. This "
+                "does not permit guessing facts, action targets, or authorization. "
+                f"{missing_information_instruction}"
+                "If a tool reports missing or expired "
+                "authorization, changing unrelated query parameters or switching "
+                "to a generic HTTP tool does not restore access; retry only after "
+                "a relevant authorization or configuration change. Never ask the "
+                "user to paste passwords, API keys, or access tokens into chat or "
+                "a clarification form; direct credential setup to the application's "
+                "connection settings instead. "
+                "If the latest user "
+                "message explicitly asks you to call a named available tool, call "
+                "that tool instead of paraphrasing the request. If a tool "
+                "fails, retry with a corrected call when possible; "
+                "otherwise explain the failure instead of presenting an unverified "
+                "tutorial or example. Treat the latest user message as the controlling "
+                "instruction for follow-up requests. If the user corrects a previous "
+                "assumption, especially about dates or freshness, revise the answer "
+                "instead of restating prior content. "
+                f"{grounding_rule()}\n\n"
+                "When writing any final user-facing response, including plain "
+                "assistant text: "
+                f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
+                f"Turn-start date ({clock_zone_label}): {current_date}. "
+                "For recent, latest, current, or time-sensitive requests, use this "
+                "date when forming search queries and judging source relevance. If the "
+                "exact current time matters or the turn may have crossed midnight, call "
+                "the get_current_time tool if it is available. "
+                "Only call tools that are present in the current tool schema for this "
+                "LLM call; "
+                "tool names mentioned in memory, previous tasks, plans, or error "
+                "messages are unavailable unless they are included in the current "
+                "schema. If a selected skill is already present in the system "
+                "context, treat its main SKILL.md guidance as already read. Use "
+                "skill documentation tools only when you need an additional "
+                "referenced file, example, asset, or detail that is not already in "
+                "the provided skill context."
+                f"\n\nAvailable tool names for this LLM call are exactly: {available_tools}. "
+                "Never call a tool name that is not in this list."
+            )
+            access_context = tool_access_context(
+                self._connector_tool_sources, active_tool_names
+            )
+            if access_context:
+                instruction = f"{instruction}\n\n{access_context}"
+        else:
+            # Reachable only with tool_choice="none", which no production
+            # construction site sets. If that ever changes, this branch needs
+            # grounding_rule() too -- it emits a final answer without it today.
+            return messages
+        completion_instruction = self._completion_evidence_instruction(context)
+        if completion_instruction:
+            instruction = f"{instruction}\n\n{completion_instruction}"
+        if messages and messages[0].get("role") == "system":
+            return [
+                {
+                    **messages[0],
+                    "content": f"{messages[0].get('content', '')}\n\n{instruction}",
+                },
+                *messages[1:],
+            ]
+        return [{"role": "system", "content": instruction}, *messages]
+
+    async def _retry_tool_protocol_response(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        iteration: int,
+        tool_schemas: list[dict[str, Any]],
+        force_final_answer: bool,
+        recovery_reason: str | None = None,
+        empty_final_answer: bool = False,
+        require_structured_final_answer: bool = False,
+    ) -> tuple[Any, ReActFinalAnswerStreamer]:
+        # tool_schemas is the repaired turn's ordinary surface. Whether that
+        # turn, if forced, offered reads was decided when it was built
+        # (_forced_answer_read_open), so the retry sends exactly the tools the
+        # turn it repairs sent, the settlement-fence turn's final_answer alone
+        # included.
+        if not force_final_answer:
+            tools = tool_schemas
+        elif self._forced_answer_read_open:
+            tools = self._forced_answer_tool_schemas(tool_schemas)
+        else:
+            tools = [self._final_answer_tool_schema()]
+        # The retry can run unforced where the main call was forced
+        # (unavailable-tool recovery restores the full tool set), so it
+        # computes its own decision with its own force flag, by the same
+        # shared formula.
+        form_answer_decision = _form_answer_decision(
+            context, force_final_answer=force_final_answer
+        )
+        messages = self._messages_for_llm(
+            context,
+            has_tools=True,
+            force_final_answer=force_final_answer,
+            tool_names=self._schema_tool_names(tools),
+            form_answer_continuation=form_answer_decision.applied,
+            allow_plain_text_final_answer=(
+                not getattr(llm, "supports_forced_tool_choice", True)
+                and not force_final_answer
+            ),
+        )
+        if recovery_reason == "unavailable_tool_call":
+            retry_instruction = (
+                "The previous response called a tool that was unavailable in the "
+                "narrowed tool schema. Re-decide this turn using the complete "
+                "current tool set listed above. Call only a tool present in that "
+                "set. If the requested work or artifact has not been successfully "
+                "produced, call the appropriate work tool; call final_answer only "
+                "when the task is actually complete and its required results exist."
+            )
+            retry_phase = "unavailable_tool_call_recovery"
+        elif recovery_reason == "settlement_final_answer_required":
+            retry_instruction = (
+                "A rejected or dispatch-unknown write ended this resumed turn. "
+                "Do not call or retry any work tool. Call final_answer with a "
+                "concise explanation of the recorded outcome."
+            )
+            retry_phase = "settlement_final_answer_recovery"
+        elif recovery_reason == "structured_final_answer_required":
+            retry_instruction = (
+                "This forced final-answer turn must preserve an explicit completion "
+                "outcome. Call final_answer with the complete user-facing response "
+                "and the appropriate completed, partial, or blocked outcome."
+            )
+            retry_phase = "structured_final_answer_recovery"
+        elif recovery_reason == "malformed_tool_arguments":
+            retry_instruction = (
+                "The previous response returned malformed JSON arguments for a "
+                "tool call. Retry this turn by calling exactly one available tool "
+                "with one complete JSON object that matches its schema. Do not "
+                "truncate, concatenate, manually serialize, or wrap the arguments "
+                "in prose. If final_answer is the only available tool, put the "
+                "complete user-facing response in its answer field."
+            )
+            retry_phase = "malformed_tool_arguments_recovery"
+        elif recovery_reason == TRUNCATED_TOOL_ARGUMENTS:
+            retry_instruction = truncated_tool_arguments_instruction(
+                self._schema_tool_names(tools), force_final_answer=force_final_answer
+            )
+            retry_phase = "truncated_tool_arguments_recovery"
+        elif recovery_reason == "empty_final_answer":
+            # On a forced turn ``tools`` above holds no work tool, so offering
+            # one would instruct the model to do something the schema forbids
+            # and waste the one repair attempt. When the turn also offers
+            # read_tool_result, the answer must still come in a turn of its
+            # own: a final_answer bundled with a read is discarded.
+            if SPILL_READ_TOOL_NAME in self._schema_tool_names(tools):
+                forced_retry_text = (
+                    "Call final_answer again with the complete user-facing "
+                    "response in its answer field, in a turn of its own."
+                )
+            else:
+                forced_retry_text = (
+                    "final_answer is the only tool available on this turn: call it "
+                    "again with the complete user-facing response in its answer "
+                    "field."
+                )
+            retry_instruction = (
+                "The previous response called final_answer with an empty answer "
+                "field, so the user received no reply at all. "
+                + (
+                    forced_retry_text
+                    if force_final_answer
+                    else "Retry this turn: if the task is complete, call "
+                    "final_answer again with the complete user-facing response in "
+                    "its answer field; if work remains, call the appropriate "
+                    "available work tool instead."
+                )
+                + " Never call final_answer with an omitted, empty, or "
+                "whitespace-only answer."
+            )
+            retry_phase = "empty_final_answer_recovery"
+        elif recovery_reason == "empty_plain_text":
+            retry_instruction = (
+                "The previous response returned no answer text and made no tool "
+                "call, so the user received no reply at all. "
+                + (
+                    "Retry by calling final_answer with the complete user-facing "
+                    "response."
+                    if force_final_answer
+                    else "Retry by calling an appropriate available tool with a "
+                    "complete response."
+                    if getattr(llm, "supports_forced_tool_choice", True)
+                    else "Retry with either an appropriate available tool call or "
+                    "a complete non-empty plain-text answer."
+                )
+            )
+            retry_phase = "empty_plain_text_recovery"
+        else:
+            retry_instruction = (
+                "The previous response used an invalid tool protocol. Retry the same "
+                "turn using native structured tool calls only. Never place one tool "
+                "invocation or its arguments inside another tool's arguments. If "
+                "work remains, call the appropriate available work tool directly; "
+                "call final_answer only when the task is actually complete."
+            )
+            retry_phase = "tool_protocol_retry"
+        if empty_final_answer and recovery_reason != "empty_final_answer":
+            # A more fundamental repair owns the instruction, but the empty answer
+            # was still detected on this response and would otherwise go
+            # unmentioned.
+            retry_instruction = (
+                f"{retry_instruction} The previous response also called "
+                "final_answer with an empty answer field; never call final_answer "
+                "with an omitted, empty, or whitespace-only answer."
+            )
+        messages[0] = {
+            **messages[0],
+            "content": f"{messages[0].get('content', '')}\n\n{retry_instruction}",
+        }
+        metadata = {
+            "iteration": iteration,
+            "phase": retry_phase,
+            **resolved_llm_metadata(llm),
+        }
+        if recovery_reason:
+            metadata["recovery_reason"] = recovery_reason
+        metadata.update(form_answer_decision.trace_metadata())
+        await runtime.checkpoint(
+            retry_phase,
+            context=context,
+            pattern=self,
+            metadata=metadata,
+        )
+        metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+            context,
+            messages,
+            tools,
+            call_kind=CALL_KIND_PROTOCOL_RETRY,
+            iteration=iteration,
+        )
+        await runtime.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=tools,
+            metadata=metadata,
+        )
+        answer_streamer = ReActFinalAnswerStreamer(runtime)
+        try:
+            response = await runtime.run_streaming_llm_call(
+                llm,
+                messages=messages,
+                tools=tools,
+                tool_choice=compatible_tool_choice_for_llm(llm, "required"),
+                on_chunk=answer_streamer.handle_chunk,
+            )
+        except LLMCallInterrupted:
+            await answer_streamer.fail(INTERRUPTED_DURING_LLM_STREAM_REASON)
+            raise
+        except Exception as exc:
+            await answer_streamer.fail(str(exc))
+            await runtime.on_llm_error(
+                context=context,
+                error=exc,
+                metadata=metadata,
+            )
+            raise
+        normalized = self._normalize_llm_response(response)
+        retry_is_invalid = self._response_requires_tool_protocol_retry(
+            normalized,
+            force_final_answer=force_final_answer,
+            require_structured_final_answer=require_structured_final_answer,
+            reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
+            allowed_tool_names=frozenset(self._schema_tool_names(tools)),
+        )
+        end_metadata = dict(metadata)
+        if retry_is_invalid:
+            end_metadata.update(
+                success=False,
+                phase="discarded_invalid_tool_protocol_retry",
+            )
+        await runtime.on_llm_end(
+            context=context,
+            response=response,
+            metadata=end_metadata,
+        )
+        return response, answer_streamer
+
+    def _response_requires_tool_protocol_retry(
+        self,
+        normalized: dict[str, Any],
+        *,
+        force_final_answer: bool,
+        require_structured_final_answer: bool | None = None,
+        reject_mixed_control_calls: bool = False,
+        allowed_tool_names: frozenset[str] | None = None,
+    ) -> bool:
+        """Whether a response breaks this turn's tool protocol.
+
+        On a forced turn a call is allowed only if its name is in
+        allowed_tool_names, the names of the tools this turn actually sent;
+        without it only final_answer is allowed.
+        """
+        if get_tool_protocol_error(normalized.get("raw")) is not None:
+            return True
+        if is_truncated_tool_call(normalized.get("raw")):
+            # Unvalidated providers pass cut-off arguments through; running
+            # the call would hand the tool a fragment of what was asked.
+            return True
+        allowed_names = allowed_tool_names or frozenset({"final_answer"})
+        tool_calls = normalized.get("tool_calls") or []
+        if require_structured_final_answer is None:
+            # Preserve the strict default for direct protocol checks. Runtime
+            # callers always pass the narrower outcome-sensitive decision.
+            require_structured_final_answer = force_final_answer
+        if require_structured_final_answer and not tool_calls:
+            return True
+        if (
+            reject_mixed_control_calls
+            and len(tool_calls) > 1
+            and any(
+                isinstance(tool_call, dict)
+                and tool_call.get("name") in self._control_tool_names()
+                for tool_call in tool_calls
+            )
+        ):
+            return True
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            if force_final_answer and tool_call.get("name") not in allowed_names:
+                return True
+        if self._batch_carries_work_tool(tool_calls):
+            # A final_answer sharing the batch with a work tool is removed by
+            # _strip_final_answer_bundled_with_work_tools before the batch is
+            # recorded, so its answer field never reaches the user and cannot
+            # be a reason to discard the whole response. Discarding here would
+            # take the work calls with it - the exact behavior this guard is
+            # not allowed to reintroduce. The empty-answer repair owns
+            # responses whose only calls are control tools.
+            return False
+        return self._empty_final_answer_call(
+            normalized
+        ) is not None or self._empty_plain_text_response(normalized)
+
+    @staticmethod
+    def _empty_plain_text_response(normalized: dict[str, Any]) -> bool:
+        if normalized.get("tool_calls"):
+            return False
+        content = normalized.get("content")
+        return content is None or not str(content).strip()
+
+    def _empty_final_answer_call(
+        self, normalized: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the first ``final_answer`` call that carries no answer text.
+
+        On forced-choice models ``final_answer`` is the only way ReAct can
+        reply. Auto-only models may instead return plain text, but once they
+        choose this tool an empty ``answer`` still produces a run with nothing
+        streamed and nothing persisted. Treating it as a tool-protocol
+        violation routes either path into the pattern's existing single repair
+        retry instead of finalizing silently.
+        """
+
+        for tool_call in normalized.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            if tool_call.get("name") != "final_answer":
+                continue
+            if not self._final_answer_text(tool_call.get("args")).strip():
+                return tool_call
+        return None
+
+    def _batch_carries_work_tool(self, tool_calls: list[dict[str, Any]]) -> bool:
+        """Whether a tool-call batch contains at least one non-control tool.
+
+        The single predicate for "this batch does real work", shared by the
+        final_answer strip and the empty-answer guard so the two cannot
+        disagree about which batches the strip owns.
+        """
+
+        control_tool_names = self._control_tool_names()
+        return any(
+            isinstance(tool_call, dict)
+            and tool_call.get("name") not in control_tool_names
+            for tool_call in tool_calls
+        )
+
+    def _strip_final_answer_bundled_with_work_tools(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split a batch that mixes ``final_answer`` with real work tools.
+
+        Returns ``(kept, removed)``. A ``final_answer`` sharing a response with
+        a work tool was written before that tool ran, so its text cannot
+        describe the result it claims to summarize. Dropping it lets the work
+        tools execute and the next iteration answer from real results.
+
+        Must run before the batch reaches ``add_assistant_message``. A
+        ``final_answer`` recorded in the message history never receives a tool
+        result, and ``ExecutionContext._sanitize_tool_message_pairs`` then drops
+        the whole assistant block together with the work-tool results the model
+        needs on the next turn.
+
+        Control-only batches are returned unchanged. ``send_message`` with
+        ``expect_response=False`` continues the turn by design, and a batch
+        with no work tool carries no result the answer could be missing.
+        """
+
+        if not self._batch_carries_work_tool(tool_calls):
+            return tool_calls, []
+        kept: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict) and tool_call.get("name") == "final_answer":
+                removed.append(tool_call)
+            else:
+                kept.append(tool_call)
+        return kept, removed
+
+    def _tool_names_for_log(self, tool_calls: list[dict[str, Any]]) -> str:
+        """Render a batch's tool names for a log line, bounded and escaped.
+
+        Names are model-controlled strings with no length or character limit of
+        their own, so they are truncated and ``repr``-escaped before reaching
+        the log: a newline inside a name would otherwise split the record.
+        Order is preserved and duplicates are kept - a batch calling the same
+        tool three times is the fact worth reading. Non-mapping entries are
+        rendered as a placeholder instead of raising, matching the
+        ``isinstance(tool_call, dict)`` defense in ``_batch_carries_work_tool``
+        and ``_strip_final_answer_bundled_with_work_tools``: this method must
+        not be the one place in the strip path that crashes the run on a
+        malformed batch it is only trying to log. That branch is
+        defense-in-depth: ``_normalize_tool_calls`` currently emits only dict
+        entries with non-empty names, so no production input reaches it today.
+        """
+
+        names = [
+            repr(
+                (
+                    str(tool_call.get("name"))
+                    if isinstance(tool_call, dict)
+                    else f"<non-mapping tool_call: {type(tool_call).__name__}>"
+                )[:STRIP_LOG_MAX_TOOL_NAME_CHARS]
+            )
+            for tool_call in tool_calls[:STRIP_LOG_MAX_TOOL_NAMES]
+        ]
+        overflow = len(tool_calls) - len(names)
+        rendered = ", ".join(names)
+        return f"{rendered} (+{overflow} more)" if overflow > 0 else rendered
+
+    def _final_answer_text(self, args: Any) -> str:
+        """Coerce a ``final_answer`` argument payload into its answer text.
+
+        The single coercion for every site that reads an answer out of
+        ``final_answer`` args - this check, the finalization it guards, and the
+        streamer's candidate lookup - so they cannot disagree on what counts as
+        an answer. ``None`` must become the empty string rather than
+        ``str(None)``, which would yield the literal ``"None"`` and be sent to
+        the user as the answer.
+        """
+
+        if not isinstance(args, dict):
+            return ""
+        answer = args.get("answer")
+        if answer is None:
+            return ""
+        return str(answer)
+
+    def _requires_full_tool_set_recovery(
+        self,
+        normalized: dict[str, Any],
+        *,
+        force_final_answer: bool,
+        allowed_tool_names: frozenset[str] | None = None,
+    ) -> bool:
+        """Whether a rejected response should get the full tool set back.
+
+        On a forced turn only a call outside allowed_tool_names does. A plain
+        response is judged by every call it carries; a provider-reported
+        unavailable_tool_call only by the one refused name the provider
+        reports, which is the first call it refused. A reply that mixes a read
+        with another tool can therefore stay on the narrowed tools on the
+        provider path where the plain path hands the full set back; that is
+        the conservative direction. Without allowed_tool_names only
+        final_answer is allowed.
+        """
+        allowed_names = allowed_tool_names or frozenset({"final_answer"})
+        protocol_error = get_tool_protocol_error(normalized.get("raw"))
+        if (
+            isinstance(protocol_error, dict)
+            and protocol_error.get("code") == "unavailable_tool_call"
+        ):
+            # Outside a forced turn the answer is unchanged: restore.
+            if not force_final_answer:
+                return True
+            rejected = _unavailable_tool_call_names(protocol_error)
+            if rejected is None:
+                # The violation does not name the call. Restore, as before,
+                # rather than keep a narrowed set the model cannot leave.
+                return True
+            return not rejected <= allowed_names
+        if not force_final_answer:
+            return False
+        return any(
+            isinstance(tool_call, dict) and tool_call.get("name") not in allowed_names
+            for tool_call in normalized.get("tool_calls") or []
+        )
+
+    def _final_answer_tool_schema(self) -> dict[str, Any]:
+        for schema in self._builtin_tool_schemas():
+            function = schema.get("function")
+            if isinstance(function, dict) and function.get("name") == "final_answer":
+                return schema
+        raise RuntimeError("final_answer control tool schema is unavailable")
+
+    def _release_forced_answer(self) -> None:
+        """Leave the forced answer turn.
+
+        The two read counters are per run and are not reset here, so a later
+        forced turn in the same run gets no fresh read allowance.
+        forced_answer_extra_iterations is never reset: it is part of the
+        loop bound, and the iteration may already be past max_iterations.
+        """
+        self.force_final_answer_next = False
+        self._forced_answer_read_open = False
+
+    def _forced_answer_turn_now(self, context: Any, *, settlement_fence: bool) -> bool:
+        """Whether the turn about to call the model is a forced answer turn."""
+        return (
+            self.force_final_answer_next
+            or settlement_fence
+            or (
+                self.finalize_after_tool_result
+                and not self.pending_tool_calls
+                and self._latest_tool_result_success(context)
+            )
+        )
+
+    def _within_iteration_bound(
+        self, iteration: int, *, runtime: PatternRuntime, context: Any
+    ) -> bool:
+        """Whether the loop may run this iteration.
+
+        max_iterations bounds every turn, as it always has. The iterations
+        forced-turn reads added extend it only for a forced answer turn, or
+        for the pending calls such a turn left behind, so an ordinary turn
+        never runs past max_iterations.
+        """
+        if iteration < self.max_iterations:
+            return True
+        if iteration >= self.max_iterations + self.forced_answer_extra_iterations:
+            return False
+        if self.pending_tool_calls:
+            return self._forced_answer_read_open or self.force_final_answer_next
+        return self._forced_answer_turn_now(
+            context, settlement_fence=self._settlement_fence_active(runtime)
+        )
+
+    def _forced_answer_read_allowance_open(self) -> bool:
+        """Both per-run forced-turn read allowances still have room."""
+        return (
+            self.forced_answer_reads_used < FORCED_ANSWER_READ_BUDGET
+            and self.forced_answer_reads_rejected < FORCED_ANSWER_READ_REJECT_CAP
+        )
+
+    def _forced_answer_tool_schemas(
+        self, normal_tool_schemas: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """The tools a forced answer turn offers.
+
+        Built, never filtered. final_answer always comes from
+        _final_answer_tool_schema(): the same-named entry of the ordinary
+        surface can be the variant whose answer description sends the model
+        to get_workspace_output_files, a tool this turn does not offer.
+        read_tool_result is appended only when the turn's ordinary surface
+        carries it -- the one fact that says this run stored a result and has
+        a reader to offer -- and both read allowances still have room.
+        """
+        schemas = [self._final_answer_tool_schema()]
+        if not self._forced_answer_read_allowance_open():
+            return schemas
+        reader = next(
+            (
+                schema
+                for schema in normal_tool_schemas
+                if self._schema_tool_names([schema]) == [SPILL_READ_TOOL_NAME]
+            ),
+            None,
+        )
+        if reader is not None:
+            schemas.append(reader)
+        return schemas
+
+    def _forced_answer_read_was_interrupted(self, tool_call: dict[str, Any]) -> bool:
+        """Whether this pending read was admitted, started and interrupted.
+
+        Only an admitted call runs, so a read whose ledger record says it was
+        interrupted mid-run has already been counted. Resuming replays that
+        same call, recognized by its id, name and arguments.
+        """
+        record = self._record_for_tool_call_id(str(tool_call.get("id")))
+        return (
+            record is not None
+            and record.status == "interrupted"
+            and record.tool_name == SPILL_READ_TOOL_NAME
+            and record.args_hash
+            == self._args_hash(self._tool_call_args_dict(tool_call))
+        )
+
+    def _apply_forced_answer_read_policy(
+        self, segment: list[dict[str, Any]], context: Any
+    ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+        """Admit or refuse each read_tool_result call of a forced turn.
+
+        The one writer of both read counters and of
+        forced_answer_extra_iterations, which moves in lock step with them.
+        Calls are judged one at a time, in order, before any of them runs:
+
+        - not read_tool_result: admitted, nothing counted;
+        - a read that was admitted, started and interrupted, now replayed on
+          resume: admitted, nothing counted again;
+        - read allowance used up: refused, nothing counted;
+        - reject allowance used up: refused, nothing counted;
+        - no path (the key is missing, None or blank, which lists the stored
+          results): admitted as one read;
+        - a path that normalizes to a stored result: admitted as one read,
+          whatever start, end and offset it carries;
+        - any other path: refused and counted as one reject.
+
+        Returns (admitted, refused) for the leading calls of segment that
+        share the first call's outcome, so results still reach the context
+        in call order; the calls after them are judged when the loop reaches
+        them.
+        """
+        stored_paths = self._spilled_paths(context)
+        admitted: list[dict[str, Any]] = []
+        refused: list[tuple[dict[str, Any], str]] = []
+        for tool_call in segment:
+            refusal: str | None = None
+            counts_as_read = False
+            counts_as_reject = False
+            if tool_call.get("name") == SPILL_READ_TOOL_NAME:
+                path = self._tool_call_args_dict(tool_call).get("path")
+                # The same test read_tool_result itself uses to decide that
+                # a call lists the stored results instead of reading one.
+                lists_stored_results = path is None or (
+                    isinstance(path, str) and not path.strip()
+                )
+                if self._forced_answer_read_was_interrupted(tool_call):
+                    # Counted when it was admitted; the replay runs uncounted.
+                    pass
+                elif self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                    refusal = FORCED_ANSWER_READS_USED_UP_TEXT
+                elif self.forced_answer_reads_rejected >= FORCED_ANSWER_READ_REJECT_CAP:
+                    refusal = FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT
+                elif (
+                    lists_stored_results
+                    or normalize_spilled_relative_path(path) in stored_paths
+                ):
+                    counts_as_read = True
+                else:
+                    refusal = FORCED_ANSWER_READ_UNLISTED_PATH_TEXT
+                    counts_as_reject = True
+            if admitted if refusal is not None else refused:
+                break
+            if counts_as_read:
+                self.forced_answer_reads_used += 1
+                self.forced_answer_extra_iterations += 1
+            if counts_as_reject:
+                self.forced_answer_reads_rejected += 1
+                self.forced_answer_extra_iterations += 1
+            if refusal is None:
+                admitted.append(tool_call)
+            else:
+                refused.append((tool_call, refusal))
+        return admitted, refused
+
+    def _schema_tool_names(self, tool_schemas: list[dict[str, Any]]) -> list[str]:
+        names: list[str] = []
+        for schema in tool_schemas:
+            function = schema.get("function")
+            if isinstance(function, dict) and function.get("name"):
+                names.append(str(function["name"]))
+        return names
+
+    def _tool_decision_groups_for_tools(self, tools: list[Any]) -> dict[str, str]:
+        groups: dict[str, str] = {}
+        for tool in tools:
+            try:
+                tool_name = self._tool_name(tool)
+            except ValueError:
+                continue
+            groups[tool_name] = self._tool_decision_group(tool, tool_name)
+        return groups
+
+    def _tool_decision_group(self, tool: Any, tool_name: str) -> str:
+        metadata = getattr(tool, "metadata", None)
+        explicit_group = self._metadata_text(metadata, "decision_group") or (
+            self._metadata_text(tool, "decision_group")
+        )
+        if explicit_group:
+            return explicit_group
+
+        category = getattr(metadata, "category", None) if metadata is not None else None
+        category_value = getattr(category, "value", category)
+        if category_value is not None:
+            category_name = str(category_value).strip()
+            if (
+                category_name
+                and category_name not in UNGROUPED_TOOL_DECISION_CATEGORIES
+            ):
+                return category_name
+        return tool_name
+
+    def _metadata_text(self, obj: Any, field_name: str) -> str:
+        if obj is None:
+            return ""
+        value = getattr(obj, field_name, None)
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    def _tool_decision_group_for_name(self, tool_name: str) -> str:
+        return self._tool_decision_groups_by_name.get(tool_name, tool_name)
+
+    def get_state(self) -> dict[str, Any]:
+        """Return JSON-serializable ReAct state for checkpointing.
+
+        Containers that some code path mutates in place are snapshotted, so
+        a caller holding the result is not looking at live state. The DAG
+        checkpoint rollback (``_DAGStepRuntime.checkpoint``) depends on
+        that: without the copy below,
+        ``_deliver_pending_tool_interaction_responses`` popping from
+        ``pending_tool_interaction_responses`` would mutate the last-good
+        snapshot and a failed checkpoint would lose the user's reply.
+
+        Everything else is emitted by reference on purpose. Values that are
+        only ever *reassigned* cannot leak a later write into a snapshot,
+        and copying them would add cost to a path that runs on the order of
+        twenty times per step -- see the per-entry notes below.
+        """
+        return {
+            "reasoning_mode": self.reasoning_mode.value,
+            "status": self.status,
+            "current_iteration": self.current_iteration,
+            "iteration_limit_delivery_attempted": self.iteration_limit_delivery_attempted,
+            "max_iterations": self.max_iterations,
+            "finalize_after_tool_result": self.finalize_after_tool_result,
+            "tool_parallel_enabled": self.tool_parallel_enabled,
+            "tool_max_concurrency": self.tool_max_concurrency,
+            "repeated_tool_decision_after_consecutive_tool_calls": (
+                self.repeated_tool_decision_after_consecutive_tool_calls
+            ),
+            "repeated_tool_decision_after_consecutive_work_tool_calls": (
+                self.repeated_tool_decision_after_consecutive_work_tool_calls
+            ),
+            "force_final_answer_next": self.force_final_answer_next,
+            # Scalars, only ever reassigned. forced_answer_read_open must
+            # survive a resume: the read policy also runs for pending calls
+            # replayed from the top of the loop, where the turn that offered
+            # the reads is no longer being computed.
+            "forced_answer_reads_used": self.forced_answer_reads_used,
+            "forced_answer_reads_rejected": self.forced_answer_reads_rejected,
+            "forced_answer_read_open": self._forced_answer_read_open,
+            "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
+            # Scalars, so no snapshot needed: the fence flag and the turn it
+            # is scoped to are only ever reassigned (see
+            # ``_settlement_fence_active`` and ``_record_settled_tool_call``).
+            "settlement_final_answer_fence": self.settlement_final_answer_fence,
+            "settlement_fence_turn_id": self.settlement_fence_turn_id,
+            # Write-once: both are always rebound to a fresh dict, never
+            # written through -- see the "Rebind rather than mutate" comment
+            # on the ``waiting_for_user_request`` update below.
+            "repeated_tool_decision": self.repeated_tool_decision,
+            "waiting_for_user_request": self.waiting_for_user_request,
+            # Popped in place by ``_deliver_pending_tool_interaction_responses``
+            # and appended to when a response arrives, so the list itself must
+            # be snapshotted. The settlement-delivery transaction also
+            # re-inserts into the live list on rollback, and
+            # ``PatternRuntime.checkpoint`` records the payload before
+            # emitting it, so sharing the list would let a failed emit
+            # retroactively rewrite an already-stored payload. The entries are
+            # only read in the delivery loop, so a shallow copy of the list is
+            # enough.
+            "pending_tool_interaction_responses": snapshot_container(
+                self.pending_tool_interaction_responses
+            ),
+            "task_text": self.task_text,
+            "memory_input_text": self.memory_input_text,
+            # Write-once: normally a plain dict from ``_normalize_llm_response``,
+            # but typed ``Any`` and only ever reassigned (518, 906, 993, 1831,
+            # 3490), never written through. The invariant holds by convention
+            # here rather than by construction.
+            "last_response": self.last_response,
+            # Write-once: always rebound (``= list(...)``, slice assignments),
+            # never appended to or popped in place.
+            "pending_tool_calls": self.pending_tool_calls,
+            # Written through by invocation id for new calls and provider id
+            # for legacy calls while a turn is in flight, then popped after
+            # backfill, so it needs a snapshot.
+            "pending_tool_call_content": snapshot_container(
+                self.pending_tool_call_content
+            ),
+            # Write-once: ``_record_tool_call`` builds a whole new
+            # ``ToolCallRecord`` per call and replaces the entry; no code
+            # mutates a stored record's ``args``/``result``. Copying them
+            # would also be the most expensive thing on this path and would
+            # break on results custom/MCP tools are free to return (locks,
+            # handles, generators).
+            "tool_ledger": {
+                key: record.to_dict() for key, record in self.tool_ledger.items()
+            },
+            # Written through by ``_store_tool_record`` and
+            # ``_reorder_ledger_for_batch``, so it needs a snapshot.
+            "tool_call_id_index": dict(self.tool_call_id_index),
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Restore ReAct state from a checkpoint payload."""
+        self.reasoning_mode = ReActReasoningMode(
+            state.get("reasoning_mode", ReActReasoningMode.TOOL_CALLING.value)
+        )
+        self.status = str(state.get("status", "idle"))
+        self.current_iteration = int(state.get("current_iteration", 0))
+        self.iteration_limit_delivery_attempted = bool(
+            state.get("iteration_limit_delivery_attempted", False)
+        )
+        self.max_iterations = int(state.get("max_iterations", self.max_iterations))
+        self.finalize_after_tool_result = bool(
+            state.get("finalize_after_tool_result", self.finalize_after_tool_result)
+        )
+        if "tool_parallel_enabled" in state:
+            self.tool_parallel_enabled = bool(state["tool_parallel_enabled"])
+        if "tool_max_concurrency" in state:
+            self.tool_max_concurrency = max(1, int(state["tool_max_concurrency"]))
+        if "repeated_tool_decision_after_consecutive_tool_calls" in state:
+            raw_threshold = state["repeated_tool_decision_after_consecutive_tool_calls"]
+            self.repeated_tool_decision_after_consecutive_tool_calls = (
+                int(raw_threshold) if raw_threshold is not None else None
+            )
+        elif "auto_reroute_after_consecutive_tool_calls" in state:
+            raw_threshold = state["auto_reroute_after_consecutive_tool_calls"]
+            self.repeated_tool_decision_after_consecutive_tool_calls = (
+                int(raw_threshold) if raw_threshold is not None else None
+            )
+
+        if "repeated_tool_decision_after_consecutive_work_tool_calls" in state:
+            raw_work_threshold = state[
+                "repeated_tool_decision_after_consecutive_work_tool_calls"
+            ]
+            self.repeated_tool_decision_after_consecutive_work_tool_calls = (
+                int(raw_work_threshold) if raw_work_threshold is not None else None
+            )
+        self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
+        # A missing, None or negative count reads as 0, and a read-open flag
+        # that is anything but True reads as False, so a checkpoint written
+        # before these keys existed resumes as a run that made no forced-turn
+        # reads.
+        self.forced_answer_reads_used = max(
+            0, int(state.get("forced_answer_reads_used", 0) or 0)
+        )
+        self.forced_answer_reads_rejected = max(
+            0, int(state.get("forced_answer_reads_rejected", 0) or 0)
+        )
+        self._forced_answer_read_open = state.get("forced_answer_read_open") is True
+        self.forced_answer_extra_iterations = max(
+            0, int(state.get("forced_answer_extra_iterations", 0) or 0)
+        )
+        self.settlement_final_answer_fence = bool(
+            state.get("settlement_final_answer_fence", False)
+        )
+        raw_fence_turn_id = state.get("settlement_fence_turn_id")
+        self.settlement_fence_turn_id = (
+            str(raw_fence_turn_id) if raw_fence_turn_id else None
+        )
+        repeated_tool_decision = state.get("repeated_tool_decision")
+        self.repeated_tool_decision = (
+            dict(repeated_tool_decision)
+            if isinstance(repeated_tool_decision, dict)
+            else None
+        )
+        waiting_request = state.get("waiting_for_user_request")
+        self.waiting_for_user_request = (
+            dict(waiting_request) if isinstance(waiting_request, dict) else None
+        )
+        pending_interaction_responses = state.get("pending_tool_interaction_responses")
+        self.pending_tool_interaction_responses = []
+        for item in (
+            pending_interaction_responses
+            if isinstance(pending_interaction_responses, list)
+            else []
+        ):
+            if not isinstance(item, dict):
+                continue
+            restored_pending = {
+                "tool_name": str(item.get("tool_name") or ""),
+                "tool_call_id": str(item.get("tool_call_id") or ""),
+                "invocation_id": self._normalized_invocation_id(
+                    item.get("invocation_id")
+                ),
+                "interaction_id": str(item.get("interaction_id") or ""),
+                "response": str(item.get("response") or ""),
+            }
+            self.pending_tool_interaction_responses.append(restored_pending)
+        stored_task_text = state.get("task_text")
+        self.task_text = str(stored_task_text) if stored_task_text else None
+        stored_memory_input = state.get("memory_input_text")
+        if stored_memory_input:
+            self.memory_input_text = str(stored_memory_input)
+        self.last_response = state.get("last_response")
+        self.pending_tool_calls = list(state.get("pending_tool_calls", []))
+        self.pending_tool_call_content = dict(
+            state.get("pending_tool_call_content", {})
+        )
+        self.tool_ledger = {
+            key: ToolCallRecord.from_dict(value)
+            for key, value in state.get("tool_ledger", {}).items()
+        }
+        stored_index = state.get("tool_call_id_index")
+        if isinstance(stored_index, dict):
+            self.tool_call_id_index = {
+                str(tool_call_id): str(key)
+                for tool_call_id, key in stored_index.items()
+                if str(key) in self.tool_ledger
+            }
+        else:
+            # A pre-identity checkpoint keys its ledger by provider id, so
+            # replaying it in stored order rebuilds the index it implies.
+            self.tool_call_id_index = {}
+            for key, record in self.tool_ledger.items():
+                self.tool_call_id_index[record.tool_call_id] = key
+
+    async def _resume_waiting_for_user_if_needed(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        tools: list[Any],
+    ) -> dict[str, Any] | None:
+        if self.status != "waiting_for_user" or not self.waiting_for_user_request:
+            return None
+
+        waiting_message_count = int(
+            self.waiting_for_user_request.get("message_count", 0)
+        )
+        if len(getattr(context, "messages", [])) <= waiting_message_count:
+            await runtime.checkpoint(
+                "waiting_for_user",
+                context=context,
+                pattern=self,
+                metadata={"waiting_for_user_request": self.waiting_for_user_request},
+            )
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": self.waiting_for_user_request.get("message", ""),
+                "message_type": self.waiting_for_user_request.get(
+                    "message_type", "question"
+                ),
+                "interactions": self.waiting_for_user_request.get("interactions"),
+                "context": context,
+                "clarification_draft": draft_from_waiting_request(
+                    self.waiting_for_user_request,
+                    execution_id=getattr(context, "execution_id", None),
+                    step_id=None,
+                ),
+            }
+
+        response = self._mark_latest_user_message_as_waiting_response(
+            context=context,
+            after_message_count=waiting_message_count,
+        )
+        self._queue_tool_interaction_responses(
+            waiting_request=self.waiting_for_user_request,
+            response=response or "",
+            tools=tools,
+        )
+        if self.pending_tool_calls:
+            # Waiting checkpoints written before the pause path discarded the
+            # plan pre-checkpoint still carry the parked batch's unexecuted
+            # siblings (#2216). Pause-time semantics already discarded them in
+            # memory, so cancel them here too: the resumed turn must replan
+            # from the user's answer, never replay a stale call.
+            logger.warning(
+                "ReAct cancelling %d stale pending tool call(s) restored from a "
+                "legacy waiting_for_user checkpoint (#2216): %s",
+                len(self.pending_tool_calls),
+                [call.get("name") for call in self.pending_tool_calls],
+            )
+            self._discard_pending_tool_plan_after_pause(
+                context,
+                reason=(
+                    "Discarded stale tool plan restored from a checkpoint "
+                    "written before user input arrived; the agent replans "
+                    "from the user's response."
+                ),
+            )
+        waiting_task = self.waiting_for_user_request.get("task_text")
+        if waiting_task and self.task_text is None:
+            self.task_text = str(waiting_task)
+        self.waiting_for_user_request = None
+        self.status = "thinking"
+        await runtime.checkpoint(
+            "tool_interaction_response_received",
+            context=context,
+            pattern=self,
+        )
+        return None
+
+    def _task_text(self, context: Any) -> str:
+        if self.task_text:
+            return self.task_text
+        self.task_text = latest_user_text(context)
+        return self.task_text
+
+    def _memory_text(self, context: Any, *, execution_text: str) -> str:
+        if self.memory_input_text:
+            return self.memory_input_text
+        self.memory_input_text = (
+            context.current_user_request_text(prefer_display=True) or execution_text
+        )
+        return self.memory_input_text
+
+    def seed_memory_input(self, memory_text: str) -> None:
+        """Provide DAG-owned provenance without replacing restored state."""
+        if self.memory_input_text is None:
+            self.memory_input_text = str(memory_text or "") or None
+
+    def _mark_latest_user_message_as_waiting_response(
+        self,
+        *,
+        context: Any,
+        after_message_count: int,
+    ) -> str | None:
+        messages = getattr(context, "messages", [])
+        if not isinstance(messages, list):
+            return None
+
+        for index in range(after_message_count, len(messages)):
+            message = messages[index]
+            if getattr(message, "role", None) != "user":
+                continue
+            metadata = getattr(message, "metadata", None)
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            if pending_user_response_lifecycle(message) is not None:
+                return str(getattr(message, "content", "") or "")
+            waiting_request = self.waiting_for_user_request or {}
+            marker = pending_user_response_marker(waiting_request)
+            if marker is None:
+                return None
+            metadata["response_to_waiting_for_user"] = marker
+            messages[index] = replace(message, metadata=metadata)
+            return str(getattr(message, "content", "") or "")
+        return None
+
+    def _queue_tool_interaction_responses(
+        self,
+        *,
+        waiting_request: Any,
+        response: str,
+        tools: list[Any],
+    ) -> None:
+        """Queue replies only for tools that expose the optional resume callback.
+
+        One user reply is queued verbatim for every resumable interaction in
+        the batch; see ``_deliver_pending_tool_interaction_responses`` for why
+        that fan-out is the intended product behavior.
+        """
+
+        if (
+            not isinstance(waiting_request, dict)
+            or waiting_request.get("kind") != "tool_waiting_for_user"
+        ):
+            return
+        raw_requests = waiting_request.get("requests")
+        requests = raw_requests if isinstance(raw_requests, list) else [waiting_request]
+        for request in requests:
+            if not isinstance(request, dict):
+                continue
+            tool_name = str(request.get("tool_name") or "")
+            if not tool_name:
+                continue
+            try:
+                tool = self._find_tool(tool_name, tools)
+            except ValueError:
+                continue
+            if user_interaction_resume_callable(tool) is None:
+                # Callback-less tools resume through the normal ReAct replan. The
+                # user's answer remains in context with waiting-response metadata.
+                continue
+            queued = {
+                "tool_name": tool_name,
+                "tool_call_id": str(request.get("tool_call_id") or ""),
+                "invocation_id": self._normalized_invocation_id(
+                    request.get("invocation_id")
+                ),
+                "interaction_id": str(
+                    request.get("interaction_id") or request.get("tool_call_id") or ""
+                ),
+                "response": response,
+            }
+            self.pending_tool_interaction_responses.append(queued)
+
+    async def _deliver_pending_tool_interaction_responses(
+        self,
+        *,
+        tools: list[Any],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Deliver checkpointed replies to their exact suspended interactions.
+
+        When a waiting batch holds several interactions that each carry a
+        resume callback, the user's single free-text reply is delivered
+        verbatim to every one of them, and each callback decides its own
+        terminal settlement. This is a deliberate product decision: the tool
+        that owns the interaction knows what its own question was, so it is
+        the only component that can interpret one shared answer, and a
+        machine-readable disambiguation protocol would put the burden on the
+        human instead. Interactions whose tool exposes no resume callback are
+        untouched by this path and keep the legacy free-text replan behavior
+        that issue #2256 requires to stay unchanged.
+        """
+
+        while self.pending_tool_interaction_responses:
+            pending = self.pending_tool_interaction_responses[0]
+            tool_name = pending.get("tool_name", "")
+            try:
+                tool = self._find_tool(tool_name, tools)
+            except ValueError:
+                tool = None
+            resume = (
+                user_interaction_resume_callable(tool) if tool is not None else None
+            )
+            if resume is None:
+                # Legacy checkpoints may contain callback delivery for a tool that
+                # no longer exists or never implemented the optional capability.
+                # The annotated user message is sufficient for the model to replan.
+                await self._skip_pending_tool_interaction_response(
+                    pending=pending,
+                    context=context,
+                    runtime=runtime,
+                    reason="resume_callback_unavailable",
+                )
+                continue
+
+            try:
+                record = self._validate_tool_interaction_settlement_target(
+                    pending=pending,
+                    context=context,
+                )
+            except RuntimeError as exc:
+                await self._abandon_invalid_settlement_target(
+                    pending=pending,
+                    context=context,
+                    runtime=runtime,
+                    error=exc,
+                )
+                continue
+
+            # Everything the rollback needs is captured BEFORE the callback
+            # runs: a raise while snapshotting would otherwise leave the
+            # external effect done but the entry still pending, re-invoking
+            # the callback on the next attempt.
+            record_before = replace(record)
+            messages = getattr(context, "messages", None)
+            messages_before = list(messages) if isinstance(messages, list) else None
+            force_final_before = self.force_final_answer_next
+            settlement_fence_before = self.settlement_final_answer_fence
+            settlement_fence_turn_before = self.settlement_fence_turn_id
+
+            # The resumed call re-enters the same execution slot that issued
+            # it, so the MCP approval gate sees the original identity (source,
+            # turn, ReAct step) instead of inventing a new one.
+            resume_call = {
+                "id": str(pending.get("tool_call_id") or ""),
+                "invocation_id": record.invocation_id,
+                "name": tool_name,
+                "turn_id": record.turn_id,
+                "step_id": record.step_id,
+            }
+            with bind_tool_call_execution_context(
+                self._mcp_gate_execution_context(resume_call, context, runtime)
+            ):
+                resumed = resume(
+                    interaction_id=pending.get("interaction_id", ""),
+                    response=pending.get("response", ""),
+                )
+                if inspect.isawaitable(resumed):
+                    resumed = await resumed
+            if resumed is not None and not isinstance(
+                resumed, ToolInteractionSettlement
+            ):
+                logger.error(
+                    "resume_user_interaction must return "
+                    "ToolInteractionSettlement or None; treating the outcome as "
+                    "dispatch_unknown. tool=%r interaction_id=%r",
+                    tool_name,
+                    pending.get("interaction_id", ""),
+                )
+                resumed = ToolInteractionSettlement.dispatch_unknown(
+                    error=(
+                        "The resume callback returned an invalid settlement. The "
+                        "external outcome is unknown and automatic retry is disabled."
+                    )
+                )
+            settlement = (
+                resumed if isinstance(resumed, ToolInteractionSettlement) else None
+            )
+
+            popped = False
+            try:
+                if settlement is not None:
+                    self._project_tool_interaction_settlement(
+                        record=record,
+                        settlement=settlement,
+                        context=context,
+                        runtime=runtime,
+                    )
+
+                # The checkpoint must contain the terminal projection and no
+                # pending callback. If persistence fails, restore the entire
+                # in-memory transaction so replay starts from the last durable
+                # waiting state.
+                self.pending_tool_interaction_responses.pop(0)
+                popped = True
+                await runtime.checkpoint(
+                    "tool_interaction_response_delivered",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_call_id": pending.get("tool_call_id", ""),
+                        "invocation_id": record.invocation_id,
+                        "interaction_id": pending.get("interaction_id", ""),
+                        "settlement_status": (
+                            settlement.status if settlement is not None else None
+                        ),
+                    },
+                )
+            except BaseException:
+                self.tool_ledger[self._ledger_key(record_before)] = record_before
+                if messages_before is not None and isinstance(messages, list):
+                    messages[:] = messages_before
+                self.force_final_answer_next = force_final_before
+                self.settlement_final_answer_fence = settlement_fence_before
+                self.settlement_fence_turn_id = settlement_fence_turn_before
+                if popped:
+                    self.pending_tool_interaction_responses.insert(0, pending)
+                raise
+            if settlement is not None:
+                settled_record = (
+                    self._find_tool_record(
+                        tool_call_id=record.tool_call_id,
+                        invocation_id=record.invocation_id,
+                    )
+                    or record
+                )
+                await self._trace_tool_interaction_settlement(
+                    record=settled_record,
+                    status=settlement.status,
+                    result=settled_record.result,
+                    error=settled_record.error,
+                    runtime=runtime,
+                )
+
+    async def _abandon_invalid_settlement_target(
+        self,
+        *,
+        pending: dict[str, Any],
+        context: Any,
+        runtime: PatternRuntime,
+        error: RuntimeError,
+    ) -> None:
+        """Close out a pending entry whose settlement target does not validate.
+
+        No resume callback has run and none will: the entry is unusable. What
+        happens to the ledger depends on which record, if any, it resolves to.
+
+        * The entry's own record is already ``completed``/``failed`` — an
+          idempotent replay of a delivery that already landed. Pop and skip;
+          the earlier terminal outcome stands.
+        * The entry's own record is still ``waiting_for_user`` (its transcript
+          slot is missing or duplicated). It cannot be left that way: the row
+          would stay waiting forever and, carrying no settlement, would be
+          invisible to ``_suppressed_duplicate_write_result``, leaving the
+          write unguarded against a model retry. A dispatch-unknown outcome is
+          forced onto it instead, which closes the row and enrolls it in the
+          turn-scoped guard.
+        * No record at that id, or a record belonging to a *different* tool.
+          Nothing here is ours to settle — writing a settlement onto another
+          tool's live row would corrupt an unrelated interaction — so the
+          entry is dropped with a warning.
+        """
+
+        tool_name = str(pending.get("tool_name") or "")
+        tool_call_id = str(pending.get("tool_call_id") or "")
+        candidate = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=self._normalized_invocation_id(pending.get("invocation_id")),
+        )
+        # Only a record for this exact call AND this exact tool is ours.
+        record = (
+            candidate
+            if candidate is not None and candidate.tool_name == tool_name
+            else None
+        )
+        already_settled = record is not None and record.status in _SETTLED_ROW_STATUSES
+        reason = "already_settled" if already_settled else "invalid_settlement_target"
+        logger.warning(
+            "Skipping stale tool interaction response. reason=%s "
+            "tool=%r tool_call_id=%r error=%s",
+            reason,
+            tool_name,
+            tool_call_id,
+            error,
+        )
+        if record is not None and record.status == "waiting_for_user":
+            await self._settle_unresolvable_waiting_record(
+                record=record,
+                pending=pending,
+                context=context,
+                runtime=runtime,
+                error=error,
+            )
+            return
+        await self._skip_pending_tool_interaction_response(
+            pending=pending,
+            context=context,
+            runtime=runtime,
+            reason=reason,
+        )
+
+    async def _settle_unresolvable_waiting_record(
+        self,
+        *,
+        record: ToolCallRecord,
+        pending: dict[str, Any],
+        context: Any,
+        runtime: PatternRuntime,
+        error: RuntimeError,
+    ) -> None:
+        """Force a dispatch-unknown outcome onto a row we can no longer settle."""
+
+        settlement = ToolInteractionSettlement.dispatch_unknown(
+            error=(
+                "The resumed tool call could not be matched to its original "
+                f"observation ({error}). The external outcome is unknown and "
+                "automatic retry is disabled."
+            )
+        )
+        # No message snapshot here: the transcript slot is precisely what
+        # failed to validate, so this path settles the ledger row alone and
+        # never rewrites the messages.
+        record_before = replace(record)
+        force_final_before = self.force_final_answer_next
+        settlement_fence_before = self.settlement_final_answer_fence
+        settlement_fence_turn_before = self.settlement_fence_turn_id
+        popped = False
+        try:
+            self._record_settled_tool_call(
+                record=record,
+                settlement=settlement,
+                result=settlement.projected_result(),
+                runtime=runtime,
+            )
+            self.pending_tool_interaction_responses.pop(0)
+            popped = True
+            await runtime.checkpoint(
+                "tool_interaction_response_skipped",
+                context=context,
+                pattern=self,
+                metadata={
+                    "tool_name": record.tool_name,
+                    "tool_call_id": record.tool_call_id,
+                    "invocation_id": record.invocation_id,
+                    "interaction_id": pending.get("interaction_id", ""),
+                    "reason": "invalid_settlement_target",
+                    "settlement_status": settlement.status,
+                },
+            )
+        except BaseException:
+            self.tool_ledger[self._ledger_key(record_before)] = record_before
+            self.force_final_answer_next = force_final_before
+            self.settlement_final_answer_fence = settlement_fence_before
+            self.settlement_fence_turn_id = settlement_fence_turn_before
+            if popped:
+                self.pending_tool_interaction_responses.insert(0, pending)
+            raise
+        settled_record = (
+            self._find_tool_record(
+                tool_call_id=record.tool_call_id,
+                invocation_id=record.invocation_id,
+            )
+            or record
+        )
+        await self._trace_tool_interaction_settlement(
+            record=settled_record,
+            status=settlement.status,
+            result=settled_record.result,
+            error=settled_record.error,
+            runtime=runtime,
+        )
+
+    async def _skip_pending_tool_interaction_response(
+        self,
+        *,
+        pending: dict[str, Any],
+        context: Any,
+        runtime: PatternRuntime,
+        reason: str,
+    ) -> None:
+        """Durably skip one undeliverable response without losing it on failure."""
+
+        self.pending_tool_interaction_responses.pop(0)
+        try:
+            # This skip runs before any ledger row is validated, so the queued
+            # request is the only identity source. The delivered and
+            # invalid-target checkpoints report the validated row instead.
+            await runtime.checkpoint(
+                "tool_interaction_response_skipped",
+                context=context,
+                pattern=self,
+                metadata={
+                    "tool_name": pending.get("tool_name", ""),
+                    "tool_call_id": pending.get("tool_call_id", ""),
+                    "invocation_id": self._normalized_invocation_id(
+                        pending.get("invocation_id")
+                    ),
+                    "interaction_id": pending.get("interaction_id", ""),
+                    "reason": reason,
+                },
+            )
+        except BaseException:
+            self.pending_tool_interaction_responses.insert(0, pending)
+            raise
+
+    async def _trace_tool_interaction_settlement(
+        self,
+        *,
+        record: ToolCallRecord,
+        status: str,
+        result: Any,
+        error: str | None,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Emit the durable settlement lifecycle without billing another call."""
+
+        tracer = getattr(runtime, "tracer", None)
+        trace_event = getattr(tracer, "trace_event", None)
+        if not callable(trace_event):
+            return
+        succeeded = status == "succeeded"
+        base: dict[str, Any] = {
+            "tool_name": record.tool_name,
+            "tool_call_id": record.tool_call_id,
+            "settlement_delivery": True,
+            "settlement_status": status,
+        }
+        if record.invocation_id:
+            base["invocation_id"] = record.invocation_id
+        # Settlement facts close the original attempt: the event writer keys
+        # them by this identity and the model context takes the settlement end
+        # as the attempt's outcome.
+        if record.tool_attempt_id and record.assistant_message_id:
+            base["tool_attempt_id"] = record.tool_attempt_id
+            base["assistant_message_id"] = record.assistant_message_id
+        turn_id = record.settlement_turn_id or getattr(runtime, "active_turn_id", None)
+        if turn_id:
+            base["turn_id"] = str(turn_id)
+        if record.issued_at is not None:
+            base["original_started_at"] = record.issued_at
+        start_data = {**base, "tool_params": copy.deepcopy(record.args)}
+        if succeeded:
+            end_type = TraceEventType(
+                TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL
+            )
+            end_data = {
+                **base,
+                "tool_params": copy.deepcopy(record.args),
+                "result": result,
+                "success": True,
+            }
+        else:
+            error_message = str(
+                error or (result.get("error") if isinstance(result, dict) else result)
+            )
+            end_type = TraceEventType(
+                TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL
+            )
+            end_data = {
+                **base,
+                "error_type": "agent_tool_error",
+                "error": error_message,
+                "error_message": error_message,
+                "result": result,
+                "success": False,
+            }
+        settlement_step_id = record.step_id or getattr(
+            runtime, "active_react_step_id", None
+        )
+        started = await self._emit_settlement_trace_event(
+            trace_event,
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
+            runtime=runtime,
+            step_id=settlement_step_id,
+            data=start_data,
+        )
+        ended = await self._emit_settlement_trace_event(
+            trace_event,
+            end_type,
+            runtime=runtime,
+            step_id=settlement_step_id,
+            data=end_data,
+        )
+        if started and ended:
+            self._clear_settlement_trace_pending(record)
+
+    def _clear_settlement_trace_pending(self, settled_record: ToolCallRecord) -> None:
+        record = self._find_tool_record(
+            tool_call_id=settled_record.tool_call_id,
+            invocation_id=settled_record.invocation_id,
+        )
+        if record is None or not record.settlement_trace_pending:
+            return
+        self.tool_ledger[self._ledger_key(record)] = replace(
+            record, settlement_trace_pending=False
+        )
+
+    async def _replay_unemitted_settlement_traces(
+        self, *, runtime: PatternRuntime
+    ) -> None:
+        for record in list(self.tool_ledger.values()):
+            if not (record.settlement_status and record.settlement_trace_pending):
+                continue
+            await self._trace_tool_interaction_settlement(
+                record=record,
+                status=record.settlement_status,
+                result=record.result,
+                error=record.error,
+                runtime=runtime,
+            )
+
+    @staticmethod
+    async def _emit_settlement_trace_event(
+        trace_event: Callable[..., Any],
+        event_type: TraceEventType,
+        *,
+        runtime: PatternRuntime,
+        step_id: str | None,
+        data: dict[str, Any],
+    ) -> bool:
+        """Require persistence and report whether the trace event landed.
+
+        A failed execution-event commit stops the run like every other strict
+        fact: readers would otherwise keep the attempt's waiting outcome. The
+        ledger still owes the trace, so the resumed run replays it. Any other
+        tracer failure leaves the trace owed and the run going.
+        """
+
+        execution_id = getattr(runtime, "execution_id", None)
+        try:
+            emitted = trace_event(
+                event_type,
+                task_id=str(execution_id or ""),
+                step_id=str(step_id or execution_id or "root"),
+                data=data,
+                require_persisted=True,
+            )
+            if inspect.isawaitable(emitted):
+                await emitted
+        except ExecutionEventPersistenceError:
+            raise
+        except Exception:
+            logger.warning("settlement trace event failed", exc_info=True)
+            return False
+        return True
+
+    def _validate_tool_interaction_settlement_target(
+        self,
+        *,
+        pending: dict[str, Any],
+        context: Any,
+    ) -> ToolCallRecord:
+        """Validate every durable identity before a resume callback can run."""
+
+        tool_call_id = str(pending.get("tool_call_id") or "")
+        invocation_id = self._normalized_invocation_id(pending.get("invocation_id"))
+        record = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+        )
+        if record is None:
+            raise RuntimeError(
+                "Cannot settle resumed tool interaction without its original "
+                f"ledger record: {tool_call_id or '<missing>'}"
+            )
+        pending_tool_name = str(pending.get("tool_name") or "")
+        if pending_tool_name != record.tool_name:
+            raise RuntimeError(
+                "Resumed tool interaction does not match its original ledger "
+                f"record: {pending_tool_name!r} != {record.tool_name!r}"
+            )
+        if record.status != "waiting_for_user":
+            raise RuntimeError(
+                "Cannot resume a tool call that is not waiting for user input: "
+                f"{tool_call_id!r} is {record.status!r} with settlement "
+                f"{record.settlement_status!r}."
+            )
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matches = [
+            message
+            for message in messages
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or getattr(message, "metadata", {}).get("invocation_id")
+                == invocation_id
+            )
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matches)}."
+            )
+        return record
+
+    def _project_tool_interaction_settlement(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Project a resumed outcome onto its original tool protocol slot."""
+
+        result = settlement.projected_result()
+        self._replace_tool_result(
+            context=context,
+            tool_name=record.tool_name,
+            tool_call_id=record.tool_call_id,
+            invocation_id=record.invocation_id,
+            result=result,
+        )
+        self._record_settled_tool_call(
+            record=record,
+            settlement=settlement,
+            result=result,
+            runtime=runtime,
+        )
+
+    def _record_settled_tool_call(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        result: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Rewrite the ledger row and raise the fence a denied outcome demands."""
+
+        tool_call: dict[str, Any] = {
+            "id": record.tool_call_id,
+            "invocation_id": record.invocation_id,
+            "name": record.tool_name,
+            "args": copy.deepcopy(record.args),
+        }
+        if record.turn_id:
+            tool_call["turn_id"] = record.turn_id
+        if record.step_id:
+            tool_call["step_id"] = record.step_id
+        if record.tool_attempt_id:
+            tool_call["tool_attempt_id"] = record.tool_attempt_id
+        if record.assistant_message_id:
+            tool_call["assistant_message_id"] = record.assistant_message_id
+        settlement_turn_id = getattr(runtime, "active_turn_id", None)
+
+        if settlement.status == "succeeded":
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result=result,
+                settlement_status=settlement.status,
+                settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
+            )
+        else:
+            error = str(
+                settlement.error
+                or (result.get("error") if isinstance(result, dict) else result)
+            )
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                result=result,
+                error=error,
+                settlement_status=settlement.status,
+                settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
+            )
+        # A rejection or an unknown dispatch anywhere in the delivery batch is
+        # an authorization boundary for the whole resumed turn. Maintainers
+        # signed off on the one-way latch: once raised, a later success in the
+        # same batch must not reopen write authorization. It is scoped to the
+        # raising turn (see _settlement_fence_active) so a turn that exits via
+        # max_iterations, an interrupt or a second pause cannot lock the rest
+        # of the conversation out of tool use. The fence is the coarse half of
+        # a pair; the fine half is the turn-scoped duplicate-write guard in
+        # _suppressed_duplicate_write_result, which blocks the one exact write
+        # even when the model is allowed to call tools at all.
+        if settlement.status in _GUARDED_SETTLEMENT_STATUSES:
+            self.force_final_answer_next = True
+            self.settlement_final_answer_fence = True
+            self.settlement_fence_turn_id = (
+                str(settlement_turn_id) if settlement_turn_id else None
+            )
+
+    def _settlement_fence_active(self, runtime: PatternRuntime) -> bool:
+        """Whether the settlement fence still binds the turn now executing.
+
+        The fence is raised by a rejected / dispatch-unknown settlement and is
+        a one-way latch *within* that turn: it survives every tool-protocol
+        retry recovery path, which would otherwise hand the work tools back to
+        the model and let it repeat the denied write. It does not survive the
+        turn. A turn that ends without reaching ``_finalize_outcome`` — via
+        ``max_iterations``, an interrupt, an invalid tool protocol, or a second
+        ``waiting_for_user`` pause — leaves the flag set, so honoring it beyond
+        its own turn would silently lock every later user message in the
+        conversation to final-answer-only.
+
+        A fence with no recorded turn id (raised while the embedding stamped no
+        turn) binds only while the runtime also reports no turn: an unknowable
+        turn cannot be compared, and failing open there matches the
+        duplicate-write guard's rule for the same situation.
+        """
+
+        if not self.settlement_final_answer_fence:
+            return False
+        active_turn_id = getattr(runtime, "active_turn_id", None)
+        active_turn_id = str(active_turn_id) if active_turn_id else None
+        if self.settlement_fence_turn_id == active_turn_id:
+            return True
+        self.settlement_final_answer_fence = False
+        self.settlement_fence_turn_id = None
+        return False
+
+    @staticmethod
+    def _replace_tool_result(
+        *,
+        context: Any,
+        tool_name: str,
+        tool_call_id: str,
+        invocation_id: str | None,
+        result: Any,
+    ) -> None:
+        """Replace the waiting observation without creating a second tool row.
+
+        The replacement lands at the original transcript index, i.e. before the
+        user message that authorized it. That ordering is deliberate: keeping
+        the result in its original tool-protocol slot is what lets the model
+        read one call with one outcome, which is the whole point of #2256, and
+        the alternative (appending a second tool row) is what the issue asks us
+        to avoid.
+        """
+
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matching_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or getattr(message, "metadata", {}).get("invocation_id")
+                == invocation_id
+            )
+        ]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matching_indexes)}."
+            )
+
+        replacement = context.add_tool_result(
+            tool_name=tool_name,
+            result=result,
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+        )
+        if not messages or messages[-1] is not replacement:
+            raise RuntimeError(
+                "Execution context did not append the replacement result."
+            )
+        messages.pop()
+        messages[matching_indexes[0]] = replacement
+
+    def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
+        if isinstance(response, str):
+            content = unwrap_final_answer_content(response)
+            return {
+                "content": content,
+                "tool_calls": [],
+                "done": True,
+                "raw": response,
+            }
+
+        if not isinstance(response, dict):
+            text = unwrap_final_answer_content(str(response))
+            return {"content": text, "tool_calls": [], "done": True, "raw": response}
+
+        tool_calls = self._normalize_tool_calls(response.get("tool_calls", []))
+        content_value: Any = response.get("content")
+        if content_value is None:
+            content_value = (
+                response.get("answer")
+                or response.get("output")
+                or response.get("message")
+            )
+        if isinstance(content_value, str):
+            content_value = unwrap_final_answer_content(content_value)
+
+        done = response.get("done")
+        if done is None:
+            done = not tool_calls
+
+        return {
+            "content": content_value,
+            "tool_calls": tool_calls,
+            "raw_tool_calls": response.get("tool_calls", []),
+            "done": bool(done),
+            "raw": response,
+        }
+
+    def _provider_state_for_context(
+        self, normalized_response: dict[str, Any]
+    ) -> dict[str, Any]:
+        raw = normalized_response.get("raw")
+        marker_key = "_xagent_provider_state"
+        if isinstance(raw, dict):
+            raw_provider_state = raw.get(marker_key)
+            if isinstance(raw_provider_state, dict):
+                return {marker_key: raw_provider_state}
+        if marker_key in normalized_response and isinstance(
+            normalized_response[marker_key], dict
+        ):
+            return {marker_key: normalized_response[marker_key]}
+        return {}
+
+    def _normalize_tool_calls(self, tool_calls: list[Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        issued_at = datetime.now(timezone.utc).timestamp()
+        for index, tool_call in enumerate(tool_calls):
+            # Three provider shapes: a dict with a nested ``function`` payload, a
+            # flat dict, and an object with a ``function`` attribute. Each yields
+            # the same (id, name, arguments) triple.
+            if isinstance(tool_call, dict):
+                call_id = tool_call.get("id")
+                function_payload = tool_call.get("function")
+                if isinstance(function_payload, dict):
+                    name = function_payload.get("name")
+                    arguments = function_payload.get("arguments", {})
+                else:
+                    name = tool_call.get("name")
+                    arguments = tool_call.get("args", tool_call.get("arguments", {}))
+            else:
+                function_payload = getattr(tool_call, "function", None)
+                if function_payload is None:
+                    continue
+                call_id = getattr(tool_call, "id", None)
+                name = getattr(function_payload, "name", None)
+                arguments = getattr(function_payload, "arguments", {})
+
+            normalized.append(
+                {
+                    "id": call_id or f"tool_call_{index}",
+                    "invocation_id": uuid.uuid4().hex,
+                    "issued_at": issued_at,
+                    "name": name,
+                    "args": self._coerce_arguments(arguments, tool_name=name),
+                }
+            )
+
+        return [call for call in normalized if call.get("name")]
+
+    def _remember_tool_call_content(
+        self, tool_calls: list[dict[str, Any]], assistant_content: Any
+    ) -> None:
+        if not isinstance(assistant_content, str):
+            return
+        content = assistant_content.strip()
+        if not content:
+            return
+
+        control_tool_names = self._control_tool_names()
+        for tool_call in tool_calls:
+            if tool_call.get("name") in control_tool_names:
+                continue
+            content_key = self._tool_call_content_key(tool_call)
+            if content_key:
+                self.pending_tool_call_content[content_key] = content
+            return
+
+    def _coerce_arguments(
+        self, arguments: Any, *, tool_name: str | None = None
+    ) -> dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                if not arguments.strip():
+                    # The happy path for a parameterless tool on providers that
+                    # send `""` instead of `"{}"` (#1501) - not a malformation.
+                    logger.debug(
+                        "ReAct tool call %s returned blank arguments; "
+                        "treating as no arguments.",
+                        tool_name or "<unknown>",
+                    )
+                else:
+                    logger.warning(
+                        "ReAct tool call %s returned malformed JSON arguments "
+                        "(%d chars); dropping them for control tools, passing "
+                        "anything else through as `input`.",
+                        tool_name or "<unknown>",
+                        len(arguments),
+                    )
+                return self._fallback_arguments(tool_name, arguments)
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning(
+                "ReAct tool call %s returned non-object JSON arguments (%s).",
+                tool_name or "<unknown>",
+                type(parsed).__name__,
+            )
+            return self._fallback_arguments(tool_name, parsed)
+        return {}
+
+    def _fallback_arguments(
+        self, tool_name: str | None, payload: Any
+    ) -> dict[str, Any]:
+        """Wrap unusable tool arguments, or drop them for control tools.
+
+        Work tools tolerate an opaque ``input`` passthrough, so they keep a
+        non-blank payload. Control tools drop it, because ``input`` is never a
+        field any of them declares: carrying it forward only disguises the loss
+        as a populated arguments object.
+
+        For ``final_answer`` dropping it is also load-bearing. That tool owns the
+        run's only user-visible exit, so a payload smuggled through as ``input``
+        would silently strip ``answer`` and finalize the run with nothing to
+        show; empty args instead let
+        ``_response_requires_tool_protocol_retry`` reject the call and spend the
+        pattern's one repair retry on it. ``send_message`` and
+        ``ask_user_question`` have no such guard - they degrade to an empty
+        message either way, exactly as they did before this branch existed.
+        """
+
+        if tool_name in self._control_tool_names():
+            return {}
+        if isinstance(payload, str) and not payload.strip():
+            # A blank payload carries nothing to preserve, so there is no
+            # opaque value for the `input` passthrough to forward.
+            return {}
+        return {"input": payload}
+
+    def _build_tool_schema(self, tool: Any) -> dict[str, Any]:
+        name = self._tool_name(tool)
+        description = self._compact_tool_description(self._tool_description(tool))
+        schema = self._compact_tool_json_schema(self._tool_json_schema(tool))
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            },
+        }
+
+    def _compact_tool_description(self, description: str) -> str:
+        """Trim redundant whitespace while preserving instructional structure."""
+        compacted_lines: list[str] = []
+        for line in description.splitlines():
+            compacted = " ".join(line.split())
+            if compacted:
+                compacted_lines.append(compacted)
+            elif compacted_lines and compacted_lines[-1]:
+                compacted_lines.append("")
+        while compacted_lines and not compacted_lines[-1]:
+            compacted_lines.pop()
+        return "\n".join(compacted_lines)
+
+    def _compact_tool_json_schema(
+        self, value: Any, *, named_schema_mapping: bool = False
+    ) -> Any:
+        """Remove presentation-only Pydantic metadata from provider schemas."""
+        if isinstance(value, list):
+            return [self._compact_tool_json_schema(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        compacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "title" and not named_schema_mapping:
+                continue
+            if named_schema_mapping:
+                compacted[key] = self._compact_tool_json_schema(item)
+            elif key == "description" and isinstance(item, str):
+                compacted[key] = self._compact_tool_description(item)
+            else:
+                compacted[key] = self._compact_tool_json_schema(
+                    item,
+                    named_schema_mapping=key
+                    in {"properties", "patternProperties", "$defs", "definitions"},
+                )
+        return compacted
+
+    def _builtin_tool_schemas(
+        self, *, can_lookup_output_files: bool = False
+    ) -> list[dict[str, Any]]:
+        schemas: list[dict[str, Any]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "final_answer",
+                    "description": (
+                        "Finish the current ReAct step and send the final answer to "
+                        "the user. Set outcome=completed only when every requested "
+                        "action and verification succeeded. Use outcome=partial when "
+                        "some useful work succeeded but the request remains "
+                        "unfinished, or outcome=blocked when no further progress is "
+                        "possible without user input or an external state change. "
+                        "Never mark an answer completed when it admits work is "
+                        "unfinished. Call this tool alone: never place it in the "
+                        "same response as any other tool call, and do not call "
+                        "additional tools after it. An answer written in the same "
+                        "response as a tool call cannot describe that tool's "
+                        "result. Set response_language to the target output "
+                        "language for this answer. "
+                        f"{final_answer_language_rule()}"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "response_language": {
+                                "type": "string",
+                                "description": REACT_RESPONSE_LANGUAGE_DESCRIPTION,
+                            },
+                            "answer": {
+                                "type": "string",
+                                "description": (
+                                    "Complete user-facing answer. It must be "
+                                    "non-empty and must match response_language. "
+                                    f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)} "
+                                    f"{final_answer_language_rule()}"
+                                ),
+                            },
+                            "outcome": {
+                                "type": "string",
+                                "enum": ["completed", "partial", "blocked"],
+                                "description": (
+                                    "Semantic outcome of the request. completed "
+                                    "means the whole request was carried out and "
+                                    "verified; partial means only part succeeded; "
+                                    "blocked means progress requires the user or an "
+                                    "external state change."
+                                ),
+                            },
+                        },
+                        "required": ["response_language", "answer", "outcome"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_message",
+                    "description": "Send a message to the user, optionally waiting for a response.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string"},
+                            "message_type": {
+                                "type": "string",
+                                "enum": [
+                                    "info",
+                                    "question",
+                                    "confirmation",
+                                    "progress",
+                                    "warning",
+                                ],
+                            },
+                            "expect_response": {"type": "boolean"},
+                            "visible": {"type": "boolean"},
+                        },
+                        "required": ["message"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ask_user_question",
+                    "description": (
+                        "Ask the user for structured input and pause execution until "
+                        "the user responds. Use this when the user explicitly asks "
+                        "to be consulted, or when execution cannot "
+                        "continue without missing user-provided information, such "
+                        "as a required file, URL, account, target object, permission, "
+                        "a fact-carrying value (one that asserts a real-world fact) "
+                        "for a tool argument that the user has not provided, "
+                        "or a choice between mutually exclusive actions with "
+                        "different side effects. Unless the user explicitly asks "
+                        "to be consulted, do not use it to confirm execution "
+                        "strategy, whether to search, whether to use memory, whether "
+                        "to apply formatting preferences, or whether to proceed with "
+                        "a sufficiently specified task; decide those yourself. A task "
+                        "is not sufficiently specified if carrying it out would "
+                        "require inventing a fact-carrying argument value the user "
+                        "has not provided. Do not request passwords, API keys, or "
+                        "access tokens in these fields. For missing data access, "
+                        "offer uploaded or pasted data where suitable; credentials "
+                        "belong in the application's connection settings, not this "
+                        "form. "
+                        + OPTIONS_REQUIRED_GUIDANCE
+                        + " "
+                        + CLARIFICATION_GUIDANCE
+                        + " default_value: "
+                        + SUGGESTED_VALUE_GUIDANCE
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string"},
+                            "interactions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {
+                                            "type": "string",
+                                            "enum": list(INTERACTION_TYPES),
+                                        },
+                                        "field": {"type": "string"},
+                                        "label": {"type": "string"},
+                                        "options": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "label": {"type": "string"},
+                                                    "value": {"type": "string"},
+                                                    "description": {"type": "string"},
+                                                    "action_type": {
+                                                        "type": "string",
+                                                        "enum": [
+                                                            "upload",
+                                                            "input_url",
+                                                            "none",
+                                                        ],
+                                                    },
+                                                },
+                                                "required": ["label", "value"],
+                                            },
+                                        },
+                                        "placeholder": {"type": "string"},
+                                        "default_value": {
+                                            "anyOf": [
+                                                {"type": "string"},
+                                                {"type": "number"},
+                                                {"type": "boolean"},
+                                                {"type": "null"},
+                                            ],
+                                            "description": SUGGESTED_VALUE_GUIDANCE,
+                                        },
+                                        "multiline": {"type": "boolean"},
+                                        "accept": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "multiple": {"type": "boolean"},
+                                    },
+                                    "required": ["type", "field", "label"],
+                                },
+                            },
+                        },
+                        "required": ["message", "interactions"],
+                    },
+                },
+            },
+        ]
+        if not self.user_interaction_enabled:
+            return [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name")
+                not in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ]
+        return schemas
+
+    def _tool_schemas_with_builtin_controls(
+        self,
+        tools: list[Any],
+    ) -> list[dict[str, Any]]:
+        control_tool_names = self._control_tool_names()
+        external_tools = [
+            self._build_tool_schema(tool)
+            for tool in tools
+            if (name := self._tool_name(tool)) not in control_tool_names
+            # Unconditional: this function only sees the static tool list
+            # (the loop builds it once, before the first iteration),
+            # so it cannot know whether the run has stored anything yet.
+            # _tool_schemas_with_spill_read adds the reader back once the
+            # registry is non-empty -- a dynamic fact this function has no
+            # way to observe.
+            and name != SPILL_READ_TOOL_NAME
+        ]
+        can_lookup_output_files = any(
+            schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
+            for schema in external_tools
+        )
+        return [
+            *external_tools,
+            *self._builtin_tool_schemas(
+                can_lookup_output_files=can_lookup_output_files
+            ),
+        ]
+
+    def _spilled_records(self, context: Any) -> Any:
+        """The records of this execution's stored results, possibly empty.
+
+        Read-only on purpose: it goes through get_component and treats a
+        missing component as empty. The context's spilled_results property
+        creates an empty registry component the first time it is read, and
+        this runs on every iteration, so reading through that property would
+        add an empty spilled_results entry to every checkpoint of every run
+        that never stored anything.
+        """
+        get_component = getattr(context, "get_component", None)
+        component = (
+            get_component("spilled_results") if callable(get_component) else None
+        )
+        return getattr(component, "records", ()) or ()
+
+    def _spilled_paths(self, context: Any) -> frozenset[str]:
+        """Exact relative paths this execution stored results into."""
+        return frozenset(
+            str(record["relative_path"])
+            for record in self._spilled_records(context)
+            if isinstance(record, dict) and isinstance(record.get("relative_path"), str)
+        )
+
+    def _forced_answer_read_instruction(self, context: Any) -> str:
+        """The forced-turn prompt sentences for a turn that offers reads.
+
+        The stored-result list is the compaction-style notice, whose header
+        says what the list is and ends with "Stored results:".
+        """
+        remaining = FORCED_ANSWER_READ_BUDGET - self.forced_answer_reads_used
+        notice = render_spill_notice(self._spilled_records(context), style="compaction")
+        return (
+            "You may call read_tool_result to read the stored results listed "
+            f"below before answering, at most {remaining} more time(s) before "
+            "the final answer. start and "
+            "end are 1-based item numbers for that file. Read in one turn and "
+            "answer in the next: a response that calls read_tool_result and "
+            "final_answer together loses the answer. Copy a path below exactly; "
+            "a path that is not listed does not work and is counted against a "
+            "separate small allowance.\n"
+            f"{notice}\n"
+            "If read_tool_result reports a result is no longer available, treat "
+            "it as unavailable and do not reconstruct it. State in your answer "
+            "which items you did not read. "
+        )
+
+    def _tool_schemas_with_spill_read(
+        self,
+        base_schemas: list[dict[str, Any]],
+        spill_read_schema: dict[str, Any] | None,
+        context: Any,
+    ) -> list[dict[str, Any]]:
+        """Add the stored-result reader once this run has actually stored one.
+
+        base_schemas never lists the reader: _tool_schemas_with_builtin_controls
+        leaves it out whatever the registry holds, and the loop builds
+        base_schemas once, before the first iteration. This runs on every
+        iteration instead, and when a tool-not-found hint is built, so both
+        see the spill that just happened. spill_read_schema is None when there
+        is no reader tool (the loop also passes None under tool_choice
+        "none"), and base_schemas then comes back unchanged whatever the
+        registry holds.
+        """
+        if spill_read_schema is None or not self._spilled_paths(context):
+            return base_schemas  # byte-identical to the baseline surface
+        return [*base_schemas, spill_read_schema]
+
+    def _control_tool_names(self) -> set[str]:
+        return set(CONTROL_TOOL_NAMES)
+
+    def _tool_message_source(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        """Return message attribution, without exposing tool arguments."""
+        source = {
+            "tool_call_id": tool_call["id"],
+            "tool_name": tool_call["name"],
+        }
+        if tool_call.get("invocation_id"):
+            source["invocation_id"] = tool_call["invocation_id"]
+        for key in (
+            "step_id",
+            "dag_step_id",
+            "turn_id",
+            "assistant_message_id",
+            "tool_attempt_id",
+        ):
+            if tool_call.get(key):
+                source[key] = tool_call[key]
+        return source
+
+    async def _handle_control_tool(
+        self,
+        tool_call: dict[str, Any],
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        *,
+        source: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        name = tool_call["name"]
+        args = tool_call.get("args", {})
+
+        if (
+            not self.user_interaction_enabled
+            and name in USER_INTERACTION_CONTROL_TOOL_NAMES
+        ):
+            error = f"Control tool '{name}' is disabled for this execution."
+            logger.warning(
+                "ReAct rejected disabled user-interaction control tool. "
+                "tool=%s tool_call_id=%s",
+                name,
+                tool_call.get("id"),
+            )
+            failure = {"success": False, "status": "error", "error": error}
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                result=failure,
+                error=error,
+            )
+            context.add_tool_result(
+                tool_name=name,
+                result=failure,
+                tool_call_id=tool_call.get("id"),
+                invocation_id=self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
+            )
+            remaining = [
+                pending
+                for pending in self.pending_tool_calls
+                if pending is not tool_call
+            ]
+            self.pending_tool_calls = [tool_call]
+            self._cancel_tool_calls(
+                remaining,
+                context,
+                reason=f"Discarded because control tool '{name}' is disabled.",
+            )
+            self.status = "thinking"
+            self.force_final_answer_next = True
+            return None
+
+        if name == "final_answer":
+            answer = self._final_answer_text(args)
+            if not answer.strip():
+                self._reject_empty_final_answer(tool_call, context)
+                return None
+            outcome = self._final_answer_outcome(args.get("outcome"))
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result={"answer": answer, "outcome": outcome},
+            )
+            self.status = "completed"
+            context.add_tool_result(
+                tool_name=name,
+                result={"answer": answer, "outcome": outcome},
+                tool_call_id=tool_call.get("id"),
+                invocation_id=self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
+            )
+            # Unconditional: the empty-answer rejection above is the only way
+            # into finalization, so an answer here always has text.
+            context.add_assistant_message(answer)
+            return await self._finalize_outcome(
+                context=context,
+                runtime=runtime,
+                response=answer,
+                outcome=outcome,
+            )
+
+        if name == "send_message":
+            message = str(args.get("message", ""))
+            expect_response = bool(args.get("expect_response", False))
+            message_type = str(args.get("message_type", "info"))
+            visible = bool(args.get("visible", True))
+            interactions: list[dict[str, Any]] = []
+            if expect_response:
+                outbound_message, interactions = await self._send_waiting_message(
+                    runtime=runtime,
+                    message=message,
+                    message_type=message_type,
+                    interactions=[],
+                    metadata=source,
+                    visible=visible,
+                )
+            else:
+                outbound_message = await runtime.send_message(
+                    message=message,
+                    message_type=message_type,
+                    expect_response=False,
+                    visible=visible,
+                    metadata=source,
+                )
+            ledger_result: dict[str, Any] = {
+                "message": message,
+                "expect_response": expect_response,
+                "visible": visible,
+            }
+            if expect_response:
+                ledger_result["interactions"] = interactions
+            self._record_tool_call(tool_call, status="completed", result=ledger_result)
+            if expect_response:
+                self.status = "waiting_for_user"
+                # No ``interactions`` in the tool result: the model called a
+                # tool that has no such parameter, and echoing a form back
+                # would read as one it produced.
+                context.add_tool_result(
+                    tool_name=name,
+                    result={
+                        "status": "waiting_for_user",
+                        "message": message,
+                        "message_type": message_type,
+                    },
+                    tool_call_id=tool_call.get("id"),
+                    invocation_id=self._normalized_invocation_id(
+                        tool_call.get("invocation_id")
+                    ),
+                )
+                self.waiting_for_user_request = {
+                    "event_id": outbound_message["event_id"],
+                    "tool_call_id": tool_call.get("id"),
+                    "invocation_id": self._normalized_invocation_id(
+                        tool_call.get("invocation_id")
+                    ),
+                    "tool_name": name,
+                    "message": message,
+                    "message_type": message_type,
+                    "interactions": interactions,
+                    "task_text": self.task_text,
+                    "message_count": len(getattr(context, "messages", [])),
+                }
+                return {
+                    "success": False,
+                    "status": self.status,
+                    "message": message,
+                    "message_type": message_type,
+                    "interactions": interactions,
+                    "context": context,
+                    "clarification_draft": draft_from_waiting_request(
+                        self.waiting_for_user_request,
+                        execution_id=getattr(context, "execution_id", None),
+                        step_id=None,
+                    ),
+                }
+            context.add_tool_result(
+                tool_name=name,
+                result={"message": message, "status": "sent"},
+                tool_call_id=tool_call.get("id"),
+                invocation_id=self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
+            )
+            return {
+                "success": True,
+                "status": "message_sent",
+                "output": message,
+                "response": message,
+                "message": message,
+            }
+
+        if name == "ask_user_question":
+            message = str(args.get("message", ""))
+            interactions = _normalize_ask_user_interactions(
+                args.get("interactions", [])
+            )
+            # Same dedup shape _pause_for_tool_results runs on the multi-tool
+            # path (append _2, _3 to a repeated base, first occupant keeps
+            # its own name), the only legitimate difference being scope:
+            # used_fields here spans only this one call's own interactions,
+            # never a sibling tool's, because this branch has no sibling
+            # tool to collide with.
+            used_fields: set[str] = set()
+            deduplicated_interactions: list[dict[str, Any]] = []
+            for interaction in interactions:
+                item = dict(interaction)
+                item["field"] = _unique_field(
+                    str(item.get("field") or "response"), used_fields
+                )
+                deduplicated_interactions.append(item)
+            deduplicated_interactions, degraded_fields = degrade_options_less_pickers(
+                deduplicated_interactions
+            )
+            # Absent, not empty, when nothing was degraded: the key is a
+            # signal, and a model that sees it on every call learns to
+            # ignore it.
+            degradation: dict[str, Any] = (
+                {"degraded_fields": degraded_fields, "note": DEGRADED_FIELDS_NOTE}
+                if degraded_fields
+                else {}
+            )
+            outbound_message, interactions = await self._send_waiting_message(
+                runtime=runtime,
+                message=message,
+                message_type="question",
+                interactions=deduplicated_interactions,
+                metadata=source,
+            )
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result={
+                    "message": message,
+                    "expect_response": True,
+                    "interactions": interactions,
+                    **degradation,
+                },
+            )
+            self.status = "waiting_for_user"
+            context.add_tool_result(
+                tool_name=name,
+                result={
+                    "status": "waiting_for_user",
+                    "message": message,
+                    "message_type": "question",
+                    # Pre-append copy: what the model supplied is its own output
+                    # and echoes back; an engine-appended field would read as
+                    # one it authored too. A degraded field is the model's own
+                    # (same name), so it does echo -- under the type the user
+                    # was actually shown.
+                    "interactions": deduplicated_interactions,
+                    **degradation,
+                },
+                tool_call_id=tool_call.get("id"),
+                invocation_id=self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
+            )
+            self.waiting_for_user_request = {
+                "event_id": outbound_message["event_id"],
+                "tool_call_id": tool_call.get("id"),
+                "invocation_id": self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
+                "tool_name": name,
+                "message": message,
+                "message_type": "question",
+                "interactions": interactions,
+                "task_text": self.task_text,
+                "message_count": len(getattr(context, "messages", [])),
+                # A form, for the form-answer-continuation text (react.py's
+                # _form_answer_decision / execution.py's readers), is the
+                # model's own question having at least one answerable field
+                # whose type is neither confirm nor file_upload (the rule
+                # stated at _NON_FORM_ANSWERABLE_TYPES). Computed
+                # from the model-authored, pre-append list -- deduplicated_interactions,
+                # not the ``interactions`` _send_waiting_message may have
+                # appended a default field to -- so an engine-appended
+                # placeholder field never manufactures a form on its own,
+                # and only this branch (ask_user_question) ever writes this
+                # key: send_message(expect_response=True) and a tool's own
+                # waiting request have no model-authored interactions to
+                # judge in the first place.
+                "form": any(
+                    _is_answerable(interaction)
+                    and interaction.get("type") not in _NON_FORM_ANSWERABLE_TYPES
+                    for interaction in deduplicated_interactions
+                ),
+            }
+            return {
+                "success": False,
+                "status": self.status,
+                "message": message,
+                "message_type": "question",
+                "interactions": interactions,
+                "context": context,
+                "clarification_draft": draft_from_waiting_request(
+                    self.waiting_for_user_request,
+                    execution_id=getattr(context, "execution_id", None),
+                    step_id=None,
+                ),
+            }
+
+        return None
+
+    async def _send_waiting_message(
+        self,
+        *,
+        runtime: PatternRuntime,
+        message: str,
+        message_type: str,
+        interactions: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        visible: bool = True,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Publish a message that suspends the run, and return what it carried.
+
+        The only ``expect_response=True`` producer, so the "at least one
+        answerable field" guarantee is made once. Not pushed into
+        ``runtime.send_message``, which also serves non-suspending messages
+        that must stay field-free, and whose callers need the published list
+        back to store on the waiting request.
+
+        Appended, never substituted for the list: an entry this check cannot
+        answer can still be a real control -- ``connect_apps`` is one the
+        frontend renders, reachable tool-authored or off-schema. An
+        options-less picker no longer reaches here from either call site
+        (``degrade_options_less_pickers``); if one did, its ``label`` would
+        be the only copy of the question text the run has, which is why this
+        appends rather than replaces.
+        """
+
+        published = list(interactions)
+        if not any(_is_answerable(item) for item in published):
+            appended = dict(DEFAULT_WAITING_INTERACTION)
+            appended["field"] = _unique_field(
+                str(appended["field"]),
+                {
+                    str(item.get("field") or "")
+                    for item in published
+                    if isinstance(item, dict)
+                },
+            )
+            published.append(appended)
+        outbound_message = await runtime.send_message(
+            message=message,
+            message_type=message_type,
+            expect_response=True,
+            visible=visible,
+            metadata={**metadata, "interactions": published},
+        )
+        return outbound_message, published
+
+    def _reject_empty_final_answer(
+        self, tool_call: dict[str, Any], context: Any
+    ) -> None:
+        """Refuse to finalize on an empty ``final_answer`` and re-request one.
+
+        For a batch whose only calls are control tools,
+        ``_response_requires_tool_protocol_retry`` still catches this on the
+        turn the model produces it, discarding the whole response before it is
+        recorded. For a batch that also carries a work tool, the fresh path
+        strips the ``final_answer`` call regardless of whether its answer is
+        empty, so the work tool runs and this handler never sees that batch
+        either. This guard is left covering the one path that reaches the
+        handler without passing through response normalization at all — a
+        checkpoint resume that restores ``pending_tool_calls`` verbatim.
+
+        Returning ``None`` keeps the run in the loop; ``force_final_answer_next``
+        makes the next turn re-request ``final_answer``, and if that turn is empty
+        too the normalization guard fails the run instead of looping.
+
+        Two deliberate differences from the fresh-turn path.
+
+        Sibling calls still pending are discarded regardless of order, because
+        by the time a resume reaches this point the assistant envelope for the
+        batch is already recorded in history (see
+        ``_ensure_pending_tool_call_envelope``), so an undiscarded sibling
+        would be left queued with no result of its own. This diverges from the
+        fresh path, which now runs the work tool instead of discarding it: the
+        fresh path can still drop ``final_answer`` before anything is
+        recorded, while a resumed batch can only cancel calls that are already
+        committed to history.
+
+        And the next turn is forced to ``final_answer`` alone, where the fresh
+        path restores the full tool set. That bounds the run: a second empty
+        answer ends it as ``invalid_tool_protocol`` rather than looping. It does
+        not prevent tool re-execution outright - if the forced turn calls a
+        tool other than ``final_answer`` or, while this run holds stored
+        results, ``read_tool_result``, ``_requires_full_tool_set_recovery``
+        restores the full set and clears the flag, so a discarded work tool
+        can be re-invoked on that turn.
+        """
+
+        logger.warning(
+            "ReAct refusing to finalize on final_answer with no answer text; "
+            "re-requesting a final answer. tool_call_id=%s arg_keys=%s",
+            tool_call.get("id"),
+            sorted(self._tool_call_args_dict(tool_call), key=str),
+        )
+        error = (
+            "final_answer was called with an empty answer, so the user received "
+            "nothing. Call final_answer again with the complete user-facing "
+            "response in its answer field."
+        )
+        # Carry the classification keys ``tool_result_succeeded`` reads, so this
+        # failure is not read back as a success, and record the same shape in the
+        # ledger as the cancelled siblings below.
+        failure = {"success": False, "status": "error", "error": error}
+        self._record_tool_call(tool_call, status="failed", result=failure, error=error)
+        context.add_tool_result(
+            tool_name="final_answer",
+            result=failure,
+            tool_call_id=tool_call.get("id"),
+            invocation_id=self._normalized_invocation_id(
+                tool_call.get("invocation_id")
+            ),
+        )
+        # Leave only the rejected call for the caller to pop, and close out the
+        # rest of the batch so no unexecuted call is left without a result.
+        # Selected by identity rather than position: the caller happens to pass
+        # the head of the queue today, but nothing here depends on that.
+        remaining = [
+            pending for pending in self.pending_tool_calls if pending is not tool_call
+        ]
+        self.pending_tool_calls = [tool_call]
+        self._cancel_tool_calls(
+            remaining,
+            context,
+            reason=(
+                "Discarded because final_answer was called with an empty answer; "
+                "the agent will produce a final answer instead."
+            ),
+        )
+        self.status = "thinking"
+        self.force_final_answer_next = True
+
+    def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
+        """Whether ``name`` may run concurrently with other safe tools.
+
+        The metadata flag is also the tool author's idempotency declaration:
+        an interrupted call can be retried on resume when cancellation races
+        with an external side effect. Unknown tools and tools without the flag
+        are conservatively kept serial.
+        """
+        try:
+            tool = self._find_tool(name, tools)
+        except ValueError:
+            return False
+        metadata = getattr(tool, "metadata", None)
+        return bool(getattr(metadata, "concurrency_safe", False))
+
+    def _next_segment(
+        self, pending: list[dict[str, Any]], tools: list[Any]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Slice the next consecutive segment off the front of ``pending``.
+
+        Returns ``(segment, kind)`` where ``kind`` is one of:
+        - ``"control"``: a single control tool (final_answer / send_message /
+          ask_user_question), which always owns its segment;
+        - ``"serial"``: a single tool executed on its own (a non-safe tool, any
+          tool when the parallel flag is off, or a lone safe tool);
+        - ``"concurrent"``: two or more consecutive concurrency-safe tools.
+        """
+        control_tool_names = self._control_tool_names()
+        first = pending[0]
+        if first["name"] in control_tool_names:
+            return [first], "control"
+        if not self.tool_parallel_enabled:
+            return [first], "serial"
+        if not self._tool_is_concurrency_safe(first["name"], tools):
+            return [first], "serial"
+
+        segment: list[dict[str, Any]] = []
+        for tool_call in pending:
+            name = tool_call["name"]
+            if name in control_tool_names:
+                break
+            if not self._tool_is_concurrency_safe(name, tools):
+                break
+            segment.append(tool_call)
+            # Cap a batch at the concurrency width. The loop re-checks the
+            # interrupt before each segment, so a mid-turn interrupt is honored
+            # after at most one wave instead of after every safe call the model
+            # emitted. Tradeoff: a run longer than the width is split into
+            # successive gather() barriers rather than one continuously
+            # pipelined batch, so under skewed tool latencies a straggler in one
+            # wave can briefly idle the next wave's slots. Acceptable for v1;
+            # decouple batch size from the semaphore if profiling shows it costs.
+            if len(segment) >= self.tool_max_concurrency:
+                break
+        # A lone safe tool degrades to serial: no gather/Semaphore overhead and
+        # byte-for-byte identical behavior to the current serial path.
+        if len(segment) == 1:
+            return segment, "serial"
+        return segment, "concurrent"
+
+    def _backfill_result(
+        self, tool_call: dict[str, Any], result: Any, context: Any
+    ) -> None:
+        """Record one tool result into the context and drop its cached content.
+
+        Shared by the serial and concurrent paths so message-history ordering
+        is produced the same way regardless of execution mode.
+        """
+        context.add_tool_result(
+            tool_name=tool_call["name"],
+            result=result,
+            tool_call_id=tool_call.get("id"),
+            invocation_id=self._normalized_invocation_id(
+                tool_call.get("invocation_id")
+            ),
+        )
+        self._forget_tool_call_content(tool_call)
+
+    def _discard_pending_tool_plan_after_pause(
+        self, context: Any, *, reason: str | None = None
+    ) -> None:
+        """Close unexecuted calls so resume always starts with a fresh LLM plan."""
+
+        discarded_calls = self.pending_tool_calls
+        self.pending_tool_calls = []
+        self.repeated_tool_decision = None
+        self._release_forced_answer()
+        self._cancel_tool_calls(
+            discarded_calls,
+            context,
+            reason=reason
+            or (
+                "Discarded because an earlier tool requires user input; "
+                "the agent will replan after the user responds."
+            ),
+        )
+
+    def _cancel_tool_calls(
+        self, tool_calls: list[dict[str, Any]], context: Any, *, reason: str
+    ) -> None:
+        """Close calls that will never run, one result each.
+
+        Preserves I2 (one result per ``tool_call_id``) for abandoned calls, so a
+        discarded batch cannot leave a tool call dangling without a result.
+        """
+
+        for tool_call in tool_calls:
+            result = {"success": False, "status": "cancelled", "error": reason}
+            self._backfill_result(tool_call, result, context)
+            self._record_tool_call(
+                tool_call,
+                status="cancelled",
+                result=result,
+            )
+
+    def _refuse_forced_answer_read(
+        self, tool_call: dict[str, Any], refusal: str, context: Any
+    ) -> None:
+        """Close a forced-turn read the read policy refused.
+
+        Closed the way _cancel_tool_calls closes a call that will never run:
+        one failed result the model reads, carrying the refusal text in
+        error, and one ledger record, here with status "refused". No tool
+        start or end event is sent, as for a cancelled call: on_tool_start
+        is where a tool invocation is metered, and this read never ran.
+        """
+        result = {"success": False, "status": "refused", "error": refusal}
+        self._backfill_result(tool_call, result, context)
+        self._record_tool_call(tool_call, status="refused", result=result)
+
+    async def _pause_for_tool_results(
+        self,
+        *,
+        waiting_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any]:
+        """Publish tool-originated questions and checkpoint the suspended run."""
+
+        if not self.user_interaction_enabled:
+            tool_names = sorted(
+                {
+                    str(tool_call.get("name") or "unknown")
+                    for tool_call, _ in waiting_pairs
+                }
+            )
+            error = (
+                "Tool-requested user interaction is disabled for this execution: "
+                + ", ".join(tool_names)
+            )
+            logger.warning("ReAct rejected tool-requested user interaction: %s", error)
+            self.status = "failed"
+            self.waiting_for_user_request = None
+            return {
+                "success": False,
+                "status": "failed",
+                "error": error,
+                "context": context,
+            }
+
+        requests: list[dict[str, Any]] = []
+        interactions: list[dict[str, Any]] = []
+        used_fields: set[str] = set()
+        for tool_call, result in waiting_pairs:
+            request_interactions = _normalize_ask_user_interactions(
+                result.get("interactions", [])
+            )
+            deduplicated_request_interactions: list[dict[str, Any]] = []
+            for interaction in request_interactions:
+                item = dict(interaction)
+                item["field"] = _unique_field(
+                    str(item.get("field") or "response"), used_fields
+                )
+                deduplicated_request_interactions.append(item)
+            # Tool-authored, so there is no model to hand the degraded names
+            # back to; the warning inside is the only signal. Degraded before
+            # the per-request list is recorded on ``requests`` below, so the
+            # structured row (built from those lists) and the published list
+            # agree on what was shown.
+            deduplicated_request_interactions, _ = degrade_options_less_pickers(
+                deduplicated_request_interactions
+            )
+            interactions.extend(deduplicated_request_interactions)
+
+            requests.append(
+                {
+                    "tool_call_id": str(tool_call.get("id") or ""),
+                    "invocation_id": self._normalized_invocation_id(
+                        tool_call.get("invocation_id")
+                    ),
+                    "tool_name": str(tool_call.get("name") or ""),
+                    "interaction_id": str(
+                        result.get("interaction_id") or tool_call.get("id") or ""
+                    ),
+                    "message": str(
+                        result.get("message")
+                        or result.get("error")
+                        or "This tool requires user input before it can continue."
+                    ),
+                    "message_type": str(result.get("message_type") or "question"),
+                    "interactions": deduplicated_request_interactions,
+                }
+            )
+
+        if len(requests) == 1:
+            message = requests[0]["message"]
+            message_type = requests[0]["message_type"]
+        else:
+            message = "Multiple tools need your input before the task can continue:\n\n"
+            message += "\n".join(
+                f"- {request['tool_name']}: {request['message']}"
+                for request in requests
+            )
+            message_type = "question"
+
+        outbound_message, interactions = await self._send_waiting_message(
+            runtime=runtime,
+            message=message,
+            message_type=message_type,
+            interactions=interactions,
+            metadata={
+                "tool_calls": [
+                    self._tool_message_source(
+                        self._with_runtime_turn_id(
+                            self._with_runtime_step(tool_call, runtime), runtime
+                        )
+                    )
+                    for tool_call, _ in waiting_pairs
+                ],
+            },
+        )
+        self.status = "waiting_for_user"
+        self.waiting_for_user_request = {
+            "event_id": outbound_message["event_id"],
+            "kind": "tool_waiting_for_user",
+            "requests": requests,
+            "message": message,
+            "message_type": message_type,
+            "interactions": interactions,
+            "task_text": self.task_text,
+            "message_count": len(getattr(context, "messages", [])),
+        }
+        waiting_result = {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": message,
+            "message_type": message_type,
+            "interactions": interactions,
+            "context": context,
+            "clarification_draft": draft_from_waiting_request(
+                self.waiting_for_user_request,
+                execution_id=getattr(context, "execution_id", None),
+                step_id=None,
+            ),
+        }
+        await runtime.checkpoint(
+            "waiting_for_user",
+            context=context,
+            pattern=self,
+            metadata={
+                "waiting_for_user_request": self.waiting_for_user_request,
+            },
+        )
+        return waiting_result
+
+    async def _run_concurrent_batch(
+        self,
+        batch: list[dict[str, Any]],
+        tools: list[Any],
+        runtime: PatternRuntime,
+        context: Any,
+    ) -> list[Any]:
+        """Run a segment of concurrency-safe tool calls and back-fill in order.
+
+        Tools run under a Semaphore via ``asyncio.gather`` (results stay aligned
+        to ``batch`` regardless of completion order, satisfying I1). Results are
+        back-filled serially in the main coroutine after all tools finish, so
+        message-history order is deterministic (I1) and every call gets exactly
+        one result (I2). ``_execute_tool_safely`` already turns tool exceptions
+        into error dicts, so any real exception captured by
+        ``return_exceptions=True`` is an infra-callback/unexpected failure and is
+        re-raised to halt the turn exactly like the serial path (I5).
+        """
+        # Prepare identity before scheduling so back-fill, ledger ordering, and
+        # pending reconciliation all observe the exact objects that execution
+        # records. Reserve generated ids across the whole batch before any task
+        # starts, including legacy id-less calls restored from checkpoints.
+        reserved_ids: set[str] = set()
+        batch = [
+            self._prepare_tool_call_identity(
+                tool_call,
+                reserved_ids=reserved_ids,
+            )
+            for tool_call in batch
+        ]
+        semaphore = asyncio.Semaphore(self.tool_max_concurrency)
+
+        async def _guarded(tool_call: dict[str, Any]) -> Any:
+            async with semaphore:
+                return await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
+
+        raw_results = await asyncio.gather(
+            *(_guarded(tool_call) for tool_call in batch),
+            return_exceptions=True,
+        )
+
+        # Tool-level failures are already converted to error dicts inside
+        # _execute_tool_safely. Reconcile the successful calls before propagating
+        # any real exception so a mixed infra-failure/interrupt batch cannot
+        # replay work that already completed. Keep exceptional calls pending by
+        # their object identity in this batch: provider-supplied ids are not
+        # guaranteed unique, so id-based filtering could accidentally drop a
+        # different call.
+        infra_error = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, BaseException)
+                and not isinstance(result, ToolCallInterrupted)
+            ),
+            None,
+        )
+        interrupted = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, ToolCallInterrupted)
+            ),
+            None,
+        )
+        if infra_error is not None or interrupted is not None:
+            completed_call_objects: set[int] = set()
+            for tool_call, result in zip(batch, raw_results):
+                if isinstance(result, BaseException):
+                    continue
+                self._backfill_result(tool_call, result, context)
+                completed_call_objects.add(id(tool_call))
+            self._reorder_ledger_for_batch(batch)
+            self.pending_tool_calls = [
+                tool_call
+                for tool_call in self.pending_tool_calls
+                if id(tool_call) not in completed_call_objects
+            ]
+            # Preserve the serial path's infra-error priority while keeping the
+            # ledger, context, and pending queue consistent for diagnostics or
+            # an explicit retry.
+            if infra_error is not None:
+                raise infra_error
+            assert interrupted is not None
+            raise interrupted
+
+        for tool_call, result in zip(batch, raw_results):
+            self._backfill_result(tool_call, result, context)
+        self._reorder_ledger_for_batch(batch)
+        return list(raw_results)
+
+    def _reorder_ledger_for_batch(self, batch: list[dict[str, Any]]) -> None:
+        """Reassert input order for this batch's ledger records (I3).
+
+        Concurrent execution can interleave ``_record_tool_call`` writes, so the
+        batch's records may land out of order in the insertion-ordered ledger.
+        ``_consecutive_*_count`` walk the provider-id index in reverse insertion
+        order, so we pop this batch's entries and re-insert them at the tail in
+        the original tool-call order. Records keep their latest (final) state;
+        only their relative position is restored.
+
+        The index replays the pre-identity pop/re-insert by provider id
+        verbatim, which also moves an id reused from an earlier step to the
+        tail. The exact rows are reordered by their own ledger keys.
+        """
+        tool_call_ids = [str(tool_call.get("id") or "") for tool_call in batch]
+        index_keys = {
+            tool_call_id: self.tool_call_id_index.pop(tool_call_id)
+            for tool_call_id in tool_call_ids
+            if tool_call_id in self.tool_call_id_index
+        }
+        for tool_call_id in tool_call_ids:
+            key = index_keys.get(tool_call_id)
+            if key is not None:
+                self.tool_call_id_index[tool_call_id] = key
+
+        ledger_keys: list[str] = []
+        for tool_call in batch:
+            record = self._find_tool_record(
+                tool_call_id=str(tool_call.get("id") or ""),
+                invocation_id=self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
+            )
+            if record is None:
+                continue
+            key = self._ledger_key(record)
+            if key not in ledger_keys:
+                ledger_keys.append(key)
+        records = {key: self.tool_ledger.pop(key) for key in ledger_keys}
+        self.tool_ledger.update(records)
+
+    def _disabled_control_tool_index(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        user_interaction_enabled: bool,
+    ) -> int | None:
+        """Index of the first disabled user-interaction control tool, if any.
+
+        Shared by ``_execute_pending_tool_calls`` (which cancels every call
+        ahead of that index) and ``_close_streamed_answer`` (which must treat
+        a batch the same way whether or not its first call has already run).
+        Both callers pass their own ``user_interaction_enabled`` state rather
+        than this reading ``self`` directly, so the two call sites cannot
+        silently drift onto different predicates.
+        """
+
+        if user_interaction_enabled:
+            return None
+        return next(
+            (
+                index
+                for index, pending in enumerate(tool_calls)
+                if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ),
+            None,
+        )
+
+    async def _execute_pending_tool_calls(
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any] | None:
+        # Normalize the internal queue once before selecting any execution path.
+        # Fresh model calls already carry identity/timing from
+        # ``_normalize_tool_calls``; legacy checkpoint calls are copied with
+        # explicit ``None`` values and retain provider-id fallback semantics.
+        # Every downstream path therefore uses the same prepared objects while
+        # caller/checkpoint-owned dictionaries remain untouched.
+        reserved_ids: set[str] = set()
+        self.pending_tool_calls = [
+            self._prepare_tool_call_identity(
+                tool_call,
+                reserved_ids=reserved_ids,
+            )
+            for tool_call in self.pending_tool_calls
+        ]
+        if not self.user_interaction_enabled:
+            disabled_index = self._disabled_control_tool_index(
+                self.pending_tool_calls,
+                user_interaction_enabled=self.user_interaction_enabled,
+            )
+            if disabled_index is not None:
+                preceding = self.pending_tool_calls[:disabled_index]
+                disabled_name = self.pending_tool_calls[disabled_index].get("name")
+                self.pending_tool_calls = self.pending_tool_calls[disabled_index:]
+                self._cancel_tool_calls(
+                    preceding,
+                    context,
+                    reason=(
+                        "Discarded because the response also called disabled "
+                        f"control tool '{disabled_name}'."
+                    ),
+                )
+        successful_tool_result = False
+        while self.pending_tool_calls:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="before_tool",
+            )
+            if interrupted is not None:
+                return interrupted
+
+            segment, kind = self._next_segment(self.pending_tool_calls, tools)
+            if self._forced_answer_read_open:
+                admitted, refused = self._apply_forced_answer_read_policy(
+                    segment, context
+                )
+                for refused_call, refusal in refused:
+                    self._refuse_forced_answer_read(refused_call, refusal, context)
+                if refused:
+                    refused_ids = {id(call) for call, _ in refused}
+                    self.pending_tool_calls = [
+                        call
+                        for call in self.pending_tool_calls
+                        if id(call) not in refused_ids
+                    ]
+                if not admitted:
+                    continue
+                if len(admitted) < len(segment):
+                    # The rest of the segment stays pending for the next pass;
+                    # re-slicing keeps the segment kind right for what is left.
+                    segment, kind = self._next_segment(admitted, tools)
+
+            if kind == "control":
+                tool_call = segment[0]
+                control_result: dict[str, Any] | None = await self._execute_tool_safely(
+                    tool_call,
+                    tools,
+                    runtime,
+                    context=context,
+                    llm=llm,
+                )
+                self.pending_tool_calls = self.pending_tool_calls[1:]
+                self._forget_tool_call_content(tool_call)
+                control_waits_for_user = (
+                    control_result is not None
+                    and control_result.get("status") == "waiting_for_user"
+                )
+                if control_waits_for_user:
+                    # Discard before the checkpoint below persists this state:
+                    # a resume restores pending_tool_calls verbatim, and a
+                    # sibling left in it replays without a fresh LLM plan --
+                    # a stale bundled final_answer even completes the resumed
+                    # turn with zero iterations (#2216). The cancellations
+                    # append tool results, so refresh the waiting request's
+                    # message watermark the way the tool-pause path snapshots
+                    # it after cancelling, keeping an answer-less resume
+                    # parked.
+                    self._discard_pending_tool_plan_after_pause(context)
+                    if self.waiting_for_user_request is not None:
+                        # Rebind rather than mutate: get_state() hands this
+                        # dict out by reference, so a fresh dict keeps any
+                        # state captured earlier from aliasing this update.
+                        # get_state() relies on this being the only way this
+                        # value ever changes, and skips copying it.
+                        self.waiting_for_user_request = {
+                            **self.waiting_for_user_request,
+                            "message_count": len(getattr(context, "messages", [])),
+                        }
+                        if control_result is not None:
+                            # The draft returned by _handle_control_tool was
+                            # built from the pre-discard message count; rebuild
+                            # it so turn_marker matches what an answer-less
+                            # resume re-derives from the persisted request
+                            # (clarification.py documents turn_marker as
+                            # stable for the lifetime of the waiting turn).
+                            control_result["clarification_draft"] = (
+                                draft_from_waiting_request(
+                                    self.waiting_for_user_request,
+                                    execution_id=getattr(context, "execution_id", None),
+                                    step_id=None,
+                                )
+                            )
+                await runtime.checkpoint(
+                    str(control_result.get("status", "control_tool"))
+                    if control_result is not None
+                    else "control_tool",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_call": tool_call},
+                )
+                if control_result is not None:
+                    if control_result.get("status") == "completed":
+                        self.pending_tool_calls = []
+                        return control_result
+                    if control_waits_for_user:
+                        return control_result
+                continue
+
+            if kind == "serial":
+                tool_call = segment[0]
+                await runtime.checkpoint(
+                    "before_tool",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_call": tool_call},
+                )
+                result = await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
+                self._backfill_result(tool_call, result, context)
+                self.pending_tool_calls = self.pending_tool_calls[1:]
+                if tool_result_waits_for_user(result):
+                    assert isinstance(result, dict)
+                    self._discard_pending_tool_plan_after_pause(context)
+                    return await self._pause_for_tool_results(
+                        waiting_pairs=[(tool_call, result)],
+                        context=context,
+                        runtime=runtime,
+                    )
+                await runtime.checkpoint(
+                    "after_tool",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_call": tool_call},
+                )
+                results = [result]
+            else:  # kind == "concurrent"
+                await runtime.checkpoint(
+                    "before_tool_batch",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_calls": segment},
+                )
+                results = await self._run_concurrent_batch(
+                    segment, tools, runtime, context
+                )
+                self.pending_tool_calls = self.pending_tool_calls[len(segment) :]
+                waiting_pairs = [
+                    (waiting_call, waiting_result)
+                    for waiting_call, waiting_result in zip(segment, results)
+                    if tool_result_waits_for_user(waiting_result)
+                    and isinstance(waiting_result, dict)
+                ]
+                if waiting_pairs:
+                    self._discard_pending_tool_plan_after_pause(context)
+                    return await self._pause_for_tool_results(
+                        waiting_pairs=waiting_pairs,
+                        context=context,
+                        runtime=runtime,
+                    )
+                await runtime.checkpoint(
+                    "after_tool_batch",
+                    context=context,
+                    pattern=self,
+                    metadata={"tool_calls": segment},
+                )
+                # Catch interrupts that arrive after the batch completed but
+                # before the next segment begins. Interrupts during the batch
+                # cancel its runtime-owned tool tasks immediately.
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="after_tool_batch",
+                )
+                if interrupted is not None:
+                    return interrupted
+
+            # Evaluate repeated-tool-decision once per segment, on its last call.
+            requested_decision = await self._request_repeated_tool_decision_if_needed(
+                tool_call=segment[-1],
+                context=context,
+                runtime=runtime,
+            )
+            if any(self._tool_result_success(result) for result in results):
+                successful_tool_result = True
+            if requested_decision:
+                successful_tool_result = False
+
+        if (
+            self.finalize_after_tool_result
+            and successful_tool_result
+            and not self.repeated_tool_decision
+        ):
+            self.force_final_answer_next = True
+        return None
+
+    async def _request_repeated_tool_decision_if_needed(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> bool:
+        if self._forced_answer_read_open:
+            # A forced turn's reads have allowances of their own. Only the
+            # turn that actually offers reads is exempt: ordinary turns,
+            # stored results or not, still get the decision.
+            return False
+        if self.repeated_tool_decision is not None:
+            return False
+
+        metadata = self._repeated_tool_call_metadata(tool_call)
+        if metadata is None:
+            return False
+
+        self.repeated_tool_decision = metadata
+        await runtime.checkpoint(
+            REPEATED_TOOL_DECISION_REQUESTED_STATUS,
+            context=context,
+            pattern=self,
+            metadata=metadata,
+        )
+        return True
+
+    async def _run_repeated_tool_decision(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any] | None:
+        metadata = dict(self.repeated_tool_decision or {})
+        if not metadata:
+            return None
+
+        messages = self._messages_for_repeated_tool_decision(context, metadata)
+        call_llm = await prepare_llm_for_context(
+            llm=llm,
+            messages=messages,
+            context=context,
+        )
+        decision_tools = [self._react_decision_tool_schema()]
+        llm_metadata = {
+            "phase": REPEATED_TOOL_DECISION_REQUESTED_STATUS,
+            **resolved_llm_metadata(call_llm),
+            **metadata,
+        }
+        llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+            context,
+            messages,
+            decision_tools,
+            call_kind=CALL_KIND_DECISION,
+            iteration=self.current_iteration,
+        )
+        await runtime.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=decision_tools,
+            metadata=llm_metadata,
+        )
+        try:
+            response = await runtime.run_streaming_llm_call(
+                call_llm,
+                messages=messages,
+                tools=decision_tools,
+                tool_choice=compatible_tool_choice_for_llm(call_llm, "required"),
+                thinking={"type": "disabled", "enable": False},
+            )
+        except LLMCallInterrupted:
+            raise
+        except Exception as exc:
+            await runtime.on_llm_error(
+                context=context,
+                error=exc,
+                metadata=llm_metadata,
+            )
+            raise
+
+        await runtime.on_llm_end(
+            context=context,
+            response=response,
+            metadata=llm_metadata,
+        )
+        self.last_response = response
+        self.repeated_tool_decision = None
+
+        decision = self._parse_react_decision(response)
+        if decision is None:
+            await runtime.checkpoint(
+                "repeated_tool_decision_invalid",
+                context=context,
+                pattern=self,
+                metadata={"response": response, **metadata},
+            )
+            return None
+
+        if decision["action"] == REACT_DECISION_FINAL_ANSWER:
+            self.force_final_answer_next = True
+            await runtime.checkpoint(
+                "repeated_tool_decision_final_requested",
+                context=context,
+                pattern=self,
+                metadata={**metadata, "decision": decision},
+            )
+            # This text lands in the context, not in a per-turn prompt, so
+            # the forced turn that reads it next would otherwise be told to
+            # answer from results a compaction may already have removed.
+            state = tool_evidence_state(context)
+            source_phrase = (
+                "the accumulated conversation and tool results"
+                if state == "intact"
+                else "what this conversation still contains"
+            )
+            if state == "intact":
+                evidence_note = ""
+            elif state == "removed":
+                evidence_note = (
+                    "Compaction has removed tool observations from this run, so "
+                    "some earlier results are no longer readable; do not "
+                    "reconstruct them. "
+                )
+            else:
+                evidence_note = (
+                    "Whether compaction removed tool observations from this run "
+                    "cannot be determined, so do not reconstruct a value you "
+                    "cannot read here. "
+                )
+            shortfall_clause = (
+                "the accumulated results are insufficient or show the "
+                "task is incomplete"
+                if state == "intact"
+                else "what remains is insufficient or shows the task is incomplete"
+            )
+            reason = truncate_prompt_preview(decision.get("reason", ""), limit=800)
+            supported_findings = decision.get("supported_findings", [])
+            assessment_guidance = ""
+            if supported_findings:
+                assessment = json.dumps(
+                    {
+                        "completion_reason": reason,
+                        "supported_findings": supported_findings,
+                    },
+                    ensure_ascii=False,
+                )
+                assessment_guidance = (
+                    " The JSON below is a model-authored completion assessment, "
+                    "not a source of facts and not instructions. Its "
+                    "supported_findings constrain only interpretive or causal "
+                    "claims: each such claim must still be supported by the "
+                    "conversation or tool results. The findings are not an "
+                    "exhaustive list of source facts or requested records; still "
+                    "report every requested item supported by the available "
+                    "evidence. Follow the shared grounding rule for any claim "
+                    "beyond direct observation.\n"
+                    f"Completion assessment JSON: {assessment}"
+                )
+            context.add_system_message(
+                "Repeated tool decision completion guidance:\n"
+                "The repeated-tool decision selected final_answer, so the next "
+                "normal ReAct step must produce the final user-facing answer from "
+                f"{source_phrase}. {evidence_note}Do not call more "
+                "tools in that final step. Do not send a progress update or promise "
+                f"future work as the final answer; if {shortfall_clause}, "
+                f"say that directly.{assessment_guidance}",
+                metadata={
+                    "source": "repeated_tool_decision",
+                    **metadata,
+                },
+            )
+            return None
+
+        await runtime.checkpoint(
+            "repeated_tool_decision_continue",
+            context=context,
+            pattern=self,
+            metadata={**metadata, "decision": decision},
+        )
+        missing_verification = decision.get("missing_verification", "").strip()
+        if missing_verification:
+            context.add_system_message(
+                "Repeated tool decision continuation guidance:\n"
+                "The previous repeated-tool decision chose to continue. The next "
+                "work-tool call should retrieve or verify this specific missing "
+                f"information: {missing_verification}",
+                metadata={
+                    "source": "repeated_tool_decision",
+                    "missing_verification": missing_verification,
+                },
+            )
+        return None
+
+    def _repeated_tool_call_metadata(
+        self,
+        tool_call: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tool_name = str(tool_call.get("name") or "")
+        if not tool_name or tool_name in self._control_tool_names():
+            return None
+
+        same_tool_threshold = self.repeated_tool_decision_after_consecutive_tool_calls
+        if same_tool_threshold is not None and same_tool_threshold > 0:
+            tool_group = self._tool_decision_group_for_name(tool_name)
+            same_tool_records = self._consecutive_successful_tool_group_records(
+                tool_group
+            )
+            same_tool_count = len(same_tool_records)
+            if same_tool_count >= same_tool_threshold:
+                metadata: dict[str, Any] = {
+                    "trigger": "same_tool_successes",
+                    "tool_name": tool_group,
+                    "latest_tool_name": tool_name,
+                    "consecutive_tool_calls": same_tool_count,
+                    "threshold": same_tool_threshold,
+                }
+                if _records_advance_pagination(same_tool_records):
+                    metadata["paginated"] = True
+                return metadata
+
+        work_tool_threshold = (
+            self.repeated_tool_decision_after_consecutive_work_tool_calls
+        )
+        if work_tool_threshold is None or work_tool_threshold <= 0:
+            return None
+
+        work_tool_records = self._consecutive_work_tool_records()
+        work_tool_count = len(work_tool_records)
+        if work_tool_count < work_tool_threshold:
+            return None
+        metadata = {
+            "trigger": "work_tool_attempts",
+            "tool_name": tool_name,
+            "latest_tool_name": tool_name,
+            "consecutive_tool_calls": work_tool_count,
+            "threshold": work_tool_threshold,
+        }
+        tool_group = self._tool_decision_group_for_name(tool_name)
+        same_group_work_records = [
+            record
+            for record in work_tool_records
+            if self._tool_decision_group_for_name(record.tool_name) == tool_group
+        ]
+        if _records_advance_pagination(same_group_work_records):
+            metadata["paginated"] = True
+        return metadata
+
+    def _messages_for_repeated_tool_decision(
+        self,
+        context: Any,
+        metadata: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        messages = list(context.get_messages_for_llm())
+        tool_name = str(metadata.get("tool_name") or "the tool")
+        count = int(metadata.get("consecutive_tool_calls") or 0)
+        trigger = metadata.get("trigger")
+        if trigger == "work_tool_attempts":
+            latest_tool_name = str(metadata.get("latest_tool_name") or tool_name)
+            count_text = (
+                f"{count} consecutive work-tool calls without a final answer"
+                if count > 0
+                else "repeated work-tool calls without a final answer"
+            )
+            call_context = (
+                f"{count_text}; the latest work tool was {latest_tool_name}. "
+                "Some attempts may have failed; count them as work already spent."
+            )
+        else:
+            latest_tool_name = str(metadata.get("latest_tool_name") or tool_name)
+            count_text = (
+                f"{count} consecutive successful calls"
+                if count > 0
+                else "repeated successful calls"
+            )
+            if latest_tool_name != tool_name:
+                call_context = (
+                    f"{count_text} in the {tool_name} tool group; "
+                    f"the latest tool was {latest_tool_name}."
+                )
+            else:
+                call_context = f"{count_text} to {tool_name}."
+        current_request = truncate_prompt_preview(
+            latest_user_text(context) or "",
+            limit=400,
+        )
+        # This call decides whether the run goes to a forced answer turn at
+        # all, so it must not be asked whether accumulated results suffice
+        # while a compaction has already removed some of them.
+        state = tool_evidence_state(context)
+        completion_clause = (
+            "the accumulated tool results have completed the user's requested work"
+            if state == "intact"
+            else "what this conversation still contains has completed the user's "
+            "requested work"
+        )
+        sufficiency_clause = (
+            "the conversation and accumulated tool results are "
+            "sufficient to answer the latest user request"
+            if state == "intact"
+            else "what this conversation still contains is sufficient to answer "
+            "the latest user request"
+        )
+        evidence_facts_text = evidence_facts(state)
+        request_anchor = (
+            "Latest user request text:\n"
+            f"{current_request or '(unavailable)'}\n\n"
+            "Use this as the controlling request when deciding whether "
+            f"{completion_clause}."
+        )
+        pagination_clause = (
+            " The consecutive calls were paging through a list: their arguments "
+            "carry a page, cursor, offset, or skip. A page that came back full, or "
+            "results with no total or last-page marker, mean more pages may "
+            f"exist, so choose {REACT_DECISION_TOOL_CALL} to fetch the next page "
+            "unless the latest user request only asks for a sample or the "
+            "first few items, or the results already show the end of the list "
+            "(a short or empty page, or an explicit total or no-next-page "
+            "marker)."
+            if metadata.get("paginated")
+            else ""
+        )
+        prompt = (
+            f"You must call {REACT_DECISION_TOOL_NAME} exactly once. Decide whether "
+            "the current ReAct run should finish or make another work-tool call. "
+            f"{request_anchor} "
+            f"{evidence_facts_text}"
+            f"You have just made {call_context} action must be "
+            f"{REACT_DECISION_FINAL_ANSWER} or {REACT_DECISION_TOOL_CALL}. Choose "
+            f"{REACT_DECISION_FINAL_ANSWER} when {sufficiency_clause}. A "
+            "final answer means the latest user request is already completed; if "
+            "the next user-facing answer would describe a future tool action or "
+            "say work is still in progress, choose tool_call instead. Choose "
+            f"{REACT_DECISION_TOOL_CALL} only when a specific missing fact, source, "
+            "verification, or work step remains; the next normal ReAct turn will "
+            "choose and call the actual work tool from the full available tool set. "
+            "In the tool arguments, write reason and missing_verification before "
+            "action so you assess completion before committing to the decision. "
+            "When choosing final_answer, also list concise supported_findings for "
+            "any interpretive or causal conclusions the final response may make. "
+            "Omit supported_findings when choosing tool_call. Every listed finding "
+            "must be directly backed by the conversation or a tool result. Follow "
+            "the shared grounding rule for what counts as supported. "
+            "Use an empty missing_verification only when no work remains. "
+            "Audit every explicit deliverable in the latest request against a "
+            "successful tool result before choosing final_answer. Model-only or "
+            "private observations are evidence for reasoning, not user-visible "
+            "deliverables. A requested computer screenshot is complete only when "
+            "the computer result marks it as a user-visible artifact and returns "
+            "its file reference. For other file or media tools, a successful "
+            "artifact, file_ref, or markdown_link is sufficient evidence. "
+            "Do not call work tools in this decision. Do not put user-facing final "
+            "answer text in this decision; the next normal ReAct step will produce "
+            "the final answer if you choose final_answer. Treat the completed-call "
+            "count in this instruction as authoritative; do not count the user's "
+            "requested number as already completed. If the latest user request "
+            "explicitly requires more completed work-tool calls or results than "
+            f"the current context contains, choose {REACT_DECISION_TOOL_CALL}."
+            f"{pagination_clause}"
+        )
+        return [*messages, {"role": "user", "content": prompt}]
+
+    def _react_decision_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": REACT_DECISION_TOOL_NAME,
+                "description": (
+                    "Decide whether ReAct should finish in the next normal final "
+                    "answer step or continue to another work-tool call."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": (
+                                "Assess whether every requested work result already "
+                                "exists. Write this assessment before choosing action."
+                            ),
+                        },
+                        "supported_findings": {
+                            "type": "array",
+                            "items": {"type": "string", "maxLength": 500},
+                            "maxItems": 12,
+                            "description": (
+                                "When action is final_answer, optional concise "
+                                "interpretive or causal findings directly supported "
+                                "by the conversation or a tool result. This is not "
+                                "an exhaustive list of source facts or requested "
+                                "records. Omit for tool_call."
+                            ),
+                        },
+                        "missing_verification": {
+                            "type": "string",
+                            "description": (
+                                "When action is tool_call, the specific missing "
+                                "fact, source, verification, or work step that "
+                                "requires another tool call. Empty only when no work "
+                                "remains."
+                            ),
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                REACT_DECISION_FINAL_ANSWER,
+                                REACT_DECISION_TOOL_CALL,
+                            ],
+                            "description": (
+                                "Choose final_answer only when the preceding "
+                                "assessment found no missing work; otherwise choose "
+                                "tool_call."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "reason",
+                        "missing_verification",
+                        "action",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _parse_react_decision(self, response: Any) -> dict[str, Any] | None:
+        normalized = self._normalize_llm_response(response)
+        for tool_call in normalized.get("tool_calls", []):
+            if tool_call.get("name") != REACT_DECISION_TOOL_NAME:
+                continue
+            args = tool_call.get("args")
+            if not isinstance(args, dict):
+                return None
+            action = str(args.get("action") or "").strip()
+            if action not in {
+                REACT_DECISION_FINAL_ANSWER,
+                REACT_DECISION_TOOL_CALL,
+            }:
+                return None
+            missing_verification = str(args.get("missing_verification") or "")
+            raw_findings = args.get("supported_findings")
+            supported_findings: list[str] = []
+            if isinstance(raw_findings, list):
+                for finding in raw_findings:
+                    if not isinstance(finding, str) or not finding.strip():
+                        continue
+                    supported_findings.append(
+                        truncate_prompt_preview(finding, limit=500)
+                    )
+                    if len(supported_findings) == 12:
+                        break
+            if action == REACT_DECISION_FINAL_ANSWER and missing_verification.strip():
+                action = REACT_DECISION_TOOL_CALL
+            if action == REACT_DECISION_TOOL_CALL:
+                supported_findings = []
+            return {
+                "action": action,
+                "reason": str(args.get("reason") or ""),
+                "supported_findings": supported_findings,
+                "missing_verification": missing_verification,
+            }
+        return None
+
+    def _consecutive_successful_tool_group_records(
+        self, tool_group: str
+    ) -> list[ToolCallRecord]:
+        records: list[ToolCallRecord] = []
+        control_tool_names = self._control_tool_names()
+        for record in reversed(self._provider_compatible_tool_records()):
+            if record.tool_name in control_tool_names:
+                continue
+            if self._tool_decision_group_for_name(record.tool_name) != tool_group:
+                break
+            if record.status != "completed" or not self._tool_result_success(
+                record.result
+            ):
+                break
+            records.append(record)
+        return records
+
+    def _consecutive_work_tool_call_count(self) -> int:
+        return len(self._consecutive_work_tool_records())
+
+    def _consecutive_work_tool_records(self) -> list[ToolCallRecord]:
+        records: list[ToolCallRecord] = []
+        control_tool_names = self._control_tool_names()
+        for record in reversed(self._provider_compatible_tool_records()):
+            if record.tool_name in control_tool_names:
+                continue
+            if record.status not in {"completed", "failed"}:
+                continue
+            records.append(record)
+        return records
+
+    async def _finalize_success(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        response: Any,
+    ) -> dict[str, Any]:
+        return await self._finalize_outcome(
+            context=context,
+            runtime=runtime,
+            response=response,
+            outcome="completed",
+        )
+
+    @staticmethod
+    def _final_answer_outcome(value: Any) -> str:
+        outcome = str(value or "completed").strip().lower()
+        if outcome not in {"completed", "partial", "blocked"}:
+            return "blocked"
+        return outcome
+
+    async def _finalize_outcome(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        response: Any,
+        outcome: str,
+    ) -> dict[str, Any]:
+        """Finish the run while preserving its semantic completion outcome."""
+
+        self.pending_tool_calls = []
+        self.waiting_for_user_request = None
+        self.pending_tool_interaction_responses = []
+        self._release_forced_answer()
+        self.settlement_final_answer_fence = False
+        self.settlement_fence_turn_id = None
+        self.status = "completed"
+        await runtime.checkpoint("final", context=context, pattern=self)
+        result = PatternResult(
+            success=True,
+            output=response,
+            metadata={
+                "response": response,
+                "status": self.status,
+                "completion_outcome": outcome,
+            },
+        ).to_dict()
+        return result
+
+    def _ensure_pending_tool_call_envelope(self, context: Any) -> None:
+        if not self.pending_tool_calls:
+            return
+        messages = [
+            message
+            for message in getattr(context, "messages", [])
+            if not getattr(message, "hidden", False)
+        ]
+        index = len(messages) - 1
+        while index >= 0 and messages[index].role == "tool":
+            index -= 1
+        if index >= 0 and messages[index].role == "assistant":
+            tool_calls = messages[index].tool_calls or []
+            existing_ids = {
+                str(tool_call.get("id"))
+                for tool_call in tool_calls
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            pending_ids = {
+                str(tool_call.get("id"))
+                for tool_call in self.pending_tool_calls
+                if tool_call.get("id")
+            }
+            if pending_ids and pending_ids.issubset(existing_ids):
+                return
+            if not pending_ids and len(tool_calls) >= len(self.pending_tool_calls):
+                return
+
+        context.add_assistant_message(
+            "",
+            tool_calls=[
+                self._tool_call_for_context(tool_call)
+                for tool_call in self.pending_tool_calls
+            ],
+        )
+
+    def _tool_call_for_context(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": tool_call.get("id"),
+            "type": "function",
+            "function": {
+                "name": tool_call.get("name"),
+                "arguments": json.dumps(
+                    tool_call.get("args", {}),
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            },
+        }
+
+    def _tool_result_success(self, result: Any) -> bool:
+        return tool_result_succeeded(result)
+
+    def _latest_tool_result_success(self, context: Any) -> bool:
+        for message in reversed(getattr(context, "messages", [])):
+            if getattr(message, "role", None) != "tool":
+                continue
+            metadata = getattr(message, "metadata", {}) or {}
+            return self._tool_result_success(metadata.get("raw_result"))
+        return False
+
+    def _completion_evidence_instruction(self, context: Any) -> str:
+        for message in reversed(getattr(context, "messages", [])):
+            metadata = getattr(message, "metadata", {}) or {}
+            evidence = metadata.get("dag_completion_evidence")
+            if not isinstance(evidence, str):
+                continue
+            evidence = evidence.strip()
+            if evidence:
+                return (
+                    "Step completion evidence: "
+                    f"{evidence} "
+                    "When the latest tool result or response satisfies this evidence "
+                    "and the termination condition, call final_answer for this step. "
+                    "Do not repeat the same work for a nicer variant unless the result "
+                    "failed or the user explicitly requested a revision."
+                )
+        return ""
+
+    async def _interrupt_if_requested(
+        self,
+        *,
+        runtime: PatternRuntime,
+        context: Any,
+        label: str,
+    ) -> dict[str, Any] | None:
+        if not await runtime.should_interrupt():
+            return None
+
+        self.status = "interrupted"
+        await runtime.checkpoint(
+            "interrupted",
+            context=context,
+            pattern=self,
+            metadata={"safe_point": label, "reason": runtime.interrupt_reason},
+        )
+        metadata: dict[str, Any] = {
+            "status": self.status,
+            "interrupt_reason": runtime.interrupt_reason,
+        }
+        failure_code = self._latest_tool_failure_code(context)
+        if failure_code is not None:
+            metadata["failure_code"] = failure_code
+        return PatternResult(
+            success=False,
+            error="ReActPattern interrupted.",
+            metadata=metadata,
+        ).to_dict()
+
+    def _suppressed_duplicate_write_result(
+        self,
+        tool_call: dict[str, Any],
+        tools: list[Any],
+    ) -> dict[str, Any] | None:
+        """Return the suppression envelope when this call repeats a completed write.
+
+        The comparison key is (guard turn id, tool_name, args_hash), each side
+        computed from the same post-transform ``tool_call`` that
+        ``_record_tool_call`` hashes and ``_execute_tool`` executes — so two
+        calls compare equal exactly when their executions would be identical.
+        The turn equality is what makes the guard strictly per-turn: the
+        runner stamps a fresh turn_id on every user message (initial and
+        injected), and ``active_turn_id`` is re-resolved from the latest user
+        message at each pattern start — so an explicit repeat requested in a
+        later turn always executes, while an intra-turn resume of the
+        checkpointed ledger keeps suppressing the replay.
+
+        An ordinary completion is keyed by its original ``turn_id``. A
+        settled row — resumed success, rejection, or unknown dispatch — is
+        keyed by ``settlement_turn_id``, the approval turn that received that
+        outcome, because the original call ran in an earlier turn and would
+        otherwise never compare equal to the model's retry. Rejected and
+        dispatch-unknown rows are guarded although their ``status`` is
+        ``"failed"``: the write must not be repeated either because the user
+        denied it or because it may already have happened. This is the fine
+        half of a defense-in-depth pair with the settlement final-answer fence
+        (see ``_settlement_fence_active``), which blocks work tools wholesale
+        for the same turn. A call with no guard turn id is never guarded:
+        without a turn to scope to, suppression could outlive a turn, so an
+        unknowable turn fails open.
+
+        Serial execution makes the check-then-record window safe for guarded
+        tools: they are non-idempotent by declaration, so
+        ``_tool_is_concurrency_safe`` keeps them out of concurrent batches
+        unless configuration marks a non-idempotent tool concurrency-safe
+        (for MCP tools that flag is connection-level operator config), which
+        contradicts the flag's documented idempotency meaning.
+        """
+        try:
+            tool = self._find_tool(tool_call["name"], tools)
+        except Exception:  # noqa: BLE001 - unknown tool fails in _execute_tool
+            return None
+        if not tool_requires_duplicate_write_guard(tool):
+            return None
+
+        turn_id = self._tool_call_turn_id(tool_call)
+        if turn_id is None:
+            return None
+
+        tool_name = str(tool_call["name"])
+        args_hash = self._args_hash(self._tool_call_args_dict(tool_call))
+        # The caller runs this scan before recording anything for the current
+        # call, so every ledger entry — including one under this call's own
+        # id, which a provider may have reused — belongs to an earlier call.
+        for record in self._provider_compatible_tool_records():
+            guarded_settlement = (
+                record.settlement_status in _GUARDED_SETTLEMENT_STATUSES
+            )
+            if record.status != "completed" and not guarded_settlement:
+                continue
+            guard_turn_id = (
+                record.settlement_turn_id
+                if record.settlement_status in _SETTLED_SETTLEMENT_STATUSES
+                else record.turn_id
+            )
+            if guard_turn_id != turn_id:
+                continue
+            if record.tool_name != tool_name or record.args_hash != args_hash:
+                continue
+            if isinstance(record.result, dict) and record.result.get(
+                DUPLICATE_WRITE_SUPPRESSED_KEY
+            ):
+                # A prior suppression envelope: keep scanning so the model
+                # always gets the genuine execution's result attached. An
+                # envelope CAN precede its genuine record here — load_state
+                # rebuilds the ledger in the checkpoint's stored order, and
+                # _reorder_ledger_for_batch re-appends a batch's records at
+                # the tail, moving a genuine record behind an envelope when a
+                # provider reused its id inside a concurrent batch.
+                continue
+            # The ledger stores the raw execution return, which may still
+            # carry reserved transport keys. add_tool_result only splits
+            # those at the top level, so drop them here — unconditionally,
+            # not via the split helpers, whose scope validation could raise —
+            # or they reach the model as noise nested inside the envelope.
+            # The spill report is one of them: add_tool_result registers it
+            # and keeps it out of the rendered body only at the top level,
+            # so nested here it would print its relative_path in the
+            # envelope's body with no notice. Dropping it loses nothing; the
+            # report was registered when the original call's result was
+            # added.
+            prior_result = record.result
+            if isinstance(prior_result, dict):
+                prior_result = {
+                    key: value
+                    for key, value in prior_result.items()
+                    if key
+                    not in (
+                        CONTEXT_REFS_KEY,
+                        SUPERSEDES_SCOPE_KEY,
+                        SPILL_RESERVED_RESULT_KEY,
+                    )
+                }
+            return build_suppression_envelope(
+                tool_name=tool_name,
+                prior_tool_call_id=record.tool_call_id,
+                prior_result=prior_result,
+                prior_succeeded=record.status == "completed",
+            )
+        return None
+
+    def _prepare_tool_call_identity(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        reserved_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return an identity-normalized call and replace its pending entry.
+
+        Provider ids may be absent or reused, while ``invocation_id`` is the
+        durable execution identity. Copy before enriching so a callback failure
+        cannot mutate caller-owned retry or diagnostic input. Concurrent batches
+        reserve fallback provider ids before scheduling to prevent collisions.
+
+        A missing invocation id is deliberately preserved as ``None``. The only
+        production producers of pending calls are ``_normalize_tool_calls``
+        (which always stamps new calls) and ``load_state`` (which may restore a
+        pre-identity checkpoint), so absence here means legacy replay rather
+        than a genuinely new call. Minting an id would fabricate exact history.
+        """
+        original_call = tool_call
+        if not tool_call.get("id"):
+            used_ids = set(self.tool_call_id_index)
+            used_ids.update(
+                str(candidate.get("id"))
+                for candidate in self.pending_tool_calls
+                if candidate.get("id")
+            )
+            if reserved_ids is not None:
+                used_ids.update(reserved_ids)
+            fallback_index = len(self.tool_call_id_index)
+            while f"tool_call_{fallback_index}" in used_ids:
+                fallback_index += 1
+            tool_call = {
+                **tool_call,
+                "id": f"tool_call_{fallback_index}",
+            }
+        if reserved_ids is not None:
+            reserved_ids.add(str(tool_call["id"]))
+        # Fill only what is missing or not yet normalized, so preparing an
+        # already-prepared call returns the same object. Batch reconciliation
+        # tracks pending calls by object identity; re-copying a legacy call at
+        # every layer would detach the pending entry from the batch's copy.
+        identity_updates: dict[str, Any] = {}
+        invocation_id = self._normalized_invocation_id(tool_call.get("invocation_id"))
+        if (
+            "invocation_id" not in tool_call
+            or tool_call["invocation_id"] != invocation_id
+        ):
+            identity_updates["invocation_id"] = invocation_id
+        if "issued_at" not in tool_call:
+            identity_updates["issued_at"] = None
+        if identity_updates:
+            tool_call = {**tool_call, **identity_updates}
+        if tool_call is not original_call:
+            self.pending_tool_calls = [
+                tool_call if candidate is original_call else candidate
+                for candidate in self.pending_tool_calls
+            ]
+        return tool_call
+
+    async def _execute_tool_safely(
+        self,
+        tool_call: dict[str, Any],
+        tools: list[Any],
+        runtime: PatternRuntime,
+        *,
+        context: Any = None,
+        llm: Any = None,
+    ) -> Any:
+        """Share invocation preparation and lifecycle cleanup across tool kinds.
+
+        Control handlers retain their scheduling results. Only ordinary tools
+        use the existing tracing, metering and business-error conversion.
+        """
+        tool_call = self._prepare_tool_call_identity(tool_call)
+        pending_call = tool_call
+        tool_call = self._with_tool_call_content(tool_call)
+        tool_call = self._with_runtime_step(tool_call, runtime)
+        tool_call = self._with_runtime_turn_id(tool_call, runtime)
+        is_control = tool_call["name"] in CONTROL_TOOL_NAMES
+        if not is_control:
+            tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+            committed = await runtime.load_committed_tool_outcome(tool_call)
+            if committed is not None:
+                result = committed["result"]
+                self._record_tool_call(
+                    tool_call,
+                    status="waiting_for_user"
+                    if tool_result_waits_for_user(result)
+                    else (
+                        "completed" if self._tool_result_success(result) else "failed"
+                    ),
+                    result=result,
+                    error=committed["error"],
+                )
+                return result
+            # The duplicate-write scan runs before this call writes any ledger
+            # record: provider-supplied tool_call ids are not guaranteed
+            # unique (see _run_concurrent_batch), so recording "running" first
+            # would clobber the completed record that is the duplicate's own
+            # evidence when the model reuses the prior call's id. The scan and
+            # the envelope record are synchronous, preserving the
+            # distinct-fallback-id invariant for concurrent batch members.
+            suppressed = self._suppressed_duplicate_write_result(tool_call, tools)
+            if suppressed is not None:
+                # Every surfaced invocation gets its exact row, but on
+                # provider id reuse the envelope must not take over the id in
+                # the index: the genuine result has to stay the provider-keyed
+                # evidence so later duplicates still find it, exactly as the
+                # pre-identity ledger skipped this write.
+                self._record_tool_call(
+                    tool_call,
+                    status="completed",
+                    result=suppressed,
+                    index_tool_call_id=(
+                        str(tool_call["id"]) not in self.tool_call_id_index
+                    ),
+                )
+                await runtime.on_tool_start(tool_call=tool_call)
+                await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
+                return suppressed
+        self._record_tool_call(tool_call, status="running")
+        recorded_terminal = False
+        try:
+            if is_control:
+                # Control rejection identifies siblings by pending-object
+                # identity. Pass that original object, not the enriched copy.
+                result = await self._handle_control_tool(
+                    pending_call,
+                    context,
+                    llm,
+                    runtime,
+                    source=self._tool_message_source(tool_call),
+                )
+                recorded_terminal = True
+                return result
+            await runtime.on_tool_start(tool_call=tool_call)
+            try:
+                with bind_tool_call_execution_context(
+                    self._mcp_gate_execution_context(tool_call, context, runtime)
+                ):
+                    result = await runtime.run_tool_call(
+                        lambda: self._execute_tool(tool_call, tools, context=context)
+                    )
+            except ToolCallInterrupted as exc:
+                await runtime.on_tool_cancelled(
+                    tool_call=tool_call,
+                    reason=str(exc),
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="interrupted",
+                    error=str(exc),
+                )
+                recorded_terminal = True
+                raise
+            except ExecutionEventPersistenceError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                error_result = {
+                    "success": False,
+                    "error": str(exc),
+                    "tool_name": tool_call["name"],
+                }
+                await runtime.on_tool_error(
+                    tool_call=tool_call, error=exc, result=error_result
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="failed",
+                    result=error_result,
+                    error=str(exc),
+                )
+                recorded_terminal = True
+                return error_result
+
+            if self.user_interaction_enabled and tool_result_requires_authentication(
+                result
+            ):
+                # Reuse the checkpoint/replan path instead of letting the model
+                # retry unchanged credentials or execute its queued fallback.
+                # Headless runs retain the ordinary classified failure result.
+                result = {
+                    **result,
+                    "status": WAITING_FOR_USER_STATUS,
+                    "message": (
+                        f"The connection used by {tool_call['name']} requires "
+                        "authentication. Please check or update its authorization "
+                        "in the connection settings, then reply to continue. "
+                        "Do not paste credentials into this conversation. You can "
+                        "also provide an exported file or choose another source."
+                    ),
+                }
+
+            if tool_result_waits_for_user(result):
+                self._record_tool_call(
+                    tool_call,
+                    status="waiting_for_user",
+                    result=result,
+                )
+                recorded_terminal = True
+                await runtime.on_tool_end(tool_call=tool_call, result=result)
+                return result
+
+            if not self._tool_result_success(result):
+                error_message = str(
+                    result.get("error") or result.get("message") or result
+                )
+                await runtime.on_tool_error(
+                    tool_call=tool_call,
+                    error=RuntimeError(error_message),
+                    result=result,
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="failed",
+                    result=result,
+                    error=error_message,
+                )
+                recorded_terminal = True
+                return result
+
+            self._record_tool_call(tool_call, status="completed", result=result)
+            recorded_terminal = True
+            await runtime.on_tool_end(tool_call=tool_call, result=result)
+            return result
+        except (ToolCallInterrupted, asyncio.CancelledError) as exc:
+            if is_control and self._tool_record_for_call(tool_call).status == "running":
+                self._record_tool_call(tool_call, status="interrupted", error=str(exc))
+                recorded_terminal = True
+            raise
+        except Exception as exc:
+            if is_control and self._tool_record_for_call(tool_call).status == "running":
+                self._record_tool_call(tool_call, status="failed", error=str(exc))
+                recorded_terminal = True
+            raise
+        finally:
+            # Final-answer handling can record completion before finalization
+            # raises. Preserve that outcome, like an ordinary on_tool_end error.
+            if is_control:
+                recorded_terminal = (
+                    self._tool_record_for_call(tool_call).status != "running"
+                )
+            # Sends and infra callbacks must propagate without leaving a
+            # running ledger entry or becoming a model-visible business error.
+            if not recorded_terminal:
+                self._record_tool_call(
+                    tool_call,
+                    status="failed",
+                    error="tool execution aborted before completion",
+                )
+
+    def _with_trace_safe_tool_args(
+        self, tool_call: dict[str, Any], tools: list[Any]
+    ) -> dict[str, Any]:
+        try:
+            tool = self._find_tool(tool_call["name"], tools)
+        except Exception:  # noqa: BLE001
+            return tool_call
+
+        sanitizer = getattr(tool, "sanitize_tool_args_for_trace", None)
+        if not callable(sanitizer):
+            return tool_call
+
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            args: dict[str, Any] = {}
+            original_args: dict[str, Any] = {}
+        elif isinstance(raw_args, dict):
+            args = copy.deepcopy(raw_args)
+            original_args = copy.deepcopy(raw_args)
+        else:
+            return tool_call
+        sanitized = sanitizer(args)
+        if not isinstance(sanitized, dict) or sanitized == original_args:
+            return tool_call
+        return {**tool_call, "args": sanitized}
+
+    def _with_runtime_step(
+        self, tool_call: dict[str, Any], runtime: PatternRuntime
+    ) -> dict[str, Any]:
+        if tool_call.get("step_id") or tool_call.get("dag_step_id"):
+            return tool_call
+
+        step_id = getattr(runtime, "active_react_step_id", None)
+        if not step_id:
+            return tool_call
+
+        return {
+            **tool_call,
+            "step_id": str(step_id),
+            "dag_step_id": str(step_id),
+        }
+
+    @staticmethod
+    def _mcp_gate_execution_context(
+        tool_call: dict[str, Any], context: Any, runtime: PatternRuntime
+    ) -> ToolCallExecutionContext:
+        metadata = getattr(context, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        dag_step_id = metadata.get("dag_step_id")
+        task_source = metadata.get("task_source")
+        run_id = metadata.get("run_id")
+        return ToolCallExecutionContext(
+            task_source=str(task_source) if task_source else None,
+            task_id=str(
+                getattr(context, "execution_id", None)
+                or getattr(runtime, "execution_id", None)
+                or ""
+            )
+            or None,
+            run_id=str(run_id) if run_id else None,
+            turn_id=str(tool_call.get("turn_id")) if tool_call.get("turn_id") else None,
+            tool_call_id=str(tool_call.get("id") or ""),
+            pattern="dag" if dag_step_id else "react",
+            react_step_id=(
+                str(tool_call.get("step_id")) if tool_call.get("step_id") else None
+            ),
+            dag_step_id=str(dag_step_id) if dag_step_id else None,
+        )
+
+    def _with_runtime_turn_id(
+        self, tool_call: dict[str, Any], runtime: PatternRuntime
+    ) -> dict[str, Any]:
+        """Stamp the current turn's id onto ``tool_call`` for on_tool_* to read.
+
+        ``runtime.active_turn_id`` carries the durable turn_id: on the real
+        ``PatternRuntime`` it's set in ``on_pattern_start`` from the
+        triggering user message's metadata; on ``_DAGStepRuntime`` (dag.py)
+        it's a property resolving the same value from the DAG's root
+        context. Either way this lets ``PatternRuntime.on_tool_start`` /
+        ``on_tool_end`` / ``on_tool_error`` attribute the resulting trace
+        event to its turn by join, not by timestamp adjacency.
+        """
+        if tool_call.get("turn_id"):
+            return tool_call
+
+        turn_id = getattr(runtime, "active_turn_id", None)
+        if not turn_id:
+            return tool_call
+
+        return {**tool_call, "turn_id": str(turn_id)}
+
+    def _with_tool_call_content(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        content = self.pending_tool_call_content.get(
+            self._tool_call_content_key(tool_call)
+        )
+        if not content:
+            return tool_call
+        return {
+            **tool_call,
+            "assistant_content": content,
+        }
+
+    def _forget_tool_call_content(self, tool_call: dict[str, Any]) -> None:
+        content_key = self._tool_call_content_key(tool_call)
+        if content_key:
+            self.pending_tool_call_content.pop(content_key, None)
+
+    @staticmethod
+    def _tool_call_content_key(tool_call: dict[str, Any]) -> str:
+        return str(tool_call.get("invocation_id") or tool_call.get("id") or "")
+
+    def _record_tool_call(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        status: str,
+        result: Any = None,
+        error: str | None = None,
+        settlement_status: str | None = None,
+        settlement_turn_id: str | None = None,
+        settlement_trace_pending: bool = False,
+        index_tool_call_id: bool = True,
+    ) -> None:
+        tool_call_id = str(
+            tool_call.get("id") or f"tool_call_{len(self.tool_call_id_index)}"
+        )
+        invocation_id = self._normalized_invocation_id(tool_call.get("invocation_id"))
+        args = self._tool_call_args_dict(tool_call)
+        args_hash = self._args_hash(args)
+        existing = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+        )
+        raw_issued_at = tool_call.get("issued_at")
+        issued_at = (
+            existing.issued_at
+            if existing is not None
+            else float(raw_issued_at)
+            if raw_issued_at is not None
+            else None
+        )
+        record = ToolCallRecord(
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+            tool_name=str(tool_call["name"]),
+            args=args,
+            args_hash=args_hash,
+            status=status,
+            result=result,
+            error=error,
+            settlement_status=settlement_status,
+            turn_id=self._tool_call_turn_id(tool_call),
+            settlement_turn_id=(
+                str(settlement_turn_id) if settlement_turn_id else None
+            ),
+            settlement_trace_pending=settlement_trace_pending,
+            step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
+            issued_at=issued_at,
+            tool_attempt_id=(
+                str(tool_call["tool_attempt_id"])
+                if tool_call.get("tool_attempt_id")
+                else None
+            ),
+            assistant_message_id=(
+                str(tool_call["assistant_message_id"])
+                if tool_call.get("assistant_message_id")
+                else None
+            ),
+        )
+        self._store_tool_record(record, index_tool_call_id=index_tool_call_id)
+
+    @staticmethod
+    def _normalized_invocation_id(value: Any) -> str | None:
+        """Use one representation for absent identity across restored state."""
+
+        return str(value) if value else None
+
+    @staticmethod
+    def _ledger_key(record: ToolCallRecord) -> str:
+        """Key one exact row: its invocation id, or its provider id if legacy."""
+
+        return record.invocation_id or record.tool_call_id
+
+    def _store_tool_record(
+        self, record: ToolCallRecord, *, index_tool_call_id: bool = True
+    ) -> None:
+        """Store one exact row and point its provider id at it.
+
+        Rewriting the same invocation replaces its row in place. The index
+        assignment keeps a provider id's first insertion position, just as
+        assigning a repeated key in the pre-identity ledger did. A legacy row
+        is keyed by its provider id, so it keeps that overwrite behaviour in
+        the ledger itself as well.
+        """
+
+        key = self._ledger_key(record)
+        self.tool_ledger[key] = record
+        if index_tool_call_id:
+            self.tool_call_id_index[record.tool_call_id] = key
+
+    def _provider_compatible_tool_records(self) -> list[ToolCallRecord]:
+        """Return the rows the pre-identity ledger would hold, in its order.
+
+        Provider-keyed consumers (repeated-tool counters, the duplicate-write
+        guard, DAG evidence) read this view so reused provider ids behave as
+        they did before invocation identity existed.
+        """
+
+        return [self.tool_ledger[key] for key in self.tool_call_id_index.values()]
+
+    def _record_for_tool_call_id(self, tool_call_id: str) -> ToolCallRecord | None:
+        """Resolve a provider id the way the pre-identity ledger did."""
+
+        key = self.tool_call_id_index.get(tool_call_id)
+        return self.tool_ledger.get(key) if key is not None else None
+
+    def _find_tool_record(
+        self, *, tool_call_id: str, invocation_id: str | None
+    ) -> ToolCallRecord | None:
+        """Return the exact row for one invocation, never a colliding one."""
+
+        record = self.tool_ledger.get(invocation_id or tool_call_id)
+        if record is None or record.invocation_id != invocation_id:
+            return None
+        return record
+
+    def _tool_record_for_call(self, tool_call: dict[str, Any]) -> ToolCallRecord:
+        record = self._find_tool_record(
+            tool_call_id=str(tool_call.get("id") or ""),
+            invocation_id=self._normalized_invocation_id(
+                tool_call.get("invocation_id")
+            ),
+        )
+        if record is None:
+            raise KeyError(str(tool_call.get("id") or ""))
+        return record
+
+    @staticmethod
+    def _tool_call_turn_id(tool_call: dict[str, Any]) -> str | None:
+        raw_turn_id = tool_call.get("turn_id")
+        return str(raw_turn_id) if raw_turn_id else None
+
+    def _args_hash(self, args: dict[str, Any]) -> str:
+        try:
+            canonical = json.dumps(args, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            canonical = str(args)
+        # Digest instead of the raw JSON: the hash is persisted in every
+        # ledger record, so large args would otherwise be stored twice.
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _tool_call_args_dict(
+        self, tool_call: dict[str, Any], *, require_mapping: bool = False
+    ) -> dict[str, Any]:
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            return {}
+        if isinstance(raw_args, dict):
+            return dict(raw_args)
+        if require_mapping:
+            raise ValueError("Tool call args must be a JSON object.")
+        return {}
+
+    def _tool_origin_map(self, tools: list[Any]) -> dict[str, str]:
+        """Tool name -> category (plus MCP/connector server), for sizing only."""
+        origins: dict[str, str] = {}
+        for tool in tools:
+            try:
+                name = self._tool_name(tool)
+            except ValueError:
+                continue
+            metadata = getattr(tool, "metadata", None)
+            category = getattr(metadata, "category", None)
+            origin = str(getattr(category, "value", category) or "other")
+            server = getattr(metadata, "source_server", None)
+            if isinstance(server, str) and server:
+                origin = f"{origin}:{server}"
+            origins[name] = origin
+        return origins
+
+    def _prompt_composition(
+        self,
+        context: Any,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]] | None,
+        *,
+        call_kind: str,
+        iteration: int,
+    ) -> dict[str, Any]:
+        """Sizes of this call's request; counts and lengths, never content."""
+        origins = {
+            name: BUILTIN_TOOL_ORIGIN
+            for name in self._schema_tool_names(tool_schemas or [])
+        }
+        origins.update(getattr(self, "_tool_origins", {}))
+        context_tokens: int | None = None
+        estimate = getattr(context, "estimate_context_tokens", None)
+        if callable(estimate):
+            try:
+                context_tokens = estimate(messages, tool_schemas or None)
+            except Exception:  # noqa: BLE001 - diagnostics must not break the call
+                context_tokens = None
+        return build_prompt_composition(
+            messages,
+            tool_schemas,
+            call_kind=call_kind,
+            iteration=iteration,
+            tool_origins=origins,
+            context_tokens=context_tokens,
+        )
+
+    def _tool_name(self, tool: Any) -> str:
+        metadata = getattr(tool, "metadata", None)
+        if metadata is not None and getattr(metadata, "name", None):
+            return str(metadata.name)
+        if getattr(tool, "name", None):
+            return str(tool.name)
+        if getattr(tool, "__name__", None):
+            return str(tool.__name__)
+        raise ValueError(f"Tool {tool!r} is missing a name.")
+
+    def _tool_description(self, tool: Any) -> str:
+        metadata = getattr(tool, "metadata", None)
+        if metadata is not None and getattr(metadata, "description", None):
+            return str(metadata.description)
+        return (
+            str(getattr(tool, "description", ""))
+            or str(getattr(tool, "__doc__", "")).strip()
+            or self._tool_name(tool)
+        )
+
+    def _tool_json_schema(self, tool: Any) -> dict[str, Any]:
+        args_type = getattr(tool, "args_type", None)
+        if callable(args_type):
+            schema_type = args_type()
+            if hasattr(schema_type, "model_json_schema"):
+                return cast(dict[str, Any], schema_type.model_json_schema())
+            if hasattr(schema_type, "schema"):
+                return cast(dict[str, Any], schema_type.schema())
+        for schema_attr in ("args_schema", "tool_call_schema"):
+            schema_type = getattr(tool, schema_attr, None)
+            if schema_type is None:
+                continue
+            if hasattr(schema_type, "model_json_schema"):
+                return cast(dict[str, Any], schema_type.model_json_schema())
+            if hasattr(schema_type, "schema"):
+                return cast(dict[str, Any], schema_type.schema())
+        args = getattr(tool, "args", None)
+        if isinstance(args, dict) and args:
+            return {"type": "object", "properties": args}
+        if inspect.isfunction(tool):
+            return self._signature_json_schema(tool)
+        return {"type": "object", "properties": {}}
+
+    def _signature_json_schema(self, fn: Any) -> dict[str, Any]:
+        signature = inspect.signature(fn)
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for name, parameter in signature.parameters.items():
+            if name in {"self", "cls"}:
+                continue
+            if parameter.kind in {
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }:
+                continue
+            properties[name] = self._annotation_json_schema(parameter.annotation)
+            if parameter.default is inspect.Parameter.empty:
+                required.append(name)
+
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+        return schema
+
+    def _annotation_json_schema(self, annotation: Any) -> dict[str, Any]:
+        if annotation is inspect.Parameter.empty:
+            return {}
+        if annotation is str or annotation == "str":
+            return {"type": "string"}
+        if annotation is int or annotation == "int":
+            return {"type": "integer"}
+        if annotation is float or annotation == "float":
+            return {"type": "number"}
+        if annotation is bool or annotation == "bool":
+            return {"type": "boolean"}
+        if annotation is dict or annotation == "dict":
+            return {"type": "object"}
+        if annotation is list or annotation == "list":
+            return {"type": "array"}
+        return {}
+
+    async def _execute_tool(
+        self, tool_call: dict[str, Any], tools: list[Any], *, context: Any
+    ) -> Any:
+        tool = self._match_tool(tool_call["name"], tools)
+        if tool is None:
+            raise ValueError(
+                self._tool_not_found_message(tool_call["name"], tools, context)
+            )
+        args = self._tool_args_for_execution(tool_call, tool)
+
+        execute = getattr(tool, "execute", None)
+        if callable(execute):
+            return await self._invoke_callable(execute, **args)
+
+        run_json_async = getattr(tool, "run_json_async", None)
+        if callable(run_json_async):
+            return await run_json_async(args)
+
+        ainvoke = getattr(tool, "ainvoke", None)
+        if callable(ainvoke):
+            return await ainvoke(args)
+
+        call = getattr(tool, "__call__", None)
+        if callable(call):
+            return await self._invoke_callable(call, **args)
+
+        raise ValueError(
+            f"Tool {tool_call['name']} does not expose a supported executor."
+        )
+
+    def _tool_args_for_execution(
+        self, tool_call: dict[str, Any], tool: Any
+    ) -> dict[str, Any]:
+        args = self._tool_call_args_dict(tool_call, require_mapping=True)
+        tool_name = self._tool_name(tool)
+        if not (tool_name.startswith("browser_") or tool_name == "computer"):
+            return args
+
+        step_id = tool_call.get("dag_step_id") or tool_call.get("step_id")
+        if step_id and not args.get("session_id"):
+            args.setdefault("_xagent_step_id", str(step_id))
+        return args
+
+    def _match_tool(self, name: str, tools: list[Any]) -> Any | None:
+        """The tool ``name`` resolves to, or None.
+
+        Matches the emitted name only, never a provider-safe respelling of it.
+        """
+        for tool in tools:
+            if self._tool_name(tool) == name:
+                return tool
+        # Semantic Agent tool names may change when an Agent is renamed. Keep
+        # historical ``agent_<id>`` calls and prior semantic names executable
+        # without exposing duplicate aliases to the model's tool schema.
+        for tool in tools:
+            matches_name = getattr(tool, "matches_name", None)
+            if callable(matches_name) and matches_name(name):
+                return tool
+        return None
+
+    def _find_tool(self, name: str, tools: list[Any]) -> Any:
+        tool = self._match_tool(name, tools)
+        if tool is None:
+            raise ValueError(f"Tool not found: {name}")
+        return tool
+
+    def _tool_not_found_message(self, name: Any, tools: list[Any], context: Any) -> str:
+        """Name what the model emitted and what it could have called instead.
+
+        The candidates are the tool names an ordinary turn offers the model,
+        built by the same functions as that turn's schema list, so the
+        stored-result reader is a candidate only once this run has stored a
+        result. Forced turns offer fewer tools, but a call outside a forced
+        turn's list is refused before any tool is looked up.
+
+        ``repr`` keeps an invalid name visibly different from a real tool whose
+        name it resembles. The replayed call shows the provider-safe spelling
+        instead, so when that spelling is itself an offered tool it is named
+        first: the model sees that name in its history and has to be told the
+        call did not run it. The spelling is only named here; lookup always
+        uses the emitted name.
+        """
+        spill_read_tool = next(
+            (tool for tool in tools if self._tool_name(tool) == SPILL_READ_TOOL_NAME),
+            None,
+        )
+        offered = self._tool_schemas_with_spill_read(
+            self._tool_schemas_with_builtin_controls(tools),
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool),
+            context,
+        )
+        available = list(dict.fromkeys(self._schema_tool_names(offered)))
+        message = f"Tool not found: {name!r}."
+        close = difflib.get_close_matches(
+            str(name),
+            available,
+            n=TOOL_NOT_FOUND_MAX_CLOSE_NAMES,
+            cutoff=TOOL_NOT_FOUND_CLOSE_CUTOFF,
+        )
+        replayed = provider_safe_tool_name(name)
+        if replayed in available:
+            close = [replayed, *(match for match in close if match != replayed)][
+                :TOOL_NOT_FOUND_MAX_CLOSE_NAMES
+            ]
+        if close:
+            return f"{message} Did you mean: {', '.join(close)}?"
+        listed = ", ".join(available[:TOOL_NOT_FOUND_MAX_LISTED_NAMES])
+        hidden = len(available) - TOOL_NOT_FOUND_MAX_LISTED_NAMES
+        more = f" (and {hidden} more)" if hidden > 0 else ""
+        return f"{message} Available tools: {listed}{more}."
+
+    async def _invoke_callable(self, fn: Any, **kwargs: Any) -> Any:
+        if inspect.iscoroutinefunction(fn):
+            return await fn(**kwargs)
+        result = await asyncio.to_thread(fn, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result

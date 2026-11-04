@@ -1,0 +1,684 @@
+@import 'katex/dist/katex.min.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Xagent Theme System - Supports dynamic theme switching */
+:root {
+  /* Default dark theme colors - Maintains backward compatibility */
+  --background: 222.2 84% 4.9%;
+  --foreground: 210 40% 98%;
+  --card: 222.2 84% 4.9%;
+  --card-foreground: 210 40% 98%;
+  --popover: 222.2 84% 4.9%;
+  --popover-foreground: 210 40% 98%;
+  --primary: 217.2 91.2% 59.8%;
+  --primary-foreground: 222.2 84% 4.9%;
+  --secondary: 217.2 32.6% 17.5%;
+  --secondary-foreground: 210 40% 98%;
+  --muted: 217.2 32.6% 17.5%;
+  --muted-foreground: 215 20.2% 65.1%;
+  --accent: 217.2 32.6% 17.5%;
+  --accent-foreground: 210 40% 98%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 217.2 32.6% 17.5%;
+  --input: 217.2 32.6% 17.5%;
+  --ring: 224.3 76.3% 94.1%;
+  --radius: 0.5rem;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Theme override rules - Ensures hardcoded colors are replaced by theme variables */
+body .bg-\[\#0E1117\] {
+  background-color: hsl(var(--background)) !important;
+}
+
+body .text-\[\#E6EDF3\] {
+  color: hsl(var(--foreground)) !important;
+}
+
+body .bg-\[\#161B22\] {
+  background-color: hsl(var(--card)) !important;
+}
+
+body .border-\[rgba\(255\,255\,255\,0\.08\)\] {
+  border-color: hsl(var(--border)) !important;
+}
+
+body .text-\[\#8B949E\] {
+  color: hsl(var(--muted-foreground)) !important;
+}
+
+body .bg-\[\#1F2937\] {
+  background-color: hsl(var(--accent)) !important;
+}
+
+body .hover\:bg-\[\#1F2937\]:hover {
+  background-color: hsl(var(--accent)) !important;
+}
+
+body .hover\:text-\[\#E6EDF3\]:hover {
+  color: hsl(var(--accent-foreground)) !important;
+}
+
+/* Keep explicit legacy mappings above, but allow arbitrary Tailwind colors
+   like text-[#3B5AF6] / bg-[#EEF2FF] / border-[#E7EAF3] to render normally. */
+
+/* Preserve specific interaction effects */
+body .hover\:\bg-\[\#1F2937\]:hover {
+  background-color: hsl(var(--accent)) !important;
+}
+
+body .hover\:\text-\[\#E6EDF3\]:hover {
+  color: hsl(var(--accent-foreground)) !important;
+}
+
+/* React Flow node background transparent */
+.react-flow__node {
+  background-color: transparent !important;
+  border: none !important;
+}
+
+.react-flow__node-default {
+  background-color: transparent !important;
+  border: none !important;
+}
+
+/* Markdown prose styles for dark theme */
+.prose {
+  color: var(--foreground);
+  max-width: none;
+}
+
+.prose h1 {
+  color: var(--foreground);
+  font-weight: 600;
+  font-size: 1.5em;
+  margin-top: 0;
+  margin-bottom: 0.5em;
+}
+
+.prose h2 {
+  color: var(--foreground);
+  font-weight: 600;
+  font-size: 1.25em;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose h3 {
+  color: var(--foreground);
+  font-weight: 600;
+  font-size: 1.1em;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose p {
+  margin-top: 0;
+  margin-bottom: 1em;
+  line-height: 1.6;
+}
+
+.prose ul,
+.prose ol {
+  margin-top: 0;
+  margin-bottom: 1em;
+  padding-left: 1.5em;
+}
+
+.prose li {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+.prose code {
+  background-color: var(--muted);
+  color: var(--foreground);
+  padding: 0.125em 0.25em;
+  border-radius: 0.25rem;
+  font-size: 0.875em;
+}
+
+.prose pre {
+  background-color: var(--muted);
+  color: var(--foreground);
+  padding: 1em;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  margin-top: 0;
+  margin-bottom: 1em;
+}
+
+.prose pre code {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.prose blockquote {
+  border-left: 4px solid var(--border);
+  padding-left: 1em;
+  margin-top: 0;
+  margin-bottom: 1em;
+  color: var(--muted-foreground);
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0;
+  margin-bottom: 1em;
+}
+
+.prose th,
+.prose td {
+  border: 1px solid var(--border);
+  padding: 0.5em;
+  text-align: left;
+}
+
+.prose th {
+  background-color: var(--muted);
+  font-weight: 600;
+}
+
+/* Keep wide Markdown tables inside the conversation, with readable columns.
+   Also applies to Markdown file previews; other file renderers own their layout. */
+.prose .markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin-bottom: 1em;
+}
+
+.prose .markdown-table-scroll:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+.prose .markdown-table-scroll > table {
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+}
+
+.prose .markdown-table-scroll th,
+.prose .markdown-table-scroll td {
+  min-width: 6rem;
+  max-width: 24rem;
+  vertical-align: top;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+.prose a {
+  color: var(--primary);
+  text-decoration: underline;
+}
+
+.prose a:hover {
+  color: var(--primary-foreground);
+}
+
+.prose hr {
+  border-color: var(--border);
+  margin-top: 2em;
+  margin-bottom: 2em;
+}
+
+.prose-invert {
+  color: var(--foreground);
+}
+
+.prose-invert h1,
+.prose-invert h2,
+.prose-invert h3,
+.prose-invert h4,
+.prose-invert h5,
+.prose-invert h6 {
+  color: var(--foreground);
+}
+
+.prose-invert code {
+  background-color: hsl(var(--muted) / 0.5);
+}
+
+.prose-invert pre {
+  background-color: hsl(var(--muted) / 0.5);
+}
+
+.prose-invert th {
+  background-color: hsl(var(--muted) / 0.5);
+}
+
+/* React Flow Minimap SVG semi-transparent background */
+.react-flow__minimap-svg {
+  background-color: hsl(var(--background) / 0.8) !important;
+  backdrop-filter: blur(8px);
+}
+
+/* React Flow control button semi-transparent background */
+.react-flow__controls-button {
+  background-color: hsl(var(--background) / 0.9) !important;
+  backdrop-filter: blur(8px);
+  border: 1px solid hsl(var(--border) / 0.5) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+.react-flow__controls-button:hover {
+  background-color: hsl(var(--background)) !important;
+}
+
+/* Hide React Flow attribution */
+.react-flow__attribution {
+  display: none !important;
+}
+
+/* Override default React Flow node selected styles to prevent distance effect */
+.react-flow__node.selected {
+  box-shadow: none !important;
+}
+
+/* Override default React Flow node hover shadows to prevent conflict with custom styles */
+.react-flow__node:hover {
+  box-shadow: none !important;
+}
+
+/* Ensure scroll area works properly */
+[data-radix-scroll-area-viewport] {
+  scroll-behavior: smooth;
+}
+
+/* Fix scrollbar styles */
+[data-radix-scroll-area-scrollbar] {
+  transition: opacity 0.2s;
+}
+
+[data-radix-scroll-area-scrollbar]:hover {
+  opacity: 1 !important;
+}
+
+/* Ensure Tabs content area height is correct */
+[data-state="active"] {
+  min-height: 0;
+}
+
+/* Ensure Tabs content displays correctly in active state */
+[data-state="active"].flex-1 {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Ensure Tabs content is correctly hidden in inactive state */
+[data-state="inactive"] {
+  display: none;
+}
+
+/* Ensure ScrollArea works properly in flex containers */
+.scrollarea-container {
+  min-height: 0;
+  flex: 1;
+}
+
+/* Ensure scroll area works properly in flex containers */
+.flex-min-height-0 {
+  min-height: 0;
+}
+
+/* Fix code block overflow issues in message containers */
+.prose.prose-sm {
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.prose.prose-sm pre {
+  background-color: hsl(var(--muted) / 0.5);
+  color: hsl(var(--foreground));
+  padding: 0.75em;
+  border-radius: 0.375rem;
+  overflow-x: auto;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+  max-width: 100%;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.prose.prose-sm pre code {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: 0.813rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: break-word;
+}
+
+.prose.prose-sm code {
+  background-color: hsl(var(--muted) / 0.3);
+  color: hsl(var(--foreground));
+  padding: 0.125em 0.25em;
+  border-radius: 0.25rem;
+  font-size: 0.813rem;
+  word-break: break-all;
+  overflow-wrap: break-word;
+}
+
+/* Ensure message containers do not overflow */
+.message-content {
+  max-width: 100%;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  overflow-x: hidden;
+  word-break: break-word;
+}
+
+/* Handle long file information in user messages */
+.user-message .message-content {
+  word-break: break-all;
+  hyphens: auto;
+  line-height: 1.4;
+}
+
+/* Fix layout issues caused by long code blocks */
+.prose.prose-sm pre::-webkit-scrollbar {
+  height: 6px;
+}
+
+.prose.prose-sm pre::-webkit-scrollbar-track {
+  background: hsl(var(--muted) / 0.2);
+  border-radius: 3px;
+}
+
+.prose.prose-sm pre::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 3px;
+}
+
+.prose.prose-sm pre::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* Ensure child elements in flex containers do not overflow */
+.flex-overflow-hidden {
+  overflow: hidden;
+}
+
+/* Enhance scroll area styles */
+.enhanced-scroll-area {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
+/* Fix scrolling issues in nested flex layouts */
+.flex-scroll-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.flex-scroll-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Native scrollbar: always visible, thin and subtle */
+.overflow-y-auto {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
+}
+
+.overflow-y-auto::-webkit-scrollbar {
+  width: 8px;
+}
+
+.overflow-y-auto::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.overflow-y-auto::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.overflow-y-auto::-webkit-scrollbar-thumb:hover {
+  background-color: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* Ensure execution log content does not overflow */
+.execution-log-content {
+  max-width: 100%;
+  word-wrap: break-word;
+}
+
+.execution-log-content pre {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Ensure Tabs component displays correctly */
+[data-radix-collection-item] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Ensure TabsTrigger button is visible */
+button[data-radix-collection-item] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  border-radius: 0.375rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: all 0.2s;
+  padding: 0.5rem 1rem;
+  border: 1px solid transparent;
+}
+
+/* Ensure TabsList layout is correct */
+[data-radix-tabs-list] {
+  display: grid;
+  width: 100%;
+}
+
+/* Ensure Tabs content area displays scrollbar correctly */
+[data-radix-tabs-content] {
+  position: relative;
+  min-height: 0;
+}
+
+[data-radix-tabs-content] .h-full {
+  height: 100%;
+  min-height: 0;
+}
+
+/* Override React Flow default node width to fit custom content */
+.react-flow__node-input,
+.react-flow__node-default,
+.react-flow__node-output,
+.react-flow__node-group {
+  width: auto !important;
+}
+
+/* Orbit animation for planning loading state */
+@keyframes orbit {
+  0% {
+    transform: rotate(0deg) translateX(40px) rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg) translateX(40px) rotate(-360deg);
+  }
+}
+
+/* Delay utilities */
+.delay-1000 {
+  animation-delay: 1000ms;
+}
+
+.delay-500 {
+  animation-delay: 500ms;
+}
+
+/* Fix text color issues for font-mono elements in dark theme */
+.font-mono {
+  color: hsl(var(--foreground)) !important;
+}
+
+.gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r;
+  background-image: linear-gradient(to right, hsl(var(--gradient-from)), hsl(var(--gradient-to)));
+}
+
+/* Reasoning UI utilities (aligned with /test components) */
+.text-reasoning-active {
+  color: hsl(var(--primary));
+}
+
+.text-reasoning-success {
+  color: hsl(142.1 76.2% 36.3%);
+}
+
+.bg-reasoning-active\/5 {
+  background-color: hsl(var(--primary) / 0.05);
+}
+
+.bg-reasoning-active\/20 {
+  background-color: hsl(var(--primary) / 0.2);
+}
+
+.border-reasoning-active\/40 {
+  border-color: hsl(var(--primary) / 0.4);
+}
+
+.shadow-reasoning-active\/5 {
+  box-shadow: 0 1px 2px 0 hsl(var(--primary) / 0.05);
+}
+
+.bg-reasoning-log {
+  background-color: hsl(var(--muted) / 0.5);
+}
+
+.text-reasoning-log-text {
+  color: hsl(var(--muted-foreground));
+}
+
+.text-reasoning-log-text\/60 {
+  color: hsl(var(--muted-foreground) / 0.6);
+}
+
+@keyframes blink {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.animate-blink {
+  animation: blink 1.2s ease-in-out infinite;
+}
+
+/* Cyber Theme Specific Styles */
+.theme-cyber {
+  /* Enhanced glow effects for cyber theme */
+  --cyber-glow: 0 0 10px hsl(180 100% 50% / 0.3);
+  --cyber-glow-strong: 0 0 20px hsl(180 100% 50% / 0.5);
+}
+
+.theme-cyber .bg-primary\/10 {
+  background-color: hsl(180 100% 50% / 0.1) !important;
+}
+
+.theme-cyber .border-primary\/20 {
+  border-color: hsl(180 100% 50% / 0.2) !important;
+}
+
+.theme-cyber .text-primary {
+  color: hsl(180 100% 50%) !important;
+}
+
+/* Cyber theme button hover effects */
+.theme-cyber button:hover,
+.theme-cyber .hover\:bg-accent:hover {
+  box-shadow: var(--cyber-glow);
+}
+
+/* Cyber theme focus effects */
+.theme-cyber input:focus,
+.theme-cyber textarea:focus,
+.theme-cyber select:focus {
+  box-shadow: 0 0 0 2px hsl(180 100% 50% / 0.2);
+}
+
+/* Status colors for cyber theme */
+.theme-cyber .status-done {
+  background-color: hsl(142 76% 36%);
+  box-shadow: 0 0 8px hsl(142 76% 36% / 0.4);
+}
+
+.theme-cyber .status-running {
+  background-color: hsl(217 91% 60%);
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  box-shadow: 0 0 8px hsl(217 91% 60% / 0.4);
+}
+
+.theme-cyber .status-action {
+  background-color: hsl(45 93% 47%);
+  box-shadow: 0 0 8px hsl(45 93% 47% / 0.4);
+}
+
+.theme-cyber .status-error {
+  background-color: hsl(0 84% 60%);
+  box-shadow: 0 0 8px hsl(0 84% 60% / 0.5);
+}
+
+/* Enhanced card hover for cyber theme */
+.theme-cyber .card-hover:hover {
+  background-color: hsl(var(--card-hover)) !important;
+  border-color: hsl(var(--border-highlight));
+  transform: translateY(-2px);
+  transition: all 0.3s ease;
+}
+
+/* File link styles for markdown renderer */
+.prose .file-link {
+  color: #3b82f6;
+  text-decoration: none;
+  border-bottom: 1px dashed #3b82f6;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.prose .file-link:hover {
+  color: #60a5fa;
+  border-bottom-style: solid;
+}
+
+.prose .file-link:active {
+  color: #2563eb;
+}

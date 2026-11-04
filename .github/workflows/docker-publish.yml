@@ -1,0 +1,191 @@
+name: Publish Docker Images
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      push_to_dockerhub:
+        description: 'Push built images to Docker Hub'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      push_to_ghcr:
+        description: 'Push built images to GHCR'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BACKEND_IMAGE: xprobe/xagent-backend
+  FRONTEND_IMAGE: xprobe/xagent-frontend
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build-and-push:
+    timeout-minutes: 240
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Free GitHub-hosted runner disk space
+        uses: endersonmenezes/free-disk-space@e6ed9b02e683a3b55ed0252f1ee469ce3b39a885
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          rm_cmd: rmz
+          rmz_version: "3.1.1"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Log in to Docker Hub
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for backend
+        id: meta-backend
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Extract metadata for frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Prepare backend version metadata
+        id: version-meta
+        shell: bash
+        run: |
+          RELEASE_VERSION="${GITHUB_REF_NAME}"
+          if [ -z "$RELEASE_VERSION" ]; then
+            RELEASE_VERSION="unknown"
+          fi
+          PACKAGE_VERSION="${RELEASE_VERSION#v}"
+          if [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+([.][0-9]+)*([a-zA-Z0-9.+-]*)?$ ]]; then
+            PACKAGE_VERSION="0.0.0+${GITHUB_SHA::12}"
+          fi
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.backend
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          build-args: |
+            XAGENT_VERSION=${{ steps.version-meta.outputs.release_version }}
+            XAGENT_PACKAGE_VERSION=${{ steps.version-meta.outputs.package_version }}
+            XAGENT_GIT_COMMIT=${{ github.sha }}
+            XAGENT_BUILD_TIME=${{ steps.version-meta.outputs.build_time }}
+          cache-from: type=registry,ref=${{ env.BACKEND_IMAGE }}:buildcache
+          cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.BACKEND_IMAGE) || '' }}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          file: docker/Dockerfile.frontend
+          build-args: |
+            NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${{ vars.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN }}
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.FRONTEND_IMAGE }}:buildcache
+          cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.FRONTEND_IMAGE) || '' }}
+
+      - name: Extract metadata for backend GHCR
+        id: meta-backend-ghcr
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/xagent-backend
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Extract metadata for frontend GHCR
+        id: meta-frontend-ghcr
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/xagent-frontend
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push backend image to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.backend
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta-backend-ghcr.outputs.tags }}
+          labels: ${{ steps.meta-backend-ghcr.outputs.labels }}
+          build-args: |
+            XAGENT_VERSION=${{ steps.version-meta.outputs.release_version }}
+            XAGENT_PACKAGE_VERSION=${{ steps.version-meta.outputs.package_version }}
+            XAGENT_GIT_COMMIT=${{ github.sha }}
+            XAGENT_BUILD_TIME=${{ steps.version-meta.outputs.build_time }}
+
+      - name: Build and push frontend image to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          file: docker/Dockerfile.frontend
+          build-args: |
+            NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${{ vars.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta-frontend-ghcr.outputs.tags }}
+          labels: ${{ steps.meta-frontend-ghcr.outputs.labels }}

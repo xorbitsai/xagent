@@ -1,0 +1,4922 @@
+"""Integration tests for /v1/chat/tasks/* endpoints.
+
+Endpoints covered:
+  - POST /v1/chat/tasks
+  - POST /v1/chat/tasks/{id}/messages
+  - GET  /v1/chat/tasks/{id}
+  - GET  /v1/chat/tasks/{id}/steps
+
+Tests mock the background-execution kickoff so the suite doesn't need
+to spin up an actual AgentService / LLM. The behaviors under test are
+HTTP shape + DB rows + which background helper was called with which
+arguments -- not the LLM call itself. The steps endpoint exercises
+real :class:`TraceEvent` rows inserted directly into the test DB to
+drive the mapping.
+"""
+
+import asyncio
+import io
+import threading
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from uuid import uuid4
+
+import pytest
+from fastapi import HTTPException
+from fastapi.datastructures import UploadFile
+from sqlalchemy.orm import Session
+
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    gated_pool_checkout,
+)
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+from xagent.web.api.v1 import tasks as v1_tasks
+from xagent.web.api.v1.deps import (
+    AgentPrincipalSnapshot,
+    ApiKeyPrincipal,
+    RuntimeApiKeySnapshot,
+)
+from xagent.web.models.agent import Agent
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
+from xagent.web.models.task import (
+    Task,
+    TaskConnectorRuntimeContext,
+    TaskStatus,
+    TraceEvent,
+)
+from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.user import User
+from xagent.web.services import task_event_bridge, task_start
+from xagent.web.services.connector_runtime import (
+    ConnectorRuntimeValues,
+    drop_ephemeral_runtime_values_for_testing,
+    get_ephemeral_runtime_values,
+    load_connector_runtime_view,
+    pop_ephemeral_runtime_values,
+    set_connector_runtime_resolver_for_testing,
+    store_ephemeral_runtime_values,
+)
+from xagent.web.services.hot_path_cache import (
+    InMemoryTTLCache,
+    cache_get,
+    set_cache_backend_for_testing,
+    task_steps_key,
+)
+from xagent.web.services.mcp_oauth import MCPAuthorizationChallenge
+from xagent.web.tools.config import (
+    ResolvedToken,
+    TokenRequest,
+    WebToolConfig,
+    set_oauth_token_resolver_hook,
+)
+
+from ..conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _install_one_slot_queue_pool,
+    _register_second_user,
+    client,
+)
+
+
+def _create_agent_with_key_for(
+    headers: dict[str, str], *, name: str = "v1 tasks test agent"
+) -> tuple[int, str]:
+    """Create an agent + api key under the user owning ``headers``."""
+    agent_resp = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": name,
+            "description": "test",
+            "instructions": "you are a test agent",
+            "execution_mode": "balanced",
+        },
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    agent_id = agent_resp.json()["id"]
+    key_resp = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert key_resp.status_code == 200, key_resp.text
+    return agent_id, key_resp.json()["full_key"]
+
+
+# Opt this file into the shared conftest ``_test_db`` fixture; see the
+# note in test_agent_api_keys.py for why we use ``usefixtures`` with a
+# string name rather than importing the fixture.
+pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+@pytest.fixture(autouse=True)
+def reset_connector_runtime_resolver():
+    set_connector_runtime_resolver_for_testing(None)
+    yield
+    set_connector_runtime_resolver_for_testing(None)
+
+
+# ===== helpers =====
+
+
+def _create_agent_with_key() -> tuple[int, str]:
+    """Create one agent under the admin user + generate its API key.
+
+    Returns: (agent_id, full_key)
+    """
+    headers = _admin_headers()
+    agent_resp = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "v1 tasks test agent",
+            "description": "test",
+            "instructions": "you are a test agent",
+            "execution_mode": "balanced",
+        },
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    agent_id = agent_resp.json()["id"]
+
+    key_resp = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert key_resp.status_code == 200, key_resp.text
+    return agent_id, key_resp.json()["full_key"]
+
+
+def _bearer(full_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {full_key}"}
+
+
+def _install_runtime_mcp_connector(
+    agent_id: int,
+    *,
+    name: str = "ShiftCare",
+    selected: bool = True,
+    required: bool = True,
+    auth_selector_required: bool = False,
+    secret_required: bool = False,
+    delegated_authorization_binding: bool = False,
+) -> int:
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        runtime_input_schema = {
+            "context": {
+                "account_id": {
+                    "type": "string",
+                    "required": required,
+                }
+            }
+        }
+        if auth_selector_required:
+            runtime_input_schema["auth_selector"] = {
+                "resource_owner_key": {
+                    "type": "string",
+                    "required": True,
+                }
+            }
+        if secret_required:
+            runtime_input_schema["secrets"] = {
+                "authorization": {
+                    "type": "string",
+                    "required": True,
+                }
+            }
+
+        runtime_bindings = [
+            {
+                "source": {
+                    "input_type": "context",
+                    "key": "account_id",
+                },
+                "target": {
+                    "target_type": "mcp_meta",
+                    "key": "account_id",
+                },
+            }
+        ]
+        if delegated_authorization_binding:
+            runtime_bindings.append(
+                {
+                    "source": {
+                        "input_type": "secrets",
+                        "key": "authorization",
+                    },
+                    "target": {
+                        "target_type": "transport_headers",
+                        "key": "Authorization",
+                    },
+                }
+            )
+
+        server = MCPServer(
+            name=name,
+            description=f"{name} MCP",
+            managed="external",
+            transport="streamable_http",
+            url=f"https://{name.lower()}.mcp.test",
+            runtime_input_schema=runtime_input_schema,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=delegated_authorization_binding,
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(agent.user_id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                can_edit=True,
+                is_active=True,
+            )
+        )
+        if selected:
+            agent.tool_categories = [f"mcp:{name}"]
+        db.commit()
+        return int(server.id)
+    finally:
+        db.close()
+
+
+# We mock ``TaskTurnOrchestrator._schedule_bg`` (the actual bg coroutine
+# spawn) rather than the public ``start_new_turn`` / ``append_turn`` so
+# the orchestrator's claim + persist logic still runs and tests can
+# verify DB writes (atomic claim flipped status, user messages got
+# persisted, etc.). Only the asyncio.create_task / agent execution is
+# stubbed.
+#
+# Scope: file-local. ``autouse=True`` means every test in this module
+# gets the mock automatically. GET-only tests (which never call the
+# orchestrator) are unaffected; POST tests assert on ``await_count`` /
+# ``await_args``. Other test files (e.g. test_steps_mapping.py,
+# test_auth.py) are NOT affected because pytest fixture scoping is
+# per-module.
+#
+# Fixture name kept as ``mock_start_task`` to minimize churn across the
+# existing test surface; conceptually it now mocks "bg scheduling".
+@pytest.fixture(autouse=True)
+def mock_start_task():
+    # Patch the lease-aware bg scheduler so the orchestrator's atomic
+    # claim + transcript persist logic still runs against a real DB;
+    # only the asyncio.create_task / agent execution is stubbed.
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ) as mocked:
+        yield mocked
+
+
+# ===== POST /v1/chat/tasks =====
+
+
+def test_create_task_forwards_timezone_to_the_first_turn(mock_start_task):
+    """SDK callers have no websocket, so the create body is their only chance
+    to declare a zone for the turn that task creation starts."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "how many shifts tomorrow?"},
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] == {
+        "timezone": "Australia/Melbourne"
+    }
+
+
+def test_create_task_without_timezone_sends_no_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
+def test_create_task_rejects_an_over_long_timezone(mock_start_task):
+    # Guest-reachable free-text field is bounded to IANA lengths (max_length=64).
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "A" * 65,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+def test_create_task_treats_a_blank_timezone_as_absent(mock_start_task):
+    # The shared helper normalizes whitespace-only to None, so the SDK path
+    # matches the workforce path rather than sending {"timezone": "  "}.
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "   ",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
+def test_create_task_happy_path(mock_start_task):
+    """Returns 202 + task_id, writes hidden SDK Task + input,
+    persists first user message, kicks off background, and leaves the
+    task readable through the SDK API surface.
+    """
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["agent_id"] == agent_id
+    # POST atomically claims RUNNING before returning 202, so the
+    # response body reports the post-claim state, not 'pending'.
+    assert body["status"] == "running"
+    assert body["run_id"]
+    assert body["state_version"] == 1
+    assert body["control_state"] == "running"
+    assert "task_id" in body
+    assert "created_at" in body
+    task_id = body["task_id"]
+
+    # DB: Task row exists, owned by admin user, source='sdk', input set.
+    # POST atomically claims RUNNING before returning 202, so the row
+    # is already RUNNING from the moment the response lands.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        assert task.agent_id == agent_id
+        assert task.source == "sdk"
+        assert task.is_visible is False
+        assert task.input == "first user message"
+        assert task.status == TaskStatus.RUNNING
+
+        # task_chat_messages: one user-role message written
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        msgs = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).all()
+        )
+        assert len(msgs) == 1
+        assert msgs[0].role == "user"
+        assert msgs[0].content == "first user message"
+    finally:
+        db.close()
+
+    sdk_task = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert sdk_task.status_code == 200, sdk_task.text
+    assert sdk_task.json()["task_id"] == task_id
+    assert sdk_task.json()["run_id"] == body["run_id"]
+    assert sdk_task.json()["state_version"] == body["state_version"]
+    assert sdk_task.json()["control_state"] == "running"
+
+    # Background kickoff was called exactly once for this task. The
+    # scheduler receives a ``TaskTurnPayload`` carrying both transcript
+    # and execution channels.
+    assert mock_start_task.call_count == 1
+    kwargs = mock_start_task.call_args.kwargs
+    assert kwargs["task_id"] == task_id
+    assert kwargs["payload"].transcript_message == "first user message"
+
+
+def test_create_task_schedules_after_commit_acknowledgement_loss(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    original_commit = Session.commit
+    acknowledgement_lost = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal acknowledgement_lost
+        original_commit(session)
+        if not acknowledgement_lost:
+            acknowledgement_lost = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "commit then schedule"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert acknowledgement_lost is True
+    assert mock_start_task.call_count == 1
+
+
+def test_create_task_uses_one_connection_at_a_time(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The request must not pin a pool slot while the turn worker claims it."""
+
+    agent_id, full_key = _create_agent_with_key()
+    engine = _install_one_slot_queue_pool(monkeypatch)
+
+    try:
+        response = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "single-slot create"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
+
+
+def test_create_task_records_key_usage_but_polling_does_not(mock_start_task):
+    """Creating/appending tasks bumps usage; polling status/steps does not."""
+
+    from xagent.web.models.agent_api_key import AgentApiKey
+
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row is not None
+        assert row.last_used_at is not None
+        assert row.usage_month == datetime.now(UTC).strftime("%Y-%m")
+        assert row.usage_month_calls == 1
+    finally:
+        db.close()
+
+    for _ in range(3):
+        assert (
+            client.get(
+                f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key)
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            ).status_code
+            == 200
+        )
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row.usage_month_calls == 1
+        db.query(Task).filter(Task.id == task_id).update(
+            {"status": TaskStatus.COMPLETED}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+        },
+    )
+    assert appended.status_code == 202, appended.text
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).first()
+        assert row.usage_month_calls == 2
+    finally:
+        db.close()
+
+
+# ===== POST /v1/chat/files + message.files =====
+
+
+def test_upload_and_attach_files_to_task(mock_start_task):
+    """Upload via /v1/chat/files, then attach the file_id to a task turn.
+
+    Asserts the returned file_id round-trips into the turn payload: the
+    execution_message carries the file reference context (so the agent
+    sees it) while the transcript stays the raw user text.
+    """
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("lesson_plan.txt", b"lesson content", "text/plain"))],
+    )
+    assert up.status_code == 200, up.text
+    files = up.json()["files"]
+    assert len(files) == 1
+    file_id = files[0]["file_id"]
+    assert files[0]["filename"] == "lesson_plan.txt"
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check this lesson plan",
+                "files": [file_id],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    # Transcript is the raw text; execution channel is file-enriched.
+    assert payload.transcript_message == "check this lesson plan"
+    assert payload.execution_message is not None
+    assert file_id in payload.execution_message
+    assert "UPLOADED FILES" in payload.execution_message
+    assert payload.attachments
+    assert any(a.get("file_id") == file_id for a in payload.attachments)
+    assert payload.file_ids == (file_id,)
+
+    # File is bound to the task after the turn is claimed (not before).
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        assert rec is not None
+        assert rec.task_id == task_id
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_durable_phase_releases_pool_and_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable object I/O precedes the short metadata transaction off-loop."""
+
+    from xagent.web.api.files import store_uploaded_files
+    from xagent.web.services.managed_file_ref import ManagedFileRef
+
+    agent_id, _full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        user_id = int(
+            db.query(User.id)
+            .join(Agent, Agent.user_id == User.id)
+            .filter(Agent.id == agent_id)
+            .scalar()
+        )
+    finally:
+        db.close()
+
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out_during_durable: list[int] = []
+    original_sync = ManagedFileRef.sync_to_durable
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
+
+    def delayed_sync(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        checked_out_during_durable.append(engine.pool.checkedout())
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "durable upload was never released"
+        return original_sync(self, *args, **kwargs)
+
+    monkeypatch.setattr(ManagedFileRef, "sync_to_durable", delayed_sync)
+    upload = UploadFile(
+        filename="nonblocking-upload.txt",
+        file=io.BytesIO(b"payload"),
+        headers={"content-type": "text/plain"},
+    )
+
+    async def upload_once() -> None:
+        await store_uploaded_files(
+            upload_items=[upload],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            single_file_mode=False,
+            user_id=user_id,
+        )
+
+    upload_task = asyncio.create_task(upload_once())
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not upload_task.done()
+        assert checked_out_during_durable == [0]
+        assert engine.pool.checkedout() == 0
+    finally:
+        release.set()
+        try:
+            await asyncio.wait_for(upload_task, timeout=30)
+        finally:
+            engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation drains upload cleanup instead of leaving an orphan."""
+
+    from xagent.web.api import files as files_api
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    agent_id, _full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        user = (
+            db.query(User)
+            .join(Agent, Agent.user_id == User.id)
+            .filter(Agent.id == agent_id)
+            .one()
+        )
+        user_id = int(user.id)
+    finally:
+        db.close()
+
+    write_started = threading.Event()
+    allow_write = threading.Event()
+    written_path = None
+
+    def delayed_copy(uploaded, *, task_id, folder, user_id):  # type: ignore[no-untyped-def]
+        nonlocal written_path
+        target_path = files_api.get_upload_path(
+            uploaded.filename or "",
+            task_id,
+            folder,
+            user_id,
+        )
+        written_path = target_path
+        with open(target_path, "xb") as buffer:
+            buffer.write(b"partial")
+        write_started.set()
+        assert allow_write.wait(timeout=GUARD_TIMEOUT)
+        return target_path
+
+    monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
+    upload = UploadFile(
+        filename="cancelled-upload.txt",
+        file=io.BytesIO(b"payload"),
+        headers={"content-type": "text/plain"},
+    )
+    upload_task = asyncio.create_task(
+        files_api.store_uploaded_files(
+            upload_items=[upload],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            single_file_mode=False,
+            user_id=user_id,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(write_started.wait, GUARD_TIMEOUT)
+        upload_task.cancel()
+        allow_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(upload_task, timeout=GUARD_TIMEOUT)
+    finally:
+        allow_write.set()
+        upload_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(upload_task, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
+
+    assert written_path is not None
+    assert not written_path.exists()
+    check_db = _direct_db_session()
+    try:
+        assert (
+            check_db.query(UploadedFile).filter(UploadedFile.user_id == user_id).count()
+            == 0
+        )
+    finally:
+        check_db.close()
+
+
+def test_upload_rejects_unsupported_type_with_v1_envelope(mock_start_task):
+    """Unsupported extension -> 400 invalid_input in the v1 envelope.
+
+    Guards against the shared ``store_uploaded_files`` leaking its bare
+    HTTPException (a 500 {"detail": ...}) past the v1 error handler.
+    """
+    _agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("payload.xyz", b"junk", "application/octet-stream"))],
+    )
+    assert up.status_code == 400, up.text
+    body = up.json()
+    assert body["error"]["code"] == "invalid_input"
+    # Must be the stable v1 envelope, not FastAPI's default {"detail": ...}.
+    assert "detail" not in body
+
+
+def test_attach_unknown_file_id_is_rejected_without_orphan(mock_start_task):
+    """A bad file_id -> 400 and NO task row is created (no orphan)."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check this",
+                "files": ["does-not-exist"],
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    # #2 regression: validation happens before task creation, so nothing is
+    # left behind. The background kickoff must never have fired either.
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0, (
+            "a bad file id must not leave an orphan task"
+        )
+    finally:
+        db.close()
+    assert mock_start_task.call_count == 0
+
+
+def test_partial_file_set_is_all_or_nothing(mock_start_task):
+    """[good, bad] -> 400; the good file is left unbound (not half-attached)."""
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("good.txt", b"content", "text/plain"))],
+    )
+    good_id = up.json()["files"][0]["file_id"]
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check these",
+                "files": [good_id, "typo-id"],
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == good_id).first()
+        assert rec is not None
+        assert rec.task_id is None, "good file must stay unbound on all-or-nothing"
+    finally:
+        db.close()
+    assert mock_start_task.call_count == 0
+
+
+def test_repeated_file_id_is_deduped(mock_start_task):
+    """The same file_id twice in one request attaches once, not twice."""
+    agent_id, full_key = _create_agent_with_key()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("dup.txt", b"content", "text/plain"))],
+    )
+    file_id = up.json()["files"][0]["file_id"]
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "check it",
+                "files": [file_id, file_id],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    # One context line and one chip, despite the duplicate id.
+    assert payload.execution_message.count(f"file_id={file_id}") == 1
+    assert [a.get("file_id") for a in payload.attachments] == [file_id]
+
+
+def test_append_message_with_files(mock_start_task):
+    """The append route also accepts and attaches files."""
+    agent_id, full_key = _create_agent_with_key()
+
+    created = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "turn one"},
+        },
+    )
+    task_id = created.json()["task_id"]
+
+    # Append is only allowed once the task leaves RUNNING.
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {"status": TaskStatus.COMPLETED}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("turn2.txt", b"more", "text/plain"))],
+    )
+    file_id = up.json()["files"][0]["file_id"]
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "look at this too",
+                "files": [file_id],
+            },
+        },
+    )
+    assert appended.status_code == 202, appended.text
+
+    payload = mock_start_task.call_args.kwargs["payload"]
+    assert payload.transcript_message == "look at this too"
+    assert file_id in payload.execution_message
+    assert any(a.get("file_id") == file_id for a in payload.attachments)
+    assert payload.file_ids == (file_id,)
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        assert rec is not None
+        assert rec.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_upload_files_requires_api_key(mock_start_task):
+    """POST /v1/chat/files without a key -> 401 invalid_api_key envelope."""
+    resp = client.post(
+        "/v1/chat/files",
+        files=[("files", ("x.txt", b"data", "text/plain"))],
+    )
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_upload_oversized_maps_to_413(mock_start_task):
+    """A 413 from the shared uploader surfaces as a v1-enveloped 413."""
+    _agent_id, full_key = _create_agent_with_key()
+
+    with patch(
+        "xagent.web.api.files.store_uploaded_files",
+        new=AsyncMock(side_effect=HTTPException(status_code=413, detail="too big")),
+    ):
+        resp = client.post(
+            "/v1/chat/files",
+            headers=_bearer(full_key),
+            files=[("files", ("big.txt", b"data", "text/plain"))],
+        )
+    assert resp.status_code == 413, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "detail" not in body  # not FastAPI's default envelope
+
+
+def test_upload_storage_unavailable_maps_to_503(mock_start_task):
+    """A 503 from the shared uploader surfaces as a retryable v1 503."""
+    _agent_id, full_key = _create_agent_with_key()
+
+    with patch(
+        "xagent.web.api.files.store_uploaded_files",
+        new=AsyncMock(side_effect=HTTPException(status_code=503, detail="down")),
+    ):
+        resp = client.post(
+            "/v1/chat/files",
+            headers=_bearer(full_key),
+            files=[("files", ("f.txt", b"data", "text/plain"))],
+        )
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "internal_error"
+    assert "detail" not in body
+
+
+def test_cross_user_file_not_attachable(mock_start_task):
+    """User B's agent key cannot attach a file uploaded by user A."""
+    # User A (admin) uploads a file under their own agent key.
+    _agent_a, key_a = _create_agent_with_key()
+    up = client.post(
+        "/v1/chat/files",
+        headers=_bearer(key_a),
+        files=[("files", ("secret.txt", b"private", "text/plain"))],
+    )
+    file_id_a = up.json()["files"][0]["file_id"]
+
+    # User B has a separate account, agent, and key.
+    bob_headers = _register_second_user()
+    agent_b, key_b = _create_agent_with_key_for(bob_headers)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(key_b),
+        json={
+            "agent_id": agent_b,
+            "message": {
+                "role": "user",
+                "content": "read A's file",
+                "files": [file_id_a],
+            },
+        },
+    )
+    # user_id filter makes A's file invisible to B -> unresolvable -> 400.
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    # A's file must remain unbound (B's failed attempt cannot touch it).
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        rec = db.query(UploadedFile).filter(UploadedFile.file_id == file_id_a).first()
+        assert rec is not None
+        assert rec.task_id is None
+    finally:
+        db.close()
+
+
+def test_create_task_persists_connector_runtime_snapshot_and_context(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.connector_runtime_selected_refs == [
+            {"connector_type": "mcp", "connector_id": server_id}
+        ]
+        context_row = (
+            db.query(TaskConnectorRuntimeContext)
+            .filter(TaskConnectorRuntimeContext.task_id == task_id)
+            .one()
+        )
+        assert context_row.connector_type == "mcp"
+        assert context_row.connector_id == server_id
+        assert context_row.context == {"account_id": "6185"}
+    finally:
+        db.close()
+
+    assert mock_start_task.call_count == 1
+
+
+def test_create_task_rejects_runtime_context_for_unselected_connector(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id, selected=False)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_runtime_context"
+    assert resp.json()["error"]["details"]["reason"] == "connector_not_selected"
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_rejects_missing_required_runtime_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    _install_runtime_mcp_connector(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "missing_runtime_context"
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_rejects_missing_required_auth_selector(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, auth_selector_required=True
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    }
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_rejects_missing_required_secret_without_resolver(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    }
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+
+
+def test_external_scoped_resolver_does_not_defer_sdk_required_secret(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    _install_runtime_mcp_connector(agent_id, required=False, secret_required=True)
+    resolver_calls = 0
+
+    def _resolver(request):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return request.values
+
+    set_connector_runtime_resolver_for_testing(_resolver, task_sources={"external"})
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+    assert resolver_calls == 0
+
+
+def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_start_task,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    prepare_runtime_plan = task_start.prepare_create_connector_runtime
+
+    def prepare_mismatched_identity(**kwargs):
+        plan = prepare_runtime_plan(**kwargs)
+        return replace(
+            plan,
+            connector_user_id=plan.connector_user_id + 1,
+        )
+
+    monkeypatch.setattr(
+        task_start,
+        "prepare_create_connector_runtime",
+        prepare_mismatched_identity,
+    )
+
+    response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "identity mismatch"},
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "connector_runtime_unavailable",
+        "message": "Connector runtime context is unavailable.",
+        "details": {"reason": "runtime_task_identity_mismatch"},
+    }
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_connector_runtime_view_loads_task_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        view = load_connector_runtime_view(
+            db=db,
+            task_id=task_id,
+            turn_id=turn_id,
+            user_id=int(task.user_id),
+        )
+    finally:
+        db.close()
+
+    assert view == {
+        f"mcp:{server_id}": {
+            "context": {"account_id": "6185"},
+            "secrets": {},
+            "auth_selector": {},
+        }
+    }
+
+
+def test_connector_runtime_view_reports_store_lost_for_missing_ephemeral(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer tenant-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    drop_ephemeral_runtime_values_for_testing(turn_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        with pytest.raises(Exception) as exc_info:
+            load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+    finally:
+        db.close()
+
+    assert getattr(exc_info.value, "code", None) == "runtime_secret_unavailable"
+    assert getattr(exc_info.value, "details", {}).get("reason") == "store_lost"
+
+
+def test_connector_runtime_resolver_can_supply_required_secret(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    def _resolver(request):
+        assert request.connector_ref.connector_id == server_id
+        assert request.values.secrets == {}
+        return ConnectorRuntimeValues(
+            context={},
+            secrets={"authorization": "Bearer hook-token"},
+            auth_selector={},
+        )
+
+    set_connector_runtime_resolver_for_testing(_resolver)
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert view[f"mcp:{server_id}"]["secrets"] == {"authorization": "Bearer hook-token"}
+
+
+def test_connector_runtime_resolver_can_supply_required_auth_selector(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, auth_selector_required=True
+    )
+
+    def _resolver(request):
+        assert request.connector_ref.connector_id == server_id
+        assert request.values.auth_selector == {}
+        return ConnectorRuntimeValues(
+            context={},
+            secrets={},
+            auth_selector={"resource_owner_key": "xagent:user:owner"},
+        )
+
+    set_connector_runtime_resolver_for_testing(_resolver)
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert view[f"mcp:{server_id}"]["auth_selector"] == {
+        "resource_owner_key": "xagent:user:owner"
+    }
+
+
+def test_connector_runtime_view_reports_not_provided_when_resolver_omits_secret(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    def _resolver(_request):
+        return None
+
+    set_connector_runtime_resolver_for_testing(_resolver)
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            with pytest.raises(Exception) as exc_info:
+                load_connector_runtime_view(
+                    db=db,
+                    task_id=task_id,
+                    turn_id=turn_id,
+                    user_id=int(task.user_id),
+                )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert getattr(exc_info.value, "code", None) == "runtime_secret_unavailable"
+    assert getattr(exc_info.value, "details", {}).get("reason") == "not_provided"
+    assert getattr(exc_info.value, "details", {}).get("connector_ref") == {
+        "connector_type": "mcp",
+        "connector_id": server_id,
+    }
+
+
+def test_create_task_rolls_back_when_runtime_secret_store_fails(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    with patch(
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
+        side_effect=RuntimeError("store failed for Bearer tenant-token"),
+    ):
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {
+                    "role": "user",
+                    "content": "runtime secret store create failure",
+                },
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer tenant-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["message"] == "Connector runtime setup failed."
+    assert "tenant-token" not in resp.text
+    assert "store failed" not in resp.text
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        assert (
+            db.query(Task)
+            .filter(Task.agent_id == agent_id)
+            .filter(Task.input == "runtime secret store create failure")
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+    turn_ids: list[str] = []
+
+    def recording_store(turn_id, values_by_ref):
+        turn_ids.append(turn_id)
+        store_ephemeral_runtime_values(turn_id, values_by_ref)
+
+    with (
+        patch(
+            "xagent.web.services.task_start.store_ephemeral_runtime_values",
+            new=recording_store,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            side_effect=RuntimeError("schedule failed for Bearer create-token"),
+        ),
+    ):
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {
+                    "role": "user",
+                    "content": "runtime secret schedule failure",
+                },
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer create-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 500
+    assert turn_ids
+    assert get_ephemeral_runtime_values(turn_ids[0]) is None
+    assert "create-token" not in resp.text
+    assert "schedule failed" not in resp.text
+    assert mock_start_task.call_count == 0
+
+
+def test_connector_runtime_resolver_can_override_values(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+
+        def _resolver(_request):
+            return ConnectorRuntimeValues(
+                context={"account_id": "hooked"},
+                secrets={},
+                auth_selector={},
+            )
+
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert view[f"mcp:{server_id}"]["context"] == {"account_id": "hooked"}
+
+
+@pytest.mark.asyncio
+async def test_web_tool_config_applies_runtime_mcp_authorization_header(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+        delegated_authorization_binding=True,
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer tenant-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        tool_config = WebToolConfig(
+            db=db,
+            request=None,
+            user=SimpleNamespace(id=int(task.user_id), is_admin=False),
+            user_id=int(task.user_id),
+            is_admin=False,
+            task_id=f"web_task_{task_id}",
+            include_mcp_tools=True,
+            tool_selection_spec=ToolSelectionSpec.from_raw(
+                tool_categories=["mcp:ShiftCare"]
+            ),
+            connector_runtime_turn_id=turn_id,
+        )
+
+        configs = await tool_config.get_mcp_server_configs()
+        refresh = configs[0]["config"].get("_connector_runtime_refresh")
+        assert callable(refresh)
+
+        def _resolver(_request):
+            return ConnectorRuntimeValues(
+                context={},
+                secrets={"authorization": "Bearer refreshed-token"},
+                auth_selector={},
+            )
+
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            refreshed_connection = refresh()
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert len(configs) == 1
+    assert configs[0]["id"] == server_id
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer tenant-token"
+    assert refreshed_connection["headers"]["Authorization"] == "Bearer refreshed-token"
+    assert configs[0]["connector_runtime"]["secrets"] == {}
+
+
+@pytest.mark.asyncio
+async def test_web_tool_config_resolver_owned_remote_keeps_adapter_runtime_data(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id, required=False)
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            PublicMCPApp(
+                app_id="shiftcare-runtime",
+                name="ShiftCare",
+                description="ShiftCare runtime app",
+                transport="streamable_http",
+                provider_name="shiftcare",
+                launch_config={},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "tenant-account"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    requests: list[TokenRequest] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        requests.append(request)
+        generation = "generation-1" if request.refresh is None else "generation-2"
+        return ResolvedToken(access_token=generation, generation=generation)
+
+    set_oauth_token_resolver_hook(resolver)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        tool_config = WebToolConfig(
+            db=db,
+            request=None,
+            user=SimpleNamespace(id=int(task.user_id), is_admin=False),
+            user_id=int(task.user_id),
+            is_admin=False,
+            task_id=f"web_task_{task_id}",
+            include_mcp_tools=True,
+            tool_selection_spec=ToolSelectionSpec.from_raw(
+                tool_categories=["mcp:ShiftCare"]
+            ),
+            connector_runtime_turn_id=turn_id,
+        )
+        configs = await tool_config.get_mcp_server_configs()
+        refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+        refreshed = await refresh(
+            MCPAuthorizationChallenge(
+                resource_metadata_url=None,
+                scope="shiftcare.read",
+                params={},
+            )
+        )
+    finally:
+        set_oauth_token_resolver_hook(None)
+        db.close()
+
+    assert requests[0].provider == "shiftcare"
+    assert configs[0]["connector_runtime"] == {
+        "context": {"account_id": "tenant-account"},
+        "secrets": {},
+        "auth_selector": {},
+    }
+    assert configs[0]["runtime_bindings"][0]["target"]["target_type"] == "mcp_meta"
+    assert refreshed["headers"]["Authorization"] == "Bearer generation-2"
+
+
+def test_connector_runtime_secrets_do_not_enter_task_transcript(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+        delegated_authorization_binding=True,
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer transcript-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        msgs = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+    finally:
+        db.close()
+
+    assert [msg.content for msg in msgs] == ["first user message"]
+    assert "transcript-token" not in repr([msg.content for msg in msgs])
+
+
+def test_create_task_missing_authorization_returns_401(mock_start_task):
+    """No Authorization header -> 401 invalid_api_key envelope."""
+    agent_id, _key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hi"},
+        },
+    )
+    assert resp.status_code == 401
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_api_key"
+    # No DB side effects
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_agent_id_mismatch_returns_404(mock_start_task):
+    """body.agent_id != authed agent.id -> 404 agent_not_found."""
+    _agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": 999999,  # not the bound agent
+            "message": {"role": "user", "content": "hi"},
+        },
+    )
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["error"]["code"] == "agent_not_found"
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_empty_message_returns_422(mock_start_task):
+    """Empty message.content fails Pydantic min_length=1.
+
+    The /v1/* path rewrites the FastAPI default
+    ``{"detail": [...]}`` shape into the SDK envelope so clients can
+    pin against ``body.error.code == 'invalid_input'`` for 422 just
+    like they do for the other error codes.
+    """
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": ""},
+        },
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "detail" not in body  # legacy FastAPI shape must not leak
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_wrong_role_returns_422(mock_start_task):
+    """role != 'user' fails Pydantic Literal check -> 422 with the
+    SDK envelope shape, not FastAPI's default ``{"detail": [...]}``."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "assistant", "content": "hi"},
+        },
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "detail" not in body
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_revoked_key_returns_401(mock_start_task):
+    """Revoked key can't create tasks -> 401 invalid_api_key."""
+    agent_id, full_key = _create_agent_with_key()
+    # Revoke the key via the admin endpoint
+    admin = _admin_headers()
+    revoke = client.delete(f"/api/agents/{agent_id}/api-key", headers=admin)
+    assert revoke.status_code == 200
+    assert revoke.json()["revoked"] is True
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hi"},
+        },
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+    assert mock_start_task.call_count == 0
+
+
+def test_create_task_cross_user_agent_returns_404(mock_start_task):
+    """Bob's key cannot target Alice's agent_id -> 404 agent_not_found.
+
+    Defense: the key is bound to agent X. Putting agent_id=Y in the
+    body where Y != X always returns 404 regardless of whether Y
+    exists, owned by a different user, etc.
+    """
+    # Admin (alice) creates agent A and a key for it.
+    alice_agent_id, _alice_key = _create_agent_with_key()
+
+    # Register bob and create agent B + key, then have bob attempt to
+    # POST against alice's agent_id using bob's own key.
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    # Bob's key + Alice's agent_id in body -> 404
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(bob_key),
+        json={
+            "agent_id": alice_agent_id,
+            "message": {"role": "user", "content": "hi"},
+        },
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "agent_not_found"
+    assert mock_start_task.call_count == 0
+
+
+# ===== Shared helper for E tests: create a task via POST then return its id =====
+
+
+def _create_task(full_key: str, agent_id: int, content: str = "hello") -> int:
+    """Drive POST /v1/chat/tasks and return the resulting task_id."""
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": content}},
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()["task_id"]
+
+
+# ===== POST /v1/chat/tasks/{task_id}/messages =====
+
+
+def test_append_task_uses_one_connection_at_a_time(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detached append preparation must release the only slot before claim."""
+
+    agent_id, full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="single-slot append",
+            description="first turn",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent_id,
+            input="first turn",
+            source="sdk",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    try:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "single-slot append"},
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert engine.pool.checkedout() == 0
+    finally:
+        engine.dispose()
+
+
+def _force_task_status(task_id: int, status: TaskStatus) -> None:
+    """Bypass the bg coroutine and flip a task to a desired status.
+
+    Tests in this file mock out the bg scheduling so a freshly-created
+    task stays at PENDING forever. The orchestrator's ``append_turn``
+    only accepts terminal statuses (COMPLETED / FAILED) -- which is
+    correct production behavior -- so tests that exercise the
+    append-happy path need to push the task to COMPLETED first.
+    """
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = status
+        db.commit()
+    finally:
+        db.close()
+
+
+def _change_agent_owner_for_existing_task(
+    *, task_id: int, agent_id: int, username: str
+) -> tuple[int, int]:
+    """Change the agent owner while preserving the task's persisted owner."""
+    _register_second_user(username=username)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        persisted_task_owner_id = int(task.user_id)
+        current_agent_owner_id = int(
+            db.query(User.id).filter(User.username == username).one()[0]
+        )
+        assert current_agent_owner_id != persisted_task_owner_id
+
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.user_id = current_agent_owner_id
+        task.status = TaskStatus.COMPLETED
+        db.commit()
+        return persisted_task_owner_id, current_agent_owner_id
+    finally:
+        db.close()
+
+
+def test_append_message_happy_path(mock_start_task):
+    """Returns 202 + accepted_at, persists new user message, kicks off bg."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    # Mark the previous turn as COMPLETED so append_turn's atomic claim
+    # passes (PENDING is rejected as busy because it means the create's
+    # bg run hasn't finished yet).
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()  # discard the create-task call so we count just the append
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    # The atomic claim in the endpoint already flipped the row to
+    # RUNNING; the response must mirror that so back-to-back POST+GET
+    # don't show contradictory statuses to SDK clients.
+    assert body["status"] == "running"
+    assert "accepted_at" in body
+
+    # Two user messages now exist for this task; task.input is the latest
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        msgs = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert len(msgs) == 2
+        assert [m.content for m in msgs] == ["first turn", "second turn"]
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        assert task.input == "second turn"
+    finally:
+        db.close()
+
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
+    mock_start_task,
+):
+    """A key-bound agent may append while the task keeps its runtime owner."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+
+    persisted_task_owner_id, current_agent_owner_id = (
+        _change_agent_owner_for_existing_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            username="sdk-owner-drift",
+        )
+    )
+    mock_start_task.reset_mock()
+
+    with patch.object(
+        task_start.TaskTurnOrchestrator,
+        "schedule_claimed_turn",
+        wraps=task_start.TaskTurnOrchestrator.schedule_claimed_turn,
+    ) as schedule_claimed_turn:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    assert schedule_claimed_turn.await_count == 1
+    assert schedule_claimed_turn.await_args.kwargs["task_owner_user_id"] == (
+        persisted_task_owner_id
+    )
+    assert (
+        schedule_claimed_turn.await_args.kwargs["actor_user_id"]
+        == current_agent_owner_id
+    )
+
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        messages = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert [message.user_id for message in messages] == [
+            persisted_task_owner_id,
+            persisted_task_owner_id,
+        ]
+    finally:
+        db.close()
+
+
+def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
+    mock_start_task,
+):
+    """Task-aware uploads use the persisted owner after agent-owner drift."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    persisted_task_owner_id, _current_agent_owner_id = (
+        _change_agent_owner_for_existing_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            username="sdk-file-owner-drift",
+        )
+    )
+    mock_start_task.reset_mock()
+
+    upload_response = client.post(
+        f"/v1/chat/files?task_id={task_id}",
+        headers=_bearer(full_key),
+        files=[("files", ("owner-file.txt", b"owner data", "text/plain"))],
+    )
+    assert upload_response.status_code == 200, upload_response.text
+    file_id = upload_response.json()["files"][0]["file_id"]
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        uploaded_file = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.user_id == persisted_task_owner_id
+        assert uploaded_file.task_id is None
+        assert str(uploaded_file.storage_key).startswith(
+            f"users/{persisted_task_owner_id}/uploads/"
+        )
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "use the existing file",
+                "files": [file_id],
+            },
+        },
+    )
+
+    assert response.status_code == 202, response.text
+
+    db = _direct_db_session()
+    try:
+        uploaded_file = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.user_id == persisted_task_owner_id
+        assert uploaded_file.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_task_aware_upload_rejects_other_agents_task_without_writing_file(
+    mock_start_task,
+):
+    """A key cannot select another agent's task runtime owner for upload."""
+    owner_agent_id, owner_key = _create_agent_with_key()
+    owner_task_id = _create_task(owner_key, owner_agent_id)
+    mock_start_task.reset_mock()
+
+    other_headers = _register_second_user(username="sdk-task-upload-other")
+    _other_agent_id, other_key = _create_agent_with_key_for(other_headers)
+    response = client.post(
+        f"/v1/chat/files?task_id={owner_task_id}",
+        headers=_bearer(other_key),
+        files=[("files", ("forbidden-owner.txt", b"private", "text/plain"))],
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "task_not_found"
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        assert (
+            db.query(UploadedFile)
+            .filter(UploadedFile.filename == "forbidden-owner.txt")
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("task_sources", "expected_status"),
+    [
+        (None, 202),
+        ({"sdk"}, 202),
+        ({"external"}, 400),
+    ],
+    ids=["legacy-global", "matching-sdk", "non-matching-external"],
+)
+def test_append_message_resolver_scope_follows_persisted_sdk_source(
+    mock_start_task,
+    task_sources: set[str] | None,
+    expected_status: int,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+    )
+    create_response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_response.status_code == 202, create_response.text
+    task_id = create_response.json()["task_id"]
+    initial_turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    db = _direct_db_session()
+    try:
+        task_owner_user_id = int(
+            db.query(Task.user_id).filter(Task.id == task_id).one()[0]
+        )
+    finally:
+        db.close()
+
+    resolver_requests = []
+
+    def resolver(request):
+        resolver_requests.append(request)
+        return ConnectorRuntimeValues(
+            context=request.values.context,
+            secrets={"authorization": "Bearer resolver-token"},
+            auth_selector=request.values.auth_selector,
+        )
+
+    append_turn_id: str | None = None
+    set_connector_runtime_resolver_for_testing(
+        resolver,
+        task_sources=task_sources,
+    )
+    try:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+            },
+        )
+        assert response.status_code == expected_status, response.text
+
+        if expected_status == 202:
+            assert mock_start_task.call_count == 1
+            append_turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+            runtime_turn_id = append_turn_id
+        else:
+            assert response.json()["error"]["code"] == "runtime_secret_unavailable"
+            assert response.json()["error"]["details"]["reason"] == "not_provided"
+            assert mock_start_task.call_count == 0
+            runtime_turn_id = initial_turn_id
+
+        db = _direct_db_session()
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=runtime_turn_id,
+                user_id=task_owner_user_id,
+            )
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+        pop_ephemeral_runtime_values(initial_turn_id)
+        if append_turn_id is not None:
+            pop_ephemeral_runtime_values(append_turn_id)
+
+    if expected_status == 202:
+        assert view[f"mcp:{server_id}"]["secrets"] == {
+            "authorization": "Bearer resolver-token"
+        }
+        assert len(resolver_requests) == 1
+        assert resolver_requests[0].task_source == "sdk"
+        assert resolver_requests[0].user_id == task_owner_user_id
+    else:
+        assert view[f"mcp:{server_id}"]["secrets"] == {
+            "authorization": "Bearer initial-token"
+        }
+        assert resolver_requests == []
+
+
+def test_append_message_rejects_changed_connector_runtime_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "9999"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "runtime_context_immutable"
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_accepts_same_connector_runtime_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_ignores_disabled_historical_connector_not_in_payload(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    stale_server_id = _install_runtime_mcp_connector(
+        agent_id, name="StaleCare", required=False, selected=False
+    )
+    active_server_id = _install_runtime_mcp_connector(
+        agent_id,
+        name="ActiveCare",
+        required=False,
+        secret_required=True,
+        selected=False,
+    )
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.tool_categories = ["mcp"]
+        db.commit()
+    finally:
+        db.close()
+
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": active_server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    db = _direct_db_session()
+    try:
+        junction = (
+            db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == stale_server_id)
+            .one()
+        )
+        junction.is_active = False
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": active_server_id,
+                    },
+                    "secrets": {"authorization": "Bearer append-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_rejects_disabled_historical_connector_in_payload(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    stale_server_id = _install_runtime_mcp_connector(
+        agent_id, name="StaleCare", required=False, selected=False
+    )
+    active_server_id = _install_runtime_mcp_connector(
+        agent_id,
+        name="ActiveCare",
+        required=False,
+        secret_required=True,
+        selected=False,
+    )
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.tool_categories = ["mcp"]
+        db.commit()
+    finally:
+        db.close()
+
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": active_server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    db = _direct_db_session()
+    try:
+        junction = (
+            db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == stale_server_id)
+            .one()
+        )
+        junction.is_active = False
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": stale_server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "connector_not_found"
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    pop_ephemeral_runtime_values(mock_start_task.call_args.kwargs["payload"].turn_id)
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    with patch(
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
+        side_effect=RuntimeError("store failed for Bearer append-token"),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer append-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["message"] == "Connector runtime setup failed."
+    assert "append-token" not in resp.text
+    assert "store failed" not in resp.text
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.COMPLETED
+        assert task.input == "first turn"
+        assert task.error_message is None
+    finally:
+        db.close()
+
+
+def test_append_message_does_not_store_runtime_secret_when_task_is_busy(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    pop_ephemeral_runtime_values(mock_start_task.call_args.kwargs["payload"].turn_id)
+    task_id = create_resp.json()["task_id"]
+    mock_start_task.reset_mock()
+
+    turn_ids: list[str] = []
+
+    def recording_store(turn_id, values_by_ref):
+        turn_ids.append(turn_id)
+        store_ephemeral_runtime_values(turn_id, values_by_ref)
+
+    with patch(
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
+        new=recording_store,
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer append-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_busy"
+    assert turn_ids == []
+    assert "append-token" not in resp.text
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_to_running_task_returns_409(mock_start_task):
+    """Appending to a RUNNING task is rejected as task_busy."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    mock_start_task.reset_mock()
+
+    # Flip status to RUNNING directly so we don't have to actually run
+    # the agent service in tests.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.RUNNING
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_busy"
+    # No new background kickoff happened
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_to_waiting_task_returns_interaction_response_required(
+    mock_start_task,
+):
+    """Appending to a waiting_for_user task is rejected with the
+    dedicated code (not task_busy), points at reply, and leaves the task
+    completely untouched -- no new transcript row, same status, same
+    run_id, no new background kickoff."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    db = _direct_db_session()
+    try:
+        before = db.query(Task).filter(Task.id == task_id).one()
+        run_id_before = before.run_id
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_before = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+    finally:
+        db.close()
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_response_required"
+    assert "reply" in resp.json()["error"]["message"]
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        after = db.query(Task).filter(Task.id == task_id).one()
+        assert after.status == TaskStatus.WAITING_FOR_USER
+        assert after.run_id == run_id_before
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_after = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+        assert message_count_after == message_count_before
+    finally:
+        db.close()
+
+
+def test_append_message_to_running_task_still_returns_task_busy(mock_start_task):
+    """The new waiting-specific code must not leak onto the
+    unrelated RUNNING rejection -- RUNNING keeps plain task_busy."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.RUNNING)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "task_busy"
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_claims_slot_atomically(mock_start_task):
+    """Successful append flips task.status to RUNNING in the same
+    transaction as the input write, so a concurrent POST can't pass
+    the busy check and both kick off background tasks.
+
+    We verify the post-state directly: after one successful append,
+    task.status == RUNNING and a second POST to the same task gets
+    409 even though the bg coroutine hasn't run yet (mocked out).
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="t1")
+    # Push to COMPLETED so the first append is allowed (PENDING is busy).
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    # First append succeeds and atomically claims the slot.
+    r1 = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "t2"}},
+    )
+    assert r1.status_code == 202
+
+    # task.status was flipped to RUNNING inside the endpoint, even
+    # though the (mocked) bg coroutine never ran. This is the
+    # mechanism that defeats the TOCTOU race.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+    finally:
+        db.close()
+
+    # Second append (the would-be losing concurrent request) hits the
+    # claim filter and 409s.
+    r2 = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "t3"}},
+    )
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "task_busy"
+    # Only one bg kickoff total (from the winning first append).
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_schedules_after_commit_acknowledgement_loss(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+    original_commit = Session.commit
+    acknowledgement_lost = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal acknowledgement_lost
+        original_commit(session)
+        if not acknowledgement_lost:
+            acknowledgement_lost = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    response = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second after disconnect"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert acknowledgement_lost is True
+    assert mock_start_task.call_count == 1
+
+
+def test_create_then_append_race_returns_409(mock_start_task):
+    """Regression: create-then-immediate-append must 409, not race.
+
+    The old append_turn used ``status != RUNNING`` which let PENDING
+    slip through. A client could POST /v1/chat/tasks, get a PENDING
+    task back, and immediately POST /messages; both the create's bg
+    coroutine and the append's bg coroutine would then race to run
+    the same task. The orchestrator's terminal-state-only filter
+    closes this: PENDING (= "first turn scheduled but not started")
+    is treated as busy.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+    # NOT calling _force_task_status here — task stays in PENDING
+    # exactly as it would right after the SDK's create response is
+    # returned but before the bg coroutine ran.
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second"},
+        },
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_busy"
+    # No second bg kickoff should have happened
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task):
+    """Regression: when ``append_turn`` refuses because a previous bg
+    coroutine is still in flight, the DB row must NOT have been mutated.
+
+    The bug scenario: previous turn flipped status to COMPLETED but the
+    bg coroutine is still in tail cleanup (``_sync_sdk_columns`` hasn't
+    returned), so ``background_task_manager.running_tasks[task_id]`` is
+    still a not-done asyncio.Task. A new append should be refused as
+    busy, and the DB row should still report COMPLETED + the original
+    input — not RUNNING + new input.
+
+    If the inflight check happened *after* the atomic UPDATE (the old
+    ordering), the row would be RUNNING + new_input even on 409
+    rejection. The old runner's _sync_sdk_columns would then see
+    RUNNING and flip the row to FAILED with a placeholder error
+    message, corrupting an otherwise successful past turn.
+    """
+    import asyncio
+
+    from xagent.web.services.task_execution import background_task_manager
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    # Snapshot DB state right before the append attempt.
+    db_before = _direct_db_session()
+    try:
+        task_before = db_before.query(Task).filter(Task.id == task_id).first()
+        original_status = task_before.status
+        original_input = task_before.input
+    finally:
+        db_before.close()
+
+    # Plant a not-done asyncio.Task in the bg manager registry to
+    # simulate "previous runner is still cleaning up".
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _never_done() -> None:
+            await asyncio.sleep(3600)
+
+        fake_inflight = loop.create_task(_never_done())
+        background_task_manager.running_tasks[task_id] = fake_inflight
+
+        try:
+            resp = client.post(
+                f"/v1/chat/tasks/{task_id}/messages",
+                headers=_bearer(full_key),
+                json={
+                    "agent_id": agent_id,
+                    "message": {"role": "user", "content": "second"},
+                },
+            )
+            assert resp.status_code == 409
+            assert resp.json()["error"]["code"] == "task_busy"
+            assert mock_start_task.call_count == 0
+
+            # The critical assertion: DB row was NOT mutated by the
+            # refused append. status stays terminal, input unchanged.
+            db_after = _direct_db_session()
+            try:
+                task_after = db_after.query(Task).filter(Task.id == task_id).first()
+                assert task_after.status == original_status, (
+                    f"task.status was corrupted on refused append: "
+                    f"{original_status} -> {task_after.status}"
+                )
+                assert task_after.input == original_input, (
+                    f"task.input was overwritten on refused append: "
+                    f"{original_input!r} -> {task_after.input!r}"
+                )
+            finally:
+                db_after.close()
+        finally:
+            # Clean up the fake registry entry so other tests aren't
+            # affected.
+            background_task_manager.running_tasks.pop(task_id, None)
+            fake_inflight.cancel()
+            loop.run_until_complete(
+                asyncio.gather(fake_inflight, return_exceptions=True)
+            )
+    finally:
+        loop.close()
+
+
+def test_append_message_to_missing_task_returns_404(mock_start_task):
+    """Appending to a task that doesn't exist -> 404 task_not_found."""
+    agent_id, full_key = _create_agent_with_key()
+    resp = client.post(
+        "/v1/chat/tasks/9999999/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_to_other_agents_task_returns_404(mock_start_task):
+    """Bob can't append to Alice's task even if he knows the id."""
+    alice_agent_id, alice_key = _create_agent_with_key()
+    alice_task_id = _create_task(alice_key, alice_agent_id)
+    mock_start_task.reset_mock()
+
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    resp = client.post(
+        f"/v1/chat/tasks/{alice_task_id}/messages",
+        headers=_bearer(bob_key),
+        json={"agent_id": bob_agent_id, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert mock_start_task.call_count == 0
+
+
+def test_append_message_body_agent_id_mismatch_returns_404(mock_start_task):
+    """body.agent_id != authed agent.id -> 404 agent_not_found.
+
+    Distinct from cross-agent task ownership (which is task_not_found) --
+    here the task IS the caller's, but the body claims a different
+    agent_id; consistent with POST /v1/chat/tasks behavior.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": 999999, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "agent_not_found"
+    assert mock_start_task.call_count == 0
+
+
+# ===== GET /v1/chat/tasks/{task_id} =====
+
+
+def test_get_task_running_right_after_create(mock_start_task):
+    """A fresh SDK task is visible as ``status='running'`` immediately
+    after POST returns: the atomic claim commits the status flip before
+    202, so an immediate GET sees RUNNING + input set + output/error
+    null + completed_at null.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="seed input")
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    assert body["status"] == "running"
+    assert body["input"] == "seed input"
+    assert body["output"] is None
+    assert body["error"] is None
+    assert "created_at" in body
+    assert body["completed_at"] is None
+
+
+def test_get_task_completed_returns_output(mock_start_task):
+    """Completed task: output populated, completed_at set."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    # Flip status + write output to simulate completed background turn
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.COMPLETED
+        task.output = "final answer"
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert body["output"] == "final answer"
+    assert body["completed_at"] is not None
+
+
+def test_get_task_failed_returns_error(mock_start_task):
+    """Failed task: error populated, completed_at set."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.FAILED
+        task.error_message = "agent crashed"
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert body["error"] == "agent crashed"
+    assert body["output"] is None
+    assert body["completed_at"] is not None
+
+
+def test_get_task_cache_io_runs_after_database_session_closes(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task snapshot cache I/O must never pin the request's pool slot."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out: list[tuple[str, int]] = []
+
+    def recording_cache_get(_key: str):
+        checked_out.append(("get", engine.pool.checkedout()))
+        return None
+
+    def recording_cache_set(
+        _key: str,
+        _value: object,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        del ttl_seconds
+        checked_out.append(("set", engine.pool.checkedout()))
+
+    monkeypatch.setattr(v1_tasks, "cache_get", recording_cache_get)
+    monkeypatch.setattr(v1_tasks, "cache_set", recording_cache_set)
+
+    try:
+        response = client.get(
+            f"/v1/chat/tasks/{task_id}",
+            headers=_bearer(full_key),
+        )
+        assert response.status_code == 200, response.text
+        assert checked_out == [("get", 0), ("set", 0)]
+    finally:
+        engine.dispose()
+
+
+# ===== GET pending_interaction projection =====
+
+
+def _insert_question_message(
+    task_id: int,
+    *,
+    content: str = "Where are you flying to?",
+    interactions: list[dict] | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Write one assistant question row directly, bypassing the WS writer.
+
+    Mirrors the shape ``_persist_agent_outbound_event`` in
+    ``api/websocket.py`` writes for ``expect_response`` outbound events:
+    ``role='assistant'``, ``message_type='question'``.
+    """
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                role="assistant",
+                content=content,
+                message_type="question",
+                interactions=interactions,
+                turn_id=turn_id or f"question-{content[:8]}-{id(content)}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_get_task_waiting_returns_pending_interaction_with_structured_controls(
+    mock_start_task,
+):
+    """Waiting task with a structured question returns question +
+    non-empty interactions."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Where are you flying to?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"}
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "waiting_for_user"
+    assert body["pending_interaction"] is not None
+    assert body["pending_interaction"]["question"] == "Where are you flying to?"
+    assert body["pending_interaction"]["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
+def test_get_task_waiting_null_interactions_stays_null(mock_start_task):
+    """A plain-text question (interactions stored NULL) must come
+    back as null, not []."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(task_id, content="Should I continue?", interactions=None)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] is None
+
+
+def test_get_task_waiting_empty_interactions_list_stays_empty_list(mock_start_task):
+    """An empty structured-controls list must come back as [], not
+    null -- the server does not normalize [] and null together."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(task_id, content="Should I continue?", interactions=[])
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == []
+
+
+def test_get_task_waiting_drops_non_mapping_interaction_elements(mock_start_task):
+    """A dirty row whose stored interactions list mixes dicts with a
+    non-dict element (e.g. a bare string a buggy writer once persisted)
+    must not 500 the GET forever -- the v1 read path filters non-mapping
+    elements out, keeping only the valid dict entries."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Should I continue?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"},
+            "not a mapping",
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
+def test_get_task_waiting_with_no_question_row_returns_null(mock_start_task):
+    """A task can reach waiting_for_user with no question message
+    persisted (e.g. an empty outbound message string). pending_interaction
+    must be null, and the response must still be 200, not 500."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pending_interaction"] is None
+
+
+def test_get_task_non_waiting_never_queries_for_a_question(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A non-waiting task's pending_interaction is null, and the
+    server must not even issue the question lookup query."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+
+    called = False
+
+    def spy_get_pending_interaction_question(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return None, None
+
+    monkeypatch.setattr(
+        v1_tasks,
+        "get_pending_interaction_question",
+        spy_get_pending_interaction_question,
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pending_interaction"] is None
+    assert called is False
+
+
+def test_get_task_pending_interaction_bypasses_stale_cache_entry(mock_start_task):
+    """Cache isolation. The task is already waiting_for_user (with
+    no question yet) when the first GET populates the snapshot cache. A
+    question row is then inserted directly into ``task_chat_messages`` --
+    which, unlike a ``Task`` column write, never touches ``tasks.updated_at``
+    -- so the cache's freshness token is still valid on the next GET. That
+    next GET must still surface the new question: the cache entry itself
+    must never carry ``pending_interaction``, or this second read would
+    serve the pre-question snapshot forever (until the cache TTL expires).
+
+    Needs a real cache backend (the default test backend is a no-op), or
+    this test would pass vacuously without ever exercising a cache hit.
+    """
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        agent_id, full_key = _create_agent_with_key()
+        task_id = _create_task(full_key, agent_id)
+        _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+        first = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "waiting_for_user"
+        assert first.json()["pending_interaction"] is None
+
+        # This insert does not touch the tasks row at all, so
+        # tasks.updated_at -- the cache's only freshness token -- is
+        # unchanged. The next GET is a genuine cache hit on the base body.
+        _insert_question_message(task_id, content="Should I continue?")
+
+        second = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["status"] == "waiting_for_user"
+        assert body["pending_interaction"] is not None
+        assert body["pending_interaction"]["question"] == "Should I continue?"
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_surface", ["task", "steps"])
+async def test_task_read_pool_wait_does_not_block_event_loop(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+    read_surface: str,
+) -> None:
+    """Both polling surfaces wait for the one-slot pool in a DB worker."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        principal = ApiKeyPrincipal(
+            key=RuntimeApiKeySnapshot(key_prefix="xag_test"),
+            agent=AgentPrincipalSnapshot(
+                id=agent_id,
+                user_id=int(agent.user_id),
+                execution_mode=str(agent.execution_mode),
+                status=str(agent.status.value),
+                origin=str(agent.origin),
+            ),
+        )
+    finally:
+        db.close()
+
+    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=0.5)
+    held_connection = engine.connect()
+    worker_entered = threading.Event()
+    helper_name = (
+        "_load_task_info_snapshot"
+        if read_surface == "task"
+        else "_load_task_steps_version_snapshot"
+    )
+    original_helper = getattr(v1_tasks, helper_name)
+
+    def recording_helper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        worker_entered.set()
+        return original_helper(*args, **kwargs)
+
+    monkeypatch.setattr(v1_tasks, helper_name, recording_helper)
+    with gated_pool_checkout(engine) as gate:
+        operation = asyncio.create_task(
+            v1_tasks.get_chat_task(task_id, principal)
+            if read_surface == "task"
+            else v1_tasks.get_chat_task_steps(task_id, principal)
+        )
+
+        try:
+            await gate.wait_until_contending()
+            # A checkpoint while the checkout is still parked proves loop progress.
+            await asyncio.sleep(0)
+            assert worker_entered.is_set()
+            assert not operation.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(operation, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
+            checked_out = engine.pool.checkedout()
+            engine.dispose()
+
+        response = operation.result()
+        assert response.task_id == task_id
+        assert checked_out == 0
+
+
+def test_get_missing_task_returns_404(mock_start_task):
+    _agent_id, full_key = _create_agent_with_key()
+    resp = client.get("/v1/chat/tasks/9999999", headers=_bearer(full_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_get_other_agents_task_returns_404(mock_start_task):
+    """Cross-agent task access -> 404 (not leaking existence)."""
+    alice_agent_id, alice_key = _create_agent_with_key()
+    alice_task_id = _create_task(alice_key, alice_agent_id)
+
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    resp = client.get(f"/v1/chat/tasks/{alice_task_id}", headers=_bearer(bob_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+# ===== F: GET /v1/chat/tasks/{task_id}/steps =====
+
+
+def _insert_trace_event(
+    *,
+    task_id: int,
+    event_type: str,
+    event_id: str,
+    timestamp: datetime,
+    data: dict,
+    step_id: str | None = None,
+    build_id: str | None = None,
+) -> None:
+    """Insert one TraceEvent row directly via the test DB.
+
+    Bypasses the production trace handler (which runs through asyncio
+    + thread pool) so tests can assert on the GET /steps surface
+    without spinning up the agent runtime.
+    """
+    db = _direct_db_session()
+    try:
+        ev = TraceEvent(
+            task_id=task_id,
+            event_id=event_id,
+            event_type=event_type,
+            timestamp=timestamp,
+            step_id=step_id,
+            build_id=build_id,
+            data=data,
+        )
+        db.add(ev)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_get_steps_returns_mapped_steps_in_order(mock_start_task):
+    """Insert react_action + tool_execution + ai_message + filtered
+    llm_call events, GET /steps, assert 3 public steps in started_at
+    order with correct types and statuses.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    # Public step 1: thinking phase=action (react_action_start/end)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="react_action_start",
+        event_id="evt-1",
+        timestamp=base.replace(second=1),
+        step_id="step-A",
+        data={},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="react_action_end",
+        event_id="evt-2",
+        timestamp=base.replace(second=2),
+        step_id="step-A",
+        data={},
+    )
+
+    # Filtered: llm_call_start / end -- must not appear
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="llm_call_start",
+        event_id="evt-3",
+        timestamp=base.replace(second=3),
+        step_id="step-A",
+        data={},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="llm_call_end",
+        event_id="evt-4",
+        timestamp=base.replace(second=4),
+        step_id="step-A",
+        data={},
+    )
+
+    # Public step 2: tool_call (execute_python)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="evt-5",
+        timestamp=base.replace(second=5),
+        step_id="step-A",
+        data={
+            "tool_name": "execute_python",
+            "tool_args": {"code": "print(1)"},
+            "tool_execution_id": "tx-1",
+        },
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_end",
+        event_id="evt-6",
+        timestamp=base.replace(second=6),
+        step_id="step-A",
+        data={
+            "tool_name": "execute_python",
+            "tool_args": {"code": "print(1)"},
+            "tool_execution_id": "tx-1",
+            "result": {"output": "1\n"},
+            "success": True,
+        },
+    )
+
+    # Public step 3: message role=assistant (ai_message)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-7",
+        timestamp=base.replace(second=7),
+        data={"content": "Here's the result"},
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    steps = body["steps"]
+    assert len(steps) == 3
+
+    # Assert ordering and types
+    assert steps[0]["type"] == "thinking"
+    assert steps[0]["data"]["phase"] == "action"
+    assert steps[0]["status"] == "completed"
+
+    assert steps[1]["type"] == "tool_call"
+    assert steps[1]["data"]["name"] == "execute_python"
+    assert steps[1]["data"]["args"] == {"code": "print(1)"}
+    assert steps[1]["data"]["result"] == {"output": "1\n"}
+
+    assert steps[2]["type"] == "message"
+    assert steps[2]["data"] == {"role": "assistant", "content": "Here's the result"}
+
+
+def test_get_steps_on_a_trace_expired_task_is_empty_not_an_error(mock_start_task):
+    """Acceptance criterion from #2563: empty, not 500.
+
+    Retention's trace path deletes a terminal task's ``trace_events`` while
+    keeping the task itself, so this endpoint is left authorizing a task that
+    exists and reading a timeline that no longer does. The cache makes that
+    worth pinning rather than assuming: the cached entry is versioned on
+    ``max(trace_events.id)``, which the purge takes to 0, so a version compared
+    loosely enough could serve the purged steps back.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-expired-1",
+        timestamp=base,
+        data={"content": "before expiry"},
+    )
+
+    # A real backend, because the default is a no-op: without this the
+    # "warm the cache first" step below caches nothing and the versioned-read
+    # path this test exists for is never exercised.
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        _run_trace_expiry_steps_case(task_id, agent_id, full_key, base)
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
+    from datetime import timedelta
+
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
+    )
+
+    # Populate the cache first: a purge that only looked correct on a cold
+    # read would pass without this.
+    warm = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert warm.status_code == 200, warm.text
+    assert len(warm.json()["steps"]) == 1
+
+    now = base + timedelta(days=200)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.COMPLETED
+        task.last_activity_at = base
+        task.lease_expires_at = None
+        # The transcript was written at wall-clock time, and the assessment
+        # measures from the newest message as well as the stored anchor
+        # (#2580), so it has to be as old as the anchor it stands beside.
+        db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).update(
+            {TaskChatMessage.created_at: base}, synchronize_session=False
+        )
+        db.commit()
+        # Task creation stages a start command; the predicate counts a pending
+        # command as work still owed, which is the point of that leg. Clear it
+        # so this test is about the trace path rather than about eligibility.
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).delete(synchronize_session=False)
+        db.commit()
+        assert (
+            purge_task(
+                db,
+                task_id,
+                now=now,
+                conversation_days=365,
+                trace_days=90,
+            )
+            is RetentionPurgeAction.PURGED_TRACES
+        )
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["steps"] == []
+    # #2565: the empty list is told apart from "never had steps".
+    assert body["steps_expired"] is True
+    expired_at = datetime.fromisoformat(body["steps_expired_at"])
+    assert expired_at.replace(tzinfo=expired_at.tzinfo or UTC) == now
+
+
+def test_get_steps_task_not_found_returns_404(mock_start_task):
+    """Non-existent task_id -> 404 task_not_found."""
+    _agent_id, full_key = _create_agent_with_key()
+    resp = client.get("/v1/chat/tasks/9999999/steps", headers=_bearer(full_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_get_steps_other_agents_task_returns_404(mock_start_task):
+    """Cross-agent steps access -> 404 (not leaking existence)."""
+    alice_agent_id, alice_key = _create_agent_with_key()
+    alice_task_id = _create_task(alice_key, alice_agent_id)
+
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent steps",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    resp = client.get(f"/v1/chat/tasks/{alice_task_id}/steps", headers=_bearer(bob_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_get_steps_empty_task_returns_empty_array(mock_start_task):
+    """Task with no trace events yet -> 200 + empty steps array."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    assert body["steps"] == []
+
+
+def test_get_steps_ignores_worker_build_trace_events(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="worker-trace-1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
+        step_id="worker-step",
+        build_id="agent_123_abcd1234",
+        data={
+            "tool_name": "worker_tool",
+            "tool_execution_id": "worker-call-1",
+            "worker_task_id": "agent_123_abcd1234",
+        },
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["steps"] == []
+
+
+def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-cache-1",
+        timestamp=base,
+        data={"content": "cached"},
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        from xagent.web.api.v1 import _step_mapping
+
+        with patch(
+            "xagent.web.api.v1.tasks.map_trace_events_to_public_steps",
+            wraps=_step_mapping.map_trace_events_to_public_steps,
+        ) as mapper:
+            first = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+            second = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+
+            assert first.status_code == 200, first.text
+            assert second.status_code == 200, second.text
+            assert first.json() == second.json()
+            assert mapper.call_count == 1
+
+            _insert_trace_event(
+                task_id=task_id,
+                event_type="ai_message",
+                event_id="evt-cache-2",
+                timestamp=base.replace(second=1),
+                data={"content": "new"},
+            )
+            third = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+
+            assert third.status_code == 200, third.text
+            assert mapper.call_count == 2
+            assert len(third.json()["steps"]) == 2
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def test_get_steps_cache_miss_revalidates_after_releasing_first_session(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache miss reloads the authorized trace snapshot in a second Session."""
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-before-cache",
+        timestamp=base,
+        data={"content": "before cache"},
+    )
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    cache_checked_out: list[int] = []
+    inserted = False
+
+    def cache_miss_after_concurrent_trace(_key: str):
+        nonlocal inserted
+        cache_checked_out.append(engine.pool.checkedout())
+        if not inserted:
+            inserted = True
+            _insert_trace_event(
+                task_id=task_id,
+                event_type="ai_message",
+                event_id="evt-during-cache",
+                timestamp=base.replace(second=1),
+                data={"content": "during cache"},
+            )
+        return None
+
+    monkeypatch.setattr(v1_tasks, "cache_get", cache_miss_after_concurrent_trace)
+    monkeypatch.setattr(v1_tasks, "cache_set", lambda *_args, **_kwargs: None)
+
+    try:
+        response = client.get(
+            f"/v1/chat/tasks/{task_id}/steps",
+            headers=_bearer(full_key),
+        )
+        assert response.status_code == 200, response.text
+        assert cache_checked_out == [0]
+        assert [step["data"]["content"] for step in response.json()["steps"]] == [
+            "before cache",
+            "during cache",
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_get_steps_redacts_runtime_secrets_before_cache_write(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="evt-secret-start",
+        timestamp=base,
+        step_id="secret-step",
+        data={
+            "tool_name": "custom_api_call",
+            "tool_execution_id": "secret-call",
+            "tool_args": {
+                "headers": {
+                    "Authorization": "Bearer runtime-token",
+                    "X-Account": "6185",
+                },
+                "connector_runtime": {
+                    "secrets": {"authorization": "Bearer nested-token"},
+                    "auth_selector": {"resource_owner_key": "xagent:user:owner"},
+                },
+            },
+        },
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_end",
+        event_id="evt-secret-end",
+        timestamp=base.replace(second=1),
+        step_id="secret-step",
+        data={
+            "tool_name": "custom_api_call",
+            "tool_execution_id": "secret-call",
+            "result": {
+                "headers": {"Authorization": "Bearer echoed-token"},
+                "safe": "ok",
+            },
+            "success": True,
+        },
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        from xagent.web.api.v1 import _step_mapping
+
+        with patch(
+            "xagent.web.api.v1.tasks.map_trace_events_to_public_steps",
+            wraps=_step_mapping.map_trace_events_to_public_steps,
+        ) as mapper:
+            first = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+            cached = cache_get(task_steps_key(task_id))
+            second = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+    finally:
+        set_cache_backend_for_testing(None)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json() == second.json()
+    assert mapper.call_count == 1
+    assert isinstance(cached, dict)
+    assert "runtime-token" not in repr(cached)
+    assert "nested-token" not in repr(cached)
+    assert "xagent:user:owner" not in repr(cached)
+    assert "echoed-token" not in repr(cached)
+    response_text = first.text + second.text
+    assert "runtime-token" not in response_text
+    assert "nested-token" not in response_text
+    assert "xagent:user:owner" not in response_text
+    assert "echoed-token" not in response_text
+    step = first.json()["steps"][0]
+    assert (
+        step["data"]["args"]["headers"]["Authorization"] == "[REDACTED_RUNTIME_SECRET]"
+    )
+    assert step["data"]["args"]["headers"]["X-Account"] == "6185"
+    assert step["data"]["result"]["headers"]["Authorization"] == (
+        "[REDACTED_RUNTIME_SECRET]"
+    )
+
+
+# ===== source filtering: SDK API surface only sees source="sdk" tasks =====
+
+
+def _insert_internal_task(agent_id: int) -> int:
+    """Manually INSERT a task under ``agent_id`` with source != "sdk".
+
+    Tests for the SDK source filter need a task that lives under the
+    same agent but was created by the Web UI / internal paths, not
+    via POST /v1/chat/tasks. Since the SDK create endpoint always
+    writes source="sdk", we bypass it and craft the row directly.
+    """
+    from xagent.web.models.agent import Agent
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        # Reuse the agent's owner so user_id stays consistent.
+        user = db.query(User).filter(User.id == agent.user_id).first()
+        assert user is not None
+        task = Task(
+            user_id=user.id,
+            title="internal task",
+            description="created via web ui, not sdk",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent.id,
+            input="internal user message",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
+    finally:
+        db.close()
+
+
+def test_get_task_returns_404_for_non_sdk_source(mock_start_task):
+    """A task created by the Web UI / internal path (source != "sdk")
+    under the same agent must NOT be readable through GET /v1/chat/tasks/{id}.
+
+    Without the source filter, an SDK API key could enumerate / read
+    the user's own Web UI conversations whenever they happen to live
+    under the same agent.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    internal_task_id = _insert_internal_task(agent_id)
+    mock_start_task.reset_mock()
+
+    resp = client.get(f"/v1/chat/tasks/{internal_task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_append_message_returns_404_for_non_sdk_source(mock_start_task):
+    """POST /v1/chat/tasks/{id}/messages on a non-SDK task must 404
+    with task_not_found — the SDK key shouldn't be able to mutate
+    Web UI conversations even if it knows the task id."""
+    agent_id, full_key = _create_agent_with_key()
+    internal_task_id = _insert_internal_task(agent_id)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{internal_task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert mock_start_task.call_count == 0
+
+
+def test_get_steps_returns_404_for_non_sdk_source(mock_start_task):
+    """GET /v1/chat/tasks/{id}/steps on a non-SDK task must 404 so
+    the SDK can't enumerate Web UI step traces under the same agent."""
+    agent_id, full_key = _create_agent_with_key()
+    internal_task_id = _insert_internal_task(agent_id)
+
+    resp = client.get(
+        f"/v1/chat/tasks/{internal_task_id}/steps", headers=_bearer(full_key)
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+# ===== Latest-turn snapshot invariant on SDK append =====
+
+
+def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
+    """An SDK append on a previously completed task immediately clears
+    the stored ``output`` and ``error_message`` so a GET right after
+    the append sees a clean latest-turn snapshot. Without this clearing,
+    the response would mix the new turn's status / input with the
+    previous turn's output — an internally contradictory snapshot for
+    SDK consumers polling the task.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+
+    # Plant a completed-state row with prior output / error_message
+    # populated, as if the first turn had finished successfully.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.COMPLETED
+        task.output = "first answer"
+        task.error_message = "stale error from prior failure"
+        db.commit()
+    finally:
+        db.close()
+
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "second"}},
+    )
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_count == 1
+
+    # After the response returns, an immediate GET must see:
+    #   - status = running (atomic transition committed)
+    #   - input = the new turn's message
+    #   - output = NULL (stale prior-turn output cleared)
+    #   - error_message = NULL (stale prior error cleared)
+    db = _direct_db_session()
+    try:
+        task_after = db.query(Task).filter(Task.id == task_id).first()
+        assert task_after.status == TaskStatus.RUNNING
+        assert task_after.input == "second"
+        assert task_after.output is None
+        assert task_after.error_message is None
+    finally:
+        db.close()
+
+
+# ===== POST /v1/chat/tasks: dispatch_class =====
+
+ACCEPT_REQUESTED_CLASS = "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
+FAIR_SHARE = "XAGENT_DISPATCHER_FAIR_SHARE"
+
+
+@pytest.fixture
+def shared_mode(monkeypatch):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
+
+
+def _create_with_dispatch_class(agent_id, full_key, **extra):
+    return client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "go"},
+            **extra,
+        },
+    )
+
+
+def _stored_declaration(task_id):
+    db = _direct_db_session()
+    try:
+        return (
+            db.query(Task.requested_dispatch_class).filter(Task.id == task_id).scalar()
+        )
+    finally:
+        db.close()
+
+
+def _command_classes(task_id):
+    db = _direct_db_session()
+    try:
+        rows = (
+            db.query(TaskExecutionCommand.kind, TaskExecutionCommand.dispatch_class)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id)
+            .all()
+        )
+        return [(str(kind), klass) for kind, klass in rows]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("value", ["Interactive", "", "urgent", 1, True])
+def test_an_invalid_dispatch_class_is_rejected(value):
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(agent_id, full_key, dispatch_class=value)
+    assert response.status_code == 422, response.text
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "sent,accept,fair,expected",
+    [
+        ("interactive", False, False, "batch"),
+        ("interactive", True, False, "batch"),
+        ("interactive", False, True, "batch"),
+        ("interactive", True, True, "interactive"),
+        ("batch", False, False, "batch"),
+        ("batch", True, True, "batch"),
+        ("null", True, True, "batch"),
+        ("omitted", True, True, "batch"),
+        ("omitted", False, False, "batch"),
+    ],
+)
+def test_the_response_reports_the_class_the_start_command_got(
+    shared_mode, monkeypatch, sent, accept, fair, expected
+):
+    monkeypatch.setenv(ACCEPT_REQUESTED_CLASS, str(accept))
+    monkeypatch.setenv(FAIR_SHARE, str(fair))
+    agent_id, full_key = _create_agent_with_key()
+    extra = (
+        {}
+        if sent == "omitted"
+        else {"dispatch_class": None if sent == "null" else sent}
+    )
+    response = _create_with_dispatch_class(agent_id, full_key, **extra)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["dispatch_class"] == expected
+    assert _command_classes(body["task_id"]) == [("start", expected)]
+    # The task stores what was sent, accepted or not; null and omitted store nothing.
+    stored = sent if sent in ("interactive", "batch") else None
+    assert _stored_declaration(body["task_id"]) == stored
+
+
+def test_without_a_dispatch_queue_the_response_class_is_null_and_the_declaration_kept():
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(
+        agent_id, full_key, dispatch_class="interactive"
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert "dispatch_class" in body
+    assert body["dispatch_class"] is None
+    assert _stored_declaration(body["task_id"]) == "interactive"
+    assert _command_classes(body["task_id"]) == []
+
+
+def test_an_append_ignores_the_field_and_follows_the_tasks_declaration(
+    shared_mode, monkeypatch
+):
+    monkeypatch.setenv(ACCEPT_REQUESTED_CLASS, "true")
+    monkeypatch.setenv(FAIR_SHARE, "true")
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(
+        agent_id, full_key, dispatch_class="interactive"
+    ).json()
+    task_id = created["task_id"]
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "run_id": created["run_id"],
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "more"},
+            "dispatch_class": "batch",
+        },
+    )
+    assert appended.status_code == 202, appended.text
+    assert "dispatch_class" not in appended.json()
+    assert _command_classes(task_id) == [
+        ("start", "interactive"),
+        ("start", "interactive"),
+    ]
+    assert _stored_declaration(task_id) == "interactive"
+
+
+# ===== Queued append: reads before the START is handed off =====
+
+_PREVIOUS_TURN_END = datetime(2026, 1, 1, tzinfo=UTC)
+_SECOND_TURN_END = datetime(2027, 1, 1, tzinfo=UTC)
+
+
+def _settle_previous_turn(task_id, run_id, **row):
+    """Rest the created task as a finished turn that ended at a fixed time."""
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {"run_id": run_id, "updated_at": _PREVIOUS_TURN_END, **row}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _queued_start(task_id):
+    db = _direct_db_session()
+    try:
+        return (
+            db.query(TaskExecutionCommand.id, TaskExecutionCommand.created_at)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == "start",
+                TaskExecutionCommand.status == "pending",
+            )
+            .one()
+        )
+    finally:
+        db.close()
+
+
+def _naive(value):
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+_PREVIOUS_TURNS = [
+    {"status": TaskStatus.COMPLETED, "control_state": "completed", "output": "first"},
+    {"status": TaskStatus.FAILED, "control_state": "failed", "error_message": "boom"},
+]
+
+
+@pytest.fixture
+def task_cache():
+    """A working cache backend: the default one stores nothing."""
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        yield
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def _append_after_previous_turn(previous):
+    """Create a task, rest it as a finished turn, check it reads as that turn,
+    then append."""
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(agent_id, full_key).json()
+    task_id = created["task_id"]
+    _settle_previous_turn(task_id, created["run_id"], **previous)
+    # Confirm the previous turn's state before appending. The append itself
+    # clears the task's cached body.
+    before = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert before.json()["status"] == previous["status"].value
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "second"}},
+    )
+    assert appended.status_code == 202, appended.text
+    assert appended.json()["status"] == "pending"
+    return task_id, full_key, appended.json()
+
+
+@pytest.mark.parametrize("previous", _PREVIOUS_TURNS, ids=["completed", "failed"])
+def test_a_queued_append_reports_when_its_start_was_accepted(
+    shared_mode, task_cache, previous
+):
+    task_id, _, body = _append_after_previous_turn(previous)
+
+    _, command_created_at = _queued_start(task_id)
+    accepted_at = datetime.fromisoformat(body["accepted_at"])
+    assert _naive(accepted_at) == _naive(command_created_at)
+    assert _naive(accepted_at) != _naive(_PREVIOUS_TURN_END)
+
+
+@pytest.mark.parametrize("previous", _PREVIOUS_TURNS, ids=["completed", "failed"])
+def test_a_queued_append_is_read_as_pending_until_its_start_is_handed_off(
+    shared_mode, task_cache, previous, monkeypatch
+):
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    from tests.web.services.test_status_only_append_supersede import _hand_off_start
+    from xagent.web.api.v1 import _events_stream
+    from xagent.web.api.v1.deps import _resolve_principal_from_credentials
+
+    task_id, full_key, _ = _append_after_previous_turn(previous)
+
+    cache_writes: list[str] = []
+    original_cache_set = v1_tasks.cache_set
+
+    def recording_cache_set(key, value, *, ttl_seconds=None):
+        cache_writes.append(key)
+        original_cache_set(key, value, ttl_seconds=ttl_seconds)
+
+    monkeypatch.setattr(v1_tasks, "cache_set", recording_cache_set)
+
+    during = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert during.status_code == 200, during.text
+    during_body = during.json()
+    assert during_body["status"] == "pending"
+    assert during_body["output"] is None
+    assert during_body["error"] is None
+    assert during_body["completed_at"] is None
+    assert len(cache_writes) == 1
+    # The append clears the task cache, so the first queued read misses and
+    # stores the row's previous-turn body; the second is served from that
+    # cached body and must still read as pending.
+    cached = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert cached.status_code == 200, cached.text
+    cached_body = cached.json()
+    assert cached_body["status"] == "pending"
+    assert cached_body["output"] is None
+    assert cached_body["error"] is None
+    assert cached_body["completed_at"] is None
+    assert len(cache_writes) == 1
+    # The events stream reads the task through the same snapshot, so an
+    # attach now keeps streaming instead of closing on the previous turn.
+    principal = _resolve_principal_from_credentials(
+        HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+    )
+    snapshot = v1_tasks.effective_task_snapshot(
+        v1_tasks._load_task_info_snapshot(task_id, principal)
+    )
+    assert snapshot.status is TaskStatus.PENDING
+    assert (
+        _events_stream._stream_close_reason(snapshot.status, snapshot.control_state)
+        is None
+    )
+
+    command_id, _ = _queued_start(task_id)
+    _hand_off_start(_direct_db_session, task_id, command_id)
+    running = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert running.json()["status"] == "running"
+
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "output": "second",
+                # SQLite stamps whole seconds; the handoff may share this
+                # second, and ``updated_at`` is the cache's freshness token.
+                "updated_at": _SECOND_TURN_END,
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+    after = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert after.json()["status"] == "completed"
+    assert after.json()["output"] == "second"
+
+
+# ===== POST /v1/chat/tasks: priority =====
+
+
+def _stored_priorities(task_id):
+    """(task column, [command column of each command]) read by explicit query."""
+    db = _direct_db_session()
+    try:
+        task = db.query(Task.dispatch_priority).filter(Task.id == task_id).scalar()
+        commands = (
+            db.query(TaskExecutionCommand.priority)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id)
+            .all()
+        )
+        return task, [priority for (priority,) in commands]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", 11, -11, "high", [1]])
+def test_an_invalid_priority_is_rejected_with_the_error_envelope(value):
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(agent_id, full_key, priority=value)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"]
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "extra,stored_on_task,on_command",
+    [
+        ({}, None, 0),
+        ({"priority": None}, None, 0),
+        ({"priority": 0}, 0, 0),
+        ({"priority": -10}, -10, -10),
+        ({"priority": 10}, 10, 10),
+        ({"priority": 3}, 3, 3),
+    ],
+    ids=["omitted", "null", "zero", "minimum", "maximum", "three"],
+)
+def test_a_priority_is_stored_on_the_task_and_its_start_command(
+    shared_mode, extra, stored_on_task, on_command
+):
+    agent_id, full_key = _create_agent_with_key()
+
+    response = _create_with_dispatch_class(agent_id, full_key, **extra)
+
+    assert response.status_code == 202, response.text
+    assert _stored_priorities(response.json()["task_id"]) == (
+        stored_on_task,
+        [on_command],
+    )
+    assert "priority" not in response.json()
+
+
+def test_an_append_ignores_the_field_and_inherits_the_tasks_priority(shared_mode):
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(agent_id, full_key, priority=4).json()
+    task_id = created["task_id"]
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "run_id": created["run_id"],
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "more"},
+            "priority": -7,
+        },
+    )
+
+    assert appended.status_code == 202, appended.text
+    assert _stored_priorities(task_id) == (4, [4, 4])
+
+
+# ===== GET /v1/chat/tasks/{id}/files + GET /v1/chat/files/{id}/download =====
+
+
+@pytest.fixture
+def isolated_uploads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point uploads and durable storage at this test's own temporary tree."""
+
+    from xagent.core.file_storage.factory import get_unscoped_file_storage
+    from xagent.web import config as web_config
+    from xagent.web.api import files as files_api
+
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    objects_dir = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", objects_dir.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    monkeypatch.setattr(web_config, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(files_api, "get_uploads_dir", lambda: uploads_dir)
+    yield uploads_dir
+    get_unscoped_file_storage.cache_clear()
+
+
+def _agent_owner_user_id(agent_id: int) -> int:
+    db = _direct_db_session()
+    try:
+        return int(db.query(Agent.user_id).filter(Agent.id == agent_id).scalar())
+    finally:
+        db.close()
+
+
+def _add_task_file(
+    *,
+    task_id: int,
+    user_id: int,
+    uploads_dir: Path,
+    filename: str,
+    content: bytes,
+    category: str | None,
+    created_at: datetime | None = None,
+    mime_type: str | None = "text/plain",
+    storage_path: Path | None = None,
+) -> str:
+    """Insert one registered file row and write its local bytes."""
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    file_id = str(uuid4())
+    path = storage_path or (
+        uploads_dir
+        / f"user_{user_id}"
+        / f"task_{task_id}"
+        / (category or "input")
+        / filename
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    db = _direct_db_session()
+    try:
+        db.add(
+            UploadedFile(
+                file_id=file_id,
+                user_id=user_id,
+                task_id=task_id,
+                filename=filename,
+                storage_path=str(path),
+                storage_status="legacy",
+                workspace_category=category,
+                mime_type=mime_type,
+                file_size=len(content),
+                created_at=created_at or datetime.now(UTC),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    return file_id
+
+
+def test_list_task_files_returns_outputs_and_uploads_in_order(isolated_uploads):
+    agent_id, full_key = _create_agent_with_key()
+    user_id = _agent_owner_user_id(agent_id)
+    task_id = _create_task(full_key, agent_id, content="produce a file")
+
+    output_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="lesson_plan.txt",
+        content=b"plan bytes",
+        category="output",
+        created_at=datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC),
+    )
+    upload_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="source.txt",
+        content=b"source bytes",
+        category=None,
+        created_at=datetime(2026, 1, 1, 9, 0, 0, tzinfo=UTC),
+    )
+    # Another task's file must never leak into this list.
+    other_task_id = _create_task(full_key, agent_id, content="another task")
+    _add_task_file(
+        task_id=other_task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="other.txt",
+        content=b"other bytes",
+        category="output",
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/files", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body) == {"files"}
+    files = body["files"]
+    assert [item["file_id"] for item in files] == [output_id, upload_id]
+    assert [item["source"] for item in files] == ["output", "upload"]
+    assert set(files[0]) == {
+        "file_id",
+        "filename",
+        "file_size",
+        "mime_type",
+        "created_at",
+        "source",
+    }
+    assert files[0]["filename"] == "lesson_plan.txt"
+    assert files[0]["file_size"] == len(b"plan bytes")
+    assert files[0]["mime_type"] == "text/plain"
+    assert datetime.fromisoformat(
+        files[0]["created_at"].replace("Z", "+00:00")
+    ) == datetime(2026, 1, 1, 8, 0, 0, tzinfo=UTC)
+
+
+def test_task_files_are_scoped_to_the_key_that_can_reach_the_task(isolated_uploads):
+    admin_headers = _admin_headers()
+    agent_a, key_a = _create_agent_with_key()
+    user_a = _agent_owner_user_id(agent_a)
+    task_a = _create_task(key_a, agent_a, content="task owned by key A")
+    file_a = _add_task_file(
+        task_id=task_a,
+        user_id=user_a,
+        uploads_dir=isolated_uploads,
+        filename="secret_plan.txt",
+        content=b"plan bytes",
+        category="output",
+    )
+
+    # Same user, different agent/key: still not this task's scope.
+    _agent_a2, key_a2 = _create_agent_with_key_for(
+        admin_headers, name="v1 tasks second agent"
+    )
+    # Different user entirely.
+    bob_headers = _register_second_user()
+    _agent_b, key_b = _create_agent_with_key_for(bob_headers)
+
+    listed = client.get(f"/v1/chat/tasks/{task_a}/files", headers=_bearer(key_a))
+    assert listed.status_code == 200, listed.text
+    downloaded = client.get(f"/v1/chat/files/{file_a}/download", headers=_bearer(key_a))
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == b"plan bytes"
+
+    for foreign_key in (key_a2, key_b):
+        list_resp = client.get(
+            f"/v1/chat/tasks/{task_a}/files", headers=_bearer(foreign_key)
+        )
+        assert list_resp.status_code == 404, list_resp.text
+        assert list_resp.json()["error"]["code"] == "task_not_found"
+
+        download_resp = client.get(
+            f"/v1/chat/files/{file_a}/download", headers=_bearer(foreign_key)
+        )
+        assert download_resp.status_code == 404, download_resp.text
+        assert download_resp.json()["error"]["code"] == "file_not_found"
+        assert b"plan bytes" not in download_resp.content
+
+
+def test_download_unbound_upload_is_owner_scoped(isolated_uploads):
+    agent_a, key_a = _create_agent_with_key()
+    _agent_owner_user_id(agent_a)
+
+    uploaded = client.post(
+        "/v1/chat/files",
+        headers=_bearer(key_a),
+        files=[("files", ("draft.txt", b"draft bytes", "text/plain"))],
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    file_id = uploaded.json()["files"][0]["file_id"]
+
+    owner_download = client.get(
+        f"/v1/chat/files/{file_id}/download", headers=_bearer(key_a)
+    )
+    assert owner_download.status_code == 200, owner_download.text
+    assert owner_download.content == b"draft bytes"
+
+    bob_headers = _register_second_user()
+    _agent_b, key_b = _create_agent_with_key_for(bob_headers)
+    foreign_download = client.get(
+        f"/v1/chat/files/{file_id}/download", headers=_bearer(key_b)
+    )
+    assert foreign_download.status_code == 404, foreign_download.text
+    assert foreign_download.json()["error"]["code"] == "file_not_found"
+    assert b"draft bytes" not in foreign_download.content
+
+
+def test_download_task_output_streams_bytes_as_attachment(isolated_uploads):
+    from urllib.parse import quote
+
+    agent_id, full_key = _create_agent_with_key()
+    user_id = _agent_owner_user_id(agent_id)
+    task_id = _create_task(full_key, agent_id, content="generate a file")
+    content = b"binary\x00output"
+    filename = "成绩单 2026.txt"
+    file_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename=filename,
+        content=content,
+        category="output",
+    )
+
+    resp = client.get(f"/v1/chat/files/{file_id}/download", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == content
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith("attachment;")
+    assert f"filename*=UTF-8''{quote(filename, safe='')}" in disposition
+
+
+def test_download_unknown_traversal_and_outside_paths_are_404(
+    isolated_uploads, tmp_path: Path
+):
+    agent_id, full_key = _create_agent_with_key()
+    user_id = _agent_owner_user_id(agent_id)
+    task_id = _create_task(full_key, agent_id, content="task")
+
+    unknown = client.get(
+        f"/v1/chat/files/{uuid4()}/download", headers=_bearer(full_key)
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "file_not_found"
+
+    missing_task = client.get(
+        f"/v1/chat/tasks/{task_id + 999}/files", headers=_bearer(full_key)
+    )
+    assert missing_task.status_code == 404
+    assert missing_task.json()["error"]["code"] == "task_not_found"
+
+    traversal = client.get(
+        "/v1/chat/files/%2e%2e%2f%2e%2e%2fetc%2fpasswd/download",
+        headers=_bearer(full_key),
+    )
+    assert traversal.status_code == 404
+
+    outside_path = tmp_path / "outside.txt"
+    outside_path.write_bytes(b"outside secret")
+    outside_id = _add_task_file(
+        task_id=task_id,
+        user_id=user_id,
+        uploads_dir=isolated_uploads,
+        filename="outside.txt",
+        content=b"outside secret",
+        category="output",
+        storage_path=outside_path,
+    )
+    outside = client.get(
+        f"/v1/chat/files/{outside_id}/download", headers=_bearer(full_key)
+    )
+    assert outside.status_code == 404, outside.text
+    assert outside.json()["error"]["code"] == "file_not_found"
+    assert b"outside secret" not in outside.content

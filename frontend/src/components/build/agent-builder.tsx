@@ -1,0 +1,3330 @@
+"use client"
+
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
+import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
+import { AgentBuilderChat } from "./agent-builder-chat"
+import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
+import { Button } from "@/components/ui/button"
+import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
+import { apiRequest, isJsonRecord } from "@/lib/api-wrapper"
+import {
+  getBackgroundJobFailureMessage,
+  isBackgroundJobResponse,
+  waitForBackgroundJob,
+} from "@/lib/background-jobs"
+import { getApiUrl } from "@/lib/utils"
+import { isBuiltinModel, getModelSourceLabel } from "@/lib/models"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
+import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { OfficialMcpSettingsDialog, type AppIntegration } from "@/components/mcp/official-mcp-settings-dialog"
+import { NeedsReconnectBadge } from "@/components/mcp/needs-reconnect-badge"
+import { useI18n } from "@/contexts/i18n-context"
+import { useApp } from "@/contexts/app-context-chat"
+import { useAuth } from "@/contexts/auth-context"
+import { useMcpApps } from "@/contexts/mcp-apps-context"
+import { renderFileMentionsHtml } from "@/components/chat/FileChip"
+import { escapeHtml } from "@/lib/html-escape"
+import { readSendDisposition, readSendErrorCode, readSendReason } from "@/components/chat/clarification-delivery"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
+import type { TranslationKey } from "@/i18n/translations"
+import { MultiSelect } from "@/components/ui/multi-select"
+import { useFileMention } from "@/hooks/use-file-mention"
+import { FileMentionDropdown } from "@/components/chat/FileMentionDropdown"
+import {
+  Select,
+  SelectRadix,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select"
+import {
+  InfoTooltip,
+} from "@/components/ui/tooltip"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { useRouter, useSearchParams } from "next/navigation"
+import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-creation-dialog"
+import { toast } from "@/components/ui/sonner"
+import { cn } from "@/lib/utils"
+import { getBrandingFromEnv } from "@/lib/branding"
+import {
+  draftsFromDeclarations,
+  promptContextFieldsKey,
+  toPromptContextFieldsPayload,
+  validatePromptContextFields,
+  type PromptContextFieldDraft,
+} from "@/lib/prompt-context-fields"
+import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches, resolveMcpToolSelector } from "@/lib/mcp-lookup"
+import { isMcpSelectionConnected, needsReconnect } from "@/lib/mcp-connection-status"
+import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
+import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { AgentTriggersDialog } from "./agent-triggers-dialog"
+import { AgentSshBindings } from "./agent-ssh-bindings"
+import { getAgentTaskHref } from "@/lib/agent-ui-access"
+import { PromptContextFieldsEditor } from "./prompt-context-fields-editor"
+import { AgentFlowView } from "./agent-flow-view"
+import { useBuilderCatalog, type AgentModelConfig, type Model } from "./use-builder-catalog"
+import { BuilderListStatus } from "./builder-list-status"
+import {
+  AgentTrigger,
+  AgentTriggerType,
+  FailedStagedTrigger,
+  StagedTrigger,
+  createAgentTrigger,
+  createStagedTriggers,
+  disableAgentTriggersOfType,
+  listAgentTriggers,
+  mergeUpdatedTriggers,
+  stagedToCreatePayload,
+  stagedToPseudoTrigger,
+} from "@/lib/agent-triggers-api"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { copyToClipboard } from "@/lib/clipboard"
+import {
+  sanitizeUnsharedConnectors,
+  sanitizeUnsharedKnowledgeBases,
+  type UnsharedConnector,
+  type UnsharedKnowledgeBase,
+} from "@/lib/team-sharing-sanitizers"
+
+interface AgentBuilderProps {
+  agentId?: string
+}
+
+interface PreviewAttachment {
+  file_id: string
+  name: string
+  size: number
+  type?: string
+}
+
+interface PreviewRecord {
+  taskId: number
+  configKey: string | null
+  message: string
+  files: Array<File | PreviewAttachment>
+}
+
+interface TemplateRequirements {
+  requiredSkills: string[]
+  requiredToolCategories: string[]
+  requiredMcpServers: string[]
+  requiresKnowledgeBase: boolean
+}
+
+// Categories a user may never assign from the builder, mirroring the
+// backend's AGENT_CONFIG_UNASSIGNABLE_CATEGORIES (which also strips them on
+// write): `agent` (multi-agent delegation) is configured through Workforce
+// instead (issue #802), and `other` is an internal fallback bucket.
+const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
+
+// The single extraction every tool_categories -> selectedMcpServers site
+// must share: isDirty compares selectedMcpServers against this same
+// extraction applied to originalData.tool_categories with a plain string
+// compare, no name/id normalization -- so a caller that inlines its own
+// copy and drifts from this one silently reintroduces a permanently-dirty
+// isDirty state.
+function mcpServerNamesFromToolCategories(categories: string[]): string[] {
+  return categories
+    .filter((c) => c.startsWith('mcp:'))
+    .map((c) => c.replace('mcp:', ''))
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+// Reduces a parsed error response body to a string that is safe to render.
+// Accepts, in order: a string `detail`, the readable message of an object
+// `detail`, the joined readable messages of an array `detail`, and a top-level
+// `message`. Anything else — including a body that failed to parse — yields the
+// supplied fallback, so an object or an array can never reach toast.error.
+function getBuilderErrorMessage(body: unknown, fallback: string): string {
+  if (!isJsonRecord(body)) return fallback
+
+  const detail = body.detail
+  const detailMessage = readNonEmptyString(detail)
+  if (detailMessage) return detailMessage
+
+  if (isJsonRecord(detail)) {
+    const message =
+      readNonEmptyString(detail.msg) ?? readNonEmptyString(detail.message)
+    if (message) return message
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        const itemMessage = readNonEmptyString(item)
+        if (itemMessage) return itemMessage
+        if (!isJsonRecord(item)) return null
+        return readNonEmptyString(item.msg) ?? readNonEmptyString(item.message)
+      })
+      .filter((message): message is string => message !== null)
+    if (messages.length > 0) return messages.join("; ")
+  }
+
+  return readNonEmptyString(body.message) ?? fallback
+}
+
+// One-time reveal of auto-generated webhook secrets. Rendered both inside the
+// creation success dialog and inline in the config form (retry path / while
+// the dialog is closed); only the inline instance is dismissible.
+function WebhookSecretsAlert({
+  secrets,
+  onDismiss,
+}: {
+  secrets: { name: string; secret: string }[]
+  onDismiss?: () => void
+}) {
+  const { t } = useI18n()
+  if (secrets.length === 0) return null
+  return (
+    <Alert className="border-amber-300 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100">
+      <AlertCircle className="h-4 w-4" />
+      <AlertTitle className="flex items-center justify-between gap-2">
+        {t("triggers.secret.title")}
+        {onDismiss && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0"
+            onClick={onDismiss}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        )}
+      </AlertTitle>
+      <AlertDescription>
+        <div className="mt-2 space-y-2">
+          {secrets.map((item) => (
+            <div key={`${item.name}:${item.secret}`} className="flex items-center gap-2">
+              <span className="max-w-[160px] shrink-0 truncate text-xs font-medium">{item.name}</span>
+              <code className="min-w-0 flex-1 break-all rounded bg-background/70 px-2 py-1.5 text-xs">
+                {item.secret}
+              </code>
+              <Button
+                type="button"
+                size="icon"
+                variant="secondary"
+                className="h-7 w-7 shrink-0"
+                onClick={async () => {
+                  if (await copyToClipboard(item.secret)) {
+                    toast.success(t("common.copied"))
+                  }
+                }}
+                title={t("common.copy")}
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+export function AgentBuilder({ agentId }: AgentBuilderProps) {
+  const MAX_INSTRUCTIONS_LENGTH = 8192;
+  const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
+  const { t, locale } = useI18n()
+  const { apps: officialApps, getAppIcon, refresh: refreshMcpApps } = useMcpApps()
+  const { user, inTeam, teamRole } = useAuth()
+  // inTeam gates the whole control (standard xagent has no teams);
+  // canSetAdminsOnly gates the "admins" option to team admins.
+  const canSetAdminsOnly = teamRole === "admin"
+  // Set once loadAgent decides to load an owner-scoped MCP list for an admin
+  // cross-user view, so the mount-time self-scoped fetch won't clobber it.
+  const ownerScopedMcpRef = useRef(false)
+  const seededGeneralRef = useRef<number | null>(null)
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const templateId = searchParams.get("template")
+  const [localAgentId, setLocalAgentId] = useState<string | undefined>(agentId)
+  const isEditMode = !!localAgentId
+  const branding = getBrandingFromEnv();
+
+  // Config State
+  const [name, setName] = useState("")
+  const [description, setDescription] = useState("")
+  const [instructions, setInstructions] = useState("")
+  const [executionMode, setExecutionMode] = useState("balanced") // "flash", "balanced", "think"
+  const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([])
+  const [promptContextFields, setPromptContextFields] = useState<PromptContextFieldDraft[]>([])
+  const [promptContextSaveAttempted, setPromptContextSaveAttempted] = useState(false)
+  // The assistant's create_agent stores no declarations, so rows typed on the new-agent page survive
+  // the created agent's first load. Refs: the chat socket keeps the onUpdateConfig closure it opened with.
+  const keepPromptContextForAgentRef = useRef<string | null>(null)
+  const localAgentIdRef = useRef(localAgentId)
+  useEffect(() => {
+    localAgentIdRef.current = localAgentId
+  }, [localAgentId])
+  const [visibility, setVisibility] = useState<"team" | "admins">("team")
+  // Agent ownership: personal (team_id NULL) is the default; "team" reveals the
+  // visibility sub-option and drives promote/demote calls on save.
+  const [ownership, setOwnership] = useState<"personal" | "team">("personal")
+  const [modelConfig, setModelConfig] = useState<AgentModelConfig>({
+    general: null,
+    small_fast: null,
+    visual: null,
+    compact: null,
+  })
+  const [selectedKbs, setSelectedKbs] = useState<string[]>([])
+  const [selectedSkills, setSelectedSkills] = useState<string[]>([])
+  const [selectedToolCategories, setSelectedToolCategories] = useState<string[]>([])
+  const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([])
+  // Whether this agent has any bound SSH target. Like connectors, an SSH
+  // binding auto-enables its tool category ("ssh") at save/preview time
+  // without the user picking it in the tool-category selector.
+  const [hasSshBindings, setHasSshBindings] = useState(false)
+  const handleSshBindingCount = useCallback((n: number) => setHasSshBindings(n > 0), [])
+  const [logoFile, setLogoFile] = useState<File | null>(null)
+  const [logoUrl, setLogoUrl] = useState<string | null>(null)  // Existing logo URL
+  const [logoRemoved, setLogoRemoved] = useState(false)  // User explicitly cleared the logo
+  const [isCreating, setIsCreating] = useState(false)
+  const [isOptimizing, setIsOptimizing] = useState(false)
+  const [loadingAgent, setLoadingAgent] = useState(false)
+  const [originalData, setOriginalData] = useState<any>(null)
+  const [isKbModalOpen, setIsKbModalOpen] = useState(false)
+  const [isModelConfigOpen, setIsModelConfigOpen] = useState(false)
+  const [isTriggersDialogOpen, setIsTriggersDialogOpen] = useState(false)
+  const [triggerDialogInitialType, setTriggerDialogInitialType] = useState<AgentTriggerType | null>(null)
+  const [triggerSummary, setTriggerSummary] = useState<AgentTrigger[]>([])
+  // Triggers configured before the agent exists (#928). Posted via the
+  // trigger API right after the agent is created, then cleared.
+  const [stagedTriggers, setStagedTriggers] = useState<StagedTrigger[]>([])
+  // Staged triggers whose POST failed after the agent was created. Their
+  // config is kept for retry/discard instead of being silently dropped.
+  const [failedStagedTriggers, setFailedStagedTriggers] = useState<FailedStagedTrigger[]>([])
+  // Auto-generated webhook secrets from staged-trigger creation; shown once.
+  const [createdWebhookSecrets, setCreatedWebhookSecrets] = useState<
+    { name: string; secret: string }[]
+  >([])
+  // Creation succeeded but ownership reconciliation opened the
+  // share-connectors dialog instead of the success dialog. The success dialog
+  // (which reveals generated webhook secrets) must still be shown once that
+  // flow resolves, whichever way it resolves.
+  const pendingCreationDialogRef = useRef(false)
+  const [showAIAssistant, setShowAIAssistant] = useState(false)
+  const [viewMode, setViewMode] = useState<"config" | "flow">("config")
+  const [configSynced, setConfigSynced] = useState(false)
+  const [notFound, setNotFound] = useState(false)
+  // Admin viewing another user's agent: writes are owner-only, so the whole
+  // builder is locked and Save/Publish/AI-assistant are hidden (#783 follow-up).
+  const [readOnly, setReadOnly] = useState(false)
+  const isFirstRender = useRef(true)
+  const modelSectionRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false
+      return
+    }
+    setConfigSynced(true)
+    const timer = setTimeout(() => setConfigSynced(false), 2000)
+    return () => clearTimeout(timer)
+  }, [name, description, instructions, executionMode, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, modelConfig])
+
+  // Create Success Dialog State
+  const [showSuccessDialog, setShowSuccessDialog] = useState(false)
+  const [createdAgent, setCreatedAgent] = useState<any>(null)
+  // Connectors referenced by an agent that isn't yet team-shared. Populated from
+  // a 422 promote-team response so the user can share them and retry.
+  const [unsharedConnectors, setUnsharedConnectors] = useState<UnsharedConnector[]>([])
+  const [unsharedKnowledgeBases, setUnsharedKnowledgeBases] = useState<
+    UnsharedKnowledgeBase[]
+  >([])
+  const [isSharingConnectors, setIsSharingConnectors] = useState(false)
+  const hasUnresolvedConnectors = unsharedConnectors.some((c) => c.reason === "unresolved")
+  const [templateRequirements, setTemplateRequirements] = useState<TemplateRequirements | null>(null)
+
+  // Data State: each picker's list loads, fails and retries on its own.
+  const {
+    models, modelsStatus, retryModels, userDefaultGeneral, modelDefaultsSettled,
+    kbs, kbsStatus, reloadKbs,
+    skills, skillsStatus, retrySkills,
+    tools, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
+    mcpServers, setMcpServers, mcpSettled,
+  } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
+  const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
+  // Catalog entry whose settings dialog runs the reconnect login (#2931).
+  const [reconnectApp, setReconnectApp] = useState<AppIntegration | null>(null)
+  const refreshConnectors = () => {
+    refreshMcpApps().catch(console.error)
+    // Keep the current list unless the refresh returns one: an error
+    // body here would break every connector lookup at render.
+    apiRequest(`${getApiUrl()}/api/mcp/servers`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => { if (Array.isArray(data)) setMcpServers(data) })
+      .catch(console.error)
+  }
+
+  const refreshTriggerSummary = useCallback(async () => {
+    if (!localAgentId) {
+      setTriggerSummary([])
+      return
+    }
+
+    try {
+      setTriggerSummary(await listAgentTriggers(localAgentId))
+    } catch (error) {
+      console.error("Failed to load trigger summary:", error)
+    }
+  }, [localAgentId])
+
+  useEffect(() => {
+    void refreshTriggerSummary()
+  }, [refreshTriggerSummary])
+
+  // While failed retries (or an unread secret) are on screen, dialog-close
+  // handlers skip router.replace to keep this instance mounted; this flag
+  // remembers that a navigation is owed once both lists drain.
+  const navPendingRef = useRef(false)
+  const reconcileDeferredNavigation = (
+    nextFailed: FailedStagedTrigger[],
+    nextSecrets: { name: string; secret: string }[],
+  ) => {
+    if (!navPendingRef.current) return
+    if (nextFailed.length > 0 || nextSecrets.length > 0) return
+    navPendingRef.current = false
+    if (createdAgent?.id) {
+      router.replace(`/build/${createdAgent.id}`)
+    }
+  }
+
+  // Retry a staged trigger whose POST failed during agent creation. The agent
+  // exists by now, so this goes straight through the live trigger API.
+  // Entries are keyed by their stable clientId — a positional index goes
+  // stale when another entry is discarded while a retry is in flight.
+  const retryFailedTrigger = async (clientId: number) => {
+    if (!localAgentId) return
+    const entry = failedStagedTriggers.find((item) => item.staged.clientId === clientId)
+    if (!entry) return
+    try {
+      const created = await createAgentTrigger(localAgentId, stagedToCreatePayload(entry.staged))
+      const nextFailed = failedStagedTriggers.filter(
+        (item) => item.staged.clientId !== clientId,
+      )
+      let nextSecrets = createdWebhookSecrets
+      const secret = created.webhook_secret
+      if (secret && !entry.staged.secret) {
+        nextSecrets = [...createdWebhookSecrets, { name: entry.staged.name, secret }]
+      }
+      setFailedStagedTriggers(nextFailed)
+      setCreatedWebhookSecrets(nextSecrets)
+      void refreshTriggerSummary()
+      toast.success(t("triggers.messages.created"))
+      reconcileDeferredNavigation(nextFailed, nextSecrets)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      setFailedStagedTriggers((prev) =>
+        prev.map((item) =>
+          item.staged.clientId === clientId ? { ...item, error: reason } : item,
+        ),
+      )
+      toast.error(
+        t("triggers.messages.stagedCreateFailed", { name: entry.staged.name, error: reason }),
+      )
+    }
+  }
+
+  // Discarding drops the entered config irreversibly, so it uses the same
+  // two-click confirm pattern as trigger deletion in the dialog.
+  const [discardConfirmClientId, setDiscardConfirmClientId] = useState<number | null>(null)
+  const discardFailedTrigger = (clientId: number) => {
+    if (discardConfirmClientId !== clientId) {
+      setDiscardConfirmClientId(clientId)
+      return
+    }
+    setDiscardConfirmClientId(null)
+    const nextFailed = failedStagedTriggers.filter(
+      (item) => item.staged.clientId !== clientId,
+    )
+    setFailedStagedTriggers(nextFailed)
+    reconcileDeferredNavigation(nextFailed, createdWebhookSecrets)
+  }
+
+  const dismissWebhookSecrets = () => {
+    setCreatedWebhookSecrets([])
+    reconcileDeferredNavigation(failedStagedTriggers, [])
+  }
+
+  // Builder card switch: toggling it off disables every enabled trigger of
+  // that type in place — no dialog. The card disappears afterwards because
+  // the summary section only lists types with enabled > 0. A Set (not a
+  // single value) so two types disabling concurrently keep their own guard.
+  const [disablingTriggerTypes, setDisablingTriggerTypes] = useState<ReadonlySet<AgentTriggerType>>(
+    new Set(),
+  )
+  const disableTriggerType = async (type: AgentTriggerType) => {
+    if (!localAgentId) {
+      setStagedTriggers((prev) =>
+        prev.map((item) => (item.type === type ? { ...item, enabled: false } : item)),
+      )
+      toast.success(t("triggers.messages.disabled"))
+      return
+    }
+    setDisablingTriggerTypes((prev) => new Set(prev).add(type))
+    try {
+      const updated = await disableAgentTriggersOfType(localAgentId, triggerSummary, type)
+      setTriggerSummary((prev) => mergeUpdatedTriggers(prev, updated))
+      toast.success(t("triggers.messages.disabled"))
+    } catch (error) {
+      console.error(error)
+      toast.error(error instanceof Error ? error.message : t("triggers.messages.saveFailed"))
+      // A partial failure may have disabled some triggers; resync the summary.
+      void refreshTriggerSummary()
+    } finally {
+      setDisablingTriggerTypes((prev) => {
+        const next = new Set(prev)
+        next.delete(type)
+        return next
+      })
+    }
+  }
+
+  // During creation the agent has no server-side triggers yet; the summary
+  // sections and flow view render the staged ones instead (#928).
+  const effectiveTriggerSummary = useMemo(
+    () => (localAgentId ? triggerSummary : stagedTriggers.map(stagedToPseudoTrigger)),
+    [localAgentId, triggerSummary, stagedTriggers],
+  )
+
+  const triggerStats = useMemo(() => {
+    const stats = {
+      webhook: { total: 0, enabled: 0 },
+      scheduled: { total: 0, enabled: 0 },
+      gmail: { total: 0, enabled: 0 },
+    }
+    effectiveTriggerSummary.forEach((trigger) => {
+      if (trigger.type !== "webhook" && trigger.type !== "scheduled" && trigger.type !== "gmail") return
+      stats[trigger.type].total += 1
+      if (trigger.enabled) {
+        stats[trigger.type].enabled += 1
+      }
+    })
+    return stats
+  }, [effectiveTriggerSummary])
+
+  const gmailConnection = useMemo(() => {
+    const gmailApp = findMatchingMcpApp(officialApps, "gmail")
+    return {
+      isConnected: Boolean(gmailApp?.is_connected),
+      connectedAccount: gmailApp?.connected_account ?? null,
+    }
+  }, [officialApps])
+
+  // File picker state for Instructions
+  const instructionsRef = useRef<HTMLDivElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [isInstructionsFocused, setIsInstructionsFocused] = useState(false)
+  const lastInstructionsRef = useRef(instructions)
+  const normalizeLineBreaks = (value: string) => value.replace(/\r\n|\r|\u2028|\u2029/g, "\n")
+  const serializeInstructionsContent = (editor: HTMLElement) => {
+    const clone = editor.cloneNode(true) as HTMLElement;
+    const chips = clone.querySelectorAll('[data-file-path]');
+
+    chips.forEach((chip) => {
+      const path = chip.getAttribute('data-file-path');
+      const fileId = chip.getAttribute('data-file-id');
+      const filename = chip.getAttribute('data-filename') || path?.split('/').pop() || path;
+      const id = fileId || path;
+      chip.replaceWith(document.createTextNode(`[${filename}](file:${id})`));
+    });
+
+    clone.querySelectorAll("br").forEach((lineBreak) => {
+      lineBreak.replaceWith(document.createTextNode("\n"));
+    });
+
+    clone.querySelectorAll("div, p").forEach((block) => {
+      if (block.lastChild?.textContent?.endsWith("\n")) {
+        return;
+      }
+      block.appendChild(document.createTextNode("\n"));
+    });
+
+    return normalizeLineBreaks((clone.textContent || ""))
+      .replace(/\u200B/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/\n$/, "");
+  };
+
+  const handleInstructionsInput = () => {
+    const editor = instructionsRef.current;
+    if (!editor) return;
+
+    let text = serializeInstructionsContent(editor);
+
+    if (text.length > MAX_INSTRUCTIONS_LENGTH) {
+      text = text.substring(0, MAX_INSTRUCTIONS_LENGTH);
+
+      let html = renderFileMentionsHtml(text);
+
+      html = html.replace(/\n/g, "<br>");
+      if (html.endsWith("<br>")) {
+        html += "<br>";
+      }
+
+      editor.innerHTML = html;
+
+      // Move cursor to the end
+      const range = document.createRange();
+      const sel = window.getSelection();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+
+    lastInstructionsRef.current = text;
+    setInstructions(text);
+
+    fileMention.checkTrigger();
+  };
+
+  const fileMention = useFileMention(instructionsRef, containerRef, handleInstructionsInput, t);
+
+  const handleInstructionsPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const text = normalizeLineBreaks(e.clipboardData.getData("text/plain"));
+
+    const currentLength = lastInstructionsRef.current.length;
+    const availableSpace = MAX_INSTRUCTIONS_LENGTH - currentLength;
+
+    if (availableSpace <= 0) {
+      return;
+    }
+
+    let textToInsert = text;
+    if (text.length > availableSpace) {
+      textToInsert = text.substring(0, availableSpace);
+    }
+
+    const editor = instructionsRef.current;
+    if (editor) {
+      editor.focus();
+      const selection = window.getSelection();
+      if (selection && selection.rangeCount > 0) {
+        const range = selection.getRangeAt(0);
+        range.deleteContents();
+        const fragment = document.createDocumentFragment();
+        const parts = textToInsert.split("\n");
+        parts.forEach((part, index) => {
+          fragment.appendChild(document.createTextNode(part));
+          if (index < parts.length - 1) {
+            fragment.appendChild(document.createElement("br"));
+          }
+        });
+        const lastNode = fragment.lastChild;
+        range.insertNode(fragment);
+        if (lastNode) {
+          const newRange = document.createRange();
+          newRange.setStartAfter(lastNode);
+          newRange.collapse(true);
+          selection.removeAllRanges();
+          selection.addRange(newRange);
+        }
+      } else {
+        editor.innerHTML += escapeHtml(textToInsert).replace(/\n/g, "<br>");
+      }
+    }
+    handleInstructionsInput();
+  };
+
+  // Handle click on delete button for chips
+  useEffect(() => {
+    const editor = instructionsRef.current;
+    if (!editor) return;
+
+    const handleClick = (e: MouseEvent) => {
+      if (readOnly) return;
+      const target = e.target as HTMLElement;
+      const deleteBtn = target.closest('.file-chip-delete');
+      if (deleteBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chip = deleteBtn.closest('[data-file-path]');
+        if (chip) {
+          chip.remove();
+          // Trigger input handling manually
+          handleInstructionsInput();
+        }
+        return;
+      }
+    };
+
+    editor.addEventListener('click', handleClick);
+    return () => editor.removeEventListener('click', handleClick);
+  }, [readOnly]);
+
+  // Sync state -> DOM
+  useEffect(() => {
+    const editor = instructionsRef.current;
+    if (!editor) return;
+
+    if (instructions !== lastInstructionsRef.current) {
+      if (!instructions) {
+        editor.innerHTML = "";
+      } else if (document.activeElement !== editor) {
+        let html = renderFileMentionsHtml(normalizeLineBreaks(instructions));
+        html = html.replace(/\n/g, "<br>");
+        if (html.endsWith("<br>")) {
+          html += "<br>";
+        }
+
+        editor.innerHTML = html;
+      }
+      lastInstructionsRef.current = instructions;
+    }
+  }, [instructions]);
+
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const previewTaskIdRef = useRef<number | null>(null)
+  // A reset or new send invalidates in-flight history loads and older sends.
+  const previewGenerationRef = useRef(0)
+  // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
+  const previewConfigGenerationRef = useRef(0)
+  // Only an accepted send for the current configuration can complete the guide.
+  // Keep this reactive: invalidating the cached task must also remove its checkmark.
+  const [previewCompletionTaskId, setPreviewCompletionTaskId] = useState<number | null>(null)
+  const [lastPreview, setLastPreview] = useState<PreviewRecord | null>(null)
+  const lastPreviewRef = useRef<PreviewRecord | null>(null)
+  const [previewHistoryLoading, setPreviewHistoryLoading] = useState(false)
+  const [previewHistoryError, setPreviewHistoryError] = useState(false)
+  const [previewSendError, setPreviewSendError] = useState<string | null>(null)
+  const [previewHistoryRetry, setPreviewHistoryRetry] = useState(0)
+  const [previewSending, setPreviewSending] = useState(false)
+  const previewSendingRef = useRef(false)
+  const previewSendSettledRef = useRef<Promise<void> | null>(null)
+
+  const bindPreviewTask = async (agentId: string | number) => {
+    // Saving may finish while a new preview is still uploading. Associate
+    // the settled record, not a staging task that could be rolled back.
+    await previewSendSettledRef.current
+    // Builder-chat callbacks can outlive the render that started the chat.
+    const record = lastPreviewRef.current
+    if (!record) return
+    try {
+      const binding = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/preview-task`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_id: record.taskId }),
+      })
+      if (!binding.ok) throw new Error("Preview association failed")
+    } catch (error) {
+      console.error("Failed to associate preview:", error)
+      toast.error(t("builds.preview.errors.linkFailed"))
+    }
+  }
+
+  const resetPreviewSession = useCallback(() => {
+    previewGenerationRef.current += 1
+    previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
+    setPreviewSendError(null)
+    closeFilePreview()
+    dispatch({ type: "CLEAR_MESSAGES" })
+    dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+    dispatch({ type: "SET_STEPS", payload: [] })
+    dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+    dispatch({ type: "SET_CURRENT_TASK", payload: null })
+    dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+    setTaskId(null, { navigate: false })
+  }, [closeFilePreview, dispatch, setTaskId])
+
+  const invalidatePreviewTask = useCallback(() => {
+    previewConfigGenerationRef.current += 1
+    previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
+    setPreviewSendError(null)
+  }, [])
+
+  useEffect(() => {
+    resetPreviewSession()
+    return () => {
+      resetPreviewSession()
+    }
+  }, [resetPreviewSession])
+
+  // Save/reload re-creates arrays and model objects without necessarily changing
+  // execution config. Compare the values sent to preview, not their references.
+  const previewConfigKey = JSON.stringify({
+    instructions,
+    executionMode,
+    models: [modelConfig.general, modelConfig.small_fast, modelConfig.visual, modelConfig.compact]
+      .map(id => id ? String(id) : null),
+    knowledgeBases: [...selectedKbs].sort(),
+    skills: [...selectedSkills].sort(),
+    toolCategories: [...new Set(buildToolCategories())].sort(),
+  })
+
+  useEffect(() => {
+    invalidatePreviewTask()
+  }, [previewConfigKey, invalidatePreviewTask])
+
+  const openPreviewRecord = useCallback((record: PreviewRecord) => {
+    closeFilePreview()
+    setPreviewSendError(null)
+    previewTaskIdRef.current = record.taskId
+    setPreviewCompletionTaskId(record.taskId)
+    // The normal task socket restores messages, execution status and files.
+    setTaskId(record.taskId, { navigate: false })
+  }, [closeFilePreview, setTaskId])
+
+  const loadedAgentId = originalData?.id
+  // previewConfigKey reads the model seed and the MCP list; opening a record
+  // before either lands would have it invalidated straight away. This waits
+  // for the mount-time MCP fetch only, not an admin's owner-scoped reload.
+  const previewInputsSettled = modelDefaultsSettled && mcpSettled
+  useEffect(() => {
+    if (!localAgentId || !previewInputsSettled || String(loadedAgentId) !== localAgentId || readOnly) return
+    // Saving a new agent must not replace its currently visible preview.
+    if (lastPreview !== null) {
+      setPreviewHistoryLoading(false)
+      return
+    }
+    let active = true
+    const generation = previewGenerationRef.current
+    setPreviewHistoryLoading(true)
+    setPreviewHistoryError(false)
+    const load = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/preview-task`)
+        if (!response.ok) throw new Error("Preview history request failed")
+        const data = await response.json()
+        if (!active || generation !== previewGenerationRef.current || !data?.task_id) return
+        const record: PreviewRecord = {
+          taskId: data.task_id,
+          configKey: data.config_key,
+          message: data.message,
+          files: data.attachments,
+        }
+        lastPreviewRef.current = record
+        setLastPreview(record)
+        openPreviewRecord(record)
+      } catch (error) {
+        console.error("Failed to load preview history:", error)
+        if (active && generation === previewGenerationRef.current) setPreviewHistoryError(true)
+      } finally {
+        if (active) setPreviewHistoryLoading(false)
+      }
+    }
+    void load()
+    return () => { active = false }
+  }, [localAgentId, previewInputsSettled, loadedAgentId, readOnly, previewHistoryRetry, openPreviewRecord, lastPreview])
+
+  // Server-side creation paths persisted no model config, which rendered "--"
+  // and tripped the required-model guard on save. Seeds only once both the
+  // viewer's default and a model list containing it have landed.
+  useEffect(() => {
+    // Not in a read-only cross-user view: the default below is the viewer's,
+    // so seeding there would render someone else's model as this agent's.
+    if (!isEditMode || readOnly || !originalData) return
+    if (seededGeneralRef.current !== null || modelConfig.general) return
+    const seeded = userDefaultGeneral
+    // Only an id the dropdown can actually show: seeding one that is missing
+    // from the fetched list renders an empty Select while counting as dirty.
+    if (!seeded || !models.some(m => m.id === seeded)) return
+    seededGeneralRef.current = seeded
+    setModelConfig(prev => ({ ...prev, general: seeded }))
+  }, [isEditMode, readOnly, originalData, modelConfig.general, models, userDefaultGeneral])
+
+  // Load agent data in edit mode
+  useEffect(() => {
+    if (!isEditMode || !localAgentId) return
+
+    // Discard results of a stale load if the effect re-runs (e.g. switching
+    // agents) before its async fetches resolve, so a late response can't
+    // clobber the current agent's state.
+    let active = true
+
+    const loadAgent = async () => {
+      try {
+        setLoadingAgent(true)
+        const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}`)
+        if (!active) return
+        if (response.ok) {
+          const agent = await response.json()
+          if (!active) return
+          setOriginalData(agent)
+          setReadOnly(agent.can_edit === false)
+          // Same synchronous block as originalData: React 18 does not batch
+          // across the await below, so leaving this after it lets the seed
+          // effect run against a committed originalData and then be clobbered
+          // -- with the ref already stamped, it would never seed again.
+          if (agent.models) {
+            setModelConfig({
+              general: agent.models.general || null,
+              small_fast: agent.models.small_fast || null,
+              visual: agent.models.visual || null,
+              compact: agent.models.compact || null,
+            })
+          }
+          setName(agent.name || "")
+          setDescription(agent.description || "")
+          setInstructions(agent.instructions || "")
+          setExecutionMode(agent.execution_mode || "balanced")
+          setSuggestedPrompts(agent.suggested_prompts || [])
+          const keepRows = keepPromptContextForAgentRef.current === localAgentId
+          if (keepRows) keepPromptContextForAgentRef.current = null
+          const loadedPromptContext = draftsFromDeclarations(agent.prompt_context_fields)
+          setPromptContextFields(prev => (keepRows ? prev : loadedPromptContext))
+          setPromptContextSaveAttempted(false)
+          setVisibility(agent.visibility === "admins" ? "admins" : "team")
+          setOwnership(agent.team_id == null ? "personal" : "team")
+          setSelectedKbs(agent.knowledge_bases || [])
+          setSelectedSkills(agent.skills || [])
+
+          // Legacy agents may still have an unassignable category saved —
+          // never show or round-trip it.
+          const rawToolCategories = agent.tool_categories || []
+          setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(rawToolCategories))
+          // Seed the SSH auto-category from the saved config so a failed
+          // bindings-load (which never fires onCount) can't leave "ssh" unset
+          // at save time. A successful load overwrites this with the live count.
+          setHasSshBindings(rawToolCategories.includes("ssh"))
+
+          // Admin inspecting someone else's agent: the mount-time /api/mcp/servers
+          // fetch returned the admin's own servers, so the owner's mcp: entries have
+          // no matching row to render. Re-fetch scoped to the owner.
+          if (user?.is_admin && agent.user_id != null && String(agent.user_id) !== String(user.id)) {
+            ownerScopedMcpRef.current = true
+            const ownerMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers?user_id=${agent.user_id}`)
+            if (!active) return
+            if (ownerMcpRes.ok) {
+              // A non-list body would break every connector lookup at render.
+              const ownerServers = await ownerMcpRes.json()
+              if (Array.isArray(ownerServers)) setMcpServers(ownerServers)
+            }
+          } else if (ownerScopedMcpRef.current) {
+            // Switching back to a self-owned agent after an admin cross-user view:
+            // reset the guard and reload the admin's own servers, since the
+            // mount-time fetch runs only once and won't re-populate them.
+            ownerScopedMcpRef.current = false
+            const selfMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers`)
+            if (!active) return
+            if (selfMcpRes.ok) {
+              const selfServers = await selfMcpRes.json()
+              if (Array.isArray(selfServers)) setMcpServers(selfServers)
+            }
+          }
+
+          setLogoUrl(agent.logo_url || null)
+          setLogoRemoved(false)
+        } else if (response.status === 404) {
+          setNotFound(true)
+        }
+      } catch (error) {
+        console.error("Failed to load agent:", error)
+      } finally {
+        if (active) setLoadingAgent(false)
+      }
+    }
+
+    loadAgent()
+    return () => {
+      active = false
+    }
+  }, [isEditMode, localAgentId, user?.id, user?.is_admin])
+
+  // Load template data when template parameter is present
+  useEffect(() => {
+    if (!templateId || isEditMode) return
+
+    const loadTemplate = async () => {
+      try {
+        setLoadingAgent(true)
+        const response = await apiRequest(
+          `${getApiUrl()}/api/templates/${templateId}`
+        )
+        if (response.ok) {
+          const template = await response.json()
+          if (template.type === "workforce") {
+            // This builder only knows how to configure a single agent.
+            // A workforce template's agent_config is always null (see
+            // TemplateManager._enrich_template) - bail out loudly instead
+            // of silently publishing an agent with empty instructions.
+            toast.error(t("builds.editor.error.templateIsWorkforce"))
+            router.replace("/templates")
+            return
+          }
+          setName(template.name || "")
+          setDescription(template.description || "")
+          setInstructions(template.agent_config?.instructions || "")
+          setExecutionMode(template.agent_config?.execution_mode || "balanced")
+          setSelectedSkills(template.agent_config?.skills || [])
+
+          // Separate regular tools from MCP servers
+          const allCategories = template.agent_config?.tool_categories || []
+          setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
+
+          const explicitlyConfiguredMcps = mcpServerNamesFromToolCategories(allCategories)
+
+          // _enrich_template merges connections into tool_categories as mcp: entries, so
+          // iterating both explicitlyConfiguredMcps and connections would add each
+          // connection-backed server twice (raw name + resolved name). Seed the list with
+          // only the explicitly configured MCPs that are NOT covered by connections (e.g.
+          // custom MCP servers), then let the connections loop below resolve and add the rest.
+          const connectionNames = (template.connections && Array.isArray(template.connections))
+            ? template.connections.map((conn: any) => typeof conn === 'string' ? conn : conn.name).filter(Boolean)
+            : []
+
+          let connectedMcpApps: string[] = explicitlyConfiguredMcps.filter(
+            (mcp: string) => !connectionNames.some((connName: string) => mcpNameMatches(mcp, connName))
+          )
+
+          // Use the template's 'connections' to figure out which MCP apps to select
+          if (template.connections && Array.isArray(template.connections)) {
+            template.connections.forEach((conn: any) => {
+              const connName = typeof conn === 'string' ? conn : conn.name;
+              if (!connName) return;
+
+              // Find the actual server object to use its exact name, to avoid case mismatches
+              const server = findMatchingMcpServer(mcpServers, connName)
+              const finalName = server ? server.name : connName;
+              if (!connectedMcpApps.some(existing => mcpNameMatches(existing, finalName) || mcpNameMatches(existing, connName))) {
+                connectedMcpApps.push(finalName)
+              }
+            });
+          }
+
+          setTemplateRequirements({
+            requiredSkills: template.agent_config?.skills || [],
+            requiredToolCategories: allCategories.filter((c: string) => !c.startsWith('mcp:')),
+            requiredMcpServers: connectedMcpApps,
+            requiresKnowledgeBase: allCategories.includes("knowledge"),
+          })
+          setSelectedMcpServers(connectedMcpApps)
+        }
+      } catch (error) {
+        console.error("Failed to load template:", error)
+      } finally {
+        setLoadingAgent(false)
+      }
+    }
+
+    loadTemplate()
+  }, [templateId, isEditMode, locale, mcpServers])
+
+  useEffect(() => {
+    if (!templateId || isEditMode) {
+      setTemplateRequirements(null)
+    }
+  }, [templateId, isEditMode])
+
+  // Convert kbs to MultiSelect options
+  const kbOptions = (Array.isArray(kbs) ? kbs : []).map((kb) => ({
+    value: kb.name,
+    label: kb.name,
+  }))
+
+  // Convert skills to MultiSelect options
+  const skillOptions = (Array.isArray(skills) ? skills : []).map((skill) => ({
+    value: skill.name,
+    label: skill.name,
+    description: skill.description || skill.when_to_use || undefined,
+  }))
+
+  const modelOptions = [
+    { value: "", label: "--" },
+    ...(Array.isArray(models) ? models : []).map((model) => ({
+      value: model.id.toString(),
+      label: model.model_name,
+      host: getModelSourceLabel(model),
+      description: model.model_id,
+      isBuiltin: isBuiltinModel(model),
+      isDefault: model.is_default,
+      isSmallFast: model.is_small_fast,
+      isVisual: model.is_visual,
+      isCompact: model.is_compact,
+    }))
+  ]
+
+  // Group tools by category for category selection. `mcp` has its own
+  // server-level selector; unassignable categories never appear.
+  const toolCategories = Array.from(
+    new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp' && isAssignableToolCategory(c)))
+  ).sort()
+
+  const toolCategoryOptions = toolCategories.map(category => {
+    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(t => t.category === category)
+    const categoryDesc = getCategoryDescription(category)
+    return {
+      value: category,
+      label: getCategoryLabel(category),
+      count: toolsInCategory.length,
+      description: (categoryDesc ? `**${categoryDesc}**\n\n` : '') + `${toolsInCategory.map(t => t.name).join(', ')}`
+    }
+  })
+
+  // Depends on mcpServers/officialApps having loaded: a preview sent earlier
+  // falls back to the raw MCP selectors.
+  function buildToolCategories(): string[] {
+    const categories = [...selectedToolCategories]
+    if (selectedKbs.length > 0 && !categories.includes("knowledge")) {
+      categories.push("knowledge")
+    }
+    if (hasSshBindings && !categories.includes("ssh")) {
+      categories.push("ssh")
+    }
+
+    // Add selected MCP servers back into tool_categories, resolved to the
+    // real connected MCPServer row's name -- see resolveMcpToolSelector for
+    // why a hard-coded id/name fallback can't work for every app. Deduped:
+    // two distinct selectedMcpServers entries can resolve to the same real
+    // row, and the backend persists tool_categories verbatim (agents.py),
+    // so an unresolved duplicate here lands in the DB and stays there.
+    const resolvedMcpSelectors = new Set(
+      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+    )
+    resolvedMcpSelectors.forEach(selector => categories.push(`mcp:${selector}`))
+    return categories
+  }
+
+  // Same as buildToolCategories() being non-empty, without resolving MCP selectors (which warns).
+  const hasConfiguredTools =
+    selectedToolCategories.length > 0 || selectedKbs.length > 0 || hasSshBindings || selectedMcpServers.length > 0
+  // load_skill is appended outside tool selection, so a zero-tool agent still gets it.
+  const alwaysAvailableToolNames = [
+    ...(hasConfiguredTools ? intrinsicToolNames : []),
+    ...(skillLoaderTool && selectedSkills.length > 0 ? [skillLoaderTool] : []),
+  ]
+
+  // Helper function for category descriptions
+  function getCategoryDescription(category: string): string {
+    const descriptions: Record<string, string> = {
+      'basic': t('builds.configForm.tools.categoryDescriptions.basic'),
+      'web_search': t('builds.configForm.tools.categoryDescriptions.webSearch'),
+      'file': t('builds.configForm.tools.categoryDescriptions.file'),
+      'vision': t('builds.configForm.tools.categoryDescriptions.vision'),
+      'image': t('builds.configForm.tools.categoryDescriptions.image'),
+      'video': t('builds.configForm.tools.categoryDescriptions.video'),
+      'knowledge': t('builds.configForm.tools.categoryDescriptions.knowledge'),
+      'mcp': t('builds.configForm.tools.categoryDescriptions.mcp'),
+      'browser': t('builds.configForm.tools.categoryDescriptions.browser'),
+      'ppt': t('builds.configForm.tools.categoryDescriptions.ppt'),
+      'office': t('builds.configForm.tools.categoryDescriptions.office'),
+      'special_image': t('builds.configForm.tools.categoryDescriptions.specialImage'),
+      'database': t('builds.configForm.tools.categoryDescriptions.database'),
+      'skill': t('builds.configForm.tools.categoryDescriptions.skill'),
+    }
+    return descriptions[category] || ""
+  }
+
+  // Helper function for category labels
+  function getCategoryLabel(category: string): string {
+    const labels: Record<string, string> = {
+      'basic': t('builds.configForm.tools.categories.basic'),
+      'web_search': t('builds.configForm.tools.categories.webSearch'),
+      'file': t('builds.configForm.tools.categories.file'),
+      'vision': t('builds.configForm.tools.categories.vision'),
+      'image': t('builds.configForm.tools.categories.image'),
+      'video': t('builds.configForm.tools.categories.video'),
+      'knowledge': t('builds.configForm.tools.categories.knowledge'),
+      'mcp': t('builds.configForm.tools.categories.mcp'),
+      'browser': t('builds.configForm.tools.categories.browser'),
+      'ppt': t('builds.configForm.tools.categories.ppt'),
+      'office': t('builds.configForm.tools.categories.office'),
+      'special_image': t('builds.configForm.tools.categories.specialImage'),
+      'database': t('builds.configForm.tools.categories.database'),
+      'skill': t('builds.configForm.tools.categories.skill'),
+    }
+    return labels[category] || category
+  }
+
+  const handlePreviewSendMessage = async (content: string, config?: any, files?: Array<File | PreviewAttachment>, fresh = false) => {
+    if (previewSendingRef.current) {
+      // Reject, rather than acknowledge, so ChatInput retains its draft/files.
+      throw Object.assign(new Error("Preview send is already pending"), { errorCode: "task_busy" })
+    }
+    previewSendingRef.current = true
+    let settleSend!: () => void
+    previewSendSettledRef.current = new Promise<void>(resolve => { settleSend = resolve })
+    setPreviewSending(true)
+    setPreviewHistoryError(false)
+    setPreviewSendError(null)
+    const generationAtStart = ++previewGenerationRef.current
+    const configGenerationAtStart = previewConfigGenerationRef.current
+    const previousTaskId = previewTaskIdRef.current
+    setPreviewCompletionTaskId(null)
+    let failureKey: TranslationKey = "builds.preview.errors.requestFailed"
+    let createdRecord: PreviewRecord | null = null
+    let sendStarted = false
+    try {
+      // Check if general model is selected
+      if (!modelConfig.general) {
+        failureKey = "builds.preview.errors.noModel"
+        throw new Error("Preview requires a general model")
+      }
+
+      let previewTaskId = !fresh && lastPreview?.configKey === previewConfigKey
+        ? previewTaskIdRef.current : null
+      // Uploads are task-bound. A fresh run needs its own copies, never a moved
+      // file_id or broader cross-task access. Download checks existing access;
+      // the normal send path uploads each copy into the new task's scope.
+      const sendFiles = files ? await Promise.all(files.map(async file => {
+        if (file instanceof File) {
+          return fresh ? new File([file], file.name, { type: file.type }) : file
+        }
+        const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(file.file_id)}`)
+        if (!response.ok) {
+          failureKey = "builds.preview.errors.filesUnavailable"
+          throw new Error("Original preview attachment is unavailable")
+        }
+        return new File([await response.arrayBuffer()], file.name, { type: file.type || "" })
+      })) : undefined
+      if (previewGenerationRef.current !== generationAtStart) return
+      const processedFiles = (sendFiles || []).map(f => ({
+        file_id: (f as any).file_id,
+        name: f.name,
+        size: f.size,
+        type: f.type || ''
+      }))
+
+      let backendMessage = content
+      if (!backendMessage.trim() && processedFiles.length > 0) {
+        backendMessage = `Uploaded files: ${processedFiles.map(f => f.name).join(', ')}`
+      }
+
+      const finalToolCategories = buildToolCategories()
+
+      if (!previewTaskId) {
+        const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: (backendMessage || "Build preview").slice(0, 80),
+            description: backendMessage,
+            llm_ids: [
+              modelConfig.general ? String(modelConfig.general) : null,
+              modelConfig.small_fast ? String(modelConfig.small_fast) : null,
+              modelConfig.visual ? String(modelConfig.visual) : null,
+              modelConfig.compact ? String(modelConfig.compact) : null,
+            ],
+            agent_config: {
+              instructions,
+              knowledge_bases: selectedKbs,
+              skills: selectedSkills,
+              tool_categories: finalToolCategories,
+              is_preview: true,
+              preview_agent_id: localAgentId && typeof localAgentId === 'string' ? parseInt(localAgentId) : null,
+              // Compare the selected configuration, not resolved default model
+              // ids. This is history metadata, never an execution instruction.
+              preview_config_key: previewConfigKey,
+            },
+            execution_mode: executionMode,
+            is_visible: false,
+          }),
+        })
+
+        if (!response.ok) {
+          throw new Error(await response.text())
+        }
+
+        const taskData = await response.json()
+        if (previewGenerationRef.current !== generationAtStart) return
+        previewTaskId = Number(taskData.task_id)
+        if (!Number.isFinite(previewTaskId)) {
+          throw new Error("Preview task creation returned an invalid task id")
+        }
+        // Config edited mid-create: this message still goes to the pre-edit task, the next send starts a fresh one.
+        if (previewConfigGenerationRef.current === configGenerationAtStart) {
+          previewTaskIdRef.current = previewTaskId
+        }
+        const record = { taskId: previewTaskId, configKey: previewConfigKey, message: backendMessage, files: sendFiles || [] }
+        createdRecord = record
+        lastPreviewRef.current = record
+        setLastPreview(record)
+
+        // Close any file preview opened from the previous preview task before switching context.
+        closeFilePreview()
+        setTaskId(previewTaskId, { navigate: false })
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: previewTaskId.toString(),
+            title: taskData.title,
+            description: taskData.description || backendMessage,
+            status: taskData.status,
+            createdAt: taskData.created_at,
+            updatedAt: taskData.updated_at,
+            modelId: taskData.model_id,
+            smallFastModelId: taskData.small_fast_model_id,
+            visualModelId: taskData.visual_model_id,
+            compactModelId: taskData.compact_model_id,
+            modelName: taskData.model_name || taskData.modelName,
+            smallFastModelName: taskData.small_fast_model_name || taskData.smallFastModelName,
+            visualModelName: taskData.visual_model_name,
+            compactModelName: taskData.compact_model_name,
+            executionMode: taskData.execution_mode,
+            isDag: taskData.is_dag,
+            agentId: taskData.agent_id,
+            waitingQuestion: taskData.waiting_question,
+            waitingInteractions: taskData.waiting_interactions,
+          }
+        })
+        dispatch({ type: "TRIGGER_TASK_UPDATE" })
+      }
+
+      sendStarted = true
+      await sendMessage(backendMessage, {
+        force: true,
+        targetTaskId: previewTaskId,
+        ...(typeof config?.clientMessageId === "string" ? { clientMessageId: config.clientMessageId } : {}),
+      }, sendFiles)
+      if (
+        previewGenerationRef.current === generationAtStart
+        && previewConfigGenerationRef.current === configGenerationAtStart
+      ) {
+        setPreviewCompletionTaskId(previewTaskId)
+      }
+    } catch (error) {
+      console.error("Preview failed:", error)
+      const disposition = readSendDisposition(error)
+      const notSent = !sendStarted || disposition === "not_sent"
+      const rollbackCreatedTask = createdRecord !== null
+        && lastPreviewRef.current === createdRecord
+        && (notSent || disposition === "rejected")
+      if (rollbackCreatedTask) {
+        // Only discard this send's new staging record. A rejection on an
+        // existing task can follow an accepted/unknown turn and must keep it.
+        // Clear invalidates the visible session, not this history rollback.
+        lastPreviewRef.current = lastPreview
+        setLastPreview(lastPreview)
+      }
+      if (previewGenerationRef.current === generationAtStart) {
+        if (notSent || rollbackCreatedTask) {
+          if (rollbackCreatedTask) {
+            // Restore via the normal history socket, without deleting tasks
+            // or touching earlier uploads. Never reopen a cleared session.
+            previewTaskIdRef.current = previewConfigGenerationRef.current === configGenerationAtStart
+              ? previousTaskId : null
+            setTaskId(state.taskId, { navigate: false })
+            dispatch({ type: "SET_CURRENT_TASK", payload: state.currentTask })
+            dispatch({ type: "SET_PROCESSING", payload: state.isProcessing })
+            if (!state.taskId) dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+          }
+          if (previewConfigGenerationRef.current === configGenerationAtStart) {
+            setPreviewCompletionTaskId(previewCompletionTaskId)
+          }
+          if (notSent && failureKey === "builds.preview.errors.requestFailed") {
+            failureKey = "builds.preview.errors.notSent"
+          }
+        }
+        if (disposition === "outcome_unknown") {
+          failureKey = "clientErrors.messageOutcomeUnknown"
+        } else if (disposition === "rejected") {
+          failureKey = "builds.preview.errors.rejected"
+        }
+        // A send error is UI state, not an assistant result in the old task.
+        const code = readSendErrorCode(error)
+        const reason = disposition === "outcome_unknown" ? ""
+          : code ? t(clientErrorTranslationKey(code)) : readSendReason(error)
+        setPreviewSendError([t(failureKey), reason].filter(Boolean).join(" "))
+        // The composer must preserve its draft/attempt ID without a second toast.
+        throw Object.assign(typeof error === "object" && error !== null ? error : new Error(String(error)), { notificationHandled: true })
+      }
+      // ChatInput and TaskConversationPanel clear text/files only on success.
+      throw error
+    } finally {
+      previewSendingRef.current = false
+      previewSendSettledRef.current = null
+      settleSend()
+      setPreviewSending(false)
+    }
+  }
+
+  const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      setLogoFile(e.target.files[0])
+      setLogoRemoved(false)
+    }
+  }
+
+  const handleRemoveLogo = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setLogoFile(null)
+    setLogoUrl(null)
+    setLogoRemoved(true)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""
+    }
+  }
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result as string
+        resolve(result)
+      }
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const isDirtyBeyondGeneralModel = useMemo(() => {
+    if (!originalData) return false
+
+    // Helper to normalize arrays for comparison
+    const normalize = (arr: any[]) => [...(arr || [])].sort().join(',')
+
+    // Helper to normalize prompts (filter empty)
+    const normalizePrompts = (arr: string[]) =>
+      [...(arr || [])].filter(p => p.trim()).sort().join(',')
+
+    // Compare basic fields
+    if (name !== (originalData.name || "")) return true
+    if ((description || "") !== (originalData.description || "")) return true
+    if ((instructions || "") !== (originalData.instructions || "")) return true
+    if (executionMode !== (originalData.execution_mode || "graph")) return true
+
+    // Compare ownership / visibility
+    const originalOwnership = originalData.team_id == null ? "personal" : "team"
+    if (ownership !== originalOwnership) return true
+    if (ownership === "team" && visibility !== (originalData.visibility === "admins" ? "admins" : "team")) return true
+
+    // Compare logo. logoRemoved only counts as a change if the agent actually
+    // had a logo to remove - e.g. upload-then-remove on a logo-less agent is a net no-op.
+    if (logoFile) return true
+    if (logoRemoved && originalData.logo_url) return true
+
+    // Compare arrays
+    if (normalizePrompts(suggestedPrompts) !== normalizePrompts(originalData.suggested_prompts)) return true
+    if (promptContextFieldsKey(promptContextFields) !== promptContextFieldsKey(draftsFromDeclarations(originalData.prompt_context_fields))) return true
+    if (normalize(selectedKbs) !== normalize(originalData.knowledge_bases)) return true
+    if (normalize(selectedSkills) !== normalize(originalData.skills)) return true
+
+    // Check MCP servers by extracting them from originalData.tool_categories
+    const originalMcpServers = mcpServerNamesFromToolCategories(originalData.tool_categories || [])
+    if (normalize(selectedMcpServers) !== normalize(originalMcpServers)) return true
+
+    // Check non-MCP tool categories
+    const nonMcpCategories = selectedToolCategories.filter(c => !c.startsWith('mcp:'))
+    const originalNonMcpCategories = (originalData.tool_categories || []).filter((c: string) => !c.startsWith('mcp:'))
+    if (normalize(nonMcpCategories) !== normalize(originalNonMcpCategories)) return true
+
+    // Compare models. The general slot is compared outside this memo: the
+    // seed has to leave Update enabled (that is the only flow that persists
+    // it) while not blocking Publish.
+    const origModels = originalData.models || {}
+    if ((modelConfig.small_fast || null) !== (origModels.small_fast || null)) return true
+    if ((modelConfig.visual || null) !== (origModels.visual || null)) return true
+    if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
+
+    return false
+  }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, promptContextFields, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+
+  const generalModelDiffers =
+    (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
+  // Enables Update, so the seeded value has a way into the database: Publish
+  // posts no body and never persists models.
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  // ...but a slot holding the seeded value is not an edit worth blocking
+  // Publish over, for the very agents the seed exists to unblock. Picking the
+  // seeded model by hand is indistinguishable from the seed itself, which is
+  // harmless: either way the delegation resolves the same default. The
+  // stored-slot test retires the exemption once an Update has persisted a
+  // model, so re-picking the seeded one is then an ordinary unsaved edit.
+  const seedStillUnsaved = !(originalData?.models || {}).general
+  const publishBlockedByEdits =
+    isDirtyBeyondGeneralModel ||
+    (generalModelDiffers &&
+      !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
+
+  // After a successful save, align server-side ownership with the chosen control:
+  // promote a personal agent to team (with visibility) or demote a team agent back
+  // to personal. Returns the ownership fields to fold into originalData, or null if
+  // a promote was blocked by unshared connectors (dialog opened for the retry).
+  const reconcileOwnership = async (
+    agentId: string,
+    savedTeamId: unknown,
+  ): Promise<{ team_id: number | null; visibility: string } | null> => {
+    const wasTeam = savedTeamId != null
+
+    if (ownership === "team" && !wasTeam) {
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/promote-team`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visibility }),
+      })
+      if (res.status === 422) {
+        const body = await res.json().catch(() => ({}))
+        const connectors = sanitizeUnsharedConnectors(body?.detail?.unshared_connectors)
+        const knowledgeBases = sanitizeUnsharedKnowledgeBases(
+          body?.detail?.unshared_knowledge_bases,
+        )
+        if (connectors.length > 0 || knowledgeBases.length > 0) {
+          setUnsharedConnectors(connectors)
+          setUnsharedKnowledgeBases(knowledgeBases)
+          return null
+        }
+        throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+      }
+      const agent = await res.json().catch(() => ({}))
+      toast.success(t("builds.configForm.promoteTeam.success"))
+      return { team_id: agent?.team_id ?? null, visibility: agent?.visibility ?? visibility }
+    }
+
+    if (ownership === "personal" && wasTeam) {
+      const res = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/demote-personal`, {
+        method: "POST",
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+      }
+      return { team_id: null, visibility: "team" }
+    }
+
+    // No ownership change; keep saved values.
+    return { team_id: (savedTeamId as number | null) ?? null, visibility }
+  }
+
+  // Share every listed connector, then retry the promote-team flow.
+  const handleShareConnectorsAndContinue = async () => {
+    if (!localAgentId) return
+    setIsSharingConnectors(true)
+    try {
+      for (const c of unsharedConnectors) {
+        if (c.reason === "unresolved" || c.id == null) continue
+        const res = await apiRequest(
+          `${getApiUrl()}/api/connectors/${c.type}/${c.id}/share`,
+          { method: "POST" },
+        )
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+        }
+      }
+      for (const kb of unsharedKnowledgeBases) {
+        const res = await apiRequest(
+          `${getApiUrl()}/api/knowledge-bases/${encodeURIComponent(kb.name)}/promote-team`,
+          { method: "POST" },
+        )
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body?.detail?.message ?? body?.detail ?? t("builds.editor.error.unknown"))
+        }
+        // 202 means the transfer runs as a durable background job. Agent
+        // promotion below requires the KB to already be team-owned, so wait for
+        // the job instead of racing it. Backends without a job queue send 204.
+        if (res.status === 202) {
+          const job = await res.json().catch(() => null)
+          // An unreadable 202 body leaves the transfer untrackable, so the KB
+          // may still be personal. Continuing would race the agent promotion
+          // that this wait exists to order.
+          if (!isBackgroundJobResponse(job)) {
+            throw new Error(t("builds.editor.error.unknown"))
+          }
+          const finished = await waitForBackgroundJob(getApiUrl(), job)
+          if (finished.status !== "succeeded") {
+            throw new Error(
+              getBackgroundJobFailureMessage(finished, t("builds.editor.error.unknown")),
+            )
+          }
+        }
+      }
+      setUnsharedConnectors([])
+      setUnsharedKnowledgeBases([])
+      const result = await reconcileOwnership(localAgentId, null)
+      if (result) {
+        setOriginalData((current: any) => ({ ...current, ...result }))
+        pendingCreationDialogRef.current = false
+        setShowSuccessDialog(true)
+      }
+    } catch (error) {
+      console.error("Failed to share connectors:", error)
+      toast.error(error instanceof Error ? error.message : t("builds.editor.error.unknown"))
+    } finally {
+      setIsSharingConnectors(false)
+    }
+  }
+
+  const handleCancelShareConnectors = () => {
+    // User declined to share: stay personal.
+    setUnsharedConnectors([])
+    setUnsharedKnowledgeBases([])
+    setOwnership("personal")
+    // If this share flow interrupted agent creation, the success dialog was
+    // deferred; show it now so generated webhook secrets are still revealed.
+    if (pendingCreationDialogRef.current) {
+      pendingCreationDialogRef.current = false
+      setShowSuccessDialog(true)
+    }
+  }
+
+  const handleCreate = async () => {
+    // Validation
+    if (!name.trim()) {
+      toast.error(t("builds.editor.validation.nameRequired"))
+      return
+    }
+
+    if (!instructions.trim()) {
+      toast.error(t("builds.editor.validation.instructionsRequired"))
+      return
+    }
+
+    if (!modelConfig.general) {
+      toast.error(t("builds.editor.validation.modelRequired"))
+      return
+    }
+
+    if (!validatePromptContextFields(promptContextFields).valid) {
+      setPromptContextSaveAttempted(true)
+      toast.error(t("builds.configForm.promptContextFields.invalid"))
+      return
+    }
+    const promptContextPayload = toPromptContextFieldsPayload(promptContextFields)
+
+    const finalToolCategories = buildToolCategories()
+
+    setIsCreating(true)
+
+    try {
+      // Convert logo to base64 if provided; an empty string tells the
+      // backend to clear an existing logo (vs. undefined, meaning "no change").
+      let logo_base64: string | undefined
+      if (logoFile) {
+        logo_base64 = await fileToBase64(logoFile)
+      } else if (logoRemoved) {
+        logo_base64 = ""
+      }
+
+      const url = isEditMode && localAgentId
+        ? `${getApiUrl()}/api/agents/${localAgentId}`
+        : `${getApiUrl()}/api/agents`
+
+      const method = isEditMode ? "PUT" : "POST"
+
+      const response = await apiRequest(url, {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: name.trim(),
+          description: description.trim() || undefined,
+          instructions: instructions.trim() || undefined,
+          execution_mode: executionMode,
+          suggested_prompts: suggestedPrompts.filter(p => p.trim()),
+          prompt_context_fields: promptContextPayload,
+          models: modelConfig,
+          knowledge_bases: selectedKbs,
+          skills: selectedSkills,
+          tool_categories: finalToolCategories,
+          // Only meaningful for team agents; sending it for a personal agent
+          // could trip the team-admin visibility guard on an ordinary save.
+          // Ownership transitions go through promote-team/demote-personal.
+          ...(ownership === "team" ? { visibility } : {}),
+          logo_base64,
+        }),
+      })
+
+      if (response.ok) {
+        setPromptContextFields(draftsFromDeclarations(promptContextPayload))
+        setPromptContextSaveAttempted(false)
+        if (isEditMode) {
+          const updatedAgent = await response.json()
+          const trimmedName = name.trim()
+          const trimmedDesc = description.trim()
+          const trimmedInstr = instructions.trim()
+          const trimmedPrompts = suggestedPrompts.filter(p => p.trim())
+
+          // Update local state to match saved data
+          setName(trimmedName)
+          setDescription(trimmedDesc)
+          setInstructions(trimmedInstr)
+          setSuggestedPrompts(trimmedPrompts)
+
+          // Reconcile team/personal ownership (may open the share-connectors dialog).
+          const ownershipResult = localAgentId
+            ? await reconcileOwnership(localAgentId, originalData?.team_id)
+            : { team_id: originalData?.team_id ?? null, visibility }
+
+          // Update original data to reflect saved state
+          setOriginalData({
+            ...originalData,
+            name: trimmedName,
+            description: trimmedDesc || undefined,
+            instructions: trimmedInstr || undefined,
+            execution_mode: executionMode,
+            suggested_prompts: trimmedPrompts,
+            prompt_context_fields: promptContextPayload,
+            models: modelConfig,
+            knowledge_bases: selectedKbs,
+            skills: selectedSkills,
+            tool_categories: finalToolCategories,
+            logo_url: updatedAgent.logo_url,
+            ...(ownershipResult ?? {}),
+          })
+          // Re-seed selectedMcpServers to match: see
+          // mcpServerNamesFromToolCategories's comment for why (isDirty
+          // would otherwise compare a resolved name against the
+          // display name the user picked, forever).
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
+          // Sync the saved logo URL so the preview doesn't fall back to the
+          // stale URL captured at initial load once logoFile is cleared below.
+          setLogoUrl(updatedAgent.logo_url || null)
+          setLogoFile(null)
+          setLogoRemoved(false)
+        } else {
+          const newAgent = await response.json()
+          setCreatedAgent(newAgent)
+          // Preview uploads must not block saving triggers or ownership.
+          void bindPreviewTask(newAgent.id)
+
+          // Staged triggers (configured before the agent existed, #928) go
+          // through the regular trigger API now that a real agent id exists.
+          // Failures don't roll back the agent; failed configs are kept in
+          // failedStagedTriggers for retry/discard instead of being dropped.
+          if (stagedTriggers.length > 0) {
+            const outcome = await createStagedTriggers(newAgent.id, stagedTriggers)
+            outcome.failed.forEach((entry) => {
+              toast.error(
+                t("triggers.messages.stagedCreateFailed", {
+                  name: entry.staged.name,
+                  error: entry.error,
+                }),
+              )
+            })
+            setStagedTriggers([])
+            setFailedStagedTriggers(outcome.failed)
+            setCreatedWebhookSecrets(outcome.generatedSecrets)
+            try {
+              setTriggerSummary(await listAgentTriggers(newAgent.id))
+            } catch (error) {
+              console.error("Failed to refresh trigger summary:", error)
+            }
+          }
+
+          // Newly created agents are always personal; promote if the user chose Team.
+          const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
+          // tool_categories: finalToolCategories explicitly, not whatever
+          // newAgent.tool_categories echoes back -- matches the edit-mode
+          // branch above, which sources both originalData and the reseed
+          // below from the same local value rather than mixing a server
+          // response with a local one.
+          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, prompt_context_fields: promptContextPayload, ...(ownershipResult ?? {}) })
+          // Same re-seed as the edit-mode branch above, and for the same
+          // reason: selectedMcpServers must hold the resolved selectors
+          // this request submitted, not the possibly-unresolved values it
+          // still held from before save.
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
+          // Only confirm success once ownership resolved. If a promote was blocked
+          // (the share-connectors dialog opened, ownershipResult is null), don't
+          // stack a "created" dialog on top of it — but remember to show it when
+          // that flow resolves, or generated webhook secrets would never surface.
+          if (ownershipResult) {
+            setShowSuccessDialog(true)
+          } else {
+            pendingCreationDialogRef.current = true
+          }
+          setLocalAgentId(newAgent.id.toString())
+
+          // Silently update URL to include ID so refreshing works
+          // We don't want to trigger a full navigation that might close the dialog or reset state if not handled carefully
+          // But since we are setting state, a replace might be fine.
+          // Let's use history API to be safe and avoid component remount
+          window.history.pushState({}, '', `/build/${newAgent.id}`)
+
+          // Also update internal state so "Edit Mode" logic kicks in effectively if we were to re-render
+          // Note: agentId comes from searchParams which won't update until router.push/replace
+          // But for the dialog purpose, we have what we need.
+        }
+      } else {
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.editor.error.unknown"))
+        )
+      }
+    } catch (error) {
+      console.error("Failed to save agent:", error)
+      toast.error(t("builds.editor.error.unknown"))
+    } finally {
+      setIsCreating(false)
+    }
+  }
+
+  const handlePublish = async () => {
+    if (!localAgentId) return
+
+    setLoadingAgent(true)
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/publish`, {
+        method: "POST",
+      })
+
+      if (response.ok) {
+        setOriginalData({
+          ...originalData,
+          status: "published",
+        })
+        toast.success(t("builds.editor.success.published"))
+      } else {
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
+      }
+    } catch (error) {
+      console.error("Failed to publish agent:", error)
+      toast.error(t("builds.editor.error.unknown"))
+    } finally {
+      setLoadingAgent(false)
+    }
+  }
+
+  const handleUnpublish = async () => {
+    if (!localAgentId) return
+
+    setLoadingAgent(true)
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/unpublish`, {
+        method: "POST",
+      })
+
+      if (response.ok) {
+        setOriginalData({
+          ...originalData,
+          status: "draft",
+        })
+        toast.success(t("builds.editor.success.unpublished"))
+      } else {
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.unpublishFailed"))
+        )
+      }
+    } catch (error) {
+      console.error("Failed to unpublish agent:", error)
+      toast.error(t("builds.editor.error.unknown"))
+    } finally {
+      setLoadingAgent(false)
+    }
+  }
+
+  const handleDialogPublish = async () => {
+    if (!createdAgent?.id) return
+
+    setLoadingAgent(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${createdAgent.id}/publish`, {
+        method: "POST",
+      })
+
+      if (response.ok) {
+        toast.success(t("builds.editor.success.published"))
+        setShowSuccessDialog(false)
+        if (failedStagedTriggers.length === 0) {
+          router.replace(`/build/${createdAgent.id}`)
+        } else {
+          navPendingRef.current = true
+        }
+      } else {
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
+      }
+    } catch (error) {
+      console.error("Failed to publish agent:", error)
+      toast.error(t("builds.editor.error.unknown"))
+    } finally {
+      setLoadingAgent(false)
+    }
+  }
+
+  const handleDialogClose = () => {
+    setShowSuccessDialog(false)
+    // router.replace remounts the builder and would drop the failed-trigger
+    // retry list. The URL was already pushState'd to /build/{id} at creation,
+    // so staying on this instance is safe while retries are pending; the
+    // deferred navigation runs once the failed list drains.
+    if (!createdAgent?.id) return
+    if (failedStagedTriggers.length === 0) {
+      router.replace(`/build/${createdAgent.id}`)
+    } else {
+      navPendingRef.current = true
+    }
+  }
+
+  const handleOptimizeInstructions = async () => {
+    if (!instructions.trim()) {
+      toast.error(t("builds.editor.validation.instructionsRequired"))
+      return
+    }
+
+    setIsOptimizing(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/optimize-instructions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instructions,
+          model_id: modelConfig.general
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        setInstructions(data.optimized_instructions)
+        toast.success(t("builds.configForm.instructions.optimizeSuccess"))
+      } else {
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(
+            error,
+            t("builds.configForm.instructions.optimizeError")
+          )
+        )
+      }
+    } catch (error) {
+      console.error("Failed to optimize instructions:", error)
+      toast.error(t("builds.configForm.instructions.optimizeError"))
+    } finally {
+      setIsOptimizing(false)
+    }
+  }
+
+  const isTemplateEntry = Boolean(templateId) && !isEditMode
+  // Of the catalog lists, only MCP feeds the requirement checks below.
+  const isTemplateRequirementsPending = isTemplateEntry && (!mcpSettled || loadingAgent || !templateRequirements)
+  const isTemplateBuildFlow = isTemplateEntry && !isTemplateRequirementsPending
+  const templateMissingKb = Boolean(
+    isTemplateBuildFlow &&
+    templateRequirements?.requiresKnowledgeBase &&
+    selectedKbs.length === 0
+  )
+  const templateMissingSkills = Boolean(
+    isTemplateBuildFlow &&
+    templateRequirements?.requiredSkills.some((skill) => !selectedSkills.includes(skill))
+  )
+  const templateMissingTools = Boolean(
+    isTemplateBuildFlow &&
+    templateRequirements?.requiredToolCategories.some((category) => !selectedToolCategories.includes(category))
+  )
+  const templateMissingMcp = Boolean(
+    isTemplateBuildFlow &&
+    templateRequirements?.requiredMcpServers.some((serverName) => {
+      const isSelected = selectedMcpServers.some((name) => mcpNameMatches(name, serverName))
+      const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+      const connectedApp = findMatchingMcpApp(officialApps, serverName)
+      const isConnected = isMcpSelectionConnected(connectedServer, connectedApp)
+      return !isSelected || !isConnected
+    })
+  )
+  const describeStepCompleted = Boolean(name.trim() && description.trim() && instructions.trim())
+  // Plain agents need a model, not an arbitrary optional tool or connector.
+  // Templates still require their declared capabilities before this step completes.
+  const configStepCompleted = Boolean(modelConfig.general)
+    && !isTemplateRequirementsPending
+    && (!isTemplateBuildFlow || (
+      !templateMissingKb && !templateMissingSkills && !templateMissingTools && !templateMissingMcp
+    ))
+  const previewStepCompleted = previewCompletionTaskId !== null
+    && lastPreview?.configKey === previewConfigKey
+    && state.taskId === previewCompletionTaskId
+    && state.currentTask?.id === String(previewCompletionTaskId)
+    && state.currentTask?.status === "completed"
+    && state.currentTask.completionOutcome !== "partial"
+    && state.currentTask.completionOutcome !== "blocked"
+    && !state.isProcessing
+
+  const buildSteps = [
+    {
+      key: "describe",
+      label: t("builds.editor.stepGuide.describe"),
+      status: describeStepCompleted ? "complete" : "current" as "complete" | "current" | "upcoming",
+    },
+    {
+      key: "configure",
+      label: t("builds.editor.stepGuide.configure"),
+      status: configStepCompleted
+        ? "complete"
+        : describeStepCompleted
+          ? "current"
+          : "upcoming" as "complete" | "current" | "upcoming",
+    },
+    {
+      key: "preview",
+      label: t("builds.editor.stepGuide.preview"),
+      status: previewStepCompleted
+        ? "complete"
+        : describeStepCompleted && configStepCompleted
+          ? "current"
+          : "upcoming" as "complete" | "current" | "upcoming",
+    },
+  ]
+  const allStepsCompleted = buildSteps.every((step) => step.status === "complete")
+  const shouldShowCompletedBanner = allStepsCompleted && !localAgentId
+
+  const getStepStatusClasses = (status: "complete" | "current" | "upcoming") =>
+    status === "complete"
+      ? "border-green-500 bg-green-500 text-white"
+      : status === "current"
+        ? "border-primary bg-primary text-primary-foreground shadow-sm"
+        : "border-border bg-background text-muted-foreground"
+
+  const getStepLabelClasses = (status: "complete" | "current" | "upcoming") =>
+    status === "complete"
+      ? "text-green-700 dark:text-green-400"
+      : status === "current"
+        ? "text-foreground"
+        : "text-muted-foreground"
+
+  const getStepConnectorClasses = (status: "complete" | "current" | "upcoming") =>
+    status === "complete" ? "bg-green-500" : status === "current" ? "bg-primary/40" : "bg-border"
+
+  const getConfigSectionClasses = (highlight: boolean) =>
+    cn(
+      "space-y-2 transition-all duration-200",
+      highlight && "rounded-xl border border-primary/30 bg-primary/5 p-4 shadow-sm"
+    )
+
+  const scrollToModelSection = () => {
+    modelSectionRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    })
+  }
+
+  const generalModelLabel = useMemo(
+    () => models.find((m) => m.id === modelConfig.general)?.model_name || "—",
+    [models, modelConfig.general],
+  )
+
+  const connectorDisplayNames = useMemo(
+    () =>
+      selectedMcpServers.map((serverName) => {
+        const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+        const matchingApp = findMatchingMcpApp(officialApps, serverName)
+        // matchingApp?.name (the catalog display name, e.g. "Chrome") first,
+        // not connectedServer?.name (the real MCPServer row name, e.g.
+        // "chrome-devtools"): this is a *display* label. Preferring the row
+        // name here made the chip flip from "Chrome" to "chrome-devtools"
+        // the instant selectedMcpServers gets re-seeded with the resolved
+        // name after a save (see mcpServerNamesFromToolCategories).
+        return matchingApp?.name || connectedServer?.name || serverName
+      }),
+    [selectedMcpServers, mcpServers, officialApps],
+  )
+
+  const flowTriggerRows = useMemo(
+    () =>
+      ([
+        { type: "webhook", titleKey: "triggers.cards.webhook.title", descKey: "triggers.cards.webhook.description" },
+        { type: "scheduled", titleKey: "triggers.cards.scheduled.title", descKey: "triggers.cards.scheduled.description" },
+        { type: "gmail", titleKey: "triggers.cards.gmail.title", descKey: "triggers.cards.gmail.description" },
+      ] as const)
+        .filter((item) => triggerStats[item.type].enabled > 0)
+        .map((item) => ({ key: item.type as string, label: t(item.titleKey), description: t(item.descKey) })),
+    [triggerStats, t],
+  )
+
+  const LeftPanel = (
+    <div className="p-6 space-y-8 min-h-full bg-card/50">
+      {/* Header moved to middle panel */}
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-[240px] flex-1">
+          <h1 className="mb-0.5 text-[20px] font-bold break-words leading-tight">{name || t("builds.editor.header.title")}</h1>
+          <p className="text-[13px] text-muted-foreground">{t("builds.editor.header.subtitle")}</p>
+        </div>
+        <div
+          className="inline-flex shrink-0 items-center gap-0.5 rounded-lg border bg-muted p-0.5"
+          title={t("builds.editor.flow.hintBar")}
+        >
+          <button
+            type="button"
+            onClick={() => setViewMode("config")}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+              viewMode === "config" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Settings2 className="h-3 w-3" />
+            {t("builds.editor.viewTabs.configure")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("flow")}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors",
+              viewMode === "flow" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Workflow className="h-3 w-3" />
+            {t("builds.editor.viewTabs.flow")}
+          </button>
+        </div>
+        <div className="flex max-w-full flex-1 flex-wrap items-center justify-end gap-2 xl:gap-4">
+          {readOnly ? (
+            <div className="flex items-center gap-2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-sm font-medium text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-400">
+              <Eye className="h-4 w-4" />
+              {t("builds.editor.header.readOnly")}
+            </div>
+          ) : (
+            <>
+              <Button
+                variant="outline"
+                className={cn(
+                  "flex items-center gap-2 transition-colors",
+                  showAIAssistant
+                    ? "bg-primary/10 text-primary border-primary/20 hover:bg-primary/20 hover:text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+                onClick={() => setShowAIAssistant(!showAIAssistant)}
+              >
+                <Bot className="h-4 w-4" />
+                {t("builds.editor.aiAssistant", { appName: branding.appName })}
+              </Button>
+
+              <Button
+                onClick={handleCreate}
+                disabled={isCreating || loadingAgent || (isEditMode && !isDirty)}
+              >
+                {isCreating
+                  ? isEditMode
+                    ? t("builds.editor.header.updating")
+                    : t("builds.editor.header.creating")
+                  : isEditMode
+                    ? t("builds.editor.header.update")
+                    : t("builds.editor.header.create")}
+              </Button>
+
+              {isEditMode && (
+                originalData?.status === "published" ? (
+                  <Button
+                    variant="outline"
+                    onClick={handleUnpublish}
+                    disabled={isCreating || loadingAgent}
+                  >
+                    {t("builds.editor.header.unpublish")}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="secondary"
+                    onClick={handlePublish}
+                    disabled={isCreating || loadingAgent || publishBlockedByEdits}
+                  >
+                    {t("builds.editor.header.publish")}
+                  </Button>
+                )
+              )}
+              {isEditMode && originalData?.status === "published" && (
+                <Button
+                  variant="secondary"
+                  onClick={() => router.push(getAgentTaskHref(localAgentId))}
+                  disabled={isCreating || loadingAgent || publishBlockedByEdits || failedStagedTriggers.length > 0 || createdWebhookSecrets.length > 0}
+                  title={publishBlockedByEdits ? t("builds.editor.header.saveBeforeChat") : undefined}
+                >
+                  <MessageSquare className="mr-2 h-4 w-4" />
+                  {t("builds.editor.header.startChat")}
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Step guide stays interactive in read-only mode: it only scrolls. Only relevant to the Configure form. */}
+      {viewMode === "config" && (
+        <div className="rounded-xl border border-primary/15 bg-primary/5 px-4 py-4">
+          <div className="mb-3 text-sm font-semibold text-primary">
+            {t("builds.editor.stepGuide.title")}
+          </div>
+          <div className="overflow-x-auto pb-1">
+            <div className="flex min-w-max items-center gap-3">
+              {buildSteps.map((step, index) => (
+                <React.Fragment key={step.key}>
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex items-center gap-3 rounded-md transition-colors",
+                      step.key === "configure" && "cursor-pointer hover:bg-primary/5 px-1 py-1"
+                    )}
+                    onClick={step.key === "configure" ? scrollToModelSection : undefined}
+                  >
+                    <div
+                      className={cn(
+                        "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold",
+                        getStepStatusClasses(step.status)
+                      )}
+                    >
+                      {step.status === "complete" ? <Check className="h-4 w-4" /> : index + 1}
+                    </div>
+                    <span className={cn("text-sm font-medium whitespace-nowrap", getStepLabelClasses(step.status))}>
+                      {step.label}
+                    </span>
+                  </button>
+                  {index < buildSteps.length - 1 && (
+                    <div className={cn("h-px min-w-10 flex-1", getStepConnectorClasses(step.status))} />
+                  )}
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewMode === "config" && shouldShowCompletedBanner && (
+        <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700 dark:border-green-900/40 dark:bg-green-900/20 dark:text-green-400">
+          <div className="flex items-center gap-2">
+            <Check className="h-4 w-4 shrink-0" />
+            <span>{t("builds.editor.stepGuide.completed")}</span>
+          </div>
+        </div>
+      )}
+
+      <fieldset disabled={readOnly} className={viewMode === "flow" ? "hidden" : "contents"}>
+      <div className="space-y-6">
+        {/* Logo Upload */}
+        <div className="space-y-2">
+          <Label>{t("builds.configForm.logo.label")}</Label>
+          <div className="flex items-center gap-4">
+            <div className="relative h-16 w-16">
+              <div
+                className={`h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden transition-colors ${readOnly ? "cursor-default" : "cursor-pointer hover:bg-muted/50"}`}
+                onClick={readOnly ? undefined : () => fileInputRef.current?.click()}
+              >
+                {logoFile ? (
+                  <img src={URL.createObjectURL(logoFile)} alt="Logo" className="h-full w-full object-cover" />
+                ) : logoUrl ? (
+                  <img src={`${getApiUrl()}${logoUrl}`} alt="Logo" className="h-full w-full object-cover" />
+                ) : (
+                  <Upload className="h-6 w-6 text-muted-foreground" />
+                )}
+              </div>
+              {!readOnly && (logoFile || logoUrl) && (
+                <button
+                  type="button"
+                  onClick={handleRemoveLogo}
+                  aria-label={t("builds.configForm.logo.remove")}
+                  className="absolute -top-2 -right-2 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              )}
+            </div>
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              ref={fileInputRef}
+              onChange={handleLogoUpload}
+            />
+          </div>
+        </div>
+
+        {/* Name */}
+        <div className="space-y-2">
+          <Label htmlFor="name">
+            {t("builds.configForm.name.label")} <span className="text-destructive">*</span>
+          </Label>
+          <Input
+            id="name"
+            placeholder={t("builds.configForm.name.placeholder")}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </div>
+
+        {/* Description */}
+        <div className="space-y-2">
+          <Label htmlFor="description">{t("builds.configForm.description.label")}</Label>
+          <Textarea
+            id="description"
+            placeholder={t("builds.configForm.description.placeholder")}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </div>
+
+        {/* Instructions */}
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="instructions">
+              {t("builds.configForm.instructions.label")} <span className="text-destructive">*</span>
+            </Label>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-xs text-muted-foreground hover:text-primary"
+              onClick={handleOptimizeInstructions}
+              disabled={isOptimizing || !instructions.trim()}
+            >
+              {isOptimizing ? (
+                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+              )}
+              {isOptimizing ? t("builds.configForm.instructions.optimizing") : t("builds.configForm.instructions.optimize")}
+            </Button>
+          </div>
+          <div className="relative" ref={containerRef}>
+            <FileMentionDropdown
+              show={fileMention.showFilePicker}
+              isLoading={fileMention.isLoadingFiles}
+              filteredFiles={fileMention.filteredFiles}
+              selectedFileIndex={fileMention.selectedFileIndex}
+              onInsert={fileMention.insertFile}
+              t={t}
+              position={fileMention.dropdownPosition}
+            />
+
+            <div
+              className={cn(
+                "relative rounded-md border shadow-sm transition-all duration-300 bg-background",
+                isInstructionsFocused ? "border-primary ring-1 ring-primary" : "border-input hover:border-border",
+                isOptimizing ? "opacity-50 pointer-events-none" : ""
+              )}
+            >
+              <div
+                ref={instructionsRef}
+                contentEditable={!isOptimizing && !readOnly}
+                className="h-[220px] min-h-[150px] max-h-[520px] w-full rounded-md bg-transparent px-3 py-2 font-mono text-sm outline-none overflow-y-auto resize-y break-words whitespace-pre-wrap text-left"
+                onInput={handleInstructionsInput}
+                onKeyDown={fileMention.handleKeyDown}
+                onPaste={handleInstructionsPaste as any}
+                onFocus={() => setIsInstructionsFocused(true)}
+                onBlur={() => setIsInstructionsFocused(false)}
+                role="textbox"
+                aria-multiline="true"
+              />
+              {!instructions && (
+                <div className="absolute top-2 left-3 text-muted-foreground pointer-events-none text-sm font-mono">
+                  {t("builds.configForm.instructions.placeholder")}
+                </div>
+              )}
+            </div>
+            {instructions.length >= MAX_INSTRUCTIONS_LENGTH && (
+              <div className="flex items-center gap-2 mt-2 text-destructive bg-destructive/10 px-3 py-2 rounded-md text-sm">
+                <XCircle className="h-4 w-4" />
+                <span>{t("builds.configForm.instructions.maxLengthExceeded")}</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Execution Mode */}
+        <div className="space-y-2">
+          <Label>{t("builds.configForm.executionMode.label")}</Label>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-2">
+            <button
+              type="button"
+              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "flash"
+                ? "bg-primary text-primary-foreground border-primary"
+                : "bg-background hover:bg-accent"
+                }`}
+              onClick={() => setExecutionMode("flash")}
+            >
+              <div className="flex items-center justify-center gap-1 mb-1">
+                <Zap className="h-3.5 w-3.5" />
+                <div className="font-medium">{t("builds.configForm.executionMode.flash.title")}</div>
+              </div>
+              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.flash.description")}</div>
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "balanced"
+                ? "bg-primary text-primary-foreground border-primary"
+                : "bg-background hover:bg-accent"
+                }`}
+              onClick={() => setExecutionMode("balanced")}
+            >
+              <div className="flex items-center justify-center gap-1 mb-1">
+                <Gauge className="h-3.5 w-3.5" />
+                <div className="font-medium">{t("builds.configForm.executionMode.balanced.title")}</div>
+              </div>
+              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.balanced.description")}</div>
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-2 text-sm border rounded-md transition-colors ${executionMode === "think"
+                ? "bg-primary text-primary-foreground border-primary"
+                : "bg-background hover:bg-accent"
+                }`}
+              onClick={() => setExecutionMode("think")}
+            >
+              <div className="flex items-center justify-center gap-1 mb-1">
+                <Brain className="h-3.5 w-3.5" />
+                <div className="font-medium">{t("builds.configForm.executionMode.think.title")}</div>
+              </div>
+              <div className="text-xs opacity-80">{t("builds.configForm.executionMode.think.description")}</div>
+            </button>
+          </div>
+        </div>
+
+        {/* Model Selection */}
+        <div ref={modelSectionRef} className={cn(getConfigSectionClasses(!modelConfig.general), "space-y-4")}>
+          <div className="flex items-center justify-between">
+            <Label>{t("builds.configForm.model.label")}</Label>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => setIsModelConfigOpen(true)}
+            >
+              <Settings2 className="h-3.5 w-3.5 md:mr-1.5" />
+              <span className="hidden md:inline">{t("builds.configForm.model.configure")}</span>
+            </Button>
+          </div>
+
+          {models.length > 0 ? (
+            <div className="space-y-1">
+              <div className="flex items-center gap-1.5">
+                <Label className="text-xs text-muted-foreground">
+                  {t("builds.configForm.model.types.general")}
+                </Label>
+                <InfoTooltip content={t("builds.configForm.model.tips.general")} />
+              </div>
+              <Select
+                value={modelConfig.general?.toString() || ""}
+                disabled={readOnly}
+                onValueChange={(value) => setModelConfig(prev => ({
+                  ...prev,
+                  general: value ? Number(value) : null
+                }))}
+                options={modelOptions}
+                placeholder="--"
+              />
+            </div>
+          ) : (
+            <BuilderListStatus status={modelsStatus} onRetry={retryModels}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.model.noData")}
+              </div>
+            </BuilderListStatus>
+          )}
+
+          <Dialog open={isModelConfigOpen} onOpenChange={setIsModelConfigOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>{t("builds.configForm.model.configure")}</DialogTitle>
+                <DialogDescription className="flex items-center gap-1.5">
+                  {t("builds.configForm.model.configureDescription")}
+                  <a
+                    href="https://docs.xagent.co/models/overview"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center text-muted-foreground hover:text-primary transition-colors"
+                    title="View Documentation"
+                  >
+                    <BookOpen className="h-3.5 w-3.5" />
+                  </a>
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-4">
+                {/* Small & Fast Model */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-xs text-muted-foreground">
+                      {t("builds.configForm.model.types.smallFast")}
+                    </Label>
+                    <InfoTooltip content={t("builds.configForm.model.tips.smallFast")} />
+                  </div>
+                  <Select
+                    value={modelConfig.small_fast?.toString() || ""}
+                    disabled={readOnly}
+                    onValueChange={(value) => setModelConfig(prev => ({
+                      ...prev,
+                      small_fast: value ? Number(value) : null
+                    }))}
+                    options={modelOptions}
+                    placeholder="--"
+                  />
+                </div>
+
+                {/* Visual Model */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-xs text-muted-foreground">
+                      {t("builds.configForm.model.types.visual")}
+                    </Label>
+                    <InfoTooltip content={t("builds.configForm.model.tips.visual")} />
+                  </div>
+                  <Select
+                    value={modelConfig.visual?.toString() || ""}
+                    disabled={readOnly}
+                    onValueChange={(value) => setModelConfig(prev => ({
+                      ...prev,
+                      visual: value ? Number(value) : null
+                    }))}
+                    options={modelOptions}
+                    placeholder="--"
+                  />
+                </div>
+
+                {/* Compact Model */}
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-xs text-muted-foreground">
+                      {t("builds.configForm.model.types.compact")}
+                    </Label>
+                    <InfoTooltip content={t("builds.configForm.model.tips.compact")} />
+                  </div>
+                  <Select
+                    value={modelConfig.compact?.toString() || ""}
+                    disabled={readOnly}
+                    onValueChange={(value) => setModelConfig(prev => ({
+                      ...prev,
+                      compact: value ? Number(value) : null
+                    }))}
+                    options={modelOptions}
+                    placeholder="--"
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button onClick={() => setIsModelConfigOpen(false)}>
+                  {t("common.confirm")}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </div>
+
+        {/* Knowledge Base - Multi Select */}
+        <div className={getConfigSectionClasses(templateMissingKb)}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Label>{t("builds.configForm.knowledgeBase.label")}</Label>
+              <InfoTooltip content={t("builds.configForm.model.tips.knowledgeBase")} />
+              {kbs.length > 0 && (
+                <div className="ml-2 flex items-center gap-1.5 border-l pl-2 border-border">
+                  <Switch
+                    id="selectAllKbs"
+                    checked={selectedKbs.length === kbOptions.length && kbOptions.length > 0}
+                    onCheckedChange={(checked: boolean) => {
+                      if (checked) {
+                        const allValues = kbOptions.map((item) => item.value)
+                        setSelectedKbs(allValues)
+                        if (!selectedToolCategories.includes("knowledge")) {
+                          setSelectedToolCategories(prev => [...prev, "knowledge"])
+                        }
+                      } else {
+                        setSelectedKbs([])
+                      }
+                    }}
+                    className="scale-75"
+                  />
+                  <Label htmlFor="selectAllKbs" className="text-xs text-muted-foreground cursor-pointer">
+                    {t("builds.configForm.knowledgeBase.selectAll")}
+                  </Label>
+                </div>
+              )}
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => setIsKbModalOpen(true)}
+            >
+              <PlusCircle className="h-4 w-4 md:mr-2" />
+              <span className="hidden md:inline">{t("builds.configForm.knowledgeBase.create")}</span>
+            </Button>
+          </div>
+
+          <MultiSelect
+            values={selectedKbs || []}
+            onValuesChange={(newValues) => {
+              setSelectedKbs(newValues)
+              if (newValues.length > 0 && !selectedToolCategories.includes("knowledge")) {
+                setSelectedToolCategories(prev => [...prev, "knowledge"])
+              }
+            }}
+            options={kbOptions}
+            placeholder={t("builds.configForm.knowledgeBase.placeholder")}
+            disabled={readOnly}
+          />
+          {/* The picker stays mounted so saved KBs remain visible; a reload
+              after creating a KB keeps the loaded list without a status line. */}
+          {kbs.length === 0 && kbsStatus !== "ready" && (
+            <BuilderListStatus status={kbsStatus} onRetry={reloadKbs}>{null}</BuilderListStatus>
+          )}
+        </div>
+
+        {/* Skills - Multi Select */}
+        <div className={getConfigSectionClasses(templateMissingSkills)}>
+          <div className="flex items-center gap-1.5">
+            <Label>{t("builds.configForm.skills.label")}</Label>
+            <InfoTooltip content={t("builds.configForm.model.tips.skills")} />
+            {skills.length > 0 && (
+              <div className="ml-2 flex items-center gap-1.5 border-l pl-2 border-border">
+                <Switch
+                  id="selectAllSkills"
+                  checked={selectedSkills.length === skillOptions.length && skillOptions.length > 0}
+                  onCheckedChange={(checked: boolean) => {
+                    if (checked) {
+                      const allValues = skillOptions.map((item: any) => item.value)
+                      setSelectedSkills(allValues)
+                    } else {
+                      setSelectedSkills([])
+                    }
+                  }}
+                  className="scale-75"
+                />
+                <Label htmlFor="selectAllSkills" className="text-xs text-muted-foreground cursor-pointer">
+                  {t("builds.configForm.skills.selectAll")}
+                </Label>
+              </div>
+            )}
+          </div>
+          {skills.length > 0 ? (
+            <MultiSelect
+              values={selectedSkills || []}
+              onValuesChange={setSelectedSkills}
+              options={skillOptions}
+              placeholder={t("builds.configForm.skills.placeholder")}
+              disabled={readOnly}
+            />
+          ) : (
+            <BuilderListStatus status={skillsStatus} onRetry={retrySkills}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.skills.noData")}
+              </div>
+            </BuilderListStatus>
+          )}
+        </div>
+
+        {/* Tools - Multi Select by Category */}
+        <div className={getConfigSectionClasses(templateMissingTools)}>
+          <div className="flex items-center gap-1.5">
+            <Label>{t("builds.configForm.tools.label")}</Label>
+            <InfoTooltip content={t("builds.configForm.model.tips.tools")} />
+            {toolCategories.length > 0 && (
+              <div className="ml-2 flex items-center gap-1.5 border-l pl-2 border-border">
+                <Switch
+                  id="selectAllTools"
+                  checked={selectedToolCategories.length === toolCategoryOptions.length && toolCategoryOptions.length > 0}
+                  onCheckedChange={(checked: boolean) => {
+                    if (checked) {
+                      const allValues = toolCategoryOptions.map((item: any) => item.value)
+                      setSelectedToolCategories(allValues)
+                    } else {
+                      setSelectedToolCategories([])
+                    }
+                  }}
+                  className="scale-75"
+                />
+                <Label htmlFor="selectAllTools" className="text-xs text-muted-foreground cursor-pointer">
+                  {t("builds.configForm.tools.selectAll")}
+                </Label>
+              </div>
+            )}
+          </div>
+          {toolCategories.length > 0 ? (
+            <MultiSelect
+              values={selectedToolCategories || []}
+              onValuesChange={setSelectedToolCategories}
+              options={toolCategoryOptions}
+              placeholder={t("builds.configForm.tools.placeholder")}
+              disabled={readOnly}
+            />
+          ) : (
+            <BuilderListStatus status={toolsStatus} onRetry={retryTools}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.tools.noData")}
+              </div>
+            </BuilderListStatus>
+          )}
+          {/* The tool count is meaningless until the tools list has loaded. */}
+          {toolsStatus === "ready" && selectedToolCategories.length > 0 && (
+            <div className="text-xs text-muted-foreground">
+              {t("builds.configForm.tools.selectedCount", {
+                count: selectedToolCategories.length,
+                tools: tools.filter(t => selectedToolCategories.includes(t.category)).length
+              })}
+            </div>
+          )}
+          {alwaysAvailableToolNames.length > 0 && (
+            <div className="text-xs text-muted-foreground">
+              {t("builds.configForm.tools.alwaysAvailable", {
+                tools: alwaysAvailableToolNames.join(", "),
+              })}
+            </div>
+          )}
+        </div>
+
+        {failedStagedTriggers.length > 0 && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>{t("triggers.staging.failedTitle")}</AlertTitle>
+            <AlertDescription>
+              <div className="mt-2 space-y-2">
+                {failedStagedTriggers.map((entry) => (
+                  <div key={entry.staged.clientId} className="flex flex-wrap items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-xs">
+                      <span className="font-medium">{entry.staged.name}</span>
+                      {` — ${entry.error}`}
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      className="h-7 px-2 text-xs"
+                      onClick={() => void retryFailedTrigger(entry.staged.clientId)}
+                    >
+                      {t("triggers.actions.retry")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={
+                        discardConfirmClientId === entry.staged.clientId
+                          ? "destructive"
+                          : "ghost"
+                      }
+                      className="h-7 px-2 text-xs"
+                      onClick={() => discardFailedTrigger(entry.staged.clientId)}
+                    >
+                      {discardConfirmClientId === entry.staged.clientId
+                        ? t("triggers.actions.confirmDiscard")
+                        : t("triggers.actions.discard")}
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* One-time reveal for webhook secrets generated outside the creation
+            success dialog (e.g. a retried staged trigger). Hidden while the
+            dialog is open — it shows the same list itself. */}
+        {!showSuccessDialog && (
+          <WebhookSecretsAlert secrets={createdWebhookSecrets} onDismiss={dismissWebhookSecrets} />
+        )}
+
+        {effectiveTriggerSummary.some((trigger) => trigger.enabled) && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-1.5">
+              <Label>{t("triggers.builder.title")}</Label>
+              <InfoTooltip content={t("triggers.builder.tooltip")} />
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {([
+                {
+                  type: "webhook" as const,
+                  icon: Webhook,
+                  title: t("triggers.cards.webhook.title"),
+                  iconClass: "bg-fuchsia-50 text-fuchsia-600 dark:bg-fuchsia-950/40 dark:text-fuchsia-300",
+                },
+                {
+                  type: "scheduled" as const,
+                  icon: CalendarClock,
+                  title: t("triggers.cards.scheduled.title"),
+                  iconClass: "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300",
+                },
+                {
+                  type: "gmail" as const,
+                  icon: Mail,
+                  title: t("triggers.cards.gmail.title"),
+                  iconClass: "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300",
+                },
+              ])
+                .filter((item) => triggerStats[item.type].enabled > 0)
+                .map((item) => {
+                  const stat = triggerStats[item.type]
+                  const openDialog = () => {
+                    setTriggerDialogInitialType(item.type)
+                    setIsTriggersDialogOpen(true)
+                  }
+                  return (
+                    <div
+                      key={item.type}
+                      className="flex min-w-0 items-center gap-2 rounded-md border border-primary/40 bg-primary/[0.03] px-2.5 py-2 text-left"
+                    >
+                      <button
+                        type="button"
+                        onClick={openDialog}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      >
+                        <div className={cn("flex h-6 w-6 shrink-0 items-center justify-center rounded", item.iconClass)}>
+                          <item.icon className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate text-sm font-medium">{item.title}</span>
+                            <span className="rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                              {t("triggers.cards.activeCount", { count: stat.enabled })}
+                            </span>
+                          </div>
+                        </div>
+                      </button>
+                      <Switch
+                        checked
+                        disabled={disablingTriggerTypes.has(item.type)}
+                        onCheckedChange={(checked) => {
+                          if (!checked) void disableTriggerType(item.type)
+                        }}
+                        className="scale-75"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={openDialog}
+                        className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                        title={t("triggers.builder.configure")}
+                      >
+                        <Settings2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  )
+                })}
+            </div>
+          </div>
+        )}
+
+        <div className={getConfigSectionClasses(templateMissingMcp)}>
+          <div className="flex items-center gap-1.5">
+            <Label>{t("tools.mcp.dialog.connector")}</Label>
+          </div>
+          <div className="flex flex-col gap-2">
+            {selectedMcpServers.map((serverName, index) => {
+              const connectedServer = findMatchingMcpServer(mcpServers, serverName)
+              const matchingApp = findMatchingMcpApp(officialApps, serverName)
+              // The row stays listed after its grant stops working, so its
+              // presence alone is not "connected". Display only: the row must
+              // stay in mcpServers, which resolves the saved mcp: selector.
+              const reconnectNeeded = needsReconnect(connectedServer)
+              const isConnected = isMcpSelectionConnected(connectedServer, matchingApp)
+              const isSupported = Boolean(matchingApp)
+              // An admin viewing another user's agent sees the owner's rows; a
+              // login started here would reconnect the admin's own account.
+              // builtin_oauth matches the gate the reconnect dialog applies.
+              const canReconnect = reconnectNeeded
+                && matchingApp?.auth_type === "builtin_oauth"
+                && !readOnly
+                && !ownerScopedMcpRef.current
+
+              let statusDesc = ""
+
+              if (reconnectNeeded) {
+                statusDesc = t("tools.mcp.needsReconnectDescription")
+              } else if (connectedServer) {
+                statusDesc = connectedServer.description || ""
+              } else if (matchingApp?.is_connected) {
+                statusDesc = matchingApp.description || ""
+              } else if (isSupported) {
+                statusDesc = t("tools.mcp.notConnected")
+              } else {
+                statusDesc = t("tools.mcp.notSupported")
+              }
+
+              // Display label: matchingApp?.name first, same reasoning as
+              // connectorDisplayNames above.
+              const server = { name: matchingApp?.name || connectedServer?.name || serverName, description: statusDesc }
+              const icon = getAppIcon(server.name)
+              return (
+                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && !reconnectNeeded && "opacity-50 bg-muted/50")}>
+                  <div className="bg-slate-100 p-1.5 rounded">
+                    {icon ? (
+                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && !reconnectNeeded && "grayscale")} />
+                    ) : (
+                      <span className="text-xl">🔌</span>
+                    )}
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium flex items-center gap-2">
+                      {server.name}
+                      {reconnectNeeded ? (
+                        <NeedsReconnectBadge />
+                      ) : !isConnected && (
+                        <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded font-normal whitespace-nowrap">
+                          {t("tools.mcp.mcpUnavailable")}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-muted-foreground">{server.description}</div>
+                  </div>
+                  <div className="ml-auto flex items-center gap-1">
+                    {canReconnect && matchingApp && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={() => setReconnectApp({ ...matchingApp, connection_status: connectedServer.connection_status })}
+                      >
+                        {t("tools.mcp.dialog.reconnect")}
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 w-8 p-0 text-red-500 hover:text-red-600 hover:bg-red-50"
+                      onClick={() => setSelectedMcpServers(prev => prev.filter(name => !mcpNameMatches(name, serverName)))}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* Connector + Triggers — shared integration buttons row */}
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setIsConnectMcpOpen(true)}
+            className="h-7 border-dashed border-primary/45 bg-primary/5 px-2 text-xs text-primary hover:border-primary hover:bg-primary/10"
+          >
+            <PlusCircle className="mr-1 h-3.5 w-3.5" />
+            {t('tools.mcp.dialog.connector')}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setTriggerDialogInitialType(null)
+              setIsTriggersDialogOpen(true)
+            }}
+            className="h-7 border-dashed border-primary/45 bg-primary/5 px-2 text-xs text-primary hover:border-primary hover:bg-primary/10"
+          >
+            <Zap className="mr-1 h-3.5 w-3.5" />
+            {t("triggers.builder.open")}
+          </Button>
+        </div>
+
+        {/* SSH targets — per-agent bindings (SaaS; managed inline, needs a saved agent) */}
+        <div className={getConfigSectionClasses(false)}>
+          <AgentSshBindings
+            agentId={localAgentId}
+            readOnly={readOnly}
+            onCount={handleSshBindingCount}
+          />
+        </div>
+
+        {/* Suggested Prompts */}
+        <div className="space-y-2">
+          <Label>{t("builds.configForm.suggestedPrompts.label")}</Label>
+          <div className="text-xs text-muted-foreground mb-2">
+            {t("builds.configForm.suggestedPrompts.description")}
+          </div>
+          <div className="space-y-3">
+            {(suggestedPrompts || []).map((prompt, index) => (
+              <div key={index} className="flex gap-2 items-start">
+                <Input
+                  value={prompt}
+                  onChange={(e) => {
+                    const newPrompts = [...suggestedPrompts]
+                    newPrompts[index] = e.target.value
+                    setSuggestedPrompts(newPrompts)
+                  }}
+                  placeholder={t("builds.configForm.suggestedPrompts.placeholder", { index: index + 1 })}
+                  className="flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    const newPrompts = suggestedPrompts.filter((_, i) => i !== index)
+                    setSuggestedPrompts(newPrompts)
+                  }}
+                >
+                  {t("builds.configForm.suggestedPrompts.delete")}
+                </Button>
+              </div>
+            ))}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setSuggestedPrompts([...suggestedPrompts, ""])}
+            >
+              {t("builds.configForm.suggestedPrompts.add")}
+            </Button>
+          </div>
+        </div>
+
+        <PromptContextFieldsEditor
+          value={promptContextFields}
+          onChange={setPromptContextFields}
+          revealEmpty={promptContextSaveAttempted}
+        />
+
+        {/* Ownership + team visibility (SaaS team context only) */}
+        {inTeam && (
+          <div className="space-y-2">
+            <Label>{t("builds.configForm.ownership.label")}</Label>
+            <div className="text-xs text-muted-foreground mb-2">
+              {t("builds.configForm.ownership.hint")}
+            </div>
+            <SelectRadix value={ownership} onValueChange={(v) => setOwnership(v as "personal" | "team")}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="personal">{t("builds.configForm.ownership.personal")}</SelectItem>
+                <SelectItem value="team">{t("builds.configForm.ownership.team")}</SelectItem>
+              </SelectContent>
+            </SelectRadix>
+
+            {ownership === "team" && (
+              <div className="space-y-2 pt-2">
+                <Label>{t("builds.configForm.visibility.label")}</Label>
+                <div className="text-xs text-muted-foreground mb-2">
+                  {t("builds.configForm.visibility.desc")}
+                </div>
+                <SelectRadix value={visibility} onValueChange={(v) => setVisibility(v as "team" | "admins")}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="team">{t("builds.configForm.visibility.team")}</SelectItem>
+                    {/* Admins-only is an admin-controlled setting; non-admins
+                        never see the option (the backend also gates it). */}
+                    {canSetAdminsOnly && (
+                      <SelectItem value="admins">
+                        {t("builds.configForm.visibility.admins")}
+                      </SelectItem>
+                    )}
+                  </SelectContent>
+                </SelectRadix>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </fieldset>
+
+      {viewMode === "flow" && (
+        <div className="flex flex-col overflow-hidden rounded-xl border bg-background" style={{ height: "min(76vh, 980px)" }}>
+          <AgentFlowView
+            name={name}
+            modelLabel={generalModelLabel}
+            executionMode={executionMode as "flash" | "balanced" | "think"}
+            instructions={instructions}
+            onInstructionsChange={setInstructions}
+            readOnly={readOnly}
+            maxInstructionsLength={MAX_INSTRUCTIONS_LENGTH}
+            kbSelected={selectedKbs}
+            kbOptions={kbOptions}
+            onKbChange={(values) => {
+              setSelectedKbs(values)
+              if (values.length > 0 && !selectedToolCategories.includes("knowledge")) {
+                setSelectedToolCategories((prev) => [...prev, "knowledge"])
+              }
+            }}
+            skillsSelected={selectedSkills}
+            skillOptions={skillOptions}
+            onSkillsChange={setSelectedSkills}
+            toolsSelected={selectedToolCategories}
+            toolOptions={toolCategoryOptions}
+            onToolsChange={setSelectedToolCategories}
+            connectorNames={connectorDisplayNames}
+            onOpenConnectors={() => setIsConnectMcpOpen(true)}
+            triggerRows={flowTriggerRows}
+            onOpenTriggers={() => {
+              setTriggerDialogInitialType(null)
+              setIsTriggersDialogOpen(true)
+            }}
+            promptCount={suggestedPrompts.length}
+          />
+        </div>
+      )}
+    </div>
+  )
+
+  const RightPanel = (
+    <div className="flex flex-col flex-1 min-h-0 h-full bg-background border-l">
+      <div className="h-14 border-b flex items-center px-4 gap-2 bg-card/30">
+        <MessageSquare className="h-5 w-5 text-muted-foreground" />
+        <span className="font-medium">{t("builds.preview.title")}</span>
+        <div className={`ml-2 px-2 py-0.5 rounded-full text-xs font-medium flex items-center gap-1 transition-all duration-300 ${configSynced
+          ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+          : "bg-muted text-muted-foreground"
+          }`}>
+          {configSynced ? <Check className="h-3 w-3" /> : <Zap className="h-3 w-3" />}
+          <span>{configSynced ? t("builds.preview.synced") : t("builds.preview.live")}</span>
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-muted-foreground hover:text-foreground"
+            onClick={resetPreviewSession}
+            title={t("common.clear") || "Clear"}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+      {previewHistoryLoading && (
+        <div className="px-4 py-2 text-xs text-muted-foreground" role="status">{t("builds.preview.historyLoading")}</div>
+      )}
+      {previewHistoryError && (
+        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs" role="alert">
+          <span>{t("builds.preview.errors.historyFailed")}</span>
+          <Button size="sm" variant="ghost" onClick={() => setPreviewHistoryRetry(value => value + 1)}>{t("common.retry")}</Button>
+        </div>
+      )}
+      {previewSendError && (
+        <div className="border-b px-4 py-2 text-xs text-destructive" role="alert">{previewSendError}</div>
+      )}
+      {lastPreview && (
+        <div className="space-y-2 border-b px-4 py-3 text-xs">
+          <p role="status" className={lastPreview.configKey !== previewConfigKey ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground"}>
+            {t(lastPreview.configKey === null ? "builds.preview.configUnknown" : lastPreview.configKey !== previewConfigKey ? "builds.preview.configChanged" : "builds.preview.currentConfig")}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {state.taskId !== lastPreview.taskId && (
+              <Button size="sm" variant="outline" disabled={previewSending} onClick={() => openPreviewRecord(lastPreview)}>{t("builds.preview.viewLast")}</Button>
+            )}
+            <Button size="sm" variant="outline"
+              disabled={previewSending || state.isProcessing || state.isHistoryLoading || previewHistoryLoading || loadingAgent || !modelConfig.general || !lastPreview.message}
+              onClick={() => void handlePreviewSendMessage(lastPreview.message, undefined, lastPreview.files, true)
+                .catch(error => {
+                  if (error?.errorCode === "task_busy") toast.error(t("clientErrors.taskBusy"))
+                })}>
+              {t("builds.preview.rerunSample")}
+            </Button>
+          </div>
+        </div>
+      )}
+      <div className="flex-1 min-h-0">
+        <TaskConversationPanel
+          mode="embedded-preview"
+          showTaskActions={true}
+          showTokenUsage={false}
+          showDagPreview={false}
+          showTaskFiles={true}
+          autoFocusInput={false}
+          deferFileUpload={true}
+          onSend={handlePreviewSendMessage}
+        />
+      </div>
+    </div>
+  )
+
+  if (notFound) {
+    return (
+      <div className="flex h-full min-h-[calc(100dvh-4rem)] w-full flex-col items-center justify-center bg-background p-4 text-center">
+        <Bot className="w-16 h-16 text-muted-foreground mb-4 opacity-20" />
+        <h2 className="text-2xl font-bold mb-2">{t("builds.editor.error.notFound")}</h2>
+        <p className="text-muted-foreground max-w-md mb-6">
+          {t("builds.editor.error.notFoundDesc")}
+        </p>
+        <Button onClick={() => router.push("/build/new")}>
+          {t("builds.editor.header.create")}
+        </Button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden">
+      <div className="flex-1 min-h-0 w-full overflow-y-auto md:overflow-hidden">
+        <ResizableThreeColumnLayout
+          showLeftPanel={showAIAssistant && !readOnly}
+          leftPanel={<AgentBuilderChat
+            agentConfig={{
+              id: localAgentId ? parseInt(localAgentId) : undefined,
+              name, description, instructions, executionMode, suggestedPrompts,
+              modelConfig, selectedKbs, selectedSkills, selectedToolCategories
+            }}
+            onUpdateConfig={(updates) => {
+              if (updates.id !== undefined) {
+                if (!localAgentId) void bindPreviewTask(updates.id)
+                const id = updates.id.toString()
+                if (id !== localAgentIdRef.current) {
+                  keepPromptContextForAgentRef.current =
+                    updates.created && localAgentIdRef.current === undefined ? id : null
+                  localAgentIdRef.current = id
+                }
+                setLocalAgentId(id)
+              }
+              if (updates.name !== undefined) setName(updates.name);
+              if (updates.description !== undefined) setDescription(updates.description);
+              if (updates.instructions !== undefined) setInstructions(updates.instructions);
+              if (updates.executionMode !== undefined) setExecutionMode(updates.executionMode);
+              if (updates.suggestedPrompts !== undefined) setSuggestedPrompts(updates.suggestedPrompts);
+              if (updates.modelConfig !== undefined) setModelConfig(updates.modelConfig);
+              if (updates.selectedKbs !== undefined) setSelectedKbs(updates.selectedKbs);
+              if (updates.selectedSkills !== undefined) setSelectedSkills(updates.selectedSkills);
+              const chatCategories = updates.selectedToolCategories
+              // Chat never writes connectors: keep a bare "mcp" grant or saving revokes it.
+              if (chatCategories !== undefined) setSelectedToolCategories(prev => [...chatCategories, ...prev.filter(c => c === "mcp")]);
+            }}
+            availableOptions={{
+              models: (Array.isArray(models) ? models : []).map(m => ({ id: m.id, name: m.model_name || m.model_id })),
+              knowledgeBases: (Array.isArray(kbs) ? kbs : []).map(k => ({ name: k.name })),
+              skills: (Array.isArray(skills) ? skills : []).map(s => ({ name: s.name })),
+              toolCategories: Array.from(new Set((Array.isArray(tools) ? tools : []).map(t => t.category)))
+            }}
+          />}
+          middlePanel={LeftPanel}
+          rightPanel={RightPanel}
+          initialLeftWidth={20}
+          initialMiddleWidth={50}
+          initialRightWidth={30}
+          minLeftWidth={15}
+          minMiddleWidth={45}
+          minRightWidth={20}
+        />
+      </div>
+      {/* Success Dialog */}
+      <Dialog open={showSuccessDialog} onOpenChange={handleDialogClose}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("builds.editor.success.created")}</DialogTitle>
+            <DialogDescription>
+              {t("builds.editor.success.createdDesc", { name: createdAgent?.name })}
+            </DialogDescription>
+          </DialogHeader>
+          {/* One-time reveal of webhook secrets generated for staged triggers
+              (#928). Closing this dialog usually navigates away and remounts
+              the builder, so this is the moment to copy them. */}
+          <WebhookSecretsAlert secrets={createdWebhookSecrets} />
+          <DialogFooter className="gap-2 sm:justify-end">
+            <div className="flex w-full sm:w-auto gap-2 justify-end">
+              <Button variant="outline" onClick={handleDialogClose}>
+                {t("builds.editor.success.keepEditing")}
+              </Button>
+              <Button onClick={handleDialogPublish}>
+                {t("builds.editor.header.publish")}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Share-connectors-first prompt (promote-team 422) */}
+      <Dialog
+        open={unsharedConnectors.length > 0 || unsharedKnowledgeBases.length > 0}
+        onOpenChange={(open) => { if (!open) handleCancelShareConnectors() }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("builds.configForm.connectorNotShared.title")}</DialogTitle>
+            <DialogDescription>
+              {t(
+                hasUnresolvedConnectors
+                  ? "builds.configForm.connectorNotShared.unresolvedDesc"
+                  : "builds.configForm.connectorNotShared.desc",
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <ul className="list-disc pl-5 text-sm space-y-1">
+            {unsharedConnectors.map((c) => (
+              <li key={`${c.type}:${c.id ?? c.name}`}>
+                {c.name}
+                {c.reason === "unresolved" && ` — ${t("builds.configForm.connectorNotShared.unresolved")}`}
+              </li>
+            ))}
+            {unsharedKnowledgeBases.map((kb) => (
+              <li key={`kb:${kb.name}`}>{kb.name}</li>
+            ))}
+          </ul>
+          <DialogFooter className="gap-2 sm:justify-end">
+            <div className="flex w-full sm:w-auto gap-2 justify-end">
+              <Button variant="outline" onClick={handleCancelShareConnectors} disabled={isSharingConnectors}>
+                {t("builds.configForm.connectorNotShared.cancel")}
+              </Button>
+              {!hasUnresolvedConnectors && (
+                <Button onClick={handleShareConnectorsAndContinue} disabled={isSharingConnectors}>
+                  {isSharingConnectors && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                  {t("builds.configForm.connectorNotShared.shareAndContinue")}
+                </Button>
+              )}
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <KnowledgeBaseCreationDialog
+        open={isKbModalOpen}
+        onOpenChange={setIsKbModalOpen}
+        onSuccess={(createdCollections) => {
+          void reloadKbs()
+          if (createdCollections && createdCollections.length > 0) {
+            setSelectedKbs(prev => {
+              const newKbs = Array.from(new Set([...prev, ...createdCollections]))
+              return newKbs
+            })
+            if (!selectedToolCategories.includes("knowledge")) {
+              setSelectedToolCategories(prev => [...prev, "knowledge"])
+            }
+          }
+        }}
+      />
+
+      <AgentTriggersDialog
+        agentId={localAgentId ? Number(localAgentId) : null}
+        staged={localAgentId ? null : { triggers: stagedTriggers, onChange: setStagedTriggers }}
+        agentName={name}
+        open={isTriggersDialogOpen}
+        onOpenChange={(dialogOpen) => {
+          setIsTriggersDialogOpen(dialogOpen)
+          // No refetch here: every mutation inside the dialog already calls
+          // onChanged (refreshTriggerSummary) as it happens, so closing the
+          // dialog has nothing left to resync — doing it anyway doubled the
+          // request for every Done/dismiss that just committed an edit.
+          if (!dialogOpen) setTriggerDialogInitialType(null)
+        }}
+        onChanged={refreshTriggerSummary}
+        initialType={triggerDialogInitialType}
+        gmailConnection={gmailConnection}
+        onConnectGmail={() => {
+          setIsTriggersDialogOpen(false)
+          setIsConnectMcpOpen(true)
+        }}
+      />
+
+      {state.filePreview.isOpen && (
+        <div className="absolute inset-y-0 right-0 z-50 w-full max-w-[720px] p-4 pointer-events-none">
+          <div className="h-full pointer-events-auto">
+            <BuildFilePreviewSheet />
+          </div>
+        </div>
+      )}
+      {!readOnly && !loadingAgent && (
+        <ConnectMcpDialog
+          open={isConnectMcpOpen}
+          onOpenChange={setIsConnectMcpOpen}
+          selectedMcpServers={selectedMcpServers}
+          onConnectSelected={(selectedApps) => {
+            setSelectedMcpServers(selectedApps)
+          }}
+          onSuccess={refreshConnectors}
+        />
+      )}
+      {!readOnly && !loadingAgent && (
+        <OfficialMcpSettingsDialog
+          open={reconnectApp !== null}
+          onOpenChange={(nextOpen) => { if (!nextOpen) setReconnectApp(null) }}
+          app={reconnectApp}
+          onSuccess={refreshConnectors}
+        />
+      )}
+    </div>
+  )
+}

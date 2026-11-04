@@ -1,0 +1,2561 @@
+"""
+DockerSandbox tests
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import logging
+import os
+import re
+import socket
+import tarfile
+import tempfile
+import threading
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import xagent.sandbox.docker_sandbox as docker_sandbox_module
+from docker import errors
+from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
+from xagent.sandbox.base import (
+    SANDBOX_RUNTIME_GID,
+    SANDBOX_RUNTIME_UID,
+    ResolvedSandboxRuntimeSpec,
+    SandboxConfig,
+    SandboxMount,
+    SandboxRuntimeConflictError,
+    SandboxTemplate,
+    SpecVerdict,
+    spec_matches_inspection,
+)
+from xagent.sandbox.docker_sandbox import (
+    DockerSandboxService,
+    MemDockerStore,
+    _parse_container_config,
+    _sandbox_archive_info,
+    _SandboxControl,
+    _write_tar_from_content,
+    _write_tar_from_local_path,
+    is_docker_available,
+)
+
+
+def _raw_tar_records(archive: io.BytesIO) -> list[tuple[bytes, bytes, bytes]]:
+    """Return ``(type, name, payload)`` without asking tarfile to interpret PAX."""
+    raw = archive.getvalue()
+    records: list[tuple[bytes, bytes, bytes]] = []
+    offset = 0
+    while raw[offset : offset + tarfile.BLOCKSIZE] != b"\x00" * tarfile.BLOCKSIZE:
+        header = raw[offset : offset + tarfile.BLOCKSIZE]
+        assert len(header) == tarfile.BLOCKSIZE
+        size = int(header[124:136].rstrip(b"\x00 ") or b"0", 8)
+        payload_start = offset + tarfile.BLOCKSIZE
+        payload = raw[payload_start : payload_start + size]
+        records.append((header[156:157], header[:100].rstrip(b"\x00"), payload))
+        offset = (
+            payload_start
+            + ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        )
+    assert raw[offset:] == b"\x00" * (len(raw) - offset)
+    return records
+
+
+def _parse_pax_records(payload: bytes) -> dict[str, str]:
+    records: dict[str, str] = {}
+    while payload:
+        length_text, separator, _ = payload.partition(b" ")
+        assert separator == b" "
+        length = int(length_text)
+        record, payload = payload[:length], payload[length:]
+        assert len(record) == length and record.endswith(b"\n")
+        key, value = record[len(length_text) + 1 : -1].decode("utf-8").split("=", 1)
+        assert key not in records
+        records[key] = value
+    return records
+
+
+def _tar_octal(raw: bytes) -> int:
+    return int(raw.rstrip(b"\x00 ") or b"0", 8)
+
+
+def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
+    archive = io.BytesIO()
+
+    _write_tar_from_content("secret", "id_key", archive)
+
+    with tarfile.open(fileobj=archive, mode="r") as tar:
+        info = tar.getmember("id_key")
+        assert info.uid == 1100
+        assert info.gid == 1010
+        assert info.mode == 0o600
+        assert info.isreg()
+        assert info.pax_headers == {"Xagent.archive.version": "1"}
+
+
+@pytest.mark.parametrize(
+    ("arcname", "expected_path"),
+    [
+        ("id_key", None),
+        ("文件.txt", "文件.txt"),
+        ("a" * 101, "a" * 101),
+        ("a" * 255, "a" * 255),
+        ("é" * 127 + "a", "é" * 127 + "a"),
+    ],
+)
+def test_write_tar_content_has_one_versioned_wire_shape(
+    arcname: str, expected_path: str | None
+) -> None:
+    archive = io.BytesIO()
+
+    _write_tar_from_content("x", arcname, archive)
+
+    extension, member = _raw_tar_records(archive)
+    extension_header = archive.getvalue()[: tarfile.BLOCKSIZE]
+    assert extension[0] == b"x"
+    assert extension[1] == b"././@PaxHeader"
+    assert _tar_octal(extension_header[100:108]) == 0
+    assert _tar_octal(extension_header[108:116]) == 0
+    assert _tar_octal(extension_header[116:124]) == 0
+    assert _tar_octal(extension_header[136:148]) == 0
+    assert member[0] == tarfile.REGTYPE
+    assert member[2] == b"x"
+    expected_pax = {"Xagent.archive.version": "1"}
+    if expected_path is not None:
+        expected_pax["path"] = expected_path
+    assert _parse_pax_records(extension[2]) == expected_pax
+
+
+@pytest.mark.parametrize(
+    "arcname",
+    [
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "nested/file",
+        "nul\x00name",
+        "a" * 256,
+        "é" * 128,
+        "\ud800",
+    ],
+)
+def test_write_tar_content_rejects_names_outside_wire_contract(arcname: str) -> None:
+    with pytest.raises(ValueError, match="valid UTF-8|single valid file name"):
+        _write_tar_from_content("x", arcname, io.BytesIO())
+
+
+@pytest.mark.parametrize("source_mode", [0o400, 0o644, 0o755])
+def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
+    tmp_path, source_mode
+) -> None:
+    source = tmp_path / "id_key"
+    source.write_text("secret", encoding="utf-8")
+    source.chmod(source_mode)
+    archive = io.BytesIO()
+
+    _write_tar_from_local_path(str(source), "id_key", archive)
+
+    with tarfile.open(fileobj=archive, mode="r") as tar:
+        info = tar.getmember("id_key")
+        assert info.uid == 1100
+        assert info.gid == 1010
+        assert info.mode == source_mode
+        assert info.mtime == 0
+        assert info.pax_headers == {"Xagent.archive.version": "1"}
+        extracted = tar.extractfile(info)
+        assert extracted is not None
+        assert extracted.read() == b"secret"
+
+
+def test_archive_size_must_fit_the_legacy_tar_field() -> None:
+    info = _sandbox_archive_info("probe", size=8**11 - 1, mode=0o600)
+    assert info.size == 8**11 - 1
+
+    for invalid_size in (-1, 8**11):
+        with pytest.raises(ValueError, match="file size"):
+            _sandbox_archive_info("probe", size=invalid_size, mode=0o600)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
+def test_write_tar_local_path_rejects_fifo_swap_without_blocking(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "upload.txt"
+    source.write_text("safe", encoding="utf-8")
+    real_open = os.open
+    swapped = False
+    opened_flags: list[int] = []
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == source and not swapped:
+            swapped = True
+            source.unlink()
+            os.mkfifo(source)
+            opened_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    with tempfile.TemporaryFile() as archive:
+        monkeypatch.setattr(docker_sandbox_module.os, "open", swap_before_open)
+        outcome: list[BaseException | None] = []
+
+        def pack() -> None:
+            try:
+                _write_tar_from_local_path(str(source), "upload.txt", archive)
+            except BaseException as exc:
+                outcome.append(exc)
+            else:
+                outcome.append(None)
+
+        worker = threading.Thread(target=pack, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        if worker.is_alive():
+            writer_fd = real_open(source, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer_fd)
+            worker.join(timeout=2)
+
+        assert not worker.is_alive(), "opening a swapped FIFO must never block"
+        assert opened_flags and opened_flags[0] & os.O_NONBLOCK
+        assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
+
+
+def test_write_tar_local_path_rejects_symlink_consistently(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("secret", encoding="utf-8")
+    source = tmp_path / "source.txt"
+    source.symlink_to(target)
+
+    with tempfile.TemporaryFile() as archive:
+        with pytest.raises(ValueError, match="regular local file"):
+            _write_tar_from_local_path(str(source), "source.txt", archive)
+
+
+@pytest.mark.parametrize("raw_pids_limit", [0, 1, 63, -1, None])
+def test_inspect_treats_unrealizable_pids_limit_as_unset(raw_pids_limit) -> None:
+    container = _labeled_container({})
+    container.attrs["HostConfig"]["PidsLimit"] = raw_pids_limit
+
+    info = _parse_container_config(container)
+
+    assert info.config.pids_limit is None
+
+
+def test_inspect_recovers_named_volume_subpath_mount() -> None:
+    container = _labeled_container({})
+    container.attrs["HostConfig"]["Mounts"] = [
+        {
+            "Type": "volume",
+            "Source": "xagent-stage-workspaces",
+            "Target": "/root/.xagent/uploads/user_1",
+            "ReadOnly": False,
+            "VolumeOptions": {"NoCopy": True, "Subpath": "user_1"},
+        }
+    ]
+    container.attrs["Mounts"] = [
+        {
+            "Type": "volume",
+            "Name": "xagent-stage-workspaces",
+            "Destination": "/root/.xagent/uploads/user_1",
+            "RW": True,
+        }
+    ]
+
+    info = _parse_container_config(container)
+
+    assert info.config.mounts == [
+        SandboxMount(
+            type="volume",
+            source="xagent-stage-workspaces",
+            target="/root/.xagent/uploads/user_1",
+            subpath="user_1",
+        )
+    ]
+    assert info.config.volumes is None
+
+
+@pytest.fixture(scope="module")
+def event_loop():
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def configured_module_sandbox_network():
+    """Provide a real dedicated bridge only to this Docker service module."""
+    key = "XAGENT_SANDBOX_NETWORK"
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = None
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(key, network_name)
+        try:
+            if is_docker_available():
+                client = docker_sandbox_module._create_docker_client()
+                network = client.networks.create(
+                    network_name,
+                    driver="bridge",
+                    labels={
+                        docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                    },
+                    options={"com.docker.network.bridge.enable_icc": "false"},
+                )
+            yield
+        finally:
+            if network is not None:
+                network.remove()
+
+
+requires_docker = pytest.mark.skipif(
+    not is_docker_available(), reason="Requires reachable Docker daemon"
+)
+
+
+@pytest.fixture(scope="module")
+def docker_service():
+    """Provide a shared Docker sandbox service for integration-style tests."""
+    client = docker_sandbox_module._create_docker_client()
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+        options={"com.docker.network.bridge.enable_icc": "false"},
+    )
+    try:
+        yield DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            network=network_name,
+            client=client,
+        )
+    finally:
+        network.remove()
+
+
+class _FakeContainerCollection:
+    """Minimal Docker container collection stub for service unit tests."""
+
+    def __init__(self, containers=()):
+        self._containers = containers
+
+    def list(self, *args, **kwargs):
+        return list(self._containers)
+
+
+class _FakeDockerClient:
+    """Minimal Docker client stub for service unit tests."""
+
+    def __init__(self, containers=()):
+        self.containers = _FakeContainerCollection(containers)
+        self.api = SimpleNamespace(_version="1.45")
+        self.networks = SimpleNamespace(
+            get=lambda name: SimpleNamespace(
+                name=name,
+                attrs={
+                    "Driver": "bridge",
+                    "Labels": {
+                        docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                    },
+                    "Options": {"com.docker.network.bridge.enable_icc": "false"},
+                },
+            )
+        )
+
+    def ping(self):
+        return True
+
+    def info(self):
+        return {"SecurityOptions": []}
+
+    def version(self):
+        return {"Version": "26.1.4", "ApiVersion": "1.45"}
+
+
+class _FailingStartContainer:
+    """Container stub whose start fails before sandbox initialization finishes."""
+
+    def __init__(self) -> None:
+        self.remove_calls: list[bool] = []
+
+    def start(self) -> None:
+        raise RuntimeError("port conflict")
+
+    def remove(self, force: bool = False) -> None:
+        self.remove_calls.append(force)
+
+
+class _PostStartContainer:
+    """Container stub used to exercise failures while observing a new runtime."""
+
+    def __init__(self) -> None:
+        self.remove_calls: list[bool] = []
+
+    def start(self) -> None:
+        return None
+
+    def reload(self) -> None:
+        return None
+
+    def remove(self, force: bool = False) -> None:
+        self.remove_calls.append(force)
+
+
+def _get_free_host_port() -> int:
+    """Reserve an ephemeral host port for Docker port-mapping tests."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+class TestDockerSandboxServiceFailures:
+    """Test failure cleanup paths that do not require Docker."""
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_removes_container_when_start_fails(self, monkeypatch):
+        """Failed startup should remove the newly-created container."""
+        created_container = _FailingStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="port conflict"):
+            await service.get_or_create(
+                "start-failure",
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(),
+            )
+
+        assert len(created_container.remove_calls) == 1
+        assert created_container.remove_calls[0] is True
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_removes_container_when_parse_fails(self, monkeypatch):
+        created_container = _PostStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        def reject_parse(_container):
+            raise RuntimeError("malformed runtime config")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module, "_parse_container_config", reject_parse
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="malformed runtime config"):
+            await service.get_or_create("parse-failure")
+
+        assert created_container.remove_calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_create_removes_container_when_inspection_fails(self, monkeypatch):
+        created_container = _PostStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        def reject_inspection(_container):
+            raise RuntimeError("malformed inspection")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module, "_build_inspection", reject_inspection
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="malformed inspection"):
+            await service.create(
+                "inspection-failure",
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(),
+            )
+
+        assert created_container.remove_calls == [True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["get_or_create", "create"])
+    async def test_named_volume_subpath_rejects_unsupported_daemon_before_create(
+        self, monkeypatch, route
+    ):
+        client = _FakeDockerClient()
+        client.version = lambda: {"Version": "25.0.18", "ApiVersion": "1.45"}
+        create_calls = 0
+
+        async def fake_create_container(*args, **kwargs):
+            nonlocal create_calls
+            create_calls += 1
+            raise AssertionError("container creation must not be reached")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        config = SandboxConfig(
+            mounts=[
+                SandboxMount(
+                    type="volume",
+                    source="workspaces",
+                    target="/home/sandbox/workspace",
+                    subpath="user_1/task_2",
+                )
+            ]
+        )
+
+        with pytest.raises(SandboxRuntimeConflictError, match="Engine >= 26.0"):
+            if route == "get_or_create":
+                await service.get_or_create("unsupported", config=config)
+            else:
+                await service.create(
+                    "unsupported",
+                    SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                    config,
+                )
+
+        assert create_calls == 0
+
+    @pytest.mark.parametrize("security_options", [[], None])
+    def test_host_workspace_readiness_probe_succeeds_and_cleans_up(
+        self, tmp_path, monkeypatch, security_options
+    ):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": security_options}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(docker_sandbox_module.os, "fchown", lambda *_args: None)
+
+        service.validate_host_workspace_access()
+
+        assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    def test_host_workspace_readiness_probe_fails_closed(self, tmp_path, monkeypatch):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        def reject_chown(*_args):
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(docker_sandbox_module.os, "fchown", reject_chown)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
+            service.validate_host_workspace_access()
+        assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    @pytest.mark.parametrize(
+        ("version", "negotiated_api"),
+        [
+            ({"Version": "25.0.18", "ApiVersion": "1.45"}, "1.45"),
+            ({"Version": "26.1.4", "ApiVersion": "1.45"}, "1.44"),
+            ({}, None),
+        ],
+    )
+    def test_volume_subpath_readiness_rejects_unsupported_daemon(
+        self, tmp_path, monkeypatch, version, negotiated_api
+    ):
+        client = _FakeDockerClient()
+        client.version = lambda: version
+        client.api._version = negotiated_api
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE", "volume_subpath")
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="Engine >= 26.0"):
+            service.validate_host_workspace_access()
+
+    def test_volume_subpath_capability_probe_is_cached(self):
+        client = _FakeDockerClient()
+        calls = 0
+
+        def version():
+            nonlocal calls
+            calls += 1
+            return {"Version": "26.1.4", "ApiVersion": "1.45"}
+
+        client.version = version
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+
+        service._require_volume_subpath_support()
+        service._require_volume_subpath_support()
+
+        assert calls == 1
+
+    def test_host_workspace_readiness_wraps_upload_root_creation_failure(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        uploads_root = tmp_path / "missing" / "uploads"
+        monkeypatch.setattr(
+            docker_sandbox_module, "get_uploads_dir", lambda: uploads_root
+        )
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        def reject_mkdir(*_args, **_kwargs):
+            raise PermissionError("read-only parent")
+
+        monkeypatch.setattr(Path, "mkdir", reject_mkdir)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_root_backend(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 1000)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="run as root"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_configured_network(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+
+        def missing_network(_name):
+            raise errors.NotFound("not found")
+
+        client.networks.get = missing_network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="is not available"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_bridge_network(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.networks.get = lambda name: SimpleNamespace(
+            name=name,
+            attrs={
+                "Driver": "overlay",
+                "Labels": {
+                    docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                },
+            },
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="bridge driver"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_exact_network_name(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get("xagent-test-sandbox-egress")
+        network.name = "different-network"
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="exact name"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_dedicated_network_label(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get(os.environ["XAGENT_SANDBOX_NETWORK"])
+        network.attrs["Labels"] = {}
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="must carry the label"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_icc_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get(os.environ["XAGENT_SANDBOX_NETWORK"])
+        network.attrs["Options"] = {"com.docker.network.bridge.enable_icc": "true"}
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="inter-container"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_reports_socket_proxy_network_denial(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.networks.get = lambda _name: (_ for _ in ()).throw(
+            errors.APIError("forbidden")
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="NETWORKS=1"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_rejects_rootless_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": ["name=rootless"]}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="rootful Docker"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_rejects_userns_remap(self, tmp_path, monkeypatch):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": ["name=userns"]}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(
+            SandboxRuntimeConflictError, match="user-namespace remapping"
+        ):
+            service.validate_host_workspace_access()
+
+
+class TestDockerSandboxRunCodeValidation:
+    """Test lightweight run_code validation paths."""
+
+    @pytest.mark.asyncio
+    async def test_run_code_rejects_unsupported_code_type(self):
+        """Unsupported code types should fail explicitly."""
+        sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+
+        with pytest.raises(ValueError, match="Unsupported code type: ruby"):
+            await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["upload", "write"])
+    async def test_invalid_remote_name_is_rejected_before_container_side_effects(
+        self, operation: str, tmp_path: Path
+    ) -> None:
+        sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+        control = _SandboxControl("test")
+        sandbox._control = control
+        touched_container = False
+
+        async def unexpected_container_call(*_args, **_kwargs):
+            nonlocal touched_container
+            touched_container = True
+            raise AssertionError("invalid archive name touched the container")
+
+        sandbox._require_container = unexpected_container_call
+        sandbox._exec_in_container = unexpected_container_call
+        local_path = tmp_path / "probe.txt"
+        local_path.write_text("probe")
+
+        with pytest.raises(ValueError, match="single valid file name"):
+            if operation == "upload":
+                await sandbox.upload_file(str(local_path), "/home/sandbox/newdir/")
+            else:
+                await sandbox.write_file("probe", "/home/sandbox/newdir/")
+
+        assert not touched_container
+        assert control.active_ops == 0
+
+
+class _LabelFilteredCollection(_FakeContainerCollection):
+    """Container collection that applies Docker-style label filters."""
+
+    def __init__(self, containers=()):
+        super().__init__(containers)
+        self.filter_calls: list[dict] = []
+
+    @staticmethod
+    def _label_matches(filter_entry: str, labels: dict) -> bool:
+        if "=" in filter_entry:
+            key, value = filter_entry.split("=", 1)
+            return labels.get(key) == value
+        return filter_entry in labels
+
+    def list(self, *args, **kwargs):
+        filters = kwargs.get("filters") or {}
+        self.filter_calls.append(filters)
+        label_filters = filters.get("label") or []
+        if isinstance(label_filters, str):
+            label_filters = [label_filters]
+        return [
+            container
+            for container in self._containers
+            if all(
+                self._label_matches(entry, getattr(container, "labels", {}))
+                for entry in label_filters
+            )
+        ]
+
+
+def _labeled_container(
+    labels: dict,
+    name: str = "user::1",
+    status: str = "running",
+    on_remove: callable | None = None,
+    on_stop: callable | None = None,
+):
+    """Minimal container stub exposing the attrs/labels the service reads."""
+    return SimpleNamespace(
+        name=name,
+        status=status,
+        labels=labels,
+        attrs={
+            "Config": {
+                "Env": [],
+                "Image": "img",
+                "WorkingDir": "/home",
+                "NetworkDisabled": False,
+            },
+            "HostConfig": {
+                "PortBindings": {},
+                "NanoCpus": 1_000_000_000,
+                "Memory": 512 * 1024 * 1024,
+                "NetworkMode": "default",
+            },
+            "State": {"Status": status},
+            "NetworkSettings": {"Networks": {"bridge": {}}},
+            "Created": "2026-01-01T00:00:00Z",
+        },
+        reload=lambda: None,
+        stop=lambda timeout=None: on_stop() if on_stop is not None else None,
+        remove=lambda force=False: on_remove() if on_remove is not None else None,
+    )
+
+
+class _ClientWithCollection(_FakeDockerClient):
+    """Fake client hosting a caller-supplied container collection."""
+
+    def __init__(self, collection):
+        self.containers = collection
+
+
+def _capture_create_client():
+    """Client stub capturing containers.create kwargs."""
+    captured: dict = {}
+
+    class _Containers:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+    class _Client:
+        containers = _Containers()
+
+    return _Client(), captured
+
+
+class TestNamespaceIsolation:
+    """Two deployments sharing one Docker daemon must never see or mutate
+    each other's sandboxes (the co-located-instances fix)."""
+
+    @pytest.mark.asyncio
+    async def test_service_constructor_rejects_malformed_namespaces(self):
+        """The service boundary must not accept a namespace that could
+        recreate a shared ownership domain."""
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            DockerSandboxService(
+                MemDockerStore(),
+                namespace="",
+                client=_FakeDockerClient(),
+            )
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            DockerSandboxService(
+                MemDockerStore(),
+                namespace="Bad-Name",
+                client=_FakeDockerClient(),
+            )
+
+    def test_service_constructor_rejects_builtin_network(self):
+        with pytest.raises(ValueError, match="Invalid sandbox network"):
+            DockerSandboxService(
+                MemDockerStore(),
+                namespace="test",
+                network="bridge",
+                client=_FakeDockerClient(),
+            )
+
+    def test_constructor_preserves_client_position_and_reads_namespace_env(
+        self, monkeypatch
+    ):
+        """Existing direct callers keep the client argument while the required
+        namespace comes from the documented environment variable."""
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "alpha")
+        monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "alpha-sandbox-egress")
+
+        positional_client = _FakeDockerClient()
+        positional = DockerSandboxService(MemDockerStore(), positional_client)
+        assert positional._client is positional_client
+        assert positional._namespace == "alpha"
+        assert positional._network == "alpha-sandbox-egress"
+
+        keyword_client = _FakeDockerClient()
+        keyword = DockerSandboxService(
+            MemDockerStore(),
+            client=keyword_client,
+        )
+        assert keyword._client is keyword_client
+        assert keyword._namespace == "alpha"
+        assert keyword._network == "alpha-sandbox-egress"
+
+    def test_constructor_without_namespace_env_fails_closed(self, monkeypatch):
+        """Compatibility must never fall back to daemon-global ownership."""
+        monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE is required"):
+            DockerSandboxService(MemDockerStore(), _FakeDockerClient())
+
+    def test_constructor_without_network_env_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "alpha")
+        monkeypatch.delenv("XAGENT_SANDBOX_NETWORK", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NETWORK is required"):
+            DockerSandboxService(MemDockerStore(), _FakeDockerClient())
+
+    def test_count_legacy_containers_uses_exact_legacy_filter(self):
+        collection = _LabelFilteredCollection(
+            [
+                _labeled_container({"xagent.managed": "true"}),
+                _labeled_container(
+                    {"xagent.managed": "true"},
+                    status="exited",
+                ),
+                _labeled_container(
+                    {
+                        "xagent.managed": "v2",
+                        "xagent.sandbox.namespace": "alpha",
+                    }
+                ),
+            ]
+        )
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+
+        assert service.count_legacy_containers() == (1, 1)
+        assert collection.filter_calls[-1] == {"label": "xagent.managed=true"}
+
+    def test_count_legacy_containers_returns_zero_when_listing_fails(self, caplog):
+        class _FailingCollection:
+            @staticmethod
+            def list(*args, **kwargs):
+                raise RuntimeError("legacy inventory unavailable")
+
+        client = _FakeDockerClient()
+        client.containers = _FailingCollection()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=client,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert service.count_legacy_containers() == (0, 0)
+        assert "Failed to list legacy sandbox containers" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_physical_names_differ_across_namespaces(self):
+        """Equal logical names map to distinct physical container names."""
+        assert docker_sandbox_module._container_name(
+            "user::1", "alpha"
+        ) != docker_sandbox_module._container_name("user::1", "beta")
+
+    @pytest.mark.asyncio
+    async def test_snapshot_tags_differ_across_namespaces(self):
+        """Equal snapshot ids map to distinct images on a shared daemon."""
+        assert docker_sandbox_module._snapshot_tag(
+            "snap-1", "alpha"
+        ) != docker_sandbox_module._snapshot_tag("snap-1", "beta")
+        assert docker_sandbox_module._snapshot_tag("snap-1", "alpha").startswith(
+            "xagent-sandbox-snapshot-alpha-"
+        )
+
+    @pytest.mark.asyncio
+    async def test_snapshot_repository_is_docker_safe(self):
+        """Every validator-accepted namespace must map to a valid Docker
+        repository name, even when the namespace itself is not one.
+
+        The Docker reference grammar allows lowercase alphanumeric segments
+        separated by ``[._]``, ``__``, or ``-+`` runs; trailing separators,
+        mixed runs like ``a_-b``, and names over 255 characters are invalid.
+        """
+        docker_ref_re = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$")
+        namespaces = [
+            "alpha",
+            "foo-",
+            "foo_",
+            "a_-b",
+            "a--b",
+            "a__b",
+            "a---b",
+            "a" * 240,
+        ]
+        for ns in namespaces:
+            repo = docker_sandbox_module._snapshot_repository(ns)
+            assert docker_ref_re.fullmatch(repo), f"{ns!r} -> {repo}"
+            assert len(repo) <= 255, f"{ns!r} -> repo too long: {len(repo)}"
+            tag = docker_sandbox_module._snapshot_tag("snap-1", ns)
+            assert len(tag) <= 255, f"{ns!r} -> full reference too long"
+        # Every mapping includes the raw namespace digest. This prevents a safe
+        # namespace from impersonating another namespace's encoded token.
+        assert docker_sandbox_module._snapshot_repository("a-b") != (
+            docker_sandbox_module._snapshot_repository("a_-b")
+        )
+        assert docker_sandbox_module._snapshot_repository("a_b") != (
+            docker_sandbox_module._snapshot_repository("a-b-eb2980a5a2")
+        )
+
+    @pytest.mark.asyncio
+    async def test_find_container_is_scoped_to_owner_labels(self):
+        collection = _LabelFilteredCollection()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        await service.inspect("user::1")
+        assert collection.filter_calls[-1]["label"] == [
+            "xagent.managed=v2",
+            "xagent.sandbox.namespace=alpha",
+            "xagent.sandbox.name=user::1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_sandboxes_is_scoped_to_namespace(self):
+        collection = _LabelFilteredCollection()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        await service.list_sandboxes()
+        assert collection.filter_calls[-1]["label"] == [
+            "xagent.managed=v2",
+            "xagent.sandbox.namespace=alpha",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_foreign_and_legacy_containers_are_invisible(self):
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+        )
+        legacy = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+        )
+        collection = _LabelFilteredCollection([foreign, legacy])
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+
+        assert await alpha.inspect("user::1") is None
+        assert await beta.inspect("user::1") is not None
+        assert [sb.name for sb in await alpha.list_sandboxes()] == []
+        assert [sb.name for sb in await beta.list_sandboxes()] == ["user::1"]
+
+    @pytest.mark.asyncio
+    async def test_delete_never_touches_foreign_namespace(self):
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            on_remove=lambda: collection._containers.remove(foreign),
+        )
+        collection = _LabelFilteredCollection([foreign])
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+
+        await alpha.delete("user::1")
+        assert await beta.inspect("user::1") is not None
+
+        await beta.delete("user::1")
+        assert await beta.inspect("user::1") is None
+
+    @pytest.mark.asyncio
+    async def test_start_stop_never_touch_foreign_namespace(self):
+        stopped: list[str] = []
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            on_stop=lambda: stopped.append("beta"),
+        )
+        collection = _LabelFilteredCollection([foreign])
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+
+        from xagent.sandbox.base import SandboxNotFoundError
+
+        with pytest.raises(SandboxNotFoundError):
+            await alpha.start_existing("user::1")
+        with pytest.raises(SandboxNotFoundError):
+            await alpha.stop_existing("user::1")
+        assert stopped == [], "foreign container must never be stopped"
+        assert await beta.inspect("user::1") is not None
+
+    @pytest.mark.asyncio
+    async def test_create_container_writes_v2_owner_labels(self, monkeypatch):
+        monkeypatch.delenv("SANDBOX_PIDS_LIMIT", raising=False)
+
+        async def _noop_ensure_image(_client, _image):
+            return None
+
+        monkeypatch.setattr(docker_sandbox_module, "_ensure_image", _noop_ensure_image)
+
+        for template in (
+            SandboxTemplate(type="image", image="img"),
+            # A snapshot-derived container must inherit nothing from the
+            # source image's owner labels: the image may carry a foreign
+            # deployment's xagent.managed/xagent.sandbox.namespace.
+            SandboxTemplate(type="snapshot", snapshot_id="snap-1"),
+        ):
+            client, captured = _capture_create_client()
+            await docker_sandbox_module._create_container(
+                client,
+                "user::1",
+                "alpha",
+                "img",
+                template,
+                SandboxConfig(),
+                "alpha-sandbox-egress",
+            )
+            assert captured["labels"]["xagent.managed"] == "v2"
+            assert captured["labels"]["xagent.sandbox.namespace"] == "alpha"
+            assert captured["labels"]["xagent.sandbox.name"] == "user::1"
+            assert captured["name"].startswith("xagent_sandbox_")
+            # tini as PID 1 so tail gets SIGTERM and exits in ~1s instead of a
+            # ~30s SIGKILL timeout. Only the create kwarg is asserted; the
+            # stop-time drop was verified manually, not gated by a CI timer.
+            assert captured["init"] is True
+            assert captured["user"] == "1100:1010"
+            assert captured["environment"]["HOME"] == "/home/sandbox"
+            assert captured["cap_drop"] == ["ALL"]
+            assert captured["pids_limit"] == 1024
+            assert captured["network"] == "alpha-sandbox-egress"
+            assert "network_mode" not in captured
+
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(
+                pids_limit=2048,
+                env={"HOME": "/tmp/custom-home"},
+                volumes=[("/host/workspace", "/root/.xagent/user_1", "rw")],
+            ),
+            "alpha-sandbox-egress",
+        )
+        assert captured["pids_limit"] == 2048
+        assert captured["environment"]["HOME"] == "/tmp/custom-home"
+        assert captured["tmpfs"]["/root"].endswith("mode=0711,uid=1100,gid=1010")
+
+        monkeypatch.setenv("SANDBOX_PIDS_LIMIT", "0")
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(),
+            "alpha-sandbox-egress",
+        )
+        assert "pids_limit" not in captured
+
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::isolated",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(network_isolated=True),
+            "alpha-sandbox-egress",
+        )
+        assert captured["network_mode"] == "none"
+        assert "network" not in captured
+
+    @pytest.mark.asyncio
+    async def test_create_container_uses_nocopy_volume_subpath_mount(self, monkeypatch):
+        async def _noop_ensure_image(_client, _image):
+            return None
+
+        monkeypatch.setattr(docker_sandbox_module, "_ensure_image", _noop_ensure_image)
+        client, captured = _capture_create_client()
+        mount = SandboxMount(
+            type="volume",
+            source="xagent-stage-workspaces",
+            target="/root/.xagent/uploads/user_1",
+            subpath="user_1/task_2",
+        )
+
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(mounts=[mount]),
+            "alpha-sandbox-egress",
+        )
+
+        assert captured["volumes"] is None
+        assert captured["mounts"] == [
+            {
+                "Target": "/root/.xagent/uploads/user_1",
+                "Source": "xagent-stage-workspaces",
+                "Type": "volume",
+                "ReadOnly": False,
+                "VolumeOptions": {
+                    "NoCopy": True,
+                    "Subpath": "user_1/task_2",
+                },
+            }
+        ]
+        assert "/root" in captured["tmpfs"]
+
+    @pytest.mark.asyncio
+    async def test_create_defaults_runtime_security_profile(self, monkeypatch):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        captured: dict[str, object] = {}
+
+        class _StopAfterDesiredSpec(Exception):
+            pass
+
+        def capture_spec(**kwargs):
+            captured.update(kwargs)
+            raise _StopAfterDesiredSpec
+
+        monkeypatch.setattr(
+            docker_sandbox_module.ResolvedSandboxRuntimeSpec,
+            "from_parts",
+            staticmethod(capture_spec),
+        )
+
+        with pytest.raises(_StopAfterDesiredSpec):
+            await service.create(
+                "user::1",
+                SandboxTemplate(type="image", image="img"),
+                SandboxConfig(),
+            )
+
+        assert captured["security_profile"] == service.runtime_security_profile()
+
+
+class TestManagerPathsRespectNamespace:
+    """Manager destructive paths (cleanup/quiesce, idle sweep) operate only
+    on this service's namespace: foreign and legacy containers survive."""
+
+    @staticmethod
+    def _services(collection):
+        alpha = DockerSandboxService(
+            MemDockerStore(),
+            namespace="alpha",
+            client=_ClientWithCollection(collection),
+        )
+        beta = DockerSandboxService(
+            MemDockerStore(),
+            namespace="beta",
+            client=_ClientWithCollection(collection),
+        )
+        return alpha, beta
+
+    @pytest.mark.asyncio
+    async def test_cleanup_quiesces_only_own_namespace(self):
+        stopped: list[str] = []
+        alpha_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "alpha",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="alpha-box",
+            on_stop=lambda: stopped.append("alpha"),
+        )
+        beta_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+            on_stop=lambda: stopped.append("beta"),
+        )
+        legacy_cont = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+            on_stop=lambda: stopped.append("legacy"),
+        )
+        collection = _LabelFilteredCollection([alpha_cont, beta_cont, legacy_cont])
+        alpha, beta = self._services(collection)
+
+        from xagent.web.sandbox_manager import SandboxManager
+
+        await SandboxManager(alpha).cleanup()
+
+        assert stopped == ["alpha"], "quiesce must stop only own-namespace containers"
+        assert await beta.inspect("user::1") is not None
+
+    @pytest.mark.asyncio
+    async def test_capacity_counts_only_own_namespace(self):
+        removed: list[str] = []
+        foreign = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+            on_remove=lambda: removed.append("beta"),
+        )
+        legacy = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+            on_remove=lambda: removed.append("legacy"),
+        )
+        collection = _LabelFilteredCollection([foreign, legacy])
+        alpha, _ = self._services(collection)
+
+        from xagent.web.sandbox_manager import SandboxManager
+
+        await SandboxManager(alpha)._ensure_capacity_for("user::2", cap=1)
+
+        assert removed == []
+        assert collection.filter_calls[-1]["label"] == [
+            "xagent.managed=v2",
+            "xagent.sandbox.namespace=alpha",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_idle_sweep_reclaims_only_own_namespace(self):
+        alpha_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "alpha",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="alpha-box",
+        )
+        beta_cont = _labeled_container(
+            {
+                "xagent.managed": "v2",
+                "xagent.sandbox.namespace": "beta",
+                "xagent.sandbox.name": "user::1",
+            },
+            name="beta-box",
+        )
+        legacy_cont = _labeled_container(
+            {"xagent.managed": "true", "xagent.sandbox.name": "user::1"},
+            name="legacy-box",
+        )
+        collection = _LabelFilteredCollection([alpha_cont, beta_cont, legacy_cont])
+        alpha, beta = self._services(collection)
+
+        # Wire the removal side effect now that the collection exists.
+        alpha_cont.remove = lambda force=False: collection._containers.remove(
+            alpha_cont
+        )
+
+        from xagent.web.sandbox_manager import SandboxManager
+
+        reclaimed = await SandboxManager(alpha).sweep_idle_sandboxes(idle_ttl=0)
+
+        assert reclaimed == ["user::1"]
+        assert [c.name for c in collection._containers] == ["beta-box", "legacy-box"]
+        assert await beta.inspect("user::1") is not None
+
+
+@requires_docker
+class TestTwoNamespaceRealDockerIsolation:
+    """Real-daemon smoke test: two namespaces on one daemon are disjoint."""
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_same_logical_name_is_isolated_between_namespaces(self):
+        alpha = DockerSandboxService(MemDockerStore(), namespace="alpha")
+        beta = DockerSandboxService(MemDockerStore(), namespace="beta")
+        name = f"ns-isolation-{uuid.uuid4().hex[:8]}"
+        template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
+        config = SandboxConfig(cpus=1, memory=512)
+        for service in (alpha, beta):
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+        try:
+            sandbox = await alpha.get_or_create(name, template=template, config=config)
+            assert sandbox.name == name
+            # The other namespace must neither see nor adopt this container.
+            assert await beta.inspect(name) is None
+            assert name not in {sb.name for sb in await beta.list_sandboxes()}
+            # The destructive direction: a foreign delete must not touch it.
+            await beta.delete(name)
+            assert await alpha.inspect(name) is not None
+            await alpha.delete(name)
+            assert await alpha.inspect(name) is None
+            assert await beta.inspect(name) is None
+        finally:
+            for service in (alpha, beta):
+                try:
+                    await service.delete(name)
+                except Exception:
+                    pass
+
+
+@requires_docker
+class TestDockerSandboxService:
+    """Test DockerSandboxService service layer functionality"""
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_create_and_delete_sandbox(self, docker_service):
+        """Test creating and deleting sandbox"""
+        name = "test_create_and_delete_sandbox"
+        service = docker_service
+
+        # Cleanup
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test creating and deleting sandbox ===")
+
+            # Create sandbox
+            template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
+
+            temp_dir = tempfile.mkdtemp()
+            host_port = _get_free_host_port()
+            config = SandboxConfig(
+                cpus=2,
+                memory=1024,
+                env={
+                    "MY_VAR": "hello",
+                },
+                volumes=[
+                    (temp_dir, "/mnt/data", "ro"),
+                ],
+                network_isolated=False,
+                ports=[
+                    (host_port, 80),  # Host dynamic port -> Container 80
+                ],
+                pids_limit=256,
+                security_profile="nonroot-public-egress-v1",
+            )
+            sandbox = await service.create(name, template, config)
+
+            inspection = await service.inspect(name)
+            assert inspection is not None
+            desired = ResolvedSandboxRuntimeSpec.from_parts(
+                template_type="image",
+                image=DEFAULT_SANDBOX_IMAGE,
+                working_dir=config.working_dir,
+                cpus=config.cpus,
+                memory=config.memory,
+                env=config.env,
+                volumes=config.volumes,
+                network_isolated=bool(config.network_isolated),
+                ports=config.ports,
+                pids_limit=config.pids_limit,
+                security_profile=config.security_profile,
+            )
+            assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
+
+            # Check status
+            info = await sandbox.info()
+            assert info.template == template
+            assert info.config == config
+            assert info.state == "running"
+
+            assert info.name == name
+            assert info.template.image == template.image
+            assert info.config.cpus == config.cpus
+            assert info.config.memory == config.memory
+            assert info.created_at is not None
+
+            # Verify environment variables are effective
+            result = await sandbox.exec("sh", "-c", "echo $MY_VAR")
+            assert result.stdout.strip() == "hello"
+            print("✓ Environment variable configuration effective")
+
+            # Verify volume mount is effective
+            result = await sandbox.exec("test", "-d", "/mnt/data")
+            assert result.exit_code == 0
+            print("✓ Volume mount configuration effective")
+
+            # Verify port mapping is effective
+            # Start HTTP server inside sandbox (port 80 in container)
+            await sandbox.exec(
+                "sh", "-c", "nohup python -m http.server 80 > /tmp/http.log 2>&1 &"
+            )
+            await asyncio.sleep(2)  # Wait for server to start
+
+            # Send HTTP request from host to mapped port.
+            import urllib.request
+
+            try:
+                response = urllib.request.urlopen(
+                    f"http://127.0.0.1:{host_port}", timeout=3
+                )
+                status_code = response.getcode()
+                if status_code == 200:
+                    print(
+                        f"✓ Port mapping configuration effective (host {host_port} -> container 80, HTTP request successful)"
+                    )
+                else:
+                    print(f"⚠ Port mapping test: HTTP status code {status_code}")
+            except Exception as e:
+                print(f"⚠ Port mapping test exception: {e}")
+                # Don't force failure, as port mapping may be affected by network environment
+
+            # Stop sandbox
+            await sandbox.stop()
+
+            info = await sandbox.info()
+            assert info.state == "stopped"
+
+            # Delete sandbox
+            await service.delete(name)
+
+            container = await service._find_container(name)
+            assert container is None
+
+            print("✅ Create and delete test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_named_volume_subpath_is_real_and_attested(self, docker_service):
+        client = docker_service._client
+        version = client.version()
+        engine = tuple(int(part) for part in version["Version"].split(".")[:2])
+        api = tuple(int(part) for part in version["ApiVersion"].split(".")[:2])
+        if engine < (26, 0) or api < (1, 45):
+            pytest.skip("Docker Engine 26/API 1.45 required for volume subpath")
+
+        suffix = uuid.uuid4().hex[:10]
+        volume_name = f"xagent-test-workspaces-{suffix}"
+        sandbox_name = f"volume-subpath-{suffix}"
+        volume = client.volumes.create(name=volume_name)
+        try:
+            await docker_sandbox_module._ensure_image(client, DEFAULT_SANDBOX_IMAGE)
+            await asyncio.to_thread(
+                client.containers.run,
+                DEFAULT_SANDBOX_IMAGE,
+                [
+                    "sh",
+                    "-c",
+                    "mkdir -p /seed/user_1/task_2 /seed/user_1/other && "
+                    "printf sibling > /seed/user_1/other/secret.txt && "
+                    "chown -R 1100:1010 /seed/user_1",
+                ],
+                user="0:0",
+                remove=True,
+                volumes={volume_name: {"bind": "/seed", "mode": "rw"}},
+            )
+            mount = SandboxMount(
+                type="volume",
+                source=volume_name,
+                target="/home/sandbox/workspace",
+                subpath="user_1/task_2",
+            )
+            sandbox = await docker_service.create(
+                sandbox_name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(mounts=[mount]),
+            )
+            await sandbox.write_file(
+                "volume-subpath-ok", "/home/sandbox/workspace/probe.txt"
+            )
+            assert (
+                await sandbox.read_file("/home/sandbox/workspace/probe.txt")
+                == "volume-subpath-ok"
+            )
+            sibling_probe = await sandbox.exec(
+                "test",
+                "!",
+                "-e",
+                "/home/sandbox/workspace/user_1/other/secret.txt",
+            )
+            assert sibling_probe.exit_code == 0
+            inspection = await docker_service.inspect(sandbox_name)
+            assert inspection is not None
+            assert inspection.facts.mounts == (mount,)
+        finally:
+            await docker_service.delete(sandbox_name)
+            await asyncio.to_thread(volume.remove, force=True)
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_get_or_create_reuse(self, docker_service):
+        """Test get_or_create reuse logic"""
+        name = "test_get_or_create_reuse"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test get_or_create reuse ===")
+
+            # First creation
+            sandbox1 = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            # Write data
+            await sandbox1.write_file("data from first", "/root/data.txt")
+
+            # Stop
+            await sandbox1.stop()
+
+            # Second retrieval (should reuse)
+            sandbox2 = await service.get_or_create(name)
+
+            # Verify data still exists
+            content = await sandbox2.read_file("/root/data.txt")
+            print(f"Read after reuse: {content}")
+            assert content == "data from first"
+
+            await sandbox2.stop()
+
+            print("✅ Reuse test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_list_sandboxes(self, docker_service):
+        """Test listing sandboxes"""
+        sandbox_names = ["test-list-1", "test-list-2"]
+        service = docker_service
+
+        # Cleanup
+        for name in sandbox_names:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+        try:
+            print("\n=== Test listing sandboxes ===")
+
+            sandbox1 = await service.get_or_create(
+                sandbox_names[0],
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            sandbox2 = await service.get_or_create(
+                sandbox_names[1],
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            sandboxes = await service.list_sandboxes()
+            names = [s.name for s in sandboxes]
+            print(f"Sandbox list: {names}")
+
+            assert sandbox_names[0] in names
+            assert sandbox_names[1] in names
+
+            # Cleanup
+            await sandbox1.stop()
+            await sandbox2.stop()
+
+            print("✅ List test passed")
+
+        finally:
+            for name in sandbox_names:
+                try:
+                    await service.delete(name)
+                except Exception:
+                    pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_concurrent_get_or_create(self, docker_service):
+        """Test if concurrent get_or_create with same name causes conflicts"""
+        name = "test_concurrent_get_or_create"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test concurrent get_or_create ===")
+
+            # Concurrently create same sandbox
+            async def create_task(task_id: int):
+                print(f"Task {task_id}: Starting get_or_create")
+                sandbox = await service.get_or_create(
+                    name,
+                    template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                    config=SandboxConfig(cpus=1, memory=256),
+                )
+                print(f"Task {task_id}: get_or_create completed")
+                return sandbox
+
+            # Start concurrent tasks
+            tasks = [create_task(i) for i in range(5)]
+            sandboxes = await asyncio.gather(*tasks)
+
+            # Verify all returned sandboxes point to same instance
+            print(f"Got {len(sandboxes)} sandbox instances")
+            for i, sb in enumerate(sandboxes):
+                assert sb.name == name
+                print(f"Task {i}: sandbox.name = {sb.name}")
+
+            # Verify only one sandbox was created
+            list_result = await service.list_sandboxes()
+            same_name_boxes = [s for s in list_result if s.name == name]
+            assert len(same_name_boxes) == 1
+            print("Only 1 sandbox instance created")
+
+            # Cleanup
+            await sandboxes[0].stop()
+
+            print("✅ Concurrent get_or_create test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_concurrent_sandbox_exec(self, docker_service):
+        """Test if concurrent execution on same sandbox instance causes conflicts"""
+        name = "test_concurrent_sandbox_exec"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test sandbox concurrent execution ===")
+
+            # Create sandbox first
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            async def exec_task(task_id: int):
+                result = await sandbox.exec("sh", "-c", f"echo 'Task {task_id}'")
+                assert result.success
+                assert f"Task {task_id}" in result.stdout
+                return task_id
+
+            # Start concurrent tasks
+            tasks = [exec_task(i) for i in range(10)]
+            results = await asyncio.gather(*tasks)
+
+            # Verify all tasks completed successfully
+            assert len(results) == 10
+            assert sorted(results) == list(range(10))
+            print(f"✓ All {len(results)} concurrent tasks completed successfully")
+
+            # Cleanup
+            await sandbox.stop()
+
+            print("✅ Concurrent execution test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_concurrent_sandboxs_exec(self, docker_service):
+        """Test if concurrent execution on different sandbox instances (same underlying box) causes conflicts"""
+        name = "test_concurrent_sandboxs_exec"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test concurrent sandbox execution ===")
+
+            # Create sandbox first
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            async def exec_task(task_id: int):
+                # Each task gets its own sandbox reference
+                sb = await service.get_or_create(name)
+
+                # Execute command
+                result = await sb.exec("echo", f"Hello from task {task_id}")
+                print(f"Task {task_id}: Command output = {result.stdout.strip()}")
+
+                # Write task-specific file
+                file_path = f"/root/task_{task_id}.txt"
+                content = f"Task {task_id} data"
+                await sb.write_file(content, file_path, overwrite=True)
+                print(f"Task {task_id}: Wrote file {file_path}")
+
+                # Read file to verify
+                read_content = await sb.read_file(file_path)
+                assert read_content == content
+                print(f"Task {task_id}: File content verification successful")
+
+                return task_id
+
+            # Start 10 concurrent tasks
+            tasks = [exec_task(i) for i in range(10)]
+            results = await asyncio.gather(*tasks)
+
+            # Verify all tasks completed successfully
+            assert len(results) == 10
+            assert sorted(results) == list(range(10))
+            print(f"✓ All {len(results)} concurrent tasks completed successfully")
+
+            # Cleanup
+            await sandbox.stop()
+
+            print("✅ Concurrent execution test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_create_snapshot_rejects_duplicate_id(self, docker_service):
+        """Creating the same snapshot ID twice should fail."""
+        name = "test_snapshot_duplicate_id"
+        snapshot_id = "duplicate-snapshot"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+        try:
+            await service.delete_snapshot(snapshot_id)
+        except Exception:
+            pass
+
+        try:
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=512),
+            )
+            await sandbox.write_file("v1", "/root/data.txt", overwrite=True)
+
+            first_snapshot = await service.create_snapshot(name, snapshot_id)
+            assert first_snapshot.snapshot_id == snapshot_id
+
+            with pytest.raises(FileExistsError):
+                await service.create_snapshot(name, snapshot_id)
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+            try:
+                await service.delete_snapshot(snapshot_id)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_snapshot_lifecycle(self, docker_service):
+        """Test snapshot create, restore, list, and delete behavior."""
+        name = "test_snapshot_lifecycle"
+        clone_name = "test_snapshot_lifecycle_clone"
+        snapshot_id = "test_snapshot_id"
+        service = docker_service
+
+        for sandbox_name in (name, clone_name):
+            try:
+                await service.delete(sandbox_name)
+            except Exception:
+                pass
+
+        try:
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=512),
+            )
+            await sandbox.write_file(
+                "snapshot-data", "/root/snapshot.txt", overwrite=True
+            )
+
+            snapshot = await service.create_snapshot(name, snapshot_id)
+            assert snapshot.snapshot_id == snapshot_id
+
+            snapshots = await service.list_snapshots()
+            assert [item.snapshot_id for item in snapshots] == [snapshot_id]
+
+            clone = await service.get_or_create(
+                clone_name,
+                template=SandboxTemplate(type="snapshot", snapshot_id=snapshot_id),
+                config=SandboxConfig(cpus=1, memory=512),
+            )
+            clone_info = await clone.info()
+            assert clone_info.template.type == "snapshot"
+            assert clone_info.template.snapshot_id == snapshot_id
+            assert await clone.read_file("/root/snapshot.txt") == "snapshot-data"
+
+            with pytest.raises(RuntimeError):
+                await service.delete_snapshot(snapshot_id)
+
+            await service.delete(clone_name)
+            await service.delete_snapshot(snapshot_id)
+            assert await service.list_snapshots() == []
+        finally:
+            for sandbox_name in (name, clone_name):
+                try:
+                    await service.delete(sandbox_name)
+                except Exception:
+                    pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_snapshot_lifecycle_with_trailing_dash_namespace(self):
+        """Snapshot round-trip works with a Compose-legal namespace that is
+        not a valid Docker repository component on its own.
+
+        Regression for the raw-namespace repository embedding: a trailing-dash
+        project name previously produced an invalid reference format error at
+        container.commit."""
+        name = "test_snapshot_trailing_dash_ns"
+        snapshot_id = "trailing-dash-snap"
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="deployment-",
+        )
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+        try:
+            await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=512),
+            )
+            snapshot = await service.create_snapshot(name, snapshot_id)
+            assert snapshot.snapshot_id == snapshot_id
+            assert await service.list_snapshots() != []
+            await service.delete_snapshot(snapshot_id)
+            assert await service.list_snapshots() == []
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+
+class TestSandboxControl:
+    """Test `_SandboxControl` concurrency guarantees."""
+
+    @pytest.mark.asyncio
+    async def test_operation_releases_on_repeated_cancellation(self):
+        """`operation()` should release active ops even if exit is cancelled again."""
+        control = _SandboxControl(name="cancel-safe")
+        # The operation body has started; `active_ops` should now be 1.
+        body_entered = asyncio.Event()
+        # Cleanup has entered `release_operation()`.
+        release_started = asyncio.Event()
+        # Hold release so the second cancellation lands during cleanup.
+        allow_release = asyncio.Event()
+        original_release = control.release_operation
+
+        async def delayed_release() -> None:
+            """Delay release until the test injects a second cancellation."""
+            release_started.set()
+            await allow_release.wait()
+            await original_release()
+
+        # Replace release with a controllable wrapper.
+        control.release_operation = delayed_release  # type: ignore[method-assign]
+
+        async def worker() -> None:
+            async with control.operation():
+                body_entered.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(worker())
+        await body_entered.wait()
+        assert control.active_ops == 1
+
+        task.cancel()
+        await release_started.wait()
+        # Cancel again while cleanup is running.
+        task.cancel()
+        allow_release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Cleanup must still release the operation.
+        assert control.active_ops == 0
+
+
+@requires_docker
+class TestDockerSandbox:
+    """Test DockerSandbox instance functionality"""
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_exec_command(self, docker_service):
+        """Test executing commands"""
+        name = "test_exec_command"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test executing commands ===")
+
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            # Execute simple command
+            msg = "hello word"
+            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > /tmp/test.txt')
+            assert result.exit_code == 0
+
+            result = await sandbox.exec("sh", "-c", "ls /tmp | grep test.txt")
+            print(f"Command output: {result.stdout.strip()}")
+
+            result = await sandbox.exec("cat", "/tmp/test.txt")
+            print(f"result: {result.stdout.strip()}")
+            assert result.stdout.strip() == msg
+
+            await sandbox.stop()
+
+            print("✅ Command execution test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_run_python_code(self, docker_service):
+        """Test running Python code"""
+        name = "test_run_python_code"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test running Python code ===")
+
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            result = await sandbox.exec(
+                "pip", "install", "--user", "--break-system-packages", "pytest"
+            )
+            print(f"Output:\n{result.stdout}")
+
+            # Run Python code
+            python_code = """
+            import asyncio
+            import pytest
+
+            async def main():
+                print("Hello from Python")
+
+            asyncio.run(main())
+            """
+            result = await sandbox.run_code(python_code, code_type="python")
+            print(f"Python output:\n{result.stdout}")
+            assert result.success
+            assert "Hello from Python" in result.stdout
+
+            await sandbox.stop()
+
+            print("✅ Python code execution test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_run_node_code(self, docker_service):
+        """Test running Node.js code"""
+        name = "test_run_node_code"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test running Node.js code ===")
+
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            # Run simple JavaScript code
+            js_code = """
+            console.log("Hello from Node.js");
+            """
+            result = await sandbox.run_code(js_code, code_type="javascript")
+            print(f"Node.js output:\n{result.stdout}")
+            assert result.success
+            assert "Hello from Node.js" in result.stdout
+
+            # Test long code (over 1KB)
+            long_js_code = (
+                "// " + "x" * 1024 + "\n" + 'console.log("Long code execution");'
+            )
+            result = await sandbox.run_code(long_js_code, code_type="javascript")
+            print(f"Long code output:\n{result.stdout}")
+            assert result.success
+            assert "Long code execution" in result.stdout
+
+            await sandbox.stop()
+
+            print("✅ Node.js code execution test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_file_read_write(self, docker_service):
+        """Test file read and write operations"""
+        name = "test_file_read_write"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test file read and write operations ===")
+
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            # Write file
+            test_content = "Hello, this is a test file!"
+            await sandbox.write_file(test_content, "/root/test.txt")
+            print("File write successful")
+
+            # Read file
+            content = await sandbox.read_file("/root/test.txt")
+            print(f"Read content: {content}")
+            assert content == test_content
+
+            # Test overwrite protection
+            try:
+                await sandbox.write_file(
+                    "new content", "/root/test.txt", overwrite=False
+                )
+                assert False, "Should raise FileExistsError"
+            except FileExistsError:
+                print("Overwrite protection working properly")
+
+            # Overwrite file
+            new_content = "Updated content"
+            await sandbox.write_file(new_content, "/root/test.txt", overwrite=True)
+            content = await sandbox.read_file("/root/test.txt")
+            assert content == new_content
+            print("File overwrite successful")
+
+            await sandbox.stop()
+
+            print("✅ File read and write operations test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_upload_download(self, docker_service):
+        """Test file upload and download"""
+        name = "test_upload_download"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test file upload and download ===")
+
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+
+            # Create temporary file for upload
+            with tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".txt"
+            ) as f:
+                upload_content = "This is a test file for upload"
+                f.write(upload_content)
+                local_upload_path = f.name
+
+            try:
+                # Upload file
+                remote_path = "/root/uploaded.txt"
+                await sandbox.upload_file(local_upload_path, remote_path)
+                print(f"Upload file: {local_upload_path} -> {remote_path}")
+
+                # Verify file uploaded
+                content = await sandbox.read_file(remote_path)
+                assert content == upload_content
+                print("Upload verification successful")
+
+                # Test overwrite protection
+                try:
+                    await sandbox.upload_file(
+                        local_upload_path, remote_path, overwrite=False
+                    )
+                    assert False, "Should raise FileExistsError"
+                except FileExistsError:
+                    print("Upload overwrite protection working properly")
+
+                # Download file
+                with tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, suffix=".txt"
+                ) as f:
+                    local_download_path = f.name
+
+                await sandbox.download_file(
+                    remote_path, local_download_path, overwrite=True
+                )
+                print(f"Download file: {remote_path} -> {local_download_path}")
+
+                # Verify downloaded file content
+                with open(local_download_path, "r") as f:
+                    downloaded_content = f.read()
+                assert downloaded_content == upload_content
+                print("Download verification successful")
+
+                # Cleanup temporary files
+                os.unlink(local_download_path)
+
+            finally:
+                os.unlink(local_upload_path)
+
+            await sandbox.stop()
+
+            print("✅ File upload and download test passed")
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_runtime_user_can_write_to_prepared_bind_mount(
+        self, docker_service, tmp_path_factory
+    ):
+        """The fixed non-root identity can write to an operator-prepared RW
+        mount even when the test runner itself has no CAP_CHOWN."""
+        name = f"test_nonroot_bind_write_{uuid.uuid4().hex[:8]}"
+        service = docker_service
+        host_dir = tmp_path_factory.mktemp("sandbox-bind-write")
+        host_dir.chmod(0o733)
+        try:
+            sandbox = await service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(
+                    cpus=1,
+                    memory=256,
+                    volumes=[(str(host_dir), "/mnt/data", "rw")],
+                ),
+            )
+
+            identity = await sandbox.exec("id", "-u")
+            assert identity.exit_code == 0, identity.stderr
+            assert identity.stdout.strip() == str(SANDBOX_RUNTIME_UID)
+            runtime_write = await sandbox.exec(
+                "sh", "-c", "printf runtime-write > /mnt/data/from-runtime.txt"
+            )
+            assert runtime_write.exit_code == 0, runtime_write.stderr
+            assert (host_dir / "from-runtime.txt").read_text() == "runtime-write"
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_upload_download_with_volume(self, docker_service):
+        """Test upload/download compatibility with volume mounts"""
+        if os.geteuid() != 0:
+            pytest.skip("writable fixed-uid bind-mount test requires host CAP_CHOWN")
+        name = "test_upload_download_with_volume"
+        service = docker_service
+
+        try:
+            await service.delete(name)
+        except Exception:
+            pass
+
+        try:
+            print("\n=== Test upload/download compatibility with volume mounts ===")
+
+            # Create temporary directory as volume
+            temp_dir = tempfile.mkdtemp()
+            os.chown(temp_dir, -1, SANDBOX_RUNTIME_GID)
+            os.chmod(temp_dir, 0o2750)
+            runtime_output = os.path.join(temp_dir, "output")
+            os.mkdir(runtime_output, mode=0o770)
+            os.chown(runtime_output, -1, SANDBOX_RUNTIME_GID)
+            os.chmod(runtime_output, 0o2770)
+            volume_file_path = os.path.join(temp_dir, "volume_file.txt")
+            volume_content = "This file is in the mounted volume"
+            with open(volume_file_path, "w") as f:
+                f.write(volume_content)
+
+            try:
+                # Create sandbox with volume mount
+                sandbox = await service.get_or_create(
+                    name,
+                    template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                    config=SandboxConfig(
+                        cpus=1,
+                        memory=256,
+                        volumes=[
+                            (temp_dir, "/mnt/data", "rw"),
+                        ],
+                    ),
+                )
+
+                # Verify file in volume is accessible
+                content = await sandbox.read_file("/mnt/data/volume_file.txt")
+                assert content == volume_content
+                print("✓ Volume mounted file accessible")
+
+                # Upload file to volume directory
+                with tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, suffix=".txt"
+                ) as f:
+                    volume_upload_content = "Uploaded file to volume"
+                    f.write(volume_upload_content)
+                    local_upload_path = f.name
+
+                remote_volume_path = "/mnt/data/uploaded_to_volume.txt"
+                await sandbox.upload_file(local_upload_path, remote_volume_path)
+
+                # Verify reading through sandbox
+                content = await sandbox.read_file(remote_volume_path)
+                assert content == volume_upload_content
+                print("✓ Upload to volume directory successful")
+
+                # Verify reading through host filesystem
+                host_file_path = os.path.join(temp_dir, "uploaded_to_volume.txt")
+                with open(host_file_path, "r") as f:
+                    host_content = f.read()
+                assert host_content == volume_upload_content
+                print("✓ Volume directory file visible on host")
+                os.unlink(local_upload_path)
+
+                # Download file from volume directory
+                with tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, suffix=".txt"
+                ) as f:
+                    local_download_path = f.name
+
+                await sandbox.download_file(
+                    remote_volume_path, local_download_path, overwrite=True
+                )
+                with open(local_download_path, "r") as f:
+                    downloaded_content = f.read()
+                assert downloaded_content == volume_upload_content
+                print("✓ Download from volume directory successful")
+                os.unlink(local_download_path)
+
+                # Write file in volume directory, verify visible on host
+                write_content = "Written from sandbox to volume"
+                await sandbox.write_file(write_content, "/mnt/data/written.txt")
+                host_written_path = os.path.join(temp_dir, "written.txt")
+                with open(host_written_path, "r") as f:
+                    host_written_content = f.read()
+                assert host_written_content == write_content
+                print("✓ Sandbox write to volume directory, visible on host")
+
+                # Prove the container's runtime uid 1100 (not the Docker
+                # archive API) can create a file in a managed workspace dir.
+                runtime_write = await sandbox.exec(
+                    "sh",
+                    "-c",
+                    "printf runtime-write > /mnt/data/output/from-runtime.txt",
+                )
+                assert runtime_write.exit_code == 0, runtime_write.stderr
+                with open(
+                    os.path.join(runtime_output, "from-runtime.txt"), "r"
+                ) as runtime_file:
+                    assert runtime_file.read() == "runtime-write"
+
+                await sandbox.stop()
+
+                print("✅ Upload/download and volume mount compatibility test passed")
+
+            finally:
+                # Cleanup temporary directory
+                import shutil
+
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass

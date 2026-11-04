@@ -1,0 +1,2370 @@
+import json
+import os
+import re
+import urllib.request
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, unquote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from dateutil import parser as _date_parser
+from dateutil import tz as _date_tz
+from dateutil.rrule import rrulestr as _rrulestr
+
+from ....config import get_tool_max_output_length
+
+# Keep room for a small structured status envelope. Kept local to this
+# module rather than baked into the shared get_tool_max_output_length()
+# getter itself -- that getter is read directly by many unrelated code
+# paths (including the core OutputFilteredToolWrapper), and clamping it
+# there would silently widen every caller's configured cap, not just this
+# helper's own smallest fallback shape.
+_MIN_OUTPUT_LENGTH = 64
+
+_DIGITS_ONLY_RE = re.compile(r"[0-9]+")
+_BARE_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_NUMERIC_BYDAY_RE = re.compile(r"[+-]?[0-9]{1,2}(MO|TU|WE|TH|FR|SA|SU)")
+# RFC 5545 UNTIL is always in "basic" form - no "-"/":" separators, unlike
+# ISO8601's "extended" form that dateutil's isoparse also happily accepts
+# (e.g. "2026-09-11T23:59:59+08:00"). dateutil.rrule.rrulestr's own RFC
+# 5545 line parser expects exactly this basic shape and raises a raw,
+# uninformative "too many values to unpack" if it isn't - see parse_rrule.
+# The trailing "Z" is itself optional: RFC 5545 permits UNTIL as a
+# floating "DATE WITH LOCAL TIME" (no "Z") whenever DTSTART is also
+# floating local time, not just the aware "DATE WITH UTC TIME" form.
+_UNTIL_RE = re.compile(r"[0-9]{8}(T[0-9]{6}Z?)?")
+
+
+def allowed_dirs_from_env(env_var_name: str) -> list[Path]:
+    """Parse JSON or legacy comma-separated roots.
+
+    An unset or blank value falls back to CWD for compatibility with standalone
+    connector launches that predate an explicit allowlist. Any nonblank value is
+    authoritative: an empty JSON array or a legacy value containing only empty
+    entries denies all roots instead of silently broadening access to CWD.
+    """
+    raw_dirs = os.environ.get(env_var_name, "")
+    stripped_raw_dirs = raw_dirs.strip()
+    if not stripped_raw_dirs:
+        return [Path.cwd().resolve()]
+    is_json_array = stripped_raw_dirs.startswith("[")
+    if is_json_array:
+        try:
+            decoded_dirs = json.loads(stripped_raw_dirs)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{env_var_name} must contain a valid JSON array") from exc
+        if not isinstance(decoded_dirs, list) or not all(
+            isinstance(raw_dir, str) for raw_dir in decoded_dirs
+        ):
+            raise ValueError(f"{env_var_name} must contain a JSON array of paths")
+        raw_dir_values = decoded_dirs
+    else:
+        raw_dir_values = raw_dirs.split(",")
+    try:
+        parsed_dirs = []
+        for raw_dir in raw_dir_values:
+            stripped = raw_dir.strip()
+            if not stripped:
+                continue
+            candidate = Path(stripped).expanduser()
+            resolved = candidate.resolve()
+            # Python 3.13's non-strict resolve() can leave a symlink loop
+            # unresolved instead of raising. Validate an explicit symlink
+            # strictly so a broken or cyclic configured root cannot be
+            # mistaken for a usable authorization boundary.
+            if candidate.is_symlink():
+                resolved = candidate.resolve(strict=True)
+            parsed_dirs.append(resolved)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{env_var_name} contains an invalid path") from exc
+    return parsed_dirs
+
+
+class InsufficientScopeError(RuntimeError):
+    """Raised by a connector's ``_find_conflicts`` on a whole-batch
+    missing-scope error (see that function's own docstring for why this
+    is raised at all rather than degrading to unchecked).
+
+    Carries whatever ``conflicts``/``unchecked_attendees`` had already
+    been confirmed before the error - a caller accumulating results
+    across multiple ``_find_conflicts`` calls for one create/update (e.g.
+    one call for newly-added attendees, another per delta segment for
+    retained attendees) needs this to still report an already-confirmed
+    real conflict (found before the error, in this call or an earlier
+    one) instead of silently discarding it just because a *later*,
+    unrelated check also hit the same scope problem. Reporting a known
+    conflict is always safe regardless of what else couldn't be checked;
+    only the "nothing confirmed yet, can't tell if this is safe" case
+    should still reject the write outright.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        conflicts: list[dict[str, Any]],
+        unchecked_attendees: list[str],
+    ) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
+        self.unchecked_attendees = unchecked_attendees
+
+
+def merge_scope_error(
+    exc: InsufficientScopeError,
+    conflicts: list[dict[str, Any]],
+    unchecked_attendees: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fold an `InsufficientScopeError` caught mid-accumulation into the
+    running `conflicts`/`unchecked_attendees` a connector's create/update
+    tool is building up (potentially across more than one `_find_conflicts`
+    call) - merging the error's own already-confirmed findings in first, so
+    a real conflict found before the error is never lost regardless of
+    which of possibly several calls actually raised.
+
+    Re-raises `exc` itself (preserving its original traceback/cause) when
+    the merged `conflicts` is still empty: nothing was confirmed yet, so
+    there is no already-known problem safe to report instead of rejecting
+    the write outright.
+    """
+    conflicts = [*conflicts, *exc.conflicts]
+    unchecked_attendees = [*unchecked_attendees, *exc.unchecked_attendees]
+    if not conflicts:
+        raise exc
+    return conflicts, unchecked_attendees
+
+
+def require_clean_identifier(value: str, field_name: str) -> str:
+    """Reject an empty or whitespace-padded id rather than silently fixing it.
+
+    An id copy-pasted or concatenated by a caller with accidental whitespace
+    is more likely a bug worth surfacing than a value to repair - repairing
+    it would mask the bug and could send a query for a different object.
+    Use this for ids that go into a JSON request body; for ids interpolated
+    into a URL path, use url_path_id instead - encoding (not just rejecting
+    whitespace) is what actually closes path/query injection.
+    """
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(
+            f"{field_name} must be a non-empty id with no surrounding whitespace"
+        )
+    return value
+
+
+def require_clean_text(value: str, field_name: str) -> str:
+    """Reject an empty or whitespace-padded free-text value (e.g. a title,
+    display name, or other human-authored field) rather than silently
+    fixing it.
+
+    Same underlying check as require_clean_identifier, but that function's
+    message ("must be a non-empty id...") reads as confusing/wrong for a
+    field that was never an id - a human-facing field like an issue's
+    summary or a priority name should be rejected in its own terms instead.
+    """
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(
+            f"{field_name} cannot be empty or have leading/trailing whitespace"
+        )
+    return value
+
+
+def url_path_id(value: str, field_name: str) -> str:
+    """Validate then percent-encode an id for safe interpolation into a URL
+    path segment.
+
+    Percent-encoding - not a blocklist of "/", "?", "#" - is what actually
+    prevents a value like "x?limit=1&foo=/reports/metrics" from escaping
+    its intended path segment: any character that could do that gets
+    encoded regardless of which one it is, rather than relying on an
+    enumeration that could miss one. "." and ".." are the one exception
+    that survives encoding unchanged (they're always-unreserved characters
+    per RFC 3986, so quote() never touches them), and requests/urllib3
+    normalize dot-segments out of the final URL before sending it --
+    verified directly: requests.Request("GET",
+    ".../sobjects/Account/..").prepare().url collapses to ".../sobjects/",
+    a completely different (still valid) endpoint. Rejected explicitly
+    since encoding can't close this one off.
+    """
+    require_clean_identifier(value, field_name)
+    if value in (".", ".."):
+        raise ValueError(f"{field_name} must not be '.' or '..'")
+    return quote(value, safe="")
+
+
+# Phase 1's per-field marker (see success_with_capped_dict): a 1-key dict
+# can't shrink by dropping trailing keys the way a list halves its elements
+# or a larger dict drops its trailing half -- floor(1 / 2) is 0, so the same
+# rule would erase the whole dict to {} in a single step. Substituting this
+# marker instead keeps that field non-empty and self-explanatory, the same
+# way the envelope's own top-level "truncated" flag is, rather than leaving
+# a bare {} a caller can't distinguish from "always empty" -- but only once
+# there's budget to spare for it (see success_with_capped_dict's marker-
+# upgrade pass): installing it any earlier, before the full response is
+# known to fit, can cost a sibling field real data it would otherwise have
+# kept -- a marker bigger than {} that gets installed while other fields
+# are still being shrunk eats into the budget they need, rather than only
+# spending what's left over once nothing more can be squeezed out.
+_FIELD_TRUNCATION_MARKER: dict[str, Any] = {"truncated": True}
+
+
+def _halve_dict_keys(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Drop the trailing half of ``value``'s keys, or return ``None`` if it
+    only has one key left to drop (its one-key floor -- see
+    ``halve_dict_or_mark`` and ``success_with_capped_dict``'s phase 1,
+    the two places this shrink step is used, for what a caller should do
+    at that floor; they differ, which is why this stops short of deciding
+    for them).
+    """
+    keys = list(value)
+    if len(keys) <= 1:
+        return None
+    return {key: value[key] for key in keys[: len(keys) // 2]}
+
+
+def _truncation_marker_or_empty(value: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``_FIELD_TRUNCATION_MARKER`` if it's no bigger
+    (serialized) than ``value``, otherwise ``{}``. A tie still installs the
+    marker: it costs nothing extra there, so there's no reason to throw
+    away the "this was truncated" signal for a byte-neutral swap."""
+    marker_size = len(json.dumps(_FIELD_TRUNCATION_MARKER, ensure_ascii=False))
+    current_size = len(json.dumps(value, ensure_ascii=False))
+    return dict(_FIELD_TRUNCATION_MARKER) if marker_size <= current_size else {}
+
+
+def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """One shrink step for a non-empty dict-valued field: drop the trailing
+    half of its keys while it still has more than one, otherwise replace it
+    with ``_truncation_marker_or_empty``'s result.
+
+    Returns ``(shrunk, floored)``. ``floored`` is True once the field hit
+    its one-key floor -- whatever came back (marker or ``{}``) is that
+    field's final state and nothing further can be squeezed out of it, so a
+    caller must stop selecting it rather than re-detect the marker later by
+    equality (which would misfire if real data happened to equal it, and
+    would spin forever if the size comparison ever admitted ties).
+
+    Installing the marker as soon as this one field hits its floor is only
+    safe when there is no sibling field whose own shrinking could still be
+    starved by the bytes it costs -- true for a local caller shrinking a
+    single dict field on its own (e.g. a connector's own capping helper
+    making room for extra fields after delegating the bulk of the
+    shrinking to ``success_with_capped_dict``), which is what this is for.
+    ``success_with_capped_dict``'s own phase 1 shrinks several dict-valued
+    fields against a shared budget and does *not* call this: it uses
+    ``_halve_dict_keys`` directly and floors to {} immediately, only
+    considering the marker afterward once every field's final size is
+    known (see that function's docstring) -- calling this here instead
+    would reintroduce exactly the problem it was written to fix.
+    """
+    halved = _halve_dict_keys(value)
+    if halved is not None:
+        return halved, False
+    return _truncation_marker_or_empty(value), True
+
+
+# Matches the spelling already used for the same "content was cut" signal
+# elsewhere in this connector (deputy.py's Deputy-error-detail truncation,
+# graphql_errors.py's truncate_error_text) rather than introducing a
+# second, differently-spelled marker for the same concept.
+_TRUNCATION_SUFFIX = "... [truncated]"
+
+
+def _envelope_with_critical(
+    critical: dict[str, Any], *, extra: dict[str, Any] | None = None
+) -> str:
+    return json.dumps(
+        {"status": "success", **(extra or {}), **critical, "truncated": True},
+        ensure_ascii=False,
+    )
+
+
+def _fit_critical_fields(
+    critical: dict[str, Any],
+    max_output_length: int,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Build the ``{"status": "success", **extra, **critical, "truncated":
+    true}`` envelope, shortening or dropping ``critical`` as needed until
+    the serialized result actually fits ``max_output_length`` -- the
+    guaranteed-fits counterpart to ``success_with_capped_dict``'s
+    last-resort call site, which needs critical_fields present but must
+    never hand back something this function can't promise is within
+    budget (see that call site for why).
+
+    ``extra`` carries the one piece of ``data`` this function otherwise
+    knows nothing about: the compact ``{field_name: {id_key: ...}}`` record
+    the caller had already isolated before falling back this far, kept
+    alongside ``critical`` rather than left behind -- shrinking or dropping
+    ``critical`` still leaves a record whose id can be looked up, which a
+    bare ``critical``-only envelope can't offer. ``extra`` itself is never
+    shrunk (an id is already about as small as a value gets); if ``critical``
+    fully dropped still doesn't leave room for it, ``extra`` is dropped too
+    rather than risk exceeding ``max_output_length``.
+
+    Even the bare ``{"status": "success", "truncated": true}`` skeleton
+    this function falls back to is not free -- ``max_output_length`` must
+    be at least its length (40 chars) for that fallback itself to fit.
+    This function has no floor of its own; it relies on its one caller
+    always passing ``max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())``
+    (``_MIN_OUTPUT_LENGTH`` is 64), never a raw, unclamped budget.
+
+    Two passes, each mirroring an existing pattern in this module rather
+    than inventing a new one:
+
+    1. Shrink the largest string value (by its own raw length, not a
+       json.dumps-serialized size -- unlike the drop pass below, this
+       doesn't need to account for quoting/escaping overhead since it's
+       choosing which value to shrink, not computing an exact byte
+       budget) toward ``_TRUNCATION_SUFFIX``. The target length for each
+       cut is derived from how much the *whole envelope* needs to shrink
+       by (not a fixed step), and is provably always smaller than the
+       field's current length whenever this loop body runs at all (the
+       loop only runs while the envelope is still oversized, so there's
+       always at least one byte of "how much shorter" to cut) -- so,
+       unlike a naive "replace with a fixed marker" approach, this can
+       never inflate a value that started out shorter than the marker
+       itself. A value that shrinks to "" is excluded from the next round
+       by the ``and value`` filter below, moving on to the next-largest
+       field.
+    2. If nothing is left to shrink (every string is now "", or
+       ``critical`` had no string to begin with -- nothing currently
+       passes a non-string critical field, but the type is
+       ``dict[str, Any]``, not ``dict[str, str]``, so nothing stops a
+       future caller from doing that) and the envelope is still oversized,
+       drop whole fields outright (largest serialized cost first) until it
+       fits. Losing a critical field entirely is a worse outcome than
+       shrinking it, but a response this function still can't guarantee
+       fits is worse still: a stdio MCP child's own budget is mirrored
+       into a *separate*, JSON-unaware truncation the parent applies to
+       this exact string (see ``success_with_capped_dict``), and that
+       blind slice corrupts an oversized response into invalid JSON rather
+       than merely truncating it.
+    """
+    working = dict(critical)
+    response = _envelope_with_critical(working, extra=extra)
+
+    while len(response) > max_output_length:
+        shrinkable = {
+            key: value
+            for key, value in working.items()
+            if isinstance(value, str) and value
+        }
+        if not shrinkable:
+            break
+        target_key = max(shrinkable, key=lambda key: len(shrinkable[key]))
+        current = shrinkable[target_key]
+        excess = len(response) - max_output_length
+        # How much shorter this value's raw content needs to be for the
+        # whole envelope to fit, with a small safety margin for
+        # JSON-escaping growth (e.g. a quote or backslash newly exposed at
+        # the cut point costs an extra backslash once re-escaped) -- an
+        # exact-excess target could otherwise still overshoot by a byte or
+        # two and force another round trip. Always strictly less than
+        # len(current) here (excess is at least 1 whenever this loop body
+        # runs), so this can never replace a value with something bigger.
+        target_len = max(0, len(current) - excess - 8)
+        if target_len >= len(_TRUNCATION_SUFFIX):
+            # Room for some real content plus the marker.
+            working[target_key] = (
+                current[: target_len - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+            )
+        else:
+            # Not even enough room left for the marker text -- keep
+            # whatever raw content still fits, unmarked (possibly ""). The
+            # envelope's own top-level "truncated" flag still signals that
+            # something, somewhere, was cut.
+            working[target_key] = current[:target_len]
+        response = _envelope_with_critical(working, extra=extra)
+
+    remaining = list(working.keys())
+    while len(response) > max_output_length and remaining:
+        drop_key = max(
+            remaining, key=lambda key: len(json.dumps(working[key], ensure_ascii=False))
+        )
+        del working[drop_key]
+        remaining.remove(drop_key)
+        response = _envelope_with_critical(working, extra=extra)
+    if len(response) > max_output_length:
+        if extra:
+            # `extra` (a bare id, typically a handful of bytes) doesn't fit
+            # even alongside every critical field fully dropped -- an
+            # extreme budget this function still must not exceed, so drop
+            # `extra` too rather than return something oversized.
+            return _fit_critical_fields(critical, max_output_length)
+        return json.dumps({"status": "success", "truncated": True}, ensure_ascii=False)
+    return response
+
+
+def success_with_capped_dict(
+    field_name: str,
+    data: Any,
+    *,
+    extra_fields: dict[str, Any] | None = None,
+    critical_fields: dict[str, Any] | None = None,
+    keep_list_tail: bool = False,
+) -> str:
+    """Build a ``{"status": "success", ...}`` payload, trimming a dict
+    until it fits the platform's output limit.
+
+    A record/report/metrics response can be a dict keyed by date,
+    dimension, or id depending on the endpoint, where most of the
+    payload's size typically lives in one or two large nested list/dict
+    values while the rest are small scalars (an "offset" or "total" field
+    alongside a big "breakdowns" list, or a handful of small standard
+    fields alongside one huge Long Text Area value). Dropping whole
+    top-level keys to shrink such a dict can discard the entire useful
+    payload on the very first step while leaving small, mostly empty
+    scalar fields behind -- and there's no cursor to retry with, so that
+    data is gone for this call. Phase 1 instead repeatedly finds the
+    largest list/dict-valued key and halves *its* contents (recursing one
+    level, not further): a list approaches empty gradually as it halves
+    (1000, 500, ..., 2, 1) -- though, like a dict, its very last element
+    still disappears in one step once it's down to a single item; that
+    residual case isn't addressed here (a pre-existing, accepted gap, not
+    one this fix closes). Halving a *dict's key count* the same way floors
+    to zero once only one key is left; phase 1 floors a dict-valued field to
+    {} at that point (same as a list's last element, and the same as this
+    function did before the marker existed), rather than installing
+    ``_FIELD_TRUNCATION_MARKER`` there directly -- a call with several
+    large dict-valued fields shrinks them one at a time, and a marker
+    installed on the first while its siblings are still oversized would
+    cost bytes those siblings need, potentially losing a sibling's real
+    value that would otherwise have fit as {}. Only once phase 1 has fully
+    converged (using {} throughout, so this step alone can never do worse
+    than the pre-marker behavior) does a second pass spend whatever budget
+    is left over upgrading floored fields back to the marker, in the order
+    they were floored (whichever field ran out of halving headroom first --
+    correlated with key count more than with original byte size, so a
+    smaller field with fewer keys can float, and get upgraded, before a
+    larger one that needed more halving rounds first), checked against the
+    actual rebuilt response each time and stopping at the first upgrade
+    that doesn't fit -- so a marker is only ever paid for out of genuine
+    surplus, never at another field's expense. Phase 2 is a fallback for
+    the residual case -- a dict with no *remaining* list/dict-valued keys
+    (either because it never had any,
+    e.g. a handful of scalar keys with huge string values, or because
+    phase 1 already exhausted the ones it had) -- and drops whole top-level
+    keys the same way, but always leaves at least one key standing rather
+    than run the same single-key floor all the way down to {}. This still
+    doesn't guarantee the final response never contains ``{}`` for this
+    field: if even one surviving key doesn't fit, the last-resort fallback
+    below can still fall back that far, by design -- these phases only
+    guarantee they won't be the ones to empty it needlessly.
+
+    ``extra_fields`` adds fixed top-level response fields that must be counted
+    while trimming the dict, such as a calendar event's derived Meet link --
+    these can still be dropped by the last-resort fallback below if space
+    runs out. ``critical_fields`` are the same shape but survive even that
+    fallback, including every rung of the ladder described below: a signal
+    like "this create's record could not be confirmed" matters more than
+    the record data it's attached to, and silently dropping it under size
+    pressure would defeat the reason it exists. If the record data has
+    already been dropped entirely and critical_fields alone still don't
+    fit, their own string values get shortened (see ``_fit_critical_fields``)
+    rather than ever handing back a response wider than max_output_length --
+    that width is a real contract with the parent MCP process for a stdio
+    connector (see ``_apply_stdio_output_limit_env``), whose own blind,
+    JSON-unaware slice would otherwise cut an oversized response anywhere,
+    up to and including mid-string. Reserved envelope keys cannot be
+    overridden by either extra_fields or critical_fields, and the two must
+    not share a key.
+
+    ``keep_list_tail`` changes list truncation to retain the newest/end of
+    each list instead of the oldest/start. Use it for ascending time series
+    where recent values are more useful than historical values. It does not
+    affect dict-key truncation or callers that leave it at the default.
+
+    If the payload is still too large once ``data`` itself is fully
+    truncated, the last resort walks a ladder from most to least
+    informative: the record's id (if it has one) with the extras intact;
+    then an empty record with the extras intact; then the id with each
+    extra field whose value is bigger than the ``True`` placeholder
+    degraded to ``True`` (largest first, same size-gate as the field
+    marker above); then the id alone; then an empty record with those same
+    degraded extras; and only then an empty record with no extras at all.
+    The id is given up for extras only while those extras are intact: a
+    real Meet link that fits beside an empty record beats keeping only the
+    id (that rung is what stops a long id from crowding the link out
+    entirely). Once the extras are degraded to an uninformative ``True``
+    placeholder, though, the id is worth keeping again over losing it for
+    that placeholder: id-alone outranks a degraded placeholder that
+    dropped the id (an id you can look the record up by beats a flag that
+    says nothing). But the id still keeps any degraded extra that fits
+    beside it -- id with degraded extras outranks id alone, since keeping
+    both costs nothing once the id already fits.
+
+    With two or more ``extra_fields``, the degradation order (largest
+    field first) is a fixed chain, not a search: it never tries "degrade
+    only a smaller field, keep a larger one intact" as an alternative, so
+    it can end up returning a less informative candidate (e.g. two fields
+    both degraded to ``True``) when a different combination (degrading
+    only the smaller one) would also have fit and kept the larger field's
+    real value. Every current caller (just ``calendar.py``'s Meet link)
+    only ever sets one ``extra_fields`` key at a time, so this doesn't
+    arise in practice; a caller that starts passing several extras at
+    once should be aware the ladder doesn't search for the best-fitting
+    combination, only degrades in size order. ``critical_fields`` never
+    enters this degradation ladder at all -- it's simply present in every
+    candidate the ladder produces, at full size, unconditionally.
+    """
+    if field_name in ("status", "truncated"):
+        # Not just an extra_fields collision: `field_name: payload` would
+        # be the exact same dict key as one of the envelope's own hardcoded
+        # fields, and the literal that appears later in the dict wins --
+        # silently discarding the real payload (if field_name == "status")
+        # or the envelope's own success/truncation markers (if field_name
+        # == "truncated") with no error at all.
+        raise ValueError(
+            f"field_name must not be a reserved envelope key: {field_name!r}"
+        )
+    extras = extra_fields or {}
+    critical = critical_fields or {}
+    reserved_fields = {"status", field_name, "truncated"}
+    if reserved_fields.intersection(extras) or reserved_fields.intersection(critical):
+        raise ValueError(
+            "extra_fields/critical_fields must not override status, the "
+            "capped field, or truncated"
+        )
+    if set(extras) & set(critical):
+        raise ValueError("extra_fields and critical_fields must not share a key")
+
+    max_output_length = max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())
+
+    def _build(
+        payload: Any,
+        truncated: bool,
+        *,
+        extras_override: dict[str, Any] | None = None,
+    ) -> str:
+        return json.dumps(
+            {
+                "status": "success",
+                field_name: payload,
+                **(extras if extras_override is None else extras_override),
+                **critical,
+                "truncated": truncated,
+            },
+            ensure_ascii=False,
+        )
+
+    response = _build(data, False)
+    if not isinstance(data, dict) or len(response) <= max_output_length:
+        return response
+
+    working = dict(data)
+    # Dict-valued fields floored to {} (their one remaining key dropped),
+    # in the order it happened -- not necessarily largest-original-field
+    # first: a field floors as soon as it runs out of halving headroom,
+    # which tracks its key count more than its byte size, so a small
+    # single-key field can float (and later get upgraded) before a larger
+    # multi-key one does. Tracked so the marker-upgrade pass below knows
+    # which fields are eligible and in what order, and to make explicit
+    # that a floored field is done rather than leaning solely on the
+    # collection_keys filter's len(value) > 0 (true for every floored
+    # field here anyway, since phase 1 never installs anything bigger than
+    # {} -- see that filter's own reasoning below).
+    floored_keys: list[str] = []
+    while len(response) > max_output_length:
+        collection_keys = [
+            key
+            for key, value in working.items()
+            if key not in floored_keys
+            and isinstance(value, (list, dict))
+            and len(value) > 0
+        ]
+        if not collection_keys:
+            break
+        target_key = max(
+            collection_keys,
+            key=lambda key: len(json.dumps(working[key], ensure_ascii=False)),
+        )
+        target_value = working[target_key]
+        if isinstance(target_value, list):
+            retained_length = len(target_value) // 2
+            if keep_list_tail and retained_length:
+                working[target_key] = target_value[-retained_length:]
+            else:
+                working[target_key] = target_value[:retained_length]
+        else:
+            halved = _halve_dict_keys(target_value)
+            if halved is not None:
+                working[target_key] = halved
+            else:
+                working[target_key] = {}
+                floored_keys.append(target_key)
+        # This loop only runs at all once the initial (untruncated) build
+        # has already failed to fit, so every rebuild from here on is
+        # truncated by definition -- there's no path back to `False`.
+        response = _build(working, True)
+
+    # Phase 1 above never installs the marker itself, so this point is
+    # reached with every floored field at {} -- the same state the
+    # pre-marker version of this function would have produced, and
+    # therefore never worse than it. Only now, with the rest of the
+    # shrinking already accounted for, is any leftover budget spent
+    # upgrading floored fields back to the informative marker, in floor
+    # order, one at a time, checked against the real rebuilt response
+    # rather than a per-field size guess -- so a marker can never come at
+    # the expense of a sibling's data the way installing it up front
+    # could. All floored fields cost the same fixed amount to upgrade, so
+    # once one doesn't fit, none of the rest would either.
+    for key in floored_keys:
+        working[key] = dict(_FIELD_TRUNCATION_MARKER)
+        upgraded_response = _build(working, True)
+        if len(upgraded_response) > max_output_length:
+            working[key] = {}
+            break
+        response = upgraded_response
+
+    keys = list(working.keys())
+    while len(response) > max_output_length and len(keys) > 1:
+        keys = keys[: len(keys) // 2]
+        working = {key: working[key] for key in keys}
+        response = _build(working, True)
+
+    if len(response) > max_output_length:
+        compact_data: dict[str, Any] = {}
+        # Checked in this order, first match wins: different connectors'
+        # APIs spell their identity field differently (Salesforce/HubSpot:
+        # "id"; Deputy: "Id"; MYOB: "Uid") -- without checking the
+        # capitalized variants too, a record that's otherwise unrecoverable
+        # after truncation would lose even its id just because the field
+        # isn't spelled exactly "id", leaving a caller with no way to look
+        # the record back up.
+        for id_key in ("id", "Id", "ID", "Uid", "UID"):
+            if isinstance(data.get(id_key), (str, int, float, bool)):
+                compact_data[id_key] = data[id_key]
+                break
+
+        # Extras snapshots from most to least informative: intact first,
+        # then one more field degraded to `True` per step, largest first.
+        extras_steps = [dict(extras)]
+        degraded_extras = dict(extras)
+        degraded_marker_size = len(json.dumps(True, ensure_ascii=False))
+        while True:
+            # Booleans are excluded from the candidate pool entirely, not
+            # just an already-`True` one: `False` (5 bytes) is technically
+            # "bigger" than `True` (4 bytes), so a plain `largest_value is
+            # True` check would let a real `False` value get "degraded" to
+            # `True` -- silently flipping it, not truncating it. Degrading
+            # a boolean can't lose information gradually the way a long
+            # string or number can (there's no partial signal between the
+            # two values), so it's never a valid degrade target.
+            degradable = {
+                key: value
+                for key, value in degraded_extras.items()
+                if not isinstance(value, bool)
+            }
+            if not degradable:
+                break
+            largest_key = max(
+                degradable,
+                key=lambda key: len(json.dumps(degradable[key], ensure_ascii=False)),
+            )
+            largest_value = degradable[largest_key]
+            if degraded_marker_size >= len(
+                json.dumps(largest_value, ensure_ascii=False)
+            ):
+                # Degrading the largest remaining (non-boolean) extra
+                # wouldn't actually shrink it (e.g. an already-short
+                # scalar) -- the same size-gate the field marker uses (see
+                # _truncation_marker_or_empty), applied here so this
+                # ladder can't grow the payload it exists to shrink.
+                # Whatever smaller fields remain aren't worth visiting
+                # individually.
+                break
+            degraded_extras[largest_key] = True
+            extras_steps.append(dict(degraded_extras))
+
+        # Rungs, top to bottom -- see this function's docstring ("the last
+        # resort walks a ladder...") for the order and its rationale. Built
+        # here as plain (record, extras) pairs, in rank order, so "rung N
+        # before rung N+1" is a property of this list's order rather than
+        # of the statements that build it; the pairs are then rendered via
+        # `_build` in one pass below.
+        full_extras, degraded_steps = extras_steps[0], extras_steps[1:]
+        rungs: list[tuple[dict[str, Any], dict[str, Any]]] = [
+            (compact_data, full_extras)
+        ]
+        if compact_data:
+            rungs.append(({}, full_extras))
+        rungs.extend((compact_data, step) for step in degraded_steps)
+        rungs.append((compact_data, {}))
+        if compact_data:
+            rungs.extend(({}, step) for step in degraded_steps)
+        rungs.append(({}, {}))
+
+        candidates = [
+            _build(record, True, extras_override=step_extras)
+            for record, step_extras in rungs
+        ]
+        candidates.append(_envelope_with_critical(critical))
+        for candidate in candidates:
+            if len(candidate) <= max_output_length:
+                return candidate
+        # Even this absolute last resort keeps critical_fields -- dropping
+        # them here would mean the one guarantee this parameter exists to
+        # make ("this signal is never silently lost to truncation") holds
+        # everywhere except the single case it matters most: when nothing
+        # else fit at all. But the result must still fit max_output_length,
+        # not just be non-empty: a stdio MCP child's own budget is mirrored
+        # into a *separate*, JSON-unaware truncation the parent process
+        # applies to this exact string (OutputFilteredToolWrapper via
+        # _apply_stdio_output_limit_env's mirrored env var) -- an oversized
+        # response here would be blindly sliced mid-structure by that
+        # parent-side filter, producing invalid JSON instead of a
+        # valid-but-abbreviated one, right on the path meant to carry an
+        # "unconfirmed" safety signal. So once nothing else is left to
+        # drop, shorten critical_fields' own string values (longest first)
+        # until the envelope fits, rather than emitting something this
+        # function can't guarantee is parseable downstream. Still try to
+        # keep compact_data (the bare id) alongside the shrunk critical
+        # fields first -- every rung above already treated a bare id as
+        # worth keeping over a fuller payload, and this last resort
+        # shouldn't be the one place that guarantee quietly stops applying.
+        return _fit_critical_fields(
+            critical,
+            max_output_length,
+            extra={field_name: compact_data} if compact_data else None,
+        )
+    return response
+
+
+def normalize_addresses(addresses: list[str] | str) -> list[str]:
+    """Split/strip a comma-separated string or list of email addresses into a
+    clean list, dropping anything blank and case-insensitive duplicates
+    (keeping the first casing seen - email addresses are case-insensitive,
+    so a caller passing the same person twice with different casing, e.g.
+    from a human-written invite list, must not become two separate
+    attendee entries downstream)."""
+    if isinstance(addresses, str):
+        raw = [address.strip() for address in addresses.split(",") if address.strip()]
+    else:
+        raw = [address.strip() for address in addresses if address and address.strip()]
+    seen: set[str] = set()
+    deduped = []
+    for address in raw:
+        key = address.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(address)
+    return deduped
+
+
+def _halve_largest_list_fields_until_bounded(
+    payload: dict[str, Any], field_names: tuple[str, ...], max_output_length: int
+) -> str:
+    """Serialize ``payload``, halving its largest named list until bounded.
+
+    Halving a list's element count works at any length above one, but
+    floor(1 / 2) is 0: unconditionally halving a single-item list the same
+    way would collapse a genuine last item (a real conflict, the one
+    remaining unchecked calendar) to ``[]`` in a single step, indistinguishable
+    from "none found" even though ``truncated`` is true. A field halved down
+    to its last item is floored to ``[]`` first instead -- never worse than
+    that old unconditional-halving behavior -- while other named fields
+    still have room to shrink. Only once nothing more can be squeezed out
+    of any field does a second pass spend whatever budget is left over
+    upgrading floored fields back to a one-item truncation marker (a dict
+    marker for a list of dicts like ``conflicts``, a sentinel string for a
+    list of strings like ``unchecked_attendees``, keeping the field a
+    well-formed list of its own element type), in the order they floored,
+    checked against the actual rebuilt response each time -- so installing
+    a marker can never cost a still-shrinking sibling field the bytes it
+    needed.
+    """
+    response = json.dumps(payload, ensure_ascii=False)
+    # Fields floored to [] (their last item dropped), in the order it
+    # happened, together with the marker that would replace that item --
+    # captured now since the item itself is gone once the field is [].
+    floored_fields: list[str] = []
+    floor_markers: dict[str, Any] = {}
+    while len(response) > max_output_length:
+        populated_fields = [
+            name
+            for name in field_names
+            if name not in floored_fields and payload.get(name)
+        ]
+        if not populated_fields:
+            break
+        field_name = max(
+            populated_fields,
+            key=lambda name: len(json.dumps(payload[name], ensure_ascii=False)),
+        )
+        values = payload[field_name]
+        if len(values) > 1:
+            payload[field_name] = values[: len(values) // 2]
+        else:
+            sample = values[0]
+            floor_markers[field_name] = (
+                {"truncated": True} if isinstance(sample, dict) else "<truncated>"
+            )
+            payload[field_name] = []
+            floored_fields.append(field_name)
+        payload["truncated"] = True
+        response = json.dumps(payload, ensure_ascii=False)
+
+    for field_name in floored_fields:
+        payload[field_name] = [floor_markers[field_name]]
+        upgraded_response = json.dumps(payload, ensure_ascii=False)
+        if len(upgraded_response) <= max_output_length:
+            response = upgraded_response
+        else:
+            payload[field_name] = []
+    return response
+
+
+def conflict_response(
+    conflicts: list[dict[str, Any]],
+    unchecked_attendees: list[str],
+    start: str,
+    end: str,
+    *,
+    check_error: str | None = None,
+) -> str:
+    """Build the status="conflict" envelope a calendar-writing MCP tool
+    returns instead of creating/updating an event, so the calling agent
+    reports the conflict to the user rather than silently double-booking.
+
+    `unchecked_attendees` is usually the self-explanatory kind (an
+    attendee absent from the provider's response, or its own per-attendee
+    error) - a missing-OAuth-scope 403 covering the whole call is instead
+    raised as `InsufficientScopeError` before ever reaching here, since
+    writing an event whose availability could never actually be checked
+    would defeat the point of this feature. The one exception: a caller
+    that catches `InsufficientScopeError` because `conflicts` was already
+    non-empty (a real conflict was confirmed before the scope error hit)
+    may pass that error's own `unchecked_attendees` through here too - at
+    that point the write is already correctly blocked by the known
+    conflict, so being honest about who else couldn't be checked is safe.
+
+    `conflicts` and `unchecked_attendees` are both uncapped input (an
+    organizer with a busy shared calendar or a wide window can turn up
+    far more overlapping events than a caller needs to see; a missing-
+    scope error partway through a large invite list can likewise mark
+    an entire remaining batch unchecked) - unlike every other response
+    path here, which routes through `success_with_capped_dict`, this
+    shape has multiple top-level fields under a non-"success" status
+    that function doesn't support, so the payload is capped locally
+    instead: whichever of `conflicts`/`unchecked_attendees` is currently
+    larger (by its own serialized size) is halved each step, so a
+    single real conflict isn't fully dropped just to make room for a
+    still-oversized `unchecked_attendees` list (unconditionally halving
+    `conflicts` first would zero out a 1-item list in a single step,
+    regardless of whether that was actually necessary). A field halved
+    down to its last item is replaced with a one-item truncation marker
+    rather than emptied to `[]`, budget permitting (see
+    `_halve_largest_list_fields_until_bounded`), so a caller can tell "the
+    last conflict/unchecked calendar was truncated away" apart from "none
+    found". If the fixed envelope itself is too large, the response falls
+    back to a compact, valid JSON object instead of relying on the
+    framework to truncate the serialized JSON at an arbitrary character
+    boundary.
+    """
+    payload: dict[str, Any] = {
+        "status": "conflict",
+        "message": f"{len(conflicts)} existing event(s) overlap {start} - {end}",
+        "conflicts": conflicts,
+        "unchecked_attendees": unchecked_attendees,
+        "hint": (
+            "Do not retry with the same time slot. Report these conflicts to "
+            "the user and ask them to pick a different time or confirm they "
+            "want to proceed anyway. Only call this tool again with "
+            "ignore_conflicts=true after the user has explicitly confirmed "
+            "they still want this slot."
+        ),
+        # Always present (not just when truncation actually happens),
+        # matching every other capped response path in this package
+        # (see success_with_capped_dict) - a caller that learned
+        # "truncated is always in the payload" from those shouldn't have
+        # to special-case this one.
+        "truncated": False,
+    }
+    if check_error:
+        payload["check_error"] = check_error
+    max_output_length = get_tool_max_output_length()
+    response = _halve_largest_list_fields_until_bounded(
+        payload, ("conflicts", "unchecked_attendees"), max_output_length
+    )
+
+    if len(response) > max_output_length:
+        compact_payloads: tuple[dict[str, Any], ...] = (
+            {
+                "status": "conflict",
+                "message": "Scheduling conflict detected; details truncated.",
+                "conflicts": [],
+                "unchecked_attendees": [],
+                "truncated": True,
+            },
+            {"status": "conflict", "truncated": True},
+        )
+        for compact_payload in compact_payloads:
+            compact_response = json.dumps(compact_payload, ensure_ascii=False)
+            if len(compact_response) <= max_output_length:
+                return compact_response
+        # A configured limit smaller than this JSON object cannot preserve
+        # both valid JSON and the response's required status. Keep the
+        # smallest contract-preserving response rather than returning `{}`.
+        return json.dumps({"status": "conflict"}, ensure_ascii=False)
+    return response
+
+
+def incomplete_check_response(
+    unchecked_attendees: list[str],
+    start: str,
+    end: str,
+    *,
+    message: str | None = None,
+) -> str:
+    """Return a bounded pre-write response when required calendars could
+    not be checked. The caller may retry with ``ignore_conflicts=True`` only
+    after the user explicitly accepts proceeding without complete checks.
+    ``message`` can describe a non-calendar prerequisite, such as a malformed
+    event window, while preserving the same bounded response contract.
+    """
+    payload: dict[str, Any] = {
+        "status": "conflict_check_incomplete",
+        "message": message
+        or (
+            f"Availability could not be checked for {len(unchecked_attendees)} "
+            f"calendar(s) for {start} - {end}. No event was written."
+        ),
+        "unchecked_attendees": unchecked_attendees,
+        "hint": (
+            "Report the unchecked calendars to the user. Choose another action, "
+            "or call this tool again with ignore_conflicts=true only after the "
+            "user explicitly confirms they want to proceed without complete "
+            "availability checks."
+        ),
+        "truncated": False,
+    }
+    max_output_length = get_tool_max_output_length()
+    response = _halve_largest_list_fields_until_bounded(
+        payload, ("unchecked_attendees",), max_output_length
+    )
+    if len(response) <= max_output_length:
+        return response
+
+    compact_payloads: tuple[dict[str, Any], ...] = (
+        {
+            "status": "conflict_check_incomplete",
+            "message": "Availability check incomplete; details truncated.",
+            "truncated": True,
+        },
+        {"status": "conflict_check_incomplete", "truncated": True},
+    )
+    for compact_payload in compact_payloads:
+        compact = json.dumps(compact_payload, ensure_ascii=False)
+        if len(compact) <= max_output_length:
+            return compact
+    return json.dumps({"status": "conflict_check_incomplete"}, ensure_ascii=False)
+
+
+def attendees_were_given(attendees: list[str] | str | None) -> bool:
+    """Whether `attendees` was actually provided by the caller for an
+    update, treating an empty string the same as not-provided at all -
+    matching every other optional field's truthy convention here (and the
+    create path's own check). An explicit empty list is still considered
+    supplied; the caller decides whether that means clearing attendees or an
+    additive no-op."""
+    return attendees is not None and attendees != ""
+
+
+def attendees_to_add(
+    attendees: list[str] | str | None, existing_attendee_emails: set[str]
+) -> list[str]:
+    """The newly-added addresses from an update's `attendees` argument,
+    normalized and deduped, that aren't already in
+    `existing_attendee_emails`. This is also useful for a replacement API that
+    checks newly added and retained attendees separately. Returns [] for
+    anything `attendees_were_given` treats as not-provided (None, ""), matching
+    its own convention, as well as for a caller-supplied list/string that turns
+    out to name only people already on the event.
+    """
+    if not attendees_were_given(attendees):
+        return []
+    existing = {email.strip().lower() for email in existing_attendee_emails}
+    return [
+        address
+        for address in normalize_addresses(attendees or [])
+        if address.lower() not in existing
+    ]
+
+
+_OVERLONG_FRACTIONAL_SECONDS = re.compile(r"(\.\d{6})\d+")
+
+
+def datetime_key_for_comparison(value: str | None) -> datetime | str | None:
+    """Return a value suitable for equality-comparing two datetime strings
+    that may be written in different but equivalent formats.
+
+    A caller re-submitting the same instant it just read back from an API
+    (or a value it typed by hand) can differ in formatting alone - "Z" vs
+    "+00:00", a different (but equal-instant) zone offset, missing vs
+    present fractional seconds - while meaning the same moment. Comparing
+    such strings directly treats a same-instant resubmission as a real
+    change, which for a scheduling-conflict check means re-querying (and,
+    worse, misjudging self-conflicts against) a window that never actually
+    moved.
+
+    Parses to a `datetime` and returns it: two aware datetimes compare
+    equal when they denote the same instant regardless of differing zone
+    offsets, which a string/isoformat() comparison would not catch. Two
+    naive datetimes (Outlook's dateTime values, which carry no offset of
+    their own) compare directly, which is correct since both sides here
+    always come from the same source. An aware value never equals a naive
+    one, which is fine - these are simply never the same source's values
+    (never worse than the plain-string comparison this replaces).
+
+    Returns the original value unchanged if it doesn't parse (None stays
+    None, and a genuinely malformed value still compares by raw string,
+    same as before this normalization existed - never worse, never a
+    crash).
+
+    Outlook commonly reports 7-digit (100-nanosecond) fractional seconds
+    (e.g. ".0000000"), one more digit than a `datetime` microsecond can
+    hold. `fromisoformat`'s tolerance for that is a CPython-version detail
+    the caller shouldn't need to know about, so any fractional-seconds run
+    longer than 6 digits is truncated to 6 before parsing, rather than
+    relying on the current interpreter to accept (and correctly truncate)
+    the extra digits itself.
+    """
+    if value is None:
+        return None
+    normalized = value
+    if normalized[-1:] in ("Z", "z"):
+        # Only the trailing UTC marker, not a blanket .replace("Z", ...) -
+        # a naive str.replace would also touch a "Z"/"z" anywhere else in
+        # the string, which happens to never occur in a valid ISO
+        # datetime today but is needless coupling to that happening to
+        # stay true.
+        normalized = normalized[:-1] + "+00:00"
+    normalized = _OVERLONG_FRACTIONAL_SECONDS.sub(r"\1", normalized)
+    try:
+        parsed: datetime = _date_parser.isoparse(normalized)
+    except ValueError:
+        return value
+    return parsed
+
+
+def reject_reversed_window(start_value: str, end_value: str) -> None:
+    """Raise ValueError when `end_value` is not after `start_value` - an
+    event window's basic ordering sanity, checked before forwarding it to
+    the provider API as-is (both on create, and on update's effective
+    window regardless of ignore_conflicts - this isn't a conflict-check
+    decision a caller can opt out of).
+
+    Deliberately permissive when either side doesn't parse to a real,
+    comparable instant (stays silent rather than rejecting) - matching
+    this module's other datetime comparisons, which treat "can't tell"
+    as "don't block", not "assume invalid". That includes the case where
+    both sides parse but one is offset-aware and the other naive (e.g. a
+    ``Z``-suffixed value alongside a naive one): Python raises
+    ``TypeError`` comparing those with ``<=`` even though both are real
+    ``datetime`` instances, so the ``isinstance`` check alone isn't
+    enough to guarantee a safe comparison - see ``window_delta_segments``,
+    which guards the identical hazard the same way.
+    """
+    start_key = datetime_key_for_comparison(start_value)
+    end_key = datetime_key_for_comparison(end_value)
+    if not (isinstance(start_key, datetime) and isinstance(end_key, datetime)):
+        return
+    try:
+        if end_key <= start_key:
+            raise ValueError(
+                f"end ({end_value!r}) must be after start ({start_value!r})."
+            )
+    except TypeError:
+        return
+
+
+def require_offset_datetime(value: str, field_name: str) -> None:
+    """Raise ValueError when `value` parses to a real instant but doesn't
+    carry a UTC offset or "Z" suffix.
+
+    A caller-supplied boundary that's naive isn't just non-compliant with
+    the documented RFC3339 contract: this module's own internal instants
+    (e.g. an existing event's boundary via `_event_boundary`) are always
+    offset-bearing, so a naive value compared against one raises
+    `TypeError` deep inside a downstream comparison (see
+    `window_delta_segments`'s aware-vs-naive guard) - which conservatively
+    falls back to using the naive value as-is, so it eventually reaches
+    the provider API's timeMin/timeMax and fails there with an opaque
+    error instead of this clear, actionable one.
+
+    Silent (no-op) when `value` doesn't parse to a real instant at all -
+    that's a different failure a caller will already hit downstream with
+    its own clear error, not this function's job to preempt.
+    """
+    try:
+        parsed: datetime = _date_parser.isoparse(value)
+    except ValueError:
+        return
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"{field_name} ({value!r}) must include a UTC offset or 'Z' "
+            "suffix (RFC3339), e.g. '2026-08-27T10:00:00+00:00' or "
+            "'2026-08-27T10:00:00Z'."
+        )
+
+
+# Global (territory="001") mappings from Unicode CLDR windowsZones.xml,
+# using modern equivalent IANA aliases where appropriate, plus legacy Windows
+# IDs already accepted by this connector.
+_WINDOWS_TO_IANA: dict[str, str] = {
+    "UTC": "UTC",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Central European Standard Time": "Europe/Warsaw",
+    "Romance Standard Time": "Europe/Paris",
+    "E. Europe Standard Time": "Europe/Chisinau",
+    "GTB Standard Time": "Europe/Bucharest",
+    # Split this Windows ID only to avoid codespell treating its three-letter
+    # abbreviation as a misspelling; joining the parts restores the real key.
+    "".join(("F", "LE Standard Time")): "Europe/Kyiv",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Russian Standard Time": "Europe/Moscow",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "Arabic Standard Time": "Asia/Baghdad",
+    "Syria Standard Time": "Asia/Damascus",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Jordan Standard Time": "Asia/Amman",
+    "Middle East Standard Time": "Asia/Beirut",
+    "Egypt Standard Time": "Africa/Cairo",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Mauritius Standard Time": "Indian/Mauritius",
+    "Iran Standard Time": "Asia/Tehran",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Afghanistan Standard Time": "Asia/Kabul",
+    "Pakistan Standard Time": "Asia/Karachi",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "India Standard Time": "Asia/Kolkata",
+    "Sri Lanka Standard Time": "Asia/Colombo",
+    "Nepal Standard Time": "Asia/Kathmandu",
+    "Central Asia Standard Time": "Asia/Bishkek",
+    "Bangladesh Standard Time": "Asia/Dhaka",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "Myanmar Standard Time": "Asia/Yangon",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Novosibirsk Standard Time": "Asia/Novosibirsk",
+    "China Standard Time": "Asia/Shanghai",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
+    "Singapore Standard Time": "Asia/Singapore",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "North Asia East Standard Time": "Asia/Irkutsk",
+    "W. Australia Standard Time": "Australia/Perth",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "Korea Standard Time": "Asia/Seoul",
+    "Cen. Australia Standard Time": "Australia/Adelaide",
+    "AUS Central Standard Time": "Australia/Darwin",
+    "E. Australia Standard Time": "Australia/Brisbane",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "West Pacific Standard Time": "Pacific/Port_Moresby",
+    "Tasmania Standard Time": "Australia/Hobart",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
+    "Central Pacific Standard Time": "Pacific/Guadalcanal",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "New Zealand Standard Time": "Pacific/Auckland",
+    "Fiji Standard Time": "Pacific/Fiji",
+    "Magadan Standard Time": "Asia/Magadan",
+    "Tonga Standard Time": "Pacific/Tongatapu",
+    "Samoa Standard Time": "Pacific/Apia",
+    "Line Islands Standard Time": "Pacific/Kiritimati",
+    "Dateline Standard Time": "Etc/GMT+12",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Alaskan Standard Time": "America/Anchorage",
+    "Pacific Standard Time (Mexico)": "America/Santa_Isabel",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Mountain Standard Time (Mexico)": "America/Mazatlan",
+    "Mountain Standard Time": "America/Denver",
+    "Central America Standard Time": "America/Guatemala",
+    "Central Standard Time": "America/Chicago",
+    "Central Standard Time (Mexico)": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    "SA Pacific Standard Time": "America/Bogota",
+    "Eastern Standard Time": "America/New_York",
+    "US Eastern Standard Time": "America/Indiana/Indianapolis",
+    "Venezuela Standard Time": "America/Caracas",
+    "Paraguay Standard Time": "America/Asuncion",
+    "Atlantic Standard Time": "America/Halifax",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "SA Western Standard Time": "America/La_Paz",
+    "Pacific SA Standard Time": "America/Santiago",
+    "Newfoundland Standard Time": "America/St_Johns",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "Argentina Standard Time": "America/Argentina/Buenos_Aires",
+    "SA Eastern Standard Time": "America/Cayenne",
+    "Greenland Standard Time": "America/Godthab",
+    "Montevideo Standard Time": "America/Montevideo",
+    "Bahia Standard Time": "America/Bahia",
+    "Azores Standard Time": "Atlantic/Azores",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "Namibia Standard Time": "Africa/Windhoek",
+    "W. Central Africa Standard Time": "Africa/Lagos",
+    "Aleutian Standard Time": "America/Adak",
+    "Altai Standard Time": "Asia/Barnaul",
+    "Astrakhan Standard Time": "Europe/Astrakhan",
+    "Aus Central W. Standard Time": "Australia/Eucla",
+    "Belarus Standard Time": "Europe/Minsk",
+    "Bougainville Standard Time": "Pacific/Bougainville",
+    "Chatham Islands Standard Time": "Pacific/Chatham",
+    "Cuba Standard Time": "America/Havana",
+    "Easter Island Standard Time": "Pacific/Easter",
+    "Eastern Standard Time (Mexico)": "America/Cancun",
+    "Haiti Standard Time": "America/Port-au-Prince",
+    "Libya Standard Time": "Africa/Tripoli",
+    "Lord Howe Standard Time": "Australia/Lord_Howe",
+    "Magallanes Standard Time": "America/Punta_Arenas",
+    "Marquesas Standard Time": "Pacific/Marquesas",
+    "N. Central Asia Standard Time": "Asia/Novosibirsk",
+    "Norfolk Standard Time": "Pacific/Norfolk",
+    "North Korea Standard Time": "Asia/Pyongyang",
+    "Omsk Standard Time": "Asia/Omsk",
+    "Qyzylorda Standard Time": "Asia/Qyzylorda",
+    "Russia Time Zone 10": "Asia/Srednekolymsk",
+    "Russia Time Zone 11": "Asia/Kamchatka",
+    "Russia Time Zone 3": "Europe/Samara",
+    "Saint Pierre Standard Time": "America/Miquelon",
+    "Sakhalin Standard Time": "Asia/Sakhalin",
+    "Sao Tome Standard Time": "Africa/Sao_Tome",
+    "Saratov Standard Time": "Europe/Saratov",
+    "South Sudan Standard Time": "Africa/Juba",
+    "Sudan Standard Time": "Africa/Khartoum",
+    "Tocantins Standard Time": "America/Araguaina",
+    "Tomsk Standard Time": "Asia/Tomsk",
+    "Transbaikal Standard Time": "Asia/Chita",
+    "Turks And Caicos Standard Time": "America/Grand_Turk",
+    "UTC+12": "Etc/GMT-12",
+    "UTC+13": "Etc/GMT-13",
+    "UTC-02": "Etc/GMT+2",
+    "UTC-08": "Etc/GMT+8",
+    "UTC-09": "Etc/GMT+9",
+    "UTC-11": "Etc/GMT+11",
+    "Volgograd Standard Time": "Europe/Volgograd",
+    "W. Mongolia Standard Time": "Asia/Hovd",
+    "West Bank Standard Time": "Asia/Hebron",
+    "Yukon Standard Time": "America/Whitehorse",
+}
+
+
+def resolve_zone_name(name: str) -> str:
+    """Map a Graph timeZone value to a name zoneinfo can load.
+
+    Returns the input unchanged when it isn't a recognized legacy Windows
+    zone name - it's then assumed to already be IANA-shaped, which
+    zoneinfo can load directly.
+    """
+    return _WINDOWS_TO_IANA.get(name, name)
+
+
+def resolve_zoneinfo(name: str, *, allow_windows_names: bool = False) -> ZoneInfo:
+    """Resolve an IANA time zone, optionally accepting Windows names, to a real
+    ``ZoneInfo``, for use anywhere a working zone is required (not just a
+    best-effort comparison) - e.g. attaching a real UTC offset to a naive
+    datetime string.
+
+    Raises ``ValueError`` rather than silently defaulting to UTC when the
+    name can't be resolved: a wrong silent guess here is exactly the class
+    of bug (a query or write running in the wrong real-world window) this
+    helper exists to prevent.
+    """
+    try:
+        resolved_name = resolve_zone_name(name) if allow_windows_names else name
+        return ZoneInfo(resolved_name)
+    except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Timezone {name!r} isn't a recognized IANA zone name"
+            + (" or Windows zone name." if allow_windows_names else ".")
+        ) from exc
+
+
+def offset_datetime_string(
+    value: str, tz_name: str, *, allow_windows_names: bool = False
+) -> str:
+    """Combine a naive datetime string (no embedded UTC offset - Outlook's
+    dateTimeTimeZone.dateTime is always this shape, paired with a separate
+    timeZone field) with its zone name into an offset-bearing ISO 8601
+    string.
+
+    Needed anywhere a naive value has to be sent to an API that (unlike
+    Outlook's own structured ``{"dateTime", "timeZone"}`` request bodies)
+    takes a single datetime string and infers UTC when it carries no
+    offset of its own. Graph's own docs for List calendarView's
+    startDateTime/endDateTime query parameters say exactly this: they're
+    "interpreted using the timezone offset specified in the value" and
+    "aren't impacted by the value of the Prefer ... header" - a naive
+    value there is silently read as UTC regardless of what timezone the
+    caller actually meant.
+
+    Raises ``ValueError`` (via ``resolve_zoneinfo``) rather than falling
+    back to UTC when ``tz_name`` can't be resolved - and also raises if
+    ``value`` turns out to already carry its own offset/``Z``, rather
+    than silently relabeling those same clock digits with `tz_name`'s
+    offset instead of converting them (``.replace(tzinfo=...)`` changes
+    what zone a datetime is interpreted in without changing the instant
+    it names, e.g. turning "10:00 UTC" into "10:00 <tz_name>" - a real
+    shift, not a no-op, whenever the two offsets differ). No public tool
+    parameter is documented as requiring a naive value, so a caller
+    passing one with an offset already attached is a real, reachable
+    input here, not just a theoretical one.
+    """
+    parsed: datetime = _date_parser.isoparse(value)
+    if parsed.tzinfo is not None:
+        raise ValueError(
+            f"{value!r} already carries a UTC offset; pass a naive "
+            "datetime string (no trailing 'Z' or +HH:MM) together with "
+            "its timezone name instead of embedding an offset in both."
+        )
+    zone = resolve_zoneinfo(tz_name, allow_windows_names=allow_windows_names)
+    localized = parsed.replace(tzinfo=zone)
+    if not _date_tz.datetime_exists(localized):
+        raise ValueError(
+            f"{value!r} does not exist in timezone {tz_name!r} because of a "
+            "daylight-saving transition"
+        )
+    return localized.isoformat()
+
+
+def calendar_day_bounds(
+    date_value: str, tz_name: str, *, days: int = 1
+) -> tuple[str, str]:
+    """Return (start, end) offset-bearing ISO instants spanning ``days``
+    full calendar day(s) starting at ``date_value``'s date, in ``tz_name``.
+
+    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string
+    (only its date component is used). Used to widen an all-day event's
+    (or an all-day toggle's) boundary into a real queryable window: an
+    all-day event occupies the *calendar's own* day, not a UTC day, so a
+    hardcoded "T00:00:00Z" is only correct for a UTC calendar.
+    """
+    if days <= 0:
+        raise ValueError("days must be a positive integer")
+    zone = resolve_zoneinfo(tz_name)
+    day: date = _date_parser.isoparse(date_value).date()
+    start = datetime.combine(day, time.min, tzinfo=zone)
+    # Advance the local calendar date before attaching the timezone again.
+    # Adding a timedelta to an aware datetime preserves the original
+    # offset across DST transitions, which can produce the wrong local
+    # midnight for the end boundary.
+    end_day = day + timedelta(days=days)
+    end = datetime.combine(end_day, time.min, tzinfo=zone)
+    return start.isoformat(), end.isoformat()
+
+
+def window_delta_segments(
+    existing_start: datetime | str | None,
+    existing_end: datetime | str | None,
+    new_start: datetime | str | None,
+    new_end: datetime | str | None,
+) -> list[tuple[datetime, datetime]]:
+    """The portion(s) of the half-open [new_start, new_end) window that
+    fall OUTSIDE [existing_start, existing_end) - the only territory an
+    attendee already on the event needs a fresh free/busy check against.
+
+    An attendee already on the event will always show this very event's
+    own busy block for any instant inside the OLD window - querying that
+    overlap can't distinguish "busy because of this event" from a real
+    conflict, the exact self-conflict bug this function exists to avoid.
+    But a window can move in a way that's neither identical/subset (no
+    new territory at all) nor fully disjoint (the whole new window is new
+    territory) - a partial nudge like 10:00-10:30 -> 10:15-10:45 makes
+    10:30-10:45 new territory while 10:15-10:30 is still old ground, and
+    checking the retained attendee only over the confirmed-safe old
+    portion (or not at all) would silently miss a genuine conflict
+    sitting in that new segment. This computes exactly that new territory
+    so the caller can check retained attendees against precisely it,
+    while newly-added attendees (who have no footprint on this event at
+    all) still get the FULL new window checked regardless of any of this
+    - they need every instant in it verified, delta or not.
+
+    ISO strings are normalized internally before comparison, so callers do
+    not have to coordinate a separate parsing step.
+
+    Returns:
+    - ``[]`` when the new window is confirmed to add no territory beyond
+      the old one (identical or a subset) - nothing new for a retained
+      attendee to be checked against.
+    - Up to two disjoint segments when the new window extends past the
+      old one's start, end, or both (e.g. extending a meeting on both
+      sides in one call).
+    - The whole ``[new_start, new_end)`` as a single segment when the two
+      windows are confirmed to not overlap at all (matching "moved
+      somewhere completely disjoint -> check the whole thing"), OR when
+      any value isn't a real, mutually-comparable instant (parsing
+      failure, or one side aware and the other naive) - "can't confirm
+      the delta is smaller than the whole window" must never silently
+      shrink what gets checked, so treat it as needing the full window.
+    - ``[]`` in the same can't-tell scenario if there's no valid new
+      window at all to fall back to (``new_start``/``new_end`` themselves
+      aren't real instants) - there is nothing meaningful to check.
+    """
+    existing_start = (
+        datetime_key_for_comparison(existing_start)
+        if isinstance(existing_start, str)
+        else existing_start
+    )
+    existing_end = (
+        datetime_key_for_comparison(existing_end)
+        if isinstance(existing_end, str)
+        else existing_end
+    )
+    new_start = (
+        datetime_key_for_comparison(new_start)
+        if isinstance(new_start, str)
+        else new_start
+    )
+    new_end = (
+        datetime_key_for_comparison(new_end) if isinstance(new_end, str) else new_end
+    )
+    if not (isinstance(new_start, datetime) and isinstance(new_end, datetime)):
+        return []
+    if not (
+        isinstance(existing_start, datetime) and isinstance(existing_end, datetime)
+    ):
+        return [(new_start, new_end)]
+    try:
+        fully_disjoint = new_end <= existing_start or new_start >= existing_end
+        if fully_disjoint:
+            return [(new_start, new_end)]
+        segments = []
+        if new_start < existing_start:
+            segments.append((new_start, existing_start))
+        if new_end > existing_end:
+            segments.append((existing_end, new_end))
+        return segments
+    except TypeError:
+        # Real datetimes that still can't be compared (aware vs. naive) -
+        # same "can't confirm smaller than the whole window" fallback.
+        return [(new_start, new_end)]
+
+
+def is_bare_date(value: str) -> bool:
+    """Whether a caller-supplied date/time string is a bare "date" (e.g.
+    Google's all-day form, "2026-08-26") rather than a "dateTime".
+
+    Checked as an exact, calendar-valid YYYY-MM-DD value (after stripping
+    outer whitespace) rather than only by the absence of a
+    "T"/"t" date/time separator: RFC3339 also permits a space in place of
+    "T" for readability, so "2026-08-26 07:00:00" contains no "t" either
+    and would otherwise be misclassified as a bare date.
+
+    The explicit ASCII shape check rejects abbreviated dates and Unicode
+    digit lookalikes; ``date.fromisoformat`` then rejects impossible dates.
+    """
+    normalized = value.strip()
+    if not _BARE_DATE_RE.fullmatch(normalized):
+        return False
+    try:
+        date.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_rrule_constraints(
+    parts: dict[str, str], *, dtstart_is_date: bool
+) -> None:
+    """Enforce RFC 5545 constraints that dateutil accepts leniently."""
+    freq = parts["FREQ"]
+    if dtstart_is_date and any(
+        key in parts for key in ("BYSECOND", "BYMINUTE", "BYHOUR")
+    ):
+        raise ValueError(
+            "invalid recurrence rule: BYSECOND, BYMINUTE, and BYHOUR must "
+            "not be used with an all-day DATE start"
+        )
+
+    byday = parts.get("BYDAY")
+    has_numeric_byday = bool(
+        byday
+        and any(
+            _NUMERIC_BYDAY_RE.fullmatch(value.strip()) for value in byday.split(",")
+        )
+    )
+    if has_numeric_byday and freq not in {"MONTHLY", "YEARLY"}:
+        raise ValueError(
+            "invalid recurrence rule: numeric BYDAY values are only valid "
+            "with MONTHLY or YEARLY frequency"
+        )
+    if has_numeric_byday and freq == "YEARLY" and "BYWEEKNO" in parts:
+        raise ValueError(
+            "invalid recurrence rule: numeric BYDAY must not be combined "
+            "with BYWEEKNO in a YEARLY rule"
+        )
+    if freq == "WEEKLY" and "BYMONTHDAY" in parts:
+        raise ValueError(
+            "invalid recurrence rule: BYMONTHDAY must not be used with WEEKLY frequency"
+        )
+    if freq in {"DAILY", "WEEKLY", "MONTHLY"} and "BYYEARDAY" in parts:
+        raise ValueError(
+            "invalid recurrence rule: BYYEARDAY is only valid with YEARLY frequency"
+        )
+    if freq != "YEARLY" and "BYWEEKNO" in parts:
+        raise ValueError(
+            "invalid recurrence rule: BYWEEKNO is only valid with YEARLY frequency"
+        )
+    if "BYSETPOS" in parts and not any(
+        key.startswith("BY") and key != "BYSETPOS" for key in parts
+    ):
+        raise ValueError(
+            "invalid recurrence rule: BYSETPOS requires another BY rule part"
+        )
+
+
+def _strip_rrule_prefix(rrule_text: str) -> str:
+    """Return `rrule_text` with any leading "RRULE:" (case-insensitive)
+    removed and outer whitespace trimmed - the one place this stripping
+    happens, so `ensure_rrule_prefix` and `parse_rrule` can't drift apart
+    on what counts as "the prefix"."""
+    body = rrule_text.strip()
+    if body.upper().startswith("RRULE:"):
+        body = body[len("RRULE:") :]
+    return body.strip()
+
+
+def ensure_rrule_prefix(rrule_text: str) -> str:
+    """Return `rrule_text` with a leading "RRULE:" (adding one if it
+    doesn't already have one), with its body canonicalized to uppercase.
+
+    RFC 5545's RRULE grammar has no case-sensitive free-text values - every
+    token (FREQ's value, BYDAY's day codes, the "T"/"Z" markers in UNTIL,
+    ...) is a fixed-case keyword - so uppercasing the whole body is always
+    safe, and it matters here specifically: `parse_rrule`'s validation
+    tolerates lowercase (dateutil is lenient), but a lowercase rule would
+    otherwise reach Google's API as literal text at whatever case the
+    caller happened to use.
+    """
+    if "\n" in rrule_text or "\r" in rrule_text:
+        raise ValueError("recurrence rule must not contain embedded newlines")
+    return f"RRULE:{_strip_rrule_prefix(rrule_text).upper()}"
+
+
+def parse_rrule(
+    rrule_text: str,
+    dtstart: str | datetime,
+    timezone: str | None = None,
+) -> dict[str, str]:
+    """Validate an RFC 5545 RRULE string and return its components (FREQ,
+    INTERVAL, BYDAY, UNTIL, COUNT, ...) as a plain dict of upper-cased keys
+    to upper-cased string values.
+
+    ``dtstart`` anchors a validation pass through ``dateutil.rrule.rrulestr``
+    so a rule that's syntactically plausible but semantically broken (e.g.
+    a nonsense FREQ) is rejected here rather than being sent to
+    Google/Outlook and either erroring opaquely or - worse - only ever
+    landing as inert description text, which is exactly the failure mode
+    reported against this connector before recurrence support existed.
+    ``dtstart`` also anchors a separate, explicit check this function adds
+    on top of dateutil's: an UNTIL before dtstart parses fine under
+    rrulestr (it just silently produces zero occurrences), so that case is
+    checked here directly rather than trusted to the library. Pass an
+    RFC3339/ISO8601 string (matching what these calendar tools already
+    require for start_time/start_datetime), or a `datetime` directly when
+    the caller already has one on hand (e.g. after localizing a naive
+    Outlook start time) - skipping the format-then-reparse round trip that
+    passing `.isoformat()` back in would otherwise cost.
+
+    ``timezone``, if given, localizes a naive DATE-TIME ``dtstart``. A
+    genuine all-day event uses a DATE value instead and remains timezone
+    independent. RFC 5545 requires UNTIL to have the same value type as
+    DTSTART: a DATE for an all-day start, a floating DATE-TIME for a
+    floating start, or a UTC DATE-TIME for an aware/timezone-qualified
+    start. These relationships are checked explicitly rather than left to
+    dateutil, which accepts several mismatched combinations. The
+    UNTIL-not-before-dtstart check then compares values with matching types
+    and awareness.
+
+    The returned dict (rather than the parsed rrule object) is what
+    callers actually build a provider payload from: Google takes the RRULE
+    text close to verbatim, while Outlook needs these components
+    translated into Graph's own pattern/range structure - neither needs
+    dateutil's internal representation, just confirmation that the text is
+    valid RFC 5545.
+    """
+    if isinstance(dtstart, str):
+        dtstart = dtstart.strip()
+    if "\n" in rrule_text or "\r" in rrule_text:
+        raise ValueError(
+            "recurrence rule must not contain embedded newlines (this could "
+            "smuggle an extra RRULE/EXDATE/RDATE line into the calendar API "
+            "request)"
+        )
+    body = _strip_rrule_prefix(rrule_text)
+    if not body:
+        raise ValueError("recurrence rule must not be empty")
+
+    parts: dict[str, str] = {}
+    for chunk in body.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(f"invalid recurrence rule component: {chunk!r}")
+        key, _, value = chunk.partition("=")
+        key = key.strip().upper()
+        if key in parts:
+            # A duplicate key (e.g. "FREQ=DAILY;FREQ=WEEKLY") would
+            # otherwise just silently overwrite the first occurrence in
+            # `parts` for local validation, while the raw text - still
+            # containing BOTH occurrences - reaches Google's API close to
+            # verbatim, where its behavior is unspecified rather than
+            # matching whatever this function validated.
+            raise ValueError(
+                f"invalid recurrence rule: {key} is specified more than once"
+            )
+        # Uppercased for the same reason ensure_rrule_prefix uppercases the
+        # whole rule text: RFC 5545's RRULE grammar has no case-sensitive
+        # free-text values, and this dict is what a future Outlook
+        # translator (parse_rrule's only other planned caller) would key
+        # lookups against - a caller who wrote "freq=daily" shouldn't get
+        # a dict with "daily" where every other caller gets "DAILY".
+        parts[key] = value.strip().upper()
+    if "FREQ" not in parts:
+        raise ValueError(
+            "recurrence rule must include FREQ, e.g. "
+            "'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z'"
+        )
+    if "UNTIL" in parts and "COUNT" in parts:
+        raise ValueError(
+            "recurrence rule must not specify both UNTIL and COUNT - RFC "
+            "5545 treats these as mutually exclusive ways to end a series"
+        )
+    dtstart_is_bare_date = isinstance(dtstart, str) and is_bare_date(dtstart)
+    _validate_rrule_constraints(parts, dtstart_is_date=dtstart_is_bare_date)
+    # RFC 5545 defines INTERVAL/COUNT as `1*DIGIT` - plain unsigned digits,
+    # nothing else. Python's int() is more permissive (a leading "+"/"-",
+    # PEP 515 "_" digit separators), and `parts` holds the ORIGINAL string,
+    # which reaches Google's API close to verbatim (only re-cased, not
+    # reconstructed from the parsed int) - so validating only the parsed
+    # value and not the string's own shape would let something like
+    # "INTERVAL=1_0" or "COUNT=+5" slip through to the live API as invalid
+    # RRULE text.
+    for key in ("INTERVAL", "COUNT"):
+        if key not in parts:
+            continue
+        if not _DIGITS_ONLY_RE.fullmatch(parts[key]):
+            raise ValueError(
+                f"invalid recurrence rule: {key} must be an integer, got {parts[key]!r}"
+            )
+        if int(parts[key]) < 1:
+            raise ValueError(
+                f"invalid recurrence rule: {key} must be a positive integer, "
+                f"got {int(parts[key])}"
+            )
+
+    # Parsed before the anchor is localized below, since whether to
+    # localize at all now depends on UNTIL's own value type.
+    until_dt = None
+    if "UNTIL" in parts:
+        # Checked against RFC 5545's actual (basic-form) UNTIL grammar
+        # before handing it to dateutil at all: isoparse below is lenient
+        # enough to accept ISO8601's extended form too (dashes, colons,
+        # e.g. "2026-09-11T23:59:59+08:00"), which RFC 5545 never allows
+        # for UNTIL - and dateutil.rrule.rrulestr's own line parser chokes
+        # on exactly that shape with a raw, uninformative "too many values
+        # to unpack" once this rule reaches the validation pass further
+        # down, instead of the clear error this function exists to give.
+        if not _UNTIL_RE.fullmatch(parts["UNTIL"]):
+            raise ValueError(
+                f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r} "
+                "- must be RFC 5545's basic form with no '-'/':' separators, "
+                "e.g. '20260911T235959Z' or '20260911'"
+            )
+        try:
+            until_dt = _date_parser.isoparse(parts["UNTIL"])
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid UNTIL value in recurrence rule: {parts['UNTIL']!r}"
+            ) from exc
+
+    if isinstance(dtstart, datetime):
+        anchor = dtstart
+    else:
+        try:
+            anchor = _date_parser.isoparse(dtstart)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid start time for recurrence rule: {dtstart}"
+            ) from exc
+    resolved_timezone = resolve_zoneinfo(timezone) if timezone is not None else None
+    if until_dt is not None:
+        until_is_date = "T" not in parts["UNTIL"]
+        if dtstart_is_bare_date != until_is_date:
+            raise ValueError(
+                "invalid recurrence rule: UNTIL must use the same DATE or "
+                "DATE-TIME value type as the event start"
+            )
+        if not dtstart_is_bare_date:
+            until_is_utc = parts["UNTIL"].endswith("Z")
+            dtstart_has_timezone = (
+                anchor.tzinfo is not None or resolved_timezone is not None
+            )
+            if dtstart_has_timezone != until_is_utc:
+                expected = (
+                    "UTC with a trailing Z"
+                    if dtstart_has_timezone
+                    else "floating local time"
+                )
+                raise ValueError(
+                    f"invalid recurrence rule: UNTIL must be {expected} to match "
+                    "the event start"
+                )
+    if (
+        anchor.tzinfo is None
+        and resolved_timezone is not None
+        and not dtstart_is_bare_date
+    ):
+        anchor = anchor.replace(tzinfo=resolved_timezone)
+    try:
+        _rrulestr(f"RRULE:{body}", dtstart=anchor)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid recurrence rule {rrule_text!r}: {exc}") from exc
+
+    # dateutil's rrulestr above does NOT catch this: an UNTIL before dtstart
+    # parses fine and just silently yields zero occurrences - a "recurring"
+    # event that never actually recurs, reported as success. Comparable
+    # whenever anchor and until_dt share the same awareness (both aware, or
+    # both naive/floating - a plain datetime comparison works fine either
+    # way); an aware-vs-naive mismatch would raise TypeError rather than
+    # answer the question, so THAT combination is skipped rather than
+    # guessed at (dateutil's rrulestr call above already rejects it before
+    # this point is ever reached, in fact).
+    if until_dt is not None and (until_dt.tzinfo is None) == (anchor.tzinfo is None):
+        if until_dt < anchor:
+            raise ValueError(
+                f"recurrence UNTIL ({parts['UNTIL']}) is before the start "
+                "time; this recurrence would never actually happen"
+            )
+
+    return parts
+
+
+def clamp_limit(limit: int, *, max_limit: int) -> int:
+    """Clamp a caller-supplied pagination page size to ``[1, max_limit]``.
+
+    An LLM caller can pass 0, a negative number, or an absurdly large value
+    for a tool's ``limit`` parameter. Silently clamping (rather than
+    raising) keeps a malformed value from producing a permanently-stuck,
+    zero-progress page -- 0 or a negative limit always slices to an empty
+    page regardless of offset, so a caller mechanically following a
+    pagination contract's own has_more/next_offset would retry forever
+    with no error to signal why.
+    """
+    return max(1, min(int(limit), max_limit))
+
+
+def clamp_offset(offset: int) -> int:
+    """Clamp a caller-supplied pagination offset to ``>= 0``.
+
+    Python slicing treats a negative start index as "count from the end",
+    so an unclamped negative offset would silently return items from the
+    tail of the list instead of erroring or being treated as the first
+    page.
+    """
+    return max(0, int(offset))
+
+
+def resolve_id_from_url(value: str, pattern: re.Pattern[str], field_name: str) -> str:
+    """Return the id captured by ``pattern`` when ``value`` is a matching URL,
+    otherwise the stripped value itself.
+
+    Guards against a non-string value the same way require_clean_identifier
+    does: ``pattern.search()``/``.strip()`` would otherwise raise a raw
+    TypeError/AttributeError instead of a clean, actionable ValueError.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    match = pattern.search(value)
+    if match:
+        return match.group(1)
+    return value.strip()
+
+
+def google_api_error_status(exc: BaseException) -> int | None:
+    """Return the HTTP status carried by a googleapiclient ``HttpError``.
+
+    Returns ``None`` for any other exception, or when the status cannot be
+    read as an integer.
+    """
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        return None
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def _google_api_error_body(exc: BaseException) -> dict[str, Any]:
+    """Return the ``error`` object of a Google API error body, or ``{}``."""
+    content = getattr(exc, "content", None)
+    if not isinstance(content, bytes):
+        return {}
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except ValueError:
+        return {}
+    error = data.get("error") if isinstance(data, dict) else None
+    return error if isinstance(error, dict) else {}
+
+
+def google_api_error_reasons(exc: BaseException) -> frozenset[str]:
+    """Return the machine-readable reasons in a Google API error body.
+
+    Google reports them as ``error.errors[].reason`` (legacy) and/or as
+    ``error.details[].reason`` (ErrorInfo), sometimes both at once, while
+    ``HttpError``'s own formatting surfaces only one of those fields. Both
+    are collected so a caller can match a reason regardless of which one
+    the API used.
+    """
+    error = _google_api_error_body(exc)
+    reasons: set[str] = set()
+    for field in ("errors", "details"):
+        entries = error.get(field)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if isinstance(reason, str) and reason:
+                reasons.add(reason)
+    return frozenset(reasons)
+
+
+def google_api_error_summary(exc: BaseException, *, with_reasons: bool = False) -> str:
+    """Return "HTTP <status> <message>" for a Google API error.
+
+    Unlike ``str(exc)``, this leaves out the request URI. Falls back to
+    ``str(exc)`` for an exception that carries no HTTP status. With
+    ``with_reasons=True``, the API's machine-readable reasons are appended
+    as " (reason: <a>, <b>)" when there are any.
+    """
+    status = google_api_error_status(exc)
+    if status is None:
+        return str(exc)
+    summary = f"HTTP {status}"
+    detail = getattr(exc, "reason", "")
+    if isinstance(detail, str) and detail:
+        summary += f" {detail}"
+    if with_reasons:
+        reasons = google_api_error_reasons(exc)
+        if reasons:
+            summary += f" (reason: {', '.join(sorted(reasons))})"
+    return summary
+
+
+# 403 reasons about the request or the token (rate limits, quota, a disabled
+# API, a missing OAuth scope) rather than about access to one file. A 403
+# with one of these reasons is not a permission problem with the file.
+GOOGLE_NON_FILE_ACCESS_403_REASONS = frozenset(
+    {
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+        "dailyLimitExceeded",
+        "sharingRateLimitExceeded",
+        "quotaExceeded",
+        "RATE_LIMIT_EXCEEDED",
+        "accessNotConfigured",
+        "SERVICE_DISABLED",
+        "insufficientPermissions",
+        "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+    }
+)
+
+# 403 reasons that mean the connected account, or this app, may not open or
+# change one file. A 403 is described as a file-access problem only when it
+# has one of these reasons or no reason at all (the Docs, Sheets and Slides
+# APIs answer a file the account cannot open with a bare PERMISSION_DENIED).
+# Any other reason, such as storageQuotaExceeded, domainPolicy or a shared
+# drive limit, is about something else, so its raw error is kept.
+GOOGLE_FILE_PERMISSION_403_REASONS = frozenset(
+    {
+        "insufficientFilePermissions",
+        "appNotAuthorizedToFile",
+        "forbidden",
+    }
+)
+
+
+def setup_proxy_env() -> None:
+    """Setup proxy environment variables from system proxies if missing."""
+    # Filter out empty proxy vars to prevent httplib2 hangs
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]:
+        if var in os.environ and not os.environ[var]:
+            del os.environ[var]
+
+    system_proxies = urllib.request.getproxies()
+    if (
+        "https" in system_proxies
+        and "HTTPS_PROXY" not in os.environ
+        and "https_proxy" not in os.environ
+    ):
+        os.environ["HTTPS_PROXY"] = system_proxies["https"]
+    if (
+        "http" in system_proxies
+        and "HTTP_PROXY" not in os.environ
+        and "http_proxy" not in os.environ
+    ):
+        os.environ["HTTP_PROXY"] = system_proxies["http"]
+
+    # If ALL_PROXY is set, ensure HTTPS_PROXY is also set
+    if "ALL_PROXY" in os.environ and "HTTPS_PROXY" not in os.environ:
+        os.environ["HTTPS_PROXY"] = os.environ["ALL_PROXY"]
+
+
+def naive_day_bounds(
+    date_value: str,
+    tz_name: str | None = None,
+    *,
+    days: int = 1,
+    allow_windows_names: bool = False,
+) -> tuple[str, str]:
+    """Return (start, end) NAIVE ISO datetime strings spanning ``days``
+    full calendar day(s) starting at ``date_value``'s effective date, for
+    an API like Outlook's dateTimeTimeZone that wants a naive clock value
+    paired with a separate timeZone field rather than an embedded offset.
+
+    ``date_value`` may be a bare "YYYY-MM-DD" or a full datetime string.
+    If it carries an offset and ``tz_name`` is supplied, the represented
+    instant is converted into that zone before its calendar date is taken.
+    Naive values are already wall-clock readings in ``tz_name`` and keep
+    their own date.
+    """
+    if days <= 0:
+        raise ValueError("days must be a positive integer")
+    parsed = _date_parser.isoparse(date_value)
+    if parsed.tzinfo is not None and tz_name is not None:
+        parsed = parsed.astimezone(
+            resolve_zoneinfo(tz_name, allow_windows_names=allow_windows_names)
+        )
+    day: date = parsed.date()
+    start = datetime.combine(day, time.min)
+    end = start + timedelta(days=days)
+    return start.isoformat(), end.isoformat()
+
+
+# Ids of Google Drive-family files (Docs, Sheets, Slides) only use these
+# characters, so a value outside this class (a document title, a sentence,
+# an unrelated URL) cannot name a file.
+_GOOGLE_FILE_ID_RE = re.compile(r"[a-zA-Z0-9_-]+")
+
+_MAX_SHOWN_INPUT_LENGTH = 80
+
+# Path segments of docs.google.com links, by the product that opens them.
+_GOOGLE_EDITOR_LINK_PRODUCTS = (
+    ("/document/", "Google Docs"),
+    ("/spreadsheets/", "Google Sheets"),
+    ("/presentation/", "Google Slides"),
+)
+
+# A published-to-the-web link (".../d/e/<publish-id>/pub") carries a publish
+# token in place of the file id.
+_PUBLISHED_LINK_RE = re.compile(r"/d/e/")
+
+_LINK_PREFIX_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://|www\.|[a-z0-9-]+\.google\.com/)"
+)
+
+# Drive links a file that is not a native Google file, most often an
+# uploaded Office or PDF file, as "drive.google.com/file/d/<id>/view" (or,
+# in older links, "docs.google.com/file/d/<id>"), and downloads its content
+# from "drive.usercontent.google.com/download?id=<id>".
+_DRIVE_FILE_LINK_RE = re.compile(
+    r"(?:docs|drive)\.google\.com/file/(?:u/\d+/)?d/"
+    r"|drive\.usercontent\.google\.com/download\?(?:[^#]*&)?id="
+)
+
+# Drive's older share links (".../open?id=<id>", which Google Forms file
+# uploads use, among others) and its download links (".../uc?id=<id>") can
+# name a native Google file as well as an uploaded one. Their id is passed to
+# the API, which opens a native file. For an uploaded file the API answers
+# with a 400, but only the Sheets API's answer for an Excel file names the
+# cause: the Docs and Slides APIs answer the id of an Excel file with a bare
+# INVALID_ARGUMENT "Request contains an invalid argument." So
+# google_file_error_message adds the next steps for an uploaded file to that
+# bare 400 for an id taken from such a link. A 400 whose message names a
+# cause (a range, a request field, a failed precondition) is about the
+# request, so it keeps the raw error, as it does for a bare id.
+_DRIVE_ID_QUERY_LINK_RE = re.compile(
+    r"drive\.google\.com/(?:u/\d+/)?(?:open|uc)\?(?:[^#]*&)?id=([a-zA-Z0-9_-]+)",
+    re.IGNORECASE,
+)
+
+# Google's generic INVALID_ARGUMENT message, which names no cause.
+_NO_CAUSE_400_MESSAGE = "request contains an invalid argument"
+
+# The Sheets API answers a request for an Excel file stored in Drive (which
+# Google Sheets opens in Office compatibility mode) with a 400 "This
+# operation is not supported for this document. The document must not be an
+# Office file." The Docs and Slides tools use the same check, in case their
+# APIs answer a Word or PowerPoint file the same way. Only the message is
+# matched: a FAILED_PRECONDITION status or reason alone is not enough, since
+# the batch-update tools send requests built by the caller, which can fail a
+# precondition for other reasons.
+_OFFICE_FILE_ERROR_MESSAGE = "not supported for this document"
+
+# Connecting Google Drive does not widen what these connectors can open: a
+# file opens when the account can open it, which depends on sharing.
+_DRIVE_NOT_NEEDED_NOTE = "Connecting Google Drive would not change this access."
+
+
+@dataclass(frozen=True)
+class GoogleFileKind:
+    """How a Google Docs/Sheets/Slides connector names its files in the
+    messages returned to the caller."""
+
+    product: str
+    noun: str
+    link_example: str
+    create_tool: str
+    # The Office file that this product's editor opens but its API cannot
+    # (e.g. "an Excel file (.xlsx)"), and the tool that reads a downloaded
+    # copy of it.
+    office_file: str
+    office_reader: str
+
+
+def _office_file_next_steps(kind: GoogleFileKind, *, editing: bool = False) -> str:
+    # "Paste", not "share": these connectors open a file with the user's own
+    # Google account, so the new file needs no sharing. "Share" in a Google
+    # editor means its Share dialog, where the user might open the file up to
+    # anyone with the link.
+    save_as = (
+        f"open it in {kind.product}, choose File > Save as {kind.product}, and "
+        f"paste the new {kind.noun}'s link"
+    )
+    if editing:
+        # A downloaded copy can only be read, so it cannot complete a change.
+        # Saving as a Google file leaves the Office file as it was, which the
+        # user needs to know before the change is made in the new copy.
+        return (
+            f"To make this change with these tools, ask the user to {save_as}. "
+            f"Tell the user that this creates a new {kind.noun}: the change "
+            "will be made in that copy, and the original file will stay "
+            "unchanged"
+        )
+    # Whether the Drive connection can see the file depends on its scope,
+    # which this process does not know, so the download is only offered as
+    # something that may work.
+    return (
+        f"If google_drive_download_file and {kind.office_reader} are "
+        "available, download the file with google_drive_download_file and "
+        f"read the downloaded copy with {kind.office_reader}; this works only "
+        "if the Google Drive connection can access the file. Otherwise, ask "
+        f"the user to attach the file to their message, or to {save_as}"
+    )
+
+
+def _other_google_file_hint(kind: GoogleFileKind) -> str:
+    # The same 400 can come back for an id of another kind of Google file
+    # (for example a document id passed to the Sheets tools), so the
+    # Office-file explanation names the way out of that case too.
+    others = " or ".join(
+        product
+        for _, product in _GOOGLE_EDITOR_LINK_PRODUCTS
+        if product != kind.product
+    )
+    return (
+        f"If google_drive_search or the file's mimeType shows that it is a "
+        f"{others} file instead, open it with the matching tools"
+    )
+
+
+def _find_by_name_hint(kind: GoogleFileKind) -> str:
+    # The Drive connector may or may not be connected next to this one, so
+    # the search is offered only "if available", and connecting it is never
+    # suggested: opening a file by its link does not need it.
+    return (
+        f"If google_drive_search is available, use it to find the "
+        f"{kind.noun}'s id by name (with per-file Drive access it only finds "
+        "files created through this app or granted to it); otherwise, or if "
+        f"it finds nothing, ask the user to paste the {kind.noun}'s link "
+        f"({kind.link_example})"
+    )
+
+
+def _is_drive_id_query_link(value: str | None) -> bool:
+    # The same test resolve_google_file_id makes before it takes the id of
+    # such a link, also inside a percent-encoded redirect link.
+    return (
+        isinstance(value, str)
+        and _DRIVE_ID_QUERY_LINK_RE.search(unquote(value)) is not None
+    )
+
+
+def _is_no_cause_400(exc: BaseException) -> bool:
+    if google_api_error_status(exc) != 400:
+        return False
+    message = _google_api_error_body(exc).get("message")
+    return (
+        isinstance(message, str)
+        and message.strip().rstrip(".").lower() == _NO_CAUSE_400_MESSAGE
+    )
+
+
+def _drive_id_query_link_400_message(
+    exc: BaseException, kind: GoogleFileKind, *, editing: bool
+) -> str:
+    # Google's response comes first: even a 400 that names no cause may be
+    # about the request itself (for example a batch update built by the
+    # caller), and nothing here knows which file the link names. The next
+    # steps are those of a Drive file link (see resolve_google_file_id). A
+    # link of this form does not show which product the file belongs to, so
+    # the way out for another kind of Google file is named too.
+    return (
+        f"{kind.product} rejected this request (Google API response: "
+        f"{google_api_error_summary(exc, with_reasons=True)}). The {kind.noun} "
+        "id was taken from a Google Drive link, which can name a file "
+        "uploaded to Drive, such as an Office or PDF file, as well as a "
+        f"{kind.product} {kind.noun}. The {kind.product} tools cannot open an "
+        f"uploaded file, and the {kind.product} API can answer its id with "
+        "this HTTP 400, which does not name the cause. "
+        f"{_office_file_next_steps(kind, editing=editing)}. "
+        f"{_other_google_file_hint(kind)}. If it is a {kind.product} "
+        f"{kind.noun}, the error is about the request itself."
+    )
+
+
+def _shown_input(value: str) -> str:
+    if len(value) > _MAX_SHOWN_INPUT_LENGTH:
+        return value[: _MAX_SHOWN_INPUT_LENGTH - 3] + "..."
+    return value
+
+
+def resolve_google_file_id(
+    value: str,
+    pattern: re.Pattern[str],
+    field_name: str,
+    kind: GoogleFileKind,
+    *,
+    editing: bool = False,
+) -> str:
+    """Resolve a link or bare id like ``resolve_id_from_url``, then reject a
+    value that cannot be an id.
+
+    These connectors open files only by link or id. A caller that passes a
+    file's name instead would otherwise get a bare "not found" from the API,
+    which reads as if the file did not exist. Rejecting it here explains how
+    to get a usable link instead, without spending an API call. A
+    percent-encoded link (for example one wrapped by a redirect URL) is
+    decoded once before giving up. A Drive ".../open?id=<id>" or
+    ".../uc?id=<id>" link resolves to its id, because it can name a native
+    file too; pass the same value to ``google_file_error_message`` as
+    ``file_link_or_id``, so that the 400 that names no cause, which the API
+    can give for an uploaded file, still gets next steps. A link to another
+    kind of Google file, or to a file uploaded to Drive, is named as such.
+
+    Pass ``editing=True`` from a tool that changes the file, as for
+    ``google_file_error_message``: the next steps for a file uploaded to
+    Drive then leave out reading a downloaded copy, which cannot complete a
+    change, and say that saving as a Google file makes a new copy.
+    """
+    resolved = resolve_id_from_url(value, pattern, field_name)
+    if _GOOGLE_FILE_ID_RE.fullmatch(resolved):
+        return resolved
+    decoded = unquote(resolved)
+    if decoded != resolved:
+        match = pattern.search(decoded)
+        if match:
+            return match.group(1)
+    drive_id_link = _DRIVE_ID_QUERY_LINK_RE.search(decoded)
+    if drive_id_link:
+        return drive_id_link.group(1)
+    shown = _shown_input(resolved)
+    lowered = decoded.lower()
+    if "docs.google.com" in lowered and _PUBLISHED_LINK_RE.search(lowered):
+        raise ValueError(
+            f"{field_name} {shown!r} is a published-to-the-web link, which "
+            "does not contain the file's id. Ask the user for the "
+            f"{kind.noun}'s own link ({kind.link_example})."
+        )
+    if "docs.google.com" in lowered:
+        for segment, product in _GOOGLE_EDITOR_LINK_PRODUCTS:
+            if segment in lowered and product != kind.product:
+                raise ValueError(
+                    f"{field_name} {shown!r} is a {product} link, not a "
+                    f"{kind.product} link. Open it with the {product} tools "
+                    "if they are available. If the user meant a "
+                    f"{kind.noun}, ask them for the {kind.noun}'s link "
+                    f"({kind.link_example})."
+                )
+    if _DRIVE_FILE_LINK_RE.search(lowered):
+        raise ValueError(
+            f"{field_name} {shown!r} is a Google Drive file link, not a "
+            f"{kind.product} link. Drive usually gives this kind of link to a "
+            f"file uploaded to Drive, such as {kind.office_file}, which the "
+            f"{kind.product} tools cannot open. "
+            f"{_office_file_next_steps(kind, editing=editing)}. "
+            f"If the file is a {kind.product} {kind.noun}, ask the user for "
+            f"the {kind.noun}'s own link ({kind.link_example})."
+        )
+    if _LINK_PREFIX_RE.match(lowered):
+        raise ValueError(
+            f"{field_name} {shown!r} is not a {kind.product} link or "
+            f"{kind.noun} id. Ask the user for the {kind.noun}'s own link "
+            f"({kind.link_example}), or offer to create a new {kind.noun} "
+            f"with {kind.create_tool}."
+        )
+    raise ValueError(
+        f"{field_name} {shown!r} is not a {kind.product} link or {kind.noun} "
+        f"id. These tools open a {kind.noun} only by its link or id and "
+        f"cannot search for or list {kind.noun}s by name. "
+        f"{_find_by_name_hint(kind)}, or offer to create a new {kind.noun} "
+        f"with {kind.create_tool}. Connecting Google Drive is not needed to "
+        f"open a {kind.noun} by its link."
+    )
+
+
+def is_google_file_unavailable_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means the file is missing or this app cannot see it:
+    an HTTP 404 (missing, or invisible to a per-file drive.file grant) or a
+    403 ``appNotAuthorizedToFile`` (the app was never granted the file).
+
+    This is the part of ``is_google_file_access_error`` that is not about
+    the account's own permission on the file. The Drive read tools and the
+    Drive move lookups map only this part: their message explains what a
+    per-file Drive connection can see, which would be wrong for a file the
+    app can see but the account may not read, so that 403 keeps Drive's raw
+    error, which names the missing permission.
+    """
+    status = google_api_error_status(exc)
+    if status == 404:
+        return True
+    return status == 403 and "appNotAuthorizedToFile" in google_api_error_reasons(exc)
+
+
+def is_google_file_access_error(exc: BaseException) -> bool:
+    """Whether ``exc`` means the file does not exist or the connected
+    account cannot open or change it.
+
+    ``is_google_file_unavailable_error`` is checked first, so a 404 or a 403
+    with ``appNotAuthorizedToFile`` always counts. Any other 403 counts when
+    it has none of ``GOOGLE_NON_FILE_ACCESS_403_REASONS`` (rate limits,
+    quota, a disabled API, a missing OAuth scope) and either one of
+    ``GOOGLE_FILE_PERMISSION_403_REASONS`` or no reason at all."""
+    if is_google_file_unavailable_error(exc):
+        return True
+    if google_api_error_status(exc) != 403:
+        return False
+    reasons = google_api_error_reasons(exc)
+    if reasons & GOOGLE_NON_FILE_ACCESS_403_REASONS:
+        return False
+    return not reasons or bool(reasons & GOOGLE_FILE_PERMISSION_403_REASONS)
+
+
+def is_google_office_file_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is the HTTP 400 the Sheets API returns for an Office
+    file stored in Drive (such as an .xlsx opened from a Sheets link), which
+    it cannot open: its message says the operation "is not supported for
+    this document". The Docs and Slides tools use the same check. Any other
+    400 is not matched, including a ``FAILED_PRECONDITION`` with another
+    message."""
+    if google_api_error_status(exc) != 400:
+        return False
+    message = _google_api_error_body(exc).get("message")
+    return isinstance(message, str) and _OFFICE_FILE_ERROR_MESSAGE in message.lower()
+
+
+def google_file_error_message(
+    exc: BaseException,
+    kind: GoogleFileKind,
+    *,
+    editing: bool = False,
+    file_link_or_id: str | None = None,
+) -> str:
+    """Return ``str(exc)``, or an actionable message when ``exc`` means the
+    file is an Office file stored in Drive, does not exist, or the connected
+    Google account cannot open it.
+
+    The raw API error only says "not found", "permission denied" or "not
+    supported for this document", which leaves the caller guessing whether
+    another connection is missing. The actionable message names what the
+    user can do instead, and keeps the API's own wording at the end for
+    diagnosis.
+
+    Pass ``editing=True`` from a tool that changes the file. A 403 there
+    usually means the account can open the file but not edit it (view or
+    comment access only), so it is described as a refused change rather
+    than as a file that could not be opened. For an Office file, the next
+    steps there leave out reading a downloaded copy, which cannot complete
+    a change, and say that saving as a Google file makes a new copy.
+
+    Pass ``file_link_or_id``, the value the caller gave before
+    ``resolve_google_file_id``. When it is a Drive ".../open?id=<id>" or
+    ".../uc?id=<id>" link, which can name a file uploaded to Drive, an HTTP
+    400 whose message names no cause ("Request contains an invalid
+    argument.") keeps Google's response and gets the next steps for an
+    uploaded file, since the Docs and Slides APIs answer such an id with
+    that 400. Any other 400 keeps the raw error. A tool that has already
+    read the file passes ``None`` for its later requests instead: the file
+    is then a Google file, so their 400 is about the request.
+    """
+    if is_google_office_file_error(exc):
+        # The product's editor does open such a file, in Office compatibility
+        # mode; only its API cannot. So the message must not say that the
+        # product itself cannot open the file.
+        return (
+            f"The {kind.product} tools cannot open this file: it is most "
+            f"likely {kind.office_file} stored in Google Drive rather than a "
+            f"{kind.product} {kind.noun}. {kind.product} can open such a file "
+            "in Office compatibility mode, but the API these tools use "
+            f"cannot. {_office_file_next_steps(kind, editing=editing)}. "
+            f"{_other_google_file_hint(kind)}. Google API response: "
+            f"{google_api_error_summary(exc, with_reasons=True)}"
+        )
+    if _is_no_cause_400(exc) and _is_drive_id_query_link(file_link_or_id):
+        return _drive_id_query_link_400_message(exc, kind, editing=editing)
+    if not is_google_file_access_error(exc):
+        return str(exc)
+    summary = google_api_error_summary(exc, with_reasons=True)
+    status = google_api_error_status(exc)
+    if editing and status == 403:
+        return (
+            f"{kind.product} could not make this change: the connected Google "
+            f"account may have only view or comment access to this "
+            f"{kind.noun}, or may not be able to open it at all. Ask the user "
+            f"to check that this Google account can edit the {kind.noun} (its "
+            "owner can share it with edit access), or offer to create a new "
+            f"{kind.noun} with {kind.create_tool} instead. "
+            f"{_DRIVE_NOT_NEEDED_NOTE} Google API response: {summary}"
+        )
+    # A one-word title ("budget", "Q3-report") looks like an id, so it gets
+    # past resolve_google_file_id and only fails here, as a 404.
+    name_hint = ""
+    ask = "Ask"
+    if status == 404:
+        name_hint = (
+            f"These tools open a {kind.noun} only by its link or id and cannot "
+            f"search for or list {kind.noun}s by name. If this value is the "
+            f"{kind.noun}'s name rather than its id: "
+            f"{_find_by_name_hint(kind)}. "
+        )
+        ask = "Otherwise, ask"
+    return (
+        f"{kind.product} could not open this {kind.noun}: it does not exist, "
+        "or the connected Google account does not have the needed access to "
+        f"it. {name_hint}{ask} the user to check that the link is complete and "
+        f"that this Google account can open the {kind.noun} (it may need to be "
+        f"shared with that account), or offer to create a new {kind.noun} with "
+        f"{kind.create_tool}. {_DRIVE_NOT_NEEDED_NOTE} Google API response: "
+        f"{summary}"
+    )

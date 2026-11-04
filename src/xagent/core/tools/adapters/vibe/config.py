@@ -1,0 +1,898 @@
+"""
+Tool Configuration Management
+
+Provides abstract and concrete configuration classes for tool creation.
+This allows different contexts (web, standalone) to provide configuration
+to the ToolFactory in a unified way.
+"""
+
+import logging
+import os
+import re
+from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
+
+from ..... import config as _root_config
+
+ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON = (
+    "actor_stdio_session_runtime_unavailable"
+)
+ACTOR_STDIO_SHADOWED_REASON = "actor_stdio_shadowed_by_visible_connection"
+# A delegated sub-agent run cannot pause for approval (a paused child is
+# classified as an unsupported nested interaction), so when the delegating
+# run's task source has an approval gate registered, its children get the
+# selected MCP servers reported as unavailable instead of live and ungated.
+NESTED_DELEGATION_NOT_APPROVABLE_REASON = "nested_delegation_not_approvable"
+
+
+class MCPFailurePolicy(str, Enum):
+    """Caller-owned behavior when a selected MCP server is unavailable."""
+
+    BEST_EFFORT = "best_effort"
+    STRICT = "strict"
+
+
+class ToolFactoryRuntimeSessionBoundaryError(RuntimeError):
+    """Tool construction cannot safely detach its database resources."""
+
+    def __init__(
+        self, message: str = "Tool runtime cleanup could not be completed."
+    ) -> None:
+        super().__init__(message)
+
+
+_CleanupResultT = TypeVar("_CleanupResultT")
+
+
+async def run_with_tool_runtime_cleanup(
+    body: Callable[[], Awaitable[_CleanupResultT]],
+    cleanup: Callable[[], None],
+    *,
+    logger: logging.Logger,
+    cleanup_error_message: str = (
+        "Tool runtime cleanup failed after the primary operation failed"
+    ),
+) -> _CleanupResultT:
+    """Run cleanup without allowing it to replace an active primary failure."""
+    primary_error: BaseException | None = None
+    try:
+        return await body()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            cleanup()
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                logger.error(cleanup_error_message, exc_info=True)
+            elif isinstance(cleanup_error, Exception):
+                raise ToolFactoryRuntimeSessionBoundaryError() from cleanup_error
+            else:
+                raise
+
+
+_PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
+    {
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+        ACTOR_STDIO_SHADOWED_REASON,
+        NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+        "adapter_construction",
+        "auth_rejected",
+        "authorization_required",
+        "catalog_app_not_found",
+        "config_load_failed",
+        "initialize",
+        "insufficient_scope",
+        "invalid_config",
+        "invalid_configuration",
+        "invalid_launch_config",
+        "list_tools",
+        "loader_failed",
+        "no_tools_returned",
+        "oauth_token_refresh_failed",
+        "oauth_token_required",
+        "oauth_token_resolver_failed",
+        "runtime_connection_failed",
+        "sandbox_list_tools",
+        "sandbox_tool_wrap",
+        "session_start",
+        "token_refresh_failed",
+    }
+)
+_DEFAULT_MCP_UNAVAILABLE_REASON = "mcp_server_unavailable"
+_PUBLIC_CAUSE_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+def is_http_status_code(value: object) -> TypeGuard[int]:
+    """Whether ``value`` is an HTTP status a status line can carry.
+
+    Only an exact ``int`` in 100..599 counts: ``bool`` and other ``int``
+    subclasses do not.
+    """
+    return type(value) is int and 100 <= value <= 599
+
+
+_DEFAULT_MCP_SERVER_NAME = "MCP server"
+
+
+@dataclass(frozen=True)
+class MCPUnavailableSummary:
+    """Public-safe identity and classification for one unavailable server.
+
+    ``cause_type`` and ``status_code`` describe the exception behind a load
+    failure: a class name (exact ``str`` matching ``_PUBLIC_CAUSE_TYPE_RE``)
+    and an HTTP status (exact ``int`` in 100..599). Either is ``None`` when
+    unknown or when the value does not pass that check.
+    """
+
+    server_name: str
+    reason: str
+    cause_type: str | None = None
+    status_code: int | None = None
+
+    @classmethod
+    def from_values(
+        cls,
+        server_name: object,
+        reason: object,
+        *,
+        cause_type: object = None,
+        status_code: object = None,
+    ) -> "MCPUnavailableSummary":
+        safe_server_name = (
+            server_name if type(server_name) is str else _DEFAULT_MCP_SERVER_NAME
+        )
+        safe_reason = (
+            reason
+            if type(reason) is str and reason in _PUBLIC_MCP_UNAVAILABLE_REASONS
+            else _DEFAULT_MCP_UNAVAILABLE_REASON
+        )
+        safe_cause_type = (
+            cause_type
+            if type(cause_type) is str and _PUBLIC_CAUSE_TYPE_RE.fullmatch(cause_type)
+            else None
+        )
+        safe_status_code = status_code if is_http_status_code(status_code) else None
+        return cls(
+            server_name=safe_server_name,
+            reason=safe_reason,
+            cause_type=safe_cause_type,
+            status_code=safe_status_code,
+        )
+
+
+@dataclass(frozen=True)
+class MCPToolLoadSummary:
+    """Immutable, public-safe outcome of one selected MCP setup attempt."""
+
+    requested_servers: tuple[str, ...] = ()
+    loaded_servers: tuple[str, ...] = ()
+    failures: tuple[MCPUnavailableSummary, ...] = ()
+    successful_tool_count: int = 0
+
+
+def _normalize_mcp_unavailable_summaries(
+    summaries: Iterable[MCPUnavailableSummary],
+    *,
+    default_reason: str = _DEFAULT_MCP_UNAVAILABLE_REASON,
+) -> tuple[MCPUnavailableSummary, ...]:
+    normalized: list[MCPUnavailableSummary] = []
+    seen: set[tuple[str, str]] = set()
+    for summary in summaries:
+        if type(summary) is MCPUnavailableSummary:
+            safe_summary = MCPUnavailableSummary.from_values(
+                summary.server_name,
+                summary.reason,
+                cause_type=summary.cause_type,
+                status_code=summary.status_code,
+            )
+        else:
+            safe_summary = MCPUnavailableSummary.from_values(None, None)
+        key = (safe_summary.server_name, safe_summary.reason)
+        if key not in seen:
+            normalized.append(safe_summary)
+            seen.add(key)
+    if not normalized:
+        normalized.append(
+            MCPUnavailableSummary(
+                server_name=_DEFAULT_MCP_SERVER_NAME,
+                reason=default_reason,
+            )
+        )
+    return tuple(normalized)
+
+
+class MCPConfigLoadError(RuntimeError):
+    """A public-safe failure to scan or prefetch selected MCP configs."""
+
+    def __init__(self, server_names: Iterable[object] = ()) -> None:
+        self.summaries = _normalize_mcp_unavailable_summaries(
+            (
+                MCPUnavailableSummary.from_values(name, "config_load_failed")
+                for name in server_names
+            ),
+            default_reason="config_load_failed",
+        )
+        super().__init__("MCP server configurations could not be loaded.")
+
+
+_REQUIRED_MCP_UNAVAILABLE_PREFIX = "Required MCP servers are unavailable"
+
+
+def _required_mcp_unavailable_message(
+    summaries: tuple[MCPUnavailableSummary, ...],
+) -> str:
+    """Name each failure by its reason code and HTTP status, never by server.
+
+    The text is broadcast to every viewer of the task, so it carries only
+    allowlisted reason codes and validated integers. Server names stay in
+    ``summaries``.
+    """
+    details: list[str] = []
+    for summary in summaries:
+        detail = summary.reason
+        if summary.status_code is not None:
+            detail = f"{detail} (HTTP {summary.status_code})"
+        if detail not in details:
+            details.append(detail)
+    return f"{_REQUIRED_MCP_UNAVAILABLE_PREFIX}: {', '.join(details)}."
+
+
+class RequiredMCPUnavailableError(RuntimeError):
+    """A selected MCP dependency is unavailable under strict setup policy.
+
+    ``str(error)`` names the reason code and HTTP status of each failure and
+    no server name; the per-server records are in ``summaries``.
+    """
+
+    def __init__(self, summaries: Iterable[MCPUnavailableSummary]) -> None:
+        self.summaries = _normalize_mcp_unavailable_summaries(summaries)
+        super().__init__(_required_mcp_unavailable_message(self.summaries))
+
+
+def enforce_mcp_failure_policy(
+    policy: MCPFailurePolicy,
+    summaries: Iterable[MCPUnavailableSummary],
+) -> None:
+    """Apply the caller-owned MCP setup policy at every loading boundary."""
+    failures = tuple(summaries)
+    if policy is MCPFailurePolicy.STRICT and failures:
+        raise RequiredMCPUnavailableError(failures)
+
+
+def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
+    """Coerce a tool-allowlist hook result into a list of tool-name strings.
+
+    The positive tool-allowlist hook is documented as ``Optional[list]``, but
+    it is user-registered and consumed against a duck-typed config, so callers
+    cannot assume the contract holds. Normalizing here keeps a single, uniform
+    policy at every consumption point:
+
+    - ``None`` passes through unchanged ("no allowlist configured").
+    - A bare scalar — ``str``/``bytes`` or any non-iterable such as
+      ``int``/``float``/``bool`` — is treated as a single tool name rather than
+      being iterated character-by-character or raising on a non-iterable.
+    - Any other iterable yields one stringified name per item.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return [str(value)]
+    return [str(item) for item in value]
+
+
+class BaseToolConfig(ABC):
+    """Abstract base class for tool configuration."""
+
+    def set_task_runtime_contribution(self, contribution: Any) -> None:
+        """Attach a detached task-runtime contribution to this factory run."""
+
+    def get_task_runtime_contribution(self) -> Any:
+        """Return the detached task-runtime contribution for this factory run."""
+
+        return None
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain the workspace shared by tool creators and AgentService."""
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return the workspace shared by tool creators and AgentService."""
+
+        return None
+
+    @abstractmethod
+    def get_workspace_config(self) -> Optional[Dict[str, Any]]:
+        """Get workspace configuration."""
+        pass
+
+    @abstractmethod
+    def get_vision_model(self) -> Optional[Any]:
+        """Get vision model."""
+        pass
+
+    @abstractmethod
+    def get_image_models(self) -> Dict[str, Any]:
+        """Get image models."""
+        pass
+
+    def get_video_models(self) -> Dict[str, Any]:
+        """Get video models."""
+        return {}
+
+    @abstractmethod
+    def get_asr_models(self) -> Dict[str, Any]:
+        """Get ASR (speech-to-text) models."""
+        pass
+
+    @abstractmethod
+    def get_tts_models(self) -> Dict[str, Any]:
+        """Get TTS (text-to-speech) models."""
+        pass
+
+    def get_sound_effect_models(self) -> Dict[str, Any]:
+        """Get sound effect generation models."""
+        return {}
+
+    def get_music_models(self) -> Dict[str, Any]:
+        """Get music generation models."""
+        return {}
+
+    @abstractmethod
+    async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
+        """Get MCP server configurations."""
+        pass
+
+    def get_actor_mcp_stdio_session_identities(self) -> Dict[str, Any]:
+        """Return host-only session identities keyed by exact MCP server name."""
+
+        return {}
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the optional host-side execution-scoped stdio consumer."""
+
+        return None
+
+    def get_mcp_failure_policy(self) -> MCPFailurePolicy:
+        """Return the MCP setup failure policy for this execution."""
+        return MCPFailurePolicy.BEST_EFFORT
+
+    async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+        """Observe an MCP setup outcome without changing setup behavior."""
+        return None
+
+    def release_db_connection(self) -> None:
+        """Release any pooled DB connection held by this config's session.
+
+        Tool creators call this right before long non-DB awaits (e.g. remote
+        MCP initialize/list-tools) so a config backed by a live SQLAlchemy
+        session does not pin a pool slot in ``idle in transaction`` for the
+        whole wait (issue #889). The session must remain usable afterwards —
+        it re-acquires a connection on its next query. Default: no-op for
+        configs without a DB session.
+        """
+
+    def get_browser_locale(self) -> Optional[str]:
+        """Locale for browser automation sessions this config's tasks create.
+
+        ``None`` means "no request-derived locale available" -- the browser
+        tool then falls back to its own deployment default (see
+        ``get_browser_tool_default_locale`` in config.py) rather than a
+        single language being hardcoded for every task regardless of who
+        asked.
+        """
+        return None
+
+    @abstractmethod
+    def get_file_tools_enabled(self) -> bool:
+        """Whether to include file tools."""
+        pass
+
+    @abstractmethod
+    def get_basic_tools_enabled(self) -> bool:
+        """Whether to include basic tools."""
+        pass
+
+    @abstractmethod
+    def get_embedding_model(self) -> Optional[str]:
+        """Get embedding model ID."""
+        pass
+
+    def get_rerank_model(self) -> Optional[str]:
+        """Get rerank model ID (registered in model hub).
+
+        Default implementation returns ``None``; web/tool implementations
+        should resolve the user's default rerank model from the database.
+        """
+        return None
+
+    @abstractmethod
+    def get_browser_tools_enabled(self) -> bool:
+        """Whether to include browser automation tools."""
+        pass
+
+    @abstractmethod
+    def get_task_id(self) -> Optional[str]:
+        """Get task ID for session tracking."""
+        pass
+
+    @abstractmethod
+    def get_allowed_collections(self) -> Optional[List[str]]:
+        """Get allowed knowledge base collections. None means all collections are allowed."""
+        pass
+
+    def get_agent_creator_user_id(self) -> Optional[int]:
+        """Get the governing agent's creator, for the knowledge-base seam.
+
+        Fail-closed default for every config that is not web-backed: without
+        a governing team there is no creator exemption to resolve, so
+        ``None`` is always correct here, not merely convenient.
+        """
+        return None
+
+    def get_declared_knowledge_bases(self) -> Optional[List[str]]:
+        """Get the governing agent's stored knowledge-base declaration.
+
+        Fail-closed default for every config that is not web-backed: see
+        ``get_agent_creator_user_id``.
+        """
+        return None
+
+    @abstractmethod
+    def get_allowed_skills(self) -> Optional[List[str]]:
+        """Get allowed skill names. None means all skills are allowed."""
+        pass
+
+    @abstractmethod
+    def get_user_id(self) -> Optional[int]:
+        """Get current user ID for multi-tenancy."""
+        pass
+
+    @abstractmethod
+    def is_admin(self) -> bool:
+        """Whether current user is admin."""
+        pass
+
+    @abstractmethod
+    def get_enable_agent_tools(self) -> bool:
+        """Whether to include published agents as tools."""
+        pass
+
+    @abstractmethod
+    def get_image_generate_model(self) -> Optional[Any]:
+        """Get default image generation model."""
+        pass
+
+    @abstractmethod
+    def get_custom_api_configs(self) -> List[Dict[str, Any]]:
+        """Get custom API configurations."""
+        pass
+
+    @abstractmethod
+    def get_image_edit_model(self) -> Optional[Any]:
+        """Get default image editing model."""
+        pass
+
+    def get_video_model(self) -> Optional[Any]:
+        """Get default video generation model."""
+        return None
+
+    def get_sound_effect_model(self) -> Optional[Any]:
+        """Get default sound effect generation model."""
+        return None
+
+    def get_music_model(self) -> Optional[Any]:
+        """Get default music generation model."""
+        return None
+
+    @abstractmethod
+    def get_sandbox(self) -> Optional[Any]:
+        """Get sandbox instance for sandboxed executors. Returns None if not available."""
+        pass
+
+    def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+        return None
+
+    def get_sql_connections(self) -> Dict[str, str]:
+        # Standalone tools historically read these at execution time. Include
+        # them in the authoritative snapshot instead of bypassing an omission.
+        prefix = "XAGENT_EXTERNAL_DB_"
+        return {
+            name[len(prefix) :]: url
+            for name, url in os.environ.items()
+            if name.startswith(prefix) and name != prefix and url
+        }
+
+    def get_allowed_agent_ids(self) -> Optional[List[int]]:
+        """Get explicitly allowed published agent IDs. None means use defaults."""
+        return None
+
+    def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
+        """Get per-agent tool metadata/runtime overrides for delegation."""
+        return {}
+
+    def get_published_agent_tool_records(self) -> Optional[List[Any]]:
+        """Return detached published-agent construction rows when prefetched."""
+        return None
+
+    def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
+        """Get remote A2A agent tool configurations.
+
+        Serialized entries cannot authorize private-network access. Invalid
+        entries are skipped independently; valid public tools are retained.
+        """
+        return []
+
+    def get_enable_global_agent_tools(self) -> bool:
+        """Whether to include globally visible published agents as tools."""
+        return True
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        """Whether explicit allowed agent IDs may cross the current user boundary."""
+        return False
+
+    def get_parent_task_id(self) -> Optional[str]:
+        """Get parent task ID for delegated tool execution."""
+        return None
+
+    def get_parent_tracer(self) -> Optional[Any]:
+        """Get parent tracer for delegated tool execution."""
+        return None
+
+    def get_agent_call_stack(self) -> List[int]:
+        """Get active agent delegation call stack for recursion prevention."""
+        return []
+
+    def get_voice(self) -> Optional[str]:
+        """The already-resolved onboarding output-voice preference (see
+        core.agent.voice_policy.apply_output_voice), or None. Threaded into
+        a delegated AgentTool's own system prompt and into any further
+        tool set it builds for a grandchild delegation, so a task's chosen
+        voice reaches every agent this user talks to - not just the
+        top-level one - without core importing a web route module."""
+        return None
+
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """The reason this config's MCP servers were refused, or None.
+
+        Set when a delegated run's connectors were refused rather than
+        loaded (see ``_nested_mcp_refusal_reason`` in ``agent_tool.py``).
+        Threaded the same way as ``get_voice`` into any further AgentTool
+        this config builds, so the refusal survives past the one hop the
+        ReAct-bound execution context covers: a grandchild delegation binds
+        no ``task_source`` of its own and would otherwise read as
+        unregistered and dispatch ungated."""
+        return None
+
+    def get_excluded_agent_id(self) -> Optional[int]:
+        """Get agent ID to exclude from agent tools."""
+        return None
+
+    @abstractmethod
+    def get_db(self) -> Optional[Any]:
+        """Get database session. Returns None for standalone usage."""
+        pass
+
+    @abstractmethod
+    def get_asr_model(self) -> Optional[Any]:
+        """Get default ASR (speech-to-text) model."""
+        pass
+
+    @abstractmethod
+    def get_tts_model(self) -> Optional[Any]:
+        """Get default TTS (text-to-speech) model."""
+        pass
+
+    @abstractmethod
+    def get_llm(self) -> Optional[Any]:
+        """Get default LLM for general tasks."""
+        pass
+
+    def get_max_output_length(self) -> int:
+        """Get maximum output length in characters.
+
+        Reads from XAGENT_TOOL_MAX_OUTPUT_LENGTH env var if set.
+        See :mod:`xagent.config` for details.
+        """
+        return _root_config.get_tool_max_output_length()
+
+    def get_max_field_count(self) -> int:
+        """Get maximum number of fields/items in dict/list for output filtering.
+
+        Reads from XAGENT_TOOL_MAX_FIELD_COUNT env var if set.
+        See :mod:`xagent.config` for details.
+        """
+        return _root_config.get_tool_max_field_count()
+
+    def get_max_recursion_depth(self) -> int:
+        """Get maximum recursion depth for output filtering.
+
+        Reads from XAGENT_TOOL_MAX_RECURSION_DEPTH env var if set.
+        See :mod:`xagent.config` for details.
+        """
+        return _root_config.get_tool_max_recursion_depth()
+
+
+class ToolConfig(BaseToolConfig):
+    """Tool configuration that uses provided config dict for standalone usage."""
+
+    def __init__(self, config_dict: Dict[str, Any]):
+        # Extract configurations from dict
+        workspace_config = config_dict.get("workspace")
+        config_dict.get("vision_model")  # Unused in base config
+        config_dict.get("image_models", [])  # Unused in base config
+        config_dict.get("video_models", [])  # Unused in base config
+        config_dict.get("asr_models", [])  # Unused in base config
+        config_dict.get("tts_models", [])  # Unused in base config
+        sound_effect_models = config_dict.get("sound_effect_models") or {}
+        sound_effect_model = config_dict.get("sound_effect_model")
+        music_models = config_dict.get("music_models") or {}
+        music_model = config_dict.get("music_model")
+        mcp_server_configs = config_dict.get("mcp_servers", [])
+        file_tools_enabled = config_dict.get("file_tools_enabled", True)
+        basic_tools_enabled = config_dict.get("basic_tools_enabled", True)
+        embedding_model = config_dict.get("embedding_model")
+        browser_tools_enabled = config_dict.get("browser_tools_enabled", True)
+        task_id = config_dict.get("task_id")
+        allowed_collections = config_dict.get("allowed_collections")
+        allowed_skills = config_dict.get("allowed_skills")
+        allowed_tools = config_dict.get("allowed_tools")
+        allowed_agent_ids = config_dict.get("allowed_agent_ids")
+        agent_tool_overrides = config_dict.get("agent_tool_overrides") or {}
+        a2a_agent_configs = config_dict.get("a2a_agent_configs") or []
+        enable_global_agent_tools = config_dict.get("enable_global_agent_tools", True)
+        allow_cross_user_agent_ids = config_dict.get(
+            "allow_cross_user_agent_ids", False
+        )
+        parent_task_id = config_dict.get("parent_task_id")
+        parent_tracer = config_dict.get("parent_tracer")
+        agent_call_stack = config_dict.get("agent_call_stack") or []
+        user_id = config_dict.get("user_id")
+        is_admin = config_dict.get("is_admin", False)
+        tool_credentials = config_dict.get("tool_credentials", {})
+
+        # Output limit configuration (uses environment variable as default)
+        # Store custom values if provided, otherwise use None to fall back to base class defaults
+        self._custom_max_output_length: int | None = None
+        try:
+            self._custom_max_output_length = int(
+                config_dict.get("max_output_length")  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError):
+            pass
+        self._custom_max_field_count: int | None = None
+        try:
+            self._custom_max_field_count = int(
+                config_dict.get("max_field_count")  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError):
+            pass
+        self._custom_max_recursion_depth: int | None = None
+        try:
+            self._custom_max_recursion_depth = int(
+                config_dict.get("max_recursion_depth")  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError):
+            pass
+
+        self.workspace_config: Optional[Dict[str, Any]] = workspace_config
+        self._task_runtime_workspace: Any = None
+        self.vision_model: Optional[Any] = (
+            None  # Standalone usage typically doesn't have web context
+        )
+        self.image_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.video_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.asr_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.tts_models: Dict[
+            str, Any
+        ] = {}  # Standalone usage typically doesn't have web context
+        self.sound_effect_models: Dict[str, Any] = (
+            sound_effect_models if isinstance(sound_effect_models, dict) else {}
+        )
+        self.sound_effect_model: Optional[Any] = sound_effect_model
+        self.music_models: Dict[str, Any] = (
+            music_models if isinstance(music_models, dict) else {}
+        )
+        self.music_model: Optional[Any] = music_model
+        self.mcp_server_configs: List[Dict[str, Any]] = mcp_server_configs
+        self.file_tools_enabled: bool = bool(file_tools_enabled)
+        self.basic_tools_enabled: bool = bool(basic_tools_enabled)
+        self.embedding_model: Optional[str] = embedding_model
+        self.browser_tools_enabled: bool = bool(browser_tools_enabled)
+        self.task_id: Optional[str] = task_id
+        self.allowed_collections: Optional[List[str]] = allowed_collections
+        self.allowed_skills: Optional[List[str]] = allowed_skills
+        self.allowed_tools: Optional[List[str]] = allowed_tools
+        self.allowed_agent_ids: Optional[List[int]] = allowed_agent_ids
+        self.agent_tool_overrides: Dict[int, Dict[str, Any]] = (
+            agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
+        )
+        self.a2a_agent_configs: List[Dict[str, Any]] = (
+            a2a_agent_configs if isinstance(a2a_agent_configs, list) else []
+        )
+        self.enable_global_agent_tools: bool = bool(enable_global_agent_tools)
+        self.allow_cross_user_agent_ids: bool = bool(allow_cross_user_agent_ids)
+        self.parent_task_id: Optional[str] = parent_task_id
+        self.parent_tracer: Optional[Any] = parent_tracer
+        self.agent_call_stack: List[int] = list(agent_call_stack)
+        self.user_id: Optional[int] = user_id
+        self.is_admin_value: bool = bool(is_admin)
+        self.tool_credentials: Dict[str, Dict[str, str]] = tool_credentials
+
+    def get_workspace_config(self) -> Optional[Dict[str, Any]]:
+        return self.workspace_config
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain the workspace shared by tool creators and AgentService."""
+
+        self._task_runtime_workspace = workspace
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return the workspace shared by tool creators and AgentService."""
+
+        return self._task_runtime_workspace
+
+    def get_vision_model(self) -> Optional[Any]:
+        return self.vision_model
+
+    def get_image_models(self) -> Dict[str, Any]:
+        return self.image_models
+
+    def get_video_models(self) -> Dict[str, Any]:
+        return self.video_models
+
+    def get_asr_models(self) -> Dict[str, Any]:
+        return self.asr_models
+
+    def get_tts_models(self) -> Dict[str, Any]:
+        return self.tts_models
+
+    def get_sound_effect_models(self) -> Dict[str, Any]:
+        return self.sound_effect_models
+
+    def get_music_models(self) -> Dict[str, Any]:
+        return self.music_models
+
+    async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
+        return self.mcp_server_configs
+
+    def get_file_tools_enabled(self) -> bool:
+        return self.file_tools_enabled
+
+    def get_basic_tools_enabled(self) -> bool:
+        return self.basic_tools_enabled
+
+    def get_embedding_model(self) -> Optional[str]:
+        return self.embedding_model
+
+    def get_browser_tools_enabled(self) -> bool:
+        return self.browser_tools_enabled
+
+    def get_task_id(self) -> Optional[str]:
+        return self.task_id
+
+    def get_allowed_collections(self) -> Optional[List[str]]:
+        return self.allowed_collections
+
+    def get_allowed_skills(self) -> Optional[List[str]]:
+        return self.allowed_skills
+
+    def get_user_id(self) -> Optional[int]:
+        return self.user_id
+
+    def is_admin(self) -> bool:
+        return self.is_admin_value
+
+    def get_enable_agent_tools(self) -> bool:
+        return True
+
+    def get_image_generate_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_custom_api_configs(self) -> List[Dict[str, Any]]:
+        return []  # Standalone config doesn't have web context for custom APIs by default
+
+    def get_image_edit_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_video_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_sound_effect_model(self) -> Optional[Any]:
+        return self.sound_effect_model
+
+    def get_music_model(self) -> Optional[Any]:
+        return self.music_model
+
+    def get_asr_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_tts_model(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_llm(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have web context
+
+    def get_allowed_tools(self) -> Optional[List[str]]:
+        """Legacy raw-list accessor.
+
+        Kept for backward compat with callers that haven't migrated to
+        :class:`ToolSelectionSpec`. New code SHOULD construct a spec via
+        :meth:`ToolSelectionSpec.from_raw` and pass it through
+        :attr:`_tool_selection_spec` instead. The factory consults the
+        spec first; this method only fires for the no-spec path.
+        """
+        return self.allowed_tools
+
+    def get_tool_selection_spec(self) -> Optional[Any]:
+        """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
+
+        Subclasses set ``self._tool_selection_spec`` to a
+        :class:`ToolSelectionSpec` instance constructed via
+        :meth:`ToolSelectionSpec.from_raw`. The factory reads this in
+        ``create_all_tools`` and dispatches mode-aware filtering through
+        ``spec.compute_allowed_names(tools)``.
+        """
+        return getattr(self, "_tool_selection_spec", None)
+
+    def get_allowed_agent_ids(self) -> Optional[List[int]]:
+        return self.allowed_agent_ids
+
+    def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
+        return self.agent_tool_overrides
+
+    def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
+        return self.a2a_agent_configs
+
+    def get_enable_global_agent_tools(self) -> bool:
+        return self.enable_global_agent_tools
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        return self.allow_cross_user_agent_ids
+
+    def get_parent_task_id(self) -> Optional[str]:
+        return self.parent_task_id
+
+    def get_parent_tracer(self) -> Optional[Any]:
+        return self.parent_tracer
+
+    def get_agent_call_stack(self) -> List[int]:
+        return self.agent_call_stack
+
+    def get_sandbox(self) -> Optional[Any]:
+        return None  # Standalone config doesn't have sandbox
+
+    def get_tool_credential(self, tool_name: str, field_name: str) -> Optional[str]:
+        tool_data = self.tool_credentials.get(tool_name)
+        if not isinstance(tool_data, dict):
+            return None
+        value = tool_data.get(field_name)
+        return value if isinstance(value, str) and value else None
+
+    def get_max_output_length(self) -> int:
+        if self._custom_max_output_length is not None:
+            return self._custom_max_output_length
+        return super().get_max_output_length()
+
+    def get_max_field_count(self) -> int:
+        if self._custom_max_field_count is not None:
+            return self._custom_max_field_count
+        return super().get_max_field_count()
+
+    def get_max_recursion_depth(self) -> int:
+        if self._custom_max_recursion_depth is not None:
+            return self._custom_max_recursion_depth
+        return super().get_max_recursion_depth()
+
+    def get_db(self) -> Optional[Any]:
+        """ToolConfig (standalone) does not have database access."""
+        return None

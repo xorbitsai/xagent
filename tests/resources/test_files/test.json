@@ -1,0 +1,13 @@
+{
+    "name": "测试用户",
+    "age": 25,
+    "email": "test@example.com",
+    "hobbies": ["读书", "游泳", "编程"],
+    "address": {
+        "city": "北京",
+        "street": "测试街道",
+        "postcode": "100000"
+    },
+    "active": true,
+    "score": 95.5
+}

@@ -1,0 +1,459 @@
+"""Core management compatibility facade for KB operations."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from ..core.schemas import (
+    CollectionOperationResult,
+    DocumentListResult,
+    DocumentOperationResult,
+    DocumentStatsResult,
+    ListCollectionsResult,
+)
+
+if TYPE_CHECKING:
+    from .coordinator import KBCoordinator
+    from .storage_shim import KBStorageShimCompatibilityFacade
+
+
+class KBCoreManagementCompatibilityFacade:
+    """Compatibility boundary for legacy management module functions.
+
+    Public management modules keep their historical import paths and signatures,
+    while coordinator-owned code gets one stable surface for list, delete,
+    retry/cancel, and ingestion-status operations.
+    """
+
+    def __init__(
+        self,
+        coordinator: KBCoordinator | None = None,
+        storage_shim: KBStorageShimCompatibilityFacade | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._storage_shim = storage_shim
+        # Lazily-built coordinator bound to an injected shim (see
+        # _active_coordinator); cached so repeated calls reuse one instance.
+        self._shim_coordinator: KBCoordinator | None = None
+
+    def _active_storage_shim(self) -> KBStorageShimCompatibilityFacade | None:
+        if self._storage_shim is not None:
+            return self._storage_shim
+        if self._coordinator is not None:
+            return self._coordinator.storage_shim
+        return None
+
+    @contextmanager
+    def _storage_context(self) -> Iterator[None]:
+        storage_shim = self._active_storage_shim()
+        if storage_shim is None:
+            yield
+            return
+
+        from ..storage.factory import bind_storage_shim_for_current_context
+
+        with bind_storage_shim_for_current_context(storage_shim):
+            yield
+
+    def _active_coordinator(self) -> KBCoordinator:
+        if self._coordinator is not None:
+            return self._coordinator
+
+        from .coordinator import KBCoordinator, get_kb_coordinator
+
+        # An injected shim without a coordinator must stay bound to that shim
+        # (mirrors vector_storage_compatibility._active_coordinator).
+        if self._storage_shim is not None:
+            if self._shim_coordinator is None:
+                self._shim_coordinator = KBCoordinator(storage_shim=self._storage_shim)
+            return self._shim_coordinator
+
+        return get_kb_coordinator()
+
+    async def list_collections(
+        self,
+        user_id: Optional[int] = None,
+        is_admin: Optional[bool] = None,
+        force_realtime: bool = False,
+    ) -> ListCollectionsResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return await management_collections._list_collections_impl(
+                user_id=user_id,
+                is_admin=is_admin,
+                force_realtime=force_realtime,
+                coordinator=self._active_coordinator(),
+            )
+
+    def list_documents(
+        self,
+        collection: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> DocumentListResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._list_documents_impl(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                coordinator=self._active_coordinator(),
+            )
+
+    def get_document_stats(
+        self,
+        collection: str,
+        doc_id: str,
+        model_tag: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> DocumentStatsResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._get_document_stats_impl(
+                collection=collection,
+                doc_id=doc_id,
+                model_tag=model_tag,
+                user_id=user_id,
+                is_admin=is_admin,
+                coordinator=self._active_coordinator(),
+            )
+
+    def delete_document(
+        self,
+        collection: str,
+        doc_id: str,
+        user_id: int,
+        is_admin: bool = False,
+    ) -> DocumentOperationResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._delete_document_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+                coordinator=self._active_coordinator(),
+            )
+
+    def delete_collection(
+        self,
+        collection: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> CollectionOperationResult:
+        from .coordinator import _run_in_separate_loop
+
+        return _run_in_separate_loop(
+            self.delete_collection_async(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        )
+
+    async def delete_collection_async(
+        self,
+        collection: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+        doc_ids: Optional[List[str]] = None,
+        delete_orphaned_metadata: bool = True,
+    ) -> CollectionOperationResult:
+        """Delete a collection through the coordinator handle boundary."""
+        return await self._active_coordinator().delete_collection(
+            collection=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            doc_ids=doc_ids,
+            delete_orphaned_metadata=delete_orphaned_metadata,
+        )
+
+    def retry_document(
+        self,
+        collection: str,
+        doc_id: str,
+        user_id: int,
+        is_admin: bool = False,
+    ) -> DocumentOperationResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._retry_document_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def cancel_document(
+        self,
+        collection: str,
+        doc_id: str,
+        user_id: int,
+        is_admin: bool = False,
+        reason: Optional[str] = None,
+    ) -> DocumentOperationResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._cancel_document_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+                reason=reason,
+            )
+
+    def cancel_collection(
+        self,
+        collection: str,
+        reason: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> CollectionOperationResult:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._cancel_collection_impl(
+                collection=collection,
+                reason=reason,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def get_document_status(self, collection: str, doc_id: str) -> Dict[str, Any]:
+        from ..management import collections as management_collections
+
+        with self._storage_context():
+            return management_collections._get_document_status_impl(
+                collection=collection,
+                doc_id=doc_id,
+            )
+
+    def write_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        if self._coordinator is not None:
+            self._coordinator.write_ingestion_status_sync(
+                collection,
+                doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+            return
+        from ..management import status as management_status
+
+        with self._storage_context():
+            management_status._write_ingestion_status_impl(
+                collection=collection,
+                doc_id=doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+
+    def load_ingestion_status(
+        self,
+        collection: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        # When collection is None the caller wants ALL collections — a
+        # collection-bound handle cannot serve this case; keep the legacy path.
+        if self._coordinator is not None and collection is not None:
+            return self._coordinator.load_ingestion_status_sync(
+                collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        from ..management import status as management_status
+
+        with self._storage_context():
+            return management_status._load_ingestion_status_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def clear_ingestion_status(
+        self,
+        collection: str,
+        doc_id: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        if self._coordinator is not None:
+            self._coordinator.clear_ingestion_status_sync(
+                collection,
+                doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            return
+        from ..management import status as management_status
+
+        with self._storage_context():
+            management_status._clear_ingestion_status_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    async def write_ingestion_status_async(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        status: str,
+        message: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        if self._coordinator is not None:
+            await self._coordinator.write_ingestion_status_async(
+                collection,
+                doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+            return
+        from ..management import status as management_status
+
+        with self._storage_context():
+            await management_status._write_ingestion_status_async_impl(
+                collection=collection,
+                doc_id=doc_id,
+                status=status,
+                message=message,
+                parse_hash=parse_hash,
+                user_id=user_id,
+            )
+
+    async def load_ingestion_status_async(
+        self,
+        collection: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[Dict[str, Any]]:
+        # When collection is None the caller wants ALL collections — a
+        # collection-bound handle cannot serve this case; keep the legacy path.
+        if self._coordinator is not None and collection is not None:
+            return await self._coordinator.load_ingestion_status_async(
+                collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        from ..management import status as management_status
+
+        with self._storage_context():
+            return await management_status._load_ingestion_status_async_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    async def clear_ingestion_status_async(
+        self,
+        collection: str,
+        doc_id: str,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        if self._coordinator is not None:
+            await self._coordinator.clear_ingestion_status_async(
+                collection,
+                doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            return
+        from ..management import status as management_status
+
+        with self._storage_context():
+            await management_status._clear_ingestion_status_async_impl(
+                collection=collection,
+                doc_id=doc_id,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def rename_collection_status(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Rename ingestion status rows from ``old_name`` to ``new_name``.
+
+        Best-effort: never raises; returns a list of warning strings on failure.
+        """
+        if self._coordinator is not None:
+            return self._coordinator.rename_collection_status_sync(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        from ..management import status as management_status
+
+        with self._storage_context():
+            return management_status._rename_collection_status_impl(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    async def rename_collection_status_async(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Async version of :meth:`rename_collection_status`."""
+        if self._coordinator is not None:
+            return await self._coordinator.rename_collection_status(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        from ..management import status as management_status
+
+        with self._storage_context():
+            return await management_status._rename_collection_status_async_impl(
+                old_name,
+                new_name,
+                user_id=user_id,
+                is_admin=is_admin,
+            )

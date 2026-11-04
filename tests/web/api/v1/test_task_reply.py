@@ -1,0 +1,1776 @@
+"""Integration tests for ``POST /v1/chat/tasks/{task_id}/reply``.
+
+Mirrors the structure of ``tests/web/api/test_a2a_api.py``'s
+input-required resume tests; both drive the runner-owned recovery
+mechanics through their original protocol entry points. Where a2a's test patches
+``xagent.web.services.task_resume._schedule_waiting_a2a_resume`` to avoid spinning
+up a real background execution, these tests patch the analogous
+``xagent.web.services.task_resume._schedule_waiting_reply_resume``.
+"""
+
+import asyncio
+import contextlib
+import logging
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
+
+import pytest
+
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
+from tests.web.services.admission_capacity_shared import (
+    release_bucket,
+    saturate_bucket,
+)
+from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointReadError,
+    CheckpointUnavailableError,
+    UnknownToolEffectError,
+)
+from xagent.core.agent.runner import UserMessageInjectionOutcome
+from xagent.web.api.v1 import task_reply as task_reply_module
+from xagent.web.models.agent import Agent
+from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.schemas.v1 import ReplyRequest
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_resume
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
+from xagent.web.services.task_execution_controller import TaskControlState
+from xagent.web.services.task_execution_host import enqueues_task_turns
+from xagent.web.services.task_interaction_close import (
+    ActiveInteractionRead,
+    ActiveInteractionUnavailable,
+)
+from xagent.web.services.task_lease_service import TaskLease, current_task_lease
+
+from ..conftest import _admin_headers, _direct_db_session, client
+
+pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+# ===== helpers =====
+
+
+_agent_name_counter = 0
+
+
+def _create_agent_with_key() -> tuple[int, str]:
+    global _agent_name_counter
+    _agent_name_counter += 1
+    headers = _admin_headers()
+    agent_resp = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": f"v1 reply test agent {_agent_name_counter}",
+            "description": "test",
+            "instructions": "you are a test agent",
+            "execution_mode": "balanced",
+        },
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    agent_id = agent_resp.json()["id"]
+    key_resp = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+    assert key_resp.status_code == 200, key_resp.text
+    return agent_id, key_resp.json()["full_key"]
+
+
+def _bearer(full_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {full_key}"}
+
+
+@pytest.fixture(autouse=True)
+def mock_start_task():
+    """Stub the leaf that starts a real background turn for the seed POST.
+
+    Only the initial ``POST /v1/chat/tasks`` used to create fixtures goes
+    through this path; the reply endpoint itself never calls it.
+    """
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ) as mocked:
+        yield mocked
+
+
+def _create_task(full_key: str, agent_id: int, content: str = "hello") -> int:
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": content}},
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()["task_id"]
+
+
+def _create_waiting_task(
+    full_key: str,
+    agent_id: int,
+    *,
+    run_id: str | None = "run-original",
+    content: str = "hello",
+) -> int:
+    """Create a task and force it straight to waiting_for_user with a run_id.
+
+    Mirrors what a real ask_user_question turn leaves behind: RUNNING ->
+    WAITING_FOR_USER, lease released, run_id retained.
+    """
+    task_id = _create_task(full_key, agent_id, content=content)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.WAITING_FOR_USER
+        task.control_state = TaskControlState.WAITING_FOR_USER.value
+        task.run_id = run_id
+        task.runner_id = None
+        task.lease_expires_at = None
+        task.last_heartbeat_at = None
+        db.commit()
+    finally:
+        db.close()
+    return task_id
+
+
+def _insert_question_message(task_id: int, *, content: str = "Continue?") -> None:
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                role="assistant",
+                content=content,
+                message_type="question",
+                turn_id=f"question-{task_id}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _patch_agent_service(post_user_message: AsyncMock):
+    agent_service = MagicMock()
+    agent_service.post_user_message = post_user_message
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    return patch(
+        "xagent.web.services.agent_service_manager.get_agent_manager",
+        return_value=agent_manager,
+    ), agent_service
+
+
+def _reply_body(agent_id: int, content: str = "yes, continue") -> dict:
+    return {"agent_id": agent_id, "message": {"role": "user", "content": content}}
+
+
+def _seed_active_interaction_row(
+    task_id: int, *, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the legacy resume
+    close test below. Mirrors test_a2a_api.py's identically-purposed
+    helper, with origin="sdk" instead of "a2a" to match this endpoint's
+    Task.source == "sdk" scoping."""
+    db = _direct_db_session()
+    try:
+        anchor = TraceEvent(
+            task_id=task_id,
+            event_id=f"anchor-{idempotency_key}",
+            event_type="agent_execution_checkpoint",
+            timestamp=datetime.now(timezone.utc),
+            data={},
+        )
+        db.add(anchor)
+        db.flush()
+        row = TaskInteractionRequest(
+            task_id=task_id,
+            run_id=run_id,
+            kind="clarification",
+            protocol_version=1,
+            status="active",
+            active_slot=1,
+            origin="sdk",
+            request_payload={"prompt": "example"},
+            request_idempotency_key=idempotency_key,
+            resume_trace_event_id=int(anchor.id),
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-execution-1",
+            resume_locator_format="trace_event_pk_v1",
+            resume_checkpoint_type="agent_execution_checkpoint",
+            resume_run_partition=run_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return int(row.id)
+    finally:
+        db.close()
+
+
+# ===== happy path =====
+
+
+def test_reply_happy_path_resumes_the_same_run(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
+    _insert_question_message(task_id)
+
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, agent_service = _patch_agent_service(post_user_message)
+    with (
+        agent_patch as get_agent_manager,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ) as schedule_resume,
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    assert body["status"] == "running"
+    assert body["run_id"] == "run-original"
+
+    agent_service.post_user_message.assert_awaited_once()
+    call_kwargs = agent_service.post_user_message.call_args.kwargs
+    assert call_kwargs["execution_message"] == "yes, continue"
+    assert call_kwargs["display_message"] == "yes, continue"
+    assert call_kwargs["request_interrupt"] is False
+    assert call_kwargs["turn_id"].startswith(f"v1:reply:{task_id}:")
+    assert (
+        get_agent_manager.return_value.get_agent_for_task.await_args.kwargs[
+            "connector_runtime_turn_id"
+        ]
+        == call_kwargs["turn_id"]
+    )
+    schedule_resume.assert_called_once()
+    scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
+    assert scheduled_lease.run_id == "run-original"
+    # Read from the task row, not inferred from which API accepted the
+    # reply: the resumed run must present the source its pending MCP
+    # approval was gated under.
+    assert schedule_resume.call_args.kwargs["trusted_task_source"] == "sdk"
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.RUNNING
+        assert task.run_id == "run-original"
+        assert body["state_version"] == task.state_version
+        assert body["control_state"] == task.control_state
+        assert task.input == "yes, continue"
+        assert task.output is None
+        assert task.error_message is None
+    finally:
+        db.close()
+
+
+def test_reply_turn_id_is_never_reused_across_retries(mock_start_task):
+    """Run inline, every call mints ``turn_id`` from a fresh ``uuid4()``, so
+    even a client retry that resubmits the identical reply body never lands
+    on the same turn id twice, and this path never sees a POSTED_REPLAY from
+    AgentRunner.inject_user_message's turn_id short-circuit."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-original")
+    _insert_question_message(task_id)
+
+    first_post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, agent_service = _patch_agent_service(first_post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        first_resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert first_resp.status_code == 202, first_resp.text
+    first_turn_id = agent_service.post_user_message.call_args.kwargs["turn_id"]
+
+    # Simulate a client retry: the same task, back in the same
+    # waiting_for_user state with the same run, resubmitting the identical
+    # reply body -- the only thing a real retry could differ on is nothing
+    # at all from this endpoint's point of view.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.WAITING_FOR_USER
+        task.control_state = TaskControlState.WAITING_FOR_USER.value
+        task.run_id = "run-original"
+        task.runner_id = None
+        task.lease_expires_at = None
+        db.commit()
+    finally:
+        db.close()
+
+    second_post = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, agent_service = _patch_agent_service(second_post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        second_resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert second_resp.status_code == 202, second_resp.text
+    second_turn_id = agent_service.post_user_message.call_args.kwargs["turn_id"]
+
+    assert first_turn_id.startswith(f"v1:reply:{task_id}:")
+    assert second_turn_id.startswith(f"v1:reply:{task_id}:")
+    assert first_turn_id != second_turn_id
+
+
+# ===== status matrix =====
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [
+        (TaskStatus.PENDING, "no_pending_interaction"),
+        (TaskStatus.RUNNING, "task_busy"),
+        (TaskStatus.PAUSED, "no_pending_interaction"),
+        (TaskStatus.COMPLETED, "no_pending_interaction"),
+        (TaskStatus.FAILED, "no_pending_interaction"),
+    ],
+)
+def test_reply_status_matrix(mock_start_task, status: TaskStatus, expected_code: str):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = status
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(full_key),
+        json=_reply_body(agent_id),
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == expected_code
+
+
+def test_reply_waiting_status_is_not_rejected_by_the_status_gate(mock_start_task):
+    """The waiting row of the status matrix: WAITING_FOR_USER must fall
+    through the status gate (not be rejected there) -- verified via the
+    lease-acquisition dimension being reached instead."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    _insert_question_message(task_id)
+
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, _ = _patch_agent_service(post_user_message)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert resp.status_code == 202, resp.text
+
+
+# ===== ownership =====
+
+
+def test_reply_with_body_agent_id_mismatch_returns_404(mock_start_task):
+    """The request body's agent_id must match the key-bound agent; a
+    mismatch is 404 agent_not_found (not 403, so the existence of the
+    other agent isn't leaked). Same key throughout -- this exercises
+    body validation, not cross-key ownership (see the dedicated
+    cross-key test below for that)."""
+    agent_id, full_key = _create_agent_with_key()
+    other_agent_id, _other_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    _insert_question_message(task_id)
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(full_key),
+        json=_reply_body(other_agent_id),
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "agent_not_found"
+
+
+def test_reply_with_a_different_agents_key_returns_404_task_not_found(
+    mock_start_task,
+):
+    """A key bound to a DIFFERENT agent than the task's owner must not
+    reach the task at all -- 404 task_not_found from
+    _resolve_task_or_404's ownership predicate, not the body-validation
+    404 the test above exercises. Body is self-consistent (the second
+    agent's own id) so only the ownership predicate can be at fault."""
+    agent_id, full_key = _create_agent_with_key()
+    other_agent_id, other_full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    _insert_question_message(task_id)
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(other_full_key),
+        json=_reply_body(other_agent_id),
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_reply_to_non_sdk_source_task_returns_404(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        task = Task(
+            user_id=int(agent.user_id),
+            title="web ui task",
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+            run_id="run-web",
+            agent_id=agent_id,
+            source="web",
+            is_visible=True,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(full_key),
+        json=_reply_body(agent_id),
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_reply_to_unknown_task_returns_404(mock_start_task):
+    _agent_id, full_key = _create_agent_with_key()
+    resp = client.post(
+        "/v1/chat/tasks/999999999/reply",
+        headers=_bearer(full_key),
+        json=_reply_body(_agent_id),
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+# ===== files rejected =====
+
+
+def test_reply_with_files_returns_422(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    _insert_question_message(task_id)
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "here", "files": ["file-1"]},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+def test_reply_missing_agent_id_returns_422(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    _insert_question_message(task_id)
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "here"}},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+# ===== checkpoint missing (endpoint layer) =====
+
+
+def test_reply_checkpoint_missing_is_fail_closed(mock_start_task):
+    """post_user_message returns False (no checkpoint found) -> 409
+    interaction_not_resumable, task restored to waiting_for_user with
+    zero residue: no runner_id, no lease, run_id unchanged, no error."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-legacy")
+    _insert_question_message(task_id)
+
+    observed_lease: dict[str, TaskLease] = {}
+
+    async def post_user_message(*_args, **_kwargs) -> UserMessageInjectionOutcome:
+        lease = current_task_lease()
+        assert lease is not None
+        assert lease.run_id == "run-legacy"
+        observed_lease["lease"] = lease
+        verify_db = _direct_db_session()
+        try:
+            leased = verify_db.query(Task).filter(Task.id == task_id).one()
+            assert leased.status == TaskStatus.RUNNING
+            assert leased.run_id == lease.run_id
+        finally:
+            verify_db.close()
+        return UserMessageInjectionOutcome.NOT_POSTED
+
+    agent_patch, _ = _patch_agent_service(AsyncMock(side_effect=post_user_message))
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_not_resumable"
+    assert observed_lease, "post_user_message stub never ran"
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert task.runner_id is None
+        assert task.lease_expires_at is None
+        assert task.run_id == "run-legacy"
+        assert task.error_message is None
+    finally:
+        db.close()
+
+
+# ===== legacy resume interaction close =====
+
+
+def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
+    mock_start_task,
+):
+    """The success path this wiring exists for: once the reply's fence
+    UPDATE lands (``_update_reply_input_sync``), the run's active
+    interaction row is retired (``terminated`` /
+    ``answered_via_legacy_resume``) and the task's protocol marker is
+    cleared back to NULL in the same commit -- mirrors
+    test_a2a_api.py's
+    test_message_send_closes_the_legacy_resume_interaction_row_on_successful_injection.
+
+    Reverting the close wiring in ``_update_reply_input_sync`` turns this
+    red: the row stays "active" and the marker stays 1.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-close-success")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-close-success", idempotency_key="reply-close-success-q1"
+    )
+
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, agent_service = _patch_agent_service(post_user_message)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 202, resp.text
+    agent_service.post_user_message.assert_awaited_once()
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "terminated"
+        assert row.terminal_reason == "answered_via_legacy_resume"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "active_interaction_read,expected_interaction_id", PRE_CHANGE_EQUIVALENT
+)
+def test_reply_reads_the_interaction_row_before_injecting(
+    mock_start_task,
+    active_interaction_read: ActiveInteractionRead,
+    expected_interaction_id: int | None,
+    caplog: pytest.LogCaptureFixture,
+):
+    """The close is keyed on the row observed *before* the injection,
+    and only the ordering makes that true -- see task_interaction_close's
+    module docstring. Moving the read after the injection leaves the whole
+    change doing nothing while the row-level assertions in the test above
+    stay green. The Found case's observed value is a fabricated id, not the
+    seeded row's, so a site that re-read the row at close time would hand
+    the close the real id and fail here.
+
+    Parametrized over every state PRE_CHANGE_EQUIVALENT enumerates
+    (Found, Absent, and both Unavailable reasons): this site's translation
+    to the ``int | None`` the close call takes must produce the same
+    result for all three states that it did before this became a
+    three-state read, regardless of which reason an unavailable read
+    carries.
+
+    That equivalence alone would also hold for a two-way ``Found`` versus
+    everything-else fold, so the cells also assert the log line this site
+    emits on -- and only on -- the ``ActiveInteractionUnavailable``
+    branch, carrying that state's own reason word. A fold that dropped the
+    third branch leaves both unavailable cells without their line.
+    """
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-close-order")
+    # Kept real and distinct from the fabricated id the Found row in
+    # PRE_CHANGE_EQUIVALENT carries: a site that re-read the row at close
+    # time (instead of using the id observed before injection) would hand
+    # the close this real id and fail the assertion below.
+    _seed_active_interaction_row(
+        task_id, run_id="run-close-order", idempotency_key="reply-close-order-q1"
+    )
+
+    order: list[str] = []
+
+    def record_read(_task_id: int) -> ActiveInteractionRead:
+        order.append("read")
+        return active_interaction_read
+
+    async def record_injection(
+        *_args: object, **_kwargs: object
+    ) -> UserMessageInjectionOutcome:
+        order.append("inject")
+        return UserMessageInjectionOutcome.POSTED_FRESH
+
+    agent_patch, _agent_service = _patch_agent_service(
+        AsyncMock(side_effect=record_injection)
+    )
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_resume.active_interaction_id_sync",
+            side_effect=record_read,
+        ),
+        patch(
+            "xagent.web.services.task_resume.close_legacy_resume_interaction",
+            return_value=1,
+        ) as close_mock,
+        caplog.at_level(logging.INFO, logger="xagent.web.services.task_resume"),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 202, resp.text
+    assert order == ["read", "inject"]
+    close_mock.assert_called_once()
+    assert close_mock.call_args.kwargs["task_id"] == task_id
+    assert close_mock.call_args.kwargs["run_id"] == "run-close-order"
+    assert close_mock.call_args.kwargs["interaction_id"] == expected_interaction_id
+
+    unavailable_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "active interaction read unavailable" in record.getMessage()
+    ]
+    if isinstance(active_interaction_read, ActiveInteractionUnavailable):
+        assert unavailable_lines == [
+            "active interaction read unavailable "
+            f"(reason={active_interaction_read.reason}) for task_id={task_id}; "
+            "the legacy resume close will match no row"
+        ]
+    else:
+        assert unavailable_lines == []
+
+
+def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() -> None:
+    """Mirrors test_a2a_api.py's
+    test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
+    for the reply site's own fence-and-close pair: the fence UPDATE and the
+    legacy resume interaction close are one atomic write in
+    ``_update_reply_input_sync`` too. A fence miss (ownership changed under
+    this lease) must roll back both together, not close the row while
+    rejecting the input.
+
+    What this actually pins is that the close must never commit
+    independently of the host transaction -- reordering the two statements
+    within that same transaction changes nothing observable, because a
+    rollback undoes every statement issued since the last commit regardless
+    of program order. Turning this red needs two changes at once, the same
+    pair the a2a-side test calls out: the close must move ahead of the
+    fence's early return (unreachable there today, since a fence miss
+    returns before the close ever runs) and it must commit independently of
+    this function's session.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-reply-atomicity")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        # _create_waiting_task leaves the task in waiting_for_user with no
+        # lease held (mirrors a real ask_user_question turn). This test
+        # needs a live RUNNING lease for the fence UPDATE to have a chance
+        # of matching, under a runner_id the stale lease below deliberately
+        # does not share -- the fence's WHERE clause requires an exact
+        # match, so that lease has already lost the race by the time the
+        # write is attempted.
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "current-runner"
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-reply-atomicity", idempotency_key="reply-atomicity-q1"
+    )
+
+    stale_lease = TaskLease(
+        task_id=task_id, runner_id="a-different-runner", run_id="run-reply-atomicity"
+    )
+    updated = task_resume._update_reply_input_sync(
+        stale_lease,
+        "attempted text",
+        row_id,
+        UserMessageInjectionOutcome.POSTED_FRESH,
+    )
+
+    assert updated is False
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version == 1
+        # Unchanged from _create_task's original content, not overwritten
+        # with the rejected fence write's "attempted text".
+        assert refreshed.input == "hello"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "injection_outcome",
+    list(UserMessageInjectionOutcome),
+    ids=lambda outcome: outcome.name,
+)
+def test_reply_input_closes_the_interaction_only_on_a_fresh_injection(
+    mock_start_task, injection_outcome: UserMessageInjectionOutcome
+):
+    """Calls the reply's fence-and-close function directly with each
+    injection outcome, on a task whose row matches the lease, so the fence
+    UPDATE lands in every case and only the guard decides whether the active
+    interaction row is retired. Only POSTED_FRESH closes it and clears the
+    marker; every other outcome, including any member added later, leaves
+    the row active and the marker set. Removing the guard turns the four
+    non-fresh cases red."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-reply-guard")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "reply-guard-runner"
+        task.lease_attempt_id = "reply-guard-attempt"
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-reply-guard", idempotency_key="reply-guard-q1"
+    )
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="reply-guard-runner",
+        run_id="run-reply-guard",
+        attempt_id="reply-guard-attempt",
+    )
+
+    updated = task_resume._update_reply_input_sync(
+        lease, "the reply", row_id, injection_outcome
+    )
+
+    expected = (
+        (("terminated", None, "answered_via_legacy_resume"), None)
+        if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        else (("active", 1, None), 1)
+    )
+    assert updated is True
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.input == "the reply"
+        assert (
+            (row.status, row.active_slot, row.terminal_reason),
+            refreshed.interaction_protocol_version,
+        ) == expected
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "injection_outcome",
+    [
+        UserMessageInjectionOutcome.POSTED_FRESH,
+        UserMessageInjectionOutcome.POSTED_REPLAY,
+    ],
+    ids=lambda outcome: outcome.name,
+)
+async def test_inline_reply_passes_its_injection_outcome_to_the_close_guard(
+    mock_start_task, monkeypatch, injection_outcome: UserMessageInjectionOutcome
+):
+    """One inline v1 reply, called directly, under a fresh v1:reply turn id:
+    the fence function receives the outcome the injection reported, and the
+    input is written either way. POSTED_FRESH closes the row read before the
+    injection exactly once and clears the marker; POSTED_REPLAY leaves the
+    row active and the marker set. No command row is written, because a
+    process without shared task execution runs the reply inline."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-inline-reply")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.interaction_protocol_version = 1
+        owner_id = int(task.user_id)
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-inline-reply", idempotency_key="inline-reply-q1"
+    )
+    assert enqueues_task_turns() is False
+
+    fence_outcomes: list[UserMessageInjectionOutcome] = []
+    real_update = task_resume._update_reply_input_sync
+
+    def record_update(task_lease, text, interaction_id, injection_outcome):
+        fence_outcomes.append(injection_outcome)
+        return real_update(task_lease, text, interaction_id, injection_outcome)
+
+    closed_ids: list[int | None] = []
+    real_close = task_resume.close_legacy_resume_interaction
+
+    def record_close(db, *, task_id, run_id, interaction_id):
+        closed_ids.append(interaction_id)
+        return real_close(
+            db, task_id=task_id, run_id=run_id, interaction_id=interaction_id
+        )
+
+    async def schedule(**kwargs):
+        # Stand in for the resume: take ownership of the heartbeat.
+        kwargs["heartbeat_stop"].set()
+        await kwargs["heartbeat_task"]
+
+    monkeypatch.setattr(task_resume, "_update_reply_input_sync", record_update)
+    monkeypatch.setattr(task_resume, "close_legacy_resume_interaction", record_close)
+    monkeypatch.setattr(task_resume, "_schedule_waiting_reply_resume", schedule)
+    post = AsyncMock(return_value=injection_outcome)
+    agent_patch, _agent_service = _patch_agent_service(post)
+    with agent_patch:
+        await task_resume.resume_task_reply(
+            task_resume.TaskReplyInput(
+                task_id=task_id,
+                agent_id=agent_id,
+                task_owner_user_id=owner_id,
+                actor_user_id=owner_id,
+                run_id="run-inline-reply",
+                status=TaskStatus.WAITING_FOR_USER,
+                text="yes, continue",
+            )
+        )
+
+    prefix, _, suffix = post.await_args.kwargs["turn_id"].rpartition(":")
+    assert prefix == f"v1:reply:{task_id}"
+    assert str(UUID(suffix)) == suffix
+    assert fence_outcomes == [injection_outcome]
+    fresh = injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert closed_ids == ([row_id] if fresh else [])
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.input == "yes, continue"
+        assert (
+            (row.status, row.active_slot, row.terminal_reason),
+            refreshed.interaction_protocol_version,
+        ) == (
+            (("terminated", None, "answered_via_legacy_resume"), None)
+            if fresh
+            else (("active", 1, None), 1)
+        )
+        assert (
+            db.query(TaskExecutionCommand)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_task):
+    """The restore (abandonment) branch's compensation cleanup: when
+    post_user_message returns False, the prelease is released back to
+    waiting_for_user via ``_restore_reply_prelease_sync``, which must also
+    reconcile a marker that no longer names any active row -- there is no
+    active interaction row staged for this run, so the NOT EXISTS guard in
+    ``clear_interaction_marker_if_unpaired`` matches and the marker clears.
+
+    Reverting the ``clear_interaction_marker_if_unpaired`` call in
+    ``_restore_reply_prelease_sync`` turns this red: the marker stays 1
+    even though the task is back in waiting_for_user with no active row.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-unpaired-marker")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+
+    agent_patch, _ = _patch_agent_service(
+        AsyncMock(return_value=UserMessageInjectionOutcome.NOT_POSTED)
+    )
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_not_resumable"
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.interaction_protocol_version is None
+    finally:
+        db.close()
+
+
+# ===== checkpoint read errors =====
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (
+            AutoModelUnavailableError("private model details"),
+            409,
+            "auto_model_unavailable",
+        ),
+        (
+            CheckpointCorruptError("all matching rows undecodable"),
+            409,
+            "interaction_not_resumable",
+        ),
+        (
+            UnknownToolEffectError("unknown external effect"),
+            409,
+            "interaction_not_resumable",
+        ),
+        (
+            CheckpointAccessRefusedError("refused", reason="superseded_legacy"),
+            409,
+            "interaction_not_resumable",
+        ),
+        (
+            CheckpointAccessRefusedError("refused", reason="lease_mismatch"),
+            409,
+            "task_busy",
+        ),
+        (
+            CheckpointAccessRefusedError("refused", reason="active_run"),
+            409,
+            "task_busy",
+        ),
+        (
+            CheckpointUnavailableError("checkpoint store unavailable"),
+            503,
+            "temporarily_unavailable",
+        ),
+    ],
+)
+def test_reply_checkpoint_read_error_maps_to_distinct_code(
+    mock_start_task,
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(
+        full_key, agent_id, run_id=f"run-{type(error).__name__}"
+    )
+    _insert_question_message(task_id)
+
+    agent_patch, _ = _patch_agent_service(AsyncMock(side_effect=error))
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == expected_status, resp.text
+    assert resp.json()["error"]["code"] == expected_code
+    if isinstance(error, AutoModelUnavailableError):
+        assert resp.json()["error"]["message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert task.runner_id is None
+        assert task.lease_expires_at is None
+    finally:
+        db.close()
+
+
+def test_reply_unknown_checkpoint_read_error_subclass_is_treated_as_retryable(
+    mock_start_task,
+):
+    """A future CheckpointReadError subclass this dispatch does not
+    recognize must fall to the conservative 503 branch, not silently
+    collapse into the terminal interaction_not_resumable code."""
+
+    class _FutureCheckpointError(CheckpointReadError):
+        pass
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    _insert_question_message(task_id)
+
+    agent_patch, _ = _patch_agent_service(
+        AsyncMock(side_effect=_FutureCheckpointError("unknown failure mode"))
+    )
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"]["code"] == "temporarily_unavailable"
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.control_state == TaskControlState.WAITING_FOR_USER.value
+        assert task.runner_id is None
+        assert task.lease_expires_at is None
+    finally:
+        db.close()
+
+
+# ===== concurrent reply race =====
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reply_race_exactly_one_winner(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-race")
+    _insert_question_message(task_id)
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        owner_user_id = int(agent.user_id)
+    finally:
+        db.close()
+
+    post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
+    agent_patch, _ = _patch_agent_service(post_user_message)
+
+    from xagent.web.api.v1.deps import (
+        AgentPrincipalSnapshot,
+        ApiKeyPrincipal,
+        RuntimeApiKeySnapshot,
+    )
+
+    principal = ApiKeyPrincipal(
+        key=RuntimeApiKeySnapshot(key_prefix="xag_test"),
+        agent=AgentPrincipalSnapshot(
+            id=agent_id,
+            user_id=owner_user_id,
+            execution_mode="balanced",
+            status="published",
+            origin="user_created",
+        ),
+    )
+
+    async def attempt(content: str) -> object:
+        try:
+            return await task_reply_module.reply_to_task(
+                task_id=task_id,
+                request=ReplyRequest(
+                    agent_id=agent_id,
+                    message={"role": "user", "content": content},
+                ),
+                principal=principal,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return exc
+
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        result_a, result_b = await asyncio.gather(
+            attempt("answer A"), attempt("answer B")
+        )
+
+    from xagent.web.api.v1.errors import V1ApiError
+
+    results = [result_a, result_b]
+    successes = [r for r in results if not isinstance(r, Exception)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 1, (result_a, result_b)
+    assert len(failures) == 1, (result_a, result_b)
+    assert isinstance(failures[0], V1ApiError)
+    assert failures[0].code.value == "task_busy"
+
+    db = _direct_db_session()
+    try:
+        # post_user_message is mocked (no real transcript write here), but
+        # the winner must be exactly one: exactly one successful claim,
+        # exactly one input write.
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.RUNNING
+        assert task.input in ("answer A", "answer B")
+    finally:
+        db.close()
+    assert post_user_message.await_count == 1
+
+
+# ===== run_id NULL historical waiting row =====
+
+
+def test_reply_untagged_checkpoint_is_not_resumed_without_an_exact_run(mock_start_task):
+    """A legacy waiting task with no run_id: the prelease mints a new run
+    (no run fence to preserve), post_user_message finds no checkpoint
+    fenced to that fresh run, and the endpoint fails closed."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id=None)
+    _insert_question_message(task_id)
+
+    async def post_user_message(*_args, **_kwargs) -> UserMessageInjectionOutcome:
+        lease = current_task_lease()
+        assert lease is not None
+        assert lease.run_id is not None
+        verify_db = _direct_db_session()
+        try:
+            leased = verify_db.query(Task).filter(Task.id == task_id).one()
+            assert leased.run_id == lease.run_id
+        finally:
+            verify_db.close()
+        return UserMessageInjectionOutcome.NOT_POSTED
+
+    agent_patch, _ = _patch_agent_service(AsyncMock(side_effect=post_user_message))
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_not_resumable"
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.runner_id is None
+        assert task.lease_expires_at is None
+        assert task.run_id is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
+    """The v1 reply scheduler must register its coordinator against its run.
+
+    The coordinator is the process-local evidence a duplicate RESUME command
+    is allowed to complete against. Bound to the wrong run -- or to no run at
+    all -- it would let a command for a different run be recorded as an
+    idempotent success.
+    """
+
+    real_manager = task_execution_service.BackgroundTaskManager()
+    lease = TaskLease(task_id=4242, runner_id="runner-x", run_id="run-reply")
+    resume_gate = asyncio.Event()
+
+    async def execute_resume_background(**_kwargs) -> None:
+        await resume_gate.wait()
+
+    with (
+        patch.object(task_execution_service, "background_task_manager", real_manager),
+        patch.object(
+            task_execution_service,
+            "execute_resume_background",
+            side_effect=execute_resume_background,
+        ),
+    ):
+        await task_resume._schedule_waiting_reply_resume(
+            task_id=4242,
+            agent_service=MagicMock(),
+            task_owner_user_id=1,
+            task_lease=lease,
+            heartbeat_stop=asyncio.Event(),
+            heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+            trusted_task_source="sdk",
+        )
+        try:
+            assert (
+                real_manager.resume_admission_state(4242, expected_run_id="run-reply")
+                is task_execution_service.ResumeReservationOutcome.COORDINATOR_RUNNING
+            )
+            assert (
+                real_manager.resume_admission_state(
+                    4242, expected_run_id="some-other-run"
+                )
+                is task_execution_service.ResumeReservationOutcome.RESERVATION_HELD
+            )
+        finally:
+            resume_gate.set()
+            coordinator = real_manager.resume_tasks[4242]
+            await asyncio.wait_for(coordinator, timeout=5)
+
+
+def test_reply_timeout_reports_accepted_outcome_unknown():
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    with patch.object(
+        task_resume,
+        "resume_task_reply",
+        AsyncMock(
+            side_effect=task_resume.TaskResumeOutcomeUnknownError("original-reply")
+        ),
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["code"] == "reply_outcome_unknown"
+    assert response.json()["error"]["details"] == {
+        "accepted": True,
+        "task_id": task_id,
+        "command_id": "original-reply",
+    }
+    assert "do not resend automatically" in response.json()["error"]["message"]
+
+
+def test_reply_fenced_rejection_restores_waiting_without_resuming(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="fenced-protocol")
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="fenced-protocol", idempotency_key="fenced-question"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE)
+    agent_patch, _agent = _patch_agent_service(post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "task_busy"
+    post.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        task = db.get(Task, task_id)
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.runner_id is None
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failure", ["unknown", "cancelled", "exception"])
+def test_reply_reports_unknown_without_closing_interaction(mock_start_task, failure):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="unknown-protocol")
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="unknown-protocol", idempotency_key="unknown-question"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN)
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    context = manager.create_context(str(task_id))
+    context.add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    async def failed_write(**payload):
+        tracer.load_latest_checkpoint.side_effect = RuntimeError("read unavailable")
+        if failure == "cancelled":
+            raise asyncio.CancelledError()
+        raise RuntimeError("lost acknowledgement")
+
+    tracer.checkpoint.side_effect = failed_write
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    post.side_effect = inject
+    agent_patch, _agent = _patch_agent_service(post)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 504, response.text
+    assert response.json()["error"]["code"] == "reply_outcome_unknown"
+    post.assert_awaited_once()
+    assert (
+        response.json()["error"]["details"]["command_id"]
+        == post.await_args.kwargs["turn_id"]
+    )
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        assert db.get(Task, task_id).status == TaskStatus.PAUSED
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()
+
+
+def _absent_write_runner(task_id: int):
+    """A real runner whose checkpoint write fails and whose authoritative
+    read-back proves the turn absent (``UserMessageInjectionRejectedError``)."""
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    manager.create_context(str(task_id)).add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None),
+        checkpoint=AsyncMock(side_effect=RuntimeError("lost write")),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+    return runner, manager, tracer
+
+
+def test_reply_proven_absent_write_asks_for_a_new_command_id(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-absent")
+    runner, manager, tracer = _absent_write_runner(task_id)
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    agent_patch, _ = _patch_agent_service(AsyncMock(side_effect=inject))
+    try:
+        with (
+            agent_patch,
+            patch(
+                "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+                new=AsyncMock(),
+            ) as schedule,
+        ):
+            resp = client.post(
+                f"/v1/chat/tasks/{task_id}/reply",
+                headers=_bearer(full_key),
+                json=_reply_body(agent_id),
+            )
+        assert resp.status_code == 409, resp.text
+        error = resp.json()["error"]
+        assert error["code"] == "task_busy"
+        assert error["details"] == {
+            "accepted": False,
+            "task_id": task_id,
+            "retry_with_new_id": True,
+        }
+        assert tracer.checkpoint.await_count == 1
+        schedule.assert_not_awaited()
+        assert [m.content for m in manager.get_context(str(task_id)).messages] == [
+            "original"
+        ]
+        db = _direct_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task.status == TaskStatus.WAITING_FOR_USER
+            assert task.runner_id is None
+            assert task.run_id == "run-absent"
+        finally:
+            db.close()
+    finally:
+        manager.remove_context(str(task_id))
+
+
+@pytest.mark.asyncio
+async def test_reply_queued_behind_capacity_is_acknowledged_promptly(
+    monkeypatch, request
+):
+    """A saturated bucket answers 202 queued now; the worker resumes later."""
+    import time
+
+    from xagent.web.services import task_coordinator_runtime, task_event_bridge
+    from xagent.web.services import task_execution_admission as admission
+    from xagent.web.services import task_resume_command
+    from xagent.web.services.task_command_execution import (
+        execute_durable_task_command,
+    )
+    from xagent.web.services.task_command_transport import (
+        dispatch_one_task_command,
+    )
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        # A released waiting task carries no owner attempt; the seed helper
+        # only clears the runner, and a shared worker cannot own a task
+        # whose attempt is still stamped.
+        task.lease_attempt_id = None
+        owner_id = task.user_id
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", MagicMock())
+    # Keep the production wait: a regression to waiting would only answer
+    # after the full timeout, which the elapsed bound below rejects.
+    monkeypatch.setattr(
+        task_resume_command, "get_task_reply_wait_timeout_seconds", lambda: 30
+    )
+    admission.set_task_admission_hook(
+        lambda db, command: admission.AdmissionPolicy("tenant:batch", 1, 20)
+    )
+    request.addfinalizer(lambda: admission.set_task_admission_hook(None))
+    holding = saturate_bucket(owner_id, agent_id)
+    body = {**_reply_body(agent_id), "command_id": "queued-reply"}
+    try:
+        started = time.monotonic()
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert time.monotonic() - started < 10
+        assert response.status_code == 202, response.text
+        payload = response.json()
+        assert payload["status"] == "queued"
+        assert payload["command_id"] == "queued-reply"
+        assert payload["task_id"] == task_id
+        assert payload["run_id"] == "run-original"
+        assert payload["control_state"] == "waiting_for_user"
+
+        # Same-ID replay converges on the one durable command and stays queued.
+        replay = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["status"] == "queued"
+        # The same ID with a different answer is a conflict, not a new reply.
+        conflict = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json={**body, "message": {"role": "user", "content": "no, stop"}},
+        )
+        assert conflict.status_code == 409, conflict.text
+        assert conflict.json()["error"]["code"] == "task_busy"
+        db = _direct_db_session()
+        try:
+            rows = (
+                db.query(TaskExecutionCommand)
+                .filter(TaskExecutionCommand.task_id == task_id)
+                .all()
+            )
+            assert [
+                (r.command_id, r.status, r.attempt_count, r.defer_count) for r in rows
+            ] == [("queued-reply", "pending", 0, 0)]
+            assert payload["state_version"] == rows[0].target_state_version
+            command_db_id = rows[0].id
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task.status == TaskStatus.WAITING_FOR_USER
+            assert task.control_state == "waiting_for_user"
+        finally:
+            db.close()
+
+        prepare = AsyncMock()
+        # The worker resumes through the same service the route calls, so
+        # scope the deterministic executor to the worker steps only.
+        with patch.object(task_resume, "resume_task_reply", prepare):
+            # The real dispatcher skips the queued reply while capacity stays
+            # occupied, without spending its attempt or defer budget.
+            for _ in range(2):
+                assert not await dispatch_one_task_command(
+                    execute_durable_task_command, command_db_id=command_db_id
+                )
+            db = _direct_db_session()
+            try:
+                row = db.get(TaskExecutionCommand, command_db_id)
+                assert (row.status, row.attempt_count, row.defer_count) == (
+                    "pending",
+                    0,
+                    0,
+                )
+            finally:
+                db.close()
+            prepare.assert_not_awaited()
+
+            release_bucket(holding)
+            # Opening capacity lets the worker run the exact continuation.
+            async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
+                while not await dispatch_one_task_command(
+                    execute_durable_task_command, command_db_id=command_db_id
+                ):
+                    await asyncio.sleep(0.05)
+        prepare.assert_awaited_once()
+        assert prepare.await_args.kwargs["turn_id"] == "queued-reply"
+
+        # After execution the same ID replays the accepted outcome, not queued.
+        final = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert final.status_code == 202, final.text
+        assert final.json()["status"] == "running"
+        assert final.json()["command_id"] == "queued-reply"
+    finally:
+        await task_coordinator_runtime.close_task_coordinators()
+
+
+@pytest.mark.asyncio
+async def test_reply_rejected_by_the_worker_handoff_replays_as_not_accepted(
+    monkeypatch,
+):
+    """Any shared-execution host: a fenced-out reply is definite, not unknown."""
+    from xagent.web.services import (
+        task_coordinator_runtime,
+        task_event_bridge,
+        task_resume_command,
+    )
+    from xagent.web.services.task_command_execution import (
+        execute_durable_task_command,
+    )
+    from xagent.web.services.task_command_transport import (
+        dispatch_one_task_command,
+    )
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id)
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).one().lease_attempt_id = None
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", MagicMock())
+    monkeypatch.setattr(
+        task_resume_command, "get_task_reply_wait_timeout_seconds", lambda: 0.05
+    )
+    body = {**_reply_body(agent_id), "command_id": "fenced-reply"}
+    try:
+        # No worker ran yet: the outcome is genuinely unknown.
+        first = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert first.status_code == 504, first.text
+        assert first.json()["error"]["details"]["accepted"] is True
+
+        # The task moved on before the worker's handoff: state_changed.
+        db = _direct_db_session()
+        try:
+            db.query(Task).filter(Task.id == task_id).one().state_version += 1
+            db.commit()
+        finally:
+            db.close()
+        prepare = AsyncMock()
+        with patch.object(task_resume, "resume_task_reply", prepare):
+            async with asyncio.timeout(DB_PROGRESS_TIMEOUT):
+                while not await dispatch_one_task_command(execute_durable_task_command):
+                    await asyncio.sleep(0.05)
+        prepare.assert_not_awaited()
+        db = _direct_db_session()
+        try:
+            row = (
+                db.query(TaskExecutionCommand)
+                .filter(TaskExecutionCommand.command_id == "fenced-reply")
+                .one()
+            )
+            assert row.status == "failed"
+            assert row.result == {"rejection_reason": "state_changed"}
+        finally:
+            db.close()
+
+        replay = client.post(
+            f"/v1/chat/tasks/{task_id}/reply", headers=_bearer(full_key), json=body
+        )
+        assert replay.status_code == 409, replay.text
+        assert replay.json()["error"]["code"] == "task_busy"
+        assert replay.json()["error"]["details"] == {
+            "accepted": False,
+            "task_id": task_id,
+            "retry_with_new_id": True,
+        }
+    finally:
+        await task_coordinator_runtime.close_task_coordinators()
+
+
+@pytest.mark.parametrize(("restored", "expected"), [(True, 0), (False, 1)])
+def test_reply_prelease_retained_for_recovery_records_unsettled(
+    mock_start_task, restored: bool, expected: int
+):
+    """A rejected reply's prelease either is restored or is sticky unsettled evidence.
+
+    The fenced rejection restores the prelease (the case above). When that
+    restore is not confirmed, the run is retained for TTL recovery, which a
+    pooled release must see before it may stop this process.
+    """
+    from xagent.web.services import release_hold as release_hold_module
+
+    hold = release_hold_module.release_hold
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id=f"prelease-{restored}")
+    _seed_active_interaction_row(
+        task_id, run_id=f"prelease-{restored}", idempotency_key=f"prelease-q-{restored}"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE)
+    agent_patch, _agent = _patch_agent_service(post)
+    restore_patch = (
+        contextlib.nullcontext()
+        if restored
+        else patch(
+            "xagent.web.services.task_resume._restore_reply_prelease_isolated",
+            new=AsyncMock(return_value=False),
+        )
+    )
+    before = hold.unsettled_total
+    with (
+        agent_patch,
+        restore_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 409, response.text
+    assert hold.unsettled_total - before == expected
+    if expected:
+        assert hold.snapshot()["unsettled"][-1]["kind"] == "prelease"

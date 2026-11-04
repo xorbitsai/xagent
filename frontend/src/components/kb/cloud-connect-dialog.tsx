@@ -1,0 +1,760 @@
+import { useState, useEffect, useRef, useCallback } from "react"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Select } from "@/components/ui/select"
+import { ConfirmDialog } from "@/components/ui/confirm-dialog"
+import { useI18n } from "@/contexts/i18n-context"
+import {
+  Check,
+  ChevronRight,
+  Folder,
+  File,
+  Loader2,
+  Search,
+  RefreshCw,
+  Trash2,
+  FolderOpen,
+} from "lucide-react"
+import { toast } from "@/components/ui/sonner"
+import { getApiUrl } from "@/lib/utils"
+import { apiRequest } from "@/lib/api-wrapper"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
+import {
+  loadGooglePicker,
+  sanitizeGooglePickerDocuments,
+} from "@/lib/google-picker"
+
+export interface CloudFile {
+  id: string
+  name: string
+  type: 'file' | 'folder'
+  accountId?: number
+  size?: string
+  updatedAt?: string
+  resourceKey?: string
+}
+
+interface ConnectedAccount {
+  id: number
+  provider: string
+  email: string
+  created_at: string
+}
+
+// Keep in sync with CloudIngestRequest.files max_length in src/xagent/web/api/kb.py.
+const MAX_CLOUD_INGEST_FILES = 5
+
+function formatCloudFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+interface CloudConnectDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  provider: {
+    id: string
+    name: string
+    hasDrives: boolean
+    authPath: string
+    logo: string
+  } | null
+  initialSelectedFiles?: CloudFile[]
+  onConfirm: (selectedFiles: CloudFile[]) => void
+  onPickerOpenChange?: (open: boolean) => void
+}
+
+export function CloudConnectDialog({
+  open,
+  onOpenChange,
+  provider,
+  initialSelectedFiles = [],
+  onConfirm,
+  onPickerOpenChange,
+}: CloudConnectDialogProps) {
+  const { t } = useI18n()
+
+  // Internal state
+  const [cloudUser, setCloudUser] = useState<string | undefined>()
+  const [selectedDrive, setSelectedDrive] = useState<string>("")
+  const [currentPath, setCurrentPath] = useState<{ id: string, name: string }[]>([])
+  const [selectedFiles, setSelectedFiles] = useState<CloudFile[]>([])
+  const [files, setFiles] = useState<CloudFile[]>([])
+  const [searchQuery, setSearchQuery] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [accountsLoading, setAccountsLoading] = useState(false)
+  const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
+  const [driveOptions, setDriveOptions] = useState<{ value: string, label: string }[]>([])
+  const [refreshTrigger, setRefreshTrigger] = useState(0)
+  const [accountToDelete, setAccountToDelete] = useState<{ id: number | null, email: string | null }>({ id: null, email: null })
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false)
+  const [pickerLoading, setPickerLoading] = useState(false)
+  const [pickerLimitWarning, setPickerLimitWarning] = useState(false)
+  const [pickerConfigured, setPickerConfigured] = useState<boolean | null>(null)
+  const [isPickerOpen, setIsPickerOpen] = useState(false)
+  const pickerOpenRef = useRef(false)
+  const oauthPopupRef = useRef<Window | null>(null)
+  const selectedFilesRef = useRef<CloudFile[]>([])
+
+  const setPickerOpen = useCallback((isOpen: boolean) => {
+    pickerOpenRef.current = isOpen
+    setIsPickerOpen(isOpen)
+    onPickerOpenChange?.(isOpen)
+  }, [onPickerOpenChange])
+
+  // Helper to check if selected
+  const isSelected = (id: string) => selectedFiles.some(f => f.id === id)
+
+  // Fetch connected accounts
+  const fetchAccounts = useCallback(async () => {
+    if (!provider) return
+
+    setAccountsLoading(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/cloud/accounts?provider=${provider.id}`)
+
+      if (response.ok) {
+        const data = await response.json()
+        setConnectedAccounts(data)
+      }
+    } catch (error) {
+      console.error("Failed to fetch connected accounts", error)
+    } finally {
+      setAccountsLoading(false)
+    }
+  }, [provider])
+
+  useEffect(() => {
+    if (provider?.id !== "google-drive") {
+      setPickerConfigured(null)
+      return
+    }
+    let cancelled = false
+    apiRequest(`${getApiUrl()}/api/cloud/google-drive/picker-availability`)
+      .then(async (response) => {
+        if (cancelled) return
+        if (!response.ok) {
+          setPickerConfigured(false)
+          return
+        }
+        const data = await response.json() as { configured?: boolean }
+        setPickerConfigured(data.configured === true)
+      })
+      .catch(() => {
+        if (!cancelled) setPickerConfigured(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [provider?.id])
+
+  // Handle OAuth login
+  const handleAuth = () => {
+    if (!provider) return
+    const width = 500
+    const height = 600
+    const left = window.screen.width / 2 - width / 2
+    const top = window.screen.height / 2 - height / 2
+
+    oauthPopupRef.current?.close()
+    oauthPopupRef.current = openOAuthAuthorizationPopup({
+      provider: provider.authPath, appId: provider.id,
+      name: `${provider.name} Auth`,
+      features: `width=${width},height=${height},left=${left},top=${top}`,
+    })
+    if (!oauthPopupRef.current) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.")
+    }
+  }
+
+  const openGooglePicker = async () => {
+    if (!provider || provider.id !== "google-drive" || !cloudUser) return
+
+    const selectedAccount = connectedAccounts.find(
+      account => (account.email || `Account ${account.id}`) === cloudUser,
+    )
+    if (!selectedAccount) return
+
+    setPickerOpen(true)
+    setPickerLoading(true)
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/cloud/google-drive/picker-config?account_id=${selectedAccount.id}`,
+      )
+      if (!response.ok) {
+        if (response.status === 401) setCloudUser(undefined)
+        throw new Error(
+          response.status === 401
+            ? t("kb.dialog.cloudConnect.auth.expired")
+            : response.status === 409
+              ? t("kb.dialog.cloudConnect.picker.reconnect")
+            : response.status === 503
+              ? t("kb.dialog.cloudConnect.picker.notConfigured")
+              : t("kb.dialog.cloudConnect.picker.error"),
+        )
+      }
+      const config = await response.json() as {
+        access_token?: string
+        developer_key?: string
+        app_id?: string
+      }
+      if (!config.access_token || !config.developer_key || !config.app_id) {
+        throw new Error(t("kb.dialog.cloudConnect.picker.notConfigured"))
+      }
+
+      await loadGooglePicker()
+      const pickerApi = window.google?.picker
+      if (!pickerApi) throw new Error(t("kb.dialog.cloudConnect.picker.error"))
+
+      const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
+        .setIncludeFolders(true)
+        .setEnableDrives(true)
+        // Folders remain available for navigation, but only files are
+        // selectable. `drive.file` does not reliably grant access to every
+        // child of a selected folder, so ingesting a folder would be
+        // misleading and would fail later for most users.
+        .setSelectFolderEnabled(false)
+      const picker = new pickerApi.PickerBuilder()
+        .setDeveloperKey(config.developer_key)
+        .setAppId(config.app_id)
+        .setOAuthToken(config.access_token)
+        .addView(docsView)
+        .enableFeature(pickerApi.Feature.MULTISELECT_ENABLED)
+        .setCallback(data => {
+          if (data.action !== pickerApi.Action.PICKED) {
+            if (data.action === pickerApi.Action.CANCEL) setPickerOpen(false)
+            return
+          }
+          setPickerOpen(false)
+
+          const pickedFiles: CloudFile[] = []
+          for (const document of sanitizeGooglePickerDocuments(data.docs)) {
+            const isFolder = document.mimeType === "application/vnd.google-apps.folder"
+            if (isFolder) continue
+            const file: CloudFile = {
+              id: document.id,
+              name: document.name || document.id,
+              type: "file",
+              accountId: selectedAccount.id,
+              resourceKey: document.resourceKey,
+              size: typeof document.sizeBytes === "number"
+                ? formatCloudFileSize(document.sizeBytes)
+                : undefined,
+            }
+            pickedFiles.push(file)
+          }
+
+          if (pickedFiles.length > 0) {
+            const merged = [...selectedFilesRef.current, ...pickedFiles]
+            const unique = merged.filter(
+              (file, index, all) => all.findIndex(item => item.id === file.id) === index,
+            )
+            const next = unique.slice(0, MAX_CLOUD_INGEST_FILES)
+            selectedFilesRef.current = next
+            setSelectedFiles(next)
+            if (unique.length > MAX_CLOUD_INGEST_FILES) setPickerLimitWarning(true)
+          }
+          setRefreshTrigger(value => value + 1)
+        })
+        .build()
+      picker.setVisible(true)
+    } catch (error) {
+      setPickerOpen(false)
+      console.error("Failed to open Google Drive Picker", error)
+      toast.error(error instanceof Error
+        ? error.message
+        : t("kb.dialog.cloudConnect.picker.error"))
+    } finally {
+      setPickerLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    const messageHandler = async (event: MessageEvent) => {
+      if (provider && isOAuthSuccessMessage(event, oauthPopupRef.current, provider.id)) {
+        oauthPopupRef.current = null
+        await fetchAccounts()
+        setCloudUser(event.data.email)
+        toast.success(t("kb.dialog.cloudConnect.auth.success"))
+      }
+    }
+
+    window.addEventListener("message", messageHandler)
+    return () => window.removeEventListener("message", messageHandler)
+  }, [fetchAccounts, t, provider])
+
+  // Toggle selection
+  const toggleSelection = (file: CloudFile) => {
+    if (isSelected(file.id)) {
+      const next = selectedFilesRef.current.filter(f => f.id !== file.id)
+      selectedFilesRef.current = next
+      setSelectedFiles(next)
+    } else {
+      if (selectedFiles.length >= MAX_CLOUD_INGEST_FILES) {
+        toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+          count: MAX_CLOUD_INGEST_FILES,
+        }))
+        return
+      }
+      const next = [...selectedFilesRef.current, file]
+      selectedFilesRef.current = next
+      setSelectedFiles(next)
+    }
+  }
+
+  // Reset state when provider changes
+  useEffect(() => {
+    oauthPopupRef.current?.close()
+    oauthPopupRef.current = null
+    setCloudUser(undefined)
+    setSelectedDrive("")
+    setCurrentPath([])
+    setFiles([])
+    selectedFilesRef.current = []
+    setSelectedFiles([])
+    setConnectedAccounts([])
+  }, [provider?.id])
+
+  // Fetch connected accounts on mount
+  useEffect(() => {
+    fetchAccounts()
+  }, [provider?.id])
+
+  // Fetch drives when account changes
+  useEffect(() => {
+    if (!cloudUser || !provider?.hasDrives) return
+
+    const fetchDrives = async () => {
+      try {
+        const selectedAccount = connectedAccounts.find(acc => (acc.email || `Account ${acc.id}`) === cloudUser)
+        const accountIdParam = selectedAccount ? `?account_id=${selectedAccount.id}` : ''
+
+        const response = await apiRequest(`${getApiUrl()}/api/cloud/${provider.id}/drives${accountIdParam}`)
+
+        if (response.ok) {
+          const data = await response.json()
+          const options = data.map((d: any) => ({
+            value: d.id,
+            label: d.name
+          }))
+          setDriveOptions(options)
+
+          // Ensure selectedDrive is valid
+          if (!options.find((o: any) => o.value === selectedDrive)) {
+            if (options.length > 0) setSelectedDrive(options[0].value)
+          }
+        }
+      } catch (error) {
+        console.error("Failed to fetch drives", error)
+      }
+    }
+
+    fetchDrives()
+  }, [cloudUser, connectedAccounts, provider?.id])
+
+  // Fetch files from backend
+  useEffect(() => {
+    if (!cloudUser || !provider) return
+
+    if (provider.hasDrives && !selectedDrive) return
+
+    const fetchFiles = async () => {
+      // Find selected account ID
+      const selectedAccount = connectedAccounts.find(acc => (acc.email || `Account ${acc.id}`) === cloudUser)
+      if (!selectedAccount) return
+
+      setLoading(true)
+      try {
+        const folderId = currentPath.length > 0
+          ? currentPath[currentPath.length - 1].id
+          : (provider.hasDrives ? selectedDrive : 'root')
+        // Use relative URL or configured API base
+
+        const accountIdParam = `&account_id=${selectedAccount.id}`
+
+        const response = await apiRequest(`${getApiUrl()}/api/cloud/${provider.id}/files?folder_id=${folderId}${accountIdParam}`)
+
+        if (response.ok) {
+          const data = await response.json()
+          setFiles(data.map((file: CloudFile) => ({
+            ...file,
+            accountId: selectedAccount.id,
+          })))
+        } else {
+          if (response.status === 401) {
+            setCloudUser(undefined) // Reset user if token invalid
+            toast.error(t("kb.dialog.cloudConnect.auth.expired"))
+          } else {
+            toast.error(t("kb.dialog.cloudConnect.error.fetchFailed"))
+          }
+        }
+      } catch (error) {
+        console.error(error)
+        toast.error(t("kb.dialog.cloudConnect.error.fetchFailed"))
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    fetchFiles()
+  }, [cloudUser, currentPath, connectedAccounts, selectedDrive, provider?.id, refreshTrigger])
+
+  // Sync initial selection when opening
+  const prevOpen = useRef(open)
+  useEffect(() => {
+    if (open && !prevOpen.current) {
+      selectedFilesRef.current = initialSelectedFiles
+      setSelectedFiles(initialSelectedFiles)
+    }
+    prevOpen.current = open
+  }, [open, initialSelectedFiles])
+
+  useEffect(() => {
+    selectedFilesRef.current = selectedFiles
+  }, [selectedFiles])
+
+  useEffect(() => {
+    if (!pickerLimitWarning) return
+    toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+      count: MAX_CLOUD_INGEST_FILES,
+    }))
+    setPickerLimitWarning(false)
+  }, [pickerLimitWarning, t])
+
+  // Reset current path when drive changes
+  useEffect(() => {
+    setCurrentPath([])
+  }, [selectedDrive])
+
+  const handleConfirm = () => {
+    onConfirm(selectedFiles)
+    onOpenChange(false)
+  }
+
+  const handleCancel = () => {
+    onOpenChange(false)
+  }
+
+  // Handle account deletion
+  const handleDeleteAccount = async () => {
+    if (!accountToDelete) return
+
+    setIsDeletingAccount(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/cloud/accounts/${accountToDelete.id}`, {
+        method: "DELETE",
+      })
+
+      if (response.ok) {
+        toast.success(t("kb.dialog.cloudConnect.auth.deleteSuccess"))
+        const accountWasSelected = connectedAccounts.find(acc => acc.id === accountToDelete.id)?.email === cloudUser ||
+          connectedAccounts.find(acc => acc.id === accountToDelete.id)?.id.toString() === cloudUser?.replace('Account ', '')
+        if (accountWasSelected) {
+          setCloudUser(undefined)
+          setSelectedDrive("")
+          setCurrentPath([])
+          setFiles([])
+        }
+        await fetchAccounts()
+      } else {
+        toast.error(t("kb.dialog.cloudConnect.auth.deleteFailed"))
+      }
+    } catch (error) {
+      console.error("Failed to delete account", error)
+      toast.error(t("kb.dialog.cloudConnect.auth.deleteFailed"))
+    } finally {
+      setIsDeletingAccount(false)
+      setAccountToDelete({ id: null, email: null })
+    }
+  }
+
+  // Filter files based on search
+  const filteredFiles = files.filter(f =>
+    f.name.toLowerCase().includes(searchQuery.toLowerCase())
+  )
+
+  const folders = filteredFiles.filter(f => f.type === 'folder')
+  const fileItems = filteredFiles.filter(f => f.type === 'file')
+
+  return (
+    <Dialog modal={!isPickerOpen} open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="sm:max-w-[900px] h-[80vh] max-h-[800px] flex flex-col"
+        onInteractOutside={(event) => {
+          // The Google Picker is rendered in a separate portal. While it is
+          // open, an outside click belongs to the Picker, not this dialog.
+          if (pickerOpenRef.current) event.preventDefault()
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>
+            {t("kb.dialog.cloudConnect.auth.title", {
+              provider: provider?.name || t("kb.dialog.cloudConnect.auth.defaultProvider")
+            })}
+          </DialogTitle>
+        </DialogHeader>
+
+        <div className="flex-1 overflow-hidden flex flex-col space-y-4 py-4">
+          {/* Account Selection Section */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label>{t("kb.dialog.cloudConnect.auth.selectAccount")}</Label>
+              {accountsLoading && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
+            </div>
+            <Select
+              disabled={accountsLoading}
+              value={cloudUser}
+              onValueChange={(value) => {
+                if (value === "add_new") {
+                  handleAuth()
+                } else {
+                  setCloudUser(value)
+                }
+              }}
+              options={[
+                ...connectedAccounts
+                  .filter(acc => acc.provider === provider?.id)
+                  .map(acc => ({
+                    value: acc.email || `Account ${acc.id}`,
+                    label: acc.email
+                      ? t("kb.dialog.cloudConnect.auth.accountProviderLabel", { email: acc.email, provider: provider?.name || t("kb.dialog.cloudConnect.auth.defaultProvider") })
+                      : t("kb.dialog.cloudConnect.auth.accountLabel", { id: acc.id }),
+                    actionIcon: <Trash2 className="h-4 w-4 text-red-500 hover:text-red-600" />,
+                    onAction: (e: React.MouseEvent) => {
+                      e.stopPropagation()
+                      setAccountToDelete({ id: acc.id, email: acc.email })
+                    }
+                  })),
+                { value: "add_new", label: t("kb.dialog.cloudConnect.auth.addAccount") }
+              ]}
+              placeholder={t("kb.dialog.cloudConnect.select.accountPlaceholder")}
+            />
+            {provider?.id === "google-drive" && cloudUser && pickerConfigured === true && (
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                onClick={openGooglePicker}
+                disabled={pickerLoading}
+              >
+                {pickerLoading
+                  ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  : <FolderOpen className="mr-2 h-4 w-4" />}
+                {t("kb.dialog.cloudConnect.picker.open")}
+              </Button>
+            )}
+          </div>
+
+          {/* Drive Selection */}
+          {provider?.hasDrives && (
+            <div className="space-y-2">
+              <Label>{t("kb.dialog.cloudConnect.select.driveLabel")}</Label>
+              <Select
+                value={selectedDrive}
+                onValueChange={setSelectedDrive}
+                options={driveOptions}
+                disabled={!cloudUser}
+                placeholder={t("kb.dialog.cloudConnect.select.drivePlaceholder")}
+              />
+            </div>
+          )}
+
+          {/* Main Content Area - Split View */}
+          <div className="flex-1 grid grid-cols-2 gap-6 min-h-0">
+            {/* Left Column: File Browser */}
+            <div className="flex flex-col border rounded-md overflow-hidden">
+              {/* Search Bar */}
+              <div className="p-2 border-b">
+                <div className="relative">
+                  <Input
+                    placeholder={t("kb.dialog.cloudConnect.search.placeholder")}
+                    className="pl-8 h-9"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    disabled={!cloudUser}
+                  />
+                  <div className="absolute left-2.5 top-2.5 text-muted-foreground">
+                    <Search className="h-4 w-4" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Breadcrumbs */}
+              <div className="flex items-center justify-between p-2 border-b bg-muted/20">
+                <div className="flex items-center gap-1 text-sm text-muted-foreground">
+                  <span
+                    className="hover:underline cursor-pointer hover:text-foreground transition-colors"
+                    onClick={() => setCurrentPath([])}
+                  >
+                    {provider?.hasDrives ? (driveOptions.find(o => o.value === selectedDrive)?.label || selectedDrive) : provider?.name}
+                  </span>
+                  {currentPath.map((folder, index) => (
+                    <div key={index} className="flex items-center gap-1">
+                      <ChevronRight size={14} />
+                      <span
+                        className={`hover:underline cursor-pointer hover:text-foreground transition-colors ${index === currentPath.length - 1 ? "font-medium text-foreground" : ""}`}
+                        onClick={() => setCurrentPath(prev => prev.slice(0, index + 1))}
+                      >
+                        {folder.name}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                  onClick={() => setRefreshTrigger(prev => prev + 1)}
+                  disabled={loading || !cloudUser || (provider?.hasDrives && !selectedDrive)}
+                  title={t("common.refresh")}
+                >
+                  <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
+                </Button>
+              </div>
+
+              {/* File List */}
+              <ScrollArea className="flex-1 overflow-auto">
+                <div className="p-2">
+                  {loading ? (
+                    <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
+                      <Loader2 className="h-8 w-8 animate-spin mb-2 opacity-50" />
+                      <span className="text-xs">{t("kb.dialog.cloudConnect.loading")}</span>
+                    </div>
+                  ) : (
+                    <>
+                      {folders.length === 0 && fileItems.length === 0 ? (
+                        <div className="text-center text-muted-foreground py-8">
+                          {searchQuery
+                            ? t("kb.dialog.cloudConnect.fileList.noMatchingFiles")
+                            : t("kb.dialog.cloudConnect.fileList.noFiles")}
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          {/* Folders Section */}
+                          {folders.length > 0 && (
+                            <div>
+                              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">
+                                {t("kb.dialog.cloudConnect.fileList.headers.folders")}
+                              </h3>
+                              <div className="space-y-1">
+                                {folders.map(folder => (
+                                  <div
+                                    key={folder.id}
+                                    className="flex items-center gap-2 p-2 hover:bg-muted/50 rounded-md cursor-pointer group"
+                                    onClick={() => setCurrentPath(prev => [...prev, { id: folder.id, name: folder.name }])}
+                                  >
+                                    <Folder className="h-5 w-5 text-blue-500 fill-blue-500/20" />
+                                    <span className="truncate flex-1 text-sm font-medium">{folder.name}</span>
+                                    <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Files Section */}
+                          {fileItems.length > 0 && (
+                            <div>
+                              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-2">
+                                {t("kb.dialog.cloudConnect.fileList.headers.files")}
+                              </h3>
+                              <div className="space-y-1">
+                                {fileItems.map(file => {
+                                  const selected = isSelected(file.id)
+                                  return (
+                                    <div
+                                      key={file.id}
+                                      className={`flex items-center gap-2 p-2 rounded-md cursor-pointer transition-colors ${selected
+                                        ? "bg-primary/10 text-primary hover:bg-primary/15"
+                                        : "hover:bg-muted/50"
+                                        }`}
+                                      onClick={() => toggleSelection(file)}
+                                    >
+                                      <div className={`flex items-center justify-center w-4 h-4 rounded border ${selected
+                                        ? "bg-primary border-primary text-primary-foreground"
+                                        : "border-muted-foreground/30 bg-background"
+                                        }`}>
+                                        {selected && <Check className="h-3 w-3" />}
+                                      </div>
+                                      <File className="h-4 w-4 text-muted-foreground" />
+                                      <div className="flex flex-col flex-1 min-w-0">
+                                        <span className="truncate text-sm font-medium">{file.name}</span>
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </ScrollArea>
+            </div>
+
+            {/* Right Column: Selected Files */}
+            <div className="flex flex-col border rounded-md overflow-hidden">
+              <div className="p-3 border-b bg-muted/20 font-medium text-sm flex items-center justify-between">
+                {t("kb.dialog.cloudConnect.selectedFiles.title")}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-foreground h-8 text-xs"
+                  onClick={() => setSelectedFiles([])}
+                  disabled={selectedFiles.length === 0}
+                >
+                  {t("kb.dialog.cloudConnect.selectedFiles.clearAll")}
+                </Button>
+              </div>
+              <ScrollArea className="flex-1 overflow-auto">
+                <div className="p-2 space-y-1">
+                  {selectedFiles.map(file => (
+                    <div key={file.id} className="flex items-center gap-2 p-2 rounded-md hover:bg-muted/50 group text-sm cursor-pointer" onClick={() => toggleSelection(file)}>
+                      <div className="w-4 h-4 bg-primary text-primary-foreground rounded flex items-center justify-center">
+                        <Check className="h-3 w-3" />
+                      </div>
+                      <File className="h-4 w-4 text-muted-foreground" />
+                      <span className="truncate flex-1">{file.name}</span>
+                    </div>
+                  ))}
+                  {selectedFiles.length === 0 && (
+                    <div className="p-8 text-center text-muted-foreground text-sm">
+                      {t("kb.dialog.cloudConnect.selectedFiles.empty")}
+                    </div>
+                  )}
+                </div>
+              </ScrollArea>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-2 pt-2 border-t mt-auto">
+          <Button variant="outline" onClick={handleCancel}>
+            {t("kb.dialog.cloudConnect.select.cancel")}
+          </Button>
+          <Button onClick={handleConfirm} disabled={selectedFiles.length === 0}>
+            {t("kb.dialog.cloudConnect.select.confirm")}
+          </Button>
+        </div>
+      </DialogContent>
+
+      <ConfirmDialog
+        isOpen={accountToDelete.id !== null}
+        onOpenChange={(open) => {
+          if (!open) setAccountToDelete({ id: null, email: null })
+        }}
+        onConfirm={handleDeleteAccount}
+        isLoading={isDeletingAccount}
+        title={t("kb.dialog.cloudConnect.auth.deleteAccount")}
+        description={t("kb.dialog.cloudConnect.auth.deleteConfirm", { email: accountToDelete.email || "" })}
+      />
+    </Dialog>
+  )
+}

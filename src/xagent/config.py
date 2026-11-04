@@ -1,0 +1,4754 @@
+"""Core configuration for xagent.
+
+Provides unified configuration for all paths and directories that can be used
+by both core and web modules without creating circular dependencies.
+
+All paths support environment variable overrides for portable deployments.
+
+Environment Variable Naming Convention:
+    Most config variables use the XAGENT_* prefix for consistency.
+    Exceptions (without XAGENT_ prefix) are kept for backward compatibility:
+    - SANDBOX_*: Sandbox container configuration (predates this module)
+    - BOXLITE_HOME_DIR: Boxlite sandbox home directory
+    - DATABASE_URL: Standard database connection URL
+    - LANCEDB_PATH: LanceDB database path
+
+Future enhancement: Consider migrating to pydantic-settings for more robust
+configuration management with validation, type safety, and better structure.
+"""
+
+from __future__ import annotations
+
+import base64
+import enum
+import functools
+import json
+import logging
+import math
+import os
+import re
+import tempfile
+from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
+
+logger = logging.getLogger(__name__)
+
+# Environment variable names
+UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
+WEB_DIR = "XAGENT_WEB_DIR"
+FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
+# Shared with the frontend build; runtime value is needed by packaged SPA CSP.
+HTML_PREVIEW_ORIGIN = "NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN"
+IMAGE_DOWNLOAD_MAX_BYTES = "XAGENT_IMAGE_DOWNLOAD_MAX_BYTES"
+VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
+REMOTE_JSON_DOWNLOAD_MAX_BYTES = "XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES"
+EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
+EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
+INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
+INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
+WORKER_COUNT = "XAGENT_WORKER_COUNT"
+CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
+TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
+ENCRYPTION_KEY = "ENCRYPTION_KEY"
+ENCRYPTION_MIGRATION_KEY = "XAGENT_ENCRYPTION_MIGRATION_KEY"
+# Public development fallback; runtime credential storage must reject it.
+DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
+TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
+TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
+TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
+TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
+TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
+TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
+TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
+TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
+TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
+TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
+TASK_AUTO_RESUME_WINDOW_SECONDS = "XAGENT_TASK_AUTO_RESUME_WINDOW_SECONDS"
+TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS"
+)
+TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN = "XAGENT_TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN"
+TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS = "XAGENT_TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS"
+TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS"
+)
+TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS = (
+    "XAGENT_TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS"
+)
+# Shared task command dispatcher.
+DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
+DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS = (
+    "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS"
+)
+DISPATCHER_FAIR_SHARE = "XAGENT_DISPATCHER_FAIR_SHARE"
+DISPATCH_ACCEPT_REQUESTED_CLASS = "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
+UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
+    "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
+)
+UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
+UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+CONVERSATION_RETENTION_DAYS = "XAGENT_CONVERSATION_RETENTION_DAYS"
+TRACE_RETENTION_DAYS = "XAGENT_TRACE_RETENTION_DAYS"
+RETENTION_ENABLED = "XAGENT_RETENTION_ENABLED"
+RETENTION_DRY_RUN = "XAGENT_RETENTION_DRY_RUN"
+RETENTION_BATCH_SIZE = "XAGENT_RETENTION_BATCH_SIZE"
+RETENTION_SWEEP_INTERVAL_SECONDS = "XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS"
+RETENTION_BATCH_PAUSE_SECONDS = "XAGENT_RETENTION_BATCH_PAUSE_SECONDS"
+TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = (
+    "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+)
+STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
+NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
+NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
+BROWSER_TOOL_DEFAULT_LOCALE = "XAGENT_BROWSER_TOOL_DEFAULT_LOCALE"
+BROWSER_TOOL_DEFAULT_TIMEZONE = "XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE"
+BROWSER_ALLOW_UNSANDBOXED = "XAGENT_BROWSER_ALLOW_UNSANDBOXED"
+BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
+BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
+BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
+BROWSER_CUA_DRIVER_MAX_ELEMENTS = "XAGENT_BROWSER_CUA_DRIVER_MAX_ELEMENTS"
+SUPPORTED_NATIVE_BROWSER_APP_NAMES = frozenset(
+    {
+        "Brave Browser",
+        "Google Chrome",
+        "Google Chrome Canary",
+        "Chromium",
+        "Microsoft Edge",
+        "Vivaldi",
+    }
+)
+_NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD = {
+    name.casefold(): name for name in SUPPORTED_NATIVE_BROWSER_APP_NAMES
+}
+MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
+FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
+FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
+FILE_MATERIALIZE_DIR = "XAGENT_FILE_MATERIALIZE_DIR"
+PREVIEW_TMP_DIR = "XAGENT_PREVIEW_TMP_DIR"
+FILE_STORAGE_STARTUP_SYNC_ENABLED = "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
+FILE_DELIVERY_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_REDIRECT_ENABLED"
+FILE_DELIVERY_SIGNED_URL_TTL_SECONDS = "XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
+FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
+FILE_STREAM_TICKET_TTL_SECONDS = "XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"
+EXTERNAL_MEDIA_URL_TTL_SECONDS = "XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS"
+SANDBOX_IMAGE = "SANDBOX_IMAGE"
+LANCEDB_PATH = "LANCEDB_PATH"
+KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
+KB_SEARCH_TIMEOUT_SECONDS = "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
+GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS = "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS"
+DEEPDOC_XINFERENCE_URL = "XAGENT_DEEPDOC_XINFERENCE_URL"
+DEEPDOC_XINFERENCE_API_KEY = "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
+DEEPDOC_XINFERENCE_TIMEOUT_SECONDS = "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+DEEPDOC_XINFERENCE_MODEL_UID = "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+DEEPDOC_XINFERENCE_USERNAME = "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+DEEPDOC_XINFERENCE_PASSWORD = "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
+DATABASE_URL = "DATABASE_URL"
+DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
+DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
+DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
+SQL_WORKER_URL = "XAGENT_SQL_WORKER_URL"
+SQL_WORKER_TOKEN = "XAGENT_SQL_WORKER_TOKEN"
+SQL_WORKER_HOST = "XAGENT_SQL_WORKER_HOST"
+SQL_WORKER_PORT = "XAGENT_SQL_WORKER_PORT"
+SQL_WORKER_QUERY_TIMEOUT_SECONDS = "XAGENT_SQL_WORKER_QUERY_TIMEOUT_SECONDS"
+SQL_WORKER_MAX_ROWS = "XAGENT_SQL_WORKER_MAX_ROWS"
+SQL_WORKER_MAX_RESULT_BYTES = "XAGENT_SQL_WORKER_MAX_RESULT_BYTES"
+SQL_WORKER_MAX_QUERY_BYTES = "XAGENT_SQL_WORKER_MAX_QUERY_BYTES"
+SQL_WORKER_MAX_CONCURRENCY = "XAGENT_SQL_WORKER_MAX_CONCURRENCY"
+RUNTIME_TELEMETRY_ENABLED = "XAGENT_RUNTIME_TELEMETRY_ENABLED"
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+OTEL_EXPORT_INTERVAL_MILLISECONDS = "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS"
+OTEL_SERVICE_NAME = "XAGENT_OTEL_SERVICE_NAME"
+_STANDARD_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+_STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
+_STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
+_STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
+MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
+LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
+LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
+AUTO_PRIMARY_MAX_ATTEMPTS = "XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS"
+AUTO_CANDIDATE_COOLDOWN_SECONDS = "XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS"
+LLM_STREAM_EMPTY_DELTA_LIMIT = "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT"
+LLM_STREAM_DEGENERATE_WINDOW = "XAGENT_LLM_STREAM_DEGENERATE_WINDOW"
+LLM_STREAM_DEGENERATE_MAX_PERIOD = "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD"
+LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
+LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
+SANDBOX_CPUS = "SANDBOX_CPUS"
+SANDBOX_MEMORY = "SANDBOX_MEMORY"
+SANDBOX_PIDS_LIMIT = "SANDBOX_PIDS_LIMIT"
+SANDBOX_ENV = "SANDBOX_ENV"
+SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
+# Set only inside the sandbox tool runner, which has no database credentials.
+SANDBOX_TOOL_RUNNER = "XAGENT_SANDBOX_TOOL_RUNNER"
+PYTHON_EXECUTOR_TIMEOUT_SECONDS = "XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS"
+SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
+SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
+SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
+SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
+SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
+SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
+SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
+SANDBOX_NETWORK = "XAGENT_SANDBOX_NETWORK"
+SANDBOX_WORKSPACE_MOUNT_MODE = "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE"
+SANDBOX_WORKSPACE_VOLUME = "XAGENT_SANDBOX_WORKSPACE_VOLUME"
+SANDBOX_WORKSPACE_VOLUME_ROOT = "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
+SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
+TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
+BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
+WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
+WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
+TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
+TASK_RUNTIME_HOOK_MAX_WORKERS = "XAGENT_TASK_RUNTIME_HOOK_MAX_WORKERS"
+TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
+    "XAGENT_TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS"
+)
+CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
+CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
+CHECKPOINT_GATE_STALL_WARNING_SECONDS = "XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS"
+ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
+TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
+DB_WRITE_RETRY_ATTEMPTS = "XAGENT_DB_WRITE_RETRY_ATTEMPTS"
+DB_WRITE_RETRY_BASE_DELAY_MS = "XAGENT_DB_WRITE_RETRY_BASE_DELAY_MS"
+DB_WRITE_RETRY_MAX_DELAY_MS = "XAGENT_DB_WRITE_RETRY_MAX_DELAY_MS"
+COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
+COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
+REDIS_URL = "XAGENT_REDIS_URL"
+HOT_PATH_CACHE_ENABLED = "XAGENT_HOT_PATH_CACHE_ENABLED"
+HOT_PATH_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
+HOT_PATH_TASK_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_TASK_CACHE_TTL_SECONDS"
+CELERY_ENABLED = "XAGENT_CELERY_ENABLED"
+CELERY_BROKER_URL = "XAGENT_CELERY_BROKER_URL"
+CELERY_RESULT_BACKEND = "XAGENT_CELERY_RESULT_BACKEND"
+BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
+    "XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS"
+)
+BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
+BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
+BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
+TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
+ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
+TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
+WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
+TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
+TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
+TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
+TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS = (
+    "XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS"
+)
+TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
+TRIGGER_CALLBACK_IP_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT"
+TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
+TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
+# Public share-channel abuse controls (#973). Each is a rate string in the
+# ``limits`` notation, e.g. "60/minute" or "500/day".
+SHARE_AUTH_RATE_LIMIT = "XAGENT_SHARE_AUTH_RATE_LIMIT"
+SHARE_AUTH_IP_RATE_LIMIT = "XAGENT_SHARE_AUTH_IP_RATE_LIMIT"
+SHARE_TASK_CREATE_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_RATE_LIMIT"
+SHARE_TASK_CREATE_TOKEN_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT"
+SHARE_WS_TURN_RATE_LIMIT = "XAGENT_SHARE_WS_TURN_RATE_LIMIT"
+SHARE_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT"
+SHARE_UPLOAD_RATE_LIMIT = "XAGENT_SHARE_UPLOAD_RATE_LIMIT"
+WIDGET_UPLOAD_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_RATE_LIMIT"
+WIDGET_UPLOAD_IP_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT"
+WIDGET_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT"
+WIDGET_WS_TURN_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT"
+WIDGET_WS_TURN_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_RATE_LIMIT"
+WIDGET_AUTH_RATE_LIMIT = "XAGENT_WIDGET_AUTH_RATE_LIMIT"
+WIDGET_AUTH_IP_RATE_LIMIT = "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT"
+WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
+WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
+WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
+WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
+SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
+SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
+GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
+GMAIL_PUBSUB_TOPIC_PREFIX = "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
+GMAIL_PUBSUB_SUBSCRIPTION_PREFIX = "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
+GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT = "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
+GMAIL_PUBSUB_TRANSPORT = "XAGENT_GMAIL_PUBSUB_TRANSPORT"
+GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
+PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
+S2S_API_BASE_URL = "XAGENT_S2S_API_BASE_URL"
+TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
+GOOGLE_RESTRICTED_SCOPES_ENABLED = "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED"
+GOOGLE_SHARED_OAUTH_GRANTS_ENABLED = "XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED"
+ZOOM_MEETING_WRITE_ENABLED = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
+GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
+GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
+GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
+PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+EMAIL_CONFIRMATION_EXPIRE_MINUTES = "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES"
+APP_BASE_URL = "XAGENT_APP_BASE_URL"
+SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
+SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
+SLACK_APP_TOKEN = "XAGENT_SLACK_APP_TOKEN"
+SLACK_REDIRECT_URI = "XAGENT_SLACK_REDIRECT_URI"
+SMTP_HOST = "XAGENT_SMTP_HOST"
+SMTP_PORT = "XAGENT_SMTP_PORT"
+SMTP_USERNAME = "XAGENT_SMTP_USERNAME"
+SMTP_PASSWORD = "XAGENT_SMTP_PASSWORD"
+SMTP_USE_TLS = "XAGENT_SMTP_USE_TLS"
+SMTP_USE_SSL = "XAGENT_SMTP_USE_SSL"
+SMTP_FROM_EMAIL = "XAGENT_SMTP_FROM_EMAIL"
+SMTP_FROM_NAME = "XAGENT_SMTP_FROM_NAME"
+GOOGLE_OIDC_CLIENT_ID = "XAGENT_GOOGLE_OIDC_CLIENT_ID"
+GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
+GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
+FRONTEND_URL = "XAGENT_FRONTEND_URL"
+CORS_ORIGINS = "XAGENT_CORS_ORIGINS"
+XAGENT_ENVIRONMENT = "XAGENT_ENVIRONMENT"
+ENVIRONMENT = "ENVIRONMENT"
+REQUIRE_SECURE_SECRETS = "XAGENT_REQUIRE_SECURE_SECRETS"
+OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
+OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
+SESSION_SECRET = "XAGENT_SESSION_SECRET"
+OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
+MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
+MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
+HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
+TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
+TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
+MODEL_PRIVATE_ENDPOINTS = "XAGENT_MODEL_PRIVATE_ENDPOINTS"
+MODEL_PRIVATE_CIDRS = "XAGENT_MODEL_PRIVATE_CIDRS"
+MCP_PRIVATE_ENDPOINTS = "XAGENT_MCP_PRIVATE_ENDPOINTS"
+MCP_PRIVATE_CIDRS = "XAGENT_MCP_PRIVATE_CIDRS"
+
+TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
+TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
+MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
+INLINE_FILE_DELIVERY_MAX_BYTES = "XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES"
+
+WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
+
+
+def get_agent_runtime() -> Literal["v1", "v2"]:
+    """Get the agent execution runtime version.
+
+    Priority:
+        1. XAGENT_AGENT_RUNTIME environment variable
+        2. "v1" default for compatibility
+
+    Returns:
+        "v1" or "v2"
+    """
+    runtime = os.getenv(AGENT_RUNTIME, "v1").strip().lower()
+    if runtime == "v1":
+        return "v1"
+    if runtime == "v2":
+        return "v2"
+    logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
+    return "v1"
+
+
+def get_interaction_protocol_mode() -> str:
+    """Raw XAGENT_INTERACTION_PROTOCOL_MODE reading: stripped and lowercased.
+
+    Returns the env value normalized for whitespace and case, or "legacy" if
+    the variable is unset or blank. Does not check that the result is one
+    of the three valid modes -- validating the parsed value and building a
+    policy out of it belongs to the interaction rollout policy owner
+    (``web/services/interaction_rollout.py``), not to this module. Unlike
+    ``get_agent_runtime`` above, an unrecognized value is not this
+    function's problem to warn about or fall back from.
+    """
+    value = os.getenv(INTERACTION_PROTOCOL_MODE)
+    if value is None or not value.strip():
+        return "legacy"
+    return value.strip().lower()
+
+
+def get_interaction_native_sources() -> list[str]:
+    """Raw XAGENT_INTERACTION_NATIVE_SOURCES reading: a normalized token list.
+
+    Comma-splits the env value, strips and lowercases each token, and skips
+    blank tokens -- the same shape ``get_external_upload_dirs`` below uses
+    for its own comma-separated list. Duplicate tokens are preserved and
+    tokens are not checked against any vocabulary here: deduplication and
+    vocabulary validation need to raise two distinguishable errors, and
+    producing those belongs to the interaction rollout policy owner, not to
+    this module.
+    """
+    raw = os.getenv(INTERACTION_NATIVE_SOURCES, "")
+    if not raw:
+        return []
+
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if token:
+            result.append(token)
+    return result
+
+
+def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
+    """Map UI execution mode to agent pattern name.
+
+    Supported modes:
+        flash: strict single call
+        balanced: ReAct
+        think: DAG plan-execute
+        auto: LLM-selected final answer / ReAct / DAG
+    """
+    mode = (execution_mode or "").strip().lower()
+    mapping = {
+        "flash": "single_call",
+        "balanced": "react",
+        "think": "dag_plan_execute",
+        "auto": "auto",
+    }
+    return mapping.get(mode, "react")
+
+
+def get_default_task_execution_mode(
+    *,
+    agent_id: object | None = None,
+    agent_runtime: str | None = None,
+) -> str:
+    """Get the default UI execution mode for a newly-created task.
+
+    Standalone tasks default to auto so simple prompts can answer directly while
+    complex prompts can still route into ReAct or DAG. Explicit v1 deployments
+    keep the legacy standalone DAG default for compatibility. Agent Builder
+    tasks keep balanced because the agent's explicit tool/KB setup is usually
+    better served by ReAct.
+    """
+    if agent_id is not None:
+        return "balanced"
+
+    if agent_runtime is not None:
+        runtime = agent_runtime.strip().lower()
+    else:
+        runtime = (os.getenv(AGENT_RUNTIME) or "").strip().lower()
+
+    if runtime == "v1":
+        return "think"
+    return "auto"
+
+
+def get_task_reply_wait_timeout_seconds() -> int:
+    """Get the shared reply preparation wait timeout (env override, default 30s)."""
+    value = os.getenv(TASK_REPLY_WAIT_TIMEOUT_SECONDS, "30")
+    try:
+        seconds = int(value)
+        if seconds > 0:
+            return seconds
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r; falling back to 30", TASK_REPLY_WAIT_TIMEOUT_SECONDS, value
+    )
+    return 30
+
+
+def get_task_lease_ttl_seconds() -> int:
+    """Get task execution lease TTL in seconds.
+
+    Priority:
+        1. XAGENT_TASK_LEASE_TTL_SECONDS environment variable
+        2. 60 seconds
+    """
+    value = os.getenv(TASK_LEASE_TTL_SECONDS, "60")
+    try:
+        seconds = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to 60",
+            TASK_LEASE_TTL_SECONDS,
+            value,
+        )
+        return 60
+    if seconds < 10:
+        logger.warning(
+            "%s=%r is too small; falling back to 60",
+            TASK_LEASE_TTL_SECONDS,
+            value,
+        )
+        return 60
+    return seconds
+
+
+def get_task_lease_heartbeat_seconds() -> int:
+    """Get task execution lease heartbeat interval in seconds.
+
+    Priority:
+        1. XAGENT_TASK_LEASE_HEARTBEAT_SECONDS environment variable
+        2. One third of the lease TTL, at least 5 seconds
+    """
+    default = max(5, get_task_lease_ttl_seconds() // 3)
+    value = os.getenv(TASK_LEASE_HEARTBEAT_SECONDS)
+    if value is None:
+        return default
+    try:
+        seconds = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to %s",
+            TASK_LEASE_HEARTBEAT_SECONDS,
+            value,
+            default,
+        )
+        return default
+    if seconds < 1:
+        logger.warning(
+            "%s=%r is too small; falling back to %s",
+            TASK_LEASE_HEARTBEAT_SECONDS,
+            value,
+            default,
+        )
+        return default
+    return min(seconds, max(1, get_task_lease_ttl_seconds() - 1))
+
+
+def get_task_lease_recovery_interval_seconds() -> int:
+    """Get the interval between automatic expired-lease recovery scans."""
+
+    default = max(5, get_task_lease_ttl_seconds() // 3)
+    return _get_positive_int_env(
+        TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
+        default,
+    )
+
+
+def get_task_lease_recovery_batch_size() -> int:
+    """Get the maximum number of expired leases scanned per recovery batch."""
+
+    return _get_positive_int_env(TASK_LEASE_RECOVERY_BATCH_SIZE, 100)
+
+
+def _get_strict_bool_env(env_var: str, default: bool) -> bool:
+    """Parse a boolean env var, warning and falling back on unrecognised values.
+
+    Unlike :func:`_get_bool_env`, an unrecognised value keeps the default
+    instead of reading as ``False``, so a typo cannot silently turn off a
+    default-on switch. Blank counts as unset, as in
+    :func:`_get_retention_bool_env`: a compose file interpolating an unset
+    shell variable passes an empty string, which states nothing and must not
+    warn on every read.
+    """
+
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+    return default
+
+
+def get_task_infra_failure_pause_enabled() -> bool:
+    """Whether eligible tasks pause (instead of failing) on infrastructure failures.
+
+    Unset (or blank or invalid), it follows
+    :func:`get_task_auto_resume_enabled`: a paused run that nothing resumes
+    is worse than a terminal failure for unattended (e.g. scheduled) tasks,
+    so pausing is the default only while automatic resume is on. Channel
+    tasks under shared execution hold their channel reply while an automatic
+    resume is pending, and reply "interrupted" once it stops without
+    resuming (see ``_read_channel_result``); channel tasks of a combined
+    (inline) host are not eligible and are never resumed automatically. Set it
+    explicitly to pause for a manual resume with automatic resume off, or to
+    fail as before with it on. Lease-expiry recovery pauses regardless, as it
+    always has.
+
+    Priority:
+        1. XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED environment variable
+        2. get_task_auto_resume_enabled()
+    """
+
+    return _get_strict_bool_env(
+        TASK_INFRA_FAILURE_PAUSE_ENABLED, get_task_auto_resume_enabled()
+    )
+
+
+def get_task_auto_resume_enabled() -> bool:
+    """Whether tasks paused by an interruption are resumed automatically.
+
+    Priority:
+        1. XAGENT_TASK_AUTO_RESUME_ENABLED environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_shutdown_handoff_enabled() -> bool:
+    """Whether a shutdown hands eligible running tasks to lease recovery.
+
+    Off, a host shutting down cancels its runs and fails them immediately.
+    On, a run the shutdown cancelled (not one a user cancelled) whose task
+    is eligible for automatic recovery keeps its lease instead: lease
+    recovery pauses it once the lease expires and automatic resume picks it
+    up, exactly as after a crash. Only takes effect while
+    :func:`get_task_auto_resume_enabled` is on. Channel tasks, status-only
+    (SDK) tasks and the sources automatic recovery excludes still fail
+    immediately.
+
+    Priority:
+        1. XAGENT_SHUTDOWN_HANDOFF_ENABLED environment variable
+        2. False
+    """
+
+    return _get_strict_bool_env(SHUTDOWN_HANDOFF_ENABLED, False)
+
+
+def get_task_auto_resume_poll_seconds() -> int:
+    """Get the auto-resume sweeper polling interval in seconds (default 5)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_POLL_SECONDS, 5)
+
+
+def get_task_auto_resume_max_per_tick() -> int:
+    """Get the maximum auto-resumes dispatched per sweeper tick (default 20)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_PER_TICK, 20)
+
+
+def get_task_auto_resume_max_inflight() -> int:
+    """Get the global cap on auto-resumed runs in flight (default 50)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_INFLIGHT, 50)
+
+
+def get_task_auto_resume_window_seconds() -> int:
+    """Get how long after an interruption auto-resume stays allowed (default 24h)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_WINDOW_SECONDS, 86400)
+
+
+def get_task_auto_resume_channel_window_seconds() -> int:
+    """Get the auto-resume staleness window for channel tasks (default 30 min)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS, 1800)
+
+
+def get_task_auto_resume_max_total_per_run() -> int:
+    """Get the absolute cap on auto-resumes for a single run (default 20)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN, 20)
+
+
+def get_task_auto_resume_short_initial_backoff_seconds() -> int:
+    """Get the first backoff for lease_expired/persistence_failure (default 10s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS, 10)
+
+
+def get_task_auto_resume_short_max_no_progress() -> int:
+    """Get the no-progress resume limit for short-backoff reasons (default 3)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS, 3)
+
+
+def get_task_auto_resume_llm_initial_backoff_seconds() -> int:
+    """Get the first backoff for llm_unavailable interruptions (default 60s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS, 60)
+
+
+def get_task_auto_resume_llm_max_backoff_seconds() -> int:
+    """Get the backoff ceiling for llm_unavailable interruptions (default 900s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS, 900)
+
+
+def get_task_auto_resume_llm_max_elapsed_seconds() -> int:
+    """Get the total retry duration for llm_unavailable interruptions (default 2h)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS, 7200)
+
+
+def get_task_auto_resume_model_output_max_no_progress() -> int:
+    """Get the run-level retry limit for model_output_invalid (default 2)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS, 2)
+
+
+def get_dispatcher_max_inflight_per_process() -> int:
+    """Get the per-process cap on executions the dispatcher admits (default 80)."""
+
+    return _get_positive_int_env(DISPATCHER_MAX_INFLIGHT_PER_PROCESS, 80)
+
+
+def get_dispatcher_interactive_reserve_per_process() -> int:
+    """Get the slots per process kept for interactive commands (default 0)."""
+
+    return _get_positive_int_env(
+        DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS, 0, minimum=0
+    )
+
+
+def get_dispatcher_fair_share_enabled() -> bool:
+    """Whether dispatch ranks tenants by the slots they hold here (default off)."""
+
+    return _get_strict_bool_env(DISPATCHER_FAIR_SHARE, False)
+
+
+def get_dispatch_accept_requested_class_enabled() -> bool:
+    """Whether a caller's declared dispatch class may decide a command's class.
+
+    Default off: a declaration is stored but never changes a command's class.
+    """
+
+    return _get_strict_bool_env(DISPATCH_ACCEPT_REQUESTED_CLASS, False)
+
+
+def get_uploaded_file_recovery_interval_seconds() -> int:
+    """Get the interval between stale file-compensation recovery scans."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS, 60)
+
+
+def get_uploaded_file_recovery_stale_seconds() -> int:
+    """Get the minimum age of a compensation claim eligible for recovery."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_STALE_SECONDS, 300)
+
+
+def get_uploaded_file_recovery_batch_size() -> int:
+    """Get the maximum file-compensation claims examined per polling tick."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_BATCH_SIZE, 100)
+
+
+def get_temp_file_cleanup_shutdown_timeout_seconds() -> int:
+    """Get how long shutdown waits for the orphaned temp-file sweep to unwind.
+
+    At shutdown the sweep's cooperative stop flag is set and the handler waits
+    up to this long for the walk to reach its next directory boundary and exit.
+    This bounds only the wait, not the walk: the executor thread is not
+    cancellable, so a long overrun is ultimately joined by asyncio.run()'s
+    teardown. Operators on very large uploads trees may want a larger value.
+
+    Unlike XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS and similar getters in this
+    module, "0" is not treated as "disable the timeout" here: it already has
+    a distinct, meaningful value for a wait bound -- "don't wait at all" --
+    which is the opposite of disabling it (waiting forever). So "0" falls
+    back to the default like any other invalid value instead.
+
+    Priority:
+        1. XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS environment variable
+        2. Default of 10 seconds
+
+    Returns:
+        Shutdown grace period in seconds
+    """
+
+    return _get_positive_int_env(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, 10)
+
+
+def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    if parsed < minimum:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    return parsed
+
+
+def _get_bool_env(env_var: str, default: bool) -> bool:
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_otel_metrics_endpoint() -> str | None:
+    """Return the full OTLP/HTTP metrics endpoint.
+
+    XAgent's explicit setting wins. Standard OpenTelemetry variables remain a
+    fallback so an existing Collector deployment can configure this service
+    consistently with the rest of its fleet. ``OTEL_EXPORTER_OTLP_ENDPOINT``
+    is a base endpoint, so the HTTP metrics path is appended to it.
+    """
+
+    endpoint = _normalized_http_env_url(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+    if endpoint is not None:
+        return endpoint
+    endpoint = _normalized_http_env_url(_STANDARD_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+    if endpoint is not None:
+        return endpoint
+    base_endpoint = _normalized_http_env_url(_STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT)
+    if base_endpoint is None:
+        return None
+    return f"{base_endpoint}/v1/metrics"
+
+
+def get_runtime_telemetry_enabled() -> bool:
+    """Whether runtime metrics should export through OpenTelemetry.
+
+    An explicit XAgent flag is authoritative. Otherwise, configuring any
+    supported OTLP endpoint enables export automatically.
+    """
+
+    if os.getenv(RUNTIME_TELEMETRY_ENABLED) is not None:
+        return _get_bool_env(RUNTIME_TELEMETRY_ENABLED, False)
+    return get_otel_metrics_endpoint() is not None
+
+
+def get_otel_export_interval_milliseconds() -> int:
+    """Return the periodic OTLP metrics export interval."""
+
+    if os.getenv(OTEL_EXPORT_INTERVAL_MILLISECONDS) is not None:
+        return _get_positive_int_env(OTEL_EXPORT_INTERVAL_MILLISECONDS, 10_000)
+    return _get_positive_int_env(_STANDARD_OTEL_METRIC_EXPORT_INTERVAL, 10_000)
+
+
+def get_otel_service_name() -> str:
+    """Return the OpenTelemetry service.name resource attribute."""
+
+    for env_var in (OTEL_SERVICE_NAME, _STANDARD_OTEL_SERVICE_NAME):
+        value = (os.getenv(env_var) or "").strip()
+        if value:
+            return value
+    return "xagent"
+
+
+def _normalized_env_url(env_var: str) -> str | None:
+    """Return the env var's value normalized as a base URL.
+
+    Strips surrounding whitespace and trailing slashes; unset or blank
+    values normalize to None.
+    """
+    value = (os.getenv(env_var) or "").strip()
+    return value.rstrip("/") or None
+
+
+def _normalized_http_env_url(env_var: str) -> str | None:
+    """Return a normalized HTTP(S) base URL or reject invalid configuration.
+
+    Server-to-server URLs are copied into externally consumed callback,
+    audience, and Agent Card fields. Validating them at the configuration
+    boundary produces an actionable error before those integrations receive a
+    malformed endpoint.
+    """
+    value = _normalized_env_url(env_var)
+    if value is None:
+        return None
+    parts = urlsplit(value)
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.netloc
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            f"Invalid {env_var} value: {value!r}. "
+            "Expected an absolute http:// or https:// URL without a query or fragment."
+        )
+    return value
+
+
+def _reject_url_userinfo(env_var: str, value: str | None) -> str | None:
+    """Reject a URL carrying ``user:password@``, returning it otherwise.
+
+    httpx does not send URL userinfo as Basic auth, so credentials placed there
+    authenticate nothing -- but ``httpx.HTTPStatusError`` renders the full URL
+    unredacted, and callers put that string into log messages, so a password
+    there ends up in plaintext in the application log.
+
+    Kept separate from :func:`_normalized_http_env_url` on purpose. That helper
+    has pre-existing callers whose own call sites do not catch ``ValueError``
+    and rely on ``or``-chained fallbacks, so rejecting inside it would turn a
+    working (if ill-advised) configuration into a runtime failure for them.
+    """
+    if value is not None and "@" in urlsplit(value).netloc:
+        raise ValueError(
+            f"Invalid {env_var} value: credentials embedded in the URL are not "
+            "supported, because error messages built from it are logged. "
+            "Remove the 'user:password@' part and configure the credential "
+            "separately."
+        )
+    return value
+
+
+def get_password_reset_expire_minutes() -> int:
+    """Return the password reset token expiry window in minutes."""
+    return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
+
+
+def get_email_confirmation_expire_minutes() -> int:
+    """Return the recovery-email confirmation expiry window in minutes."""
+    return _get_positive_int_env(EMAIL_CONFIRMATION_EXPIRE_MINUTES, 15)
+
+
+def get_app_base_url() -> str | None:
+    """Return the trusted frontend base URL used in email links."""
+    return _normalized_env_url(APP_BASE_URL)
+
+
+def get_sql_worker_url() -> str | None:
+    """Return the internal SQL execution service URL, when isolation is enabled."""
+
+    return _reject_url_userinfo(
+        SQL_WORKER_URL, _normalized_http_env_url(SQL_WORKER_URL)
+    )
+
+
+def get_sql_worker_token() -> str | None:
+    """Return the shared bearer token for the internal SQL execution service."""
+
+    value = (os.getenv(SQL_WORKER_TOKEN) or "").strip()
+    return value or None
+
+
+def get_sql_worker_host() -> str:
+    """Return the interface address used by the standalone SQL worker."""
+
+    value = (os.getenv(SQL_WORKER_HOST) or "0.0.0.0").strip()
+    if not value or any(character.isspace() for character in value):
+        raise ValueError(f"Invalid {SQL_WORKER_HOST} value")
+    return value
+
+
+def get_sql_worker_port() -> int:
+    """Return the TCP port used by the standalone SQL worker."""
+
+    port = _get_positive_int_env(SQL_WORKER_PORT, 8090)
+    if port > 65535:
+        raise ValueError(f"Invalid {SQL_WORKER_PORT} value: {port}")
+    return port
+
+
+def get_python_executor_timeout_seconds() -> int:
+    """Get the wall-clock limit for one execute_python_code call.
+
+    Priority:
+        1. XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS environment variable
+        2. 1200 seconds (20 minutes)
+
+    The default sits above the longest legitimate runs seen in production
+    (video rendering, ~16 minutes) while still bounding runaway code.
+
+    Returns:
+        Positive number of seconds. Invalid values fall back to the default.
+    """
+    return _get_positive_int_env(PYTHON_EXECUTOR_TIMEOUT_SECONDS, 1200)
+
+
+def get_sql_worker_query_timeout_seconds() -> int:
+    """Return the hard wall-clock limit applied to one isolated SQL query."""
+
+    return _get_positive_int_env(SQL_WORKER_QUERY_TIMEOUT_SECONDS, 30)
+
+
+def get_sql_worker_max_rows() -> int:
+    """Return the maximum number of rows an isolated query may return."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_ROWS, 10_000)
+
+
+def get_sql_worker_max_result_bytes() -> int:
+    """Return the maximum serialized result size produced by the SQL worker."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_RESULT_BYTES, 8 * 1024 * 1024)
+
+
+def get_sql_worker_max_query_bytes() -> int:
+    """Return the largest SQL statement accepted by the isolated worker."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_QUERY_BYTES, 1024 * 1024)
+
+
+def get_sql_worker_max_concurrency() -> int:
+    """Return the number of query subprocesses admitted by one SQL worker."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_CONCURRENCY, 4)
+
+
+def get_slack_client_id() -> str | None:
+    """Return the Slack app client ID used by the workspace OAuth flow."""
+    value = (os.getenv(SLACK_CLIENT_ID) or "").strip()
+    return value or None
+
+
+def get_slack_client_secret() -> str | None:
+    """Return the Slack app client secret used to exchange OAuth codes."""
+    value = (os.getenv(SLACK_CLIENT_SECRET) or "").strip()
+    return value or None
+
+
+def get_slack_app_token() -> str | None:
+    """Return the shared Slack Socket Mode app-level token."""
+    value = (os.getenv(SLACK_APP_TOKEN) or "").strip()
+    return value or None
+
+
+def get_slack_oauth_redirect_uri() -> str | None:
+    """Return the externally reachable Slack OAuth callback URL.
+
+    An explicit redirect URI wins. Otherwise derive the callback from the
+    public backend base URL so all advertised provider callbacks share the
+    same deployment-level source of truth.
+    """
+    explicit = _normalized_env_url(SLACK_REDIRECT_URI)
+    if explicit is not None:
+        return explicit
+    public_base_url = get_public_api_base_url()
+    if public_base_url is None:
+        return None
+    return f"{public_base_url}/api/channels/slack/oauth/callback"
+
+
+def get_smtp_host() -> str:
+    return os.getenv(SMTP_HOST, "").strip()
+
+
+def get_smtp_port() -> int:
+    return _get_positive_int_env(SMTP_PORT, 587)
+
+
+def get_smtp_username() -> str:
+    return os.getenv(SMTP_USERNAME, "").strip()
+
+
+def get_smtp_password() -> str:
+    return os.getenv(SMTP_PASSWORD, "")
+
+
+def get_smtp_use_tls() -> bool:
+    return _get_bool_env(SMTP_USE_TLS, True)
+
+
+def get_smtp_use_ssl() -> bool:
+    return _get_bool_env(SMTP_USE_SSL, False)
+
+
+def get_smtp_from_email() -> str:
+    return os.getenv(SMTP_FROM_EMAIL, "").strip()
+
+
+def get_smtp_from_name(default: str) -> str:
+    return os.getenv(SMTP_FROM_NAME, default).strip() or default
+
+
+def get_openrouter_official_providers_only() -> bool:
+    """Return whether OpenRouter requests should pin official provider endpoints."""
+    return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
+
+
+def get_xrouter_excluded_models() -> tuple[str, ...]:
+    """Return model slugs excluded from xrouter candidate sets.
+
+    The environment value is a comma-separated list. Empty entries are ignored,
+    and duplicates are removed while preserving the configured order.
+    """
+    value = os.getenv(XROUTER_EXCLUDED_MODELS, "")
+    return tuple(
+        dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
+    )
+
+
+def get_form_answer_continuation_enabled() -> bool:
+    """Return whether the form-answer continuation text may be applied.
+
+    One switch for every model, on by default. Unset means on; any set value
+    other than ``1``, ``true``, ``yes`` or ``on`` (case-insensitive, surrounding
+    whitespace ignored) means off, including an empty value. Read on every
+    call (not cached).
+    """
+    return _get_bool_env(FORM_ANSWER_CONTINUATION_ENABLED, True)
+
+
+def get_mcp_oauth_allow_private_hosts() -> bool:
+    """Return whether MCP OAuth URL policy may target local/private hosts.
+
+    This is intended only for local development with local authorization
+    servers. Production deployments should leave it disabled.
+    """
+    return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
+
+
+def get_hubspot_mcp_client_id() -> str | None:
+    """Return the client ID for Xagent's HubSpot MCP Connector."""
+    value = (os.getenv(HUBSPOT_MCP_CLIENT_ID) or "").strip()
+    return value or None
+
+
+def get_hubspot_mcp_client_secret() -> str | None:
+    """Return the client secret for Xagent's HubSpot MCP Connector."""
+    value = (os.getenv(HUBSPOT_MCP_CLIENT_SECRET) or "").strip()
+    return value or None
+
+
+def get_toby_personal_stdio_enabled() -> bool:
+    """Return whether trusted Toby actor executions may use personal stdio."""
+
+    return _get_bool_env(TOBY_PERSONAL_STDIO_ENABLED, False)
+
+
+def get_trusted_egress_proxy_enabled() -> bool:
+    """Return whether the ambient HTTP(S)_PROXY may be used for public fetches.
+
+    Outbound SSRF guarding pins the DNS resolution used at validation time
+    to the one used at connect time. Routing through a proxy breaks that
+    guarantee, since the proxy performs its own, independent DNS resolution
+    of the target host. This flag is an explicit opt-in acknowledging that
+    the configured proxy is trusted to enforce its own private-range egress
+    policy; leave it disabled unless that is true.
+    """
+    return _get_bool_env(TRUSTED_EGRESS_PROXY, False)
+
+
+def _csv_env(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
+def get_model_private_endpoints() -> list[str]:
+    """Operator-only exact model origins, including scheme and port; default deny."""
+    return _csv_env(MODEL_PRIVATE_ENDPOINTS)
+
+
+def get_model_private_cidrs() -> list[str]:
+    """Operator-only DNS address constraints for private model origins."""
+    return _csv_env(MODEL_PRIVATE_CIDRS)
+
+
+def get_mcp_private_endpoints() -> list[str]:
+    """Operator-only exact remote MCP origins, including scheme and port; default deny."""
+    return _csv_env(MCP_PRIVATE_ENDPOINTS)
+
+
+def get_mcp_private_cidrs() -> list[str]:
+    """Operator-only DNS address constraints for private remote MCP origins."""
+    return _csv_env(MCP_PRIVATE_CIDRS)
+
+
+def get_mcp_oauth_proxy_url() -> str | None:
+    """Return an explicit trusted proxy URL for outbound MCP OAuth HTTP calls."""
+    value = os.getenv(MCP_OAUTH_PROXY_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError(
+            f"Invalid {MCP_OAUTH_PROXY_URL} value: {value!r}. "
+            "Expected an absolute HTTP(S) proxy URL."
+        )
+    return value
+
+
+def _redis_url_with_database(url: str, database: int) -> str:
+    """Return a Redis URL pointing at a different logical database."""
+    parts = urlsplit(url)
+    if parts.scheme not in {"redis", "rediss", "redis+socket"}:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, f"/{database}", "", ""))
+
+
+def get_redis_url() -> str | None:
+    """Return the optional Redis URL used by hot-path cache backends."""
+    value = os.getenv(REDIS_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_shared_task_execution_enabled() -> bool:
+    """Enable durable handoff for an explicitly shared deployment topology.
+
+    Explicit configuration always wins.  Without it, preserve the established
+    shared behavior for managed worker pools and split web/worker hosts, while
+    keeping an unconfigured combined wheel or container self-contained.
+    """
+    configured = os.getenv(SHARED_TASK_EXECUTION_ENABLED)
+    if configured is not None and configured.strip():
+        return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    return get_worker_count() is not None or get_task_execution_role() != "combined"
+
+
+def get_task_execution_role() -> Literal["combined", "web", "worker"]:
+    """Get the process duties; combined hosts both ingress and execution."""
+    role = os.getenv(TASK_EXECUTION_ROLE, "combined").strip().lower()
+    if role == "combined":
+        return "combined"
+    if role == "web":
+        return "web"
+    if role == "worker":
+        return "worker"
+    raise ValueError(f"{TASK_EXECUTION_ROLE} must be combined, web or worker")
+
+
+def get_worker_count() -> int | None:
+    """Get the opt-in number of worker processes managed by the combined CLI."""
+    value = os.getenv(WORKER_COUNT)
+    if not value:
+        return None
+    try:
+        count = int(value)
+    except ValueError:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer") from None
+    if count <= 0:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer")
+    return count
+
+
+def get_channel_ingress_enabled() -> bool:
+    """Open bot connections only on the designated shared ingress host."""
+    if get_shared_task_execution_enabled() and get_task_execution_role() == "worker":
+        return False
+    shared_setting = os.getenv(SHARED_TASK_EXECUTION_ENABLED)
+    explicitly_local = bool(shared_setting and shared_setting.strip()) and not (
+        _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    )
+    return _get_bool_env(CHANNEL_INGRESS_ENABLED, explicitly_local)
+
+
+def validate_task_execution_host_config() -> None:
+    """Reject invalid execution configuration before accepting tasks."""
+    role = get_task_execution_role()
+    if not get_shared_task_execution_enabled():
+        if role != "combined":
+            raise ValueError(
+                f"{TASK_EXECUTION_ROLE}={role} requires {SHARED_TASK_EXECUTION_ENABLED}"
+            )
+        get_task_runtime_secrets_ttl_seconds()
+        return
+    if not get_redis_url():
+        raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")
+    get_task_runtime_secrets_ttl_seconds()
+    key = get_task_runtime_secrets_encryption_key()
+    if key is None:
+        raise ValueError(
+            "Shared task execution requires an explicit private common ENCRYPTION_KEY"
+        )
+    from cryptography.fernet import Fernet
+
+    Fernet(key.encode())
+    get_task_event_channel_prefix()
+
+
+def get_task_runtime_secrets_ttl_seconds() -> int:
+    """Maximum lifetime of accepted connector values; default one day."""
+    value = int(os.getenv(TASK_RUNTIME_SECRETS_TTL_SECONDS, "86400"))
+    if value <= 0:
+        raise ValueError(f"{TASK_RUNTIME_SECRETS_TTL_SECONDS} must be positive")
+    return value
+
+
+def get_task_runtime_secrets_encryption_key() -> str | None:
+    """Return the explicitly configured ENCRYPTION_KEY.
+
+    Invalid Fernet keys are rejected by the store before any write.
+    """
+    key = os.getenv(ENCRYPTION_KEY)
+    if not key:
+        return None
+    return key
+
+
+def get_task_event_channel_prefix() -> str:
+    """Redis Pub/Sub is not isolated by Redis DB number; namespace each deployment."""
+    prefix = os.getenv(TASK_EVENT_CHANNEL_PREFIX, "xagent:task-events:v1").strip()
+    if not prefix or not re.fullmatch(r"[A-Za-z0-9:._-]+", prefix):
+        raise ValueError(
+            f"{TASK_EVENT_CHANNEL_PREFIX} must be a nonempty channel prefix"
+        )
+    return prefix
+
+
+def get_hot_path_cache_enabled() -> bool:
+    """Return whether optional hot-path caching is enabled.
+
+    Caching is inert unless ``XAGENT_REDIS_URL`` is configured or tests install
+    an explicit cache backend. This flag gives operators a kill switch without
+    changing the Redis URL.
+    """
+    value = os.getenv(HOT_PATH_CACHE_ENABLED, "true").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def get_hot_path_cache_ttl_seconds() -> int:
+    """Default TTL for agent/model hot-path response caches."""
+    return _get_positive_int_env(HOT_PATH_CACHE_TTL_SECONDS, 30)
+
+
+def get_hot_path_task_cache_ttl_seconds() -> int:
+    """Default TTL for task polling response caches."""
+    return _get_positive_int_env(HOT_PATH_TASK_CACHE_TTL_SECONDS, 30)
+
+
+def get_celery_enabled() -> bool:
+    """Return whether durable background jobs should be enqueued to Celery."""
+    return _get_bool_env(CELERY_ENABLED, False)
+
+
+EXECUTION_BUDGET_DEFAULT_TOKENS = "XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS"
+EXECUTION_BUDGET_MAX_TOKENS = "XAGENT_EXECUTION_BUDGET_MAX_TOKENS"
+EXECUTION_BUDGET_SOFT_PERCENT = "XAGENT_EXECUTION_BUDGET_SOFT_PERCENT"
+
+
+def get_execution_budget_defaults() -> dict[str, int | None]:
+    """Read execution-budget defaults; absent limits preserve unlimited runs.
+
+    Invalid limits are configuration errors, never silently unlimited budgets.
+    """
+    values: dict[str, int | None] = {}
+    for key, env_name in (
+        ("default_tokens", EXECUTION_BUDGET_DEFAULT_TOKENS),
+        ("max_tokens", EXECUTION_BUDGET_MAX_TOKENS),
+        ("soft_limit_percent", EXECUTION_BUDGET_SOFT_PERCENT),
+    ):
+        raw = os.getenv(env_name)
+        value = int(raw) if raw else (80 if key == "soft_limit_percent" else None)
+        if value is not None and (
+            value <= 0 or (key == "soft_limit_percent" and value >= 100)
+        ):
+            raise ValueError(f"Invalid {env_name}")
+        values[key] = value
+    default_tokens, max_tokens = values["default_tokens"], values["max_tokens"]
+    if (
+        default_tokens is not None
+        and max_tokens is not None
+        and default_tokens > max_tokens
+    ):
+        raise ValueError(
+            f"{EXECUTION_BUDGET_DEFAULT_TOKENS} must not exceed "
+            f"{EXECUTION_BUDGET_MAX_TOKENS}"
+        )
+    return values
+
+
+EXECUTION_EVENT_READ_ROW_BUDGETS = "XAGENT_EXECUTION_EVENT_READ_ROW_BUDGETS"
+EXECUTION_EVENT_READ_DURATION_BUDGETS_MS = (
+    "XAGENT_EXECUTION_EVENT_READ_DURATION_BUDGETS_MS"
+)
+# The V2 execution-event readers a budget can name, and the key that applies
+# to every operation not listed.
+EXECUTION_EVENT_READ_OPERATIONS = (
+    "model",
+    "display",
+    "reconnect",
+    "checkpoint",
+    "tool_outcome",
+)
+EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY = "*"
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_execution_event_read_budgets(env_var: str, raw: str) -> Mapping[str, int]:
+    """Parse ``model=2000,*=50000``; cached per raw value, errors are not."""
+    budgets: dict[str, int] = {}
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        name, separator, number = (part.strip() for part in token.partition("="))
+        if not separator:
+            raise ValueError(
+                f"Invalid {env_var}: {token!r} must be <operation>=<positive integer>"
+            )
+        name = name.lower()
+        if name != EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY and (
+            name not in EXECUTION_EVENT_READ_OPERATIONS
+        ):
+            raise ValueError(
+                f"Invalid {env_var}: unknown operation {name!r}; expected one of "
+                f"{', '.join(EXECUTION_EVENT_READ_OPERATIONS)} or "
+                f"{EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY!r}"
+            )
+        if name in budgets:
+            raise ValueError(f"Invalid {env_var}: duplicate operation {name!r}")
+        if not (number.isascii() and number.isdigit()) or int(number) <= 0:
+            raise ValueError(
+                f"Invalid {env_var}: {name!r} needs a positive integer, got {number!r}"
+            )
+        budgets[name] = int(number)
+    return MappingProxyType(budgets)
+
+
+def _get_execution_event_read_budgets(env_var: str) -> Mapping[str, int]:
+    return _parse_execution_event_read_budgets(env_var, os.getenv(env_var) or "")
+
+
+def get_execution_event_read_row_budgets() -> Mapping[str, int]:
+    """Per-operation row budgets for V2 execution-event reads.
+
+    Priority:
+        1. XAGENT_EXECUTION_EVENT_READ_ROW_BUDGETS, e.g.
+           ``model=2000,reconnect=20000,*=50000``
+        2. Default: empty (measure only, no budget)
+
+    ``*`` applies to operations not listed. Budgets only report; they never
+    refuse or truncate a read. The parsed result is cached by the raw value,
+    so a changed environment takes effect without re-parsing on every read.
+
+    Raises:
+        ValueError: Malformed entry, unknown operation, duplicate, or a value
+            that is not a positive integer.
+    """
+    return _get_execution_event_read_budgets(EXECUTION_EVENT_READ_ROW_BUDGETS)
+
+
+def get_execution_event_read_duration_budgets_ms() -> Mapping[str, int]:
+    """Per-operation duration budgets (milliseconds) for V2 event reads.
+
+    Same format, caching and semantics as
+    :func:`get_execution_event_read_row_budgets`, read from
+    XAGENT_EXECUTION_EVENT_READ_DURATION_BUDGETS_MS.
+    """
+    return _get_execution_event_read_budgets(EXECUTION_EVENT_READ_DURATION_BUDGETS_MS)
+
+
+def get_tool_parallel_enabled() -> bool:
+    """Whether independent tool calls in a ReAct turn run concurrently.
+
+    Priority:
+        1. XAGENT_TOOL_PARALLEL_ENABLED environment variable
+        2. Default ``False`` (serial; byte-for-byte equivalent to before)
+
+    Returns:
+        True if concurrency-safe tool calls in a turn should run as a batch.
+    """
+    return _get_bool_env(TOOL_PARALLEL_ENABLED, False)
+
+
+def get_tool_max_concurrency() -> int:
+    """Maximum concurrent tool calls per ReAct turn batch (Semaphore bound).
+
+    Priority:
+        1. XAGENT_TOOL_MAX_CONCURRENCY environment variable
+        2. Default ``3`` (kept low to limit API rate-limit pressure;
+           per-API throttling is tracked separately)
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The per-batch concurrency cap (>= 1).
+    """
+    return _get_positive_int_env(TOOL_MAX_CONCURRENCY, 3)
+
+
+def get_task_runtime_hook_max_workers() -> int:
+    """Maximum process-wide worker threads for task runtime provider hooks."""
+
+    return _get_positive_int_env(TASK_RUNTIME_HOOK_MAX_WORKERS, 8)
+
+
+def get_task_runtime_hook_queue_timeout_seconds() -> int:
+    """Seconds a provider hook may wait for a runtime worker before starting."""
+
+    return _get_positive_int_env(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, 30)
+
+
+def get_native_browser_enabled() -> bool:
+    """Whether tasks may control a browser on the interactive Xagent host."""
+
+    return _get_bool_env(NATIVE_BROWSER_ENABLED, False)
+
+
+def get_native_browser_app_name() -> str:
+    """Browser application exposed by the Local browser runtime."""
+
+    configured = (
+        os.getenv(NATIVE_BROWSER_APP_NAME, "Google Chrome").strip() or "Google Chrome"
+    )
+    canonical = _NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD.get(configured.casefold())
+    if canonical is None:
+        supported = ", ".join(sorted(SUPPORTED_NATIVE_BROWSER_APP_NAMES))
+        raise ValueError(
+            f"{NATIVE_BROWSER_APP_NAME} must name a supported browser: {supported}"
+        )
+    return canonical
+
+
+def get_browser_allow_unsandboxed() -> bool:
+    """Whether Playwright may launch Chromium without its sandbox."""
+
+    return _get_bool_env(BROWSER_ALLOW_UNSANDBOXED, False)
+
+
+_BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")
+
+
+def get_browser_tool_default_locale() -> str:
+    """Get the fallback Playwright context locale for the browser_use tool.
+
+    Used when a task/request carries no resolvable locale of its own (see
+    ``WebToolConfig.get_browser_locale``). Was previously hardcoded to
+    ``"zh-CN"``, which forced every automated browser session -- regardless
+    of the requesting user's own language -- to request and render
+    Chinese-localized pages.
+
+    Priority:
+        1. XAGENT_BROWSER_TOOL_DEFAULT_LOCALE environment variable
+        2. "en-US"
+
+    Raises:
+        ValueError: if the env var is set but isn't a plausible BCP-47 tag
+            (e.g. "en-US"). This getter is called lazily, from
+            BrowserSession.__init__ on first browser tool use rather than at
+            process startup, so a typo still fails as a clean tool-call
+            error instead of an opaque Playwright error at session creation.
+    """
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_LOCALE, "").strip()
+    if not configured:
+        return "en-US"
+    if not _BCP47_LOCALE_RE.match(configured):
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_LOCALE} must be a BCP-47 locale tag "
+            f"(e.g. 'en-US', 'zh-CN'), got {configured!r}"
+        )
+    return configured
+
+
+def get_browser_tool_default_timezone() -> str | None:
+    """Get the fallback Playwright context timezone for the browser_use tool.
+
+    Priority:
+        1. XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE environment variable
+        2. None (Playwright falls back to the host's own system timezone)
+
+    Raises:
+        ValueError: if the env var is set but isn't a recognized IANA
+            timezone name (e.g. "Asia/Shanghai"). Like
+            get_browser_tool_default_locale, this is read lazily on first
+            browser tool use, not at process startup.
+    """
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_TIMEZONE, "").strip()
+    if not configured:
+        return None
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(configured)
+    except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_TIMEZONE} must be a valid IANA timezone "
+            f"name (e.g. 'Asia/Shanghai'), got {configured!r}"
+        ) from exc
+    return configured
+
+
+def get_browser_cua_driver_command() -> str:
+    """Executable used to start the Local browser cua-driver MCP server."""
+
+    return os.getenv(BROWSER_CUA_DRIVER_COMMAND, "cua-driver").strip() or "cua-driver"
+
+
+def get_browser_cua_driver_socket() -> str | None:
+    """Optional cua-driver daemon socket endpoint for Local browser."""
+
+    value = os.getenv(BROWSER_CUA_DRIVER_SOCKET, "").strip()
+    return value or None
+
+
+def get_browser_cua_driver_timeout_seconds() -> float:
+    """Per-call timeout for the Local browser driver."""
+
+    raw_value = os.getenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "30").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 30.0
+    if value > 0:
+        return value
+    logger.warning(
+        "Invalid %s=%r; falling back to 30 seconds",
+        BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
+        raw_value,
+    )
+    return 30.0
+
+
+def get_browser_cua_driver_max_elements() -> int:
+    """Maximum AX elements requested for one Local browser observation."""
+
+    return _get_positive_int_env(BROWSER_CUA_DRIVER_MAX_ELEMENTS, 2_000)
+
+
+def get_checkpoint_encoding_v2_enabled() -> bool:
+    """Whether checkpoint trace events use the v2 storage encoding.
+
+    v2 extends the v1 refs/blob encoding to nested DAG/auto contexts,
+    per-record tool-ledger dedup, and system-prompt blobs. Decode support
+    for v2 is unconditional; this flag only gates NEW writes so a fleet can
+    be rolled out in two phases (deploy with ``0`` first so every instance
+    can read v2, then remove the override to start writing it).
+
+    Priority:
+        1. XAGENT_CHECKPOINT_ENCODING_V2 environment variable
+        2. Default ``True``
+
+    Returns:
+        True if new checkpoints are written with the v2 encoding.
+    """
+    return _get_bool_env(CHECKPOINT_ENCODING_V2, True)
+
+
+def get_checkpoint_history_limit() -> int:
+    """How many checkpoint trace events to retain per task execution.
+
+    Older checkpoint rows beyond this limit are deleted when a new
+    checkpoint is persisted (resume only ever reads the most recent
+    readable checkpoint; a few older rows are kept as a fallback for
+    unreadable-latest recovery and debugging).
+
+    Priority:
+        1. XAGENT_CHECKPOINT_HISTORY_LIMIT environment variable
+        2. Default ``8``
+
+    ``0`` disables pruning entirely. Invalid values fall back to the
+    default.
+
+    Returns:
+        The number of checkpoint rows to keep per execution (>= 0).
+    """
+    return _get_positive_int_env(CHECKPOINT_HISTORY_LIMIT, 8, minimum=0)
+
+
+def get_checkpoint_gate_stall_warning_seconds() -> float:
+    """Seconds an exclusive checkpoint section may run before it is reported.
+
+    The section is never timed out: abandoning a write that may still land
+    would create the uncertain outcome it exists to rule out. Crossing this
+    threshold only logs a warning and counts a stall, repeating each interval
+    while the section is still held.
+
+    Priority:
+        1. XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS environment variable
+        2. Default ``30``
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The stall warning interval in seconds.
+    """
+    value = _get_positive_float_env(CHECKPOINT_GATE_STALL_WARNING_SECONDS, 30.0)
+    return 30.0 if value is None else value
+
+
+def get_compact_threshold_ratio() -> float:
+    """Fraction of a model's context window at which to trigger compaction.
+
+    Priority:
+        1. XAGENT_COMPACT_THRESHOLD_RATIO environment variable
+        2. Default ``0.75``
+
+    Values outside ``(0, 1]`` fall back to the default.
+
+    Returns:
+        The compaction trigger ratio.
+    """
+    raw = os.getenv(COMPACT_THRESHOLD_RATIO)
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r (not a float); using default 0.75",
+                COMPACT_THRESHOLD_RATIO,
+                raw,
+            )
+            return 0.75
+        if 0.0 < value <= 1.0:
+            return value
+        logger.warning(
+            "%s=%r is outside (0, 1]; using default 0.75",
+            COMPACT_THRESHOLD_RATIO,
+            raw,
+        )
+    return 0.75
+
+
+def get_compact_threshold_default() -> int:
+    """Fallback compaction threshold (tokens) when a model has no context window set.
+
+    Priority:
+        1. XAGENT_COMPACT_THRESHOLD_DEFAULT environment variable
+        2. Default ``32000``
+    """
+    return _get_positive_int_env(COMPACT_THRESHOLD_DEFAULT, 32000)
+
+
+def get_celery_broker_url() -> str | None:
+    """Return the Celery broker URL.
+
+    If only ``XAGENT_REDIS_URL`` is configured, derive DB 1 so Celery broker
+    traffic does not share the short-TTL hot-path cache database.
+    """
+    value = os.getenv(CELERY_BROKER_URL)
+    if value is not None:
+        value = value.strip()
+        return value or None
+
+    redis_url = get_redis_url()
+    if redis_url is None:
+        return None
+    return _redis_url_with_database(redis_url, 1)
+
+
+def get_celery_result_backend() -> str | None:
+    """Return the optional Celery result backend URL.
+
+    Background job state is persisted in the application database, so Celery
+    results are disabled unless explicitly configured.
+    """
+    value = os.getenv(CELERY_RESULT_BACKEND)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_background_job_visibility_timeout_seconds() -> int:
+    """Return Celery broker visibility timeout for long-running jobs."""
+    return _get_positive_int_env(
+        BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
+        3600,
+        minimum=60,
+    )
+
+
+def get_background_job_max_retries() -> int:
+    """Return the default max attempts for durable background jobs."""
+    return _get_positive_int_env(BACKGROUND_JOB_MAX_RETRIES, 3)
+
+
+def get_background_job_stale_seconds() -> int:
+    """Return the longest gap without a durable row update before requeueing.
+
+    Measured against ``updated_at`` -- progress or status persistence -- not
+    against how long the job has been running, so a job that keeps reporting is
+    never requeued for being long. Liveness rides on whatever the work loop
+    persists; there is no timer heartbeat.
+    """
+    return _get_positive_int_env(BACKGROUND_JOB_STALE_SECONDS, 7200, minimum=60)
+
+
+def get_background_job_sweep_interval_seconds() -> int:
+    """Return how often the scheduler scans for stale background jobs."""
+    return _get_positive_int_env(
+        BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
+        300,
+        minimum=30,
+    )
+
+
+def get_kb_milvus_cleanup_interval_seconds() -> int:
+    """Return how often the leftover Milvus rows of a Milvus deployment are purged."""
+    return _get_positive_int_env(
+        KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
+        3600,
+        minimum=300,
+    )
+
+
+def get_kb_milvus_cleanup_enabled() -> bool:
+    """Return whether the scheduled leftover Milvus row purge runs at all."""
+    return _get_bool_env(KB_MILVUS_CLEANUP_ENABLED, True)
+
+
+def get_taskless_upload_ttl_seconds() -> int:
+    """Age after which an unbound task-less public upload is GC-eligible (#973).
+
+    A task-less public-share upload is bound to its task at run start; if the
+    guest never completes task creation it stays orphaned. Rows older than
+    this (and still unbound) are reaped. Default 48h — long enough that a slow
+    but real first turn is never reaped mid-flow.
+
+    Priority:
+        1. XAGENT_TASKLESS_UPLOAD_TTL_SECONDS environment variable
+        2. Default 172800 (48 hours)
+    """
+    return _get_positive_int_env(
+        TASKLESS_UPLOAD_TTL_SECONDS,
+        48 * 60 * 60,
+        minimum=60 * 60,
+    )
+
+
+def get_orphan_upload_sweep_interval_seconds() -> int:
+    """How often the orphan task-less-upload GC sweep runs (#973).
+
+    Priority:
+        1. XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS environment variable
+        2. Default 3600 (hourly)
+    """
+    return _get_positive_int_env(
+        ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS,
+        60 * 60,
+        minimum=60,
+    )
+
+
+def get_task_cleanup_retry_interval_seconds() -> int:
+    """How often the task-cleanup retry driver looks for due obligations (#2587).
+
+    A task deletion that could not release a workspace directory or a
+    runtime-extension's state records the obligation and this driver retries
+    it. The interval only sets how often an idle driver re-checks; per-row
+    backoff decides when a given obligation is due.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS environment variable
+        2. Default 300 (5 minutes)
+    """
+    return _get_positive_int_env(
+        TASK_CLEANUP_RETRY_INTERVAL_SECONDS,
+        5 * 60,
+        minimum=30,
+    )
+
+
+def get_task_cleanup_max_attempts() -> int:
+    """Attempts before a cleanup obligation stops retrying (#2587).
+
+    After this many failed attempts the obligation moves to the terminal
+    ``exhausted`` state, where it stays for an operator to reconcile rather
+    than being retried forever against a resource that will never come back.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_MAX_ATTEMPTS environment variable
+        2. Default 8
+    """
+    return _get_positive_int_env(TASK_CLEANUP_MAX_ATTEMPTS, 8)
+
+
+def get_workforce_preview_run_stale_seconds() -> int:
+    """Age after which an abandoned builder preview run is GC-eligible.
+
+    Preview runs (workforce builder "test before save", ``is_preview`` true —
+    either an ephemeral create-mode draft or an edit-mode test against an
+    already-saved workforce) are only invalidated client-side when the draft
+    changes; a closed tab, crashed browser, or network drop leaves the run
+    (and its hidden Task) active server-side forever with no owner left to
+    invalidate it. Rows still non-terminal past this age are reaped by the
+    scheduled sweep.
+
+    Priority:
+        1. XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS environment variable
+        2. Default 7200 (2 hours)
+
+    Clamped to a minimum of 300 seconds (5 minutes), so a misconfigured tiny
+    value can't reap a preview run that is still genuinely in progress.
+    """
+    return _get_positive_int_env(WORKFORCE_PREVIEW_RUN_STALE_SECONDS, 7200, minimum=300)
+
+
+def get_trigger_dispatcher_enabled() -> bool:
+    """Return whether the backend should start prepared trigger runs."""
+    return _get_bool_env(TRIGGER_DISPATCHER_ENABLED, True)
+
+
+def get_trigger_dispatcher_interval_seconds() -> int:
+    """Return how often backend processes poll prepared trigger runs."""
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+        5,
+        minimum=1,
+    )
+
+
+def get_trigger_dispatcher_batch_size() -> int:
+    """Return max prepared trigger runs one backend poll should start."""
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_BATCH_SIZE,
+        20,
+        minimum=1,
+    )
+
+
+def get_trigger_dispatcher_startup_jitter_seconds() -> int:
+    """Return the max random delay before the dispatcher's first tick.
+
+    Priority:
+        1. XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS environment
+           variable
+        2. Default 30
+
+    A container restart brings every trigger that fell due while it was
+    down (Gmail watch renewals, scheduled triggers) up for processing all
+    at once, and the dispatcher's first tick runs immediately on startup --
+    before egress networking may be fully warmed up. This delay pushes that
+    first tick past the likely warm-up window; it does not shrink how much
+    that tick processes (still gated by the dispatcher's own batch-size and
+    scan-limit settings), only when it starts. On a multi-replica rolling
+    restart it also desyncs every replica's first tick from firing at the
+    same instant, spreading their combined load across the window instead
+    of concentrating it in a single moment. 0 disables the delay.
+    """
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
+        30,
+        minimum=0,
+    )
+
+
+def get_trigger_callback_rate_limit() -> str:
+    """Rate limit for the public trigger callback endpoint.
+
+    Priority:
+        1. XAGENT_TRIGGER_CALLBACK_RATE_LIMIT environment variable
+        2. Default "120/minute"
+
+    Returns:
+        A rate string in the ``limits`` notation, e.g. "120/minute".
+    """
+    value = (os.getenv(TRIGGER_CALLBACK_RATE_LIMIT) or "").strip()
+    return value or "120/minute"
+
+
+def get_trigger_callback_ip_rate_limit() -> str:
+    """Per-IP ceiling across ALL callback ids on the public callback endpoint.
+
+    Priority:
+        1. XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT environment variable
+        2. Default "600/minute"
+
+    The per-callback-id bucket alone can be bypassed by rotating random
+    callback ids; this IP-wide bucket caps that traffic before audit writes.
+
+    Returns:
+        A rate string in the ``limits`` notation, e.g. "600/minute".
+    """
+    value = (os.getenv(TRIGGER_CALLBACK_IP_RATE_LIMIT) or "").strip()
+    return value or "600/minute"
+
+
+def get_trigger_crud_rate_limit() -> str:
+    """Rate limit for trigger create/update/delete API calls per user.
+
+    Priority:
+        1. XAGENT_TRIGGER_CRUD_RATE_LIMIT environment variable
+        2. Default "60/minute"
+
+    Returns:
+        A rate string in the ``limits`` notation, e.g. "60/minute".
+    """
+    value = (os.getenv(TRIGGER_CRUD_RATE_LIMIT) or "").strip()
+    return value or "60/minute"
+
+
+def _get_rate_limit(env_var: str, default: str) -> str:
+    """Read a ``limits``-notation rate string with an env override.
+
+    Priority: the given ``XAGENT_*`` env var, else ``default``. The value is
+    validated (and defaulted) at parse time by the rate limiter, so this only
+    trims and falls back on an empty/unset var.
+    """
+    return (os.getenv(env_var) or "").strip() or default
+
+
+def get_share_auth_rate_limit() -> str:
+    """Per-share-token limit on ``POST /api/share/auth`` (#973).
+
+    No ``guest_id`` exists before auth, so this bounds one share link's token
+    minting; the per-IP ceiling below bounds a single client across links.
+    """
+    return _get_rate_limit(SHARE_AUTH_RATE_LIMIT, "60/minute")
+
+
+def get_share_auth_ip_rate_limit() -> str:
+    """Per-IP ceiling on ``POST /api/share/auth`` across all share links."""
+    return _get_rate_limit(SHARE_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_share_task_create_rate_limit() -> str:
+    """Per-guest limit on public share task creation (#973).
+
+    Task creation is the costly surface (each spawns an owner-billed run), so
+    this is the tighter of the two task-create buckets.
+    """
+    return _get_rate_limit(SHARE_TASK_CREATE_RATE_LIMIT, "30/minute")
+
+
+def get_share_task_create_token_rate_limit() -> str:
+    """Per-share-token ceiling on public share task creation.
+
+    Stops a client rotating fresh ``guest_id`` tokens (one auth each) from
+    bypassing the per-guest bucket on one share link.
+    """
+    return _get_rate_limit(SHARE_TASK_CREATE_TOKEN_RATE_LIMIT, "120/minute")
+
+
+def get_share_ws_turn_rate_limit() -> str:
+    """Per-guest limit on share websocket turns (#973).
+
+    Follow-up turns bypass task-create and each starts an owner-billed run;
+    this caps the burst rate before a turn is enqueued.
+    """
+    return _get_rate_limit(SHARE_WS_TURN_RATE_LIMIT, "60/minute")
+
+
+def get_share_ws_connect_ip_rate_limit() -> str:
+    """Per-IP limit on share websocket connection attempts (#973).
+
+    The share websocket accepts the handshake before auth so denial reasons
+    reach the client, which means even a garbage token completes a full 101
+    upgrade before rejection. This caps how many of those handshakes one IP
+    can open; over-limit attempts are refused pre-accept (no upgrade cost).
+    """
+    return _get_rate_limit(SHARE_WS_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_share_upload_rate_limit() -> str:
+    """Per-guest limit on public share file uploads (#973)."""
+    return _get_rate_limit(SHARE_UPLOAD_RATE_LIMIT, "60/minute")
+
+
+def get_widget_upload_rate_limit() -> str:
+    """Per-widget-entity limit on public widget file uploads (#973).
+
+    Keyed on the embedded agent/workforce (not the widget ``guest_id``,
+    which is client-supplied and rotatable at will). Loose: one widget
+    serves many legitimate guests.
+    """
+    return _get_rate_limit(WIDGET_UPLOAD_RATE_LIMIT, "240/minute")
+
+
+def get_widget_upload_ip_rate_limit() -> str:
+    """Per-caller-IP limit on public widget file uploads (#973).
+
+    The tighter bucket: bounds one abuser without a trustworthy per-guest
+    key. Kept loose enough for enterprise NAT."""
+    return _get_rate_limit(WIDGET_UPLOAD_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_ws_connect_ip_rate_limit() -> str:
+    """Per-IP limit on widget websocket connection attempts (#1056).
+
+    The widget websocket path mirrors the share handshake budget but in its
+    own bucket, so probes against one public channel cannot consume the
+    other's. Keyed per IP because the gate runs pre-auth; over-limit attempts
+    are refused pre-accept (no upgrade cost).
+    """
+    return _get_rate_limit(WIDGET_WS_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_widget_ws_turn_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget websocket turns (#1056).
+
+    The tighter turn bucket. Unlike the share turn gate this cannot key on
+    the guest: the widget ``guest_id`` is client-supplied and rotatable at
+    will, so the caller IP is the only per-abuser key available. The default
+    numerically matches the share per-guest turn rate, but this bucket is
+    per-IP: N guests behind one NAT egress share a single 60/minute budget
+    here, where the share path gives each guest its own. Raise it for
+    deployments with large shared-egress populations — and behind a reverse
+    proxy, set XAGENT_TRUSTED_PROXY_HOPS so all traffic does not collapse
+    onto the proxy's IP.
+    """
+    return _get_rate_limit(WIDGET_WS_TURN_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_ws_turn_rate_limit() -> str:
+    """Per-widget-entity limit on widget websocket turns (#1056).
+
+    The loose backstop bounding total owner-billed turn volume through one
+    embedded agent/workforce across all callers (one widget serves many
+    legitimate guests).
+    """
+    return _get_rate_limit(WIDGET_WS_TURN_RATE_LIMIT, "240/minute")
+
+
+def get_widget_auth_rate_limit() -> str:
+    """Per-widget-entity limit on widget auth + embed-ticket minting (#1108).
+
+    The loose aggregate backstop bounding total auth/ticket volume through one
+    embedded agent/workforce across all callers. Deliberately loose: both
+    endpoints fire on every widget page load and the entity key is shared by
+    all of a widget's visitors, so a tight per-entity bucket would 429
+    ordinary visitors on a busy embed. The per-IP limit below is the tight
+    per-visitor / per-abuser bound. Kept at the same 4:1 entity:IP ratio as
+    the sibling widget upload / ws-turn gates — and auth is the one gate whose
+    denial is fail-closed client-side (the widget never loads), so its
+    aggregate backstop is deliberately the most tolerant, not the tightest.
+    Raise this for very high-traffic embeds.
+    """
+    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "1200/minute")
+
+
+def get_widget_auth_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget auth + embed-ticket minting (#1108).
+
+    The tight per-visitor / per-abuser bound (visitors have distinct IPs):
+    bounds one caller minting guest tokens / embed tickets (each call does DB
+    lookups and signs a JWT) regardless of how many widget keys or tickets
+    they cycle through, since the IP is not cheaply rotatable. Raise this
+    where many genuine visitors share one address (corporate NAT, carrier
+    CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy
+    — otherwise every caller resolves to the proxy's IP and this becomes one
+    global cap. (example.env carries the same caveat for all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_widget_task_create_rate_limit() -> str:
+    """Per-widget-entity limit on public widget task creation (#1108).
+
+    The loose backstop bounding total task-create volume through one embedded
+    agent/workforce across all callers (one widget serves many legitimate
+    guests). The per-IP bucket below is the tighter per-abuser gate; unlike the
+    share path this cannot key on the guest, whose id is client-supplied and
+    rotatable at will. Kept at the 4:1 entity:IP ratio shared by every widget
+    gate: the entity bucket only accumulates on admitted requests, so ``ratio``
+    cooperating under-cap IPs are needed to saturate it — 4 here, not 2, on the
+    surface where each admitted request spawns an owner-billed run.
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_RATE_LIMIT, "240/minute")
+
+
+def get_widget_task_create_ip_rate_limit() -> str:
+    """Per-caller-IP limit on public widget task creation (#1108).
+
+    The tighter bucket: task creation is the costly surface (each spawns an
+    owner-billed run), and the caller IP is the only trustworthy per-abuser
+    key on the widget path. Numerically matches the widget upload/turn IP
+    default. Raise this where many genuine visitors share one address
+    (corporate NAT, carrier CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly
+    behind a reverse proxy — otherwise every caller resolves to the proxy's IP
+    and this becomes one global cap. (example.env carries the same caveat for
+    all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_run_quota() -> str:
+    """Per-widget-entity rolling run quota (#1108).
+
+    The widget mirror of :func:`get_share_run_quota`, in its own bucket so a
+    popular/abused widget cannot drain the owner's whole team quota. Keyed on
+    the embedded agent/workforce, with a per-creating-IP sub-quota
+    (:func:`get_widget_run_ip_quota`) as the per-abuser dimension — the widget
+    ``guest_id`` is client-supplied (rotatable at will), so unlike the share
+    path there is no per-guest sub-quota. NOTE: this quota applies to
+    already-live widget tasks as soon as it deploys (their ``agent_config``
+    carries the widget markers); the only opt-out is raising the env var.
+    """
+    return _get_rate_limit(WIDGET_RUN_QUOTA, "500/day")
+
+
+def get_widget_run_ip_quota() -> str:
+    """Per-creating-IP, per-widget rolling run sub-quota (#1108).
+
+    The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
+    share path's per-guest window. Its bucket is keyed ``entity|ip``, i.e.
+    scoped to one widget: a caller's budget on one embedded agent/workforce is
+    independent of every other widget on the instance. That scoping matters
+    because this quota is charged per *turn* — a bare-IP bucket would make one
+    NAT/CGNAT egress share a single turn budget across unrelated widgets.
+
+    Sizing: this is a share of a rolling owner-billed budget, not a burst
+    throttle, so it is deliberately far below the per-minute burst gates
+    (widget WS turn / task-create, both 60/minute per IP) and instead sized as
+    a fraction of :func:`get_widget_run_quota` — at the defaults one caller
+    needs several sustained hours to drain a widget's daily budget. It does
+    NOT stop a multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each
+    staying under its own window, still exhaust the entity quota —
+    structurally the same limit as the share path's per-guest quota.
+
+    The IP is the one the server observed at task creation (stamped into
+    ``agent_config``, never client-supplied); tasks created before this deploy
+    carry no marker and are bounded by the entity quota alone. Raise it for
+    deployments fronted by large shared egress (corporate NAT, carrier CGNAT),
+    where many genuine visitors present one address, and set
+    XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy — otherwise
+    every caller resolves to the proxy's IP and this becomes one global cap.
+    (example.env carries the same caveat for all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
+
+
+def get_share_run_quota() -> str:
+    """Per-share rolling run quota (#973).
+
+    Bounds the owner-billed runs one share link can start per window so a
+    single popular/abused link cannot exhaust the owner's whole team quota.
+    Rolling (not cumulative) so a legitimately busy link self-clears rather
+    than being permanently bricked.
+    """
+    return _get_rate_limit(SHARE_RUN_QUOTA, "500/day")
+
+
+def get_share_run_guest_quota() -> str:
+    """Per-guest rolling run quota within a share link (#973).
+
+    Shorter window than the per-share quota: bounds a single visitor's burst
+    of runs so one guest cannot consume the whole link's budget.
+    """
+    return _get_rate_limit(SHARE_RUN_GUEST_QUOTA, "60/hour")
+
+
+def get_trusted_proxy_hops() -> int:
+    """Number of trusted reverse-proxy hops in front of the backend.
+
+    Priority:
+        1. XAGENT_TRUSTED_PROXY_HOPS environment variable
+        2. Default 0 (forwarded headers are not trusted)
+
+    Returns:
+        How many trailing X-Forwarded-For entries were appended by trusted
+        proxies. 0 means the raw peer address is used.
+    """
+    return _get_positive_int_env(TRUSTED_PROXY_HOPS, 0, minimum=0)
+
+
+def get_gmail_pubsub_project_id() -> str | None:
+    """GCP project id used for per-mailbox Gmail Pub/Sub provisioning.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_PROJECT_ID environment variable
+        2. None (Gmail provisioning is not configured)
+    """
+    value = (os.getenv(GMAIL_PUBSUB_PROJECT_ID) or "").strip()
+    return value or None
+
+
+def get_gmail_pubsub_topic_prefix() -> str:
+    """Prefix for deterministic per-mailbox Gmail Pub/Sub topic names.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX environment variable
+        2. Default "xagent-gmail"
+    """
+    value = (os.getenv(GMAIL_PUBSUB_TOPIC_PREFIX) or "").strip()
+    return value or "xagent-gmail"
+
+
+def get_gmail_pubsub_subscription_prefix() -> str:
+    """Prefix for deterministic per-mailbox Gmail push subscription names.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX environment variable
+        2. Default "xagent-gmail-push"
+    """
+    value = (os.getenv(GMAIL_PUBSUB_SUBSCRIPTION_PREFIX) or "").strip()
+    return value or "xagent-gmail-push"
+
+
+def get_gmail_pubsub_transport() -> str:
+    """Transport used by the Gmail Pub/Sub provisioning clients.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_TRANSPORT environment variable ("grpc" or "rest")
+        2. Default "grpc"
+
+    "rest" exists for environments whose egress proxy cannot tunnel gRPC:
+    the default gRPC channel hangs indefinitely there, leaving Gmail watch
+    provisioning stuck at pending with no recorded error.
+    """
+    value = (os.getenv(GMAIL_PUBSUB_TRANSPORT) or "").strip().lower()
+    return value if value in ("grpc", "rest") else "grpc"
+
+
+def get_gmail_pubsub_push_service_account() -> str | None:
+    """Service-account email used for Pub/Sub push OIDC tokens.
+
+    Priority:
+        1. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT environment variable
+        2. None
+
+    Used both when provisioning the push subscription (oidc_token identity)
+    and, optionally, to validate the pushing service account on delivery.
+    """
+    value = (os.getenv(GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT) or "").strip()
+    return value or None
+
+
+def get_gmail_registration_timeout_seconds() -> int:
+    """How long a trigger create/update waits for Gmail provisioning.
+
+    Priority:
+        1. XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS environment variable
+        2. Default 10 seconds
+
+    Slow registration returns a pending state after this timeout while the
+    reconcile flow converges to active or failed in the background.
+    """
+    return _get_positive_int_env(GMAIL_REGISTRATION_TIMEOUT_SECONDS, 10)
+
+
+def get_public_api_base_url() -> str | None:
+    """Public base URL of the backend API for advertised routes and callbacks.
+
+    Priority:
+        1. XAGENT_PUBLIC_API_BASE_URL environment variable
+        2. None (consumers apply their own compatibility or validation policy)
+
+    Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
+    e.g. password-reset emails): externally advertised browser and MCP API URLs
+    should normally use the public backend origin. Server-to-server consumers
+    can override this via XAGENT_S2S_API_BASE_URL (see
+    get_s2s_api_base_url).
+    """
+    return _normalized_http_env_url(PUBLIC_API_BASE_URL)
+
+
+def get_s2s_api_base_url() -> str | None:
+    """Backend base URL advertised to server-to-server integrations.
+
+    Priority:
+        1. XAGENT_S2S_API_BASE_URL environment variable
+        2. XAGENT_PUBLIC_API_BASE_URL for backward-compatible deployments
+        3. None
+
+    The separate value lets deployments send provider callbacks and A2A
+    traffic directly to a regional backend while browser and MCP traffic keep
+    using the canonical public API. External providers that fetch
+    purpose-bound media URLs issued by this backend are consumers as well, so
+    the ingress behind this URL must let them reach the external-media route.
+    Trailing slashes are removed so consumers can append absolute API paths
+    without producing duplicate separators.
+    """
+    return _normalized_http_env_url(S2S_API_BASE_URL) or get_public_api_base_url()
+
+
+def get_gmail_callback_base_url() -> str | None:
+    """Return the base URL used for Gmail Pub/Sub callbacks.
+
+    ``XAGENT_TRIGGER_CALLBACK_BASE_URL`` was the Gmail-specific override
+    before the broader S2S URL was introduced. Keep it as a deprecated
+    fallback so upgrading does not silently move existing subscriptions back
+    to a browser-facing public edge. A2A deliberately uses
+    :func:`get_s2s_api_base_url` directly and never advertises this legacy
+    Gmail-only endpoint.
+
+    Priority:
+        1. XAGENT_S2S_API_BASE_URL
+        2. XAGENT_TRIGGER_CALLBACK_BASE_URL (deprecated)
+        3. XAGENT_PUBLIC_API_BASE_URL
+        4. None
+    """
+    return (
+        _normalized_http_env_url(S2S_API_BASE_URL)
+        or _normalized_http_env_url(TRIGGER_CALLBACK_BASE_URL)
+        or get_public_api_base_url()
+    )
+
+
+def get_google_restricted_scopes() -> bool:
+    """Enable Gmail and full Drive authorization only in the review environment."""
+    return _get_bool_env(GOOGLE_RESTRICTED_SCOPES_ENABLED, False)
+
+
+def get_google_shared_oauth_grants_enabled() -> bool:
+    """Enable shared Google authorization, callback writes, and resolution.
+
+    When enabled, login unions scopes from current catalog associations,
+    callbacks mirror one shared credential into app-specific compatibility
+    rows, and runtime prefers an explicitly-associated shared grant. Turning
+    the flag off restores the legacy read path, but not independent per-app
+    refresh tokens; a scope-incompatible adopted app may still need reconnect.
+    """
+    return _get_bool_env(GOOGLE_SHARED_OAUTH_GRANTS_ENABLED, False)
+
+
+def get_zoom_meeting_write_enabled() -> bool:
+    """Whether the Zoom connector may request meeting:write:meeting.
+
+    Off by default: every scope in the Zoom catalog row is requested at
+    authorization time, and a Zoom app that has not been granted this scope
+    can reject the whole request, read-only connections included. When on,
+    the scope is requested and zoom_create_meeting is offered to the model.
+    """
+    return _get_bool_env(ZOOM_MEETING_WRITE_ENABLED, False)
+
+
+def get_gmail_watch_enabled() -> bool:
+    """Return whether the Gmail watch feature is enabled.
+
+    Gates both watch registration (OAuth connect, Gmail trigger
+    create/update/enable) and the background renewal/retry scans. With the
+    flag off (the default), no new watch is created and Gmail triggers report
+    a failed provisioning status with an explicit disabled error where
+    applicable. An existing Gmail watch is not stopped by disabling this flag:
+    callbacks can remain deliverable until the watch expires or its mailbox
+    resources are explicitly torn down.
+
+    Teardown is deliberately left ungated: rebinding, disabling, or deleting
+    a Gmail trigger still releases the old mailbox's watch and Pub/Sub
+    resources while this flag is off, so switching it off never strands
+    those resources.
+
+    The operator endpoint-reconciliation CLI
+    (``reconcile_gmail_push_endpoints``) is also deliberately ungated, so
+    push endpoints can be migrated ahead of enabling this flag.
+    """
+    return _get_bool_env(GMAIL_WATCH_ENABLED, False)
+
+
+def get_gmail_watch_renewal_interval_seconds() -> int:
+    """Return how often the backend scans Gmail watches for renewal."""
+    return _get_positive_int_env(
+        GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS,
+        3600,
+        minimum=60,
+    )
+
+
+def get_gmail_watch_renewal_lead_seconds() -> int:
+    """Return how early Gmail watches should be renewed before expiration."""
+    return _get_positive_int_env(
+        GMAIL_WATCH_RENEWAL_LEAD_SECONDS,
+        24 * 60 * 60,
+        minimum=60,
+    )
+
+
+def get_google_oidc_client_id() -> str | None:
+    """Return the configured Google OIDC client ID, if any."""
+    value = os.getenv(GOOGLE_OIDC_CLIENT_ID)
+    return value.strip() if value and value.strip() else None
+
+
+def get_google_oidc_client_secret() -> str | None:
+    """Return the configured Google OIDC client secret, if any."""
+    value = os.getenv(GOOGLE_OIDC_CLIENT_SECRET)
+    return value.strip() if value and value.strip() else None
+
+
+def get_google_oidc_redirect_uri() -> str | None:
+    """Return the configured Google OIDC callback URI, if any."""
+    value = os.getenv(GOOGLE_OIDC_REDIRECT_URI)
+    return value.strip() if value and value.strip() else None
+
+
+def get_frontend_url() -> str:
+    """Return the public frontend origin used after browser auth callbacks."""
+    value = os.getenv(FRONTEND_URL)
+    if value and value.strip():
+        return value.strip().rstrip("/")
+    return "http://localhost:3000"
+
+
+def get_cors_origins() -> list[str]:
+    """Return the explicit browser origins allowed to call the API."""
+    configured = os.getenv(CORS_ORIGINS)
+    if configured and configured.strip():
+        origins = [
+            origin.strip().rstrip("/")
+            for origin in configured.split(",")
+            if origin.strip()
+        ]
+        if "*" in origins:
+            raise ValueError(
+                "XAGENT_CORS_ORIGINS cannot contain '*' when credentials are enabled"
+            )
+        return origins
+    return [get_frontend_url()]
+
+
+def get_environment() -> str:
+    """Return the normalized deployment environment name."""
+    for setting in (XAGENT_ENVIRONMENT, ENVIRONMENT):
+        value = os.getenv(setting)
+        if value and value.strip():
+            return value.strip().lower()
+    return "development"
+
+
+def get_require_secure_secrets() -> bool:
+    """Whether development should also enforce production secret checks."""
+    return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
+
+
+TOOL_CREDENTIALS_ENCRYPTION_KEY = "XAGENT_SECRET_ENCRYPTION_KEY"
+LEGACY_TOOL_CREDENTIALS_KEY_ALIAS = "SECRET_KEY"
+TOOL_CREDENTIALS_MIGRATION_KEY = "XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY"
+DEV_TOOL_CREDENTIALS_KEY = "xagent-dev-key"
+KNOWN_INSECURE_SECRETS = frozenset(
+    {
+        INSECURE_SECRET_PLACEHOLDER,
+        DEV_TOOL_CREDENTIALS_KEY,
+        "change-me",
+        "change-me-to-a-random-session-secret",
+        "replace-with-a-long-random-secret",
+        "secret",
+        "a-separate-private-32-or-more-character-tool-key",
+    }
+)
+
+
+def requires_secure_secrets() -> bool:
+    return get_environment() != "development" or get_require_secure_secrets()
+
+
+def validate_tool_credentials_key(raw: str | None, *, setting: str) -> None:
+    if not raw or len(raw.strip()) < 32:
+        raise RuntimeError(f"{setting} must contain at least 32 secret characters")
+    if raw.strip().lower() in KNOWN_INSECURE_SECRETS:
+        raise RuntimeError(f"{setting} must not use a public placeholder")
+
+
+def get_tool_credentials_encryption_key() -> str:
+    """Keep the historical key derivation while refusing deployed defaults."""
+    setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+    raw = os.getenv(setting)
+    if not raw or not raw.strip():
+        setting = LEGACY_TOOL_CREDENTIALS_KEY_ALIAS
+        raw = os.getenv(setting)
+    if requires_secure_secrets():
+        if not raw or not raw.strip():
+            setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+        validate_tool_credentials_key(raw, setting=setting)
+    # Preserve historical derivation for explicitly configured keys, including
+    # surrounding whitespace; only blank values are ignored when selecting.
+    return raw if raw and raw.strip() else DEV_TOOL_CREDENTIALS_KEY
+
+
+def validate_private_encryption_key(key: str | None) -> None:
+    """Reject the public key by key material, not its Base64 spelling."""
+    from cryptography.fernet import Fernet
+
+    if not key:
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+    try:
+        Fernet(key.encode("ascii"))
+    except ValueError as exc:
+        raise RuntimeError("ENCRYPTION_KEY must provide a valid Fernet key") from exc
+    # Fernet accepts standard Base64, extra padding and embedded whitespace.
+    # All equivalent encodings of the published key are equally public.
+    if base64.urlsafe_b64decode(key) == base64.urlsafe_b64decode(
+        DEV_FALLBACK_ENCRYPTION_KEY
+    ):
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+
+
+def validate_encryption_config() -> None:
+    """Reject missing, public or malformed encryption keys before admission."""
+    if not requires_secure_secrets():
+        return
+    validate_private_encryption_key(os.getenv(ENCRYPTION_KEY))
+    get_tool_credentials_encryption_key()
+
+
+AUTH_RATE_LIMIT_WINDOW_SECONDS = "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS"
+AUTH_LOGIN_IP_LIMIT = "XAGENT_AUTH_LOGIN_IP_LIMIT"
+AUTH_LOGIN_ACCOUNT_LIMIT = "XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT"
+AUTH_LOGIN_PAIR_LIMIT = "XAGENT_AUTH_LOGIN_PAIR_LIMIT"
+AUTH_RECOVERY_IP_LIMIT = "XAGENT_AUTH_RECOVERY_IP_LIMIT"
+AUTH_RECOVERY_EMAIL_LIMIT = "XAGENT_AUTH_RECOVERY_EMAIL_LIMIT"
+AUTH_RECOVERY_PAIR_LIMIT = "XAGENT_AUTH_RECOVERY_PAIR_LIMIT"
+EMAIL_CHANGE_TARGET_LIMIT = "XAGENT_EMAIL_CHANGE_TARGET_LIMIT"
+AUTH_RATE_LIMIT_MAX_LOCAL_KEYS = "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS"
+
+
+def get_auth_rate_limit_window_seconds() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_WINDOW_SECONDS, 900)
+
+
+def get_auth_login_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_IP_LIMIT, 200)
+
+
+def get_auth_login_account_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_ACCOUNT_LIMIT, 50)
+
+
+def get_auth_login_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_PAIR_LIMIT, 5)
+
+
+def get_auth_recovery_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_IP_LIMIT, 200)
+
+
+def get_auth_recovery_email_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_EMAIL_LIMIT, 50)
+
+
+def get_auth_recovery_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_PAIR_LIMIT, 5)
+
+
+def get_email_change_target_limit() -> int:
+    """Limit confirmation mail to an arbitrary, potentially unregistered target."""
+    return _get_positive_int_env(EMAIL_CHANGE_TARGET_LIMIT, 5)
+
+
+def get_auth_rate_limit_max_local_keys() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_MAX_LOCAL_KEYS, 10_000)
+
+
+def get_oidc_login_ttl_seconds() -> int:
+    """Return the short-lived OIDC login transaction TTL."""
+    return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)
+
+
+def get_oidc_exchange_ttl_seconds() -> int:
+    """Return the short-lived OIDC frontend exchange-code TTL."""
+    return _get_positive_int_env(OIDC_EXCHANGE_TTL_SECONDS, 120)
+
+
+def get_session_secret() -> str:
+    """Return the Starlette session secret used by browser OAuth flows."""
+    value = os.getenv(SESSION_SECRET)
+    if value and value.strip():
+        return value.strip()
+    return os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
+
+
+def get_web_dir() -> Path:
+    """Get the web directory path.
+
+    Priority:
+    1. XAGENT_WEB_DIR environment variable
+    2. Default to src/xagent/web relative to this file
+
+    Returns:
+        Path object for web directory
+    """
+    env_dir = os.getenv(WEB_DIR)
+    if env_dir:
+        return Path(env_dir)
+
+    # Default: src/xagent/web relative to this file
+    # This file is at: src/xagent/config.py
+    # Web dir is at: src/xagent/web/
+    return Path(__file__).parent / "web"
+
+
+class UploadsDirConfigurationError(Exception):
+    """The configured uploads directory has no single physical meaning.
+
+    Raised where the value is read, which for the web app is
+    ``app.py``'s module body: the failure lands during import, before the
+    application object exists, so no request-handling frame is on the stack to
+    swallow it and the process simply refuses to start. That -- not this
+    exception's place in the hierarchy -- is what keeps a misconfigured
+    deployment from being reported as a transient per-request failure.
+    """
+
+
+class ExternalUploadsDirConfigurationError(Exception):
+    """A configured external upload directory has two physical meanings."""
+
+
+# First absolutized reading of each cwd-dependent uploads root, kept so the
+# root cannot move mid-process (see _require_unambiguous_uploads_dir). Keyed by
+# the configured spelling, so changing the configuration still takes effect.
+_pinned_relative_uploads_roots: dict[str, Path] = {}
+
+# External upload dirs feed both the chat allowlist and sandbox mount building
+# through separate calls. Pin cwd-dependent spellings on first use so a later
+# process-wide chdir cannot make those consumers name different directories.
+_pinned_relative_external_upload_dirs: dict[str, Path] = {}
+
+
+def _reset_path_config_caches_for_tests() -> None:
+    """Clear cwd-dependent path pins between tests.
+
+    Production code deliberately keeps these values for the process lifetime;
+    tests need an explicit reset boundary so their result cannot depend on
+    which working directory an earlier test pinned for the same spelling.
+    """
+    _pinned_relative_uploads_roots.clear()
+    _pinned_relative_external_upload_dirs.clear()
+
+
+def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
+    """Reject an uploads dir whose two normalizations name different places.
+
+    Paths under the uploads root reach consumers that normalize differently,
+    and both normalizations are load-bearing:
+
+    - lexical (``canonical_sandbox_path``) is still used by generic sandbox
+      configuration identities and must not preserve ``..`` segments that a
+      backend will report differently;
+    - physical (``realpath``) is what ``TaskWorkspace``, the upload writers
+      and ``files.py``'s containment checks use, because files have to be
+      found.
+
+    They agree on every spelling but one: a symlink followed by ``..``, where
+    the lexical form discards the symlink the physical form follows. That
+    configuration gives one logical directory two readings. Workspace mount
+    producers retain both readings -- the lexical one for Docker-host path
+    translation and the physical one for file identity -- so rejecting this
+    ambiguous spelling at the shared configuration boundary prevents those
+    two load-bearing views from naming different directories.
+
+    An ordinary symlink is untouched -- following one is not a disagreement,
+    both spellings still name a single directory.
+
+    Returns the absolutized value rather than the configured one, so callers
+    receive the path this check actually examined. A relative or
+    ``~``/``$VAR``-prefixed value is resolved against the environment as it
+    stands here; returning it unresolved would let a later ``os.chdir`` (the
+    Python execution tool does exactly that, process-wide, while a task runs)
+    move the directory out from under the guarantee.
+    """
+    from .sandbox.base import canonical_sandbox_path
+
+    raw = str(uploads_dir)
+    expanded = Path(os.path.expandvars(raw)).expanduser()
+    if expanded.is_absolute():
+        absolute = expanded
+    else:
+        # A relative value means whatever the working directory says, and this
+        # process changes it: the Python execution tool chdirs process-wide for
+        # the duration of a task's code. Pinning the first reading keeps one
+        # root for the process, so two callers cannot compose paths from two
+        # different directories depending on when they asked.
+        absolute = _pinned_relative_uploads_roots.setdefault(raw, Path.cwd() / expanded)
+    canonical = canonical_sandbox_path(str(absolute))
+    if os.path.realpath(canonical) != os.path.realpath(absolute):
+        # Name whichever variable actually produced this root, so the
+        # operator edits the one that is set.
+        source = UPLOADS_DIR if os.getenv(UPLOADS_DIR) else WEB_DIR
+        raise UploadsDirConfigurationError(
+            f"The uploads root {str(uploads_dir)!r} (from {source}) names two "
+            f"different directories depending on how it is normalized: "
+            f"lexically it is {canonical!r}, resolving to "
+            f"{os.path.realpath(canonical)!r}, while resolving the configured "
+            f"spelling directly gives {os.path.realpath(absolute)!r}. A '..' "
+            "segment after a symlink does that. Configure the directory you "
+            "actually mean."
+        )
+    return absolute
+
+
+def get_uploads_dir() -> Path:
+    """Get the uploads directory path.
+
+    Priority:
+    1. XAGENT_UPLOADS_DIR environment variable
+    2. Default to WEB_DIR/uploads for backward compatibility
+
+    Validated here rather than at each consumer: this is the root every
+    workspace, upload, knowledge-base and sandbox-mount path is composed
+    from, so one check covers all of them -- see
+    :func:`_require_unambiguous_uploads_dir`. The validation is on the value
+    this function returns, not on one of the two branches that produce it:
+    ``XAGENT_WEB_DIR`` reaches the uploads root just as directly as
+    ``XAGENT_UPLOADS_DIR`` does, and an ambiguous spelling in either is the
+    same ambiguity downstream.
+
+    Returns:
+        Path object for uploads directory
+
+    Raises:
+        UploadsDirConfigurationError: The resulting root's lexical and
+            physical normalizations name different directories.
+    """
+    env_dir = os.getenv(UPLOADS_DIR)
+    if env_dir:
+        uploads_dir = Path(env_dir)
+    else:
+        # Default: web/uploads
+        uploads_dir = get_web_dir() / "uploads"
+    return _require_unambiguous_uploads_dir(uploads_dir)
+
+
+def get_html_preview_origin() -> str:
+    """Preview runner setting; match the value baked into the frontend build."""
+    return os.getenv(HTML_PREVIEW_ORIGIN, "").strip()
+
+
+def get_frontend_dist_dir() -> Path:
+    """Get the directory holding the built frontend static export.
+
+    Priority:
+        1. XAGENT_FRONTEND_DIST_DIR environment variable
+        2. Default to WEB_DIR/frontend_dist (where the wheel bundles the export)
+
+    The directory may not exist (e.g. an editable install without a frontend
+    build, or the multi-container Docker deployment where Next.js serves the
+    frontend). Callers must handle a missing directory by falling back to
+    API-only serving.
+
+    Returns:
+        Path object for the bundled frontend static export directory
+    """
+    env_dir = os.getenv(FRONTEND_DIST_DIR)
+    if env_dir:
+        return Path(env_dir)
+
+    return get_web_dir() / "frontend_dist"
+
+
+ARTIFACT_VALIDATION_MAX_BYTES = "XAGENT_ARTIFACT_VALIDATION_MAX_BYTES"
+ARTIFACT_VALIDATION_TIMEOUT_SECONDS = "XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS"
+
+
+def get_artifact_validation_max_bytes() -> int:
+    """Maximum snapshot bytes to format-check (larger files remain unchecked)."""
+    return _parse_size_bytes(
+        os.getenv(ARTIFACT_VALIDATION_MAX_BYTES) or "32M", ARTIFACT_VALIDATION_MAX_BYTES
+    )
+
+
+def get_artifact_validation_timeout_seconds() -> float:
+    """Hard timeout for each isolated artifact parser process."""
+    import math
+
+    value = float(os.getenv(ARTIFACT_VALIDATION_TIMEOUT_SECONDS) or "8")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{ARTIFACT_VALIDATION_TIMEOUT_SECONDS} must be positive and finite"
+        )
+    return value
+
+
+def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
+    """Bound provider downloads; invalid explicit limits fail closed."""
+    variable = (
+        IMAGE_DOWNLOAD_MAX_BYTES if media_kind == "image" else VIDEO_DOWNLOAD_MAX_BYTES
+    )
+    default = 64 * 1024 * 1024 if media_kind == "image" else 512 * 1024 * 1024
+    value = os.getenv(variable)
+    if not value or not value.strip():
+        return default
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {variable} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, variable)
+
+
+def get_remote_json_download_max_bytes() -> int:
+    """Bound remote speech-batch JSON inputs; invalid limits fail closed."""
+    value = os.getenv(REMOTE_JSON_DOWNLOAD_MAX_BYTES)
+    if not value or not value.strip():
+        return 10 * 1024 * 1024
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {REMOTE_JSON_DOWNLOAD_MAX_BYTES} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, REMOTE_JSON_DOWNLOAD_MAX_BYTES)
+
+
+def get_max_upload_size_bytes() -> int:
+    """Get the maximum allowed upload size in bytes.
+
+    Priority:
+    1. XAGENT_MAX_UPLOAD_SIZE environment variable
+    2. Default to 100MB
+
+    Supported formats:
+    - Raw bytes: ``104857600``
+    - Human-readable: ``100M``, ``100MB``, ``1G``, ``512K``
+
+    Returns:
+        Maximum upload size in bytes.
+
+    Raises:
+        ValueError: If the configured value is invalid.
+    """
+
+    env_value = os.getenv(MAX_UPLOAD_SIZE)
+    if not env_value:
+        return 100 * 1024 * 1024
+
+    if not env_value.strip():
+        return 100 * 1024 * 1024
+    return _parse_size_bytes(env_value, MAX_UPLOAD_SIZE)
+
+
+def _parse_size_bytes(env_value: str, setting: str) -> int:
+    """Shared positive byte-size parser for upload and validation budgets."""
+    normalized = env_value.strip().upper()
+
+    suffix_multipliers = [
+        ("GB", 1024 * 1024 * 1024),
+        ("G", 1024 * 1024 * 1024),
+        ("MB", 1024 * 1024),
+        ("M", 1024 * 1024),
+        ("KB", 1024),
+        ("K", 1024),
+        ("B", 1),
+    ]
+
+    result: int | None = None
+    for suffix, multiplier in suffix_multipliers:
+        if normalized.endswith(suffix):
+            number_part = normalized[: -len(suffix)].strip()
+            if not number_part:
+                raise ValueError(
+                    f"Invalid {setting} value: {env_value!r}. Missing numeric value."
+                )
+            try:
+                result = int(float(number_part) * multiplier)
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid {setting} value: {env_value!r}.") from exc
+            break
+
+    if result is None:
+        try:
+            result = int(float(normalized))
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {setting} value: {env_value!r}.") from exc
+
+    if result <= 0:
+        raise ValueError(
+            f"Invalid {setting} value: {env_value!r}. Value must be positive."
+        )
+
+    return result
+
+
+def get_file_storage_uri() -> str:
+    """Get the durable file storage URI.
+
+    Priority:
+        1. XAGENT_FILE_STORAGE_URI environment variable
+        2. file://<storage-root>/files
+
+    Returns:
+        fsspec-compatible URI for durable user-visible file storage.
+    """
+    env_value = os.getenv(FILE_STORAGE_URI)
+    if env_value:
+        return env_value
+
+    return (get_storage_root().expanduser().resolve() / "files").as_uri()
+
+
+def get_file_storage_options() -> dict[str, Any]:
+    """Get fsspec provider options for durable file storage.
+
+    The value must be a JSON object. Provider-specific details such as S3
+    endpoint URL, region, or credentials profile live here to keep the config
+    surface small.
+    """
+    env_value = os.getenv(FILE_STORAGE_OPTIONS)
+    if not env_value:
+        return {}
+
+    try:
+        parsed = json.loads(env_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid {FILE_STORAGE_OPTIONS} value: {env_value!r}"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid {FILE_STORAGE_OPTIONS} value: must be a JSON object")
+
+    return parsed
+
+
+def get_file_materialize_dir() -> Path:
+    """Get the local directory used for temporary durable-file materialization."""
+    env_value = os.getenv(FILE_MATERIALIZE_DIR)
+    if env_value:
+        return Path(env_value)
+
+    return Path(tempfile.gettempdir()) / "xagent-materialized"
+
+
+def get_preview_tmp_dir() -> Path:
+    """Get the local directory used for temporary build-preview files."""
+    env_value = os.getenv(PREVIEW_TMP_DIR)
+    if env_value:
+        return Path(env_value).expanduser()
+
+    return Path(tempfile.gettempdir()) / "xagent-preview"
+
+
+def get_file_storage_startup_sync_enabled() -> bool:
+    """Return whether registered local files should sync to durable storage at startup."""
+    env_value = os.getenv(FILE_STORAGE_STARTUP_SYNC_ENABLED)
+    if env_value is None or not env_value.strip():
+        return True
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_STORAGE_STARTUP_SYNC_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_redirect_enabled() -> bool:
+    """Return whether private file endpoints may redirect to durable object URLs."""
+    env_value = os.getenv(FILE_DELIVERY_REDIRECT_ENABLED)
+    if env_value is None or not env_value.strip():
+        return False
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_DELIVERY_REDIRECT_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_signed_url_ttl_seconds() -> int:
+    """Get signed durable-object URL lifetime for private file delivery redirects."""
+    env_value = os.getenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 300
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl <= 0:
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be positive."
+        )
+
+    return ttl
+
+
+def get_file_stream_ticket_ttl_seconds() -> int:
+    """Get the lifetime of a media-streaming preview ticket.
+
+    Priority:
+        1. XAGENT_FILE_STREAM_TICKET_TTL_SECONDS environment variable
+        2. Default of 600 (10 minutes)
+
+    Kept independent of, and far shorter than, the user's own access token
+    TTL: unlike a Bearer header, this credential rides in a URL a media
+    element loads directly. The frontend never puts it anywhere a user could
+    put it in the address bar, browser history, or a copied link, so the
+    realistic exposure is proxy/CDN/server access logs and a devtools
+    network panel -- a leaked or logged ticket should still stop being
+    replayable long before a stolen access token would need to.
+
+    Returns:
+        Ticket lifetime in seconds.
+    """
+    env_value = os.getenv(FILE_STREAM_TICKET_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 600
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {FILE_STREAM_TICKET_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl <= 0:
+        raise ValueError(
+            f"Invalid {FILE_STREAM_TICKET_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be positive."
+        )
+
+    return ttl
+
+
+def get_external_media_url_ttl_seconds() -> int:
+    """Get the lifetime of an external-service media URL.
+
+    These URLs let a named external provider fetch one registered image. They
+    are deliberately short-lived because the credential appears in the URL.
+
+    Priority:
+        1. XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS environment variable
+        2. Default of 600 (10 minutes)
+    """
+    env_value = os.getenv(EXTERNAL_MEDIA_URL_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 600
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {EXTERNAL_MEDIA_URL_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl < 60 or ttl > 3600:
+        raise ValueError(
+            f"Invalid {EXTERNAL_MEDIA_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be between 60 and 3600 seconds."
+        )
+    return ttl
+
+
+def get_file_delivery_accel_redirect_enabled() -> bool:
+    """Return whether private file endpoints may use nginx X-Accel-Redirect."""
+    env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED)
+    if env_value is None or not env_value.strip():
+        return False
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_DELIVERY_ACCEL_REDIRECT_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_accel_redirect_prefix() -> str:
+    """Get the internal nginx URI prefix used for X-Accel-Redirect."""
+    env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX)
+    prefix = (
+        env_value.strip()
+        if env_value is not None and env_value.strip()
+        else "/_xagent_internal_files/"
+    )
+    if not prefix.startswith("/"):
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_ACCEL_REDIRECT_PREFIX} value: {env_value!r}. "
+            "Value must start with '/'."
+        )
+    if not prefix.endswith("/"):
+        prefix += "/"
+    return prefix
+
+
+def format_file_size(size_bytes: int) -> str:
+    """Format a byte count for user-facing messages."""
+    units = [("GB", 1024 * 1024 * 1024), ("MB", 1024 * 1024), ("KB", 1024)]
+
+    for unit, divisor in units:
+        value = size_bytes / divisor
+        if value >= 0.9995:
+            rounded = round(value, 1)
+            if float(rounded).is_integer():
+                return f"{int(rounded)}{unit}"
+            return f"{rounded:.1f}{unit}"
+
+    return f"{size_bytes}B"
+
+
+def get_external_upload_dirs() -> list[Path]:
+    """Get external upload directories from environment variable.
+
+    The XAGENT_EXTERNAL_UPLOAD_DIRS environment variable should contain
+    a comma-separated list of directory paths. Environment variables and
+    ``~`` are expanded and relative paths are pinned to their first observed
+    working directory. The returned path deliberately preserves its symlink
+    spelling: Docker sibling-mode translation needs that backend-relative
+    spelling, while file-access consumers resolve it in their own domain.
+
+    Example: /path/to/uploads1,/path/to/uploads2
+
+    Only directories that exist are included in the result.
+
+    Returns:
+        List of Path objects for existing external directories
+    """
+    env_dirs = os.getenv(EXTERNAL_UPLOAD_DIRS, "")
+    if not env_dirs:
+        return []
+
+    result = []
+    for dir_path in env_dirs.split(","):
+        dir_path = dir_path.strip()
+        if dir_path:
+            expanded = Path(os.path.expandvars(dir_path)).expanduser()
+            if expanded.is_absolute():
+                absolute = expanded
+            else:
+                absolute = _pinned_relative_external_upload_dirs.setdefault(
+                    dir_path, Path.cwd() / expanded
+                )
+            from .sandbox.base import canonical_sandbox_path
+
+            canonical = Path(canonical_sandbox_path(str(absolute)))
+            physical_configured = os.path.realpath(absolute)
+            physical_canonical = os.path.realpath(canonical)
+            if physical_configured != physical_canonical:
+                raise ExternalUploadsDirConfigurationError(
+                    f"External upload directory {dir_path!r} names two different "
+                    "directories depending on normalization: lexically it is "
+                    f"{str(canonical)!r}, resolving to {physical_canonical!r}, "
+                    "while resolving the configured spelling directly gives "
+                    f"{physical_configured!r}. A '..' segment after a symlink "
+                    "does that; configure the directory you actually mean."
+                )
+            if canonical.is_dir():
+                result.append(canonical)
+            else:
+                logger.warning(
+                    "External upload directory does not exist or is not a directory: %r",
+                    canonical,
+                )
+
+    return result
+
+
+def get_external_skills_dirs() -> list[Path]:
+    """Get external skills library directories from environment variable.
+
+    The XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS environment variable should contain
+    a comma-separated list of directory paths. Supports ~ expansion and environment
+    variable expansion in paths.
+
+    Example: ~/my-skills,/opt/skills,$PROJECT_DIR/skills
+
+    Note: Unlike get_external_upload_dirs(), this includes all configured paths
+    even if they don't exist yet. This allows users to configure skills directories
+    before creating them.
+
+    Returns:
+        List of Path objects for external skills directories
+    """
+    env_dirs = os.getenv(EXTERNAL_SKILLS_LIBRARY_DIRS, "")
+    if not env_dirs:
+        return []
+
+    result = []
+    for dir_path in env_dirs.split(","):
+        dir_path = dir_path.strip()
+        if not dir_path:
+            continue
+
+        # Check for URL-like paths before path expansion
+        if "://" in dir_path:
+            logger.warning(f"Skipping non-local path (not supported yet): {dir_path}")
+            continue
+
+        # Expand environment variables and user home directory
+        expanded_path = os.path.expanduser(os.path.expandvars(dir_path))
+        path = Path(expanded_path)
+
+        result.append(path)
+
+    return result
+
+
+def get_storage_root() -> Path:
+    """Get the storage root directory path.
+
+    Priority:
+    1. XAGENT_STORAGE_ROOT environment variable
+    2. Default to ~/.xagent
+
+    Returns:
+        Path object for storage root directory
+    """
+    env_dir = os.getenv(STORAGE_ROOT)
+    if env_dir:
+        # Expand ~ here so every consumer (including sqlite3, which opens a
+        # literal ./~/... path) sees the same absolute location.
+        return Path(env_dir).expanduser()
+
+    # Default: ~/.xagent
+    return Path.home() / ".xagent"
+
+
+def get_sandbox_image() -> str:
+    """Get the default sandbox image name.
+
+    Priority:
+    1. SANDBOX_IMAGE environment variable
+    2. Default to xprobe/xagent-sandbox:latest
+
+    Returns:
+        Sandbox image name
+    """
+    return os.getenv(SANDBOX_IMAGE, "xprobe/xagent-sandbox:latest")
+
+
+def get_sandbox_max_concurrency() -> int:
+    """Maximum concurrent worker sandboxes per lifecycle.
+
+    Priority:
+        1. XAGENT_SANDBOX_MAX_CONCURRENCY environment variable
+        2. Default ``3`` to match the default tool batch width
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The per-lifecycle sandbox worker cap (>= 1).
+    """
+    return _get_positive_int_env(SANDBOX_MAX_CONCURRENCY, 3)
+
+
+def _get_positive_float_env(env_var: str, default: float | None) -> float | None:
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    # float() also parses "nan"/"inf"; nan comparisons are always False and
+    # inf would make asyncio.sleep hang, so require a finite positive value.
+    if not math.isfinite(parsed) or parsed <= 0:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    return parsed
+
+
+def get_sandbox_idle_ttl() -> float | None:
+    """Idle TTL in seconds after which unreferenced sandboxes are reclaimed.
+
+    Priority:
+        1. XAGENT_SANDBOX_IDLE_TTL environment variable (seconds)
+        2. Default ``None`` — idle reclamation disabled
+
+    Invalid or non-positive values keep reclamation disabled.
+
+    Reclamation deletes the container: anything written outside the
+    bind-mounted workspace/uploads paths (e.g. lazily installed pip
+    packages, files under ``/tmp`` or ``$HOME``) is lost. Workspace data on
+    bind mounts survives, and the sandbox is transparently recreated on
+    next use.
+
+    Returns:
+        TTL in seconds, or None when idle reclamation is disabled.
+    """
+    return _get_positive_float_env(SANDBOX_IDLE_TTL, None)
+
+
+def get_sandbox_sweep_interval() -> float:
+    """Interval in seconds between idle sandbox sweep runs.
+
+    Priority:
+        1. XAGENT_SANDBOX_SWEEP_INTERVAL environment variable (seconds)
+        2. Default ``60``
+
+    Only meaningful when XAGENT_SANDBOX_IDLE_TTL is set. Invalid or
+    non-positive values fall back to the default.
+
+    Returns:
+        Sweep interval in seconds (> 0).
+    """
+    interval = _get_positive_float_env(SANDBOX_SWEEP_INTERVAL, None)
+    return 60.0 if interval is None else interval
+
+
+def get_sandbox_max_containers() -> int | None:
+    """Maximum number of concurrently existing sandbox containers.
+
+    Priority:
+        1. XAGENT_SANDBOX_MAX_CONTAINERS environment variable
+        2. Default ``None`` — no cap (previous behavior)
+
+    The cap counts all managed containers including per-lifecycle workers;
+    the transient warmup container is excluded. When the cap is reached,
+    the least-recently-used idle sandbox is evicted to make room; if
+    nothing is evictable the request fails with ``SandboxCapacityError``.
+    Invalid or non-positive values keep the cap disabled.
+
+    Returns:
+        The container cap, or None when no cap is enforced.
+    """
+    # Sentinel default 0 (< minimum) maps every unset/invalid case to None.
+    return _get_positive_int_env(SANDBOX_MAX_CONTAINERS, 0, minimum=1) or None
+
+
+def get_lancedb_path() -> Path:
+    """Get the LanceDB database path.
+
+    Priority:
+    1. LANCEDB_PATH environment variable
+    2. Default to STORAGE_ROOT/data/lancedb
+
+    Returns:
+        Path object for LanceDB directory
+    """
+    env_path = os.getenv(LANCEDB_PATH)
+    if env_path:
+        return Path(env_path)
+
+    # Default: storage_root/data/lancedb
+    return get_storage_root() / "data" / "lancedb"
+
+
+def get_google_drive_download_timeout_seconds() -> int:
+    """Get the maximum wait for a Google Drive long-running download.
+
+    Native Google Workspace exports can return a pending Drive operation. This
+    timeout bounds polling inside the cloud-ingest HTTP request. External proxy
+    timeouts must also allow time for the final file transfer.
+
+    Priority:
+        1. XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS environment variable
+        2. Default of 600 seconds
+
+    Returns:
+        Maximum operation wait in seconds.
+    """
+    return _get_positive_int_env(GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS, 600)
+
+
+def get_kb_collections_timeout_seconds() -> int:
+    """Get the deadline for a single knowledge base collection listing scan.
+
+    Bounds one ``list_collections`` scan so the /api/kb/collections endpoint
+    fails fast instead of hanging a request. The default is deliberately
+    generous: the scan runs off the event loop in a worker thread, so a slow
+    deployment now genuinely hits this deadline where previously the blocking
+    scan starved the timer and always eventually succeeded. Measured cost is
+    roughly 4s for a 400k-row table, so 30s keeps ~7x headroom while still
+    bounding the request.
+
+    Priority:
+        1. XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS environment variable
+        2. Default of 30 seconds
+
+    Returns:
+        Per-scan timeout in seconds
+    """
+    return _get_positive_int_env(KB_COLLECTIONS_TIMEOUT_SECONDS, 30)
+
+
+def get_kb_search_timeout_seconds() -> int:
+    """Get the deadline for searching a single knowledge base collection.
+
+    Bounds one ``run_document_search`` call so an agent's knowledge_search does
+    not wait forever on a stuck backend. The collections of one search run
+    concurrently, so each of them holds a shared default-executor worker for as
+    long as it runs; without a deadline an agent bound to N knowledge bases can
+    pin N workers indefinitely. The default is generous because the budget has
+    to cover embedding the query, the LanceDB scan and an optional rerank round
+    trip.
+
+    Known limitation, same as the collection listing endpoint: cancelling the
+    ``asyncio.wait_for`` coroutine does not stop the underlying ``to_thread``
+    worker, so a timed-out search keeps running to completion in the default
+    executor. The deadline frees the caller, not the worker. A worker stuck in
+    rerank outlives it by that model's own budget (``RerankModelConfig.timeout``,
+    180s by default), so it can outlast this deadline threefold.
+
+    Priority:
+        1. XAGENT_KB_SEARCH_TIMEOUT_SECONDS environment variable
+        2. Default of 60 seconds
+
+    Returns:
+        Per-collection search timeout in seconds
+    """
+    # ponytail: the rerank budget is not clamped to this one - clamping means
+    # threading a per-call timeout through SearchConfig into the rerank adapter.
+    # Do it if leaked workers actually starve the executor.
+    return _get_positive_int_env(KB_SEARCH_TIMEOUT_SECONDS, 60)
+
+
+def get_deepdoc_xinference_url() -> str | None:
+    """Return the Xinference base URL that DeepDoc parsing is offloaded to.
+
+    Leaving this unset keeps document parsing entirely local. It must
+    otherwise be an absolute http:// or https:// base URL carrying no query
+    or fragment, since request paths are appended to it. A malformed value
+    raises rather than silently downgrading to local parsing, so the
+    misconfiguration surfaces instead of showing up only as unexplained
+    slowness.
+    """
+    return _reject_url_userinfo(
+        DEEPDOC_XINFERENCE_URL, _normalized_http_env_url(DEEPDOC_XINFERENCE_URL)
+    )
+
+
+def get_deepdoc_xinference_api_key() -> str | None:
+    """Return the API key for remote DeepDoc parsing, if one is configured.
+
+    A dedicated key wins over the bare ``XINFERENCE_API_KEY`` shared with the
+    other Xinference clients. Returning None is valid: a self-hosted
+    Xinference deployment often runs without authentication.
+    """
+    value = (os.getenv(DEEPDOC_XINFERENCE_API_KEY) or "").strip()
+    if value:
+        return value
+    return (os.getenv("XINFERENCE_API_KEY") or "").strip() or None
+
+
+def get_deepdoc_xinference_timeout_seconds() -> int:
+    """Return the read timeout for one remote DeepDoc document parse.
+
+    Parsing a large PDF can take minutes, so the default matches the
+    ``timeout=1800`` precedent in deepdoc-lib's own MinerU API client
+    (``deepdoc/parser/mineru_parser.py``).
+    """
+    return _get_positive_int_env(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, 1800)
+
+
+def get_deepdoc_xinference_model_uid() -> str:
+    """Return the Xinference model UID that remote DeepDoc requests target.
+
+    The OCR endpoint dispatches on this ``model`` form field, so it must name a
+    launched DeepDoc model. ``DeepDoc`` is the model name Xinference registers
+    the family under, which is also the UID a launch gets when none is chosen.
+    """
+    return (os.getenv(DEEPDOC_XINFERENCE_MODEL_UID) or "").strip() or "DeepDoc"
+
+
+def get_deepdoc_xinference_username() -> str | None:
+    """Return the username for the remote DeepDoc JWT exchange, if configured.
+
+    Xinference clusters started with authentication mint a bearer token from
+    ``POST /token``; deployments that instead issue a long-lived API key leave
+    this unset and configure the key.
+    """
+    return (os.getenv(DEEPDOC_XINFERENCE_USERNAME) or "").strip() or None
+
+
+def get_deepdoc_xinference_password() -> str | None:
+    """Return the password for the remote DeepDoc JWT exchange, if configured."""
+    return os.getenv(DEEPDOC_XINFERENCE_PASSWORD) or None
+
+
+def get_default_sqlite_db_path() -> str:
+    """Get the default SQLite database file path string.
+
+    Returns:
+        Path string for SQLite database file in storage root
+    """
+    # The original implementation in manager.py returned str
+    # So we need to convert it to str here
+    storage_root = get_storage_root()
+    return str(storage_root / "xagent.db")
+
+
+def get_database_url() -> str:
+    """Get the database URL.
+
+    Priority:
+    1. DATABASE_URL environment variable (full connection string)
+    2. Default to SQLite in storage root
+
+    Returns:
+        Database connection string
+    """
+    database_url = os.getenv(DATABASE_URL)
+    if database_url is not None:
+        return database_url
+
+    # Default: SQLite in storage root
+    db_path = get_default_sqlite_db_path()
+    return f"sqlite:///{db_path}"
+
+
+def get_db_pool_size() -> int:
+    """Get the SQLAlchemy connection pool size for the shared web engine.
+
+    Priority:
+        1. XAGENT_DB_POOL_SIZE environment variable
+        2. 10
+
+    Returns:
+        Number of persistent connections kept in the pool per process.
+    """
+    return _get_positive_int_env(DB_POOL_SIZE, 10)
+
+
+def get_async_trace_db_enabled() -> bool:
+    """Async PostgreSQL/file-SQLite trace writes; restart to change backend.
+
+    Private memory databases and custom session-only hosts retain bounded sync
+    writes so a second engine cannot change database identity.
+    """
+    return _get_bool_env(ASYNC_TRACE_DB_ENABLED, True)
+
+
+def get_trace_db_max_inflight() -> int:
+    """Bound trace writes before thread/connection acquisition, per event loop.
+
+    Defaults to a conservative four, not the throughput benchmark's optimum.
+    The PostgreSQL async trace pool has this cap and no overflow; SQLite uses
+    one trace writer per loop in either mode. Sync PostgreSQL writes also
+    clamp to leave one shared pooled connection where pool size permits.
+    """
+    return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)
+
+
+def get_db_write_retry_attempts() -> int:
+    """Get the total attempts for a V2 execution-event write, first try included.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_ATTEMPTS environment variable
+        2. Default of 3
+
+    A value of 1 disables retries. SQLite errors are capped at two attempts
+    regardless of this value, because SQLite reports BUSY only after waiting
+    out its busy timeout.
+
+    Returns:
+        Maximum number of attempts, at least 1
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_ATTEMPTS, 3)
+
+
+def get_db_write_retry_base_delay_ms() -> int:
+    """Get the base backoff, in milliseconds, between execution-event write retries.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_BASE_DELAY_MS environment variable
+        2. Default of 50
+
+    The ceiling doubles with each retry up to the maximum delay, and the
+    actual wait is jittered uniformly below that ceiling. Zero retries
+    immediately.
+
+    Returns:
+        Base delay in milliseconds, at least 0
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_BASE_DELAY_MS, 50, minimum=0)
+
+
+def get_db_write_retry_max_delay_ms() -> int:
+    """Get the backoff ceiling, in milliseconds, for execution-event write retries.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_MAX_DELAY_MS environment variable
+        2. Default of 1000
+
+    Returns:
+        Maximum delay in milliseconds, at least 0
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_MAX_DELAY_MS, 1000, minimum=0)
+
+
+def get_db_max_overflow() -> int:
+    """Get the SQLAlchemy connection pool max overflow for the shared web engine.
+
+    Priority:
+        1. XAGENT_DB_MAX_OVERFLOW environment variable
+        2. 20
+
+    Returns:
+        Number of extra connections allowed beyond the pool size (0 disables
+        overflow).
+    """
+    return _get_positive_int_env(DB_MAX_OVERFLOW, 20, minimum=0)
+
+
+def get_db_pool_timeout_seconds() -> int:
+    """Get the timeout for acquiring a connection from the pool, in seconds.
+
+    Priority:
+        1. XAGENT_DB_POOL_TIMEOUT_SECONDS environment variable
+        2. 30
+
+    Returns:
+        Seconds to wait for a free pooled connection before raising.
+    """
+    return _get_positive_int_env(DB_POOL_TIMEOUT_SECONDS, 30)
+
+
+def get_db_pool_kwargs() -> dict[str, Any]:
+    """Shared SQLAlchemy pool kwargs for every pooled (non-SQLite) engine.
+
+    Single source for the pool sizing/health knobs so the shared web engine
+    and the ad-hoc storage engine cannot drift apart. Note the same values
+    apply to EACH engine that uses them: a process running both holds up to
+    2 x (pool_size + max_overflow) connections (see example.env).
+
+    Returns:
+        Keyword arguments for :func:`sqlalchemy.create_engine`.
+    """
+    return {
+        "pool_size": get_db_pool_size(),
+        "max_overflow": get_db_max_overflow(),
+        "pool_timeout": get_db_pool_timeout_seconds(),
+        "pool_recycle": 3600,  # Recycle connections after 1 hour
+        "pool_pre_ping": True,  # Verify connections before using
+    }
+
+
+def get_mcp_tool_init_timeout_seconds() -> int:
+    """Get the per-server timeout for MCP tool initialization, in seconds.
+
+    Bounds the connect + initialize + list-tools handshake for one MCP server
+    during agent setup, so a hung server cannot stall task startup (and pin
+    resources such as DB connections) indefinitely. A timed-out server is
+    skipped; the remaining servers still load.
+
+    Priority:
+        1. XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS environment variable
+        2. 60
+
+    Returns:
+        Seconds allowed per MCP server; 0 disables the timeout.
+    """
+    return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_connector_probe_users() -> frozenset[str]:
+    """Get the accounts allowed to run a connector's read-only probe.
+
+    The probe route (POST /api/mcp/servers/{id}/probe) calls a connector's
+    declared read-only tool against the vendor for the caller's own connected
+    server. It is meant for the connector smoke monitor, not for every user,
+    and the platform has no role beyond ``is_admin``, which the low-privilege
+    monitor account must not hold. An entry names an account by its exact
+    username, or by its email address compared case-insensitively; both
+    columns are unique, and an entry matches either axis. Create the account
+    before naming it here: an entry for an account that does not exist yet
+    goes to whoever registers that username or address first.
+
+    Priority:
+        1. XAGENT_CONNECTOR_PROBE_USERS environment variable (comma-separated)
+        2. empty (nobody may run probes)
+
+    Returns:
+        Frozenset of usernames and email addresses; empty when unset or blank.
+    """
+    return frozenset(_csv_env(CONNECTOR_PROBE_USERS))
+
+
+def get_llm_retry_deadline_seconds() -> float:
+    """Get the wall-clock ceiling for one LLM call's whole retry loop.
+
+    Attempt counting cannot bound how long one call holds an execution slot,
+    because every attempt may consume a full request timeout. This is the
+    bound that does. It gates whether a *new* attempt may start, so one call
+    can still overrun it by a single attempt's duration.
+
+    Priority:
+        1. XAGENT_LLM_RETRY_DEADLINE_SECONDS environment variable
+        2. 300
+
+    Returns:
+        Seconds allowed for one call's retry loop; invalid or non-positive
+        values fall back to the default, because an unbounded loop is the
+        defect this exists to prevent.
+    """
+    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, 300.0)
+    return 300.0 if deadline is None else deadline
+
+
+def get_llm_capacity_max_attempts() -> int:
+    """Get the attempt budget for a provider capacity refusal.
+
+    Deliberately far below the per-model ``max_retries``: a provider that
+    reports being over capacity has asked us not to grow its load, so
+    replaying the identical request is the wrong response. Only ever lowers
+    a call's ceiling -- it cannot raise it above ``max_retries``.
+
+    Priority:
+        1. XAGENT_LLM_CAPACITY_MAX_ATTEMPTS environment variable
+        2. 2
+
+    Returns:
+        Attempts allowed for a capacity refusal; invalid or non-positive
+        values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_CAPACITY_MAX_ATTEMPTS, 2)
+
+
+def get_auto_primary_max_attempts() -> int:
+    """Get the attempt budget for an Auto candidate that has a fallback.
+
+    When a configured Auto call can move to its fallback (one is set and
+    supports the request's input), the routed candidate stops after this
+    many attempts and the request goes to the fallback instead, so an
+    outage costs seconds rather than the whole retry deadline. A call that
+    cannot move keeps the candidate's own ``max_retries``. The fallback itself keeps its own ``max_retries``. Only
+    ever lowers a candidate's ceiling -- it cannot raise it above that
+    candidate's ``max_retries``.
+
+    Priority:
+        1. XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS environment variable
+        2. 2
+
+    Returns:
+        Attempts allowed for the routed candidate; invalid or non-positive
+        values fall back to the default.
+    """
+    return _get_positive_int_env(AUTO_PRIMARY_MAX_ATTEMPTS, 2)
+
+
+def get_auto_candidate_cooldown_seconds() -> float:
+    """Get how long a failed Auto candidate is skipped in favour of the fallback.
+
+    After a routed candidate fails with an availability failure (provider
+    down, timeout, quota, rejected credential, missing model; not a rate
+    limit, which clears within seconds),
+    this process sends requests routed to it straight to the fallback for
+    this long, then tries the candidate again. The state is per process.
+
+    Priority:
+        1. XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS environment variable
+        2. 300
+
+    Returns:
+        Cooldown in seconds; invalid or non-positive values fall back to
+        the default.
+    """
+    cooldown = _get_positive_float_env(AUTO_CANDIDATE_COOLDOWN_SECONDS, 300.0)
+    return 300.0 if cooldown is None else cooldown
+
+
+def get_llm_stream_empty_delta_limit() -> int:
+    """Get the consecutive-empty-delta budget before an LLM stream is abandoned.
+
+    Counts streaming deltas in a row that carry no content, no tool-call
+    bytes, no reasoning text and no finish_reason -- a stream stuck emitting
+    nothing is making no progress even though the connection is still open.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT environment variable
+        2. 200
+
+    Returns:
+        The count of consecutive empty deltas at which the stream is
+        abandoned (the Nth empty delta in a row triggers it); 0 disables the
+        check. Invalid or negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_EMPTY_DELTA_LIMIT, 200, minimum=0)
+
+
+def get_llm_stream_degenerate_window() -> int:
+    """Get the trailing-character window inspected for a degenerate stream tail.
+
+    Used two ways: to size the trailing slice of reasoning text checked for a
+    whitespace-only or periodic (repeated) tail, and as the trailing-whitespace
+    budget allowed after a complete tool-call JSON object has already been
+    emitted.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_WINDOW environment variable
+        2. 256
+
+    Returns:
+        Trailing characters inspected; 0 disables the whitespace and
+        periodicity checks (non-whitespace after a complete tool-call object
+        is still rejected: it can never parse). Invalid or
+        negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_WINDOW, 256, minimum=0)
+
+
+def get_llm_stream_degenerate_max_period() -> int:
+    """Get the longest repeat period the periodicity check searches for.
+
+    Bounds how far the degenerate-tail check looks inside the trailing
+    window (``get_llm_stream_degenerate_window``) for a repeating substring,
+    e.g. a model looping on the same few characters instead of finishing.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD environment variable
+        2. 64
+
+    Returns:
+        Longest repeat period, in characters, considered. Invalid or
+        non-positive values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_MAX_PERIOD, 64)
+
+
+def get_llm_stream_no_payload_abort_models() -> frozenset[str]:
+    """Get the model allowlist for the opt-in no-payload wall-clock abort.
+
+    The wall-clock abort in ``get_llm_stream_no_payload_timeout_seconds`` only
+    applies to models named here, because it is a blunter, time-based signal
+    than the delta- and degenerate-tail checks above and is meant for models
+    known to stall without ever emitting the finish signals those checks rely
+    on. Matching is exact and case-sensitive against the model string sent on
+    the wire (e.g. ``moonshotai.kimi-k2.5``) -- no normalization or prefix
+    matching is applied.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS environment variable
+        2. empty (no models opted in)
+
+    Returns:
+        Frozenset of wire model names for which the no-payload abort is
+        enabled; empty when unset or blank.
+    """
+    raw = os.getenv(LLM_STREAM_NO_PAYLOAD_ABORT_MODELS, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def get_llm_stream_no_payload_timeout_seconds() -> float:
+    """Get the no-payload wall-clock timeout for allow-listed models.
+
+    Seconds after the first streamed chunk before an allow-listed model's
+    stream (see ``get_llm_stream_no_payload_abort_models``) is abandoned if it
+    has produced no content and no tool-call chunk in that time. Only applies
+    to models on that allowlist; other models are governed solely by the
+    delta- and degenerate-tail checks above.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS environment variable
+        2. 30
+
+    Returns:
+        Seconds allowed with no payload before the stream is abandoned;
+        invalid or non-positive values fall back to the default.
+    """
+    timeout = _get_positive_float_env(LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS, 30.0)
+    return 30.0 if timeout is None else timeout
+
+
+def get_sandbox_cpus() -> int | None:
+    """Get the CPU count for sandbox containers.
+
+    Returns:
+        CPU count from SANDBOX_CPUS env var, or None
+    """
+    env_str = os.getenv(SANDBOX_CPUS)
+    if env_str:
+        try:
+            return int(env_str)
+        except ValueError:
+            logger.warning(f"Invalid {SANDBOX_CPUS} value: {env_str}")
+    return None
+
+
+def get_sandbox_memory() -> int | None:
+    """Get the memory limit for sandbox containers (in MB).
+
+    Returns:
+        Memory value from SANDBOX_MEMORY env var, or None
+    """
+    env_str = os.getenv(SANDBOX_MEMORY)
+    if env_str:
+        try:
+            return int(env_str)
+        except ValueError:
+            logger.warning(f"Invalid {SANDBOX_MEMORY} value: {env_str}")
+    return None
+
+
+def get_sandbox_pids_limit() -> int | None:
+    """Get the process/thread limit for sandbox containers.
+
+    Priority:
+        1. SANDBOX_PIDS_LIMIT environment variable
+        2. 1024 by default
+
+    Linux counts threads against the pids cgroup. The default therefore
+    leaves enough room for Chrome and numeric libraries while still bounding
+    fork bombs. Set the value to 0 to omit the Docker pids limit on hosts
+    without a pids cgroup controller. Other values below 64 and invalid values
+    fall back to 1024.
+    """
+    value = os.getenv(SANDBOX_PIDS_LIMIT)
+    if value is None or not value.strip():
+        return 1024
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = -1
+    if parsed == 0:
+        return None
+    if parsed >= 64:
+        return parsed
+    logger.warning("Invalid %s=%r; falling back to 1024", SANDBOX_PIDS_LIMIT, value)
+    return 1024
+
+
+def get_sandbox_env() -> dict[str, str]:
+    """Get the environment variables for sandbox containers.
+
+    Format: KEY1=value1;KEY2=value2
+
+    Returns:
+        Dictionary of environment variables
+    """
+    env_str = os.getenv(SANDBOX_ENV, "").strip()
+    if not env_str:
+        return {}
+
+    env = {}
+    for pair in env_str.split(";"):
+        try:
+            key, value = pair.strip().split("=", 1)
+        except ValueError:
+            logger.warning("Invalid sandbox env config: must be in KEY=value format")
+            continue
+
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            env[key] = value
+        elif not key:
+            logger.warning("Environment variable has empty key")
+        elif not value:
+            logger.warning(f"Environment variable {key!r} has empty value")
+
+    return env
+
+
+def get_sandbox_volumes(
+    *, host_side_sources: bool = False
+) -> list[tuple[str, str, str]]:
+    """Get the volume mappings for sandbox containers.
+
+    Format: src:dst[:mode];src2:dst2[:mode2]
+    - src: source path on host
+    - dst: destination path in container
+    - mode: ro or rw (default: ro)
+
+    Args:
+        host_side_sources: When True, source paths are already Docker-host paths.
+            Only environment variables are expanded; relative paths and ``~`` are
+            rejected instead of being normalized inside the backend container.
+
+    Returns:
+        List of (src, dst, mode) tuples
+    """
+    env_str = os.getenv(SANDBOX_VOLUMES, "").strip()
+    if not env_str:
+        return []
+
+    volumes = []
+    for item in env_str.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+
+        parts = item.split(":", 2)
+        if len(parts) < 2:
+            logger.warning(f"Invalid sandbox volume config: {item}")
+            continue
+
+        src = os.path.expandvars(parts[0].strip())
+        dst = parts[1].strip()
+        if not src or not dst:
+            logger.warning(f"Invalid sandbox volume: {item}")
+            continue
+
+        if host_side_sources:
+            if src.startswith("~") or not Path(src).is_absolute():
+                logger.warning(
+                    "Invalid sandbox host volume source in Docker sibling mode: %s",
+                    item,
+                )
+                continue
+        else:
+            # Normalize paths to resolve any relative components
+            src = os.path.abspath(os.path.expanduser(src))
+
+        mode = parts[2].strip().lower() if len(parts) > 2 else "ro"
+        if mode not in ("ro", "rw"):
+            logger.warning(f"Invalid sandbox volume mode: {item}, using 'ro'")
+            mode = "ro"
+
+        volumes.append((src, dst, mode))
+
+    return volumes
+
+
+def get_sandbox_host_project_root() -> Path | None:
+    """Get the host project root used for Docker sibling sandbox code mounts.
+
+    Priority:
+    1. XAGENT_SANDBOX_HOST_PROJECT_ROOT environment variable
+    2. None, which lets callers use their local runtime project root
+
+    Returns:
+        Path to the project root as resolved from the Docker host's perspective,
+        or None when not configured.
+    """
+    env_str = os.getenv(SANDBOX_HOST_PROJECT_ROOT)
+    if env_str:
+        return Path(os.path.expandvars(env_str.strip()))
+    return None
+
+
+# Read once at import, never per call: the sandbox runner inherits this marker
+# before it imports anything, while agent-authored code runs late and must not
+# be able to flip host registration into sandbox mode process-wide.
+_IN_SANDBOX_TOOL_RUNNER = _get_bool_env(SANDBOX_TOOL_RUNNER, False)
+
+
+def in_sandbox_tool_runner() -> bool:
+    """Return whether this process is the sandbox tool runner.
+
+    Priority:
+    1. XAGENT_SANDBOX_TOOL_RUNNER as it stood at process start
+    2. False, the host process default
+
+    Returns:
+        True when running inside the sandbox, where no database or object
+        storage credentials are available.
+    """
+    return _IN_SANDBOX_TOOL_RUNNER
+
+
+def get_sandbox_host_storage_root() -> Path | None:
+    """Get the Docker host storage root used for sibling sandbox bind mounts.
+
+    Priority:
+    1. XAGENT_SANDBOX_HOST_STORAGE_ROOT environment variable
+    2. None, which lets callers use backend paths directly
+
+    Returns:
+        Path to the Xagent storage root as seen by the Docker host, or None when
+        not configured.
+    """
+    env_str = os.getenv(SANDBOX_HOST_STORAGE_ROOT)
+    if env_str:
+        return Path(os.path.expandvars(env_str.strip()))
+    return None
+
+
+_SANDBOX_NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_SANDBOX_NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_BUILTIN_DOCKER_NETWORKS = frozenset({"bridge", "host", "none", "default"})
+
+
+def validate_sandbox_namespace(namespace: str) -> None:
+    """Validate a sandbox ownership namespace.
+
+    Enforces the Docker Compose project-name grammar (lowercase letters,
+    decimal digits, dashes and underscores, beginning with a lowercase letter
+    or digit). Callers that accept a namespace from outside the environment
+    (e.g. the Docker sandbox service constructor) must run this so a
+    malformed value can never recreate a shared ownership domain.
+
+    Raises:
+        ValueError: The value does not match the grammar.
+    """
+    if not _SANDBOX_NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(
+            f"Invalid sandbox namespace {namespace!r}: must match the Docker "
+            "Compose project-name grammar (lowercase letters, digits, dashes, "
+            "underscores; start with a letter or digit)"
+        )
+
+
+def get_sandbox_namespace() -> str | None:
+    """Get the stable per-deployment namespace for sandbox resources.
+
+    The namespace is the ownership boundary between deployments that share one
+    Docker daemon: every sandbox container (physical name and owner labels)
+    a deployment creates is scoped to it, and every lookup/list/cleanup
+    operation is restricted to it. It must be stable across restarts and
+    unique per deployment; the Docker Compose project name
+    (``COMPOSE_PROJECT_NAME``) is the canonical source.
+
+    Accepts the Docker Compose project-name grammar: lowercase letters,
+    decimal digits, dashes and underscores, beginning with a lowercase letter
+    or digit.
+
+    Returns:
+        The configured namespace, or None when unset/empty.
+
+    Raises:
+        ValueError: The variable is set but does not match the grammar.
+    """
+    raw = os.getenv(SANDBOX_NAMESPACE, "").strip()
+    if not raw:
+        return None
+    validate_sandbox_namespace(raw)
+    return raw
+
+
+def validate_sandbox_network(network: str) -> None:
+    """Validate the dedicated Docker network used by untrusted sandboxes."""
+    if (
+        len(network) > 255
+        or not _SANDBOX_NETWORK_RE.fullmatch(network)
+        or network.lower() in _BUILTIN_DOCKER_NETWORKS
+    ):
+        raise ValueError(
+            f"Invalid sandbox network {network!r}: use a dedicated Docker "
+            "network name containing only letters, digits, dots, dashes, or "
+            "underscores; built-in Docker networks are not allowed"
+        )
+
+
+def get_sandbox_network() -> str | None:
+    """Return the dedicated Docker network for sandbox containers.
+
+    The deployment owns creation and firewall policy for this network. XAgent
+    only attaches containers to the exact configured name and verifies the
+    attachment before publishing or reusing them.
+    """
+    raw = os.getenv(SANDBOX_NETWORK, "").strip()
+    if not raw:
+        return None
+    validate_sandbox_network(raw)
+    return raw
+
+
+def get_sandbox_workspace_mount_mode() -> Literal["bind", "volume_subpath"]:
+    """Return the workspace mount mechanism used for sandbox containers."""
+    value = os.getenv(SANDBOX_WORKSPACE_MOUNT_MODE, "").strip().lower() or "bind"
+    if value not in {"bind", "volume_subpath"}:
+        raise ValueError(
+            f"{SANDBOX_WORKSPACE_MOUNT_MODE} must be 'bind' or "
+            f"'volume_subpath', got {value!r}"
+        )
+    return value  # type: ignore[return-value]
+
+
+_DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]+$")
+
+
+def get_sandbox_workspace_volume() -> str | None:
+    """Return the deployment-owned workspace volume name, when configured."""
+    value = os.getenv(SANDBOX_WORKSPACE_VOLUME, "").strip()
+    if not value:
+        return None
+    if not _DOCKER_VOLUME_NAME_RE.fullmatch(value):
+        raise ValueError(
+            f"{SANDBOX_WORKSPACE_VOLUME} must be a valid Docker volume name"
+        )
+    return value
+
+
+def get_sandbox_workspace_volume_root() -> Path | None:
+    """Return the backend path at which the workspace volume root is mounted."""
+    value = os.getenv(SANDBOX_WORKSPACE_VOLUME_ROOT, "").strip()
+    if not value:
+        return None
+    root = Path(os.path.expandvars(value)).expanduser()
+    if not root.is_absolute():
+        raise ValueError(f"{SANDBOX_WORKSPACE_VOLUME_ROOT} must be an absolute path")
+    return root
+
+
+def get_sandbox_worker_id() -> str | None:
+    """Stable replica identity for shared sandbox ownership, never a process UUID.
+
+    Configure a distinct identity for each concurrently running execution host
+    and reuse it on restart. Legacy local execution keeps its existing scope.
+    """
+    if not get_shared_task_execution_enabled():
+        return None
+    worker_id = os.getenv(SANDBOX_WORKER_ID, "").strip()
+    if not worker_id:
+        raise ValueError(f"Shared sandbox execution requires {SANDBOX_WORKER_ID}")
+    validate_sandbox_namespace(worker_id)
+    return worker_id
+
+
+def get_sandbox_worker_namespace() -> str | None:
+    """Scope Docker containers and metadata to one stable execution host."""
+    namespace = get_sandbox_namespace()
+    if namespace is None:
+        return None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is None:
+        return namespace
+    # Hash the pair to avoid ambiguous concatenations of deployment/replica ids.
+    import hashlib
+
+    suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
+    return f"{namespace}-{suffix}"
+
+
+def get_boxlite_home_dir() -> Path | None:
+    """Get the BoxLite home, isolated by stable worker ID in shared mode.
+
+    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
+    Shared execution uses a worker subdirectory under the configured home or
+    the unified storage root's boxlite directory.
+    """
+    env_str = os.getenv(BOXLITE_HOME_DIR)
+    home_dir = Path(env_str) if env_str else None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is not None:
+        return (home_dir or get_storage_root() / "boxlite") / worker_id
+    return home_dir
+
+
+def get_tool_max_output_length() -> int:
+    """Get the maximum per-string output length for tools.
+
+    This limit applies to individual string values within the output structure,
+    not the total output size. The total output size is indirectly controlled
+    by the combination of per-string limit, max field count, and max recursion depth.
+
+    Returns:
+        Maximum per-string length from TOOL_MAX_OUTPUT_LENGTH env var, or 50k
+        by default.
+    """
+    env_str = os.getenv(TOOL_MAX_OUTPUT_LENGTH)
+    if env_str:
+        try:
+            return int(env_str)
+        except ValueError:
+            logger.warning("Invalid %s value: %s", TOOL_MAX_OUTPUT_LENGTH, env_str)
+    return 50 * 1024
+
+
+def get_web_search_provider() -> str:
+    """Get the preferred web search provider.
+
+    Priority:
+        1. XAGENT_WEB_SEARCH_PROVIDER environment variable
+        2. "auto"
+
+    Valid values are: auto, google, tavily, exa, zhipu.
+    """
+    provider = (os.getenv(WEB_SEARCH_PROVIDER) or "auto").strip().lower()
+    if provider in WEB_SEARCH_PROVIDERS:
+        return provider
+
+    logger.warning(
+        "Invalid %s value: %r. Falling back to 'auto'.",
+        WEB_SEARCH_PROVIDER,
+        provider,
+    )
+    return "auto"
+
+
+def get_web_crawl_tls_impersonate() -> str | None:
+    """Get the optional TLS impersonation spec for website crawling.
+
+    Priority:
+        1. XAGENT_WEB_CRAWL_TLS_IMPERSONATE environment variable
+        2. None (plain httpx)
+
+    Values:
+        - unset, empty, "none", or "null": None
+        - "auto": built-in crawler fallback chain
+        - any other non-empty value: curl_cffi impersonate spec
+    """
+    value = os.getenv(WEB_CRAWL_TLS_IMPERSONATE)
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
+        return None
+    return normalized
+
+
+def get_tool_max_recursion_depth() -> int:
+    """Get the maximum recursion depth for tools.
+
+    Returns:
+        Maximum recursion depth from TOOL_MAX_RECURSION_DEPTH env var, or 20 by default.
+        20 layers is sufficient for most real-world data structures while preventing
+        excessively deep nesting that could cause performance issues.
+    """
+    env_str = os.getenv(TOOL_MAX_RECURSION_DEPTH)
+    if env_str:
+        try:
+            return int(env_str)
+        except ValueError:
+            logger.warning("Invalid TOOL_MAX_RECURSION_DEPTH value: {env_str}")
+    return 20
+
+
+def get_tool_max_field_count() -> int:
+    """Get the maximum number of fields/items in dict/list for tools.
+
+    This helps control total output size by limiting the cardinality of
+    collections. Combined with per-string length and recursion depth limits,
+    it provides reasonable protection against excessive output without
+    requiring expensive total size calculation.
+
+    Returns:
+        Maximum fields from TOOL_MAX_FIELD_COUNT env var, or 1000 by default
+    """
+    env_str = os.getenv(TOOL_MAX_FIELD_COUNT)
+    if env_str:
+        try:
+            return int(env_str)
+        except ValueError:
+            logger.warning("Invalid TOOL_MAX_FIELDS value: {env_str}")
+    return 1000
+
+
+def get_inline_file_delivery_max_bytes() -> int:
+    """Decoded budget per run; zero rejects attachments, not Base64 passthrough."""
+    try:
+        value = int(os.getenv(INLINE_FILE_DELIVERY_MAX_BYTES, str(8 * 1024 * 1024)))
+        if value < 0:
+            raise ValueError("Inline file delivery budget must be non-negative")
+    except ValueError:
+        logger.warning(
+            "Invalid XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES; rejecting inline attachments"
+        )
+        return 0
+    return value
+
+
+def get_max_trace_payload_bytes() -> int:
+    """Max byte size for individual trace payload fields (e.g. data.messages,
+    data.response) before truncation.
+
+    Applies to the LLM I/O audit trace: a long DAG task hitting all 9 audit
+    sites can otherwise write multi-MB rows into trace_events. Also bounds
+    the rendered size of every trace category's console log line, not only
+    LLM audit events.
+
+    Priority:
+        1. XAGENT_MAX_TRACE_PAYLOAD_BYTES env var
+        2. Default 50_000 (~50KB, large enough for typical compacted
+           messages while bounding worst case)
+
+    Returns:
+        Maximum bytes per truncated trace field.
+    """
+    env_str = os.getenv(MAX_TRACE_PAYLOAD_BYTES)
+    if env_str:
+        try:
+            value = int(env_str)
+            if value < 0:
+                logger.warning(
+                    f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value (negative): {env_str!r}"
+                )
+            else:
+                return value
+        except ValueError:
+            logger.warning(f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value: {env_str!r}")
+    return 50_000
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2557).
+#
+# Nothing in this repository reads these yet; the job that expires data is a
+# follow-up change. They are settings, and the docstrings below describe what
+# each one means rather than what a consumer will do with it.
+#
+# All of them are read once per process. These getters call ``os.getenv`` at
+# call time, but ``.env`` is loaded at start-up and no code assigns these names
+# afterwards, so within one process each returns the same value forever:
+# changing any of them takes a restart. ``RETENTION_ENV_VARS`` names the set,
+# and ``test_no_module_assigns_a_retention_environment_variable`` pins it.
+#
+# Two rules run through the whole section:
+#   * a value that cannot be read disables the leg it configures, rather than
+#     falling back to a working default -- a default here is a number of days,
+#     and a number of days deletes conversations;
+#   * a switch that cannot be read resolves to whichever side deletes nothing.
+# ---------------------------------------------------------------------------
+
+#: Every environment variable this section reads. One list, consumed by the
+#: getters' tests and by the guard that checks none of them is assigned at run
+#: time, so a new setting cannot be added to only some of those places.
+RETENTION_ENV_VARS: tuple[str, ...] = (
+    CONVERSATION_RETENTION_DAYS,
+    TRACE_RETENTION_DAYS,
+    RETENTION_ENABLED,
+    RETENTION_DRY_RUN,
+    RETENTION_BATCH_SIZE,
+    RETENTION_SWEEP_INTERVAL_SECONDS,
+    RETENTION_BATCH_PAUSE_SECONDS,
+)
+
+#: The largest period the date arithmetic downstream can express. Above it,
+#: ``retention_cutoff``'s ``now - timedelta(days=days)`` raises OverflowError
+#: instead of returning a cutoff, so an operator pasting a date (``20260923``)
+#: would otherwise configure a period that fails on every use.
+#:
+#: The true limit is the distance back to ``datetime.min``, about 739,900 days
+#: today and growing daily; this sits far below so it needs no clock. A period
+#: of 1,900 years already means "keep everything", which is spelled by leaving
+#: the variable unset. It does not catch every mistyped date -- ``260923`` is
+#: 714 years and passes -- but such a value is inert rather than broken.
+#:
+#: ``retention_cli.py`` deliberately asks the arithmetic instead of bounding:
+#: it reports which of an operator's candidate periods are unrepresentable and
+#: needs the exact boundary. This decides only whether to accept a value, which
+#: a ceiling answers without knowing where the boundary is.
+MAX_RETENTION_DAYS = 700_000
+
+
+class _RetentionDays(enum.Enum):
+    """How a period variable was configured.
+
+    Four cases rather than a nullable int, because the two getters read them
+    differently: ``ZERO`` disables the conversation period and inherits it for
+    the trace period. Classifying once is what keeps those two readings from
+    disagreeing about which spellings are zero.
+    """
+
+    UNSET = "unset"
+    ZERO = "zero"
+    DAYS = "days"
+    INVALID = "invalid"
+
+
+def _classify_retention_days(env_var: str) -> tuple[_RetentionDays, int | None]:
+    """Read one period variable into (case, days).
+
+    ``days`` is set only for :attr:`_RetentionDays.DAYS`; no other case names a
+    period. ``0`` is a documented spelling and is classified silently, while a
+    negative, unparsable or too-large value warns.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return _RetentionDays.UNSET, None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    if parsed == 0:
+        return _RetentionDays.ZERO, None
+    if parsed < 0 or parsed > MAX_RETENTION_DAYS:
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    return _RetentionDays.DAYS, parsed
+
+
+def _get_retention_bool_env(env_var: str, *, permissive: bool) -> bool:
+    """Parse a retention switch, resolving what it cannot read to "delete nothing".
+
+    ``permissive`` is the value that lets expiry proceed, and is also the
+    default: both switches ship in their permissive position, since neither is
+    meant to restrain a deployment that has configured no period. An
+    unrecognised value therefore resolves to ``not permissive``.
+
+    Deliberately not :func:`_get_bool_env`, which reads anything unrecognised
+    as ``False`` -- fine for a feature flag, wrong here, where that turns
+    ``XAGENT_RETENTION_DRY_RUN=enabled`` into a real purge and
+    ``XAGENT_RETENTION_ENABLED=y`` into a silent stop.
+
+    Blank counts as unset, matching :func:`_classify_retention_days`: a compose
+    file interpolating an unset shell variable passes an empty string, which
+    states nothing and must not warn on every read.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return permissive
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    logger.warning(
+        "Unrecognised %s=%r; reading it as %r so that nothing is deleted",
+        env_var,
+        value,
+        not permissive,
+    )
+    return not permissive
+
+
+def get_conversation_retention_days() -> int | None:
+    """Days of conversation retention, or ``None`` when conversations never expire.
+
+    Priority:
+        1. XAGENT_CONVERSATION_RETENTION_DAYS environment variable
+        2. Default ``None``
+
+    ``None`` disables conversation expiry only. Traces can still expire under
+    their own period, which is a supported configuration.
+
+    Returns:
+        Retention period in days, or None.
+    """
+    return _classify_retention_days(CONVERSATION_RETENTION_DAYS)[1]
+
+
+def get_trace_retention_days() -> int | None:
+    """Days of execution-trace retention.
+
+    Priority:
+        1. XAGENT_TRACE_RETENTION_DAYS environment variable
+        2. XAGENT_CONVERSATION_RETENTION_DAYS (traces expire with the
+           conversation they belong to)
+        3. Default ``None`` -- no trace ever expires
+
+    Unset and ``0`` both mean "same as the conversation period", which is
+    deliberately not what ``0`` means for the conversation period itself: a
+    trace period normally shortens the conversation period, so its
+    unconfigured value is the period it shortens.
+
+    A value that is set but unusable is a third case and does *not* inherit:
+    an operator who typos ``XAGENT_TRACE_RETENTION_DAYS=90d`` was asking for
+    90 days and must not silently receive 365. It disables trace expiry,
+    leaving the conversation period to act alone.
+
+    Configuring this alone is supported rather than accidental -- traces are
+    the bulk of the stored bytes and are debugging data, so "keep
+    conversations indefinitely, expire traces after N days" is one of the
+    shapes #2567 has on the table.
+
+    A trace period longer than the conversation period is accepted and will
+    have no effect, because whole-conversation expiry removes the traces with
+    the conversation.
+
+    Returns:
+        Retention period in days, or None when traces never expire.
+    """
+    case, days = _classify_retention_days(TRACE_RETENTION_DAYS)
+    if case is _RetentionDays.DAYS:
+        return days
+    if case is _RetentionDays.INVALID:
+        return None
+    return get_conversation_retention_days()
+
+
+def get_retention_enabled() -> bool:
+    """Kill switch for retention expiry.
+
+    Priority:
+        1. XAGENT_RETENTION_ENABLED environment variable
+        2. Default ``True``
+
+    Defaulting to true enables nothing on its own: with no period configured
+    there is nothing to expire. The switch exists so that stopping expiry does
+    not mean editing the periods, which are the settings an operator would
+    otherwise have to restore correctly afterwards.
+
+    It takes effect on restart, like every setting in this section. Making it
+    changeable under a running process would need a source that process
+    re-reads, such as a database setting; that is not built.
+
+    An unrecognised value resolves to ``False``.
+
+    Returns:
+        False when explicitly disabled, and when the value cannot be read.
+    """
+    return _get_retention_bool_env(RETENTION_ENABLED, permissive=True)
+
+
+def get_retention_dry_run() -> bool:
+    """Whether expiry should report what it would delete and delete nothing.
+
+    Priority:
+        1. XAGENT_RETENTION_DRY_RUN environment variable
+        2. Default ``False``
+
+    An unrecognised value resolves to ``True``. This is the setting an
+    operator is meant to reach for before a first real run, so a typo in it
+    must not be the difference between a report and a deletion.
+
+    Returns:
+        True when no writes may be performed, including when the configured
+        value cannot be read.
+    """
+    return _get_retention_bool_env(RETENTION_DRY_RUN, permissive=False)
+
+
+def get_retention_batch_size() -> int:
+    """How many tasks one expiry batch may consider.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_SIZE environment variable
+        2. Default ``100``
+
+    Blank counts as unset, matching the rest of this section.
+
+    Returns:
+        Positive batch size.
+    """
+    value = os.getenv(RETENTION_BATCH_SIZE)
+    if value is None or not value.strip():
+        return 100
+    return _get_positive_int_env(RETENTION_BATCH_SIZE, 100)
+
+
+def get_retention_sweep_interval_seconds() -> float:
+    """Seconds between expiry sweeps once the eligible backlog is drained.
+
+    Priority:
+        1. XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS environment variable
+        2. Default ``86400`` (daily)
+
+    Daily by default because #2557 proposes wording the customer-facing
+    commitment as "within 7 days after the retention period ends"; a daily
+    sweep leaves six days of headroom for a backlog.
+
+    Returns:
+        Interval in seconds.
+    """
+    value = _get_positive_float_env(RETENTION_SWEEP_INTERVAL_SECONDS, None)
+    return 86400.0 if value is None else value
+
+
+def get_retention_batch_pause_seconds() -> float:
+    """Seconds to pause between batches while a backlog remains.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_PAUSE_SECONDS environment variable
+        2. Default ``5``
+
+    This is the rate limit. Deleting millions of rows pressures autovacuum and
+    replication on PostgreSQL (item H of the side-effect review on #2557), so
+    a drained backlog can wait a full interval while a live one only pauses.
+
+    Returns:
+        Pause in seconds.
+    """
+    value = _get_positive_float_env(RETENTION_BATCH_PAUSE_SECONDS, None)
+    return 5.0 if value is None else value
+
+
+# Zendesk Marketplace request headers (#3222). Unprefixed so they sit with the
+# ZENDESK_CLIENT_ID/ZENDESK_CLIENT_SECRET settings of the same OAuth client.
+ZENDESK_MARKETPLACE_NAME = "ZENDESK_MARKETPLACE_NAME"
+ZENDESK_MARKETPLACE_ORGANIZATION_ID = "ZENDESK_MARKETPLACE_ORGANIZATION_ID"
+ZENDESK_MARKETPLACE_APP_ID = "ZENDESK_MARKETPLACE_APP_ID"
+ZENDESK_MARKETPLACE_HEADER_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("X-Zendesk-Marketplace-Name", ZENDESK_MARKETPLACE_NAME),
+    ("X-Zendesk-Marketplace-Organization-Id", ZENDESK_MARKETPLACE_ORGANIZATION_ID),
+    ("X-Zendesk-Marketplace-App-Id", ZENDESK_MARKETPLACE_APP_ID),
+)
+ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH = 256
+# Printable ASCII only: CR/LF would split the header, and both HTTP clients
+# fail on other characters (httpx rejects non-ASCII values outright, and
+# http.client cannot encode text outside latin-1).
+_ZENDESK_MARKETPLACE_HEADER_VALUE_PATTERN = re.compile(r"[\x20-\x7e]+")
+
+
+def get_zendesk_marketplace_headers() -> dict[str, str]:
+    """Get the Zendesk Marketplace headers for requests to a Zendesk account.
+
+    Priority:
+        1. ZENDESK_MARKETPLACE_NAME, ZENDESK_MARKETPLACE_ORGANIZATION_ID and
+           ZENDESK_MARKETPLACE_APP_ID environment variables
+        2. No headers
+
+    Zendesk requires these on every API request from a Marketplace
+    integration app. Each header is sent when its variable is set, so name
+    and organization ID can go out before the app ID has been assigned. A
+    deployment with its own OAuth client leaves all three unset and sends
+    nothing new. A value that is not printable ASCII or is longer than
+    ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH is ignored with a warning, so a
+    bad setting never breaks or splits the request.
+
+    Returns:
+        Header name to value, for the configured and valid settings only.
+    """
+    headers: dict[str, str] = {}
+    for header, env_var in ZENDESK_MARKETPLACE_HEADER_ENV_VARS:
+        value = (os.getenv(env_var) or "").strip()
+        if not value:
+            continue
+        if (
+            len(value) > ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH
+            or not _ZENDESK_MARKETPLACE_HEADER_VALUE_PATTERN.fullmatch(value)
+        ):
+            # The value is not logged: it may hold the characters that make
+            # it unsafe to send.
+            logger.warning(
+                "Ignoring %s: it must be printable ASCII and at most %d "
+                "characters; %s is not sent",
+                env_var,
+                ZENDESK_MARKETPLACE_HEADER_MAX_LENGTH,
+                header,
+            )
+            continue
+        headers[header] = value
+    return headers

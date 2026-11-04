@@ -1,0 +1,207 @@
+"""Public share-link routes for agent chat."""
+
+from typing import Any
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+)
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
+from ..models.database import get_db
+from ..models.deployment import DeploymentOwnerType
+from ..models.user import User
+from ..models.workforce import Workforce
+from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..services.deployments import find_enabled_share_deployment
+from ..services.share_rate_limit import (
+    get_share_rate_limiter,
+    remote_ip_from_request,
+)
+from .public_chat_access import (
+    PublicChatAuthResponse,
+    ShareChatAccessContext,
+    build_share_chat_dependency,
+    create_public_chat_access_token,
+    create_share_chat_task,
+    mint_share_guest_id,
+    public_websocket_header_token,
+    share_chat_websocket_endpoint,
+    upload_share_chat_files,
+)
+
+share_router = APIRouter(prefix="/api/share", tags=["share"])
+
+
+class ShareAuthRequest(BaseModel):
+    share_token: str
+
+
+@share_router.post("/auth", response_model=PublicChatAuthResponse)
+async def authenticate_share_link(
+    request: ShareAuthRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Authenticate a public share link and issue a guest chat token."""
+    # Abuse control (#973): unauthenticated endpoint. Bucket per share token +
+    # per caller IP before any DB work; covers the workforce fallback below.
+    if not get_share_rate_limiter().allow_auth(
+        request.share_token, remote_ip_from_request(http_request)
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
+    agent = (
+        db.query(Agent)
+        .filter(
+            Agent.share_token == request.share_token,
+            Agent.share_enabled.is_(True),
+        )
+        .first()
+    )
+    if not agent or is_workforce_generated_manager_agent(agent):
+        # Not an agent share token: workforce share credentials live in the
+        # deployments table. Manager agents stay rejected above — external
+        # access enters only via workforce credentials.
+        return _authenticate_workforce_share_link(db, request.share_token)
+    if agent.status != AgentStatus.PUBLISHED:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+
+    user = db.query(User).filter(User.id == agent.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Agent owner not found")
+
+    access_token = create_public_chat_access_token(
+        {
+            "sub": user.username,
+            "user_id": user.id,
+            "auth_mode": "share",
+            "share_agent_id": int(agent.id),
+            "share_token": agent.share_token,
+            # Server-minted per-guest isolation credential (#973); never
+            # accepted from the client, so this request carries no guest_id.
+            "guest_id": mint_share_guest_id(),
+        }
+    )
+    return PublicChatAuthResponse(
+        access_token=access_token,
+        agent_id=int(agent.id),
+        agent_name=agent.name,
+        agent_logo=agent.logo_url,
+        agent_description=agent.description,
+        suggested_prompts=agent.suggested_prompts or [],
+    )
+
+
+def _authenticate_workforce_share_link(
+    db: Session, share_token: str
+) -> PublicChatAuthResponse:
+    """Resolve a workforce share token and issue a guest chat token."""
+    deployment = find_enabled_share_deployment(
+        db, share_token, DeploymentOwnerType.WORKFORCE
+    )
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    workforce = (
+        db.query(Workforce).filter(Workforce.id == int(deployment.owner_id)).first()
+    )
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    if workforce.status != "active":
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+
+    user = db.query(User).filter(User.id == int(workforce.owner_user_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Workforce owner not found")
+
+    access_token = create_public_chat_access_token(
+        {
+            "sub": user.username,
+            "user_id": user.id,
+            "auth_mode": "share",
+            "share_workforce_id": int(workforce.id),
+            "share_token": deployment.share_token,
+            # Server-minted per-guest isolation credential (#973); never
+            # accepted from the client, so this request carries no guest_id.
+            "guest_id": mint_share_guest_id(),
+        }
+    )
+    return PublicChatAuthResponse(
+        access_token=access_token,
+        workforce_id=int(workforce.id),
+        agent_name=workforce.name,
+        agent_description=workforce.description,
+        suggested_prompts=[],
+    )
+
+
+get_current_share_user_dep = build_share_chat_dependency()
+
+
+@share_router.post("/files/upload")
+async def upload_share_file(
+    file: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    task_type: str = Form(...),
+    message: str = Form(""),
+    task_id: str = Form(None),
+    folder: str = Form(None),
+    share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
+    db: Session = Depends(get_db),
+) -> Any:
+    # Abuse control (#973): per-guest cap on public uploads (guest_id is
+    # server-minted on the share path, so it is a trustworthy key). Storage
+    # quota + orphan GC are enforced inside upload_share_chat_files.
+    if not get_share_rate_limiter().allow_upload(share_info.guest_id):
+        raise HTTPException(status_code=429, detail="Too many requests")
+    return await upload_share_chat_files(
+        file=file,
+        files=files,
+        task_type=task_type,
+        message=message,
+        task_id=task_id,
+        folder=folder,
+        access_context=share_info,
+        db=db,
+    )
+
+
+@share_router.post("/chat/task/create", response_model=TaskCreateResponse)
+async def create_share_task(
+    request: TaskCreateRequest,
+    share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
+    db: Session = Depends(get_db),
+) -> Any:
+    # Abuse control (#973): task-create is the costly surface (each spawns an
+    # owner-billed run). Bucket per guest + per share token (the token bucket
+    # stops guest_id rotation from bypassing the per-guest cap).
+    if not get_share_rate_limiter().allow_task_create(
+        share_info.share_token, share_info.guest_id
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
+    return await create_share_chat_task(
+        request=request,
+        access_context=share_info,
+        db=db,
+        default_channel_name="Shared Agent",
+    )
+
+
+@share_router.websocket("/chat/ws/{task_id}")
+async def websocket_share_chat_endpoint(
+    websocket: WebSocket,
+    task_id: int,
+) -> None:
+    """Share chat socket; the guest token rides the handshake headers."""
+    await share_chat_websocket_endpoint(
+        websocket=websocket,
+        task_id=task_id,
+        token=public_websocket_header_token(websocket),
+    )

@@ -1,0 +1,211 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # Run daily at UTC 20:00
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      push_to_dockerhub:
+        description: 'Push built images to Docker Hub'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      push_to_ghcr:
+        description: 'Push built images to GHCR'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BACKEND_IMAGE: xprobe/xagent-backend
+  FRONTEND_IMAGE: xprobe/xagent-frontend
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build-and-push-nightly:
+    # Upstream only: the schedule pushes to the xprobe/* Docker Hub namespace.
+    # workflow_dispatch stays open so a fork can test changes by hand.
+    if: github.event_name == 'workflow_dispatch' || github.repository_owner == 'xorbitsai'
+    timeout-minutes: 240
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: main  # Build nightly version from main branch
+
+      - name: Free GitHub-hosted runner disk space
+        uses: endersonmenezes/free-disk-space@e6ed9b02e683a3b55ed0252f1ee469ce3b39a885
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          rm_cmd: rmz
+          rmz_version: "3.1.1"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Log in to Docker Hub
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare nightly version metadata
+        id: version-meta
+        shell: bash
+        run: |
+          NIGHTLY_DATE="$(date -u +%Y%m%d)"
+          NIGHTLY_VERSION="nightly-$NIGHTLY_DATE"
+          PACKAGE_VERSION="0.0.dev$NIGHTLY_DATE"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "nightly_version=$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend nightly image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.backend
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:nightly
+            ${{ env.BACKEND_IMAGE }}:${{ steps.version-meta.outputs.nightly_version }}
+          labels: |
+            org.opencontainers.image.title=Xagent Backend (Nightly)
+            org.opencontainers.image.description=Nightly build of Xagent backend
+            org.opencontainers.image.version=${{ steps.version-meta.outputs.nightly_version }}
+            org.opencontainers.image.created=${{ steps.version-meta.outputs.build_time }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            XAGENT_VERSION=${{ steps.version-meta.outputs.nightly_version }}
+            XAGENT_PACKAGE_VERSION=${{ steps.version-meta.outputs.package_version }}
+            XAGENT_GIT_COMMIT=${{ github.sha }}
+            XAGENT_BUILD_TIME=${{ steps.version-meta.outputs.build_time }}
+          cache-from: type=registry,ref=${{ env.BACKEND_IMAGE }}:buildcache
+          cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.BACKEND_IMAGE) || '' }}
+
+      - name: Build and push frontend nightly image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          file: docker/Dockerfile.frontend
+          build-args: |
+            NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${{ vars.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN }}
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:nightly
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.version-meta.outputs.nightly_version }}
+          labels: |
+            org.opencontainers.image.title=Xagent Frontend (Nightly)
+            org.opencontainers.image.description=Nightly build of Xagent frontend
+            org.opencontainers.image.version=${{ steps.version-meta.outputs.nightly_version }}
+            org.opencontainers.image.created=${{ steps.version-meta.outputs.build_time }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.FRONTEND_IMAGE }}:buildcache
+          cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.FRONTEND_IMAGE) || '' }}
+
+      - name: Prepare GHCR nightly image metadata
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        id: ghcr-meta
+        shell: bash
+        run: |
+          NIGHTLY_DATE="$(date -u +%Y%m%d)"
+          NIGHTLY_VERSION="nightly-$NIGHTLY_DATE"
+          echo "nightly_version=$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata for backend GHCR
+        id: meta-backend-ghcr
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/xagent-backend
+          tags: |
+            type=raw,value=nightly
+            type=raw,value=${{ steps.ghcr-meta.outputs.nightly_version }}
+
+      - name: Extract metadata for frontend GHCR
+        id: meta-frontend-ghcr
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/xagent-frontend
+          tags: |
+            type=raw,value=nightly
+            type=raw,value=${{ steps.ghcr-meta.outputs.nightly_version }}
+
+      - name: Build and push backend nightly image to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.backend
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta-backend-ghcr.outputs.tags }}
+          labels: ${{ steps.meta-backend-ghcr.outputs.labels }}
+          build-args: |
+            XAGENT_VERSION=${{ steps.version-meta.outputs.nightly_version }}
+            XAGENT_PACKAGE_VERSION=${{ steps.version-meta.outputs.package_version }}
+            XAGENT_GIT_COMMIT=${{ github.sha }}
+            XAGENT_BUILD_TIME=${{ steps.version-meta.outputs.build_time }}
+
+      - name: Build and push frontend nightly image to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push_to_ghcr == 'true' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          file: docker/Dockerfile.frontend
+          build-args: |
+            NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${{ vars.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta-frontend-ghcr.outputs.tags }}
+          labels: ${{ steps.meta-frontend-ghcr.outputs.labels }}
+
+      - name: Notify on failure
+        # Forks have Issues disabled by default, so this would just fail again.
+        if: ${{ failure() && github.repository_owner == 'xorbitsai' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Nightly build failed - ' + new Date().toISOString().split('T')[0],
+              body: 'Nightly Docker build failed. [Check the workflow run](' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId + ')',
+              labels: ['nightly', 'ci-failed']
+            })

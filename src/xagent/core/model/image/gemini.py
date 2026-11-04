@@ -1,0 +1,886 @@
+"""
+Gemini image generation model implementation.
+
+This module provides image generation and editing capabilities using Google's Gemini API.
+Supports Gemini models like:
+- gemini-2.5-flash-image (text-to-image only)
+- gemini-3-pro-image-preview-2k (text-to-image and image editing)
+"""
+
+import base64
+import logging
+import os
+import pathlib
+import re
+from math import gcd
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from ....config import get_media_download_max_bytes
+from ...utils.public_download import download_public_input
+from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
+from ..chat.token_context import MediaCallType
+from ..public_http import create_public_model_async_client
+from .base import (
+    BaseImageModel,
+    InvalidImageResponseError,
+    decode_billed_body,
+    default_image_abilities,
+    invalid_response_from,
+    resolve_requested_size,
+)
+from .usage import (
+    _usable_modality_token_count,
+    record_image_usage,
+    record_unusable_response,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _gemini_token_usage(response_data: Any) -> Dict[str, Any]:
+    """Token counts from a Gemini 200, never raising.
+
+    Reads defensively because it runs *before* the metering call, in the same
+    try as the structural checks below. A 200 whose ``usageMetadata`` is a list
+    or a string -- or whose whole body is a JSON array -- would otherwise raise
+    ``AttributeError`` here, be reclassified as an already-billed invalid
+    response, and lose the billing row for a call Google did charge for: the
+    reclassified error asserts the row was already written, and the retry policy
+    refuses to retry on that basis. Absent or malformed metadata yields zeros,
+    so the row still records the call as billed-but-unmeasured.
+    """
+    metadata = (
+        response_data.get("usageMetadata") if isinstance(response_data, dict) else None
+    )
+    if not isinstance(metadata, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage: Dict[str, Any] = {
+        "prompt_tokens": metadata.get("promptTokenCount", 0),
+        "completion_tokens": metadata.get("candidatesTokenCount", 0),
+        "total_tokens": metadata.get("totalTokenCount", 0),
+    }
+    split = _gemini_input_modality_split(metadata)
+    if split is not None:
+        # The OpenAI-shaped key record_image_usage already reads, so the split
+        # reaches the media row through the one shared path.
+        usage["input_tokens_details"] = {
+            "text_tokens": split[0],
+            "image_tokens": split[1],
+        }
+    return usage
+
+
+def _gemini_input_modality_split(metadata: Dict[str, Any]) -> Optional[tuple[int, int]]:
+    """``(text, image)`` prompt tokens from ``promptTokensDetails``, or ``None``.
+
+    Gemini reports the input breakdown as a list of ``ModalityTokenCount``
+    entries (``{"modality": "TEXT" | "IMAGE" | ..., "tokenCount": n}``); see
+    https://ai.google.dev/api/generate-content#UsageMetadata. A modality absent
+    from the list contributed no tokens, so a text-only prompt yields an
+    explicit image count of 0.
+
+    The split prices text and image input at different rates, so it is given
+    only when it accounts for the whole prompt; otherwise ``None`` leaves the
+    row without a split, which billing reports as unpriced input rather than
+    charging a guessed rate. That covers a missing or malformed list, an entry
+    whose count is not a whole non-negative number, a non-zero count in a
+    modality that is neither text nor image (audio, video, document,
+    unspecified: no text or image price applies to it), and a split that does
+    not sum to ``promptTokenCount``.
+    """
+    details = metadata.get("promptTokensDetails")
+    if not isinstance(details, list):
+        return None
+    prompt_tokens = _usable_modality_token_count(metadata.get("promptTokenCount"))
+    if prompt_tokens is None:
+        return None
+    text_tokens = image_tokens = 0
+    for entry in details:
+        if not isinstance(entry, dict):
+            return None
+        tokens = _usable_modality_token_count(entry.get("tokenCount"))
+        if tokens is None:
+            return None
+        modality = entry.get("modality")
+        if modality == "TEXT":
+            text_tokens += tokens
+        elif modality == "IMAGE":
+            image_tokens += tokens
+        elif tokens:
+            return None
+    if text_tokens + image_tokens != prompt_tokens:
+        return None
+    return text_tokens, image_tokens
+
+
+def _parse_size_to_gemini_config(size: str, model_name: str) -> Dict[str, str]:
+    """
+    Parse size string to Gemini image configuration.
+
+    Gemini uses aspectRatio and imageSize instead of direct dimensions.
+
+    Args:
+        size: Size string like "1920*1080" or "1920x1080"
+        model_name: Model name (e.g., "gemini-3-pro-image-preview-2k")
+
+    Returns:
+        Dict with 'aspectRatio' and 'imageSize' keys for Gemini API
+
+    Example:
+        >>> _parse_size_to_gemini_config("1920*1080", "gemini-3-pro-image-preview-2k")
+        {'aspectRatio': '16:9', 'imageSize': '2K'}
+    """
+    # Supported aspect ratios by Gemini
+    supported_ratios = [
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+    ]
+
+    # Determine max resolution based on model name
+    model_name_lower = model_name.lower()
+    if "2k" in model_name_lower:
+        max_resolution = 2048
+    elif "4k" in model_name_lower:
+        max_resolution = 4096
+    else:
+        # Default to 2K for unknown models
+        max_resolution = 2048
+
+    # Normalize size string
+    size_normalized = size.replace("*", "x")
+
+    try:
+        if "x" not in size_normalized:
+            # Default to square if invalid format
+            return {"aspectRatio": "1:1", "imageSize": "1K"}
+
+        width_str, height_str = size_normalized.split("x")
+        width = int(width_str)
+        height = int(height_str)
+
+        # Calculate aspect ratio
+        divisor = gcd(width, height)
+        aspect_ratio = f"{width // divisor}:{height // divisor}"
+
+        # Use exact ratio if supported, otherwise find closest
+        if aspect_ratio in supported_ratios:
+            ratio = aspect_ratio
+        else:
+            # Find closest supported ratio by comparing decimal values
+            target_ratio = width / height
+            ratio = min(
+                supported_ratios,
+                key=lambda r: abs(
+                    (lambda x: int(x.split(":")[0]) / int(x.split(":")[1]))(r)
+                    - target_ratio
+                ),
+            )
+
+        # Determine image size based on max dimension and model limit
+        max_dimension = max(width, height)
+
+        # First determine what size bucket the request falls into
+        if max_dimension <= 1024:
+            requested_size = "1K"
+        elif max_dimension <= 2048:
+            requested_size = "2K"
+        elif max_dimension <= 4096:
+            requested_size = "4K"
+        else:
+            requested_size = "4K"
+
+        # Clamp to model's maximum supported resolution
+        if max_resolution < 1024:
+            image_size = "1K"
+        elif max_resolution < 2048:
+            image_size = "1K"
+        elif max_resolution < 4096:
+            # 2K model - cap at 2K
+            image_size = "1K" if requested_size == "1K" else "2K"
+        else:
+            # 4K model - support all sizes
+            image_size = requested_size
+
+        return {"aspectRatio": ratio, "imageSize": image_size}
+
+    except (ValueError, IndexError, ZeroDivisionError):
+        # Return defaults if parsing fails
+        return {"aspectRatio": "1:1", "imageSize": "1K"}
+
+
+class GeminiImageModel(BaseImageModel):
+    """
+    Gemini image generation and editing model client.
+
+    Supports text-to-image generation and image editing using Google's Gemini models
+    via the generateContent API.
+
+    Compatible with models like:
+    - gemini-2.5-flash-image (Imagen 3 powered) - text-to-image only
+    - gemini-3-pro-image-preview-2k - text-to-image and image editing
+
+    Image editing is supported for models with "3-pro" in the name by default.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash-image",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: float = 300.0,
+        abilities: Optional[List[str]] = None,
+        model_id: str = "",
+    ):
+        """
+        Initialize Gemini image generation model.
+
+        Args:
+            model_name: Model identifier (e.g., "gemini-2.5-flash-image")
+            api_key: Google API key for authentication
+            base_url: Base URL for API (optional, defaults to official Google API)
+            timeout: Request timeout in seconds
+            abilities: List of supported abilities (defaults to auto-detected based on model)
+                      Some models like "gemini-3-pro-image-preview-2k" also support ["generate", "edit"]
+            model_id: Configured model id used for usage attribution
+        """
+        self.model_name = model_name
+        # See OpenAIImageModel: this provider records its own usage, so the
+        # configured id must live here rather than on the retry wrapper.
+        self.model_id = model_id
+        self.api_key = (
+            api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        )
+        self.base_url = (
+            base_url if base_url else "https://generativelanguage.googleapis.com/v1beta"
+        ).rstrip("/")
+        self.timeout = timeout
+
+        # Newer models like gemini-3-pro-image-preview-2k support editing
+        self._abilities = abilities or default_image_abilities("gemini", model_name)
+
+    @property
+    def abilities(self) -> List[str]:
+        """
+        Get the list of abilities supported by this Gemini image model.
+
+        Returns:
+            List[str]: List of supported abilities (["generate"] or ["generate", "edit"])
+        """
+        return self._abilities
+
+    def has_ability(self, ability: str) -> bool:
+        """
+        Check if this image model implementation supports a specific ability.
+
+        Args:
+            ability: The ability to check
+
+        Returns:
+            bool: True if the ability is supported, False otherwise
+        """
+        return ability in self.abilities
+
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024*1024",
+        negative_prompt: str = "",
+        resolution: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        aspect_ratio: Optional[str] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Generate an image from a text prompt using Gemini API.
+
+        Uses the generateContent endpoint with the Gemini model.
+        For models like gemini-2.5-flash-image that have Imagen 3 capabilities.
+
+        Args:
+            prompt: Text prompt for image generation
+            size: Image size in format "width*height" (e.g., "1024*1024")
+            negative_prompt: Negative prompt for image generation (passed in request)
+            resolution: Alternative size specification (e.g., "1920x1080")
+            width: Image width in pixels
+            height: Image height in pixels
+            aspect_ratio: Aspect ratio (e.g., "16:9", "3:2", "1:1"). Overrides size-based calculation if provided.
+            **kwargs: Additional parameters (e.g., temperature, etc.)
+
+        Returns:
+            dict with image generation result containing:
+            - image_url: Data URL of the generated image (base64 encoded)
+            - usage: Image generation usage statistics
+            - request_id: Request identifier
+
+        Raises:
+            RuntimeError: If the API call fails or model doesn't support generation
+        """
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
+
+        if not self.has_ability("generate"):
+            raise RuntimeError("This model doesn't support image generation")
+
+        # Handle alternative size parameters
+        # Priority: aspect_ratio > resolution > width+height > size
+        actual_size = size
+
+        # Log received parameters for debugging
+        if resolution or (width and height) or aspect_ratio:
+            logger.info(
+                f"Image size parameters received - size: {size}, resolution: {resolution}, "
+                f"width: {width}, height: {height}, aspect_ratio: {aspect_ratio}"
+            )
+
+            # Warn users that Gemini doesn't support exact pixel dimensions
+            logger.warning(
+                "Gemini API does not support exact pixel dimensions. "
+                "Requests will be converted to the closest aspect ratio (e.g., 4:3, 3:2, 16:9) "
+                "and size bucket (1K/2K/4K). Actual output dimensions may vary from requested dimensions."
+            )
+
+        if resolution:
+            # resolution format: "1920x1080"
+            actual_size = resolution.replace("x", "*")
+            logger.info(
+                f"Using resolution parameter: {resolution} -> actual_size={actual_size}"
+            )
+        elif width and height:
+            # width + height format
+            actual_size = f"{width}*{height}"
+            logger.info(
+                f"Using width/height parameters: {width}x{height} -> actual_size={actual_size}"
+            )
+        elif aspect_ratio:
+            logger.info(
+                f"Using aspect_ratio parameter: {aspect_ratio} with base size: {actual_size}"
+            )
+
+        # else use the default size parameter
+
+        # Build the API URL using generateContent endpoint
+        is_official_api = "googleapis.com" in self.base_url
+
+        # Remove 'models/' prefix from model_name if present
+        clean_model_name = self.model_name.replace("models/", "", 1)
+
+        if is_official_api:
+            api_url = f"{self.base_url}/models/{clean_model_name}:generateContent?key={self.api_key}"
+            headers = {}
+        else:
+            # For proxy services
+            api_url = f"{self.base_url}/models/{clean_model_name}:generateContent"
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        # Prepare request body following Gemini API format
+        # The prompt should be in the contents.parts[0].text field
+        request_body: dict[str, Any] = {"contents": [{"parts": [{"text": prompt}]}]}
+
+        # Add generation config
+        gen_config: dict[str, Any] = {"responseModalities": ["Image"]}
+
+        # Add image configuration based on size
+        image_config = _parse_size_to_gemini_config(actual_size, self.model_name)
+
+        # Override aspect ratio if explicitly provided
+        if aspect_ratio:
+            if image_config:
+                image_config["aspectRatio"] = aspect_ratio
+            else:
+                image_config = {"aspectRatio": aspect_ratio}
+            logger.info(f"Using explicit aspect_ratio: {aspect_ratio}")
+
+        if image_config:
+            gen_config["imageConfig"] = image_config
+            logger.info(
+                f"Final image_config: aspectRatio={image_config.get('aspectRatio')}, imageSize={image_config.get('imageSize')}"
+            )
+
+        if kwargs:
+            if "temperature" in kwargs:
+                gen_config["temperature"] = kwargs["temperature"]
+        request_body["generationConfig"] = gen_config
+
+        # Log the request
+        logger.info(
+            "Gemini image generation API URL: %s",
+            redact_url_credentials_for_logging(api_url),
+        )
+        logger.info(f"Generation config: {gen_config}")
+        logger.debug(f"Request prompt: {prompt[:100]}...")
+
+        try:
+            # Make the async HTTP request
+            timeout = httpx.Timeout(self.timeout, connect=10.0)
+            async with create_public_model_async_client(timeout=timeout) as client:
+                response = await client.post(
+                    api_url,
+                    json=request_body,
+                    headers=headers,
+                )
+
+                logger.info(
+                    f"Gemini image generation response status: {response.status_code}"
+                )
+
+                if response.status_code != 200:
+                    error_text = response.text
+                    logger.error(
+                        "Gemini image generation error: %s",
+                        redact_sensitive_text(error_text),
+                    )
+                    response.raise_for_status()
+
+                # Inside the billing boundary: the 200 is already charged, so a
+                # body that will not decode is an invalid response, not a
+                # retryable failure. Left outside, a JSONDecodeError reached the
+                # retry predicate and the call was re-billed with no metering
+                # row ever written.
+                try:
+                    response_data = decode_billed_body(
+                        response.json, "Gemini returned an undecodable body"
+                    )
+                except InvalidImageResponseError:
+                    # Metered before re-raising. Classifying an undecodable
+                    # billed body as non-retryable stops the repeat charges,
+                    # but the one real charge still has to leave a row -- the
+                    # same half openai/xinference already do on their own
+                    # decode failures.
+                    record_unusable_response(
+                        model_name=self.model_name,
+                        model_id=self.model_id,
+                        call_type=MediaCallType.GENERATE_IMAGE,
+                        resolution=(image_config or {}).get("imageSize", ""),
+                    )
+                    raise
+
+                # Parse the response
+                # Gemini API returns:
+                # {
+                #   "candidates": [
+                #     {
+                #       "content": {
+                #         "parts": [
+                #           {
+                #             "inlineData": {
+                #               "mimeType": "image/png",
+                #               "data": "base64_encoded_image_data"
+                #             }
+                #           }
+                #         ]
+                #       },
+                #       "finishReason": "STOP",
+                #       ...
+                #     }
+                #   ],
+                #   "usageMetadata": {...}
+                # }
+
+                # Meter before validating the response body. Google has already
+                # billed this 200, and usageMetadata is present even when the
+                # candidate carries no usable image (safety-blocked finish reason,
+                # empty parts). Recording after the structural checks below would
+                # drop usage for exactly those billed-but-unusable responses.
+                # Those checks raise InvalidImageResponseError, which the production
+                # retry policy refuses to retry, so this row is written exactly once
+                # per billed call.
+                token_usage = _gemini_token_usage(response_data)
+                record_image_usage(
+                    {"usage": token_usage},
+                    model_name=self.model_name,
+                    model_id=self.model_id,
+                    call_type=MediaCallType.GENERATE_IMAGE,
+                    # image_count stays 1 deliberately. The Gemini API has no
+                    # multi-image parameter and this client forwards only
+                    # `temperature` out of **kwargs, so a caller-supplied `n` never
+                    # reaches the provider; the response parser also takes just the
+                    # first inlineData part. Billing `n` here would charge for
+                    # images that were never generated.
+                    resolution=(image_config or {}).get("imageSize", ""),
+                )
+
+            candidates = response_data.get("candidates", [])
+            if not candidates:
+                raise InvalidImageResponseError("No candidates in response")
+
+            first_candidate = candidates[0]
+            finish_reason = first_candidate.get("finishReason")
+            content = first_candidate.get("content", {})
+            parts = content.get("parts", [])
+
+            if not parts:
+                raise InvalidImageResponseError("No parts in response content")
+
+            # Look for inlineData with image (base64 encoded)
+            image_url = None
+            for part in parts:
+                inline_data = part.get("inlineData")
+                if inline_data:
+                    mime_type = inline_data.get("mimeType", "image/png")
+                    base64_data = inline_data.get("data")
+                    if base64_data:
+                        image_url = f"data:{mime_type};base64,{base64_data}"
+                        break
+
+            # If no inlineData, check for Markdown image link in text response
+            if not image_url:
+                for part in parts:
+                    text = part.get("text", "")
+                    if text:
+                        # Extract image URL from Markdown format: ![Image](url)
+                        import re
+
+                        match = re.search(r"!\[.*?\]\((https?://[^\)]+)\)", text)
+                        if match:
+                            image_url = match.group(1)
+                            break
+
+            if not image_url:
+                if finish_reason and finish_reason != "STOP":
+                    raise InvalidImageResponseError(
+                        f"Image generation failed with finish reason: {finish_reason}"
+                    )
+                raise InvalidImageResponseError("No image data in response")
+
+            # Usage was already recorded above, before validation.
+            return {
+                "image_url": image_url,
+                "usage": token_usage,
+                "request_id": response_data.get("requestId"),
+                "finish_reason": finish_reason,
+                "raw_response": response_data,
+            }
+
+        except InvalidImageResponseError:
+            # Re-raised unchanged: wrapping it in a plain RuntimeError below
+            # would erase the non-retryable classification, and the response was
+            # already billed and metered, so a retry only buys another charge.
+            raise
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            # Same classification, reached implicitly. `candidates` and `parts`
+            # are checked for truthiness but not for element type, so a 200
+            # whose candidates are strings fails on `.get` with an
+            # AttributeError rather than a raise. Classified positionally
+            # instead of by enumerating shapes: anything that fails walking an
+            # already-metered body is an invalid response. The request half of
+            # this try raises httpx errors, matched by the clauses below.
+            raise invalid_response_from(e, "Invalid response format") from e
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                "Gemini image generation API error "
+                f"({e.response.status_code}): {redact_sensitive_text(e.response.text)}"
+            ) from e
+        except httpx.TimeoutException as e:
+            raise RuntimeError(f"Image generation timeout: {str(e)}") from e
+        except httpx.NetworkError as e:
+            raise RuntimeError(
+                f"Network error during image generation: {str(e)}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Image generation failed: {str(e)}") from e
+
+    async def edit_image(
+        self,
+        image_url: str | list[str],
+        prompt: str,
+        negative_prompt: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Edit an image using Gemini API with image and text prompt.
+
+        This method supports image editing for compatible Gemini models like
+        gemini-3-pro-image-preview-2k. The image is provided as inlineData (base64 encoded).
+
+        Args:
+            image_url: URL (or list of URLs) of the source image(s) to edit.
+                      Supports http/https URLs and data URLs.
+            prompt: Text prompt describing the desired edits
+            negative_prompt: Negative prompt for image generation (currently not used by Gemini)
+            **kwargs: Additional parameters like size or aspect_ratio
+
+        Returns:
+            dict with image editing result containing:
+            - image_url: URL of the edited image (from Markdown format in response)
+            - usage: Token usage statistics
+            - request_id: Request identifier
+
+        Raises:
+            RuntimeError: If the API call fails or model doesn't support editing
+        """
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is required")
+
+        if not self.has_ability("edit"):
+            raise RuntimeError(
+                "This model doesn't support image editing. "
+                "Use a model like gemini-3-pro-image-preview-2k for editing capabilities."
+            )
+
+        # Build the API URL
+        is_official_api = "googleapis.com" in self.base_url
+
+        # Remove 'models/' prefix from model_name if present
+        clean_model_name = self.model_name.replace("models/", "", 1)
+
+        if is_official_api:
+            api_url = f"{self.base_url}/models/{clean_model_name}:generateContent?key={self.api_key}"
+            headers = {}
+        else:
+            api_url = f"{self.base_url}/models/{clean_model_name}:generateContent"
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        # Prepare request body with image and prompt
+        parts: list[dict[str, Any]] = []
+
+        # Handle single or multiple images
+        images = [image_url] if isinstance(image_url, str) else image_url
+        if not images:
+            raise ValueError("At least one image must be provided for editing")
+
+        for img in images:
+            # Determine mime type and get base64 data
+            if img.startswith("data:"):
+                # Data URL: data:image/png;base64,xxxxx
+                # Parse MIME type from data URL format
+                try:
+                    mime_type = img[5:].split(";base64,")[0]
+                    if not mime_type or "/" not in mime_type:
+                        mime_type = "image/png"
+                except IndexError:
+                    mime_type = "image/png"
+                base64_data = img.split(",", 1)[1]
+                parts.append(
+                    {"inlineData": {"mimeType": mime_type, "data": base64_data}}
+                )
+            elif img.startswith(("http://", "https://")):
+                # HTTP URL: download and encode
+                try:
+                    img_response = await download_public_input(
+                        img,
+                        timeout=60.0,
+                        max_bytes=get_media_download_max_bytes("image"),
+                    )
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": img_response.content_type or "image/jpeg",
+                                "data": base64.b64encode(img_response.content).decode(
+                                    "utf-8"
+                                ),
+                            }
+                        }
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to process remote reference image: {e}"
+                    ) from None
+            else:
+                # Local file path - read and encode
+                # Check if it's a valid file path
+                path = pathlib.Path(img)
+                if not path.is_file():
+                    raise ValueError(f"File not found: {img}")
+
+                try:
+                    # Read file and determine mime type
+                    with open(path, "rb") as f:
+                        image_bytes = f.read()
+                except (OSError, IOError) as e:
+                    raise ValueError(f"Failed to read file {img}: {e}") from e
+
+                # Determine mime type from extension
+                ext = path.suffix.lower()
+                mime_map = {
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".png": "image/png",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                    ".bmp": "image/bmp",
+                    ".tiff": "image/tiff",
+                    ".tif": "image/tiff",
+                }
+                mime_type = mime_map.get(ext, "image/jpeg")
+                base64_data = base64.b64encode(image_bytes).decode("utf-8")
+                parts.append(
+                    {"inlineData": {"mimeType": mime_type, "data": base64_data}}
+                )
+
+        # Add the text prompt
+        parts.append({"text": prompt})
+
+        request_body: dict[str, Any] = {"contents": [{"parts": parts}]}
+
+        # Add generation config
+        gen_config: dict[str, Any] = {"responseModalities": ["Image"]}
+
+        # Optionally add size config if provided.
+        # Same precedence generate_image applies -- reported by review against
+        # the other three providers, and true here too: reading `size` alone
+        # renders and bills an edit at the stale default.
+        size = resolve_requested_size(
+            kwargs.get("size"),
+            resolution=kwargs.get("resolution"),
+            width=kwargs.get("width"),
+            height=kwargs.get("height"),
+        )
+        image_config = _parse_size_to_gemini_config(size, self.model_name)
+        aspect_ratio = kwargs.get("aspect_ratio")
+        if aspect_ratio:
+            image_config["aspectRatio"] = str(aspect_ratio)
+        if image_config:
+            gen_config["imageConfig"] = image_config
+
+        request_body["generationConfig"] = gen_config
+
+        # Log the request
+        logger.info(
+            "Gemini image editing API URL: %s",
+            redact_url_credentials_for_logging(api_url),
+        )
+        logger.debug(f"Image config: {image_config}")
+        logger.debug(f"Edit prompt: {prompt[:100]}...")
+
+        try:
+            timeout = httpx.Timeout(self.timeout, connect=10.0)
+            async with create_public_model_async_client(timeout=timeout) as client:
+                response = await client.post(
+                    api_url,
+                    json=request_body,
+                    headers=headers,
+                )
+
+                logger.info(
+                    f"Gemini image editing response status: {response.status_code}"
+                )
+
+                if response.status_code != 200:
+                    error_text = response.text
+                    logger.error(
+                        "Gemini image editing error: %s",
+                        redact_sensitive_text(error_text),
+                    )
+                    response.raise_for_status()
+
+                # Inside the billing boundary: the 200 is already charged, so a
+                # body that will not decode is an invalid response, not a
+                # retryable failure. Left outside, a JSONDecodeError reached the
+                # retry predicate and the call was re-billed with no metering
+                # row ever written.
+                try:
+                    response_data = decode_billed_body(
+                        response.json, "Gemini returned an undecodable body"
+                    )
+                except InvalidImageResponseError:
+                    # See generate_image: a billed body that will not decode
+                    # still leaves a row.
+                    record_unusable_response(
+                        model_name=self.model_name,
+                        model_id=self.model_id,
+                        call_type=MediaCallType.EDIT_IMAGE,
+                        resolution=(image_config or {}).get("imageSize", ""),
+                    )
+                    raise
+
+                # Meter before validating the response body — see generate_image
+                # for why a billed 200 must be recorded ahead of the structural
+                # checks below.
+                token_usage = _gemini_token_usage(response_data)
+                record_image_usage(
+                    {"usage": token_usage},
+                    model_name=self.model_name,
+                    model_id=self.model_id,
+                    call_type=MediaCallType.EDIT_IMAGE,
+                    # image_count stays 1 — see generate_image: `n` never reaches
+                    # the Gemini API and only one image is ever parsed back.
+                    resolution=(image_config or {}).get("imageSize", ""),
+                )
+
+            # Parse response - similar to generate but for edited image
+            candidates = response_data.get("candidates", [])
+            if not candidates:
+                raise InvalidImageResponseError("No candidates in response")
+
+            first_candidate = candidates[0]
+            finish_reason = first_candidate.get("finishReason")
+            content = first_candidate.get("content", {})
+            response_parts = content.get("parts", [])
+
+            if not response_parts:
+                raise InvalidImageResponseError("No parts in response content")
+
+            # Look for image URL in Markdown text response (most common format)
+            edited_image_url = None
+            for part in response_parts:
+                text = part.get("text", "")
+                if text:
+                    # Extract image URL from Markdown format: ![Image](url)
+                    match = re.search(r"!\[.*?\]\((https?://[^\)]+)\)", text)
+                    if match:
+                        edited_image_url = match.group(1)
+                        break
+
+            # Also check for inlineData as fallback
+            if not edited_image_url:
+                for part in response_parts:
+                    inline_data = part.get("inlineData")
+                    if inline_data:
+                        mime_type = inline_data.get("mimeType", "image/png")
+                        base64_data = inline_data.get("data")
+                        if base64_data:
+                            edited_image_url = f"data:{mime_type};base64,{base64_data}"
+                            break
+
+            if not edited_image_url:
+                if finish_reason and finish_reason != "STOP":
+                    raise InvalidImageResponseError(
+                        f"Image editing failed with finish reason: {finish_reason}"
+                    )
+                raise InvalidImageResponseError("No image data in edit response")
+
+            # Usage was already recorded above, before validation.
+            return {
+                "image_url": edited_image_url,
+                "usage": token_usage,
+                "request_id": response_data.get("requestId"),
+                "finish_reason": finish_reason,
+                "raw_response": response_data,
+            }
+
+        except InvalidImageResponseError:
+            # Re-raised unchanged: wrapping it in a plain RuntimeError below
+            # would erase the non-retryable classification, and the response was
+            # already billed and metered, so a retry only buys another charge.
+            raise
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            # Same classification, reached implicitly. `candidates` and `parts`
+            # are checked for truthiness but not for element type, so a 200
+            # whose candidates are strings fails on `.get` with an
+            # AttributeError rather than a raise. Classified positionally
+            # instead of by enumerating shapes: anything that fails walking an
+            # already-metered body is an invalid response. The request half of
+            # this try raises httpx errors, matched by the clauses below.
+            raise invalid_response_from(e, "Invalid response format") from e
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                "Gemini image editing API error "
+                f"({e.response.status_code}): {redact_sensitive_text(e.response.text)}"
+            ) from e
+        except httpx.TimeoutException as e:
+            raise RuntimeError(f"Image editing timeout: {str(e)}") from e
+        except httpx.NetworkError as e:
+            raise RuntimeError(f"Network error during image editing: {str(e)}") from e
+        except Exception as e:
+            raise RuntimeError(f"Image editing failed: {str(e)}") from e

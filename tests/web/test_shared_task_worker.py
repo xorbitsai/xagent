@@ -1,0 +1,364 @@
+"""A worker admits no execution until its runtime and event transport are ready."""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from sqlalchemy import text
+
+from xagent.web import worker
+from xagent.web.models.database import Base, get_engine, init_db
+
+
+def test_worker_schema_requires_deployed_revision_without_migrating(tmp_path):
+    init_db(db_url=f"sqlite:///{tmp_path / 'worker.db'}")
+    worker.validate_worker_schema()
+    with get_engine().begin() as connection:
+        connection.execute(text("DELETE FROM alembic_version"))
+    with pytest.raises(RuntimeError, match="run migrations"):
+        worker.validate_worker_schema()
+    with get_engine().connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT COUNT(*) FROM alembic_version")
+            ).scalar_one()
+            == 0
+        )
+    Base.metadata.drop_all(bind=get_engine())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge_fails", [False, True])
+async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    order = []
+    for name in (
+        "configure_db",
+        "validate_worker_schema",
+        "validate_interaction_rollout_at_startup",
+        "register_local_browser_runtime",
+        "register_execution_scope_snapshot_loader",
+        "initialize_langfuse",
+        "shutdown_task_runtime_hook_executor",
+        "unregister_local_browser_runtime",
+        "flush_langfuse",
+    ):
+        monkeypatch.setattr(worker, name, Mock())
+    manager = SimpleNamespace(
+        start_accepting=lambda: order.append("accept"),
+        shutdown=AsyncMock(side_effect=lambda: order.append("drain")),
+    )
+    monkeypatch.setattr(worker, "background_task_manager", manager)
+    monkeypatch.setattr(
+        worker,
+        "close_task_coordinators",
+        AsyncMock(side_effect=lambda: order.append("coordinator_drain")),
+    )
+    monkeypatch.setattr(
+        worker, "create_skill_manager", lambda: SimpleNamespace(initialize=AsyncMock())
+    )
+    monkeypatch.setattr(
+        worker,
+        "create_template_manager",
+        lambda: SimpleNamespace(initialize=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "admit_memory_storage_at_startup",
+        lambda: order.append("memory_admission"),
+    )
+
+    from xagent.web.services import chrome_mcp_runtime
+
+    pool = SimpleNamespace(
+        close_all=AsyncMock(side_effect=lambda: order.append("chrome_drain"))
+    )
+    monkeypatch.setattr(chrome_mcp_runtime, "_chrome_pool", pool)
+    monkeypatch.setattr(chrome_mcp_runtime, "_chrome_pool_manager", object())
+
+    async def start_bridge():
+        order.append("bridge")
+        if bridge_fails:
+            raise ConnectionError("bridge unavailable")
+
+    monkeypatch.setattr(worker, "start_task_event_bridge", start_bridge)
+
+    async def stop_dispatch():
+        order.append("stop_claims")
+
+    async def stop_bridge():
+        order.append("stop_bridge")
+
+    async def stop_heartbeat():
+        order.append("heartbeat_idle")
+
+    async def recovery(**kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("recovery_stop")
+
+    async def auto_resume(**kwargs):
+        order.append("auto_resume")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("auto_resume_stop")
+
+    monkeypatch.setattr(worker, "stop_task_command_dispatcher", stop_dispatch)
+    monkeypatch.setattr(worker, "stop_task_event_bridge", stop_bridge)
+    monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", stop_heartbeat)
+    monkeypatch.setattr(worker, "run_task_lease_recovery_loop", recovery)
+    monkeypatch.setattr(worker, "run_task_auto_resume_loop", auto_resume)
+    monkeypatch.setattr(
+        worker,
+        "start_task_command_dispatcher",
+        lambda executor: order.append("dispatch"),
+    )
+
+    async def supervise(executor, stop_event):
+        assert executor is worker.execute_durable_task_command
+        assert stop_event is stop
+        # Let the background loops start, as the real supervisor's waits do.
+        await asyncio.sleep(0)
+        order.append("supervise")
+
+    monkeypatch.setattr(worker, "supervise_task_command_dispatcher", supervise)
+
+    async def initialize_host():
+        order.append("host_hooks")
+
+    stop = asyncio.Event()
+    stop.set()
+    if bridge_fails:
+        with pytest.raises(ConnectionError):
+            await worker.run_worker(initialize_host=initialize_host, stop=stop)
+        assert "accept" not in order
+        assert "dispatch" not in order
+        assert "supervise" not in order
+        assert "auto_resume" not in order
+    else:
+        await worker.run_worker(initialize_host=initialize_host, stop=stop)
+        assert (
+            order.index("host_hooks")
+            < order.index("bridge")
+            < order.index("accept")
+            < order.index("dispatch")
+            < order.index("supervise")
+            < order.index("stop_claims")
+        )
+        # The sweeper runs beside lease recovery and is cancelled before it,
+        # after the claims stop.
+        assert order.index("accept") < order.index("auto_resume")
+        assert (
+            order.index("stop_claims")
+            < order.index("auto_resume_stop")
+            < order.index("recovery_stop")
+            < order.index("coordinator_drain")
+        )
+        # Persistent memory is admitted before this worker will accept a task.
+        # The worker process never runs the FastAPI startup, so this is its
+        # only admission; without it the worker serves no persistent memory,
+        # because acquisition never admits lazily.
+        assert order.index("memory_admission") < order.index("accept")
+    assert (
+        order.index("stop_claims")
+        < order.index("coordinator_drain")
+        < order.index("drain")
+        < order.index("heartbeat_idle")
+        < order.index("stop_bridge")
+        < order.index("chrome_drain")
+    )
+
+    pool.close_all.assert_awaited_once()
+    assert chrome_mcp_runtime._chrome_pool is None
+    assert chrome_mcp_runtime._chrome_pool_manager is None
+
+
+@pytest.mark.asyncio
+async def test_memory_admission_failure_never_aborts_the_worker_boot(monkeypatch):
+    """Memory is fenced off on its own; the worker still serves tasks."""
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    order = []
+    for name in (
+        "configure_db",
+        "validate_worker_schema",
+        "validate_interaction_rollout_at_startup",
+        "register_local_browser_runtime",
+        "register_execution_scope_snapshot_loader",
+        "initialize_langfuse",
+        "shutdown_task_runtime_hook_executor",
+        "unregister_local_browser_runtime",
+        "flush_langfuse",
+        "start_task_command_dispatcher",
+    ):
+        monkeypatch.setattr(worker, name, Mock())
+    monkeypatch.setattr(
+        worker,
+        "background_task_manager",
+        SimpleNamespace(
+            start_accepting=lambda: order.append("accept"),
+            shutdown=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(worker, "close_task_coordinators", AsyncMock())
+    monkeypatch.setattr(
+        worker, "create_skill_manager", lambda: SimpleNamespace(initialize=AsyncMock())
+    )
+    monkeypatch.setattr(
+        worker,
+        "create_template_manager",
+        lambda: SimpleNamespace(initialize=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(worker, "start_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "stop_task_command_dispatcher", AsyncMock())
+    monkeypatch.setattr(worker, "stop_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_lease_recovery_loop", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_auto_resume_loop", AsyncMock())
+
+    # Break admission itself, not the startup helper: the helper's own
+    # exception isolation is what must keep the boot alive, so stubbing it out
+    # would test nothing.
+    from xagent.web import dynamic_memory_store
+
+    admissions = []
+
+    def exploding_admission():
+        admissions.append(1)
+        raise RuntimeError("memory directory is on fire")
+
+    monkeypatch.setattr(
+        dynamic_memory_store, "admit_memory_storage", exploding_admission
+    )
+
+    stop = asyncio.Event()
+    stop.set()
+    await worker.run_worker(stop=stop)
+
+    assert admissions == [1]
+    assert "accept" in order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown_step_fails", [False, True])
+async def test_worker_runs_process_diagnostics_until_stop(
+    monkeypatch, shutdown_step_fails
+):
+    """The per-process diagnostics line runs while the worker serves and drains."""
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    order = []
+    for name in (
+        "configure_db",
+        "validate_worker_schema",
+        "validate_interaction_rollout_at_startup",
+        "register_local_browser_runtime",
+        "register_execution_scope_snapshot_loader",
+        "initialize_langfuse",
+        "shutdown_task_runtime_hook_executor",
+        "unregister_local_browser_runtime",
+        "flush_langfuse",
+        "admit_memory_storage_at_startup",
+    ):
+        monkeypatch.setattr(worker, name, Mock())
+    monkeypatch.setattr(
+        worker,
+        "background_task_manager",
+        SimpleNamespace(
+            start_accepting=lambda: None,
+            shutdown=AsyncMock(side_effect=lambda: order.append("drain")),
+        ),
+    )
+    monkeypatch.setattr(worker, "close_task_coordinators", AsyncMock())
+    monkeypatch.setattr(
+        worker, "create_skill_manager", lambda: SimpleNamespace(initialize=AsyncMock())
+    )
+    monkeypatch.setattr(
+        worker,
+        "create_template_manager",
+        lambda: SimpleNamespace(initialize=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(worker, "start_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "stop_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_lease_recovery_loop", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_auto_resume_loop", AsyncMock())
+    monkeypatch.setattr(
+        worker,
+        "start_task_command_dispatcher",
+        lambda executor: order.append("dispatch"),
+    )
+
+    async def stop_claims():
+        order.append("stop_claims")
+        if shutdown_step_fails:
+            raise ConnectionError("claim shutdown failed")
+
+    monkeypatch.setattr(worker, "stop_task_command_dispatcher", stop_claims)
+    diagnostics = SimpleNamespace(name="diagnostics")
+    seen = {}
+
+    def start_diagnostics():
+        order.append("diagnostics_start")
+        return diagnostics
+
+    async def stop_diagnostics(task):
+        seen["stopped"] = task
+        order.append("diagnostics_stop")
+
+    monkeypatch.setattr(worker, "start_process_diagnostics", start_diagnostics)
+    monkeypatch.setattr(worker, "stop_process_diagnostics", stop_diagnostics)
+    telemetry = SimpleNamespace(name="telemetry")
+
+    def start_telemetry():
+        order.append("telemetry_start")
+        return telemetry
+
+    async def stop_telemetry(task):
+        seen["telemetry_stopped"] = task
+        order.append("telemetry_stop")
+
+    monkeypatch.setattr(worker, "start_process_runtime_telemetry", start_telemetry)
+    monkeypatch.setattr(worker, "stop_process_runtime_telemetry", stop_telemetry)
+
+    async def supervise(executor, stop_event):
+        assert "diagnostics_start" in order
+        assert "diagnostics_stop" not in order
+        order.append("supervise")
+
+    monkeypatch.setattr(worker, "supervise_task_command_dispatcher", supervise)
+
+    stop = asyncio.Event()
+    stop.set()
+    if shutdown_step_fails:
+        with pytest.raises(ConnectionError):
+            await worker.run_worker(stop=stop)
+    else:
+        await worker.run_worker(stop=stop)
+        assert order.index("drain") < order.index("diagnostics_stop")
+    # Metric export is flushed last, after the final diagnostics line, even
+    # when a shutdown step fails.
+    assert order[-2:] == ["diagnostics_stop", "telemetry_stop"]
+    assert order.index("telemetry_start") < order.index("dispatch")
+    assert order.index("dispatch") < order.index("diagnostics_start")
+    assert seen["stopped"] is diagnostics
+    assert seen["telemetry_stopped"] is telemetry

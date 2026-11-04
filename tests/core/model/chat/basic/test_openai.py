@@ -1,0 +1,3991 @@
+"""Test cases for OpenAI LLM implementation using OpenAI SDK."""
+
+import ast
+import asyncio
+import copy
+import json
+import logging
+import re
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import httpx
+import openai
+import pytest
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk, ChoiceDelta
+from pydantic import BaseModel, ConfigDict
+
+from xagent.core.agent.context.execution import ExecutionContext
+from xagent.core.agent.runtime import PatternRuntime
+from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
+from xagent.core.model.chat.basic.openai import (
+    PROVIDER_STATE_METADATA_KEY,
+    OpenAILLM,
+    _format_openai_error,
+    _model_provider_error,
+    _provider_failure_kind,
+    field_content,
+)
+from xagent.core.model.chat.error import retry_on
+from xagent.core.model.chat.exceptions import (
+    MODEL_PROVIDER_FAILURE_KINDS,
+    LLMEmptyContentError,
+    LLMRetryableError,
+    ModelProviderError,
+    ModelProviderRetryableError,
+)
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+    ChunkType,
+)
+from xagent.core.retry.strategy import FixedDelay
+from xagent.core.retry.wrapper import create_retry_wrapper
+
+
+def _stream_chunk(tool_calls=None, finish_reason=None):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                finish_reason=finish_reason,
+            )
+        ]
+    )
+
+
+def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        type=call_type,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+async def _empty_stream():
+    """A stream that ends without yielding any chunk."""
+    if False:
+        yield None
+
+
+def _response_format_bad_request(message: str) -> openai.BadRequestError:
+    """A 400 whose text matches the response_format fallback's trigger check."""
+    return openai.BadRequestError(
+        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": message, "code": 400}},
+    )
+
+
+def _unrelated_bad_request() -> openai.BadRequestError:
+    """A 400 that has nothing to do with response_format."""
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Unsupported image format'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": "Unsupported image format", "code": 400}},
+    )
+
+
+def _api_timeout_error() -> openai.APITimeoutError:
+    """The SDK's timeout error, as raised by a request that never answered."""
+    return openai.APITimeoutError(
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    )
+
+
+class TestOpenAILLM:
+    """Test cases for OpenAI LLM implementation."""
+
+    @pytest.fixture
+    def llm(self, openai_llm_config):
+        """Fixture providing OpenAI LLM instance."""
+        return OpenAILLM(**openai_llm_config)
+
+    @pytest.mark.asyncio
+    async def test_basic_chat_completion(self, llm, mock_chat_completion, mocker):
+        """Test basic chat completion functionality."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {
+                "role": "user",
+                "content": "Hello! Please respond with just 'Hello World'.",
+            },
+        ]
+
+        response = await llm.chat(messages)
+
+        # Verify response is a dict with text content
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+        assert response.get("content") == "Hello World"
+        print(f"Basic chat response: {response}")
+
+        # Verify the API was called with correct parameters
+        mock_client.chat.completions.create.assert_called_once()
+        call_args = mock_client.chat.completions.create.call_args
+        assert call_args.kwargs["model"] == "gpt-4o-mini"
+        assert call_args.kwargs["messages"] == messages
+        assert call_args.kwargs["temperature"] == 0.7
+        # The configured default_max_tokens (models.max_tokens) applies when
+        # the caller passes none, consistent with the other provider classes.
+        assert call_args.kwargs["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_tool_calling(self, llm, mock_tool_call_completion, mocker):
+        """Test tool calling functionality."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_tool_call_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant with access to tools.",
+            },
+            {
+                "role": "user",
+                "content": "What's the weather like in Boston? Please use the get_weather tool.",
+            },
+        ]
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state, e.g. San Francisco, CA",
+                            }
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        response = await llm.chat(messages, tools=tools)
+
+        # Verify tool call response structure
+        assert isinstance(response, dict)
+        assert response.get("type") == "tool_call"
+        assert "tool_calls" in response
+        tool_calls = response["tool_calls"]
+        assert len(tool_calls) > 0
+        assert tool_calls[0]["function"]["name"] == "get_weather"
+        assert tool_calls[0]["id"] == "call_test"
+        print(f"Tool calling response: {response}")
+
+        # Verify the API was called with tools
+        mock_client.chat.completions.create.assert_called_once()
+        call_args = mock_client.chat.completions.create.call_args
+        assert "tools" in call_args.kwargs
+        assert call_args.kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_openai_chat_omits_enable_thinking_when_disabled(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Official OpenAI chat completions must not receive Qwen extensions."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        await llm.chat(
+            [{"role": "user", "content": "Hello"}],
+            thinking={"type": "disabled"},
+        )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "extra_body" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_openai_stream_omits_enable_thinking_when_enabled(
+        self, openai_llm_config, mocker
+    ):
+        """Thinking intent should not add unsupported OpenAI chat parameters."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Hello"}],
+                thinking={"type": "enabled"},
+            )
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert chunks == []
+        assert "extra_body" not in call_kwargs
+
+    def test_openai_provider_reasoning_hook_is_noop_by_default(self, openai_llm_config):
+        """Official OpenAI chat completions do not add provider reasoning payloads."""
+
+        llm = OpenAILLM(
+            **openai_llm_config,
+            abilities=["chat", "tool_calling", "thinking_mode"],
+        )
+
+        assert llm._prepare_provider_reasoning_extra_body(
+            extra_body={"trace_id": "abc"},
+            thinking={"type": "enabled"},
+            tools=None,
+            response_format=None,
+            output_config=None,
+            is_streaming=True,
+        ) == {"trace_id": "abc"}
+
+    def test_parse_stream_chunks_mixed_delta_emits_token_then_tool_call(self, llm):
+        """A delta carrying text and tool-call fragments expands to a TOKEN
+        followed by a TOOL_CALL snapshot, with the finish marker on the last
+        payload; blank text next to tool calls emits no TOKEN."""
+        accumulated_tool_calls = {}
+
+        mixed = _stream_chunk(
+            [
+                _tool_call_delta(0, "call_a", "search", '{"q":'),
+                _tool_call_delta(1, "call_b", "lookup", '{"id":1}'),
+            ]
+        )
+        mixed.choices[0].delta.content = "Checking"
+        chunks = llm._parse_stream_chunks(mixed, accumulated_tool_calls)
+        assert [chunk.type for chunk in chunks] == [
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+        ]
+        assert chunks[0].delta == "Checking"
+        assert [call["id"] for call in chunks[1].tool_calls] == ["call_a", "call_b"]
+        assert [chunk.finish_reason for chunk in chunks] == ["", ""]
+
+        assert llm._parse_stream_chunks(_stream_chunk(), accumulated_tool_calls) == []
+
+        blank = _stream_chunk(
+            [_tool_call_delta(0, None, None, '"x"}')], finish_reason="tool_calls"
+        )
+        blank.choices[0].delta.content = ""
+        (final,) = llm._parse_stream_chunks(blank, accumulated_tool_calls)
+        assert final.type == ChunkType.TOOL_CALL
+        assert final.finish_reason == "tool_calls"
+        assert accumulated_tool_calls["call_a"]["function"]["arguments"] == '{"q":"x"}'
+
+        text_end = _stream_chunk(finish_reason="stop")
+        text_end.choices[0].delta.content = "done"
+        (token,) = llm._parse_stream_chunks(text_end, {})
+        assert (token.type, token.delta, token.finish_reason) == (
+            ChunkType.TOKEN,
+            "done",
+            "stop",
+        )
+
+    def test_parse_stream_chunks_mixed_final_delta_reuses_reasoning_raw(self, llm):
+        mixed = _stream_chunk(
+            [_tool_call_delta(0, "call_a", "search", '{"q":"x"}')],
+            finish_reason="tool_calls",
+        )
+        mixed.choices[0].delta.content = "Checking"
+        mixed.model_dump = MagicMock(return_value={"id": "mixed-final"})
+
+        chunks = llm._parse_stream_chunks(
+            mixed, {}, "Checking the source", has_reasoning_content=True
+        )
+
+        assert [(chunk.type, chunk.finish_reason) for chunk in chunks] == [
+            (ChunkType.TOKEN, ""),
+            (ChunkType.TOOL_CALL, "tool_calls"),
+        ]
+        assert chunks[0].delta == "Checking"
+        assert chunks[1].tool_calls[0]["function"]["arguments"] == '{"q":"x"}'
+        mixed.model_dump.assert_called_once_with()
+        assert chunks[0].raw is chunks[1].raw
+        assert chunks[0].raw["reasoning_content"] == "Checking the source"
+
+        empty = _stream_chunk()
+        empty.model_dump = MagicMock()
+        assert (
+            llm._parse_stream_chunks(
+                empty, {}, "Checking the source", has_reasoning_content=True
+            )
+            == []
+        )
+        empty.model_dump.assert_not_called()
+
+    def test_parse_stream_chunks_ignores_empty_idless_tool_call_placeholder(self, llm):
+        """Some OpenAI-compatible providers emit empty id-less tool-call slots."""
+
+        accumulated_tool_calls = {}
+
+        llm._parse_stream_chunks(
+            _stream_chunk(
+                [
+                    _tool_call_delta(
+                        0,
+                        "call_sum",
+                        "mcp_everything_mcp_get_sum",
+                        '{"a":123,"b":456}',
+                    )
+                ]
+            ),
+            accumulated_tool_calls,
+        )
+        llm._parse_stream_chunks(
+            _stream_chunk(
+                [
+                    _tool_call_delta(
+                        1,
+                        "call_long",
+                        "mcp_everything_mcp_trigger_long_running_operation",
+                        '{"duration":5}',
+                    )
+                ]
+            ),
+            accumulated_tool_calls,
+        )
+        llm._parse_stream_chunks(
+            _stream_chunk([_tool_call_delta(2, None, "", "", None)]),
+            accumulated_tool_calls,
+        )
+
+        (final_chunk,) = llm._parse_stream_chunks(
+            _stream_chunk(finish_reason="tool_calls"),
+            accumulated_tool_calls,
+        )
+
+        assert final_chunk is not None
+        assert final_chunk.tool_calls == [
+            {
+                "index": 0,
+                "id": "call_sum",
+                "type": "function",
+                "function": {
+                    "name": "mcp_everything_mcp_get_sum",
+                    "arguments": '{"a":123,"b":456}',
+                },
+            },
+            {
+                "index": 1,
+                "id": "call_long",
+                "type": "function",
+                "function": {
+                    "name": "mcp_everything_mcp_trigger_long_running_operation",
+                    "arguments": '{"duration":5}',
+                },
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_calling_preserves_empty_reasoning_content(
+        self, openai_llm_config, mocker
+    ):
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.type = "function"
+        tool_call.function.name = "search"
+        tool_call.function.arguments = '{"query":"xagent"}'
+
+        mock_message = MagicMock()
+        mock_message.content = None
+        mock_message.tool_calls = [tool_call]
+        mock_message.reasoning_content = ""
+
+        mock_choice = MagicMock()
+        mock_choice.message = mock_message
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage = None
+        mock_response.model_dump.return_value = {"id": "tool-response"}
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Search"}],
+            tools=[{}],
+        )
+
+        assert response["type"] == "tool_call"
+        assert response["reasoning_content"] == ""
+        assert response["reasoning"] == ""
+
+    @pytest.mark.asyncio
+    async def test_internal_xagent_message_keys_are_stripped(
+        self, llm, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        await llm.chat(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    PROVIDER_STATE_METADATA_KEY: {
+                        "deepseek": {"reasoning_content": ""}
+                    },
+                    "_xagent_private": "internal",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"query":"xagent"}',
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+
+        call_messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
+        assert PROVIDER_STATE_METADATA_KEY not in call_messages[0]
+        assert "_xagent_private" not in call_messages[0]
+        assert "reasoning_content" not in call_messages[0]
+
+    @pytest.mark.asyncio
+    async def test_json_mode(self, llm, mock_json_completion, mocker):
+        """Test JSON mode functionality."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_json_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that responds in JSON format.",
+            },
+            {
+                "role": "user",
+                "content": "Please provide a simple JSON object with 'name' and 'age' fields.",
+            },
+        ]
+
+        response = await llm.chat(messages, response_format={"type": "json_object"})
+
+        # Verify JSON response
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+
+        # Try to parse as JSON
+        content = response.get("content", "")
+        parsed = json.loads(content)
+        assert isinstance(parsed, dict)
+        assert "name" in parsed
+        assert "age" in parsed
+        print(f"JSON mode response: {parsed}")
+
+        # Verify response_format was passed
+        mock_client.chat.completions.create.assert_called_once()
+        call_args = mock_client.chat.completions.create.call_args
+        assert call_args.kwargs["response_format"] == {"type": "json_object"}
+
+    @pytest.mark.asyncio
+    async def test_context_manager(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Test async context manager functionality."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        async with OpenAILLM(**openai_llm_config) as ctx_llm:
+            messages = [{"role": "user", "content": "Say 'test'"}]
+            response = await ctx_llm.chat(messages)
+
+            assert isinstance(response, dict)
+            assert response.get("type") == "text"
+            assert response.get("content") == "Hello World"
+            print(f"Context manager response: {response}")
+
+        # Verify the client was properly closed
+        assert ctx_llm._client is None
+
+    @pytest.mark.asyncio
+    async def test_error_handling_invalid_model(self, mocker):
+        """Test error handling with invalid model name."""
+        # Setup mock to raise an API error
+        mock_client = mocker.AsyncMock()
+
+        import httpx
+        from openai import APIError
+
+        # Create a mock request
+        mock_request = httpx.Request(
+            "POST", "https://api.openai.com/v1/chat/completions"
+        )
+
+        mock_client.chat.completions.create.side_effect = APIError(
+            "Invalid model",
+            request=mock_request,
+            body={"error": {"message": "Model not found"}},
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        # Use a clearly invalid model name
+        llm = OpenAILLM(
+            model_name="invalid-model-name-that-does-not-exist-12345",
+            base_url="https://api.openai.com/v1",
+            api_key="test-key",
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Should raise a RuntimeError
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(messages)
+
+        # Verify error message contains API error information
+        error_msg = str(exc_info.value)
+        assert "OpenAI API error" in error_msg
+        print(f"Error handling test passed: {error_msg}")
+
+    def test_format_openrouter_error_preserves_provider_metadata(self):
+        """OpenRouter provider metadata should survive OpenAI-compatible errors."""
+
+        class FakeOpenRouterError(Exception):
+            message = "Provider returned error"
+            status_code = 400
+            body = {
+                "error": {
+                    "metadata": {
+                        "provider_name": "DeepSeek",
+                        "raw": '{"error":{"message":"missing field `name`"}}',
+                        "previous_errors": [
+                            {
+                                "provider_name": "WandB",
+                                "code": 400,
+                                "raw": '{"error":"invalid request params"}',
+                            }
+                        ],
+                    }
+                }
+            }
+
+        error_msg = _format_openai_error(
+            "OpenAI bad request",
+            FakeOpenRouterError("Provider returned error"),
+        )
+
+        assert "OpenAI bad request (400): Provider returned error" in error_msg
+        assert "provider_name=DeepSeek" in error_msg
+        assert "provider_raw=" in error_msg
+        assert "missing field `name`" in error_msg
+        assert "previous_errors=" in error_msg
+        assert "WandB" in error_msg
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_marks_early_transport_disconnect_retryable(
+        self, openai_llm_config, mocker
+    ):
+        """Early stream transport disconnects should be retried by the wrapper."""
+
+        async def failing_stream():
+            raise RuntimeError(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            )
+            yield
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = failing_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(LLMRetryableError, match="stream connection failed"):
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat(
+                    [{"role": "user", "content": "Hello"}]
+                )
+            ]
+
+    @pytest.mark.asyncio
+    async def test_custom_parameters(self, llm, mock_chat_completion, mocker):
+        """Test custom parameters like temperature and max_tokens."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [{"role": "user", "content": "Count from 1 to 3."}]
+
+        # Test with custom temperature and max_tokens
+        response = await llm.chat(
+            messages,
+            temperature=0.1,  # Low temperature for more deterministic output
+            max_tokens=50,  # Limit response length
+        )
+
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+        assert response.get("content") == "Hello World"
+        print(f"Custom parameters response: {response}")
+
+        # Verify custom parameters were passed
+        mock_client.chat.completions.create.assert_called_once()
+        call_args = mock_client.chat.completions.create.call_args
+        assert call_args.kwargs["temperature"] == 0.1
+        assert call_args.kwargs["max_tokens"] == 50
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_uses_default_max_tokens(self, openai_llm_config, mocker):
+        """stream_chat falls back to the configured default_max_tokens."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_tokens_overrides_default_on_stream_and_vision(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """An explicit max_tokens (e.g. the compaction budget) wins over the default."""
+
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Hi"}], max_tokens=50
+            )
+        ]
+        assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 50
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.vision_chat([{"role": "user", "content": "Hi"}], max_tokens=60)
+        assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_no_default_max_tokens_omits_parameter(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Without a configured default the request keeps the API's own default."""
+
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        config = {**openai_llm_config, "default_max_tokens": None}
+        llm = OpenAILLM(**config, abilities=["chat", "vision"])
+        messages = [{"role": "user", "content": "Hi"}]
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.chat(messages)
+        await llm.vision_chat(messages)
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [chunk async for chunk in llm.stream_chat(messages)]
+
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 3
+        for call in calls:
+            assert "max_tokens" not in call.kwargs
+            assert "max_completion_tokens" not in call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_preserves_zero_temperature(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Vision calls should preserve explicit 0.0 instead of using defaults."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh"
+                        },
+                    },
+                ],
+            }
+        ]
+
+        response = await llm.vision_chat(messages, temperature=0.0)
+
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+
+        call_args = mock_client.chat.completions.create.call_args
+        assert call_args.kwargs["temperature"] == 0.0
+        assert call_args.kwargs["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_returns_the_response_format_retry_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Dropping response_format must not also drop the answer.
+
+        The retry succeeds, so vision_chat has to return that reply's
+        envelope. Returning ``None`` instead reaches the vision tool as an
+        unsupported response shape, turning a successful answer into a
+        detection failure.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            response_format={"type": "json_object"},
+        )
+
+        assert response == {
+            "type": "text",
+            "content": "Hello World",
+            "raw": mock_chat_completion.model_dump(),
+            "finish_reason": "stop",
+        }
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_unrelated_bad_request_is_terminal(
+        self, openai_llm_config, mocker
+    ):
+        """A 400 unrelated to response_format keeps failing with its own message."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _unrelated_bad_request()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_reports_a_failed_retry_as_a_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A retry that is rejected too surfaces as the documented RuntimeError.
+
+        The method documents ``Raises: RuntimeError``; a raw provider
+        exception escaping from the retry would break that, and would differ
+        from how ``stream_chat`` reports the same double rejection.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            _unrelated_bad_request(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):
+        """Test that client cleanup works properly."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        # Make a request to ensure client is initialized
+        messages = [{"role": "user", "content": "Hello"}]
+        await llm.chat(messages)
+
+        # Verify client was created
+        assert llm._client is not None
+
+        # Close the client
+        await llm.close()
+
+        # Verify client is closed (this is mainly to ensure no exceptions are raised)
+        assert llm._client is None
+
+    @pytest.mark.asyncio
+    async def test_multiple_concurrent_requests(
+        self, llm, mock_chat_completion, mocker
+    ):
+        """Test handling multiple concurrent requests."""
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [{"role": "user", "content": "Respond with just 'OK'"}]
+
+        # Make multiple concurrent requests
+        tasks = [llm.chat(messages) for _ in range(3)]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # All requests should succeed
+        for i, response in enumerate(responses):
+            assert not isinstance(response, Exception), (
+                f"Request {i} failed: {response}"
+            )
+            assert isinstance(response, dict)
+            assert response.get("content") == "Hello World"
+
+        print(f"Concurrent requests test passed with {len(responses)} responses")
+
+        # Verify multiple calls were made
+        assert mock_client.chat.completions.create.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_none_content_response(self, openai_llm_config, mocker):
+        """Test handling of None content response."""
+        # Setup mock with None content
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = None
+        mock_message.tool_calls = None
+        # No reasoning trace either: this is a genuinely empty response and
+        # the adapter must keep raising so callers can surface the failure.
+        mock_message.reasoning_content = None
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        # The shared model wrapper retries this transient provider response.
+        with pytest.raises(
+            LLMEmptyContentError,
+            match="LLM returned None content and no tool calls",
+        ):
+            await llm.chat([{"role": "user", "content": "Hello"}])
+
+    @pytest.mark.asyncio
+    async def test_empty_content_response(self, openai_llm_config, mocker):
+        """Test handling of empty string content response."""
+        # Setup mock with empty string content
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        # No reasoning trace either: ensures the empty-response error path
+        # still triggers when a provider returns nothing useful at all.
+        mock_message.reasoning_content = None
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        # The shared model wrapper retries this transient provider response.
+        with pytest.raises(
+            LLMEmptyContentError,
+            match="LLM returned empty content and no tool calls",
+        ):
+            await llm.chat([{"role": "user", "content": "Hello"}])
+
+    @pytest.mark.asyncio
+    async def test_empty_content_uses_shared_retry(
+        self,
+        openai_llm_config,
+        mock_chat_completion,
+        mocker,
+    ):
+        empty_message = SimpleNamespace(
+            content="",
+            tool_calls=None,
+            reasoning_content=None,
+        )
+        empty_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=empty_message,
+                )
+            ],
+            usage=None,
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            empty_response,
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        inner = OpenAILLM(**openai_llm_config)
+        llm = create_retry_wrapper(
+            inner,
+            BaseLLM,  # type: ignore[type-abstract]
+            retry_methods={"chat"},
+            strategy=FixedDelay(delay_ms=0),
+            max_retries=2,
+            retry_on=retry_on,
+        )
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_content_falls_back_to_reasoning_content(
+        self, openai_llm_config, mocker
+    ):
+        """Reasoning models (e.g. qwen3-thinking, deepseek-r1) served via
+        OpenAI-compatible endpoints can return ``content=""`` while the
+        partial answer lives in ``reasoning_content`` when the generation
+        is truncated by ``max_tokens`` (``finish_reason="length"``).
+
+        The adapter must surface the reasoning text as content instead of
+        treating the response as invalid — otherwise the model connection
+        test endpoint can never validate a reasoning model.
+        """
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "length"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = "Here"
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.model_dump.return_value = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Here",
+                    },
+                }
+            ]
+        }
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["type"] == "text"
+        assert result["content"] == "Here"
+        assert result["reasoning_content"] == "Here"
+        assert result["reasoning"] == "Here"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_falls_back_to_reasoning_content_with_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        """The vision_chat path must surface finish_reason the same way
+        chat() does when content is empty and reasoning_content is used
+        as a fallback (see
+        test_empty_content_falls_back_to_reasoning_content above)."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "length"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = "Here"
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.model_dump.return_value = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Here",
+                    },
+                }
+            ]
+        }
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image"}]
+        )
+
+        assert result["content"] == "Here"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_reasoning_content_still_raises(
+        self, openai_llm_config, mocker
+    ):
+        """A whitespace-only reasoning trace must NOT be treated as a
+        usable answer.
+
+        The empty-content guard checks ``content.strip()``; the
+        reasoning fallback must apply the same rule, otherwise a
+        provider returning ``reasoning_content="   "`` would surface a
+        blank string as if it were a valid response.
+        """
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "length"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = "   \n  "
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(
+            RuntimeError, match="LLM returned empty content and no tool calls"
+        ):
+            await llm.chat([{"role": "user", "content": "Hello"}])
+
+    @pytest.mark.asyncio
+    async def test_finish_reason_stop_with_only_reasoning_still_raises(
+        self, openai_llm_config, mocker
+    ):
+        """The reasoning-content fallback is scoped to truncated responses
+        (``finish_reason="length"``) only.
+
+        If a provider returns ``finish_reason="stop"`` with empty content
+        and a populated reasoning trace, the model is claiming to be done
+        without producing a final answer -- that is a real model failure
+        and the adapter must surface it instead of silently promoting the
+        scratchpad to the assistant message.
+        """
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = "I should answer the user."
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(
+            RuntimeError, match="LLM returned empty content and no tool calls"
+        ):
+            await llm.chat([{"role": "user", "content": "Hello"}])
+
+    @pytest.mark.asyncio
+    async def test_empty_string_api_key(self, openai_llm_config, monkeypatch):
+        """Test that empty string API key is allowed and does not fallback to environment variable."""
+        # Set environment variable to ensure we can test that it's NOT used
+        monkeypatch.setenv("OPENAI_API_KEY", "env-api-key-should-not-be-used")
+
+        # Create LLM with empty string API key
+        config = openai_llm_config.copy()
+        config["api_key"] = ""  # Empty string
+
+        llm = OpenAILLM(**config)
+
+        # Verify that the API key is empty string, not the environment variable
+        assert llm.api_key == ""
+        print(
+            f"Empty string API key test passed: API key is '{llm.api_key}' (not using env var)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_api_key_with_env_fallback(self, openai_llm_config, monkeypatch):
+        """Test None API key with environment variable fallback."""
+        # Set environment variable
+        env_api_key = "env-api-key-for-fallback"
+        monkeypatch.setenv("OPENAI_API_KEY", env_api_key)
+
+        # Create LLM with None API key
+        config = openai_llm_config.copy()
+        config["api_key"] = None
+
+        llm = OpenAILLM(**config)
+
+        # Verify that the API key is from environment variable
+        assert llm.api_key == env_api_key
+        print(f"None API key with env fallback test passed: API key is '{llm.api_key}'")
+
+    @pytest.mark.asyncio
+    async def test_missing_api_key_initialization(self, openai_llm_config, monkeypatch):
+        """Test LLM initialization when API key is completely missing."""
+        # Remove environment variable
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        # Create LLM with None API key and no environment variable
+        config = openai_llm_config.copy()
+        config["api_key"] = None
+
+        llm = OpenAILLM(**config)
+
+        # The LLM should initialize with None API key
+        # OpenAI SDK will handle the missing API key when making requests
+        assert llm.api_key is None
+        print(f"Missing API key test: LLM initialized with API key = {llm.api_key}")
+
+    @pytest.mark.asyncio
+    async def test_empty_string_api_key_request(
+        self, openai_llm_config, monkeypatch, mocker
+    ):
+        """Test making a request with empty string API key."""
+        # Remove environment variable to ensure we're testing empty string behavior
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        # Create LLM with empty string API key
+        config = openai_llm_config.copy()
+        config["api_key"] = ""  # Empty string
+
+        # Mock AsyncOpenAI constructor to capture its arguments
+        mock_async_openai = mocker.MagicMock()
+        mock_client = mocker.AsyncMock()
+        mock_async_openai.return_value = mock_client
+
+        # Create a mock response
+        mock_choice = mocker.Mock()
+        mock_choice.finish_reason = "stop"
+        mock_message = mocker.Mock()
+        mock_message.content = "Test response"
+        mock_message.tool_calls = None
+        mock_choice.message = mock_message
+
+        # Mock usage with integer values
+        mock_usage = mocker.Mock()
+        mock_usage.input_tokens = 10
+        mock_usage.output_tokens = 5
+        mock_response_usage = mocker.Mock()
+        mock_response_usage.usage = mock_usage
+
+        mock_response = mocker.Mock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage = mock_usage
+        mock_client.chat.completions.create.return_value = mock_response
+
+        # Patch AsyncOpenAI before creating LLM
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            mock_async_openai,
+        ).start()
+
+        # Create LLM and make a request
+        llm = OpenAILLM(**config)
+
+        # Verify LLM has empty string API key
+        assert llm.api_key == ""
+
+        # Make a request
+        messages = [{"role": "user", "content": "Hello"}]
+        response = await llm.chat(messages)
+
+        # Verify the request was made successfully
+        assert isinstance(response, dict)
+        assert response.get("content") == "Test response"
+        mock_client.chat.completions.create.assert_called_once()
+
+        # Verify AsyncOpenAI was called with empty string API key
+        mock_async_openai.assert_called_once()
+        call_args = mock_async_openai.call_args
+
+        # Check that api_key parameter is empty string
+        # Note: The actual behavior depends on OpenAI SDK implementation
+        # With empty string API key, the SDK might omit Authorization header
+        assert call_args.kwargs.get("api_key") == ""
+        print(
+            f"Empty string API key request test passed: AsyncOpenAI called with API key = '{call_args.kwargs.get('api_key')}'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_available_models_with_default_base_url(self, mocker):
+        """Test listing available models using SDK with default base URL."""
+        from openai.types import Model
+
+        # Mock the models list response from SDK
+        mock_model1 = Model(
+            id="gpt-4o", created=1234567890, owned_by="openai", object="model"
+        )
+        mock_model2 = Model(
+            id="gpt-4o-mini", created=1234567891, owned_by="openai", object="model"
+        )
+
+        mock_models_page = mocker.MagicMock()
+        mock_models_page.data = [mock_model1, mock_model2]
+
+        # Mock the AsyncOpenAI client
+        mock_client = mocker.AsyncMock()
+        mock_client.models.list.return_value = mock_models_page
+        mock_client.close = mocker.AsyncMock()
+
+        # Patch AsyncOpenAI to return our mock
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+        )
+
+        # Call without base_url - should use official API
+        models = await OpenAILLM.list_available_models("test-api-key")
+
+        # Verify results
+        assert len(models) == 2
+        # Models are sorted by created date (newest first)
+        # gpt-4o-mini: created=1234567891, gpt-4o: created=1234567890
+        assert models[0]["id"] == "gpt-4o-mini"
+        assert models[1]["id"] == "gpt-4o"
+
+        # Verify the SDK's models.list() was called
+        mock_client.models.list.assert_called_once()
+
+        # Verify client was closed
+        mock_client.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_list_available_models_with_custom_base_url(self, mocker):
+        """Test listing available models using SDK with custom base URL."""
+        from openai.types import Model
+
+        # Mock the models list response from SDK
+        mock_model = Model(
+            id="custom-model-1", created=1234567890, owned_by="custom", object="model"
+        )
+
+        mock_models_page = mocker.MagicMock()
+        mock_models_page.data = [mock_model]
+
+        # Mock the AsyncOpenAI client
+        mock_client = mocker.AsyncMock()
+        mock_client.models.list.return_value = mock_models_page
+        mock_client.close = mocker.AsyncMock()
+
+        # Patch AsyncOpenAI to return our mock and capture constructor args
+        async_openai_mock = mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+        )
+
+        # Call with custom base_url
+        custom_base_url = "https://custom-proxy.com/v1"
+        models = await OpenAILLM.list_available_models(
+            "test-api-key", base_url=custom_base_url
+        )
+
+        # Verify results
+        assert len(models) == 1
+        assert models[0]["id"] == "custom-model-1"
+
+        # Verify AsyncOpenAI was called with custom base_url
+        async_openai_mock.assert_called_once()
+        call_kwargs = async_openai_mock.call_args.kwargs
+        assert call_kwargs["base_url"] == custom_base_url
+        assert call_kwargs["api_key"] == "test-api-key"
+
+        # Verify the SDK's models.list() was called
+        mock_client.models.list.assert_called_once()
+
+        # Verify client was closed
+        mock_client.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_list_available_models_unauthorized(self, mocker):
+        """Test listing models with invalid API key using SDK."""
+        import openai
+
+        # Mock the AsyncOpenAI client
+        mock_client = mocker.AsyncMock()
+
+        # Create a mock 401 response
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 401
+        mock_response.text = "Unauthorized"
+
+        mock_client.models.list.side_effect = openai.AuthenticationError(
+            "Invalid API key",
+            response=mock_response,
+            body={"error": {"message": "Invalid API key"}},
+        )
+        mock_client.close = mocker.AsyncMock()
+
+        # Patch AsyncOpenAI to return our mock
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+        )
+
+        # Should raise ValueError for invalid API key
+        with pytest.raises(ValueError, match="Invalid API key"):
+            await OpenAILLM.list_available_models("invalid-key")
+
+        # Verify client was closed even after error
+        mock_client.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_output_config_json_schema(self, llm, mocker):
+        """Test output_config with json_schema format for OpenAI."""
+        from openai.types.chat import ChatCompletion
+        from openai.types.chat.chat_completion import Choice
+        from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+        # Create mock completion with JSON schema response
+        mock_completion = ChatCompletion(
+            id="test-json-schema-id",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content='{"joke": "Why did the chicken cross the road?", "punchline": "To get to the other side!"}',
+                        role="assistant",
+                        tool_calls=None,
+                    ),
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o",
+            object="chat.completion",
+            usage=None,
+        )
+
+        # Setup mock
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        messages = [{"role": "user", "content": "Tell me a short joke."}]
+
+        # Test with output_config using json_schema format
+        # For OpenAI, this should be converted to response_format
+        output_config = {
+            "format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "joke": {
+                            "type": "string",
+                            "description": "The text of the joke.",
+                        },
+                        "punchline": {
+                            "type": "string",
+                            "description": "The punchline of the joke.",
+                        },
+                    },
+                    "required": ["joke", "punchline"],
+                    "additionalProperties": False,
+                },
+            }
+        }
+
+        response = await llm.chat(messages, output_config=output_config)
+
+        assert isinstance(response, dict)
+        assert response.get("type") == "text"
+        # Verify the response contains the expected JSON
+        assert "joke" in response.get("content", "")
+        assert "punchline" in response.get("content", "")
+
+        # Verify the API was called with response_format (OpenAI format)
+        mock_client.chat.completions.create.assert_called_once()
+        call_args = mock_client.chat.completions.create.call_args
+        assert "response_format" in call_args.kwargs
+        assert call_args.kwargs["response_format"]["type"] == "json_schema"
+        assert "json_schema" in call_args.kwargs["response_format"]
+
+    @pytest.mark.parametrize(
+        ("empty_arguments", "expected"),
+        [("", ""), ("   ", "   "), (None, "")],
+    )
+    @pytest.mark.parametrize("method", ["chat", "vision_chat"])
+    @pytest.mark.asyncio
+    async def test_empty_tool_arguments_are_not_fatal(
+        self,
+        openai_llm_config,
+        mock_tool_call_completion,
+        mocker,
+        method,
+        empty_arguments,
+        expected,
+    ):
+        """Providers send `""` for parameterless calls; patterns repair the rest.
+
+        Passed through rather than normalized to `"{}"`: the blank string is
+        what auto's and the DAG plan generator's retry paths key on. `None`
+        coerces to `""`; whitespace-only passes through unchanged.
+        """
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        mock_tool_call_completion.choices[0].message.tool_calls[
+            0
+        ].function.arguments = empty_arguments
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_tool_call_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        response = await getattr(llm, method)([{"role": "user", "content": "hi"}])
+
+        assert response["type"] == "tool_call"
+        assert response["tool_calls"][0]["function"]["arguments"] == expected
+        assert response["finish_reason"] == "tool_calls"
+
+    @pytest.mark.parametrize(
+        ("empty_arguments", "expected"),
+        [("", ""), ("   ", "   "), (None, "")],
+    )
+    def test_parse_stream_chunks_passes_empty_tool_arguments_through(
+        self, llm, empty_arguments, expected
+    ):
+        """Same on the streaming finish-reason path; `None` accumulates as `""`."""
+        accumulated_tool_calls = {}
+        llm._parse_stream_chunks(
+            _stream_chunk(
+                [
+                    _tool_call_delta(
+                        0, "call_empty", "list_image_models", empty_arguments
+                    )
+                ]
+            ),
+            accumulated_tool_calls,
+        )
+
+        (final_chunk,) = llm._parse_stream_chunks(
+            _stream_chunk(finish_reason="tool_calls"),
+            accumulated_tool_calls,
+        )
+
+        assert final_chunk is not None
+        assert final_chunk.tool_calls[0]["function"]["arguments"] == expected
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A second BadRequestError from the response_format resend must be
+        wrapped into RuntimeError, not escape as a bare SDK exception, just
+        like every other ``chat()`` failure path. This pins WHICH of the two
+        errors becomes ``__cause__``: it must be the resend's own failure,
+        not the first attempt's, and the wrapped message must carry the
+        resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """When the resend succeeds, ``chat()`` already returns the processed
+        result today; this pins that behavior against the same failure-path
+        restructuring."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Same guarantee as ``chat()``: the vision path must not leak a bare
+        BadRequestError when the response_format resend also fails. This
+        pins WHICH of the two errors becomes ``__cause__``: it must be the
+        resend's own failure, not the first attempt's, and the wrapped
+        message must carry the resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A successful resend must return the processed result, not fall
+        through to an implicit ``None`` (the vision_chat() half of #1650)."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "describe this"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result is not None
+        assert result.get("type") == "text"
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``vision_chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_response_format_resend_timeout_is_retryable(
+        self, openai_llm_config, mocker
+    ):
+        """``stream_chat`` already had this nested-try shape before this PR;
+        its diff is untouched here. This test pins the sibling contract that
+        ``test_chat_...`` and ``test_vision_chat_...`` above were aligned
+        to: ``stream_chat`` classifies the same response_format-resend
+        timeout as ``LLMRetryableError`` rather than ``RuntimeError``."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(LLMRetryableError) as exc_info:
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat(
+                    [{"role": "user", "content": "hi"}],
+                    response_format={"type": "json_object"},
+                )
+            ]
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_after_resend_raises_empty_content_error(
+        self, openai_llm_config, mocker
+    ):
+        """Pins ``vision_chat()``'s empty-content contract, which had zero
+        tests of its own (``chat()`` has ``test_empty_content_response``;
+        ``vision_chat()`` had nothing). The response_format resend is the
+        carrier here because falling through to the normal processing path
+        is what makes this outcome reachable on the resend at all: before
+        this PR, a successful resend short-circuited to ``None`` instead of
+        running that processing path."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = None
+        mock_choice.message = mock_message
+        empty_response = MagicMock()
+        empty_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            empty_response,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(
+            LLMEmptyContentError,
+            match="LLM returned empty content and no tool calls",
+        ):
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+
+class TestFieldContent:
+    """``field_content`` must not mistake a pydantic model's declared default
+    for a value the provider actually sent."""
+
+    class _MessageWithDeclaredDefault(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        reasoning_content: str = "sdk-default-not-from-provider"
+
+    def test_field_content_ignores_a_declared_default_on_a_pydantic_model(self):
+        message = self._MessageWithDeclaredDefault()
+
+        assert field_content(message, "reasoning_content") == (False, None)
+
+    def test_field_content_reads_a_value_passed_through_model_extra(self):
+        """The real-world path: the OpenAI SDK builds response and delta
+        objects through ``construct()``, which -- unlike a normal pydantic
+        ``__init__`` -- only adds explicitly-declared fields to
+        ``model_fields_set`` and routes every unrecognized field straight to
+        ``model_extra``. ``ChoiceDelta`` doesn't declare ``reasoning_content``,
+        so this is exactly how a provider's reasoning field actually arrives
+        on a streaming delta."""
+        delta = ChoiceDelta.construct(role="assistant", reasoning_content="step 1")
+
+        assert "reasoning_content" not in delta.model_fields_set
+        assert field_content(delta, "reasoning_content") == (True, "step 1")
+
+
+def _bad_request(
+    message: str,
+    *,
+    param: str | None = None,
+    code: str | None = None,
+    metadata: dict | None = None,
+) -> openai.BadRequestError:
+    """Build the error the way the SDK does, from a wire-shaped response.
+
+    Constructing the exception directly with a hand-written ``body`` is what
+    made an earlier revision's structural lookup look tested when it could
+    never fire in production: the SDK unwraps the outer ``error`` object in
+    ``_make_status_error``, so a fixture that passes the wrapped shape is
+    testing a shape no real error has. Going through
+    ``_make_status_error_from_response`` keeps the fixture honest.
+    """
+    error_payload: dict = {"message": message, "type": "invalid_request_error"}
+    if param is not None:
+        error_payload["param"] = param
+    if code is not None:
+        error_payload["code"] = code
+    if metadata is not None:
+        error_payload["metadata"] = metadata
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        json={"error": error_payload},
+    )
+    error = openai.AsyncOpenAI(api_key="test")._make_status_error_from_response(
+        response
+    )
+    assert isinstance(error, openai.BadRequestError)
+    return error
+
+
+_MAX_TOKENS_REJECTION = (
+    "Unsupported parameter: 'max_tokens' is not supported with this model. "
+    "Use 'max_completion_tokens' instead."
+)
+
+_REASONING_TOOLS_REJECTION = (
+    "Function tools with reasoning_effort are not supported for this model in "
+    "/v1/chat/completions. To use function tools, use /v1/responses or set "
+    "reasoning_effort to 'none'."
+)
+
+
+class TestRejectedParameterDegrade:
+    """Reasoning models spell the output budget ``max_completion_tokens``.
+
+    Context compaction always sends an output budget, and a configured
+    ``default_max_tokens`` sends one on every call, so without this a
+    reasoning model converses normally while every compaction fails and
+    falls back to dropping messages.
+    """
+
+    @pytest.mark.asyncio
+    async def test_chat_renames_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Summarize."}], max_tokens=5000
+        )
+
+        assert response["content"] == "Hello World"
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        # Renamed, not dropped: for compaction the budget is what keeps a
+        # summary from re-triggering the next compaction.
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_chat_renames_default_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A budget that came from default_max_tokens rides the same rename."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_default_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """Main agent turns stream with no explicit budget, so the
+        default-sourced one must ride the same rename on that path."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            _empty_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}]
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_chat_disables_reasoning_for_function_tools(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _REASONING_TOOLS_REJECTION,
+                param="reasoning_effort",
+                code="validation_error",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "description": "No operation",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Call the tool."}], tools=tools
+        )
+
+        assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "reasoning_effort" not in first_kwargs
+        assert retry_kwargs["reasoning_effort"] == "none"
+        assert retry_kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_one_rejection_naming_both_degrades_both(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The two degrades are independent, not alternatives.
+
+        Judging them with if/elif let a response_format rejection be skipped
+        whenever the same error text also mentioned max_tokens -- and
+        ``vision_chat`` always sends both parameters together, so the
+        precondition is routinely met.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'max_tokens' is not supported with this "
+                "model. Use 'max_completion_tokens' instead. response_format is "
+                "also not supported."
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_response_format_degrade_survives_a_max_tokens_mention(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """An error that merely echoes ``max_tokens`` in its upstream blob
+        must not consume the response_format degrade.
+
+        Here max_tokens is in the request but the rejection is about
+        response_format alone, so only response_format is degraded.
+        Passes against the pre-PR code too, because renaming max_tokens did
+        not exist there -- so this is not a regression test for main. It
+        guards a mistake this PR made and had to correct: an
+        earlier revision judged the two degrades with if/elif, which let a
+        response_format rejection be skipped whenever the same text mentioned
+        max_tokens.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "response_format is not supported by this model "
+                "(request had max_tokens=5000)"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_an_out_of_range_value_does_not_trigger_the_rename(
+        self, openai_llm_config, mocker
+    ):
+        """Anchoring on an unsupported-parameter signal keeps arbitrary
+        upstream text -- ``provider_raw`` can echo a whole request body --
+        from starting a retry that cannot help.
+        Passes against the pre-PR code too, because renaming max_tokens did
+        not exist there -- so this is not a regression test for main. It
+        guards a mistake this PR made and had to correct: an earlier
+        revision treated ``param == "max_tokens"`` as sufficient on its own,
+        which re-opened exactly this hole, and went unnoticed because the
+        fixture did not set ``param``.
+        """
+        mock_client = mocker.AsyncMock()
+        # A real out-of-range rejection names the same param as an
+        # unsupported-parameter one; the param alone must not be taken as
+        # licence to rename.
+        mock_client.chat.completions.create.side_effect = _bad_request(
+            "max_tokens is too large: 200000", param="max_tokens"
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError, match="too large"):
+            await llm.chat(
+                [{"role": "user", "content": "Summarize."}], max_tokens=200000
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_renames_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}], max_tokens=5000
+        )
+
+        assert response["content"] == "Hello World"
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_max_tokens_and_keeps_extra_body(
+        self, openai_llm_config, mocker
+    ):
+        """The streaming path rebuilds the stream itself rather than reusing
+        the non-streaming helper, so its retry needs its own coverage --
+        including the ``extra_body`` branch, which the sibling methods do not
+        have."""
+
+        async def one_chunk_stream():
+            yield _stream_chunk(finish_reason="stop")
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            one_chunk_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        mocker.patch.object(
+            llm, "_prepare_provider_reasoning_extra_body", return_value={"probe": 1}
+        )
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}], max_tokens=5000
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+        assert retry_kwargs["extra_body"] == {"probe": 1}
+
+
+class TestReasoningFallbackIsDeclared:
+    """The client marks content it substituted, and compaction honours it.
+
+    These two live in different packages; without a test that runs the real
+    producer into the real consumer, a change to the response shape on one
+    side would silently stop the other from recognising it.
+    """
+
+    @staticmethod
+    def _truncated_reasoning_completion():
+        message = SimpleNamespace(
+            role="assistant",
+            content="",
+            tool_calls=None,
+            reasoning_content="Let me think about the file first",
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="length")],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": "length"}]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_marks_a_substituted_reasoning_trace(
+        self, openai_llm_config, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = (
+            self._truncated_reasoning_completion()
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert response["content"] == "Let me think about the file first"
+        assert response[CONTENT_SOURCE_KEY] == CONTENT_SOURCE_REASONING_FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_compaction_rejects_what_the_client_marked(
+        self, openai_llm_config, mocker
+    ):
+        """The producer's real output, fed to the real consumer."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = (
+            self._truncated_reasoning_completion()
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        context = ExecutionContext()
+        context.compact_config.threshold = 1
+        context.add_user_message("current request")
+        context.add_tool_result(
+            "read_file", {"output": "x" * 200}, tool_call_id="call-1"
+        )
+        before = list(context.messages)
+
+        result = context.compact_with_llm_response(response, llm=None)
+
+        assert not result.compacted
+        assert context.messages == before
+
+
+class TestRejectedParameterIdentification:
+    """Which parameter a 400 is about, when the text alone cannot say.
+
+    ``_format_openai_error`` appends ``provider_raw`` and ``previous_errors``,
+    so for a gateway that tried several upstreams the message is several
+    providers' complaints concatenated. A keyword found there may belong to an
+    attempt unrelated to this failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_echoed_request_does_not_condemn_an_unrejected_parameter(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The rejection is about response_format; an earlier upstream in the
+        gateway's chain merely grumbled about max_tokens. Renaming max_tokens
+        here would spend the retry on a parameter this endpoint accepts, and
+        lose the response_format recovery that would have worked.
+        Passes against the pre-PR code too, because renaming max_tokens did
+        not exist there -- so this is not a regression test for main. It
+        guards a mistake this PR made and had to correct: the
+        case a reviewer reproduced against an earlier revision of this branch.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' is not supported "
+                "with this model.",
+                param="response_format",
+                metadata={
+                    "provider_name": "upstream-a",
+                    "previous_errors": (
+                        '{"error": "max_tokens must be <= 4096 for this model"}'
+                    ),
+                },
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_upstream_blob_naming_the_replacement_does_not_rename(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The sharpest form of the problem.
+
+        Here the echoed upstream text names ``max_completion_tokens`` itself,
+        which is the one phrase the text-only rule trusts. Only the endpoint's
+        own ``param`` can say that this rejection is about response_format --
+        so this fails unless that field is actually readable, which it is not
+        when the code looks for a wrapper the SDK has already unwrapped.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' is not supported "
+                "with this model.",
+                param="response_format",
+                code="unsupported_parameter",
+                metadata={
+                    "provider_name": "upstream-a",
+                    "previous_errors": (
+                        '{"error": "use max_completion_tokens for this model"}'
+                    ),
+                },
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+
+class TestSequentiallyRejectedParameters:
+    """Endpoints commonly report one invalid parameter per response."""
+
+    @pytest.mark.asyncio
+    async def test_two_rejections_in_a_row_are_both_degraded(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.",
+                param="response_format",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert response["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_loop_is_bounded_by_the_supported_degrades(
+        self, openai_llm_config, mocker
+    ):
+        """Bounded by construction: each degrade removes or renames a
+        parameter and fires only while that parameter is still present, so an
+        endpoint that keeps rejecting the same one cannot spin.
+
+        Four identical rejections are queued for two degradable parameters;
+        the loop must stop after three requests, not consume them all.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError):
+            await llm.chat(
+                [{"role": "user", "content": "Summarize."}],
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_degrades_two_rejections_in_a_row(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert response["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_degrades_two_rejections_in_a_row(
+        self, openai_llm_config, mocker
+    ):
+        """The streaming path rebuilds the stream inside the loop rather than
+        calling the shared helper the other two use, so its second round needs
+        its own coverage."""
+
+        async def one_chunk_stream():
+            yield _stream_chunk(finish_reason="stop")
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            one_chunk_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}],
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+
+class TestFinishReasonOnResponse:
+    """#2786: non-streaming responses carry the provider's ``finish_reason``
+    so ``llm_call_end`` can record it."""
+
+    @staticmethod
+    def _text_response(finish_reason):
+        message = SimpleNamespace(content="Hello", tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": finish_reason}]},
+        )
+
+    @staticmethod
+    def _tool_call_response():
+        tool_call = SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="search", arguments='{"q":"x"}'),
+        )
+        message = SimpleNamespace(content=None, tool_calls=[tool_call])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="tool_calls", message=message)],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": "tool_calls"}]},
+        )
+
+    @staticmethod
+    def _patch_client(mocker, response):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_text_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._text_response("length"))
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_chat_tool_call_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._tool_call_response())
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Search"}], tools=[{}])
+
+        assert result["type"] == "tool_call"
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", [None, ""])
+    async def test_chat_omits_finish_reason_when_provider_sends_none(
+        self, openai_llm_config, mocker, finish_reason
+    ):
+        self._patch_client(mocker, self._text_response(finish_reason))
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert "finish_reason" not in result
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._text_response("stop"))
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat([{"role": "user", "content": "Describe"}])
+
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_carries_finish_reason_on_final_content_delta(
+        self, openai_llm_config, mocker
+    ):
+        """An endpoint that reports ``finish_reason`` on the same chunk as the
+        last content delta must not lose it: the runtime reads the reason from
+        whichever chunk carries it."""
+
+        async def stream():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="Hello", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ]
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=" world", tool_calls=None),
+                        finish_reason="length",
+                    )
+                ]
+            )
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        chunks = [c async for c in llm.stream_chat([{"role": "user", "content": "x"}])]
+
+        tokens = [c for c in chunks if c.is_token()]
+        assert [c.delta for c in tokens] == ["Hello", " world"]
+        assert [c.finish_reason for c in tokens] == ["", "length"]
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_chunks_tool_call_delta_carries_finish_reason(
+        self, openai_llm_config
+    ):
+        """A tool-call delta chunk that also carries ``finish_reason`` (some
+        OpenAI-compatible endpoints put it on the same chunk as the final
+        delta, see ``_parse_stream_chunks`` above) must surface that reason on
+        the returned ``StreamChunk`` rather than dropping it."""
+        llm = OpenAILLM(**openai_llm_config)
+
+        (chunk,) = llm._parse_stream_chunks(
+            _stream_chunk(
+                [_tool_call_delta(0, "call_1", "search", '{"q":1}')],
+                finish_reason="length",
+            ),
+            {},
+        )
+
+        assert chunk is not None
+        assert chunk.is_tool_call()
+        assert chunk.finish_reason == "length"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "openrouter-deepseek"])
+@pytest.mark.parametrize("usage_shape", ["separate", "coalesced", "both"])
+async def test_mixed_stream_delta_reaches_runtime_without_losing_payload(
+    mocker, provider, usage_shape
+):
+    """One SDK delta may carry text and tool arguments at the same time.
+
+    Both must reach typed consumers before the next SDK delta is consumed,
+    including when the last argument bytes share the finish/usage envelope.
+    """
+    from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
+    from xagent.core.model.chat.stream_progress import StreamProgressGuard
+
+    observed = []
+    prefix = '{"local_time": "'
+    suffix = '2026-10-14 15:30:00", "timezone": "Asia/Shanghai"}'
+    usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+
+    def sdk_chunk(content, arguments, *, first=False, final=False):
+        return ChatCompletionChunk(
+            id="synthetic-mixed-stream",
+            created=0,
+            model="synthetic-model",
+            object="chat.completion.chunk",
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": content,
+                        "reasoning_content": "first" if first else " second",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_clock" if first else None,
+                                "type": "function",
+                                "function": {
+                                    "name": "validate_local_time" if first else None,
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls" if final else None,
+                }
+            ],
+            usage=usage if final and usage_shape != "separate" else None,
+        )
+
+    async def sdk_stream():
+        yield sdk_chunk("Checking", prefix, first=True)
+        assert [chunk.type for chunk in observed] == [
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+        ]
+        assert observed[-1].tool_calls[0]["function"]["arguments"] == prefix
+        yield sdk_chunk(" now", suffix, final=True)
+        assert [chunk.type for chunk in observed[:4]] == [
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+        ]
+        # No separate finish packet: the mixed final delta must suffice.
+        if usage_shape != "coalesced":
+            yield ChatCompletionChunk(
+                id="synthetic-mixed-stream",
+                created=0,
+                model="synthetic-model",
+                object="chat.completion.chunk",
+                choices=[],
+                usage=usage,
+            )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = sdk_stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+    )
+    token_usage = mocker.patch("xagent.core.model.chat.basic.openai.add_token_usage")
+    observe = mocker.spy(StreamProgressGuard, "observe")
+    llm_class = OpenRouterLLM if provider.startswith("openrouter") else OpenAILLM
+    llm = llm_class(
+        model_name=(
+            "deepseek/deepseek-v4-flash"
+            if provider == "openrouter-deepseek"
+            else "dots-studio/dots-3-note-preview:free"
+        ),
+        base_url=None,
+        api_key="test-key",
+    )
+    non_streaming = mocker.patch.object(llm, "chat", new=mocker.AsyncMock())
+    result = await PatternRuntime().run_streaming_llm_call(
+        llm,
+        messages=[{"role": "user", "content": "Validate the synthetic local time."}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "validate_local_time",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "local_time": {"type": "string"},
+                            "timezone": {"type": "string"},
+                        },
+                        "required": ["local_time", "timezone"],
+                    },
+                },
+            }
+        ],
+        on_chunk=lambda chunk: observed.append(copy.deepcopy(chunk)),
+    )
+
+    assert result["content"] == "Checking now"
+    assert len(result["tool_calls"]) == 1
+    call = result["tool_calls"][0]
+    assert call["id"] == "call_clock"
+    assert call["function"]["name"] == "validate_local_time"
+    assert json.loads(call["function"]["arguments"]) == {
+        "local_time": "2026-10-14 15:30:00",
+        "timezone": "Asia/Shanghai",
+    }
+    assert result["finish_reason"] == "tool_calls"
+    assert result["reasoning_content"] == "first second"
+    assert result["usage"] == usage
+    assert [chunk.type for chunk in observed] == [
+        ChunkType.TOKEN,
+        ChunkType.TOOL_CALL,
+        ChunkType.TOKEN,
+        ChunkType.TOOL_CALL,
+        ChunkType.USAGE,
+    ]
+    assert [chunk.finish_reason for chunk in observed] == ["", "", "", "tool_calls", ""]
+    # The progress guard observes raw SDK deltas, not the expanded events.
+    assert observe.call_count == (2 if usage_shape == "coalesced" else 3)
+    token_usage.assert_called_once()
+    mock_client.chat.completions.create.assert_awaited_once()
+    non_streaming.assert_not_awaited()
+
+
+class TestStreamNoProgressAbort:
+    """#2785: a stream that keeps emitting chunks but stopped making progress
+    is abandoned by ``stream_chat`` itself, since the runtime never sees the
+    deltas ``_parse_stream_chunks`` drops and the interval timeout only
+    measures silence."""
+
+    _ENV = {
+        "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT": "5",
+        "XAGENT_LLM_STREAM_DEGENERATE_WINDOW": "32",
+        "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD": "8",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _small_thresholds(self, monkeypatch):
+        for name, value in self._ENV.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.delenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", raising=False)
+
+    class _ClosableStream:
+        """An async iterable with the ``close()`` coroutine the OpenAI SDK's
+        ``AsyncStream`` exposes; records whether the abort closed it."""
+
+        def __init__(self, chunks, *, before_yield=None):
+            self._chunks = chunks
+            self._before_yield = before_yield
+            self.closed = False
+            self.consumed = 0
+
+        def __aiter__(self):
+            return self._iterate()
+
+        async def _iterate(self):
+            for chunk in self._chunks:
+                if self._before_yield is not None:
+                    self._before_yield()
+                self.consumed += 1
+                yield chunk
+
+        async def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _delta_chunk(*, content=None, tool_calls=None, finish_reason=None, **fields):
+        delta = SimpleNamespace(content=content, tool_calls=tool_calls, **fields)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+        )
+
+    @staticmethod
+    def _patch_client(mocker, stream):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+    async def _collect(self, llm):
+        return [c async for c in llm.stream_chat([{"role": "user", "content": "x"}])]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_loop_without_payload_ends_with_no_progress(
+        self, openai_llm_config, mocker, caplog
+    ):
+        """The dominant prod shape: reasoning deltas to the cap, no content, no
+        tool call. The stream is closed early and ends with an END chunk whose
+        ``finish_reason`` marks the abort, so the runtime's no-payload
+        fallback runs after seconds instead of ~105 s."""
+        chunks = [self._delta_chunk(reasoning_content="Let me think about it. ")]
+        chunks += [self._delta_chunk(reasoning_content="verify ") for _ in range(200)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert result[0].raw[STREAM_ABORTED_KEY] == "reasoning_repetition"
+        assert stream.closed is True
+        assert stream.consumed < 40  # cut at the window, not at the cap
+        abort_logs = [r for r in caplog.records if "Aborting" in r.getMessage()]
+        assert len(abort_logs) == 1
+        message = abort_logs[0].getMessage()
+        assert "gpt-4o-mini" in message
+        assert "reasoning_repetition" in message
+        assert "reasoning_fields=reasoning_content" in message
+        assert "verify" not in message  # names only, never values
+        # One warning per abort: the standalone field-name line is debug here.
+        assert not [
+            r
+            for r in caplog.records
+            if "no content or tool calls" in r.getMessage()
+            and r.levelno >= logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_reasoning_spelling_is_still_inspected(
+        self, openai_llm_config, mocker
+    ):
+        """Predicate 1 reads whatever ``reasoning*`` field the delta carries, so
+        a loop under a non-default spelling is caught without waiting for the
+        field name to be learned from logs."""
+        chunks = [self._delta_chunk(reasoning="   ") for _ in range(200)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_empty_deltas_end_with_no_progress(self, openai_llm_config, mocker):
+        chunks = [self._delta_chunk() for _ in range(50)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert stream.consumed == 5
+
+    @pytest.mark.asyncio
+    async def test_whitespace_tail_after_complete_tool_call_keeps_the_call(
+        self, openai_llm_config, mocker
+    ):
+        """Trace 5040325 shape: valid JSON followed by a whitespace loop. The
+        call survives; the delta that tripped the guard is dropped and the
+        trailing whitespace already streamed (below the window) is harmless
+        to ``json.loads``."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": ')]
+            ),
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, '"x"}')]),
+        ]
+        chunks += [
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, "\n\t")])
+            for _ in range(100)
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        final = result[-1]
+        assert final.is_tool_call()
+        assert final.finish_reason == "no_progress"
+        assert final.raw[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+        final_arguments = final.tool_calls[0]["function"]["arguments"]
+        assert json.loads(final_arguments) == {"q": "x"}
+        assert len(final_arguments) < len('{"q": "x"}') + 32
+        assert stream.closed is True
+        assert stream.consumed < 30
+        # The tail equals the last snapshot already streamed, so the runtime's
+        # merge sees a repeat, never a shorter "delta".
+        assert all(c.is_tool_call() for c in result)
+        assert final_arguments == result[-2].tool_calls[0]["function"]["arguments"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_object_after_complete_tool_call_is_cut_at_first_byte(
+        self, openai_llm_config, mocker
+    ):
+        """Trace 4580191 shape: the same object repeated. Cut at the first
+        non-whitespace byte after the object closed; the first object is kept."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, None, None, '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, None, None, '{"q": "x"}')]
+            ),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert result[-1].finish_reason == "no_progress"
+        assert result[-1].tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert stream.consumed == 2
+
+    @pytest.mark.asyncio
+    async def test_long_legitimate_reasoning_then_tool_call_is_untouched(
+        self, openai_llm_config, mocker
+    ):
+        """The DeepSeek / Qwen-thinking shape: many non-repetitive reasoning
+        deltas, then a tool call and a clean finish. Nothing is aborted and the
+        provider's own ``finish_reason`` survives."""
+        words = "first consider the user asked for a shift on Monday so we need".split()
+        chunks = [
+            self._delta_chunk(reasoning_content=f"{words[i % len(words)]}{i} ")
+            for i in range(300)
+        ]
+        chunks += [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(finish_reason="tool_calls"),
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(
+                    prompt_tokens=3, completion_tokens=5, total_tokens=8
+                ),
+            ),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        assert stream.consumed == len(chunks)
+        tool_chunks = [c for c in result if c.is_tool_call()]
+        assert tool_chunks[-1].finish_reason == "tool_calls"
+        assert result[-1].is_usage()
+        assert not any(c.finish_reason == "no_progress" for c in result)
+
+    @pytest.mark.asyncio
+    async def test_parallel_tool_call_after_a_complete_one_is_untouched(
+        self, openai_llm_config, mocker
+    ):
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(1, "call_2", "search", '{"q": ')]
+            ),
+            self._delta_chunk(tool_calls=[_tool_call_delta(1, None, None, '"y"}')]),
+            self._delta_chunk(finish_reason="tool_calls"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        final = [c for c in result if c.is_tool_call()][-1]
+        assert final.finish_reason == "tool_calls"
+        assert [tc["function"]["arguments"] for tc in final.tool_calls] == [
+            '{"q": "x"}',
+            '{"q": "y"}',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_open_object_growing_is_left_to_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """The ``create_shift`` runaway: the object never closes, so the guard
+        does not fire and the stream runs to its (test) end."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[
+                    _tool_call_delta(0, "call_1", "create_shift", '{"staff_ids": [')
+                ]
+            )
+        ]
+        chunks += [
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, f"{i},")])
+            for i in range(300)
+        ]
+        chunks.append(self._delta_chunk(finish_reason="length"))
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        assert stream.consumed == len(chunks)
+        assert result[-1].finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_no_payload_timeout_is_opt_in_by_model_name(
+        self, openai_llm_config, mocker, monkeypatch
+    ):
+        """The wall-clock trigger fires only for an allow-listed wire model
+        name, measured from the first delta, and only before any payload."""
+        monkeypatch.setenv(
+            "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "gpt-4o-mini,other"
+        )
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "30")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "0")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "0")
+        now = [1000.0]
+        monkeypatch.setattr(
+            "xagent.core.model.chat.stream_progress.time.monotonic", lambda: now[0]
+        )
+        words = "genuinely different reasoning every single time here".split()
+        chunks = [
+            self._delta_chunk(reasoning_content=words[i % len(words)] + str(i))
+            for i in range(50)
+        ]
+
+        def tick():
+            now[0] += 1.0  # one delta per simulated second
+
+        listed = self._ClosableStream(chunks, before_yield=tick)
+        self._patch_client(mocker, listed)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert result[-1].finish_reason == "no_progress"
+        assert listed.closed is True
+        assert 30 <= listed.consumed <= 32
+
+        # Same stream, model not listed: runs to the end.
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "other")
+        now[0] = 1000.0
+        unlisted = self._ClosableStream(chunks, before_yield=tick)
+        self._patch_client(mocker, unlisted)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert unlisted.closed is False
+        assert unlisted.consumed == 50
+        assert not any(c.finish_reason == "no_progress" for c in result)
+
+    @pytest.mark.asyncio
+    async def test_clean_stream_with_no_payload_logs_field_names(
+        self, openai_llm_config, mocker, caplog
+    ):
+        """A stream that ends on its own with neither content nor tool calls is
+        the invisible fallback path; log the reasoning field names (never their
+        values) so the spelling can be read off prod logs."""
+        chunks = [
+            self._delta_chunk(reasoning_details=[{"text": "secret thought"}]),
+            self._delta_chunk(finish_reason="length"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "length"
+        assert stream.closed is False
+        field_logs = [
+            r for r in caplog.records if "no content or tool calls" in r.getMessage()
+        ]
+        assert len(field_logs) == 1
+        message = field_logs[0].getMessage()
+        assert "reasoning_details" in message
+        assert "secret thought" not in message
+        assert "aborted=no" in message
+
+    @pytest.mark.asyncio
+    async def test_stream_with_content_does_not_log_field_names(
+        self, openai_llm_config, mocker, caplog
+    ):
+        chunks = [
+            self._delta_chunk(content="Hello", reasoning_content="hmm"),
+            self._delta_chunk(finish_reason="stop"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            await self._collect(llm)
+
+        assert not [
+            r for r in caplog.records if "no content or tool calls" in r.getMessage()
+        ]
+
+
+_PROVIDER_REQUEST = httpx.Request(
+    "POST", "https://api.example.test/v1/chat/completions"
+)
+
+
+def _status_error(
+    error_class: type[openai.APIStatusError],
+    status: int,
+    body: object,
+) -> openai.APIStatusError:
+    """An SDK status error built the way the SDK builds one.
+
+    ``body`` is the already-unwrapped error object (or the raw text of a body
+    that was not JSON); the message embeds it like the SDK's own
+    ``"Error code: NNN - ..."`` text.
+    """
+    return error_class(
+        f"Error code: {status} - {body}",
+        response=httpx.Response(status, request=_PROVIDER_REQUEST),
+        body=body,
+    )
+
+
+class _Shape:
+    """One provider failure and what the adapter must report for it."""
+
+    def __init__(
+        self,
+        build,
+        *,
+        kind: str,
+        status: int | None,
+        code: str | None,
+        message: str | None,
+        prefix: str,
+        stream_prefix: str | None = None,
+        retryable_on_stream: bool = False,
+        retry_on: bool = False,
+    ):
+        self.build = build
+        self.kind = kind
+        self.status = status
+        self.code = code
+        self.message = message
+        self.prefix = prefix
+        self.stream_prefix = stream_prefix or prefix
+        self.retryable_on_stream = retryable_on_stream
+        self.retry_on = retry_on
+
+
+_ECHOED_KEY = "sk-test-key-echo"
+
+_PROVIDER_SHAPES = {
+    "400": _Shape(
+        lambda: _status_error(
+            openai.BadRequestError,
+            400,
+            {"message": "Unsupported image format", "code": "invalid_value"},
+        ),
+        kind="bad_request",
+        status=400,
+        code="invalid_value",
+        message="Unsupported image format",
+        prefix="OpenAI bad request",
+    ),
+    "401": _Shape(
+        lambda: _status_error(
+            openai.AuthenticationError,
+            401,
+            {
+                "message": f"Incorrect API key provided: {_ECHOED_KEY}",
+                "code": "invalid_api_key",
+            },
+        ),
+        kind="authentication_failed",
+        status=401,
+        code="invalid_api_key",
+        message=f"Incorrect API key provided: {_ECHOED_KEY}",
+        prefix="OpenAI authentication failed",
+    ),
+    "403": _Shape(
+        lambda: _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {"message": "Model is decommissioned", "code": "provider_code_4204"},
+        ),
+        kind="access_denied",
+        status=403,
+        code="provider_code_4204",
+        message="Model is decommissioned",
+        prefix="OpenAI API error",
+    ),
+    "404": _Shape(
+        lambda: _status_error(
+            openai.NotFoundError,
+            404,
+            {"message": "The model does not exist", "code": "model_not_found"},
+        ),
+        kind="not_found",
+        status=404,
+        code="model_not_found",
+        message="The model does not exist",
+        prefix="OpenAI API error",
+    ),
+    "408": _Shape(
+        lambda: _status_error(
+            openai.APIStatusError,
+            408,
+            {"message": "Request timeout", "code": "request_timeout"},
+        ),
+        kind="timeout",
+        status=408,
+        code="request_timeout",
+        message="Request timeout",
+        prefix="OpenAI API error",
+        retry_on=True,
+    ),
+    "429": _Shape(
+        lambda: _status_error(
+            openai.RateLimitError,
+            429,
+            {"message": "Slow down", "code": "rate_limit_exceeded"},
+        ),
+        kind="rate_limited",
+        status=429,
+        code="rate_limit_exceeded",
+        message="Slow down",
+        prefix="OpenAI rate limit exceeded",
+        retryable_on_stream=True,
+        retry_on=True,
+    ),
+    "503-plain-text": _Shape(
+        lambda: _status_error(openai.InternalServerError, 503, "upstream unavailable"),
+        kind="server_error",
+        status=503,
+        code=None,
+        message=None,
+        prefix="OpenAI API error",
+        retry_on=True,
+    ),
+    "timeout": _Shape(
+        lambda: openai.APITimeoutError(request=_PROVIDER_REQUEST),
+        kind="timeout",
+        status=None,
+        code=None,
+        message=None,
+        prefix="OpenAI API timeout",
+        retryable_on_stream=True,
+        retry_on=True,
+    ),
+    "connection": _Shape(
+        lambda: openai.APIConnectionError(request=_PROVIDER_REQUEST),
+        kind="connection_failed",
+        status=None,
+        code=None,
+        message=None,
+        prefix="OpenAI API error",
+        stream_prefix="OpenAI stream connection failed",
+        retryable_on_stream=True,
+        retry_on=True,
+    ),
+}
+
+
+async def _raise_from_adapter(mocker, openai_llm_config, method: str, error):
+    """Run one adapter method against a client whose request raises ``error``."""
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [error]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+    messages = [{"role": "user", "content": "Hi"}]
+    with pytest.raises(Exception) as caught:
+        if method == "stream_chat":
+            _ = [chunk async for chunk in llm.stream_chat(messages)]
+        else:
+            await getattr(llm, method)(messages)
+    return caught.value
+
+
+class TestModelProviderError:
+    """Every provider failure leaves the adapter as a typed exception whose
+    fields carry the response, with the text and retry behaviour unchanged."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["chat", "vision_chat", "stream_chat"])
+    @pytest.mark.parametrize("shape_id", list(_PROVIDER_SHAPES))
+    async def test_failure_is_typed_with_fields_text_and_cause(
+        self, openai_llm_config, mocker, method, shape_id
+    ):
+        shape = _PROVIDER_SHAPES[shape_id]
+        error = shape.build()
+
+        exc = await _raise_from_adapter(mocker, openai_llm_config, method, error)
+
+        prefix = shape.stream_prefix if method == "stream_chat" else shape.prefix
+        assert isinstance(exc, ModelProviderError)
+        assert exc.kind == shape.kind
+        assert exc.kind in MODEL_PROVIDER_FAILURE_KINDS
+        assert exc.status_code == shape.status
+        assert exc.provider_code == shape.code
+        assert exc.provider_message == shape.message
+        assert exc.prefix == prefix
+        assert str(exc).startswith(prefix)
+        assert exc.__cause__ is error
+        assert exc.details == []
+        assert str(exc) == _format_openai_error(prefix, error)
+        retryable = method == "stream_chat" and shape.retryable_on_stream
+        assert isinstance(exc, LLMRetryableError) is retryable
+        assert isinstance(exc, ModelProviderRetryableError) is retryable
+        assert retry_on(exc) is shape.retry_on
+        if shape_id == "401":
+            assert _ECHOED_KEY in exc.sdk_message
+            assert _ECHOED_KEY in str(exc)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["chat", "vision_chat", "stream_chat"])
+    async def test_an_oversized_message_is_capped_in_text_and_sdk_message(
+        self, openai_llm_config, mocker, method
+    ):
+        error = _status_error(openai.InternalServerError, 503, {"message": "x" * 5000})
+
+        exc = await _raise_from_adapter(mocker, openai_llm_config, method, error)
+
+        assert len(exc.sdk_message) < 4100
+        assert re.search(r"\.\.\.<truncated \d+ chars>$", str(exc))
+        assert exc.status_code == 503
+
+    def test_an_oversized_body_message_is_capped_in_provider_message(self):
+        error = _status_error(openai.InternalServerError, 503, {"message": "x" * 5000})
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.provider_message is not None
+        assert re.search(r"\.\.\.<truncated \d+ chars>$", exc.provider_message)
+        assert len(exc.provider_message) < 4100
+
+    def test_format_openai_error_text_is_exact_with_and_without_status(self):
+        with_status = _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {
+                "message": "Model is decommissioned",
+                "metadata": {"provider_name": "upstream-a", "raw": "raw body"},
+            },
+        )
+        without_status = openai.APIError(
+            "stream broke", request=_PROVIDER_REQUEST, body=None
+        )
+
+        assert _format_openai_error("OpenAI API error", with_status) == (
+            "OpenAI API error (403): Error code: 403 - {'message': "
+            "'Model is decommissioned', 'metadata': {'provider_name': 'upstream-a', "
+            "'raw': 'raw body'}} | provider_name=upstream-a | provider_raw=raw body"
+        )
+        assert _format_openai_error("OpenAI API error", without_status) == (
+            "OpenAI API error: stream broke"
+        )
+        # The raw status attribute is printed as received; validation of the
+        # status belongs to the typed exception, not to this text.
+        raw_status = openai.APIError("odd", request=_PROVIDER_REQUEST, body=None)
+        raw_status.status_code = 999  # type: ignore[attr-defined]
+        assert _format_openai_error("OpenAI API error", raw_status) == (
+            "OpenAI API error (999): odd"
+        )
+
+    @pytest.mark.asyncio
+    async def test_diagnostic_suffixes_are_kept_in_details_and_text(
+        self, openai_llm_config, mocker
+    ):
+        error = _status_error(
+            openai.PermissionDeniedError,
+            403,
+            {
+                "message": "Model is decommissioned",
+                "code": "provider_code_4204",
+                "metadata": {"provider_name": "upstream-a", "raw": "raw body"},
+            },
+        )
+
+        exc = await _raise_from_adapter(mocker, openai_llm_config, "chat", error)
+
+        assert exc.details == ["provider_name=upstream-a", "provider_raw=raw body"]
+        assert str(exc).endswith(" | provider_name=upstream-a | provider_raw=raw body")
+        assert str(exc) == _format_openai_error("OpenAI API error", error)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "body", "kind", "code", "message"),
+        [
+            (
+                403,
+                {
+                    "error": {
+                        "message": "Model is decommissioned",
+                        "code": "provider_code_4204",
+                    }
+                },
+                "access_denied",
+                "provider_code_4204",
+                "Model is decommissioned",
+            ),
+            (
+                401,
+                {
+                    "error": {
+                        "message": f"Incorrect API key provided: {_ECHOED_KEY}",
+                        "code": "invalid_api_key",
+                    }
+                },
+                "authentication_failed",
+                "invalid_api_key",
+                f"Incorrect API key provided: {_ECHOED_KEY}",
+            ),
+        ],
+    )
+    async def test_a_real_sdk_response_populates_the_fields(
+        self, openai_llm_config, status, body, kind, code, message
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, json=body, request=request)
+
+        llm = OpenAILLM(**openai_llm_config)
+        llm._client = openai.AsyncOpenAI(
+            api_key="test-api-key",
+            base_url="https://api.example.test/v1",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        with pytest.raises(ModelProviderError) as caught:
+            await llm.chat([{"role": "user", "content": "Hi"}])
+
+        exc = caught.value
+        assert exc.kind == kind
+        assert exc.status_code == status
+        assert exc.provider_code == code
+        assert exc.provider_message == message
+        assert isinstance(exc.__cause__, openai.APIStatusError)
+        assert str(exc) == _format_openai_error(exc.prefix, exc.__cause__)
+
+    @pytest.mark.asyncio
+    async def test_an_error_object_inside_an_sse_stream_is_unknown(
+        self, openai_llm_config
+    ):
+        first = {
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4o-mini",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "he"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        error_event = {
+            "error": {
+                "message": "flagged",
+                "type": "invalid_request_error",
+                "code": "invalid_prompt",
+            }
+        }
+        body = f"data: {json.dumps(first)}\n\ndata: {json.dumps(error_event)}\n\n"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body.encode(),
+                request=request,
+            )
+
+        llm = OpenAILLM(**openai_llm_config)
+        llm._client = openai.AsyncOpenAI(
+            api_key="test-api-key",
+            base_url="https://api.example.test/v1",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        with pytest.raises(ModelProviderError) as caught:
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+            ]
+
+        exc = caught.value
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.provider_code == "invalid_prompt"
+        assert exc.provider_message == "flagged"
+        assert isinstance(exc.__cause__, openai.APIError)
+        assert not isinstance(exc, LLMRetryableError)
+        assert str(exc) == "OpenAI API error: flagged"
+
+
+class _FailsToDescribeItself(Exception):
+    """An error whose every accessor raises."""
+
+    @property
+    def message(self):
+        raise RuntimeError("message accessor failed")
+
+    @property
+    def status_code(self):
+        raise RuntimeError("status accessor failed")
+
+    @property
+    def code(self):
+        raise RuntimeError("code accessor failed")
+
+    @property
+    def body(self):
+        raise RuntimeError("body accessor failed")
+
+    @property
+    def response(self):
+        raise RuntimeError("response accessor failed")
+
+
+class _UnprintableError(_FailsToDescribeItself):
+    def __str__(self):
+        raise RuntimeError("str failed")
+
+
+class _ResponseJsonFails:
+    def json(self):
+        raise ValueError("not json")
+
+
+class _OnlyMessageFails(Exception):
+    """A rate-limit-shaped error whose message accessor raises; the other
+    fields are intact."""
+
+    status_code = 429
+    body = {"message": "Slow down", "code": "rate_limit_exceeded"}
+
+    @property
+    def message(self):
+        raise RuntimeError("message accessor failed")
+
+
+class TestModelProviderErrorFactory:
+    @pytest.mark.parametrize(
+        ("error_class", "status", "kind"),
+        [
+            (openai.InternalServerError, 500, "server_error"),
+            (openai.APIStatusError, 599, "server_error"),
+            (openai.APIStatusError, 402, "rejected"),
+            (openai.ConflictError, 409, "rejected"),
+            (openai.UnprocessableEntityError, 422, "rejected"),
+            (openai.APIStatusError, 418, "rejected"),
+            (openai.APIStatusError, 302, "unknown"),
+        ],
+    )
+    def test_status_errors_map_to_a_kind_by_status(self, error_class, status, kind):
+        error = _status_error(error_class, status, {"message": "m"})
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.kind == kind
+        assert exc.status_code == status
+
+    @pytest.mark.parametrize(
+        ("build", "kind", "boundary_code"),
+        [
+            (
+                lambda: _status_error(
+                    openai.AuthenticationError, 401, {"message": "m"}
+                ),
+                "authentication_failed",
+                "credential_rejected",
+            ),
+            (
+                lambda: _status_error(
+                    openai.PermissionDeniedError, 403, {"message": "m"}
+                ),
+                "access_denied",
+                "credential_rejected",
+            ),
+            (
+                lambda: _status_error(openai.NotFoundError, 404, {"message": "m"}),
+                "not_found",
+                "model_not_available",
+            ),
+            (
+                lambda: _status_error(openai.APIStatusError, 402, {"message": "m"}),
+                "rejected",
+                "provider_quota",
+            ),
+            (
+                lambda: _status_error(
+                    openai.InternalServerError, 503, {"message": "m"}
+                ),
+                "server_error",
+                "provider_unavailable",
+            ),
+            (
+                lambda: openai.APIConnectionError(request=_PROVIDER_REQUEST),
+                "connection_failed",
+                "provider_unavailable",
+            ),
+        ],
+        ids=["401", "403", "404", "402", "503", "connection"],
+    )
+    def test_the_failure_kind_is_distinct_from_the_call_boundary_code(
+        self, build, kind, boundary_code
+    ):
+        error = build()
+
+        assert (
+            _provider_failure_kind(error, getattr(error, "status_code", None)) == kind
+        )
+        assert classify_provider_failure(error) == boundary_code
+
+    def test_an_error_without_a_status_is_unknown(self):
+        error = openai.APIError("stream broke", request=_PROVIDER_REQUEST, body=None)
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.provider_code is None
+        assert exc.provider_message is None
+
+    def test_a_response_validation_error_keeps_its_status_and_is_unknown(self):
+        error = openai.APIResponseValidationError(
+            httpx.Response(200, request=_PROVIDER_REQUEST),
+            body=None,
+            message="bad shape",
+        )
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.kind == "unknown"
+        assert exc.status_code == 200
+
+    def test_a_non_sdk_exception_is_unknown(self):
+        exc = _model_provider_error("OpenAI API error", ValueError("odd"))
+
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.sdk_message == "odd"
+
+    @pytest.mark.parametrize("status", [True, "403", 403.0, 99, 600, None])
+    def test_only_an_integer_http_status_is_accepted(self, status):
+        class _Odd(Exception):
+            status_code = None
+
+        error = _Odd("odd")
+        error.status_code = status
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.status_code is None
+        assert exc.kind == "unknown"
+
+    @pytest.mark.parametrize("message", [None, "", "   ", 7, ["x"]])
+    def test_a_blank_or_non_string_body_message_is_absent(self, message):
+        error = _status_error(
+            openai.PermissionDeniedError, 403, {"message": message, "code": "c"}
+        )
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert exc.provider_message is None
+        assert exc.provider_code == "c"
+
+    def test_it_never_raises_when_every_accessor_fails(self):
+        error = _FailsToDescribeItself("transport exploded")
+        error.__dict__["response"] = _ResponseJsonFails()
+
+        exc = _model_provider_error("OpenAI API error", error)
+
+        assert type(exc) is ModelProviderError
+        assert exc.kind == "unknown"
+        assert exc.status_code is None
+        assert exc.provider_message is None
+        assert exc.provider_code is None
+        assert exc.details == []
+        assert exc.sdk_message == "transport exploded"
+
+    def test_it_never_raises_when_the_response_body_cannot_be_read(self):
+        class _Error(Exception):
+            body = None
+            response = _ResponseJsonFails()
+
+        exc = _model_provider_error("OpenAI API error", _Error("no body"))
+
+        assert exc.kind == "unknown"
+        assert exc.provider_message is None
+        assert exc.provider_code is None
+        assert exc.details == []
+        assert exc.sdk_message == "no body"
+
+    def test_it_never_raises_when_the_error_cannot_even_be_printed(self):
+        exc = _model_provider_error("OpenAI API error", _UnprintableError())
+
+        assert type(exc) is ModelProviderError
+        assert exc.kind == "unknown"
+        assert exc.sdk_message
+        assert "_UnprintableError" in exc.sdk_message
+
+    def test_one_failing_field_does_not_affect_the_others(self):
+        exc = _model_provider_error("OpenAI API error", _OnlyMessageFails("Slow down"))
+
+        assert exc.kind == "rate_limited"
+        assert exc.status_code == 429
+        assert exc.provider_code == "rate_limit_exceeded"
+        assert exc.provider_message == "Slow down"
+        assert exc.sdk_message == "Slow down"
+
+
+def _openai_adapter_methods_and_handlers():
+    """(method name, handler) for every ``except openai.*`` handler inside the
+    three public request methods of ``OpenAICompatibleLLM``."""
+    import xagent.core.model.chat.basic.openai as adapter
+
+    tree = ast.parse(Path(adapter.__file__).read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "OpenAICompatibleLLM"
+    )
+    wanted = {"chat", "vision_chat", "stream_chat"}
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in wanted
+    ]
+    assert {method.name for method in methods} == wanted
+
+    def is_openai_attribute(node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "openai"
+        )
+
+    for method in methods:
+        for node in ast.walk(method):
+            if not isinstance(node, ast.ExceptHandler) or node.type is None:
+                continue
+            if is_openai_attribute(node.type) or (
+                isinstance(node.type, ast.Tuple)
+                and all(is_openai_attribute(elt) for elt in node.type.elts)
+            ):
+                yield method.name, node
+
+
+def _raises_directly_in(handler: ast.ExceptHandler):
+    """Raise nodes in the handler body, not descending into nested scopes."""
+    pending: list[ast.AST] = list(handler.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Raise):
+            yield node
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+        ):
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+
+
+class TestEveryProviderRaiseSiteIsTyped:
+    def test_each_openai_handler_raises_through_the_factory_from_its_error(self):
+        offenders: list[str] = []
+        checked = 0
+        for method_name, handler in _openai_adapter_methods_and_handlers():
+            for raise_node in _raises_directly_in(handler):
+                if raise_node.exc is None:
+                    continue
+                checked += 1
+                call = raise_node.exc
+                through_factory = (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "_model_provider_error"
+                )
+                from_handler_error = (
+                    isinstance(raise_node.cause, ast.Name)
+                    and handler.name is not None
+                    and raise_node.cause.id == handler.name
+                )
+                if not (through_factory and from_handler_error):
+                    offenders.append(f"{method_name}: line {raise_node.lineno}")
+
+        assert offenders == []
+        assert checked == 16

@@ -1,0 +1,1175 @@
+name: Pull Request Checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  # Required once "CI Summary" is a required status check and a merge queue is
+  # enabled: without this the context is never reported on a merge group, its
+  # entries time out, and every merge stalls. Harmless before a queue exists --
+  # merge_group simply never fires. Note the jobs' `draft == false` guards all
+  # short-circuit on `github.event_name != 'pull_request'`, so they do run here.
+  merge_group:
+
+env:
+  DEEPDOC_CACHE_PATH: .cache/deepdoc
+  DEEPDOC_MODEL_HOME: ${{ github.workspace }}/.cache/deepdoc
+  DEEPDOC_NLTK_DATA_DIR: ${{ github.workspace }}/.cache/deepdoc/nltk_data
+  DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Which halves of the tree this change touches. Consumed by the jobs below as
+  # *step*-level guards, never as a job-level `if:` -- see the comment on
+  # ci-summary and docs/branch-protection.md "Gate at the step, not at the job".
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    # The merge queue allows 60 minutes for a check to respond. A hung API call
+    # must not eat that budget.
+    timeout-minutes: 5
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      # paths-filter defaults its `token` input to github.token, and any
+      # non-empty token sends it down the pulls.listFiles API path rather than
+      # git diff. Without this scope that call is a 403, the step throws, and
+      # every pull request fails here. Fail-closed, but total -- do not drop it.
+      pull-requests: read
+    outputs:
+      # Non-pull_request events (merge_group, push to main, workflow_dispatch)
+      # never filter. The merge queue is the last gate before main and has to
+      # behave exactly as it did before this job existed, which also makes it
+      # the safety net for anything the pull-request filters get wrong.
+      #
+      # `!= 'false'` rather than `== 'true'` so that a missing or empty filter
+      # output lands on "run everything" instead of silently skipping. The
+      # literal-value assertion in ci-summary is the other half of that guard.
+      #
+      # The changed_files clauses are the third: pulls.listFiles caps at 3000
+      # files and paths-filter never checks the rows it got against that count.
+      # `== null` is not redundant -- an absent count compares as 0.
+      code: >-
+        ${{ github.event_name != 'pull_request'
+        || github.event.pull_request.changed_files == null
+        || github.event.pull_request.changed_files > 3000
+        || steps.filter.outputs.code != 'false' }}
+      frontend: >-
+        ${{ github.event_name != 'pull_request'
+        || github.event.pull_request.changed_files == null
+        || github.event.pull_request.changed_files > 3000
+        || steps.filter.outputs.frontend != 'false' }}
+
+    steps:
+      # No checkout: on pull_request the action reads the changed file list from
+      # the API, so this job never materialises the branch's code.
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request'
+        # Pinned by commit rather than by tag. This action decides whether the
+        # test suite runs at all, so a hijacked tag here would silently disable
+        # the only required check on the repository.
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          # `code` expresses "not a docs-only change" through negation, which
+          # needs "matches at least one include and no exclude". The default
+          # `some` quantifier does not mean that.
+          predicate-quantifier: 'some-with-excludes'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!assets/**'
+              # Root-level markdown only. src/xagent/skills/**/SKILL.md is input
+              # to tests/skills and to the read_skill_doc tool, so it is code.
+              - '!*.md'
+              # Only the source tree, not all of `frontend/`: two Python tests
+              # read frontend/package.json and frontend/public, and paths-filter
+              # cannot re-include a file a pattern has already excluded.
+              - '!frontend/src/**'
+            frontend:
+              - 'frontend/**'
+              # The last step of frontend-build builds a wheel from the hatch
+              # `packages`/`artifacts` config and asserts both the bundled
+              # frontend and the Python package are inside it.
+              - 'pyproject.toml'
+              # Hatchling honours .gitignore when it selects files -- the
+              # frontend_dist `artifacts` override exists because of it -- so an
+              # edit here can drop a tracked file from the wheel.
+              - '.gitignore'
+              # pyproject's `readme` target, and root markdown is excluded from
+              # `code` -- without this rule, renaming it skips the only job that
+              # builds a wheel.
+              - 'README.md'
+              # The whole package tree, not just the entrypoint: hatchling
+              # packages all of src/xagent and drops any file .gitignore
+              # matches, so a backend-only change can break the wheel while
+              # never touching a rule above (PR #1848 review).
+              - 'src/xagent/**'
+              - '.github/workflows/ci.yml'
+
+  prepare-deepdoc-cache:
+    name: Prepare Deepdoc Cache
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    outputs:
+      cache-hit: ${{ steps.deepdoc-cache.outputs.cache-hit }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Check Deepdoc cache
+        id: deepdoc-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-v1
+          lookup-only: true
+
+      - name: Ensure uv is available
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv venv --python 3.12
+
+      - name: Install dependencies
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Download Deepdoc models
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run deepdoc-download-models
+
+      - name: Verify Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Save Deepdoc cache
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-v1
+
+      - name: Upload Deepdoc cache artifact
+        if: steps.deepdoc-cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Ensure uv is available
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Check uv lockfile
+        shell: bash
+        run: |
+          set -e
+          if python3 -m uv --version >/dev/null 2>&1; then
+            _UV="python3 -m uv"
+          else
+            _UV="uv"
+          fi
+
+          if ! $_UV lock --check; then
+            echo "::error::uv.lock is out of date. Run 'uv lock' and commit the updated lockfile."
+            exit 1
+          fi
+
+      - name: Create virtual environment (if not exists)
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --group dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run pre-commit
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python --version
+          python3 -m uv run pre-commit run --all-files
+        env:
+          PRE_COMMIT_USE_SYSTEM: true
+
+      # Not only in the pytest-fast-deepdoc `core` leg: this is the one job
+      # CI Summary gathers that no `changes` output can gate, and a suite
+      # validating those outputs must not be skippable by them.
+      - name: Run CI contract tests
+        shell: bash
+        run: python3 -m uv run python -m pytest tests/test_ci_summary_contract.py tests/test_e2e_ci_shards_contract.py -q
+
+  pytest-fast:
+    name: Pytest Fast (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # The web leg's test step alone takes about 35 minutes on a healthy run,
+    # and slow runners pushed it past a 40-minute limit near the end. Hung
+    # tests are cut by pytest-timeout (300 s per test), not by this limit.
+    timeout-minutes: 60
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: [changes, pre-commit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: web
+            paths: tests/web tests/architecture
+          - name: integration
+            paths: tests/integration
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      XAGENT_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
+
+      # The web leg installs the full backend environment and pulls a sandbox
+      # image before running a large test shard. GitHub's stock image otherwise
+      # runs out of disk while pytest is still writing the runner diagnostic log.
+      - name: Free GitHub-hosted runner disk space
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
+        uses: endersonmenezes/free-disk-space@e6ed9b02e683a3b55ed0252f1ee469ce3b39a885
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          rm_cmd: rmz
+          rmz_version: "3.1.1"
+
+      - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Setup Node.js
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Pre-pull the sandbox image
+        # tests/web/test_sandbox_reconcile_e2e.py drives a real Docker daemon.
+        # Pull with retries here so registry flakes fail in this step instead of
+        # as APIErrors inside the tests (#1099).
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
+        shell: bash
+        run: |
+          set -e
+          image="$(python3 -m uv run python -c 'from xagent.config import get_sandbox_image; print(get_sandbox_image())')"
+          .github/scripts/docker-pull-retry.sh "$image"
+
+      - name: Run tests
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v --durations=30
+
+      - name: Run privileged writable sandbox tests
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
+        shell: bash
+        run: |
+          set -e
+          sudo -E "$PWD/.venv/bin/python" -m pytest \
+            tests/sandbox/test_docker_sandbox.py::TestDockerSandbox::test_upload_download_with_volume \
+            tests/core/test_workspace_nonroot_permissions.py::test_permission_migration_assigns_real_sandbox_gid \
+            -q
+
+  pytest-fast-deepdoc:
+    name: Pytest Fast Deepdoc (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: [changes, prepare-deepdoc-cache, pre-commit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            paths: >-
+              tests/test_ci_summary_contract.py
+              tests/test_docker_workflow_versions.py
+              tests/test_runtime_baseline.py
+              tests/test_shared_worker_benchmark.py
+              tests/agent
+              tests/alembic
+              tests/core
+              tests/migration
+              tests/migrations
+              tests/providers
+              tests/sandbox
+              tests/skills
+              tests/templates
+              tests/utils
+          - name: web-integration
+            paths: tests/web_integration
+
+    steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
+
+      - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Restore Deepdoc cache
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit == 'true')
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-v1
+
+      - name: Download Deepdoc cache artifact
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')
+        uses: actions/download-artifact@v8
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+
+      - name: Verify Deepdoc cache
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Setup Node.js
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Pre-pull the sandbox image
+        # tests/sandbox drives a real Docker daemon (test_docker_lifecycle_api.py
+        # and friends). Same reasoning as the pytest-fast web leg (#1099).
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'core')
+        shell: bash
+        run: |
+          set -e
+          image="$(python3 -m uv run python -c 'from xagent.config import get_sandbox_image; print(get_sandbox_image())')"
+          .github/scripts/docker-pull-retry.sh "$image"
+
+      - name: Run tests
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+
+  pytest-slow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: [changes, prepare-deepdoc-cache, pre-commit]
+
+    steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
+
+      - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          # Use python -m uv to be safe
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          # 使用 python3 -m uv 确保 uv 命令可用
+          _UV="python3 -m uv"
+          $_UV --version
+          # Use Python 3.12 for onnxruntime-gpu compatibility
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Restore Deepdoc cache
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit == 'true')
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-v1
+
+      - name: Download Deepdoc cache artifact
+        if: needs.changes.outputs.code == 'true' && (needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')
+        uses: actions/download-artifact@v8
+        with:
+          name: deepdoc-cache
+          path: ${{ env.DEEPDOC_CACHE_PATH }}
+
+      - name: Verify Deepdoc cache
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          from deepdoc.common import model_store
+          from deepdoc.common.tiktoken_cache import cl100k_base_cache_key
+          from deepdoc.depend.nltk_manager import ensure_nltk_data
+
+          cache_root = Path(os.environ["DEEPDOC_MODEL_HOME"]).resolve()
+          failures = []
+
+          for bundle_name, spec in model_store.BUNDLES.items():
+              candidates = {cache_root / spec.subdir}
+              for required_file in spec.required_files:
+                  candidates.update(hit.parent for hit in cache_root.rglob(required_file))
+
+              found = None
+              for candidate in sorted(candidates):
+                  exists, missing = model_store.validate_bundle_dir(bundle_name, candidate)
+                  if exists:
+                      found = candidate
+                      break
+
+              if found is None:
+                  failures.append(
+                      f"{bundle_name}: missing {', '.join(spec.required_files)} under {cache_root}"
+                  )
+              else:
+                  print(f"{bundle_name}\t{found}")
+
+          tiktoken_file = (
+              Path(os.environ["DEEPDOC_TIKTOKEN_CACHE_DIR"]).resolve()
+              / cl100k_base_cache_key()
+          )
+          if not tiktoken_file.exists():
+              failures.append(f"tiktoken: missing {tiktoken_file}")
+          else:
+              print(f"tiktoken\t{tiktoken_file}")
+
+          try:
+              ensure_nltk_data(
+                  data_dir=os.environ["DEEPDOC_NLTK_DATA_DIR"],
+                  offline=True,
+              )
+              print(f"nltk\t{Path(os.environ['DEEPDOC_NLTK_DATA_DIR']).resolve()}")
+          except Exception as exc:
+              failures.append(f"nltk: {exc}")
+
+          if failures:
+              for failure in failures:
+                  print(f"ERROR\t{failure}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Setup Node.js
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        if: needs.changes.outputs.code == 'true'
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Run slow tests
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest -m "slow and not postgresql" -v
+
+  pytest-milvus:
+    name: Pytest Milvus
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: [changes, pre-commit]
+    env:
+      MILVUS_URI: http://localhost:19530
+      XAGENT_REQUIRE_MILVUS: "1"
+
+    steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
+
+      - name: Start Milvus standalone
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          # The base file's env_file needs .env while Compose loads it; tests must not see it.
+          touch .env
+          trap 'rm -f .env' EXIT
+          printf 'services:\n  milvus:\n    ports:\n      - "19530:19530"\n' > "$RUNNER_TEMP/milvus-ports.yml"
+          export COMPOSE_FILE="docker-compose.yml:docker/docker-compose.milvus.yml:$RUNNER_TEMP/milvus-ports.yml"
+          echo "COMPOSE_FILE=$COMPOSE_FILE" >> "$GITHUB_ENV"
+          docker compose config --images milvus | xargs .github/scripts/docker-pull-retry.sh
+          docker compose up -d --wait --wait-timeout 300 milvus
+
+      - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment (if not exists)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv venv --python 3.12
+
+      - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --extra milvus
+
+      - name: Run Milvus tests
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools tests/web/api/test_kb_milvus_rollback.py tests/web_integration -m milvus -v
+
+      - name: Show Milvus logs
+        if: needs.changes.outputs.code == 'true' && failure()
+        shell: bash
+        run: |
+          touch .env
+          docker compose logs --tail 200 milvus-etcd milvus-minio milvus
+
+  e2e:
+    name: e2e (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: [changes, pre-commit]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      # Every shared-execution test cold-starts its own web and worker hosts,
+      # so the suite is split by file, balanced on recorded file durations.
+      matrix:
+        include:
+          - shard: shared-execution
+            paths: tests/e2e/test_shared_execution.py
+          - shard: shared-happy-paths
+            paths: >-
+              tests/e2e/test_shared_happy_paths.py
+              tests/e2e/test_shared_gmail.py
+              tests/e2e/test_shared_network_recovery.py
+          - shard: auto-resume
+            paths: >-
+              tests/e2e/test_shared_auto_resume.py
+              tests/e2e/test_shared_channel_auto_resume.py
+              tests/e2e/test_shared_provider_outage.py
+              tests/e2e/test_shared_database_outage.py
+              tests/e2e/test_shared_sdk_auto_resume.py
+          - shard: rest
+            paths: >-
+              tests/e2e
+              --ignore=tests/e2e/test_shared_execution.py
+              --ignore=tests/e2e/test_shared_happy_paths.py
+              --ignore=tests/e2e/test_shared_gmail.py
+              --ignore=tests/e2e/test_shared_network_recovery.py
+              --ignore=tests/e2e/test_shared_auto_resume.py
+              --ignore=tests/e2e/test_shared_channel_auto_resume.py
+              --ignore=tests/e2e/test_shared_provider_outage.py
+              --ignore=tests/e2e/test_shared_database_outage.py
+              --ignore=tests/e2e/test_shared_sdk_auto_resume.py
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      XAGENT_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Skip tests
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Docs-only change; no code paths touched."
+
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@v7
+
+      - name: Ensure uv is available
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          _UV="python3 -m uv"
+          $_UV --version
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --group test
+
+      - name: Verify Docker
+        if: needs.changes.outputs.code == 'true'
+        run: docker version
+
+      - name: Pull e2e service images
+        # Retry service images before pytest so registry failures surface here
+        # instead of as confusing Docker daemon errors inside e2e fixtures.
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          .github/scripts/docker-pull-retry.sh cgr.dev/chainguard/minio postgres:17-bookworm
+
+      - name: Run e2e tests
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run python -m pytest ${{ matrix.paths }} --run-special -v --durations=20
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changes
+
+    steps:
+      - name: Skip frontend build
+        if: needs.changes.outputs.frontend != 'true'
+        run: echo "No frontend or packaging change; nothing to build."
+
+      - name: Checkout code
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history + tags so hatch-vcs can derive the version
+
+      - name: Setup Node.js
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Python
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run widget regression tests with coverage
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm run test:widget:coverage
+
+      # The widget lane above is an explicit regression suite for the widget,
+      # Session, and browser-auth contracts. Keep the broader page-directory,
+      # KB component, and App Router suites so newly added tests are discovered
+      # automatically.
+      - name: Run frontend test manifest contract
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        shell: bash
+        run: npm run test:ci-manifest
+
+      - name: Run page component tests
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        shell: bash
+        run: npm run test:pages
+
+      - name: Run knowledge base component tests
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm run test:kb-components
+
+      - name: Run file component tests
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm run test:file-previews
+
+      - name: Run App Router tests
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm run test:app-pages
+
+      - name: Run Home and Build supporting contract tests
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm run test:home-build-contracts
+
+      - name: Run builder reconnect contract
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npx vitest run --config vitest.config.ts src/components/build/agent-builder-reconnect-dialog.test.tsx
+
+      # Static export is the default build (served by FastAPI in the pip/uvx
+      # deployment). Verify it produces a servable bundle: index shell plus the
+      # dynamic-route __shell__ pages the SPA fallback depends on.
+      - name: Build frontend (static export)
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: npm run build
+      - name: Verify static export output
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: |
+          set -e
+          test -f out/index.html || { echo "::error::static export missing out/index.html"; exit 1; }
+          shells=$(find out -name '__shell__*.html' | wc -l)
+          test "$shells" -gt 0 || { echo "::error::static export produced no dynamic-route shells"; exit 1; }
+          echo "Static export OK ($shells dynamic-route shells)."
+
+      # The multi-container Docker image serves the frontend via a Node server,
+      # so the standalone build must keep working too.
+      - name: Build frontend (standalone / Docker)
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+          NEXT_OUTPUT: standalone
+        run: |
+          set -e
+          npm run build
+          test -f .next/standalone/server.js || { echo "::error::standalone build missing server.js"; exit 1; }
+          echo "Standalone build OK."
+
+      # Guard the export -> wheel packaging path (runs only at release otherwise),
+      # so a broken bundling glob or a dropped Python package is caught on the PR.
+      - name: Verify package bundles the frontend
+        if: needs.changes.outputs.frontend == 'true'
+        run: |
+          set -e
+          rm -rf frontend/.next frontend/out src/xagent/web/frontend_dist
+          ( cd frontend && NEXT_TELEMETRY_DISABLED=1 npm run build )
+          cp -r frontend/out src/xagent/web/frontend_dist
+          python -m pip install --quiet build
+          python -m build --wheel
+          python -m zipfile -l dist/*.whl | grep -q "xagent/web/frontend_dist/index.html" \
+            || { echo "::error::wheel is missing the bundled frontend (frontend_dist)"; exit 1; }
+          python -m zipfile -l dist/*.whl | grep -q "xagent/web/__main__.py" \
+            || { echo "::error::wheel is missing the Python package (xagent/web/__main__.py)"; exit 1; }
+          echo "Wheel bundles the frontend and the full Python package."
+
+      - name: Verify wheel dependencies resolve without project overrides
+        if: needs.changes.outputs.frontend == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --dry-run --ignore-installed dist/*.whl
+
+  lancedb-memory-compatibility:
+    name: LanceDB Memory Compatibility (${{ matrix.lancedb }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        lancedb: ['0.32.0', '0.33.0', '0.37.1']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install locked test environment
+        shell: bash
+        run: |
+          python -m pip install uv
+          python -m uv sync --locked --no-default-groups --group test
+          python -m uv pip install "lancedb==${{ matrix.lancedb }}"
+
+      - name: Run storage admission compatibility tests
+        run: >-
+          python -m uv run --no-sync python -m pytest
+          tests/core/memory/test_storage_admission_matrix.py -q
+
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    needs:
+      - changes
+      - prepare-deepdoc-cache
+      - pre-commit
+      - pytest-fast
+      - pytest-fast-deepdoc
+      - pytest-slow
+      - pytest-milvus
+      - e2e
+      - frontend-build
+      - lancedb-memory-compatibility
+
+    steps:
+      - name: Check required jobs
+        shell: bash
+        run: |
+          set -e
+
+          failed=0
+          check_job() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name finished with result: $result"
+              failed=1
+            fi
+          }
+
+          check_job "changes" "${{ needs.changes.result }}"
+          check_job "prepare-deepdoc-cache" "${{ needs['prepare-deepdoc-cache'].result }}"
+          check_job "pre-commit" "${{ needs['pre-commit'].result }}"
+          check_job "pytest-fast" "${{ needs['pytest-fast'].result }}"
+          check_job "pytest-fast-deepdoc" "${{ needs['pytest-fast-deepdoc'].result }}"
+          check_job "pytest-slow" "${{ needs['pytest-slow'].result }}"
+          check_job "pytest-milvus" "${{ needs['pytest-milvus'].result }}"
+          check_job "e2e" "${{ needs.e2e.result }}"
+          check_job "frontend-build" "${{ needs['frontend-build'].result }}"
+          check_job "lancedb-memory-compatibility" "${{ needs['lancedb-memory-compatibility'].result }}"
+
+          # On an empty outputs value every guarded work step skips, only
+          # the Skip sentinel runs, and the job reports success -- so the
+          # results above cannot tell that nothing ran. This is what fails.
+          check_flag() {
+            local name="$1"
+            local value="$2"
+            case "$value" in
+              true|false) ;;
+              *)
+                echo "::error::changes.outputs.$name is '$value', expected true or false"
+                failed=1
+                ;;
+            esac
+          }
+
+          check_flag "code" "${{ needs.changes.outputs.code }}"
+          check_flag "frontend" "${{ needs.changes.outputs.frontend }}"
+
+          exit "$failed"

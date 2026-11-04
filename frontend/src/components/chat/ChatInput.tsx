@@ -1,0 +1,1679 @@
+import React, { useState, useRef, useEffect, useId, useMemo } from "react";
+import { renderFileMentionsHtml } from "./FileChip";
+import { escapeHtml } from "@/lib/html-escape";
+import { useRouter } from "next/navigation";
+import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
+import { VoiceModeButton } from "./voice-mode-button";
+import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models";
+import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
+import { useI18n } from "@/contexts/i18n-context";
+import { useApp } from "@/contexts/app-context-chat";
+import type { SessionAttachmentsConfig, SessionStopState } from "@/contexts/app-context-chat";
+import { useAuth } from "@/contexts/auth-context";
+import { ConfigDialog } from "@/components/config-dialog";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { clientErrorTranslationKey } from "@/lib/client-errors";
+import { notifySendFailure } from "@/lib/send-failure-notice";
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
+import { capabilityRefusal } from "@/lib/widget-session-upload";
+import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
+import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
+import { useFileMention, FileItem } from "@/hooks/use-file-mention";
+import { FileMentionDropdown } from "./FileMentionDropdown";
+import { toast } from "@/components/ui/sonner";
+import { useVoiceInputControls } from "@/components/voice-input-controller";
+import { LocalBrowserMenu, type LocalBrowserTarget } from "./LocalBrowserMenu";
+import {
+  hasTaskRuntimeComposerExtension,
+  type TaskRuntimeComposerSelection,
+} from "@/lib/task-runtime-ui-extension";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+export type ComposerAttachmentStatus = "uploading" | "uploaded" | "failed";
+
+const DEFAULT_FILE_ACCEPT =
+  ".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp";
+
+// A requested message is typed in at most this many steps, so a long one
+// still takes under a second, and is sent a moment after it is complete.
+const AUTO_SEND_TYPING_STEP_MS = 20;
+const AUTO_SEND_MAX_TYPING_STEPS = 40;
+const AUTO_SEND_PAUSE_MS = 200;
+
+export type ComposerAutoSendRequest = { id: number; text: string };
+
+interface ChatInputProps {
+  onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
+  placeholder?: string;
+  isLoading?: boolean;
+  files?: File[];
+  onFilesChange?: (files: File[]) => void;
+  showModeToggle?: boolean;
+  mode?: "task" | "process";
+  onModeChange?: (mode: "task" | "process") => void;
+  inputValue?: string;
+  onInputChange?: (value: string) => void;
+  currentInteractionRequestId?: string;
+  // Fires on the editor's own focus/blur, independent of `isLoading`/task
+  // status - lets a controlled caller know it's currently unsafe to rely
+  // on a programmatic `inputValue` change being reflected in the visible
+  // editor (see the DOM-sync effect below, which intentionally skips
+  // updating a focused editor from an external value change).
+  onFocusChange?: (focused: boolean) => void;
+  taskStatus?: TaskStatus | string;
+  onPause?: () => void;
+  onResume?: () => void;
+  onStop?: () => void;
+  stopState?: SessionStopState;
+  taskConfig?: Partial<AgentConfig>;
+  hideConfig?: boolean;
+  readOnlyConfig?: boolean;
+  hideFileUpload?: boolean;
+  filesDisabled?: boolean;
+  voiceInputEnabled?: boolean;
+  onVoiceConversation?: (config: AgentConfig) => void;
+  voiceConversationDisabled?: boolean;
+  compact?: boolean;
+  autoFocus?: boolean;
+  minHeightClass?: string;
+  promptHighlightTerms?: string[];
+  // Drives `hasSelectedAgent` below (skips the no-model-selected guard) -
+  // never rendered as a visible chip; callers that assign a task lead show
+  // that in their own header instead (see ChatStartScreen's hero swap).
+  selectedAgents?: Array<{
+    id: number | string;
+    name: string;
+  }>;
+  uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
+  deferFileUpload?: boolean;
+  /**
+   * Upload-only mode for a composer whose `filesDisabled` is set: the visitor
+   * may pick, drop and paste files, which are collected in `files` for the
+   * caller to upload and send. Everything that reads a file back (mentions,
+   * chip previews) stays governed by `filesDisabled`, and this composer never
+   * uploads a file itself in this mode.
+   */
+  attachments?: SessionAttachmentsConfig;
+  /** Upload state of each collected file, kept by the caller in this mode. */
+  attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>;
+  onRetryAttachment?: (file: File) => void;
+  /**
+   * True while the caller is uploading files or sending a message with files.
+   * Retrying a failed file is refused until it is false again, so a retry never
+   * starts beside work that is already in flight.
+   */
+  attachmentsBusy?: boolean;
+  /**
+   * A message to type into the composer and then send as if the visitor had
+   * typed it and pressed send, with the same checks, retry identity and
+   * failure toast. Each new `id` is one request. A request that arrives while
+   * another is being typed or sent is dropped. Sending is held while the text
+   * is being typed, so Enter or the send button never sends part of it. The
+   * text is typed without its leading whitespace, which the send trims off
+   * anyway, so the draft is never blank while it is being typed. It is sent
+   * only if the composer still holds exactly the typed text once it is in, so
+   * a controlled caller must pass that back as `inputValue`. When the
+   * composer cannot send at that moment, the text stays in it for the visitor
+   * to send. An edit by the visitor while it is being typed stops it without
+   * sending.
+   */
+  autoSendRequest?: ComposerAutoSendRequest | null;
+}
+
+type ExecutionMode = "auto" | "flash" | "balanced" | "think";
+const EXECUTION_MODES: ExecutionMode[] = ["auto", "flash", "balanced", "think"];
+type ExecutionModeConfig = ExecutionMode | { mode: ExecutionMode };
+
+interface AgentConfig {
+  model: string;
+  smallFastModel?: string;
+  visualModel?: string;
+  compactModel?: string;
+  memorySimilarityThreshold?: number;
+  executionMode?: ExecutionModeConfig;
+  clientMessageId?: string;
+  metadata?: Record<string, unknown>;
+  runtimeExtensions?: Record<string, Record<string, unknown>>;
+}
+
+interface ModelRecord {
+  id?: number | string;
+  model_id?: string;
+  model_name?: string;
+  is_default?: boolean;
+}
+
+interface DefaultModelRecord {
+  config_type?: string;
+  model?: ModelRecord | null;
+}
+
+export function ChatInput({
+  onSend,
+  placeholder,
+  isLoading,
+  files = [],
+  onFilesChange,
+  mode,
+  inputValue,
+  onInputChange,
+  currentInteractionRequestId,
+  onFocusChange,
+  taskStatus,
+  onPause,
+  onResume,
+  onStop,
+  stopState = "idle",
+  taskConfig,
+  hideConfig = false,
+  readOnlyConfig = false,
+  hideFileUpload = false,
+  filesDisabled = false,
+  voiceInputEnabled = true,
+  onVoiceConversation,
+  voiceConversationDisabled = false,
+  compact = false,
+  autoFocus = false,
+  minHeightClass = "min-h-[130px]",
+  promptHighlightTerms = [],
+  selectedAgents = [],
+  uploadFile,
+  deferFileUpload = false,
+  attachments,
+  attachmentStatuses,
+  onRetryAttachment,
+  attachmentsBusy = false,
+  autoSendRequest,
+}: ChatInputProps) {
+  const router = useRouter();
+  const [internalMessage, setInternalMessage] = useState("");
+  const [isFocused, setIsFocused] = useState(false);
+  const [showNoModelAlert, setShowNoModelAlert] = useState(false);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  // Undefined until picked, so an untouched composer keeps the server default.
+  const [pickedExecutionMode, setPickedExecutionMode] = useState<ExecutionMode>();
+  const [executionModeMenuOpen, setExecutionModeMenuOpen] = useState(false);
+  const [localBrowserTarget, setLocalBrowserTarget] =
+    useState<LocalBrowserTarget | null>(null);
+  const [taskRuntimeSelection, setTaskRuntimeSelection] =
+    useState<TaskRuntimeComposerSelection | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isSubmittingRef = useRef(false);
+  const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
+  const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
+  const dragDepthRef = useRef(0);
+  const mountedRef = useRef(false);
+  const { t } = useI18n();
+  const { user } = useAuth();
+  const { openFilePreview } = useApp();
+  const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
+  const voiceModels = useVoiceModels(Boolean(voiceInputEnabled && onVoiceConversation));
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!autoFocus || !editorRef.current) return;
+    const el = editorRef.current;
+    const frameId = window.requestAnimationFrame(() => {
+      el.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [autoFocus]);
+
+  const applyPromptHighlights = (html: string, highlightTerms: string[]) => {
+    if (!highlightTerms.length) return html;
+    // Only our escaped text / generated chip HTML reaches this template. Walk
+    // text nodes so a match in a file ID, class or attribute cannot corrupt
+    // the HTML boundary by inserting a new element inside an attribute.
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    for (const term of highlightTerms) {
+      if (!term) continue;
+      const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode as Text;
+        if (node.parentElement?.closest("[data-prompt-highlight], [data-file-path]")) continue;
+        const index = node.data.indexOf(term);
+        if (index < 0) continue;
+        const match = node.splitText(index);
+        match.splitText(term.length);
+        const highlighted = document.createElement("span");
+        highlighted.dataset.promptHighlight = "true";
+        highlighted.className = "font-medium";
+        highlighted.style.cssText = "color:#3b5cff;text-decoration-line:underline;text-decoration-style:dashed;text-decoration-color:#3b5cff;text-underline-offset:4px;";
+        highlighted.textContent = term;
+        match.replaceWith(highlighted);
+        break;
+      }
+    }
+    return template.innerHTML;
+  };
+
+  const serializeEditorContent = (editor: HTMLElement) => {
+    const clone = editor.cloneNode(true) as HTMLElement;
+    const chips = clone.querySelectorAll("[data-file-path]");
+
+    chips.forEach((chip) => {
+      const path = chip.getAttribute("data-file-path");
+      const fileId = chip.getAttribute("data-file-id");
+      const filename =
+        chip.getAttribute("data-filename") || path?.split("/").pop() || path;
+      const id = fileId || path;
+      chip.replaceWith(document.createTextNode(`[${filename}](file:${id})`));
+    });
+
+    clone.querySelectorAll("br").forEach((lineBreak) => {
+      lineBreak.replaceWith(document.createTextNode("\n"));
+    });
+
+    clone.querySelectorAll("div, p").forEach((block) => {
+      if (block.lastChild?.textContent?.endsWith("\n")) {
+        return;
+      }
+      block.appendChild(document.createTextNode("\n"));
+    });
+
+    return (clone.textContent || "")
+      .replace(/\u200B/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/\n$/, "");
+  };
+
+  // A requested message being typed in (see autoSendRequest). It turns
+  // "ready" once the whole text is in and the pause has passed, and the effect
+  // after handleSubmit sends it from a render that already holds that text.
+  const [autoTyping, setAutoTyping] = useState<
+    { text: string; phase: "typing" | "ready" } | null
+  >(null);
+  const autoTypingTimerRef = useRef<number | null>(null);
+  const handledAutoSendIdRef = useRef<number | null>(null);
+  const stopAutoTyping = () => {
+    if (autoTypingTimerRef.current !== null) {
+      window.clearTimeout(autoTypingTimerRef.current);
+      autoTypingTimerRef.current = null;
+    }
+    setAutoTyping(null);
+  };
+  useEffect(() => () => {
+    if (autoTypingTimerRef.current !== null) {
+      window.clearTimeout(autoTypingTimerRef.current);
+    }
+  }, []);
+
+  const handleInput = () => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    // The visitor took over the composer: keep what is there, send nothing.
+    if (autoTyping) stopAutoTyping();
+
+    const text = serializeEditorContent(editor);
+
+    if (isControlled) {
+      onInputChange?.(text);
+    } else {
+      setInternalMessage(text);
+    }
+
+    fileMention.checkTrigger();
+  };
+
+  const fileMention = useFileMention(
+    editorRef,
+    containerRef,
+    handleInput,
+    t,
+    filesDisabled,
+  );
+  // Whether the composer may collect files at all. `filesDisabled` alone also
+  // closes every file read, which upload-only mode must not reopen, so only the
+  // collecting sites below use this instead of `filesDisabled`.
+  const filesBlocked = filesDisabled && !attachments;
+  const attachmentsPaused = !!attachments && !!currentInteractionRequestId;
+  const enabledFiles = useMemo(
+    () => filesBlocked ? [] : files,
+    [files, filesBlocked],
+  );
+
+  // Track files for async operations
+  const filesRef = useRef(enabledFiles);
+  const uploadAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+
+  useEffect(() => {
+    filesRef.current = enabledFiles;
+  }, [enabledFiles]);
+
+  // Determine if controlled or uncontrolled
+  const isControlled = inputValue !== undefined;
+  const message = isControlled ? inputValue : internalMessage;
+  // The latest draft, for a send that settles after the user typed again.
+  const messageRef = useRef(message);
+  useEffect(() => {
+    messageRef.current = message;
+  }, [message]);
+
+  // Typing steps run after later renders, so they write through the latest
+  // draft setter.
+  const setDraftRef = useRef<(value: string) => void>(setInternalMessage);
+  useEffect(() => {
+    setDraftRef.current = isControlled
+      ? (value: string) => onInputChange?.(value)
+      : setInternalMessage;
+  }, [isControlled, onInputChange]);
+
+  useEffect(() => {
+    if (!autoSendRequest || handledAutoSendIdRef.current === autoSendRequest.id) return;
+    handledAutoSendIdRef.current = autoSendRequest.id;
+    // Typed without its leading whitespace, so every step leaves a draft that
+    // is not blank. A blank draft counts as the visitor clearing the composer,
+    // which forgets the message id kept for retrying a failed send, so a retry
+    // of the same prompt would get a new id. The send trims it off anyway.
+    const text = autoSendRequest.text.trimStart();
+    if (autoTyping || isSubmittingRef.current || !text.trim()) return;
+
+    // Whole characters as a reader sees them, so an emoji or an accented
+    // letter is never shown half typed. Without Intl.Segmenter, whole code
+    // points, so a surrogate pair is never split.
+    const characters = typeof Intl.Segmenter === "function"
+      ? Array.from(new Intl.Segmenter().segment(text), ({ segment }) => segment)
+      : Array.from(text);
+    const reduceMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const charactersPerStep = reduceMotion
+      ? characters.length
+      : Math.ceil(characters.length / AUTO_SEND_MAX_TYPING_STEPS);
+    let typed = 0;
+    const typeNextStep = () => {
+      typed = Math.min(characters.length, typed + charactersPerStep);
+      setDraftRef.current(characters.slice(0, typed).join(""));
+      autoTypingTimerRef.current = typed < characters.length
+        ? window.setTimeout(typeNextStep, AUTO_SEND_TYPING_STEP_MS)
+        : window.setTimeout(() => {
+          autoTypingTimerRef.current = null;
+          setAutoTyping({ text, phase: "ready" });
+        }, AUTO_SEND_PAUSE_MS);
+    };
+    setAutoTyping({ text, phase: "typing" });
+    typeNextStep();
+    // Runs once per request. Whether another one is in progress is read from
+    // the render that delivered this request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSendRequest]);
+
+
+  // Handle click on delete button and file chip preview
+  useEffect(() => {
+    if (filesDisabled) return;
+
+    const editor = editorRef.current;
+    if (!editor) return;
+
+    const handleClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      const deleteBtn = target.closest('.file-chip-delete');
+      if (deleteBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chip = deleteBtn.closest('[data-file-path]');
+        if (chip) {
+          chip.remove();
+          // Trigger input event manually to update state
+          const event = new Event('input', { bubbles: true });
+          editor.dispatchEvent(event);
+        }
+        return;
+      }
+
+      // Handle file chip preview click
+      const chip = target.closest('.file-chip-preview');
+      if (chip) {
+        e.preventDefault();
+        e.stopPropagation();
+        const filePath = chip.getAttribute('data-file-path');
+        if (filePath) {
+          // If we have fileId mapped in our list, use it. Otherwise use the path as fileId fallback.
+          const fileInfo = fileMention.fileList.find((f: FileItem) => f.relative_path === filePath || f.filename === filePath);
+          const fileName = fileInfo?.filename || filePath.split('/').pop() || filePath;
+
+          openFilePreview(
+            fileInfo?.file_id || filePath, // use file_id as fileId if available, fallback to path
+            fileName,
+            [{ fileName, fileId: fileInfo?.file_id || filePath }]
+          );
+        }
+      }
+    };
+
+    editor.addEventListener('click', handleClick);
+    return () => editor.removeEventListener('click', handleClick);
+  }, [fileMention.fileList, filesDisabled, openFilePreview]);
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>({
+    model: "",
+    memorySimilarityThreshold: 1.5,
+  });
+  const [defaultAgentConfig, setDefaultAgentConfig] = useState<{
+    model: string;
+    smallFastModel?: string;
+    visualModel?: string;
+    compactModel?: string;
+  }>({ model: "" });
+  const [models, setModels] = useState<ModelRecord[]>([]);
+
+  // State to track files currently being uploaded
+  const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
+
+  const extractDroppedFiles = (dataTransfer: DataTransfer) => {
+    const itemFiles = Array.from(dataTransfer.items || [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file instanceof File);
+
+    return itemFiles.length > 0 ? itemFiles : Array.from(dataTransfer.files || []);
+  };
+
+  const isFileDragEvent = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer?.types || []).includes("Files");
+
+  const resetDragState = () => {
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+  };
+
+  useEffect(() => {
+    if (!filesDisabled) return;
+
+    uploadAbortControllersRef.current.forEach((controller) => {
+      controller.abort();
+    });
+    uploadAbortControllersRef.current.clear();
+    setUploadingFiles(new Set());
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+  }, [filesDisabled]);
+
+  // Helper to upload files immediately
+  const uploadFiles = async (newFiles: File[]) => {
+    if (filesDisabled || newFiles.length === 0) return;
+
+    // Mark as uploading (use name + lastModified as rough unique ID)
+    const fileIds = newFiles.map(f => `${f.name}-${f.lastModified}`);
+    setUploadingFiles(prev => {
+      const next = new Set(prev);
+      fileIds.forEach(id => next.add(id));
+      return next;
+    });
+
+    const failedFiles = new Set<File>();
+    const uploadedFileIds = new Map<File, string>();
+    let uploadErrorMessage: string | null = null;
+
+    // Upload files individually to ensure better reliability and progress tracking
+    await Promise.all(newFiles.map(async (file) => {
+      const fileId = `${file.name}-${file.lastModified}`;
+      const controller = new AbortController();
+      uploadAbortControllersRef.current.set(fileId, controller);
+
+      try {
+        const currentTaskType = mode || 'task';
+
+        if (uploadFile) {
+          const result = await uploadFile(file, { taskType: currentTaskType });
+          const fileId = normalizeUploadFileIds([result?.file_id], 1)?.[0] ?? null;
+          if (fileId) {
+            uploadedFileIds.set(file, fileId);
+          } else {
+            failedFiles.add(file);
+          }
+        } else {
+          const formData = new FormData();
+          formData.append('file', file);
+          // Default to task mode if not specified
+          formData.append('task_type', currentTaskType);
+
+          const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal
+          });
+
+          const parsed = await parseApiResponse(response);
+
+          const data = isJsonRecord(parsed.data) ? parsed.data : null;
+          const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null;
+          if (response.ok && data?.success === true && fileId) {
+            uploadedFileIds.set(file, fileId);
+          } else {
+            failedFiles.add(file);
+            const uploadError = classifyUploadError(response, parsed);
+            uploadErrorMessage = uploadErrorMessage
+              || t(clientErrorTranslationKey(uploadError.errorCode));
+          }
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          // Upload cancelled, do nothing
+        } else {
+          console.error("Error uploading file:", error);
+          failedFiles.add(file);
+          uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
+        }
+      } finally {
+        uploadAbortControllersRef.current.delete(fileId);
+        setUploadingFiles(prev => {
+          const next = new Set(prev);
+          next.delete(fileId);
+          return next;
+        });
+      }
+    }));
+
+    const successfulFiles = newFiles.filter(file => (
+      !failedFiles.has(file) && uploadedFileIds.has(file)
+    ));
+    const existingUploadedFileIds = filesRef.current
+      .filter(file => !newFiles.includes(file))
+      .map(file => (file as File & { file_id?: unknown }).file_id)
+      .filter(fileId => fileId !== undefined);
+    const normalizedFileIds = normalizeUploadFileIds(
+      [
+        ...existingUploadedFileIds,
+        ...successfulFiles.map(file => uploadedFileIds.get(file)),
+      ],
+      existingUploadedFileIds.length + successfulFiles.length,
+    );
+    if (!normalizedFileIds) {
+      successfulFiles.forEach(file => failedFiles.add(file));
+      uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
+    } else {
+      const newFileIds = normalizedFileIds.slice(existingUploadedFileIds.length);
+      successfulFiles.forEach((file, index) => {
+        (file as File & { file_id?: string }).file_id = newFileIds[index];
+      });
+    }
+
+    // Handle failed files
+    if (failedFiles.size > 0) {
+      toast.error(uploadErrorMessage || t("files.uploadFailed") || "Failed to upload some files");
+      if (onFilesChange) {
+        onFilesChange(filesRef.current.filter(f => !failedFiles.has(f)));
+      }
+    }
+  };
+
+  // Applies the advertised limits to files the visitor is adding, before any of
+  // them is collected. Each kind of refusal is reported once per selection.
+  const admitAttachments = (
+    newFiles: File[],
+    limits: SessionAttachmentsConfig,
+  ): File[] => {
+    const admitted: File[] = [];
+    const refused = new Set<"type" | "size" | "count">();
+    for (const file of newFiles) {
+      const refusal = capabilityRefusal(file, limits);
+      if (refusal) {
+        refused.add(refusal);
+      } else if (filesRef.current.length + admitted.length >= limits.maxFiles) {
+        refused.add("count");
+      } else {
+        admitted.push(file);
+      }
+    }
+    if (refused.has("type")) toast.error(t("widgetSession.attachments.typeNotSupported"));
+    if (refused.has("size")) toast.error(t("clientErrors.uploadTooLarge"));
+    if (refused.has("count")) {
+      toast.error(t("widgetSession.attachments.tooManyFiles", { count: limits.maxFiles }));
+    }
+    return admitted;
+  };
+
+  const appendFiles = (newFiles: File[]) => {
+    if (
+      filesBlocked
+      || newFiles.length === 0
+      || !onFilesChange
+      || isInputBusy
+    ) return;
+    if (attachments) {
+      // Upload-only mode: the caller owns uploading, so nothing here uploads,
+      // whatever `deferFileUpload` says.
+      if (attachmentsPaused) {
+        toast.error(t("widgetSession.attachments.noFilesOnAnswer"));
+        return;
+      }
+      const admitted = admitAttachments(newFiles, attachments);
+      if (admitted.length > 0) onFilesChange([...filesRef.current, ...admitted]);
+      return;
+    }
+    onFilesChange([...filesRef.current, ...newFiles]);
+    if (!deferFileUpload) {
+      uploadFiles(newFiles);
+    }
+  };
+
+  // Fetch default models on mount
+  useEffect(() => {
+    if (hideConfig) {
+      return;
+    }
+
+    const fetchDefaultModels = async () => {
+      try {
+        const apiUrl = getApiUrl();
+
+        // Fetch all models first to have the list for display names
+        const modelsResponse = await apiRequest(`${apiUrl}/api/models/?category=llm`, {
+          headers: {}
+        });
+
+        let allModels: ModelRecord[] = [];
+        if (modelsResponse.ok) {
+          allModels = await modelsResponse.json();
+          if (Array.isArray(allModels)) {
+            setModels(allModels);
+          }
+        }
+
+        // Fetch user default models
+        const defaultResponse = await apiRequest(`${apiUrl}/api/models/user-default`, {
+          headers: {}
+        });
+
+        const defaultModels: Record<string, ModelRecord | undefined> = {};
+        if (defaultResponse.ok) {
+          const defaults = await defaultResponse.json();
+          if (Array.isArray(defaults)) {
+            defaults.forEach((defaultConfig: DefaultModelRecord) => {
+              if (defaultConfig && defaultConfig.config_type && defaultConfig.model) {
+                defaultModels[defaultConfig.config_type] = defaultConfig.model;
+              }
+            });
+          }
+        }
+
+        // Find default if no user preference
+        if (!defaultModels.general && allModels.length > 0) {
+          const defaultModel = allModels.find((m) => m.is_default) || allModels[0];
+          if (defaultModel) {
+            defaultModels.general = { model_id: defaultModel.model_id };
+          }
+        }
+
+        const newDefaultConfig = {
+          model: defaultModels.general?.model_id || "",
+          smallFastModel: defaultModels.small_fast?.model_id,
+          visualModel: defaultModels.visual?.model_id,
+          compactModel: defaultModels.compact?.model_id
+        };
+
+        setDefaultAgentConfig(newDefaultConfig);
+
+        setAgentConfig(prev => ({
+          ...prev,
+          model: prev.model || newDefaultConfig.model,
+          smallFastModel: prev.smallFastModel || newDefaultConfig.smallFastModel,
+          visualModel: prev.visualModel || newDefaultConfig.visualModel,
+          compactModel: prev.compactModel || newDefaultConfig.compactModel
+        }));
+      } catch (error) {
+        console.error('Failed to fetch default models:', error);
+      }
+    };
+
+    fetchDefaultModels();
+  }, [hideConfig]);
+
+  // Update config when taskConfig changes
+  useEffect(() => {
+    if (taskConfig) {
+      setAgentConfig(prev => ({
+        ...prev,
+        model: taskConfig.model || prev.model,
+        smallFastModel: taskConfig.smallFastModel || prev.smallFastModel,
+        visualModel: taskConfig.visualModel || prev.visualModel,
+        compactModel: taskConfig.compactModel || prev.compactModel,
+        executionMode: taskConfig.executionMode
+      }));
+    } else if (!readOnlyConfig) {
+      setAgentConfig(prev => ({
+        ...prev,
+        model: defaultAgentConfig.model,
+        smallFastModel: defaultAgentConfig.smallFastModel,
+        visualModel: defaultAgentConfig.visualModel,
+        compactModel: defaultAgentConfig.compactModel,
+        executionMode: undefined
+      }));
+    } else {
+      // readOnlyConfig is true but taskConfig hasn't arrived yet - e.g. the
+      // caller just switched to a different lead and that lead's own
+      // config fetch is still in flight. The disabled read-only model
+      // button below renders straight from `agentConfig`, so leaving the
+      // previous lead's stale model/mode in place would show it as if it
+      // belonged to whoever is selected now.
+      setAgentConfig(prev => ({
+        ...prev,
+        model: "",
+        smallFastModel: undefined,
+        visualModel: undefined,
+        compactModel: undefined,
+        executionMode: undefined
+      }));
+    }
+  }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
+
+  const handleConfigChange = (config: AgentConfig) => {
+    setAgentConfig(config);
+  };
+
+  const normalizedTaskStatus = normalizeTaskStatus(taskStatus);
+  const allowsLiveGuidanceInput =
+    normalizedTaskStatus === 'running' ||
+    normalizedTaskStatus === 'paused' ||
+    normalizedTaskStatus === 'waiting_for_user';
+  const isInputBusy =
+    !!isLoading &&
+    !allowsLiveGuidanceInput &&
+    !isStoppedTaskStatus(normalizedTaskStatus);
+  // Only a new standalone task: the backend takes execution_mode at creation
+  // only, and an agent (a template resolves into one) overrides it anyway.
+  const showExecutionModePicker =
+    !hideConfig && !readOnlyConfig && !taskConfig;
+  // Unset reads as "Default", not "Auto": the server default is auto only when
+  // XAGENT_AGENT_RUNTIME is unset (config.get_default_task_execution_mode).
+  const executionModeTriggerLabel = pickedExecutionMode
+    ? t(`builds.configForm.executionMode.${pickedExecutionMode}.title`)
+    : t("builds.configForm.executionMode.unset");
+  const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
+  const showTaskRuntimeExtension =
+    hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
+  const activeLocalBrowserTarget = showLocalBrowser ? localBrowserTarget : null;
+  const activeTaskRuntimeSelection = showTaskRuntimeExtension
+    ? taskRuntimeSelection
+    : null;
+  // `agentConfig` mirrors `taskConfig` via a separate effect (below) that
+  // runs asynchronously after a prop change, not synchronously with it - a
+  // read landing in that gap (e.g. right after switching to a different
+  // read-only lead, before its own config has finished loading) would
+  // otherwise still show/send the PREVIOUS lead's model, even though
+  // `taskConfig` itself already correctly reflects the new one (or the
+  // absence of one yet). Read model fields straight from the live prop
+  // instead of the mirror, whenever one is meant to be authoritative -
+  // shared by both the read-only model badge below and handleSubmit, so a
+  // future caller of either one doesn't have to remember this separately.
+  // `hideConfig` alone (no taskConfig, not read-only) legitimately means
+  // "use my own configured default", not "mirror of taskConfig", so it's
+  // excluded here even though no current caller combines them.
+  const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
+  const displayModel = configIsDrivenByTaskConfig
+    ? taskConfig?.model || ""
+    : agentConfig.model;
+  useEffect(() => {
+    if (!showExecutionModePicker) {
+      setPickedExecutionMode(undefined);
+      setExecutionModeMenuOpen(false);
+    }
+  }, [showExecutionModePicker]);
+  useEffect(() => {
+    if (!showLocalBrowser) setLocalBrowserTarget(null);
+  }, [showLocalBrowser]);
+  useEffect(() => {
+    if (!showTaskRuntimeExtension) setTaskRuntimeSelection(null);
+  }, [showTaskRuntimeExtension]);
+  const voiceInputLabel =
+    voiceInput.status === "recording"
+      ? t("voiceInput.stop")
+      : voiceInput.status === "transcribing"
+        ? t("voiceInput.transcribing")
+        : t("voiceInput.start");
+  const voiceInputDisabled =
+    voiceInput.status === "transcribing" ||
+    (voiceInput.status === "idle" && isInputBusy);
+  const handleVoiceInputClick = () => {
+    if (voiceInput.status === "recording") {
+      voiceInput.stopRecording();
+      return;
+    }
+    if (voiceInputEnabled && voiceInput.status === "idle") {
+      voiceInput.startRecording(editorRef.current);
+    }
+  };
+
+  const hasDraft = message.trim().length > 0 || enabledFiles.length > 0;
+  useEffect(() => {
+    if (!hasDraft) {
+      draftRequestSnapshotRef.current = null;
+      deliveryAttemptRef.current = null;
+    } else if (draftRequestSnapshotRef.current === null) {
+      draftRequestSnapshotRef.current = {
+        requestId: currentInteractionRequestId,
+      };
+    }
+  }, [currentInteractionRequestId, hasDraft]);
+  // The stop control exists only in the compact toolbar, and only when the
+  // caller passes onStop. Every stop rule in this composer -- the stop square,
+  // its hints, the "Stopping..." names and the hold on sending -- keys on this
+  // one condition, so a composer without the stop control behaves the same
+  // whatever stopState it is handed.
+  const offersStopControl = compact && !!onStop;
+  const isStopInFlight = offersStopControl && stopState === "stopping";
+  const canSubmit = () => {
+    const isUploadingFiles = uploadingFiles.size > 0
+      || enabledFiles.some((file) => attachmentStatuses?.get(file) === "uploading");
+    // A stop request the server has not answered yet still owns this turn, so
+    // a composer that offers the stop control accepts nothing new until it
+    // resolves: the send control stays in its slot, dimmed and inert, instead
+    // of delivering a message into the run the visitor has just asked to end.
+    //
+    // A requested message is sent only once it is fully typed.
+    return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight
+      && autoTyping?.phase !== "typing";
+  };
+  const canPauseTask =
+    !!isLoading &&
+    !!onPause &&
+    isPausableTaskStatus(normalizedTaskStatus);
+  const shouldShowPauseButton = canPauseTask && !hasDraft;
+  const reactId = useId();
+  const stopHintId = `${reactId}-stop-hint`;
+  // The stop control lives only in the compact toolbar. That is deliberate:
+  // the compact toolbar is the only layout that offers it, and the wider
+  // toolbar below carries the pause control instead, so a caller that passes
+  // `onStop` without `compact` gets no stop control at all. It steps aside for
+  // the send button whenever there is a draft — the same rule the pause button
+  // already follows above — but a send button shown while a stop is in flight
+  // is inert (see canSubmit), so stepping aside never opens a way into the
+  // turn being stopped. The not-sent and timed-out hints both explain that
+  // control, so each is gated on exactly the same condition; a hint with no
+  // visible control on screen would have nothing to refer to.
+  const showStopButton = offersStopControl && !hasDraft;
+  // The stop control and the send control take turns in the same slot, so the
+  // size and the box styling come from here instead of each of them carrying
+  // its own copy: the slot keeps one shape whichever control is on screen.
+  const composerActionButtonProps = (isDimmed: boolean) => ({
+    size: "icon" as const,
+    className: cn(
+      "h-8 w-8 rounded-lg transition-all duration-300",
+      // opacity-50 and pointer-events-none repeat what Button's `disabled:`
+      // styles give a natively disabled control, so the stop control -- which
+      // uses aria-disabled to keep focus -- looks and behaves under the
+      // pointer exactly like the send control when either is dimmed.
+      isDimmed && "bg-muted text-muted-foreground/50 opacity-50 pointer-events-none"
+    ),
+  });
+  // Two outcomes, two sentences: "timed_out" means the request went out and
+  // was never confirmed; "not_sent" means the socket refused it and nobody
+  // received it.
+  const stopHintKey =
+    stopState === "timed_out"
+      ? "widgetSession.stopTimedOut"
+      : stopState === "not_sent"
+        ? "widgetSession.stopNotSent"
+        : null;
+  const showStopHint = showStopButton && stopHintKey !== null;
+  const stopButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("widgetSession.stopResponse");
+  // With a draft the send control takes the stop control's slot, and while a
+  // stop is in flight it is inert (see canSubmit). It carries the same
+  // "Stopping..." name the stop control would, so the reason stays on screen.
+  const sendButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("common.send");
+  // The hint's status region stays mounted for as long as this composer
+  // offers the stop control, and only its text changes: a status region that
+  // appears together with its text is not announced by many screen readers.
+  // It is empty when there is nothing to say (no hint, or a draft has put the
+  // send control in the stop control's slot), and composers without the stop
+  // control do not render it at all.
+  const stopHintText = showStopHint ? t(stopHintKey) : "";
+
+  const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesBlocked
+    ) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current += 1;
+    setIsDraggingFiles(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLFormElement>) => {
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesBlocked
+    ) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+    if (!isDraggingFiles) {
+      setIsDraggingFiles(true);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLFormElement>) => {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setIsDraggingFiles(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLFormElement>) => {
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesBlocked
+    ) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const droppedFiles = extractDroppedFiles(e.dataTransfer);
+    resetDragState();
+    appendFiles(droppedFiles);
+  };
+
+  const executionMode = showExecutionModePicker ? pickedExecutionMode : taskConfig?.executionMode;
+  const normalizedExecutionMode = executionMode
+    ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+    : undefined;
+  const extraRuntimeExtensions = activeLocalBrowserTarget
+    ? { local_browser: { ...activeLocalBrowserTarget } }
+    : activeTaskRuntimeSelection?.runtimeExtensions;
+  const deliveryConfig = (clientMessageId?: string, requestId?: string) => {
+    const metadata = {
+      ...(agentConfig.metadata || {}),
+      ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      ...(requestId ? { request_id: requestId } : {}),
+    };
+    return {
+      ...agentConfig,
+      ...(configIsDrivenByTaskConfig ? {
+        model: displayModel,
+        smallFastModel: taskConfig?.smallFastModel,
+        visualModel: taskConfig?.visualModel,
+        compactModel: taskConfig?.compactModel,
+        executionMode: normalizedExecutionMode,
+      } : {}),
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      ...(extraRuntimeExtensions ? {
+        runtimeExtensions: { ...(agentConfig.runtimeExtensions || {}), ...extraRuntimeExtensions },
+      } : {}),
+      ...(!configIsDrivenByTaskConfig && normalizedExecutionMode ? { executionMode: normalizedExecutionMode } : {}),
+    };
+  };
+  const voiceInputButton = voiceInputEnabled && voiceInput.hasAsrModel ? (
+    <TooltipProvider><Tooltip delayDuration={200}>
+      <TooltipTrigger asChild>
+        <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
+          aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label={voiceInputLabel}
+            className={cn(
+              "h-8 w-8 p-0 rounded-full transition-colors",
+              voiceInput.status === "recording"
+                ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+              voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+            )}
+            disabled={voiceInputDisabled}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={handleVoiceInputClick}
+          >
+            {voiceInput.status === "recording" ? (
+              <Square className="h-3.5 w-3.5 fill-current" />
+            ) : voiceInput.status === "transcribing" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Mic className="h-4 w-4" />
+            )}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
+    </Tooltip></TooltipProvider>
+  ) : null;
+  const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
+    <VoiceModeButton iconOnly
+      reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
+      disabled={voiceConversationDisabled || isInputBusy || voiceInput.status !== "idle"}
+      onClick={() => {
+        onVoiceConversation(deliveryConfig());
+      }} />
+  ) : null;
+
+  const handleSubmit = async (e?: React.SyntheticEvent) => {
+    e?.preventDefault();
+
+    if (!canSubmit() || isSubmittingRef.current) return;
+
+    const hasSelectedAgent = selectedAgents.length > 0;
+    const shouldRequireModelSelection = !hideConfig && !readOnlyConfig;
+    if (shouldRequireModelSelection && !hasSelectedAgent && !agentConfig.model) {
+      setShowNoModelAlert(true);
+      return;
+    }
+
+    try {
+      isSubmittingRef.current = true;
+      const trimmed = message.trim();
+      const messageToSend = trimmed;
+      const deliveryKey = JSON.stringify([
+        messageToSend,
+        extraRuntimeExtensions || null,
+        enabledFiles.map((file) => [
+          file.name,
+          file.size,
+          file.lastModified,
+        ]),
+      ]);
+      const previousAttempt = deliveryAttemptRef.current;
+      const clientMessageId = previousAttempt?.key === deliveryKey
+        ? previousAttempt.clientMessageId
+        : generateClientMessageId();
+      deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
+      const draftRequestId = draftRequestSnapshotRef.current?.requestId;
+      const configToSend = deliveryConfig(clientMessageId, draftRequestId);
+
+      const sentDraft = message;
+      await onSend(messageToSend, configToSend);
+      deliveryAttemptRef.current = null;
+      draftRequestSnapshotRef.current = null;
+      setPickedExecutionMode(undefined);
+      setExecutionModeMenuOpen(false);
+      setLocalBrowserTarget(null);
+      setTaskRuntimeSelection(null);
+      fileMention.resetMention();
+
+      // A send can wait minutes for a reconnect; keep a draft typed meanwhile.
+      if (messageRef.current === sentDraft) {
+        if (isControlled) {
+          onInputChange?.("");
+        } else {
+          setInternalMessage("");
+        }
+      }
+    } catch (error) {
+      if (
+        error instanceof Error
+        && (error as Error & { retryWithNewId?: boolean }).retryWithNewId === true
+      ) {
+        deliveryAttemptRef.current = null;
+      }
+      // A containing surface (e.g. Builder preview) may already show a
+      // persistent error. Keep retry state, but do not duplicate its notice.
+      // A lost connection's failure can arrive up to a resend wait later, after
+      // the user left; no toast for a gone input. Other failures still notify.
+      notifySendFailure(error, t, { suppressConnectionLost: !mountedRef.current });
+    } finally {
+      // Small delay to prevent double submission
+      setTimeout(() => {
+        isSubmittingRef.current = false;
+      }, 500);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (fileMention.handleKeyDown(e)) {
+      return;
+    }
+
+    if (e.key === "Enter" && !e.shiftKey) {
+      // Prevent triggering submit when using IME (e.g., Chinese input method)
+      if (e.nativeEvent.isComposing) {
+        return;
+      }
+      e.preventDefault();
+      handleSubmit(e);
+    }
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    const items = Array.from(e.clipboardData.items || []);
+    const fileItems = items.filter(item => item.kind === 'file');
+
+    if (fileItems.length > 0 && !hideFileUpload && !filesBlocked) {
+      e.preventDefault();
+      const pastedFiles: File[] = [];
+
+      fileItems.forEach((item, index) => {
+        const file = item.getAsFile();
+        if (file) {
+          const hasName = file.name.length > 0;
+          // Handle default "image.png" name which causes conflicts when pasting multiple images
+          if (hasName && file.name !== 'image.png') {
+            pastedFiles.push(file);
+          } else {
+            const timestamp = Date.now();
+            const mime = item.type || file.type || 'application/octet-stream';
+            const ext = mime.split('/')[1] || 'bin';
+            // If it was image.png, preserve extension but make unique. Otherwise default to pasted-file
+            const baseName = file.name === 'image.png'
+              ? `image-${timestamp}-${index}`
+              : `pasted-file-${timestamp}-${index}`;
+
+            const namedFile = new File([file], `${baseName}.${ext}`, {
+              type: mime,
+              lastModified: timestamp,
+            });
+            pastedFiles.push(namedFile);
+          }
+        }
+      });
+
+      appendFiles(pastedFiles);
+    } else {
+      // Strip formatting from text paste
+      e.preventDefault();
+      const text = e.clipboardData.getData("text/plain");
+      document.execCommand("insertText", false, text);
+      // Trigger input handling manually as execCommand might not bubble up to React's onInput reliably in all browsers
+      handleInput();
+    }
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (filesBlocked) return;
+
+    const selectedFiles = Array.from(e.target.files || []);
+    appendFiles(selectedFiles);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  const removeFile = (index: number) => {
+    const fileToRemove = enabledFiles[index];
+    if (fileToRemove) {
+      const fileId = `${fileToRemove.name}-${fileToRemove.lastModified}`;
+      const controller = uploadAbortControllersRef.current.get(fileId);
+      if (controller) {
+        controller.abort();
+        uploadAbortControllersRef.current.delete(fileId);
+      }
+    }
+    onFilesChange?.(enabledFiles.filter((_, i) => i !== index));
+  };
+
+  useEffect(() => {
+    if (autoTyping?.phase !== "ready") return;
+    setAutoTyping(null);
+    // handleSubmit applies every check a send press does, so a composer that
+    // cannot send now keeps the typed text for the visitor.
+    if (message === autoTyping.text) void handleSubmit();
+    // Runs when typing turns ready, and sends the draft of that render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoTyping]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    // A requested message is typed into a focused editor too, with the caret
+    // kept after the typed text.
+    const typingIntoFocusedEditor =
+      autoTyping !== null && document.activeElement === editor;
+    const moveCaretToEnd = () => {
+      if (!typingIntoFocusedEditor) return;
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    };
+
+    if (!message) {
+      if (editor.innerHTML !== "") {
+        editor.innerHTML = "";
+      }
+    } else if (document.activeElement !== editor || typingIntoFocusedEditor) {
+      if (filesDisabled) {
+        let html = applyPromptHighlights(
+          escapeHtml(sanitizeFilesDisabledPresentationText(message)),
+          promptHighlightTerms,
+        );
+        html = html.replace(/\n/g, "<br>");
+        if (editor.innerHTML !== html) {
+          editor.innerHTML = html;
+          moveCaretToEnd();
+        }
+        return;
+      }
+
+      const currentText = serializeEditorContent(editor);
+
+      if (message !== currentText) {
+        let html = renderFileMentionsHtml(message, true);
+        html = applyPromptHighlights(html, promptHighlightTerms);
+        html = html.replace(/\n/g, "<br>");
+
+        editor.innerHTML = html;
+        moveCaretToEnd();
+      }
+    }
+  }, [autoTyping, filesDisabled, message, promptHighlightTerms]);
+
+  return (
+    // No space-y here: the hint region below is mounted while it is empty, so
+    // it carries its own gap and only while it has text, which keeps the
+    // composer from shifting when the region mounts.
+    <div>
+      {offersStopControl && (
+        <p
+          id={stopHintId}
+          role="status"
+          className={cn("text-xs text-muted-foreground", stopHintText && "mb-3")}
+        >
+          {stopHintText}
+        </p>
+      )}
+      {/* Input area */}
+      <div
+        className="relative"
+        ref={containerRef}
+      >
+        {fileMention.fileMentionsEnabled && (
+          <FileMentionDropdown
+            show={fileMention.showFilePicker}
+            isLoading={fileMention.isLoadingFiles}
+            filteredFiles={fileMention.filteredFiles}
+            selectedFileIndex={fileMention.selectedFileIndex}
+            onInsert={fileMention.insertFile}
+            t={t}
+            position={fileMention.dropdownPosition}
+          />
+        )}
+        <form
+          onSubmit={handleSubmit}
+          className={cn(
+            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm rounded-2xl",
+            isFocused
+              ? "shadow-[0_0_0_3px_rgba(48,64,207,0.16)]"
+              : ""
+          )}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          style={{
+            borderColor: isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
+          }}
+        >
+          {isDraggingFiles && (
+            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-primary/5 px-4">
+              <div className="flex max-w-sm items-center gap-3 rounded-2xl border border-primary/20 bg-background/95 px-4 py-3 text-left shadow-lg backdrop-blur-sm">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10 text-primary">
+                  <Paperclip className="h-4 w-4" />
+                </div>
+                <div className="space-y-1">
+                  <div className="text-sm font-medium text-foreground">{t("chatPage.fileUpload.dropHere")}</div>
+                </div>
+              </div>
+            </div>
+          )}
+          {enabledFiles.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-4 pt-3">
+              {enabledFiles.map((file, index) => {
+                const attachmentStatus = attachmentStatuses?.get(file);
+                const isUploading = attachmentStatus === "uploading"
+                  || uploadingFiles.has(`${file.name}-${file.lastModified}`);
+                const isFailed = attachmentStatus === "failed";
+                return (
+                  <div
+                    key={index}
+                    className={cn(
+                      "inline-flex h-8 items-center gap-2 rounded-md border border-slate-200 bg-slate-100 px-3 text-sm text-slate-700 animate-fade-in-scale transition-colors",
+                      isUploading && "opacity-70",
+                      isFailed && "border-red-300 bg-red-50 text-red-700"
+                    )}
+                  >
+                    <div className="flex h-4 w-4 items-center justify-center text-slate-600">
+                      {isUploading ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <FileIcon className="h-3.5 w-3.5" />
+                      )}
+                    </div>
+                    <span className="max-w-[180px] truncate font-medium">{file.name}</span>
+                    {attachmentStatus === "uploading" && (
+                      <span className="text-xs text-slate-500">
+                        {t("widgetSession.attachments.uploading")}
+                      </span>
+                    )}
+                    {isFailed && (
+                      <button
+                        type="button"
+                        onClick={() => onRetryAttachment?.(file)}
+                        disabled={attachmentsBusy}
+                        className="text-xs font-medium underline underline-offset-2 disabled:pointer-events-none disabled:opacity-50"
+                      >
+                        {t("widgetSession.attachments.uploadFailedRetry")}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => removeFile(index)}
+                      className="ml-0.5 rounded-sm p-0.5 text-slate-400 transition-colors hover:bg-slate-200 hover:text-slate-700"
+                      title={isUploading ? t("common.cancel") : t("common.remove")}
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="relative flex-1">
+            <div
+              ref={editorRef}
+              contentEditable
+              data-voice-input="false"
+              className={cn(
+                "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
+                compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
+                isInputBusy ? "opacity-50 pointer-events-none" : ""
+              )}
+              onInput={handleInput}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              onFocus={() => {
+                setIsFocused(true);
+                onFocusChange?.(true);
+              }}
+              onBlur={() => {
+                setIsFocused(false);
+                onFocusChange?.(false);
+              }}
+              role="textbox"
+              aria-multiline="true"
+            />
+            {!message && (
+              <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
+                {placeholder ?? t("chatPage.input.placeholder")}
+              </div>
+            )}
+          </div>
+
+          {/* Bottom toolbar or inline button */}
+          {compact ? (
+            <div className="absolute right-2 bottom-2 flex items-center gap-2">
+              {!hideFileUpload && !filesBlocked && (
+                <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    accept={attachments?.accept ?? DEFAULT_FILE_ACCEPT}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isInputBusy || attachmentsPaused}
+                    title={t("chatPage.input.actions.upload")}
+                  >
+                    <Paperclip className="h-4 w-4" />
+                  </Button>
+                </>
+              )}
+              {voiceInputButton}
+              {voiceConversationButton}
+              {showStopButton ? (
+                <Button
+                  type="button"
+                  {...composerActionButtonProps(isStopInFlight)}
+                  // Not `disabled`: the visitor has just pressed this button,
+                  // and disabling a focused button drops keyboard focus to the
+                  // page. While a stop is pending it stays focusable, reports
+                  // itself unavailable, reads "Stopping...", and ignores presses.
+                  aria-disabled={isStopInFlight || undefined}
+                  onClick={() => {
+                    if (isStopInFlight) return;
+                    onStop?.();
+                  }}
+                  aria-label={stopButtonLabel}
+                  title={stopButtonLabel}
+                  aria-describedby={showStopHint ? stopHintId : undefined}
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  {...composerActionButtonProps(!canSubmit())}
+                  disabled={!canSubmit()}
+                  aria-label={sendButtonLabel}
+                  title={sendButtonLabel}
+                >
+                  {isInputBusy ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">
+              <div className="flex items-center gap-2">
+                {/* Settings button - left of upload */}
+                {!hideConfig && (
+                  <>
+                    {readOnlyConfig ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
+                        disabled={true}
+                        title={models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
+                      >
+                        <Globe className="h-4 w-4" />
+                        <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
+                          {models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
+                        </span>
+                      </Button>
+                    ) : (
+                      <ConfigDialog
+                        onConfigChange={handleConfigChange}
+                        currentConfig={agentConfig}
+                        trigger={
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-9 px-3 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-xl gap-2"
+                            disabled={isInputBusy}
+                            title={t('agent.input.actions.config')}
+                          >
+                            <Globe className="h-4 w-4" />
+                            <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
+                              {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                            </span>
+                          </Button>
+                        }
+                      />
+                    )}
+                  </>
+                )}
+                {showExecutionModePicker && (
+                  // Popover, not ui/select: the form is overflow-hidden and clips it.
+                  <Popover open={executionModeMenuOpen} onOpenChange={setExecutionModeMenuOpen}>
+                    <PopoverTrigger
+                      type="button"
+                      className="inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+                      disabled={isInputBusy}
+                      title={t("builds.configForm.executionMode.label")}
+                      aria-label={`${t("builds.configForm.executionMode.label")}: ${executionModeTriggerLabel}`}
+                    >
+                      <Sparkles className="h-4 w-4" />
+                      <span className="max-w-[150px] truncate hidden sm:inline-block">
+                        {executionModeTriggerLabel}
+                      </span>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" side="top" className="w-64 space-y-0.5 p-1.5">
+                      {EXECUTION_MODES.map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          aria-pressed={mode === pickedExecutionMode}
+                          onClick={() => {
+                            setPickedExecutionMode(mode);
+                            setExecutionModeMenuOpen(false);
+                          }}
+                          className={cn(
+                            "flex w-full flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left transition-colors hover:bg-muted",
+                            mode === pickedExecutionMode && "bg-muted"
+                          )}
+                        >
+                          <span className="text-sm font-medium">
+                            {t(`builds.configForm.executionMode.${mode}.title`)}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {t(`builds.configForm.executionMode.${mode}.description`)}
+                          </span>
+                        </button>
+                      ))}
+                    </PopoverContent>
+                  </Popover>
+                )}
+                {/* Add files or bind this new task to a local host window. */}
+                {(!hideFileUpload && !filesBlocked)
+                  || showLocalBrowser
+                  || showTaskRuntimeExtension ? (
+                  <>
+                    {!hideFileUpload && !filesBlocked && (
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        onChange={handleFileSelect}
+                        className="hidden"
+                        accept={attachments?.accept ?? DEFAULT_FILE_ACCEPT}
+                      />
+                    )}
+                    <LocalBrowserMenu
+                      disabled={isInputBusy}
+                      selectedTarget={localBrowserTarget}
+                      onTargetChange={setLocalBrowserTarget}
+                      extensionSelection={taskRuntimeSelection}
+                      onExtensionSelectionChange={setTaskRuntimeSelection}
+                      onAddFiles={
+                        !hideFileUpload && !filesBlocked && !attachmentsPaused
+                          ? () => fileInputRef.current?.click()
+                          : undefined
+                      }
+                      showLocalBrowser={showLocalBrowser}
+                      showTaskRuntimeExtension={showTaskRuntimeExtension}
+                    />
+                  </>
+                ) : null}
+              </div>
+
+              <div className="flex items-center gap-2">
+                {shouldShowPauseButton && (
+                  <Button
+                    type="button"
+                    size="icon"
+                    onClick={onPause}
+                    className="h-8 w-8 rounded-full transition-all duration-300 bg-yellow-500 hover:bg-yellow-600 text-white"
+                    title={t('agent.input.actions.pauseTask')}
+                  >
+                    <Pause className="h-4 w-4" />
+                  </Button>
+                )}
+                <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
+                  ⏎ {t("common.send")}
+                </span>
+                {voiceInputButton}
+                {voiceConversationButton}
+                <Button
+                  type="submit"
+                  size="icon"
+                  disabled={!canSubmit()}
+                  className={cn(
+                    "h-8 w-8 rounded-lg transition-all duration-300",
+                    !canSubmit() && "bg-muted text-muted-foreground/50"
+                  )}
+                >
+                  {isInputBusy ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+                {normalizedTaskStatus === 'paused' && onResume && (
+                  <Button
+                    type="button"
+                    size="icon"
+                    onClick={onResume}
+                    className="h-8 w-8 rounded-full transition-all duration-300 bg-green-500 hover:bg-green-600 text-white"
+                    title={t('agent.input.actions.resumeTask')}
+                  >
+                    <Play className="h-4 w-4" />
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+        </form>
+      </div>
+
+      <AlertDialog open={showNoModelAlert} onOpenChange={setShowNoModelAlert}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("common.notice")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("chatPage.input.noModelAlert")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => router.push("/models")}>
+              {t("common.confirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}

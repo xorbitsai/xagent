@@ -1,0 +1,1159 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime
+from typing import Any, Literal, cast
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from ..auth_dependencies import get_current_user
+from ..models.chat_message import TaskChatMessage
+from ..models.database import get_db
+from ..models.task import Task
+from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
+from ..models.user import User
+from ..models.workforce import Workforce
+from ..services.assistant_history_safety import client_safe_assistant_history_content
+from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
+from ..services.trigger_providers import (
+    CallbackRequestContext,
+    process_trigger_callback,
+    record_trigger_audit,
+    record_trigger_audit_best_effort,
+)
+from ..services.trigger_rate_limit import (
+    check_callback_rate_limit,
+    check_trigger_crud_rate_limit,
+    remote_ip_from_request,
+    should_audit_rate_limited_callback,
+)
+from ..services.triggers import (
+    TRIGGER_TURN_ID_CONFIG_KEY,
+    TriggerNotFoundError,
+    TriggerRunPreparationError,
+    TriggerSecretError,
+    TriggerServiceError,
+    create_agent_trigger,
+    create_workforce_trigger,
+    decrypt_trigger_run_payload,
+    delete_agent_trigger,
+    delete_workforce_trigger,
+    find_webhook_trigger,
+    fire_trigger,
+    get_owned_agent,
+    get_owned_trigger,
+    get_workforce_trigger,
+    update_agent_trigger,
+    update_workforce_trigger,
+    verify_webhook_secret,
+)
+from ..services.workforce_access import ensure_workforce_access
+from ..utils.db_timezone import format_datetime_for_api
+
+_RUN_HISTORY_MESSAGE_LIMIT = 200
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["triggers"])
+
+
+class TriggerCreateRequest(BaseModel):
+    type: Literal["webhook", "scheduled", "gmail"]
+    name: str | None = Field(default=None, max_length=200)
+    enabled: bool = True
+    config: dict[str, Any] = Field(default_factory=dict)
+    prompt_template: str | None = None
+    secret: str | None = None
+
+
+class TriggerUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=200)
+    enabled: bool | None = None
+    config: dict[str, Any] | None = None
+    prompt_template: str | None = None
+    secret: str | None = None
+    rotate_secret: bool = False
+
+
+class TriggerTestRequest(BaseModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+    source_event_id: str | None = None
+
+
+class TriggerResponse(BaseModel):
+    id: int
+    user_id: int
+    agent_id: int | None
+    workforce_id: int | None = None
+    type: str
+    name: str
+    enabled: bool
+    config: dict[str, Any]
+    prompt_template: str | None
+    webhook_token: str | None
+    webhook_secret: str | None = None
+    callback_id: str | None = None
+    provisioning_status: str | None = None
+    provisioning_error: str | None = None
+    next_run_at: str | None
+    last_run_at: str | None
+    last_error: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+class TriggerRunResponse(BaseModel):
+    id: int
+    trigger_id: int
+    task_id: int | None
+    background_job_id: str | None
+    status: str
+    source_event_id: str | None
+    payload_snapshot: dict[str, Any] | None
+    payload_stored: bool = False
+    payload: Any | None = None
+    idempotency_key: str
+    error_message: str | None
+    started_at: str | None
+    finished_at: str | None
+    # When the retention purge expired this run's conversation (#2565);
+    # ``task_id`` is null from then on. ``status`` is untouched by it: a run
+    # that completed still completed. A null ``task_id`` without this
+    # timestamp is a task deleted some other way.
+    task_expired_at: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+class TriggerRunHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class TriggerRunHistoryResponse(BaseModel):
+    run_id: int
+    task_id: int
+    messages: list[TriggerRunHistoryMessage]
+
+
+class TriggerFireResponse(BaseModel):
+    trigger_run: TriggerRunResponse
+    duplicate: bool = False
+
+
+def _dt(value: datetime | None) -> str | None:
+    """Format a trigger/run timestamp for the API response.
+
+    Delegates to ``format_datetime_for_api`` rather than a bare
+    ``value.isoformat()``: for a tz-aware UTC datetime (the PostgreSQL case)
+    the two produce the identical string, but for SQLite's naive-UTC storage
+    ``format_datetime_for_api`` adds the ``+00:00`` offset a bare
+    ``isoformat()`` omits. Applying it here fixes every field this function
+    serializes, not only the new ``task_expired_at`` (#2565).
+    """
+    return format_datetime_for_api(value)
+
+
+def _serialize_trigger(
+    trigger: AgentTrigger, *, webhook_secret: str | None = None
+) -> TriggerResponse:
+    return TriggerResponse(
+        id=int(trigger.id),
+        user_id=int(trigger.user_id),
+        agent_id=int(trigger.agent_id) if trigger.agent_id is not None else None,
+        workforce_id=(
+            int(trigger.workforce_id) if trigger.workforce_id is not None else None
+        ),
+        type=str(trigger.type),
+        name=str(trigger.name),
+        enabled=bool(trigger.enabled),
+        config=dict(trigger.config or {}),
+        prompt_template=trigger.prompt_template,
+        webhook_token=trigger.webhook_token,
+        webhook_secret=webhook_secret,
+        callback_id=trigger.callback_id,
+        provisioning_status=trigger.provisioning_status,
+        provisioning_error=trigger.provisioning_error,
+        next_run_at=_dt(cast(datetime | None, trigger.next_run_at)),
+        last_run_at=_dt(cast(datetime | None, trigger.last_run_at)),
+        last_error=trigger.last_error,
+        created_at=_dt(cast(datetime | None, trigger.created_at)),
+        updated_at=_dt(cast(datetime | None, trigger.updated_at)),
+    )
+
+
+def _serialize_run(
+    run: TriggerRun, *, payload: Any | None = None
+) -> TriggerRunResponse:
+    snapshot = run.payload_snapshot if isinstance(run.payload_snapshot, dict) else None
+    payload_stored = bool(snapshot and "encrypted_payload" in snapshot)
+    if snapshot and payload_stored:
+        # Never ship ciphertext to clients; decrypted content is only
+        # available through the audited include_payload read.
+        snapshot = {k: v for k, v in snapshot.items() if k != "encrypted_payload"}
+    return TriggerRunResponse(
+        id=int(run.id),
+        trigger_id=int(run.trigger_id),
+        task_id=int(run.task_id) if run.task_id is not None else None,
+        background_job_id=run.background_job_id,
+        status=str(run.status),
+        source_event_id=run.source_event_id,
+        payload_snapshot=snapshot,
+        payload_stored=payload_stored,
+        payload=payload,
+        idempotency_key=str(run.idempotency_key),
+        error_message=run.error_message,
+        started_at=_dt(getattr(run, "started_at", None)),
+        finished_at=_dt(getattr(run, "finished_at", None)),
+        task_expired_at=_dt(getattr(run, "task_expired_at", None)),
+        created_at=_dt(getattr(run, "created_at", None)),
+        updated_at=_dt(getattr(run, "updated_at", None)),
+    )
+
+
+def _agent_or_404(db: Session, *, user_id: int, agent_id: int) -> None:
+    if get_owned_agent(db, user_id=user_id, agent_id=agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+
+def _trigger_or_404(
+    db: Session,
+    *,
+    user_id: int,
+    agent_id: int,
+    trigger_id: int,
+) -> AgentTrigger:
+    trigger = get_owned_trigger(
+        db, user_id=user_id, agent_id=agent_id, trigger_id=trigger_id
+    )
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    return trigger
+
+
+def _enforce_crud_rate_limit(user_id: int) -> None:
+    if not check_trigger_crud_rate_limit(user_id):
+        raise HTTPException(
+            status_code=429, detail="Too many trigger management requests"
+        )
+
+
+def _handle_service_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, TriggerNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, TriggerSecretError):
+        return HTTPException(status_code=401, detail=str(exc))
+    if isinstance(exc, TriggerRunPreparationError):
+        # The run was recorded but no task was attached; a retry of the same
+        # event repairs it via the idempotency key, so ask the caller to retry.
+        return HTTPException(status_code=500, detail=str(exc))
+    if isinstance(exc, TriggerServiceError):
+        return HTTPException(status_code=400, detail=str(exc))
+    logger.exception("Unhandled trigger API error")
+    return HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/api/agents/{agent_id}/triggers",
+    response_model=list[TriggerResponse],
+)
+async def list_triggers(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TriggerResponse]:
+    user_id = int(current_user.id)
+    _agent_or_404(db, user_id=user_id, agent_id=agent_id)
+    # The agent is already confirmed manageable above; list all its triggers
+    # regardless of which teammate created them.
+    rows = (
+        db.query(AgentTrigger)
+        .filter(AgentTrigger.agent_id == agent_id)
+        .order_by(AgentTrigger.created_at.desc(), AgentTrigger.id.desc())
+        .all()
+    )
+    # Gmail provisioning converges in background threads/sweeps that only
+    # write the watch state; fold that convergence into the reported status.
+    await asyncio.to_thread(reconcile_gmail_trigger_provisioning, db, rows)
+    return [_serialize_trigger(row) for row in rows]
+
+
+@router.post(
+    "/api/agents/{agent_id}/triggers",
+    response_model=TriggerResponse,
+)
+async def create_trigger(
+    agent_id: int,
+    request: TriggerCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
+    try:
+        # Runs in a worker thread: Gmail trigger provisioning can block on
+        # cloud calls up to the registration timeout.
+        trigger, secret = await asyncio.to_thread(
+            create_agent_trigger,
+            db,
+            user_id=int(current_user.id),
+            agent_id=agent_id,
+            trigger_type=request.type,
+            name=request.name,
+            enabled=request.enabled,
+            config=request.config,
+            prompt_template=request.prompt_template,
+            secret=request.secret,
+        )
+        return _serialize_trigger(trigger, webhook_secret=secret)
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.patch(
+    "/api/agents/{agent_id}/triggers/{trigger_id}",
+    response_model=TriggerResponse,
+)
+async def update_trigger(
+    agent_id: int,
+    trigger_id: int,
+    request: TriggerUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
+    try:
+        trigger, secret = await asyncio.to_thread(
+            update_agent_trigger,
+            db,
+            user_id=int(current_user.id),
+            agent_id=agent_id,
+            trigger_id=trigger_id,
+            updates=request.model_dump(exclude_unset=True),
+        )
+        return _serialize_trigger(trigger, webhook_secret=secret)
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.delete("/api/agents/{agent_id}/triggers/{trigger_id}")
+async def delete_trigger(
+    agent_id: int,
+    trigger_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _enforce_crud_rate_limit(int(current_user.id))
+    try:
+        await asyncio.to_thread(
+            delete_agent_trigger,
+            db,
+            user_id=int(current_user.id),
+            agent_id=agent_id,
+            trigger_id=trigger_id,
+        )
+        return {"message": "Trigger deleted"}
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs",
+    response_model=list[TriggerRunResponse],
+)
+async def list_trigger_runs(
+    agent_id: int,
+    trigger_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TriggerRunResponse]:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    rows = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.trigger_id == int(trigger.id))
+        .order_by(TriggerRun.created_at.desc(), TriggerRun.id.desc())
+        .limit(100)
+        .all()
+    )
+    return [_serialize_run(row) for row in rows]
+
+
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}",
+    response_model=TriggerRunResponse,
+)
+async def get_trigger_run(
+    agent_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    include_payload: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    return _trigger_run_detail(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        include_payload=include_payload,
+        request=request,
+        user=current_user,
+    )
+
+
+def _trigger_run_detail(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+    include_payload: bool,
+    request: Request,
+    user: User,
+) -> TriggerRunResponse:
+    run = _run_or_404(db, trigger=trigger, run_id=run_id)
+
+    payload: Any | None = None
+    if include_payload:
+        try:
+            payload = decrypt_trigger_run_payload(run)
+        except Exception as exc:
+            # A failed read of a stored payload (e.g. after key rotation) is
+            # as forensically relevant as a successful one; record it before
+            # the error propagates. Requests for runs that never stored a
+            # payload are plain validation errors and stay unaudited.
+            snapshot = run.payload_snapshot
+            if isinstance(snapshot, dict) and "encrypted_payload" in snapshot:
+                _audit_payload_read(
+                    db,
+                    trigger=trigger,
+                    run=run,
+                    request=request,
+                    user=user,
+                    success=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    best_effort=True,
+                )
+            raise _handle_service_error(exc)
+        _audit_payload_read(
+            db,
+            trigger=trigger,
+            run=run,
+            request=request,
+            user=user,
+            success=True,
+        )
+    return _serialize_run(run, payload=payload)
+
+
+def _run_or_404(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+) -> TriggerRun:
+    run = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Trigger run not found")
+    return run
+
+
+def _audit_payload_read(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run: TriggerRun,
+    request: Request,
+    user: User,
+    success: bool,
+    surface: str | None = None,
+    error: str | None = None,
+    best_effort: bool = False,
+) -> None:
+    detail: dict[str, Any] = {
+        "trigger_run_id": int(run.id),
+        "user_id": int(user.id),
+        "success": success,
+    }
+    if surface is not None:
+        detail["surface"] = surface
+    if error is not None:
+        detail["error"] = error
+    audit = record_trigger_audit_best_effort if best_effort else record_trigger_audit
+    audit(
+        db,
+        outcome=TriggerAuditOutcome.PAYLOAD_READ,
+        provider=str(trigger.provider) if trigger.provider else None,
+        callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+        trigger_id=int(trigger.id),
+        detail=detail,
+        remote_ip=request.client.host if request.client else None,
+    )
+
+
+def _display_history_messages(
+    db: Session,
+    *,
+    task: Task,
+    initiating_turn_id: str,
+) -> list[TriggerRunHistoryMessage]:
+    """Read only the routine-initiated display turn.
+
+    Trigger tasks remain available to their owner for private follow-up turns.
+    Team-visible history therefore includes only rows carrying the recorded
+    initiating turn identity, while still reading the display projection so
+    model-context compaction cannot remove the original routine input.
+    """
+    rows: list[tuple[Any, Any, Any]]
+    if int(task.conversation_storage_version) == 2:
+        from ..services.task_event_display import load_event_display_messages_for_turn
+
+        rows = [
+            (row.get("role"), row.get("content"), row.get("turn_id"))
+            for row in load_event_display_messages_for_turn(
+                db,
+                int(task.id),
+                initiating_turn_id,
+                limit=_RUN_HISTORY_MESSAGE_LIMIT,
+            )
+        ]
+    else:
+        stored_rows = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == int(task.id),
+                TaskChatMessage.turn_id == initiating_turn_id,
+            )
+            .order_by(TaskChatMessage.id.asc())
+            .limit(_RUN_HISTORY_MESSAGE_LIMIT)
+            .all()
+        )
+        rows = []
+        for stored_row in stored_rows:
+            stored_role = str(stored_row.role)
+            stored_content = str(stored_row.content or "")
+            if stored_role == "assistant":
+                stored_content = client_safe_assistant_history_content(
+                    content=stored_content,
+                    message_type=str(stored_row.message_type or ""),
+                )
+            rows.append((stored_role, stored_content, stored_row.turn_id))
+
+    messages: list[TriggerRunHistoryMessage] = []
+    for role, content, turn_id in rows:
+        if turn_id != initiating_turn_id:
+            continue
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        if not content.strip():
+            # Tool-only/empty assistant projections have no safe textual
+            # content on this deliberately text-only read surface.
+            continue
+        messages.append(
+            TriggerRunHistoryMessage(
+                role=cast(Literal["user", "assistant"], role),
+                content=content,
+            )
+        )
+    return messages
+
+
+def _trigger_run_history(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+    request: Request,
+    user: User,
+) -> TriggerRunHistoryResponse:
+    """Return a run's read-only, client-safe transcript.
+
+    Authorization deliberately happens through the parent trigger route before
+    this helper is called. A routine run remains owned by the user who created
+    the routine, so authorizing against the generic Task/WebSocket endpoints
+    would wrongly reject other teammates who can already view that routine.
+    Keeping this as a dedicated read-only projection avoids widening task
+    ownership or granting access to continue somebody else's conversation.
+    """
+    run = _run_or_404(db, trigger=trigger, run_id=run_id)
+    if run.task_id is None:
+        if run.task_expired_at is not None:
+            raise HTTPException(
+                status_code=410,
+                detail="Trigger run conversation has expired",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation not found",
+        )
+
+    task_id = int(run.task_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation not found",
+        )
+
+    task_config = dict(task.agent_config or {})
+    recorded_run_id = task_config.get("trigger_run_id")
+    initiating_turn_id = task_config.get(TRIGGER_TURN_ID_CONFIG_KEY)
+    if (
+        not isinstance(recorded_run_id, int)
+        or recorded_run_id != int(run.id)
+        or not isinstance(initiating_turn_id, str)
+        or not initiating_turn_id
+    ):
+        # Existing Tasks may predate explicit initiating-turn provenance.
+        # Guessing from the first surviving user row can expose a later owner
+        # follow-up, so legacy or mismatched records deliberately fail closed.
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation history is unavailable",
+        )
+
+    messages = _display_history_messages(
+        db,
+        task=task,
+        initiating_turn_id=initiating_turn_id,
+    )
+    # The first user turn is the rendered trigger prompt and may embed the
+    # original event payload. Treat this read like include_payload=True so it
+    # leaves the same durable forensic trail.
+    _audit_payload_read(
+        db,
+        trigger=trigger,
+        run=run,
+        request=request,
+        user=user,
+        success=True,
+        surface="run_history",
+    )
+    return TriggerRunHistoryResponse(
+        run_id=int(run.id),
+        task_id=task_id,
+        messages=messages,
+    )
+
+
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+    response_model=TriggerRunHistoryResponse,
+)
+def get_trigger_run_history(
+    agent_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunHistoryResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    return _trigger_run_history(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        request=request,
+        user=current_user,
+    )
+
+
+@router.post(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/test",
+    response_model=TriggerFireResponse,
+)
+async def test_trigger(
+    agent_id: int,
+    trigger_id: int,
+    request: TriggerTestRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerFireResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    try:
+        run, created = await fire_trigger(
+            db,
+            trigger=trigger,
+            event_payload=request.payload,
+            source_event_id=request.source_event_id,
+            test=True,
+            event_type="test",
+        )
+        return TriggerFireResponse(
+            trigger_run=_serialize_run(run), duplicate=not created
+        )
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+# --- Workforce trigger management -----------------------------------------
+#
+# Workforce triggers reuse the AgentTrigger model with workforce_id set and
+# agent_id NULL. The existing agent routes embed agent_id in the path and
+# resolve ownership through get_owned_agent, so they cannot serve workforce
+# triggers; this parallel group scopes everything to an authorized workforce.
+
+
+def _workforce_or_404(
+    db: Session,
+    *,
+    user: User,
+    workforce_id: int,
+    action: str,
+) -> Workforce:
+    workforce = db.get(Workforce, workforce_id)
+    return ensure_workforce_access(db, user, workforce, action=action)
+
+
+def _workforce_trigger_or_404(
+    db: Session,
+    *,
+    user: User,
+    workforce_id: int,
+    trigger_id: int,
+    action: str,
+) -> AgentTrigger:
+    _workforce_or_404(db, user=user, workforce_id=workforce_id, action=action)
+    trigger = get_workforce_trigger(
+        db, workforce_id=workforce_id, trigger_id=trigger_id
+    )
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    return trigger
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers",
+    response_model=list[TriggerResponse],
+)
+async def list_workforce_triggers_route(
+    workforce_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TriggerResponse]:
+    _workforce_or_404(db, user=current_user, workforce_id=workforce_id, action="view")
+    rows = (
+        db.query(AgentTrigger)
+        .filter(AgentTrigger.workforce_id == workforce_id)
+        .order_by(AgentTrigger.created_at.desc(), AgentTrigger.id.desc())
+        .all()
+    )
+    await asyncio.to_thread(reconcile_gmail_trigger_provisioning, db, rows)
+    return [_serialize_trigger(row) for row in rows]
+
+
+@router.post(
+    "/api/workforces/{workforce_id}/triggers",
+    response_model=TriggerResponse,
+)
+async def create_workforce_trigger_route(
+    workforce_id: int,
+    request: TriggerCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
+    workforce = _workforce_or_404(
+        db, user=current_user, workforce_id=workforce_id, action="edit"
+    )
+    try:
+        trigger, secret = await asyncio.to_thread(
+            create_workforce_trigger,
+            db,
+            user_id=int(current_user.id),
+            workforce_id=int(workforce.id),
+            trigger_type=request.type,
+            name=request.name,
+            enabled=request.enabled,
+            config=request.config,
+            prompt_template=request.prompt_template,
+            secret=request.secret,
+        )
+        return _serialize_trigger(trigger, webhook_secret=secret)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.patch(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}",
+    response_model=TriggerResponse,
+)
+async def update_workforce_trigger_route(
+    workforce_id: int,
+    trigger_id: int,
+    request: TriggerUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerResponse:
+    _enforce_crud_rate_limit(int(current_user.id))
+    _workforce_or_404(db, user=current_user, workforce_id=workforce_id, action="edit")
+    try:
+        trigger, secret = await asyncio.to_thread(
+            update_workforce_trigger,
+            db,
+            user_id=int(current_user.id),
+            workforce_id=workforce_id,
+            trigger_id=trigger_id,
+            updates=request.model_dump(exclude_unset=True),
+        )
+        return _serialize_trigger(trigger, webhook_secret=secret)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.delete("/api/workforces/{workforce_id}/triggers/{trigger_id}")
+async def delete_workforce_trigger_route(
+    workforce_id: int,
+    trigger_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _enforce_crud_rate_limit(int(current_user.id))
+    _workforce_or_404(db, user=current_user, workforce_id=workforce_id, action="edit")
+    try:
+        await asyncio.to_thread(
+            delete_workforce_trigger,
+            db,
+            workforce_id=workforce_id,
+            trigger_id=trigger_id,
+        )
+        return {"message": "Trigger deleted"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs",
+    response_model=list[TriggerRunResponse],
+)
+def list_workforce_trigger_runs_route(
+    workforce_id: int,
+    trigger_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TriggerRunResponse]:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    rows = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.trigger_id == int(trigger.id))
+        .order_by(TriggerRun.created_at.desc(), TriggerRun.id.desc())
+        .limit(100)
+        .all()
+    )
+    return [_serialize_run(row) for row in rows]
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs/{run_id}",
+    response_model=TriggerRunResponse,
+)
+def get_workforce_trigger_run_route(
+    workforce_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    include_payload: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    return _trigger_run_detail(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        include_payload=include_payload,
+        request=request,
+        user=current_user,
+    )
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs/{run_id}/history",
+    response_model=TriggerRunHistoryResponse,
+)
+def get_workforce_trigger_run_history_route(
+    workforce_id: int,
+    trigger_id: int,
+    run_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunHistoryResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    return _trigger_run_history(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        request=request,
+        user=current_user,
+    )
+
+
+@router.post(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/test",
+    response_model=TriggerFireResponse,
+)
+async def test_workforce_trigger_route(
+    workforce_id: int,
+    trigger_id: int,
+    request: TriggerTestRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerFireResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="run",
+    )
+    try:
+        run, created = await fire_trigger(
+            db,
+            trigger=trigger,
+            event_payload=request.payload,
+            source_event_id=request.source_event_id,
+            test=True,
+            event_type="test",
+        )
+        return TriggerFireResponse(
+            trigger_run=_serialize_run(run), duplicate=not created
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _handle_service_error(exc)
+
+
+_SECRET_QUERY_PARAMS = frozenset(
+    {"token", "secret", "signature", "key", "apikey", "api_key", "auth"}
+)
+
+
+class TriggerCallbackResponse(BaseModel):
+    outcome: str | None
+    detail: str | None = None
+    trigger_run_ids: list[int] = Field(default_factory=list)
+    duplicates: int = 0
+
+
+@router.post(
+    "/api/triggers/callback/{provider}/{callback_id}",
+    response_model=TriggerCallbackResponse,
+)
+async def receive_trigger_callback(
+    provider: str,
+    callback_id: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Response | TriggerCallbackResponse:
+    """Public unified trigger callback endpoint.
+
+    The callback id is only a locator; authentication happens inside the
+    provider pipeline via provider-specific proof (e.g. HMAC signature
+    headers). The raw body is preserved for signature verification.
+    """
+    remote_ip = remote_ip_from_request(request)
+    # Rate limiting runs before any parsing, so hostile or garbage traffic
+    # cannot amplify database writes; throttling is still observable through
+    # one deduplicated rate_limited audit row per source per window.
+    if not check_callback_rate_limit(callback_id, remote_ip):
+        if should_audit_rate_limited_callback(callback_id, remote_ip):
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.RATE_LIMITED,
+                provider=provider,
+                callback_id=callback_id,
+                remote_ip=remote_ip,
+                detail={"route": "unified_callback"},
+            )
+        raise HTTPException(status_code=429, detail="Too many callback requests")
+
+    # Secrets are accepted only via headers. A request that smuggles its
+    # proof through the query string is rejected outright.
+    for query_key in request.query_params:
+        if query_key.lower() in _SECRET_QUERY_PARAMS:
+            raise HTTPException(
+                status_code=400,
+                detail="Callback credentials must be sent via headers",
+            )
+
+    raw_body = await request.body()
+    context = CallbackRequestContext(
+        provider=provider,
+        callback_id=callback_id,
+        method=request.method,
+        url_path=request.url.path,
+        headers=dict(request.headers),
+        query_params=dict(request.query_params),
+        remote_ip=remote_ip,
+    )
+    result = await process_trigger_callback(db, context=context, raw_body=raw_body)
+    if result.challenge is not None:
+        return Response(
+            content=result.challenge.body,
+            media_type=result.challenge.media_type,
+            status_code=result.challenge.status_code,
+        )
+    response.status_code = result.status_code
+    return TriggerCallbackResponse(
+        outcome=result.outcome.value if result.outcome else None,
+        detail=result.detail,
+        trigger_run_ids=[int(run.id) for run in result.runs],
+        duplicates=result.duplicates,
+    )
+
+
+class PublicTriggerFireResponse(BaseModel):
+    trigger_run_id: int
+    status: str
+    duplicate: bool = False
+
+
+async def _read_legacy_payload(request: Request) -> dict[str, Any]:
+    body = await request.body()
+    if not body:
+        return {}
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except ValueError:
+        return {"body": body.decode("utf-8", errors="replace")}
+    if isinstance(decoded, dict):
+        return decoded
+    return {"value": decoded}
+
+
+@router.post(
+    "/api/triggers/webhook/{webhook_token}",
+    response_model=PublicTriggerFireResponse,
+    deprecated=True,
+)
+async def receive_legacy_webhook_trigger(
+    webhook_token: str,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> PublicTriggerFireResponse:
+    """Deprecated pre-pipeline webhook endpoint, kept for migration.
+
+    Serves only triggers created before the unified callback pipeline
+    (bcrypt-hashed shared secret in the x-xagent-trigger-secret header).
+    Re-saving such a trigger assigns a callback id and rotating its secret
+    moves callers to /api/triggers/callback/webhook/{callback_id}.
+    """
+    remote_ip = remote_ip_from_request(request)
+    if not check_callback_rate_limit(webhook_token, remote_ip):
+        if should_audit_rate_limited_callback(webhook_token, remote_ip):
+            record_trigger_audit_best_effort(
+                db,
+                outcome=TriggerAuditOutcome.RATE_LIMITED,
+                provider="webhook",
+                callback_id=webhook_token,
+                remote_ip=remote_ip,
+                detail={"route": "legacy_webhook"},
+            )
+        raise HTTPException(status_code=429, detail="Too many callback requests")
+
+    response.headers["Deprecation"] = "true"
+    trigger = find_webhook_trigger(db, webhook_token)
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+    if not trigger.enabled:
+        raise HTTPException(status_code=409, detail="Trigger is disabled")
+
+    secret = request.headers.get("x-xagent-trigger-secret")
+    try:
+        verify_webhook_secret(trigger, secret)
+    except TriggerSecretError as exc:
+        record_trigger_audit(
+            db,
+            outcome=TriggerAuditOutcome.REJECTED_SIGNATURE,
+            provider=str(trigger.type),
+            trigger_id=int(trigger.id),
+            detail={"route": "legacy_webhook", "reason": str(exc)},
+            remote_ip=remote_ip,
+        )
+        raise _handle_service_error(exc)
+
+    try:
+        payload = await _read_legacy_payload(request)
+        source_event_id = (
+            request.headers.get("x-xagent-event-id")
+            or request.headers.get("x-event-id")
+            or request.headers.get("x-request-id")
+        )
+        run, created = await fire_trigger(
+            db,
+            trigger=trigger,
+            event_payload=payload,
+            source_event_id=source_event_id,
+        )
+    except Exception as exc:
+        logger.warning("Legacy webhook trigger %s rejected: %s", trigger.id, exc)
+        raise _handle_service_error(exc)
+
+    record_trigger_audit(
+        db,
+        outcome=TriggerAuditOutcome.ACCEPTED,
+        provider=str(trigger.type),
+        trigger_id=int(trigger.id),
+        detail={"route": "legacy_webhook", "run_ids": [int(run.id)]},
+        remote_ip=remote_ip,
+    )
+    return PublicTriggerFireResponse(
+        trigger_run_id=int(run.id),
+        status=str(run.status),
+        duplicate=not created,
+    )

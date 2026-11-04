@@ -1,0 +1,754 @@
+"""Tool Management API Route Handlers"""
+
+import asyncio
+import logging
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any, cast
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import case, func, text
+from sqlalchemy.orm import Query, Session
+
+from ...config import get_uploads_dir
+from ...core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
+from ...core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
+from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
+from ..auth_dependencies import get_current_user
+from ..init_tool_configs import get_default_tool_configs
+from ..models.database import get_db
+from ..models.task import Task, TraceEvent
+from ..models.tool_config import ToolConfig
+from ..models.user import User
+from ..services.tool_credentials import (
+    TOOL_CREDENTIAL_SPECS,
+    clear_tool_credential,
+    delete_sql_connection,
+    get_tool_credential_view,
+    list_configurable_tool_names,
+    list_sql_connections,
+    set_sql_connection,
+    set_tool_credentials,
+)
+from ..tools.config import WebToolConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _tool_usage_query(db: Session, user_id: int | None = None) -> Query[Any]:
+    """Count persisted completion events, shared by the list and usage endpoints."""
+    tool_name = TraceEvent.data["tool_name"].as_string()
+    query: Query[Any] = (
+        db.query(
+            tool_name.label("tool_name"),
+            func.count(TraceEvent.id).label("usage_count"),
+        )
+        .filter(
+            TraceEvent.event_type == "tool_execution_end",
+            tool_name.isnot(None),
+            tool_name != "",
+        )
+        .group_by(tool_name)
+    )
+    if user_id is not None:
+        query = query.filter(
+            TraceEvent.task_id.in_(db.query(Task.id).filter(Task.user_id == user_id))
+        )
+    return query
+
+
+# Counts are decoration on the tool list, so they get a short budget of their own
+# rather than the database-wide statement timeout.
+_USAGE_STATS_STATEMENT_TIMEOUT_MS = 3_000
+
+
+def _load_tool_usage_counts(db: Session, user_id: int | None = None) -> dict[str, int]:
+    """Best-effort usage counts for the tool list; empty when they cannot be read.
+
+    The query runs in a SAVEPOINT that is always rolled back. On PostgreSQL that
+    both recovers the request transaction after a failed statement and undoes
+    the transaction-local timeout, so later reads on ``db`` are unaffected.
+    """
+    try:
+        savepoint = db.begin_nested()
+        try:
+            if db.get_bind().dialect.name == "postgresql":
+                # On the connection, not ``db.execute``: a text() statement would
+                # mark the request session as possibly written.
+                db.connection().execute(
+                    text("SELECT set_config('statement_timeout', :statement, true)"),
+                    {"statement": f"{_USAGE_STATS_STATEMENT_TIMEOUT_MS}ms"},
+                )
+            rows = _tool_usage_query(db, user_id).all()
+            return {row.tool_name: row.usage_count for row in rows}
+        finally:
+            savepoint.rollback()
+    except Exception as e:
+        logger.error("Failed to fetch tool usage stats: %s", e)
+        return {}
+
+
+def _require_user_id(current_user: User) -> int:
+    user_id: object = getattr(current_user, "id", None)
+    if isinstance(user_id, int):
+        return user_id
+    raise HTTPException(status_code=500, detail="Authenticated user is missing an id")
+
+
+# Category display names (for frontend display)
+CATEGORY_DISPLAY_NAMES = {
+    "vision": "Vision",
+    "image": "Image",
+    "video": "Video",
+    "audio": "Audio",
+    "knowledge": "Knowledge",
+    "file": "File",
+    "web_search": "Web Search",
+    "basic": "Basic",
+    "browser": "Browser",
+    "ppt": "PPT",
+    "agent": "Agent",
+    "mcp": "MCP",
+    "skill": "Skill",
+    "ssh": "SSH",
+    "database": "Database",
+    "other": "Other",
+}
+
+# 创建路由器
+tools_router = APIRouter(prefix="/api/tools", tags=["tools"])
+
+
+class CredentialFieldUpdate(BaseModel):
+    value: str
+
+
+class ToolCredentialUpdateRequest(BaseModel):
+    credentials: dict[str, CredentialFieldUpdate]
+
+
+class ToolEnableUpdateRequest(BaseModel):
+    enabled: bool
+
+
+class SqlConnectionUpsertRequest(BaseModel):
+    connection_url: str
+
+
+def _create_tool_info(
+    tool: Any,
+    category: str,
+    vision_model: Any = None,
+    image_models: Any = None,
+    video_models: Any = None,
+    asr_models: Any = None,
+    tts_models: Any = None,
+    sound_effect_models: Any = None,
+    music_models: Any = None,
+) -> dict[str, Any]:
+    """Create tool information based on category instead of hardcoded names"""
+    tool_name = getattr(tool, "name", tool.__class__.__name__)
+
+    # 基于类别设置状态和类型信息
+    status = "available"
+    status_reason = None
+    enabled = True
+    tool_type = "basic"
+
+    if category == "vision":
+        tool_type = "vision"
+        # vision tool depends on vision model
+        if not vision_model:
+            status = "missing_model"
+            status_reason = (
+                "Vision model not configured, "
+                "please add a vision model in model management page"
+            )
+            enabled = False
+
+    elif category == "image":
+        tool_type = "image"
+        # image tool depends on image models
+        if not image_models:
+            status = "missing_model"
+            status_reason = (
+                "Image model not configured, please add an "
+                "image generation model in model management page"
+            )
+            enabled = False
+        elif tool_name == "edit_image":
+            # Special check for image editing capability
+            has_edit_capability = any(
+                "edit" in (getattr(model, "abilities", None) or ())
+                for model in image_models.values()
+            )
+            if not has_edit_capability:
+                status = "missing_capability"
+                status_reason = (
+                    "Current image model does not support editing, "
+                    "please add an image model with editing support"
+                )
+                enabled = False
+
+    elif category == "video":
+        tool_type = "video"
+        if not video_models:
+            status = "missing_model"
+            status_reason = (
+                "Video model not configured, please add a "
+                "video generation model in model management page"
+            )
+            enabled = False
+
+    elif category == "audio":
+        tool_type = "audio"
+        if tool_name == "generate_sound_effect" and not sound_effect_models:
+            status = "missing_model"
+            status_reason = (
+                "Sound effect model not configured, please add a sound effect model"
+            )
+            enabled = False
+        elif tool_name == "generate_music" and not music_models:
+            status = "missing_model"
+            status_reason = "Music model not configured, please add a music model"
+            enabled = False
+        elif (
+            not asr_models
+            and not tts_models
+            and tool_name
+            not in {
+                "generate_sound_effect",
+                "generate_music",
+            }
+        ):
+            status = "missing_model"
+            status_reason = (
+                "Audio model not configured, please add an "
+                "ASR or TTS model in model management page"
+            )
+            enabled = False
+        elif tool_name == "transcribe_audio" and not asr_models:
+            status = "missing_model"
+            status_reason = (
+                "ASR model not configured, please add a "
+                "speech recognition model in model management page"
+            )
+            enabled = False
+        elif tool_name == "synthesize_speech" and not tts_models:
+            status = "missing_model"
+            status_reason = (
+                "TTS model not configured, please add a "
+                "text-to-speech model in model management page"
+            )
+            enabled = False
+
+    elif category == "file":
+        tool_type = "file"
+    elif category == "knowledge":
+        tool_type = "knowledge"
+    elif category == "special_image":
+        tool_type = "image"
+    elif category == "mcp":
+        tool_type = "mcp"
+        # Extract server name from tool name (format: server_name_tool_name)
+        # MCP tools are prefixed with server name
+        parts = tool_name.split("_", 1)
+        if len(parts) > 1:
+            server_name = parts[0]
+            # Add server info to description if available
+            description = getattr(tool, "description", "")
+            if server_name and f"[MCP Server: {server_name}]" not in description:
+                # Server name is already in description from mcp_adapter
+                pass
+    elif category == "ppt":
+        tool_type = "office"
+    elif category == "browser":
+        tool_type = "browser"
+    elif category == "agent":
+        tool_type = "agent"
+    elif category == "skill":
+        tool_type = "skill"
+
+    return {
+        "name": tool_name,
+        "description": getattr(tool, "description", ""),
+        "type": tool_type,
+        "category": category,
+        "display_category": CATEGORY_DISPLAY_NAMES.get(category, category.capitalize()),
+        "enabled": enabled,
+        "always_available": tool_name in INTRINSIC_TOOL_NAMES,
+        "requires_configuration": False,
+        "status": status,
+        "status_reason": status_reason,
+        "config": {},
+        "dependencies": [],
+    }
+
+
+def _withheld_edit_image_row(
+    tools: list[dict[str, Any]], image_models: Any
+) -> dict[str, Any] | None:
+    """Row explaining an edit_image that capability gating kept out of the toolset.
+
+    Without it the admin listing just drops the tool, losing the only prompt to
+    register an edit-capable model.
+    """
+    # Not dead code despite the status check below also rejecting this case: with
+    # no image model there is nothing to explain, and the route asserts it does no
+    # extra work here.
+    if not image_models:
+        return None
+    if any(item.get("name") == "edit_image" for item in tools):
+        return None
+    row = _create_tool_info(
+        SimpleNamespace(
+            name="edit_image",
+            description="Edit an existing image with a text prompt",
+        ),
+        "image",
+        image_models=image_models,
+    )
+    # Only ever surface the disabled explanation, never invent an available tool.
+    return row if row["status"] == "missing_capability" else None
+
+
+@tools_router.get("/available")
+async def get_available_tools(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    include_usage: bool = True,
+) -> dict[str, Any]:
+    """Get list of all available tools, including MCP tools.
+
+    Tools are self-describing - each tool declares its own category via
+    metadata.category field. No manual category mapping needed.
+
+    ``include_usage=false`` skips the usage aggregation and omits
+    ``usage_count`` for callers that only need the tool list.
+    """
+
+    # Create a temporary request object (simulating WebToolConfig requirements)
+    class MockRequest:
+        def __init__(self, user: User) -> None:
+            self.credentials: Any | None = None
+            self.user = user
+
+    # Get or create user sandbox for list mcp tools. Routed through the
+    # lease provider + attach/release (like chat.py) so this request
+    # participates in the manager's lifecycle-lock exclusion and
+    # ref-counting — a raw get_or_create_sandbox call could race the idle
+    # sweep and be handed a container about to be deleted.
+    from ..sandbox_manager import get_sandbox_manager
+
+    sandbox_manager = get_sandbox_manager()
+    sandbox = None
+    sandbox_attached = False
+    sandbox_user_id = str(int(current_user.id))
+    if sandbox_manager is not None:
+        try:
+            sandbox = await sandbox_manager.get_or_create_lease_provider(
+                "tools", sandbox_user_id
+            )
+            # attach_provider (identity-checked), not the existence-only
+            # attach(): this call already holds the specific provider object
+            # returned above, so it must catch the case where that object was
+            # already replaced by a rebuild/sweep/eviction between creation
+            # and attach (ABA) — the same pattern chat.py's
+            # ``_acquire_sandbox_task`` uses when it holds a provider handle.
+            sandbox_attached = await sandbox_manager.attach_provider(
+                "tools", sandbox_user_id, sandbox
+            )
+            if not sandbox_attached:
+                # The provider was reclaimed by a concurrent sweep/eviction
+                # between creation and attach. Drop the stale reference and
+                # list tools without a sandbox (same output as the
+                # sandbox-disabled path) rather than failing a metadata-only
+                # request. Call sites that execute inside the sandbox must
+                # treat attach() == False as an error instead (see chat.py).
+                logger.warning(
+                    "Sandbox for user %s was reclaimed before attach; "
+                    "listing tools without a sandbox",
+                    sandbox_user_id,
+                )
+                sandbox = None
+        except Exception as e:
+            sandbox = None
+            logger.error(f"Failed to create sandbox for user {sandbox_user_id}: {e}")
+
+    # Create WebToolConfig, now includes MCP tools
+    # Note: llm=None for tool listing (display only, no execution)
+    current_user_id = _require_user_id(current_user)
+    tool_config = WebToolConfig(
+        db=db,
+        request=MockRequest(current_user),
+        user_id=current_user_id,
+        is_admin=bool(current_user.is_admin),
+        llm=None,  # Not needed for tool listing
+        workspace_config={
+            "base_dir": str(get_uploads_dir()),
+            "task_id": "tools_list",  # Use a generic task ID for workspace creation
+        },
+        include_mcp_tools=False,  # Disable MCP tools listing to avoid slow loading
+        task_id="tools_list",  # Generic task ID for tool listing
+        browser_tools_enabled=True,  # Enable browser automation tools
+        sandbox=sandbox,
+    )
+
+    async def build_tool_listing_response() -> dict[str, Any]:
+        # Tool construction is the last operation that owns the sandbox lease.
+        from ...core.tools.adapters.vibe.factory import ToolFactory
+
+        try:
+            all_tools = await ToolFactory.create_all_tools(
+                tool_config, apply_user_override_filter=False
+            )
+        finally:
+            if sandbox_manager is not None and sandbox_attached:
+                await sandbox_manager.release("tools", sandbox_user_id)
+
+        def get_tool_category(tool: Any) -> str:
+            """Get category from the tool's self-describing metadata."""
+            try:
+                metadata = getattr(tool, "metadata", None)
+                category = getattr(metadata, "category", None)
+                value = getattr(category, "value", None)
+                if isinstance(value, str) and value:
+                    return value
+            except Exception:
+                logger.warning(
+                    "Failed to read tool category from metadata for %s",
+                    getattr(tool, "name", tool.__class__.__name__),
+                    exc_info=True,
+                )
+            return "other"
+
+        vision_model = tool_config.get_vision_model()
+        image_models = tool_config.get_image_models()
+        video_models = tool_config.get_video_models()
+        asr_models = tool_config.get_asr_models()
+        tts_models = tool_config.get_tts_models()
+        sound_effect_models = tool_config.get_sound_effect_models()
+        music_models = tool_config.get_music_models()
+
+        tools: list[dict[str, Any]] = []
+        for tool in all_tools:
+            category = get_tool_category(tool)
+            tools.append(
+                _create_tool_info(
+                    tool,
+                    category,
+                    vision_model,
+                    image_models,
+                    video_models,
+                    asr_models,
+                    tts_models,
+                    sound_effect_models,
+                    music_models,
+                )
+            )
+
+        withheld = _withheld_edit_image_row(tools, image_models)
+        if withheld is not None:
+            tools.append(withheld)
+
+        if include_usage:
+            usage_user_id = None if bool(current_user.is_admin) else current_user_id
+            usage_map = await asyncio.to_thread(
+                _load_tool_usage_counts, db, usage_user_id
+            )
+            for tool_item in tools:
+                tool_item["usage_count"] = usage_map.get(tool_item.get("name", ""), 0)
+
+        default_configs = {
+            item["tool_name"]: item for item in get_default_tool_configs()
+        }
+        config_rows = db.query(ToolConfig).all()
+        enabled_map: dict[str, bool] = {}
+        requires_configuration_map: dict[str, bool] = {
+            tool_name: bool(config.get("requires_configuration", False))
+            for tool_name, config in default_configs.items()
+        }
+        for row in config_rows:
+            row_tool_name = cast(Any, row.tool_name)
+            if isinstance(row_tool_name, str):
+                enabled_map[row_tool_name] = bool(cast(Any, row.enabled))
+                requires_configuration_map[row_tool_name] = bool(
+                    cast(Any, getattr(row, "requires_configuration", False))
+                )
+        for tool_item in tools:
+            tool_name = str(tool_item.get("name") or "")
+            if tool_name in enabled_map:
+                tool_item["enabled"] = enabled_map[tool_name]
+                if not enabled_map[tool_name]:
+                    tool_item["status"] = "disabled"
+                    tool_item["status_reason"] = "Disabled by tool policy"
+            requires_configuration = requires_configuration_map.get(tool_name, False)
+            if not requires_configuration and tool_item.get("category") == "database":
+                requires_configuration = requires_configuration_map.get(
+                    "sql_query", False
+                )
+            tool_item["requires_configuration"] = requires_configuration
+
+        # Factory handoff makes policy reads detached from the request Session.
+        user_overrides = tool_config.get_user_tool_overrides()
+        for tool_item in tools:
+            tool_name = str(tool_item.get("name") or "")
+            override = user_overrides.get(tool_name)
+            if override and override.get("enabled") is not None:
+                if not override["enabled"]:
+                    tool_item["enabled"] = False
+                    tool_item["status"] = "disabled"
+                    tool_item["status_reason"] = "Disabled by admin"
+                elif tool_item["status"] in ("disabled", "available"):
+                    tool_item["enabled"] = True
+                    tool_item["status"] = "available"
+                    tool_item["status_reason"] = None
+
+        return {
+            "tools": tools,
+            "count": len(tools),
+            "skill_loader_tool": LOAD_SKILL_TOOL_NAME,
+        }
+
+    return await run_with_tool_runtime_cleanup(
+        build_tool_listing_response,
+        tool_config.close,
+        logger=logger,
+        cleanup_error_message=(
+            "Failed to close tool listing runtime after route failure"
+        ),
+    )
+
+
+@tools_router.get("/configurable")
+async def get_configurable_tools(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    items: list[dict[str, Any]] = []
+    for tool_name in list_configurable_tool_names():
+        view = get_tool_credential_view(db, tool_name)
+        items.append(
+            {
+                "tool_name": tool_name,
+                "display_name": view.get("display_name", tool_name),
+                "configured": view["configured"],
+                "fields": view["fields"],
+            }
+        )
+
+    return {
+        "tools": items,
+        "count": len(items),
+    }
+
+
+@tools_router.get("/sql-connections")
+async def get_sql_connections(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    items = list_sql_connections(db, _require_user_id(current_user))
+    return {
+        "connections": items,
+        "count": len(items),
+    }
+
+
+@tools_router.put("/sql-connections/{name}")
+async def upsert_sql_connection(
+    name: str,
+    payload: SqlConnectionUpsertRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    current_user_id = _require_user_id(current_user)
+    try:
+        set_sql_connection(db, current_user_id, name, payload.connection_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "connections": list_sql_connections(db, current_user_id),
+    }
+
+
+@tools_router.delete("/sql-connections/{name}")
+async def remove_sql_connection(
+    name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    current_user_id = _require_user_id(current_user)
+    delete_sql_connection(db, current_user_id, name)
+    return {
+        "connections": list_sql_connections(db, current_user_id),
+    }
+
+
+@tools_router.put("/{tool_name}/enabled")
+async def update_tool_enabled(
+    tool_name: str,
+    payload: ToolEnableUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    config_row = db.query(ToolConfig).filter(ToolConfig.tool_name == tool_name).first()
+    if not config_row:
+        defaults = {item["tool_name"]: item for item in get_default_tool_configs()}
+        default_data = defaults.get(tool_name)
+        if default_data:
+            config_row = ToolConfig(**default_data)
+        else:
+            config_row = ToolConfig(
+                tool_name=tool_name,
+                tool_type="builtin",
+                category="other",
+                display_name=tool_name,
+                description="",
+                enabled=payload.enabled,
+                config={},
+                dependencies=[],
+                status="available",
+            )
+        db.add(config_row)
+
+    cast(Any, config_row).enabled = payload.enabled
+    db.add(config_row)
+    db.commit()
+    return {
+        "tool_name": tool_name,
+        "enabled": bool(cast(Any, config_row).enabled),
+    }
+
+
+@tools_router.get("/{tool_name}/credentials")
+async def get_tool_credentials(
+    tool_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    if tool_name not in TOOL_CREDENTIAL_SPECS:
+        raise HTTPException(
+            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
+        )
+
+    return get_tool_credential_view(db, tool_name)
+
+
+@tools_router.put("/{tool_name}/credentials")
+async def update_tool_credentials(
+    tool_name: str,
+    payload: ToolCredentialUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    if tool_name not in TOOL_CREDENTIAL_SPECS:
+        raise HTTPException(
+            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
+        )
+
+    updates = {
+        field_name: field_update.value
+        for field_name, field_update in payload.credentials.items()
+    }
+
+    try:
+        set_tool_credentials(db, tool_name, updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return get_tool_credential_view(db, tool_name)
+
+
+@tools_router.delete("/{tool_name}/credentials/{field_name}")
+async def delete_tool_credential(
+    tool_name: str,
+    field_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not bool(current_user.is_admin):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    if tool_name not in TOOL_CREDENTIAL_SPECS:
+        raise HTTPException(
+            status_code=404, detail=f"Tool '{tool_name}' is not configurable"
+        )
+
+    if field_name not in TOOL_CREDENTIAL_SPECS[tool_name]:
+        raise HTTPException(
+            status_code=404, detail=f"Field '{field_name}' is not configurable"
+        )
+
+    clear_tool_credential(db, tool_name, field_name)
+    return get_tool_credential_view(db, tool_name)
+
+
+@tools_router.get("/usage")
+async def get_tool_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """Get tool usage statistics"""
+    try:
+        # Run synchronous database queries in thread pool to avoid blocking event loop
+        user_id = (
+            None if bool(current_user.is_admin) else _require_user_id(current_user)
+        )
+
+        def _get_tool_usage_sync() -> list[dict[str, Any]]:
+            # Completion payloads carry a boolean; older events omit it on success.
+            success = func.coalesce(TraceEvent.data["success"].as_boolean(), True)
+            usage_stats = (
+                _tool_usage_query(db, user_id)
+                .add_columns(
+                    func.sum(case((success, 1), else_=0)).label("success_count"),
+                    func.sum(case((success, 0), else_=1)).label("error_count"),
+                    func.max(TraceEvent.timestamp).label("last_used_at"),
+                )
+                .all()
+            )
+
+            result = []
+            for stat in usage_stats:
+                usage_count = cast(int, getattr(stat, "usage_count", 0) or 0)
+                success_count = cast(int, getattr(stat, "success_count", 0) or 0)
+                error_count = cast(int, getattr(stat, "error_count", 0) or 0)
+                last_used_at = getattr(stat, "last_used_at", None)
+                result.append(
+                    {
+                        "tool_name": stat.tool_name,
+                        "usage_count": usage_count,
+                        "success_count": success_count,
+                        "error_count": error_count,
+                        "success_rate": (success_count / usage_count * 100)
+                        if usage_count > 0
+                        else 0,
+                        "last_used_at": last_used_at.isoformat()
+                        if isinstance(last_used_at, datetime)
+                        else None,
+                    }
+                )
+
+            return result
+
+        # Execute in thread pool to avoid blocking
+        return await asyncio.to_thread(_get_tool_usage_sync)
+
+    except Exception as e:
+        logger.error(f"Get tool usage failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e

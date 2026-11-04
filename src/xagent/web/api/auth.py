@@ -1,0 +1,6369 @@
+"""Authentication API endpoints"""
+
+import asyncio
+import base64
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
+from urllib.parse import urlparse
+
+import bcrypt
+
+from ...core.utils import public_requests as requests
+
+# Relax token scope verification as Google might add extra scopes (like openid)
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
+
+from ...builtin_identity import owned_catalog_marker
+from ...config import (
+    get_app_base_url,
+    get_auth_login_account_limit,
+    get_auth_login_ip_limit,
+    get_auth_login_pair_limit,
+    get_auth_rate_limit_max_local_keys,
+    get_auth_rate_limit_window_seconds,
+    get_auth_recovery_email_limit,
+    get_auth_recovery_ip_limit,
+    get_auth_recovery_pair_limit,
+    get_email_change_target_limit,
+    get_email_confirmation_expire_minutes,
+    get_google_restricted_scopes,
+    get_google_shared_oauth_grants_enabled,
+    get_password_reset_expire_minutes,
+)
+from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
+from ...core.runtime_performance import (
+    increment_counter as increment_performance_counter,
+)
+from ...core.runtime_performance import (
+    observe_duration,
+    observe_value,
+)
+from ...core.utils.api_key import verify_dummy
+from ...core.utils.security import host_matches_suffix
+from .. import jwt_codec as jwt
+from ..auth_config import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    JWT_ALGORITHM,
+    JWT_SECRET_KEY,
+    PASSWORD_MIN_LENGTH,
+    REFRESH_TOKEN_EXPIRE_DAYS,
+)
+from ..auth_dependencies import get_current_user, get_user_from_token
+from ..auth_sessions import (
+    commit_refresh_credentials,
+    lock_current_session_epoch,
+    matches_user_session,
+    new_session_epoch,
+    user_session_claims,
+)
+from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
+from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
+from ..jwt_codec import JWTError
+from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
+from ..models.actor_oauth_flow import ActorOAuthFlowState
+from ..models.auth_database import (
+    SyncAuthSessionFactory,
+    get_auth_db,
+    run_auth_db_worker,
+)
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
+from ..models.system_setting import SystemSetting
+from ..models.user import User, email_confirmation_clear_values
+from ..models.user_oauth import UserOAuth
+from ..oauth_account_hosts import (
+    OAuthAccountError,
+    get_oauth_account_host,
+    resolve_oauth_account_endpoints,
+)
+from ..oauth_provider_quirks import (
+    matches_provider_family,
+    requires_json_accept_header,
+    requires_pkce,
+)
+from ..schemas.voice_preferences import VoiceConversationPreferences
+from ..services import gmail_provisioning
+from ..services.auth_attempts import (
+    AttemptBucket,
+    clear_shared_attempt,
+    refund_local_attempt,
+    refund_shared_attempt,
+    reserve_local_attempts,
+    reserve_shared_attempts,
+)
+from ..services.auth_email import (
+    is_auth_email_configured,
+    send_email_change_confirmation,
+    send_email_changed_notice,
+    send_password_reset_email,
+)
+from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.oauth_state_claims import claim_oauth_state
+from ..services.trigger_rate_limit import remote_ip_from_request
+from ..services.user_oauth import (
+    delete_scoped_user_oauth_accounts,
+    normalize_user_oauth_resource_owner_key,
+    scoped_user_oauth_query,
+)
+from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
+from ..utils.script_json import script_safe_json
+
+logger = logging.getLogger(__name__)
+
+auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+
+REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
+SETUP_COMPLETED_SETTING_KEY = "setup_completed"
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MAX_USER_ID = 2_147_483_647
+_ACTOR_OAUTH_FLOW_TTL = timedelta(minutes=10)
+_ACTOR_OAUTH_COOKIE_PREFIX = "xagent_actor_oauth_"
+_ACTOR_OWNER_CLAIM_VERSION = 1
+_ORDINARY_OAUTH_STATE_COOKIE = "xagent_oauth_state"
+_ORDINARY_OAUTH_STATE_COOKIE_PREFIX = f"{_ORDINARY_OAUTH_STATE_COOKIE}_"
+_login_failure_lock = threading.Lock()
+_login_failures: dict[str, AttemptBucket] = {}
+_password_recovery_lock = threading.Lock()
+_password_recovery_attempts: dict[str, AttemptBucket] = {}
+
+
+def _budget_key(kind: str, value: str) -> str:
+    return hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()
+
+
+def _reserve_auth_budgets(
+    namespace: str,
+    budgets: tuple[tuple[str, int], ...],
+    *,
+    now: float | None = None,
+    member: str | None = None,
+) -> int:
+    window = get_auth_rate_limit_window_seconds()
+    retry = reserve_shared_attempts(namespace, budgets, window=window, member=member)
+    if retry is not None:
+        return retry
+    store, lock = (
+        (_login_failures, _login_failure_lock)
+        if namespace == "login"
+        else (_password_recovery_attempts, _password_recovery_lock)
+    )
+    return reserve_local_attempts(
+        store,
+        lock,
+        budgets,
+        window=window,
+        max_keys=get_auth_rate_limit_max_local_keys(),
+        now=now,
+        member=member,
+    )
+
+
+def _clear_login_failures(key: str) -> None:
+    if clear_shared_attempt("login", key):
+        return
+    with _login_failure_lock:
+        _login_failures.pop(key, None)
+
+
+def _refund_login_ip(key: str, member: str) -> None:
+    try:
+        refund_shared_attempt("login", key, member)
+    finally:
+        refund_local_attempt(_login_failures, _login_failure_lock, key, member)
+
+
+def _password_recovery_attempt_key(namespace: str, value: str) -> str:
+    return _budget_key("password-recovery:" + namespace, value)
+
+
+def _enforce_budgets(
+    namespace: str, budgets: tuple[tuple[str, int], ...], *, member: str | None = None
+) -> None:
+    retry = _reserve_auth_budgets(namespace, budgets, member=member)
+    if retry:
+        raise HTTPException(
+            429,
+            "Too many authentication attempts. Try again later.",
+            headers={"Retry-After": str(retry)},
+        )
+
+
+async def _enforce_password_recovery_rate_limit(
+    identifiers: tuple[tuple[str, str], ...],
+) -> None:
+    budgets = [
+        (
+            _password_recovery_attempt_key(namespace, value),
+            get_auth_recovery_ip_limit()
+            if namespace == "ip"
+            else get_auth_recovery_email_limit(),
+        )
+        for namespace, value in identifiers
+    ]
+    values = dict(identifiers)
+    if "email" in values:
+        budgets.append(
+            (
+                _password_recovery_attempt_key(
+                    "ip-email", values.get("ip", "unknown") + "\0" + values["email"]
+                ),
+                get_auth_recovery_pair_limit(),
+            )
+        )
+    await asyncio.to_thread(_enforce_budgets, "recovery", tuple(budgets))
+
+
+def _login_ip_budget(client_host: str) -> tuple[str, int]:
+    return _budget_key("ip", client_host), get_auth_login_ip_limit()
+
+
+def _login_budgets(
+    client_host: str, identifier: str, user: User | None
+) -> tuple[tuple[str, int], ...]:
+    identity = (
+        f"user:{user.id}"
+        if user is not None
+        else f"unknown:{identifier.strip().lower()}"
+    )
+    return (
+        _login_ip_budget(client_host),
+        (_budget_key("account", identity), get_auth_login_account_limit()),
+        (
+            _budget_key("ip-account", client_host + "\0" + identity),
+            get_auth_login_pair_limit(),
+        ),
+    )
+
+
+def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
+    """Provision Gmail watches without letting the outcome reach the caller.
+
+    This runs after the OAuth token is committed, so the connect has already
+    succeeded. Anything raised here would be rendered by the callback's outer
+    handler as an ``Authentication Failed`` 500, telling the user a connector
+    failed while it is in fact connected. A best-effort side effect must not
+    be able to change what the callback returns.
+    """
+    # The module is imported at module level so that a genuine module
+    # resolution failure surfaces at startup instead of being logged here as a
+    # routine provisioning warning. The call stays inside the guard, and going
+    # through the module keeps the attribute lookup late so tests can patch it.
+    try:
+        gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+            db,
+            user_id=user_id,
+            context="after OAuth callback",
+        )
+    except Exception:
+        logger.warning(
+            "Best-effort Gmail watch provisioning failed for user %s "
+            "after OAuth callback",
+            user_id,
+            exc_info=True,
+        )
+
+
+def _run_post_commit_oauth_side_effects(
+    db: Session,
+    *,
+    user_id: int,
+    connector_key: str,
+    provision_gmail: bool = False,
+) -> None:
+    """Run the OAuth callback's post-commit work; never raise.
+
+    ``connector_key`` is the value persisted as ``UserOAuth.provider``: the app
+    id when the connect is app-scoped (``"gmail"``), otherwise the provider
+    name (``"google"``).
+
+    ``user_id`` is a validated ``oauth_state`` claim. The callback validates
+    this claim before the provider exchange and database changes.
+
+    Everything here runs once ``db.commit()`` has persisted the OAuth token, so
+    the connect has already succeeded as far as the user is concerned. The
+    callback's outer ``except Exception`` would render anything raised here as
+    an ``Authentication Failed`` 500, reporting a failure for a connector that
+    is in fact connected. That is the bug #1150 reproduced on staging.
+
+    Guarding the region rather than each individual call is what makes that
+    property structural: a side effect added here inherits it, instead of
+    reintroducing #1150 whenever someone forgets to wrap their own call. The
+    inner guards each side effect carries are kept as well, deliberately, so
+    that neither layer is load-bearing on its own.
+
+    One guard over the whole region does couple the side effects to each other:
+    a raiser aborts the ones after it. That is why the inner guards matter and
+    are worth keeping per side effect. Anything added here that must run even
+    when an earlier entry fails needs its own guard, exactly as Gmail
+    provisioning has.
+
+    Response construction stays outside this region on purpose. It also runs
+    after the commit, but a failure there leaves no response to return, so it
+    must keep reaching the outer handler rather than being swallowed here.
+
+    Failures are logged only. That is acceptable while every side effect in
+    this region has its own recovery path: Gmail watches are re-provisioned by
+    ``scan_due_gmail_watch_renewals``. A side effect that a swallowed failure
+    would strand needs a user-visible signal instead.
+    """
+    try:
+        if connector_key == "gmail" or provision_gmail:
+            _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
+    except Exception:
+        logger.warning(
+            "Post-commit OAuth side effects failed for user %s on connector %s; "
+            "the connect itself succeeded",
+            user_id,
+            connector_key,
+            exc_info=True,
+        )
+
+
+def _matching_gmail_reconnect_tombstone(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    connector_key: str,
+    provider_user_id: object,
+    email: object,
+) -> UserOAuth | None:
+    """Return the same-identity Gmail tombstone that a reconnect can revive.
+
+    Gmail triggers and watch state bind to ``UserOAuth.id``. Replacing a
+    retained tombstone with a fresh row would cascade-delete its watch and
+    leave the trigger bound to the removed id. Only ordinary Gmail needs this
+    identity preservation; actor credentials have no Gmail lifecycle rows.
+
+    A stable upstream id wins. Email is a fallback only when the stored row
+    did not have an upstream id, so authorizing a different Google identity
+    cannot silently move an existing mailbox trigger to that account.
+    """
+    if resource_owner_key is not None or connector_key != "gmail":
+        return None
+
+    candidates = (
+        scoped_user_oauth_query(
+            db,
+            user_id=int(user_id),
+            resource_owner_key=None,
+        )
+        .filter(
+            UserOAuth.provider == connector_key,
+        )
+        .order_by(UserOAuth.id.desc())
+        .all()
+    )
+    candidates = [candidate for candidate in candidates if not candidate.access_token]
+    normalized_provider_user_id = str(provider_user_id) if provider_user_id else None
+    if normalized_provider_user_id is not None:
+        for candidate in candidates:
+            if candidate.provider_user_id == normalized_provider_user_id:
+                return candidate
+
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return None
+    for candidate in candidates:
+        if candidate.provider_user_id:
+            # The stored row has its own verified upstream id -- matching it
+            # by email alone would let an unverified reconnect (this
+            # callback's provider_user_id came back empty) silently move a
+            # different identity's mailbox trigger onto whatever account is
+            # authorizing right now.
+            continue
+        if str(candidate.email or "").strip().lower() == normalized_email:
+            return candidate
+    return None
+
+
+def _oauth_env_name(provider: str, suffix: str) -> str:
+    # "-" -> "_" before uppercasing: a hyphenated provider_name (e.g.
+    # "employment-hero", or an admin-created "-sandbox" variant of any
+    # family) would otherwise produce an env var name no deployment could
+    # ever set (env vars can't contain "-"), silently breaking this
+    # fallback for every hyphenated provider. Every non-hyphenated provider
+    # name is unaffected by this replacement. Note this makes two distinct
+    # provider names that differ only in "-" vs "_" (e.g. a hypothetical
+    # "foo-bar" and "foo_bar") resolve to the same env var name -- no such
+    # pair exists among current providers, so this is a dormant, not
+    # currently reachable, collision.
+    return f"{provider.upper().replace('-', '_')}_{suffix}"
+
+
+def _is_salesforce_provider(provider: str) -> bool:
+    """Match the Salesforce family, including admin-created sandbox rows.
+
+    A prefix match, not exact equality: example.env's documented sandbox
+    workaround is an admin hand-creating a second provider row (e.g.
+    "salesforce-sandbox") pointing at test.salesforce.com, since the
+    provider-row model has no per-user sandbox toggle. Every Salesforce-only
+    code path below -- the instance_url presence guard and the
+    provider_user_id identity backfill -- must use this same predicate; an
+    exact match on either would silently grant that row the capability while
+    skipping its safeguard.
+
+    PKCE is gated separately, by requires_pkce() (oauth_provider_quirks.py):
+    that predicate also covers Employment Hero, so it is no longer
+    Salesforce-only and must not be conflated with this one. Both share the
+    same underlying family-match algorithm (matches_provider_family below),
+    just applied to a different provider set -- see that function's
+    docstring for the "-"-anchored-prefix reasoning this predicate relies on.
+    """
+    return matches_provider_family(provider, "salesforce")
+
+
+_DEPUTY_HOST_SUFFIX = "deputy.com"
+
+
+def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
+    """Turn Deputy's token-response ``endpoint`` field into the full origin
+    UserOAuth.instance_url stores for every provider that has one.
+
+    Deputy returns this as a bare host (e.g. "acme.au.deputy.com", no
+    scheme -- unlike Salesforce's instance_url, which already includes
+    "https://"). Unlike the shallow "is this non-empty" check Salesforce's
+    instance_url guard below does, this fully canonicalizes and validates
+    the value up front (same depth as deputy.py's own _instance_url(),
+    which every tool call routes through) rather than deferring to it:
+    this value is also consumed directly by this file's own
+    _fetch_deputy_identity() and by tools/config.py's refresh-URL builder,
+    both of which build a URL via plain string concatenation with no
+    re-parsing of their own, so a value good enough to only pass a shallow
+    check here (e.g. carrying a trailing slash, an embedded path, or a
+    non-https scheme) would silently produce a malformed request URL at
+    those two call sites, or connect "successfully" only for every
+    deputy_*.py tool call to then fail with an opaque instance_url error.
+    Returning None (rather than raising, like deputy.py's version does)
+    lets the callback's own guard turn a bad value into one clear
+    "did not return an endpoint" error at connect time instead.
+    """
+    if not isinstance(raw_endpoint, str):
+        return None
+    endpoint = raw_endpoint.strip()
+    if not endpoint:
+        return None
+    if not endpoint.startswith("https://") and not endpoint.startswith("http://"):
+        endpoint = f"https://{endpoint}"
+
+    from urllib.parse import urlparse
+
+    try:
+        # urlparse() itself, not just the .port access below, can raise
+        # ValueError on malformed input (e.g. an IPv6-literal-like host:
+        # urlparse("https://[::1].deputy.com") raises "Invalid IPv6 URL")
+        # -- wrapping only .port would let that escape uncaught here and
+        # surface as a raw 500 instead of this function's intended "not a
+        # valid endpoint" None return.
+        parsed = urlparse(endpoint.rstrip("/"))
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").rstrip(".")
+    if parsed.scheme != "https" or not host_matches_suffix(
+        hostname, _DEPUTY_HOST_SUFFIX
+    ):
+        return None
+    return f"{parsed.scheme}://{hostname}{port}"
+
+
+_MYOB_BUSINESS_ID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _normalize_myob_business_id(raw_business_id: object) -> Optional[str]:
+    """Validate the `businessId` MYOB appends to its own authorization
+    redirect as a well-formed GUID.
+
+    This is the *only* place MYOB ever names the business the user
+    consented to -- never the token response (unlike every other
+    per-connection identifier this file normalizes, e.g. Salesforce's/
+    Deputy's), and there is no discovery endpoint to recover it after the
+    fact the way Xero's /connections is: MYOB's own equivalent (GET
+    https://api.myob.com/accountright/) stopped returning company files
+    for API keys created under the post-2025 granular-scope model. So a
+    malformed or missing value here is unrecoverable for this connection,
+    not just a "let a later call fail with a clear error" case the way an
+    unvalidated instance_url elsewhere would be. UserOAuth.instance_url
+    stores this (myob.py reads it via env_mapping's "instance_url" token
+    type, the same mechanism Salesforce/Deputy already use for their own
+    per-connection value), so it's checked with the same strictness here as
+    at connect time, not left to fail opaquely on the first tool call.
+    """
+    if not isinstance(raw_business_id, str):
+        return None
+    business_id = raw_business_id.strip()
+    if not _MYOB_BUSINESS_ID_PATTERN.match(business_id):
+        return None
+    return business_id
+
+
+def _resolve_oauth_secret(
+    provider: str, encrypted_value: Optional[str], env_suffix: str
+) -> str:
+    from ...core.utils.encryption import decrypt_value
+
+    if encrypted_value:
+        value = decrypt_value(encrypted_value)
+        if value:
+            return value
+    return os.environ.get(_oauth_env_name(provider, env_suffix), "")
+
+
+def _resolve_oauth_client_per_field(provider: str, db_provider: Any) -> tuple[str, str]:
+    """Resolve the OAuth client id and secret of a provider row, field by field.
+
+    Each field is read from ``db_provider`` and falls back to its own
+    ``<PROVIDER>_CLIENT_ID`` or ``<PROVIDER>_CLIENT_SECRET`` environment
+    variable when the row leaves it blank (see ``_resolve_oauth_secret``). An
+    empty string means that field is not configured. The connector runtime
+    refreshes stored credentials with this client, so other code that
+    refreshes the same credentials resolves it here too.
+    """
+    return (
+        _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID"),
+        _resolve_oauth_secret(provider, db_provider.client_secret, "CLIENT_SECRET"),
+    )
+
+
+def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
+    if getattr(db_provider, "redirect_uri", None):
+        return str(db_provider.redirect_uri)
+    return os.environ.get(
+        _oauth_env_name(provider, "REDIRECT_URI"),
+        f"http://localhost:8000/api/auth/{provider}/callback",
+    )
+
+
+def _oauth_provider_config_error(
+    provider: str, missing_env_names: list[str]
+) -> HTMLResponse:
+    escaped_provider = html.escape(provider)
+    escaped_missing = html.escape(", ".join(missing_env_names))
+    return HTMLResponse(
+        content=(
+            "<h1>Error: OAuth provider not configured</h1>"
+            f"<p>Missing {escaped_missing} for provider {escaped_provider}.</p>"
+            "<p>Configure the provider in admin settings or set the corresponding "
+            "environment variables and restart the backend.</p>"
+        ),
+        status_code=500,
+    )
+
+
+def _oauth_account_error_response(message: str) -> HTMLResponse:
+    return HTMLResponse(
+        content=f"<h1>Error: Invalid account</h1><p>{html.escape(message)}</p>",
+        status_code=400,
+    )
+
+
+def _merge_oauth_scopes(
+    default_scopes: list[str] | None, app_scopes: list[str] | None
+) -> list[str]:
+    """Preserve provider default order and sort app scopes for deterministic URLs."""
+    scopes: list[str] = []
+    seen: set[str] = set()
+
+    for scope in default_scopes or []:
+        if scope and scope not in seen:
+            scopes.append(scope)
+            seen.add(scope)
+
+    for scope in sorted(app_scopes or []):
+        if scope and scope not in seen:
+            scopes.append(scope)
+            seen.add(scope)
+
+    return scopes
+
+
+def _oauth_scope_separator(provider: str) -> str:
+    # Linear's authorize endpoint documents scope as "a comma separated list
+    # of scopes" -- unlike most providers here, which accept a space-joined
+    # list.
+    if provider.lower() in ("meta", "linear"):
+        return ","
+    return " "
+
+
+def _merged_oauth_scopes(
+    default_scopes: list[str] | None, app_scopes: list[str] | None, provider: str
+) -> tuple[list[str], str]:
+    """Merge provider default scopes with an app row's oauth_scopes, and
+    join them into one scope string -- the shared place for this specific
+    "merge default+app scopes, dedupe, join" pattern, used by
+    _generic_oauth_login's authorize-redirect leg and MYOB's token-exchange
+    leg in generic_oauth_callback.
+
+    Returns (merged_list, joined_string): the list is needed by the
+    authorize-redirect leg (to exclude required scopes from optional_scope
+    below), the string by MYOB's leg, which has no default_scopes of its
+    own and sources everything from the app row. A single-caller wrapper
+    around the string alone was tried first and correctly called out as
+    pointless indirection when the other leg still inlined the same
+    computation separately -- this version is what actually makes it one
+    shared computation for those two, instead of a same-shaped copy.
+
+    NOT the only scope-string mechanism in this file: Deputy's own
+    code-exchange leg (see its `if is_deputy:` block above) builds its
+    scope string by hand instead, for reasons specific to it -- it needs a
+    literal fallback ("longlife_refresh_token") this function has no
+    concept of, and doesn't dedupe, both deliberate per that block's own
+    comment. Left as-is rather than folded in here.
+    """
+    scopes = _merge_oauth_scopes(default_scopes or [], app_scopes)
+    scope_str = _oauth_scope_separator(provider).join(scopes)
+    return scopes, scope_str
+
+
+# Entra ID reports "access_denied" + error_subcode=cancel for ANY abandoned
+# sign-in/consent step: a user backing out of an ordinary prompt, and a
+# non-admin stopped by the "Need admin approval" screen, look identical in
+# those two parameters. Neither the requested scopes nor the subcode can say
+# which one happened, so the admin-consent handoff is keyed on the one thing
+# that can: a provider error code in error_description that Microsoft's own
+# error reference defines as an admin-consent block.
+#   AADSTS90094  AdminConsentRequired
+#   AADSTS90095  AdminConsentRequiredRequestAccess (admin consent workflow)
+# https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+# Deliberately NOT included: AADSTS65004 (UserDeclinedConsent, an ordinary
+# decline), AADSTS65001 (DelegationDoesNotExist, a user can still consent),
+# AADSTS90093 (GraphUserUnauthorized, not a consent error).
+#
+# Known limit: the SG prod redirects captured on 2026-09-17 for this exact
+# scenario carried only error/error_subcode/state and NO error_description,
+# so for that redirect shape this gate never opens and the user gets the
+# generic error page. Do not widen the gate to make that case fire -- the
+# signal simply is not in the redirect.
+_MICROSOFT_ADMIN_CONSENT_ERROR_CODES = frozenset({"AADSTS90094", "AADSTS90095"})
+
+
+def _microsoft_admin_consent_error(error_description: str | None) -> bool:
+    """Return whether Microsoft's callback explicitly reports admin blocking."""
+    if not error_description:
+        return False
+    codes = re.findall(r"\bAADSTS\d+\b", error_description.upper())
+    return any(code in _MICROSOFT_ADMIN_CONSENT_ERROR_CODES for code in codes)
+
+
+# How long a minted admin-consent handoff link stays valid. Deliberately
+# generous (not the 10-minute lifetime of an ordinary oauth_state): the
+# whole point of this link is to be forwarded to an org administrator, who
+# may not act on it immediately -- an IT approval queue measured in hours,
+# not minutes, is the realistic case this is designed for.
+_MICROSOFT_ADMIN_CONSENT_STATE_LIFETIME = timedelta(hours=24)
+
+
+def _build_microsoft_admin_consent_url(
+    db_provider: Any,
+    app_id: str | None,
+    app_info: Dict[str, Any] | None,
+) -> str | None:
+    """Build a tenant-wide admin consent link for the Microsoft provider.
+
+    Only called once Microsoft has explicitly reported an admin-consent block
+    (see _MICROSOFT_ADMIN_CONSENT_ERROR_CODES). The v2.0 /adminconsent
+    endpoint is the documented way to let a tenant admin grant that approval
+    once for the whole org, after which ordinary users can complete the
+    normal login flow. `organizations` (not `common`) is used as the tenant
+    segment: consumer Microsoft accounts have no concept of admin consent,
+    and this link is only ever useful for a work/school tenant. The scope
+    list is the same provider-default + connector merge the normal login
+    requests, so the admin approves exactly what users will ask for.
+
+    `app_info` is the catalog row the caller already looked up for `app_id`
+    (None for a bare login or an app_id with no catalog row). Returns None
+    when the provider has no client_id configured, so the caller falls back
+    to the plain error page instead of linking to a request Microsoft would
+    reject.
+    """
+    from urllib.parse import urlencode
+
+    client_id = _resolve_oauth_secret("microsoft", db_provider.client_id, "CLIENT_ID")
+    if not client_id:
+        return None
+
+    app_scopes: list[str] | None = None
+    if app_info and "oauth_scopes" in app_info:
+        app_scopes = app_info["oauth_scopes"]
+
+    _, scope_str = _merged_oauth_scopes(
+        db_provider.default_scopes, app_scopes, "microsoft"
+    )
+    redirect_uri = _resolve_oauth_redirect_uri("microsoft", db_provider)
+    state = create_access_token(
+        {"type": "admin_consent_state", "app_id": app_id},
+        expires_delta=_MICROSOFT_ADMIN_CONSENT_STATE_LIFETIME,
+    )
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    if scope_str:
+        params["scope"] = scope_str
+    return (
+        "https://login.microsoftonline.com/organizations/v2.0/adminconsent?"
+        f"{urlencode(params)}"
+    )
+
+
+def _microsoft_admin_consent_required_response(admin_consent_url: str) -> HTMLResponse:
+    """Explain the admin-consent block and hand over a link to send to IT.
+
+    Replaces the generic "Error: access_denied" page for this one specific,
+    expected Microsoft flow: it's not a bug the user can retry their way out
+    of, so the page says what to do instead of just reporting failure.
+    """
+    escaped_url = html.escape(admin_consent_url, quote=True)
+    validity_hours = int(
+        _MICROSOFT_ADMIN_CONSENT_STATE_LIFETIME.total_seconds() // 3600
+    )
+    return HTMLResponse(
+        content=(
+            "<h1>Admin approval required</h1>"
+            "<p>Your Microsoft 365 organization requires an administrator "
+            "to approve this connector before anyone in your organization "
+            "can use it. This is a one-time approval done by Microsoft, "
+            "not by Xagent.</p>"
+            "<p>Send this link to your Microsoft 365 administrator, or open "
+            f"it yourself if you are one. It stays valid for {validity_hours} "
+            "hours:</p>"
+            f'<p><a href="{escaped_url}">{escaped_url}</a></p>'
+            "<p>Once an administrator approves it, everyone in your "
+            "organization can connect this app normally.</p>"
+        ),
+        status_code=400,
+    )
+
+
+def _handle_microsoft_admin_consent_return(
+    request: Request, db: Session
+) -> HTMLResponse:
+    """Render the landing page Entra ID redirects an admin to after /adminconsent.
+
+    This return trip carries admin_consent=True/False and the original
+    `state` instead of the usual authorization `code` -- generic_oauth_
+    callback's ordinary code/state handling would otherwise reject it as
+    "Missing code or state". The state proves only that Xagent minted this
+    handoff link earlier; it is NOT proof that Microsoft granted anything --
+    the link is deliberately shown to (and meant to be forwarded by) the
+    user it was issued to, so anyone holding it can call this endpoint with
+    admin_consent=True directly, without ever visiting Microsoft. There is
+    no client_credentials/Graph call here to independently confirm the
+    tenant grant, so the response below must not assert one occurred --
+    see the neutral wording below, which is deliberate, not an oversight.
+    """
+    state = request.query_params.get("state")
+    payload = verify_token(state) if state else None
+    if not payload or payload.get("type") != "admin_consent_state":
+        # Covers a genuinely time-expired token AND a malformed/tampered/
+        # wrong-type one -- verify_token collapses all of those to None, so
+        # this wording must not assert "expired" as the definite cause for
+        # a value that may never have been a real handoff link at all.
+        return HTMLResponse(
+            content=(
+                "<h1>This admin approval link is no longer valid</h1>"
+                "<p>This can happen if the link has expired or is "
+                "otherwise invalid, but that does not undo anything on "
+                "Microsoft's side -- if an administrator already approved "
+                "this in Microsoft, that approval still stands. Ask your "
+                "team members to try connecting again to confirm.</p>"
+            ),
+            status_code=400,
+        )
+
+    app_id = payload.get("app_id")
+    app_label = "this connector"
+    if app_id:
+        app_info = get_app_by_id(db, str(app_id))
+        app_label = html.escape(
+            str(app_info["name"]) if app_info and app_info.get("name") else str(app_id)
+        )
+    error = request.query_params.get("error")
+    admin_consent = request.query_params.get("admin_consent", "").casefold()
+    # Microsoft's documented admin-consent error response can include
+    # admin_consent=True alongside error=consent_required. An explicit error
+    # must therefore take precedence over the success marker.
+    if not error and admin_consent == "true":
+        return HTMLResponse(
+            content=(
+                "<h1>Response received</h1>"
+                f"<p>Microsoft sent back a response for {app_label}, but "
+                "Xagent has no way to independently confirm from this "
+                "redirect alone that your organization's admin actually "
+                "granted consent -- that record lives entirely on "
+                "Microsoft's side.</p>"
+                "<p>Ask your team members to try connecting again. If it "
+                "completes without the admin approval prompt, the consent "
+                "went through. If it still asks for admin approval, check "
+                "with your administrator, or have them look in the Azure "
+                "portal under Microsoft Entra ID &rarr; Enterprise "
+                "applications for this app's grant status.</p>"
+            )
+        )
+    if error:
+        error_text = truncate_error_text(str(error), limit=200)
+        description_text = truncate_error_text(
+            str(request.query_params.get("error_description") or ""), limit=500
+        )
+        logger.warning(
+            "Microsoft admin consent callback failed: error=%r, description=%r",
+            error_text,
+            description_text,
+        )
+    return HTMLResponse(
+        content=(
+            "<h1>Admin consent was not granted</h1>"
+            f"<p>Your administrator did not approve {app_label}. Team "
+            "members will not be able to connect it until an administrator "
+            "grants approval.</p>"
+        ),
+        status_code=400,
+    )
+
+
+# Under Facebook Login for Business (config_id mode), the Meta Login
+# Configuration named by config_id is the *sole* source of truth for granted
+# permissions -- see _generic_oauth_login below, which sends config_id
+# instead of scope/optional_scope entirely. Every provider="meta" app that
+# doesn't have its own entry here falls back to the one shared META_CONFIG_ID,
+# so a deployment that adds a new permission to that shared Login
+# Configuration for one app (e.g. ads_read for Meta Ads) hands that same
+# permission to every other meta app's authorize request too -- not merely
+# offered, since the resulting token is capable of it regardless of which app
+# the user thought they were connecting. Give an app its own env var here (a
+# dedicated Login Configuration scoped to just its own permissions) to avoid
+# sharing a token's capability across connectors that don't ask for it.
+_META_APP_CONFIG_ID_ENV_VARS = {
+    "facebook": "META_FACEBOOK_CONFIG_ID",
+    "instagram": "META_INSTAGRAM_CONFIG_ID",
+    "meta-ads": "META_ADS_CONFIG_ID",
+    "whatsapp": "META_WHATSAPP_CONFIG_ID",
+}
+
+
+def _meta_login_config_id(app_id: str | None = None) -> str:
+    if app_id:
+        # Normalized the same way requires_app_scoped_oauth_grant resolves
+        # app_id (mcp_apps._normalize_oauth_grant_key), not a bare .lower() --
+        # an admin-created app_id like "Meta Ads" normalizes to "meta-ads"
+        # there but not here, which would silently miss this override and
+        # fall back to the shared META_CONFIG_ID for that app, reintroducing
+        # the exact cross-app capability sharing this override exists to
+        # avoid. Imported locally to match this module's existing lazy-import
+        # convention for mcp_apps (see requires_app_scoped_oauth_grant above).
+        from ..mcp_apps import _normalize_oauth_grant_key
+
+        normalized_app_id = _normalize_oauth_grant_key(app_id)
+        app_env_var = (
+            _META_APP_CONFIG_ID_ENV_VARS.get(normalized_app_id)
+            if normalized_app_id
+            else None
+        )
+        if app_env_var:
+            app_config_id = os.environ.get(app_env_var)
+            if app_config_id:
+                return app_config_id
+    return os.environ.get("META_CONFIG_ID", "")
+
+
+def _exchange_meta_long_lived_token(
+    provider: str,
+    token_url: str,
+    token_data: dict[str, Any],
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any]:
+    if provider.lower() != "meta":
+        return token_data
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return token_data
+
+    try:
+        response = requests.get(
+            token_url,
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "fb_exchange_token": access_token,
+            },
+            timeout=10.0,
+        )
+        long_lived_token_data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning(
+            "Meta long-lived token exchange failed; using short-lived token: %s",
+            exc,
+        )
+        return token_data
+
+    if (
+        response.status_code != 200
+        or not isinstance(long_lived_token_data, dict)
+        or "error" in long_lived_token_data
+    ):
+        reason_parts = []
+        if response.status_code != 200:
+            reason_parts.append(f"status={response.status_code}")
+        if not isinstance(long_lived_token_data, dict):
+            reason_parts.append(f"body_type={type(long_lived_token_data).__name__}")
+        else:
+            error = long_lived_token_data.get("error")
+            if error:
+                reason_parts.append(f"error={error}")
+        reason = ", ".join(reason_parts) or "unknown reason"
+        logger.warning(
+            "Meta long-lived token exchange returned unusable response; "
+            "using short-lived token: %s",
+            reason,
+        )
+        return token_data
+
+    return {**token_data, **long_lived_token_data}
+
+
+def _normalize_intercom_token_response(
+    provider: str, token_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Map Intercom's `{"token": ...}` token response onto `access_token`.
+
+    Intercom's token endpoint (POST /auth/eagle/token) does not follow the
+    standard OAuth2 token response shape: it returns only `{"token": "..."}`,
+    with no `access_token`, `token_type`, or `expires_in` fields. Without this,
+    generic_oauth_callback's `token_data.get("access_token")` would silently
+    resolve to None and the connection would be persisted with no token.
+    """
+    if provider.lower() != "intercom":
+        return token_data
+    if "access_token" in token_data:
+        return token_data
+    token = token_data.get("token")
+    if not token:
+        return token_data
+    return {**token_data, "access_token": token}
+
+
+# One shared cap for every provider-supplied error detail echoed to the
+# browser -- both renderers below default to it so the two error shapes
+# (standard error/error_description, Intercom's error.list) can't silently
+# diverge by someone tuning one magic default and not the other.
+_OAUTH_ERROR_MESSAGE_LIMIT = 500
+
+# Diagnostic fields safe to log verbatim from a token-endpoint response --
+# everything else (access_token, refresh_token, client_secret, and any
+# provider-specific field that might carry a token) is reduced to presence
+# only. Server-side logging isn't a safe place for the raw payload either:
+# hide_parameters isn't a substitute here since these are dict values being
+# logged directly, not SQL bound parameters. Applied recursively (see
+# _redact_oauth_log_value), so "message"/"type" also cover an allowlisted
+# key's own nested object shape (Meta's "error" is itself
+# {"message": ..., "type": ...}, the same shape _bounded_oauth_error_message
+# already extracts from for the browser-facing message).
+_OAUTH_LOG_SAFE_KEYS = frozenset(
+    {"error", "error_description", "error_uri", "reason", "type", "message"}
+)
+
+
+def _redact_oauth_log_value(value: Any) -> Any:
+    """Recursively apply _OAUTH_LOG_SAFE_KEYS to a value found under an
+    already-allowlisted key.
+
+    A first version of this redaction serialized an allowlisted key's
+    whole value verbatim (e.g. via json.dumps) once it wasn't a plain str.
+    That reopened the exact leak this function exists to close: a
+    malformed/adversarial response can nest a live secret *inside* an
+    allowlisted key's object (`{"error": {"access_token": "..."}}`), and a
+    verbatim dump would still put it in the log even though the top-level
+    `access_token` field is correctly redacted. Recursing with the same
+    allowlist at every level closes that regardless of nesting depth.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                _redact_oauth_log_value(nested)
+                if key in _OAUTH_LOG_SAFE_KEYS
+                else "<redacted>"
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_oauth_log_value(item) for item in value]
+    if isinstance(value, str):
+        return value[:_OAUTH_ERROR_MESSAGE_LIMIT]
+    return value
+
+
+def _redact_oauth_log_payload(token_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a provider token/error response down to a safe-to-log shape.
+
+    Only the allowlisted diagnostic fields keep their (recursively
+    redacted, length-capped) value; every other key is replaced with a
+    presence marker so a malformed or partial response can't put a live
+    access/refresh token into the server log the way logging the raw dict
+    would.
+
+    An allowlisted key's value can still be non-str -- Meta's "error" is
+    itself an object (`{"message": ..., "type": ...}`), the same shape
+    `_bounded_oauth_error_message` already handles for the browser-facing
+    message -- so this keeps that diagnostic content instead of blanking
+    it, but via the same recursive allowlist rather than a verbatim dump.
+    """
+    return {
+        key: (
+            _redact_oauth_log_value(value)
+            if key in _OAUTH_LOG_SAFE_KEYS
+            else "<redacted>"
+        )
+        for key, value in token_data.items()
+    }
+
+
+def _extract_provider_error_message(
+    token_data: dict[str, Any], *, limit: int = _OAUTH_ERROR_MESSAGE_LIMIT
+) -> str | None:
+    """Best-effort human-readable detail for a token exchange that yielded no
+    access_token.
+
+    Standard OAuth2 providers surface `error`/`error_description`, already
+    handled by the `"error" in token_data` check earlier in the callback.
+    This covers Intercom's differently-shaped `error.list` envelope instead
+    (`{"type": "error.list", "errors": [{"message": "..."}]}`), which does
+    not use an `error` key and so slips past that earlier check. Capped the
+    same way as `_bounded_oauth_error_message`'s standard-shape sibling --
+    this value is echoed to the browser too, and an unbounded provider
+    message is exactly the risk that helper was added to close.
+    """
+    errors = token_data.get("errors")
+    if isinstance(errors, list) and errors:
+        first_error = errors[0]
+        if isinstance(first_error, dict) and first_error.get("message"):
+            return str(first_error["message"])[:limit]
+    return None
+
+
+def _bounded_oauth_error_message(
+    token_data: Dict[str, Any], *, limit: int = _OAUTH_ERROR_MESSAGE_LIMIT
+) -> str:
+    """Bounded, allowlisted, HTML-escaped rendering of a token-endpoint
+    error response for a `token_data["error"]` payload.
+
+    Echoing `str(token_data)` in full (as this used to) was safe only by
+    accident: it relied on no provider's error payload ever containing a
+    token. Making GitHub's JSON error path reachable here (via the
+    provider-quirk Accept header) removed that accidental guarantee, so
+    only the standard OAuth2 `error`/`error_description` fields are
+    rendered now, with every other field dropped and the result capped in
+    length.
+
+    `error` is a bare string for standard OAuth2 providers, but Meta's is
+    itself an object (`{"message": ..., "type": "OAuthException", ...}`)
+    -- str()-ing that directly would render a Python dict repr into the
+    page instead of the actual message. `error_description` is likewise
+    absent from Zoom's error shape, which instead carries the
+    human-readable detail in a `reason` key.
+    """
+    raw_error = token_data.get("error")
+    if isinstance(raw_error, dict):
+        error = str(
+            raw_error.get("message") or raw_error.get("type") or "unknown_error"
+        )
+    else:
+        error = str(raw_error or "unknown_error")
+    description = token_data.get("error_description") or token_data.get("reason")
+    if not isinstance(description, str):
+        # Only a plain-string description is rendered -- an object-valued
+        # one would repr a Python dict into the page, the same defect the
+        # dict-`error` branch above exists to prevent.
+        description = None
+    message = error if not description else f"{error}: {description}"
+    return html.escape(message[:limit])
+
+
+def _fetch_linear_viewer_identity(
+    access_token: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Linear has no flat REST userinfo endpoint (GraphQL-only), so identity
+    comes from a `viewer` query against the same GraphQL endpoint the
+    connector's tools use, instead of the generic `userinfo_url` REST GET
+    path below (left empty for Linear's provider row).
+
+    This doubles as the post-exchange token verification every other
+    provider gets for free from its REST userinfo call: a token Linear
+    won't honour is caught here and reported, instead of being persisted
+    as healthy and failing opaquely later from inside a tool call.
+
+    Raises RuntimeError with a human-readable message on any failure, so
+    the callback can report it the same way the Slack-style `ok: false`
+    branch below does, rather than silently connecting.
+    """
+    response = requests.post(
+        "https://api.linear.app/graphql",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={"query": "query { viewer { id email } }"},
+        timeout=10.0,
+    )
+
+    def _payload_errors_message(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        errors = payload.get("errors")
+        return graphql_errors_message(errors) if errors else None
+
+    if response.status_code != 200:
+        # Mirrors linear.py's _graphql(): prefer the structured GraphQL
+        # "errors" shape, but fall back to the raw (truncated) body for any
+        # other error shape (a differently-keyed JSON error, or an HTML
+        # gateway/WAF page on a 502/504) rather than discarding it.
+        detail = None
+        try:
+            detail = _payload_errors_message(response.json())
+        except ValueError:
+            pass
+        if detail is None:
+            detail = truncate_error_text(response.text.strip(), limit=500)
+        raise RuntimeError(
+            f"Linear API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Linear API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Linear API returned an unexpected response body")
+    data = payload.get("data")
+    viewer = data.get("viewer") if isinstance(data, dict) else None
+    if not isinstance(viewer, dict):
+        raise RuntimeError(
+            _payload_errors_message(payload) or "Linear did not return a viewer"
+        )
+    return viewer.get("id"), viewer.get("email")
+
+
+def _fetch_deputy_identity(
+    access_token: str, instance_url: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Fetch the connected employee's id/email from Deputy's per-install
+    ``GET /api/v1/me`` -- the same endpoint Deputy's own docs point to for
+    validating a token ("Validate tokens via GET to .../api/v1/me").
+
+    Deputy has no fixed userinfo host the generic ``userinfo_url`` REST-GET
+    branch below could point at -- the host itself is per-account (see
+    instance_url) -- so this mirrors _fetch_linear_viewer_identity's
+    approach of a dedicated fetch instead. It also doubles as the same
+    post-exchange token verification every other provider gets for free
+    from its REST userinfo call: a token Deputy won't honour is caught
+    here and reported, instead of being persisted as healthy and failing
+    opaquely later from inside a tool call.
+
+    Raises RuntimeError with a human-readable message on a failed/
+    unparsable response, matching _fetch_linear_viewer_identity. Which
+    exact keys Deputy's employee object uses for id/email is not
+    guaranteed here the way Linear's GraphQL shape is -- a handful of
+    plausible keys are tried, and a miss just leaves that half of the
+    identity pair as None rather than failing the whole connect, since no
+    deputy_*.py tool depends on this identity pair to function.
+    """
+    response = requests.get(
+        f"{instance_url}/api/v1/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10.0,
+    )
+    if response.status_code != 200:
+        detail = truncate_error_text(response.text.strip(), limit=500)
+        raise RuntimeError(
+            f"Deputy API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Deputy API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Deputy API returned an unexpected response body")
+
+    raw_id = payload.get("Id")
+    provider_user_id = (
+        str(raw_id) if isinstance(raw_id, (str, int)) and raw_id != "" else None
+    )
+    email = None
+    for email_key in ("Email", "CompanyEmail", "DeputyEmail"):
+        candidate = payload.get(email_key)
+        if isinstance(candidate, str) and candidate:
+            email = candidate
+            break
+    return provider_user_id, email
+
+
+_EMPLOYMENT_HERO_API_BASE = "https://api.employmenthero.com/api/v1"
+_EMPLOYMENT_HERO_HOST_SUFFIX = "employmenthero.com"
+# Safety bound on _fetch_employment_hero_identity's pagination loop -- a
+# misbehaving/malicious response that never returns a short page must not
+# hang this callback in an unbounded fetch; 50 pages at 100 items each
+# (5000 organisations) is far beyond any real grant's scope.
+_EMPLOYMENT_HERO_IDENTITY_MAX_PAGES = 50
+# Wall-clock companion to the page-count cap above: generic_oauth_callback
+# runs as a sync def, so it occupies a FastAPI threadpool worker (not the
+# event loop) for its whole duration. The page-count cap alone bounds
+# *requests*, not elapsed time -- a slow/misconfigured token_url host could
+# still occupy a worker for MAX_PAGES * DEFAULT_TIMEOUT_SECONDS in the
+# worst case. This bounds when a NEW request may be issued, not the
+# function's total runtime: the check runs before each request, so a
+# request already in flight when the deadline is crossed can still run to
+# its own 10s timeout -- worst case is this budget plus one request
+# timeout (~25s here), not a hard 15s ceiling.
+_EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS = 15.0
+# Comfortably under Postgres's ~2704-byte btree index row-size limit that
+# UserOAuth's (user_id, provider, provider_user_id) uniqueness index enforces
+# -- see _fetch_employment_hero_identity's docstring.
+_PROVIDER_USER_ID_SAFE_LENGTH = 500
+
+
+def _is_employment_hero_token_url(token_url: str) -> bool:
+    """True if `token_url`'s host is employmenthero.com or a subdomain of it.
+
+    Guards the call to _fetch_employment_hero_identity below: matches_
+    provider_family(provider, "employment-hero") trusts provider_name alone
+    (by design -- an admin-created "employment-hero-sandbox" row is exactly
+    the documented workaround this predicate exists for), but nothing else
+    ties that row's `token_url` to the real Employment Hero. Without this
+    check, an admin who points an "employment-hero"-family row's token_url
+    at an unrelated issuer would have this callback take the access token
+    that issuer returns and forward it, as a Bearer credential, to the real
+    api.employmenthero.com -- this check keeps the identity fetch (and the
+    provider_user_id it derives) scoped to grants that actually came from
+    Employment Hero's own token endpoint, falling through to the same
+    NULL-identity path a non-family provider with no userinfo_url takes
+    otherwise.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        hostname = (urlparse(token_url).hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    return host_matches_suffix(hostname, _EMPLOYMENT_HERO_HOST_SUFFIX)
+
+
+def _fetch_employment_hero_identity(access_token: str) -> Optional[str]:
+    """Fetch the accessible organisations for this grant from Employment
+    Hero's `GET /organisations` -- the same endpoint employment_hero.py's own
+    employment_hero_list_organisations tool calls, and the closest thing to
+    an identity check a token exposes (Employment Hero has no OIDC-style
+    "me" endpoint, per the registry row's comment). Employment Hero grants
+    are org-scoped rather than user-scoped, so there is no email to return;
+    the sorted, JSON-encoded set of organisation ids becomes provider_user_id
+    instead -- distinguishing tokens by the organisations they can reach
+    gives UserOAuth's (user_id, provider, provider_user_id) uniqueness
+    constraint a real value to key on. Without this, two concurrent
+    callbacks for the same user (a double-clicked Connect button, or two
+    open tabs) would each insert a row with provider_user_id=None, which
+    SQL's NULL-is-never-equal-to-NULL semantics lets the unique index pass
+    straight through -- the same race Salesforce's token-id fallback and
+    Deputy/Linear's own identity fetches each close for their provider (see
+    the Salesforce branch's comment above).
+
+    A grant with zero accessible organisations returns None rather than
+    failing the whole connect -- a token scoped to no organisation at
+    all is an edge case no tool in this connector could do anything useful
+    with anyway, so a hard connect-time error would be disproportionate;
+    the duplicate-row race is simply not closed for that one case, the same
+    tradeoff _fetch_deputy_identity accepts when Deputy's employee object is
+    missing every id-like key.
+
+    Paginates through every page rather than trusting a single 100-item
+    page: a grant with more than 100 accessible organisations would
+    otherwise have its provider_user_id derived from only the first 100,
+    silently excluding the rest from the uniqueness key. Termination is
+    driven by the response envelope's own `total_pages` (confirmed present
+    in Employment Hero's actual response shape -- see
+    test_list_organisations_requests_expected_path_and_params's fixture),
+    not by comparing the returned page size against the 100 this function
+    itself requested: this API's documented max page size is a ceiling on
+    what a caller may ask for, not a guarantee the server always returns
+    that many when more results exist, so a page shorter than requested is
+    not on its own reliable proof there's nothing left. Falls back to that
+    same short-page heuristic only if a response is ever missing
+    `total_pages` entirely. Capped at _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES
+    pages, and separately at _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS before a
+    new page request may be issued (this runs inside a sync callback
+    occupying a FastAPI threadpool worker for its duration, so a slow
+    token_url host could otherwise hold one for page-count-many timeouts;
+    see that constant's own comment for why this bounds new requests, not
+    the function's total runtime) -- either safety bound against a
+    misbehaving/malicious/slow response logs a warning when hit; a
+    truncated organisation set at that point is still used rather than
+    failing the whole connect, matching the zero-organisation tradeoff
+    above.
+
+    The resulting id set is hashed rather than stored as a raw joined
+    string once it's long enough to risk exceeding Postgres's ~2704-byte
+    btree index row-size limit (UUID-shaped organisation ids at real scale
+    -- a partner/bookkeeper account with 70+ accessible organisations --
+    can exceed it): a hash is still a stable, deterministic value per exact
+    organisation set, which is all the uniqueness key actually needs.
+
+    Raises RuntimeError on a failed/unparsable response, matching
+    _fetch_deputy_identity/_fetch_linear_viewer_identity.
+    """
+    item_per_page = 100
+    organisation_ids: set[str] = set()
+    deadline = time.monotonic() + _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS
+    for page_index in range(1, _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES + 1):
+        if time.monotonic() > deadline:
+            # This is a `break`, not a `for...else` fall-through -- logged
+            # here rather than relying on the loop's own cap-exhaustion
+            # warning below, since exceeding the time budget can happen
+            # well before exhausting the page-count one.
+            logger.warning(
+                "Employment Hero organisation lookup exceeded its %.0fs "
+                "time budget after %d page(s); provider_user_id may be "
+                "derived from an incomplete organisation set.",
+                _EMPLOYMENT_HERO_IDENTITY_MAX_SECONDS,
+                page_index - 1,
+            )
+            break
+        response = requests.get(
+            f"{_EMPLOYMENT_HERO_API_BASE}/organisations",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"page_index": page_index, "item_per_page": item_per_page},
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            detail = truncate_error_text(response.text.strip(), limit=500)
+            raise RuntimeError(
+                f"Employment Hero API error (status {response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "Employment Hero API returned a non-JSON response: "
+                f"{truncate_error_text(response.text.strip(), limit=500)}"
+            ) from None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError(
+                "Employment Hero API returned an unexpected response body"
+            )
+        organisation_ids.update(
+            str(item["id"])
+            for item in items
+            if isinstance(item, dict) and item.get("id") not in (None, "")
+        )
+        total_pages_raw = data.get("total_pages") if isinstance(data, dict) else None
+        # bool is an int subclass in Python (isinstance(True, int) is True)
+        # -- excluded explicitly so a stray boolean in the envelope can't be
+        # misread as a page count. A numeric string ("3") is accepted since
+        # nothing guarantees this field is always JSON-typed as a number
+        # rather than a string on Employment Hero's side; an integer-valued
+        # float (3.0) is accepted too, but a genuinely fractional one (3.5)
+        # is not -- that's not a valid page count under any serialization,
+        # so it's treated the same as a missing field rather than silently
+        # truncated into a wrong one.
+        total_pages: Optional[int] = None
+        if isinstance(total_pages_raw, bool):
+            pass
+        elif isinstance(total_pages_raw, int):
+            total_pages = total_pages_raw
+        elif isinstance(total_pages_raw, float) and total_pages_raw.is_integer():
+            total_pages = int(total_pages_raw)
+        elif isinstance(total_pages_raw, str) and total_pages_raw.strip().isdigit():
+            total_pages = int(total_pages_raw.strip())
+        if total_pages is not None and total_pages > 0:
+            if page_index >= total_pages:
+                break
+        elif len(items) < item_per_page:
+            break
+    else:
+        logger.warning(
+            "Employment Hero organisation lookup hit the %s-page safety cap; "
+            "provider_user_id may be derived from an incomplete organisation "
+            "set.",
+            _EMPLOYMENT_HERO_IDENTITY_MAX_PAGES,
+        )
+    # JSON-encoded, not comma-joined: a raw ",".join would let two distinct
+    # id sets collide onto the same string whenever an id itself happens to
+    # contain a literal "," (not expected for Employment Hero's UUID/numeric
+    # ids today, but not a contract this code can rely on) -- e.g.
+    # {"a,b", "c"} and {"a", "b,c"} both join to "a,b,c". JSON's own string
+    # quoting/escaping makes that collision impossible regardless of what
+    # characters an id contains.
+    provider_user_id = (
+        json.dumps(sorted(organisation_ids)) if organisation_ids else None
+    )
+    if provider_user_id and len(provider_user_id) > _PROVIDER_USER_ID_SAFE_LENGTH:
+        provider_user_id = hashlib.sha256(provider_user_id.encode()).hexdigest()
+    return provider_user_id
+
+
+def create_access_token(
+    data: Dict[str, Any], expires_delta: Optional[timedelta] = None
+) -> str:
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+    to_encode.update({"exp": expire})
+    if "type" not in to_encode:
+        to_encode["type"] = "access"
+    encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def create_refresh_token(data: Dict[str, Any]) -> str:
+    """Create JWT refresh token with longer expiry"""
+    # Refresh consumes user_id, never username/sub. Omit that redundant,
+    # unbounded UTF-8 claim to keep the signed token within VARCHAR(255).
+    # Access tokens retain sub; verification still accepts existing refresh JWTs.
+    to_encode = {"user_id": data["user_id"]}
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    # Rotation must change the stored value even within one JWT timestamp second.
+    to_encode.update(
+        {"exp": expire, "type": "refresh", "jti": secrets.token_urlsafe(16)}
+    )
+    encoded_jwt: str = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def verify_refresh_token(token: str) -> Optional[dict[str, Any]]:
+    """Verify JWT refresh token and return payload"""
+    try:
+        payload: dict[str, Any] = jwt.decode(
+            token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
+        if payload.get("type") != "refresh":
+            return None
+        return payload
+    except JWTError:
+        return None
+
+
+def verify_token(token: str) -> Optional[dict[str, Any]]:
+    """Verify JWT token and return payload"""
+    try:
+        payload: dict[str, Any] = jwt.decode(
+            token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
+        return payload
+    except JWTError:
+        return None
+
+
+class LoginRequest(BaseModel):
+    """Login request model"""
+
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    """Login response model"""
+
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    user_id: Optional[int] = None
+    expires_in: Optional[int] = None
+    refresh_expires_in: Optional[int] = None
+
+
+class RegisterRequest(BaseModel):
+    """User registration request model"""
+
+    username: str
+    email: Optional[str] = None
+    password: str
+
+
+class RegisterResponse(BaseModel):
+    """User registration response model"""
+
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+
+
+class SetupStatusResponse(BaseModel):
+    initialized: bool
+    needs_setup: bool
+    registration_enabled: bool
+    password_min_length: int
+
+
+class RegisterSwitchRequest(BaseModel):
+    enabled: bool
+
+
+class RegisterSwitchResponse(BaseModel):
+    success: bool
+    registration_enabled: bool
+    message: str
+
+
+class ChangePasswordRequest(BaseModel):
+    """Change password request model"""
+
+    current_password: str
+    new_password: str
+
+
+class ChangePasswordResponse(BaseModel):
+    """Change password response model"""
+
+    success: bool
+    message: str
+
+
+class UserProfileResponse(BaseModel):
+    success: bool
+    message: str
+    user: Dict[str, Any]
+
+
+class UpdateEmailRequest(BaseModel):
+    email: str
+    current_password: Optional[str] = None
+
+
+class UpdateEmailResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+    pending_confirmation: bool = False
+    unchanged: bool = False
+    error_code: Optional[str] = None
+
+
+class ConfirmEmailRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
+
+
+# The 5 voice options the onboarding "Launch" step offers - each agent's
+# system prompt gets a short instruction derived from whichever one the
+# user picked (see apply_user_voice in api/agents.py). Re-exported from
+# core.agent.voice_policy (the canonical source, not redeclared here) so
+# this and _VOICE_INSTRUCTIONS there can never drift into two
+# independently-maintained copies of the same 5-string set.
+VALID_USER_VOICES = _CORE_VALID_VOICES
+
+# Onboarding's "About you"/"Goals" steps are short free-text labels and a
+# handful of goal picks, not open-ended documents - these mirror the
+# max_length this codebase already puts on comparably-scoped free-text
+# fields (e.g. agents.py's/custom_api.py's name/description Fields).
+# Without a bound, the full preferences JSON is replayed through every
+# login/`/me`/email-update/token-validation/PATCH response, so an
+# unbounded field lets a user inflate all of those response bodies.
+PREFERENCES_TEXT_FIELD_MAX_LENGTH = 200
+PREFERENCES_GOALS_MAX_ITEMS = 20
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """Partial update for the current user's onboarding/voice preferences.
+    Only fields actually present in the request body are merged into the
+    stored dict (see exclude_unset=True below) - onboarding writes these
+    incrementally, one step at a time, not all at once."""
+
+    # Pydantic's default (extra="ignore") would validate a typo'd key
+    # (e.g. "voce") to an empty, all-unset model: model_dump(exclude_unset=True)
+    # then returns {}, so the PATCH silently skips persistence and cache
+    # invalidation while still reporting success - forbid so a typo/unknown
+    # key is a 422, not a lost write the client believes succeeded.
+    model_config = ConfigDict(extra="forbid")
+
+    onboarded: Optional[StrictBool] = None
+    execution_budget_tokens: Optional[StrictInt] = Field(default=None, gt=0)
+    execution_budget_soft_percent: Optional[StrictInt] = Field(
+        default=None, ge=1, le=99
+    )
+    department: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    industry: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    voice: Optional[str] = None
+    voice_conversation: VoiceConversationPreferences | None = None
+    goals: Optional[
+        List[Annotated[str, Field(max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH)]]
+    ] = Field(default=None, max_length=PREFERENCES_GOALS_MAX_ITEMS)
+
+    @field_validator("voice")
+    @classmethod
+    def _validate_voice(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in VALID_USER_VOICES:
+            raise ValueError(f"voice must be one of {sorted(VALID_USER_VOICES)}")
+        return value
+
+    # A blank string is meaningless stored data, not a "clear this field"
+    # signal - a merge-style PATCH already has one for that (send `null`
+    # for the key, same as tokens_must_not_be_blank rejects a blank
+    # access/refresh token above rather than treating it as "no token").
+    @field_validator("department", "industry")
+    @classmethod
+    def _reject_blank_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+    @field_validator("goals")
+    @classmethod
+    def _reject_blank_goals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        stripped_goals = [item.strip() for item in value]
+        if any(not item for item in stripped_goals):
+            raise ValueError("goal must not be blank")
+        return stripped_goals
+
+
+class UpdatePreferencesResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+
+
+class RefreshTokenRequest(BaseModel):
+    """Refresh token request model"""
+
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
+    """Optional refresh token for revoking exactly the session being logged out."""
+
+    refresh_token: Optional[str] = None
+
+
+class RefreshTokenResponse(BaseModel):
+    """Refresh token response model"""
+
+    success: Literal[True]
+    message: str
+    access_token: Annotated[StrictStr, Field(min_length=1)]
+    refresh_token: Annotated[StrictStr, Field(min_length=1)]
+    expires_in: Annotated[StrictInt, Field(gt=0)]
+    refresh_expires_in: Annotated[StrictInt, Field(gt=0)]
+
+    @field_validator("access_token", "refresh_token")
+    @classmethod
+    def tokens_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Token must not be blank")
+        return value
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ForgotPasswordResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+class ResetPasswordResponse(BaseModel):
+    success: bool
+    message: str
+
+
+def hash_password(password: str) -> str:
+    """Hash a password with bcrypt (with a SHA-256 pre-hash for long inputs).
+
+    The pre-hash avoids bcrypt's historical 72-byte input truncation while the
+    resulting value remains a standard bcrypt string. Legacy unsalted SHA-256
+    rows are wrapped into this format by the
+    ``20261027_wrap_legacy_password_hashes`` migration.
+    """
+    password_material = (
+        hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
+    )
+    return bcrypt.hashpw(password_material, bcrypt.gensalt()).decode("ascii")
+
+
+async def hash_password_async(password: str) -> str:
+    """Run bcrypt hashing off the FastAPI event loop."""
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str) -> bool:
+    """Run bcrypt verification off the FastAPI event loop."""
+    return await asyncio.to_thread(verify_password, password, password_hash)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify bcrypt passwords and transparently support legacy SHA-256 rows."""
+    if password_hash.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            password_material = (
+                hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
+            )
+            return bcrypt.checkpw(password_material, password_hash.encode("ascii"))
+        except (ValueError, UnicodeEncodeError):
+            return False
+
+    # Legacy rows were stored as a bare SHA-256 digest. The
+    # 20261027_wrap_legacy_password_hashes migration wraps them in bcrypt; this
+    # fallback only covers rows written by an older release after that ran, and
+    # successful authentication upgrades them immediately.
+    legacy_digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    valid = secrets.compare_digest(legacy_digest, password_hash)
+    if not valid:
+        # Keep legacy and unusable-password failures on the bcrypt timing floor.
+        verify_dummy()
+    return valid
+
+
+def needs_password_rehash(password_hash: str) -> bool:
+    """Return whether a successful login should replace a legacy hash."""
+    return not password_hash.startswith(("$2a$", "$2b$", "$2y$"))
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(EMAIL_PATTERN.match(email))
+
+
+def hash_auth_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def hash_password_reset_token(token: str) -> str:
+    """Preserve the invitation adapters' existing password-proof contract."""
+    return hash_auth_token(token)
+
+
+def generate_password_reset_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def get_app_name() -> str:
+    return os.getenv("XAGENT_APP_NAME") or os.getenv("NEXT_PUBLIC_APP_NAME") or "Xagent"
+
+
+def build_password_reset_url(token: str) -> str:
+    base_url = get_app_base_url()
+    if not base_url:
+        raise RuntimeError(
+            "XAGENT_APP_BASE_URL must be configured for password reset emails"
+        )
+    # Keep the one-time token in the URL fragment. Browsers do not send the
+    # fragment in HTTP requests or Referer headers, so it cannot leak through
+    # reverse-proxy access logs or third-party resources loaded by the page.
+    return f"{base_url}/reset-password#token={token}"
+
+
+def has_users(db: Session) -> bool:
+    return db.query(User.id).first() is not None
+
+
+def is_registration_enabled(db: Session) -> bool:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == REGISTRATION_ENABLED_SETTING_KEY)
+        .first()
+    )
+    if setting is None:
+        return True
+    return str(setting.value).lower() == "true"
+
+
+def set_registration_enabled(db: Session, enabled: bool) -> None:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == REGISTRATION_ENABLED_SETTING_KEY)
+        .first()
+    )
+    value = "true" if enabled else "false"
+    if setting is None:
+        setting = SystemSetting(key=REGISTRATION_ENABLED_SETTING_KEY, value=value)
+        db.add(setting)
+    else:
+        setattr(setting, "value", value)
+    db.commit()
+
+
+def is_setup_completed(db: Session) -> bool:
+    setting = (
+        db.query(SystemSetting)
+        .filter(SystemSetting.key == SETUP_COMPLETED_SETTING_KEY)
+        .first()
+    )
+    return setting is not None and str(setting.value).lower() == "true"
+
+
+@auth_router.get("/setup-status", response_model=SetupStatusResponse)
+async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
+    initialized = has_users(db)
+    registration_enabled = is_registration_enabled(db)
+    return SetupStatusResponse(
+        initialized=initialized,
+        needs_setup=not initialized,
+        registration_enabled=registration_enabled,
+        password_min_length=PASSWORD_MIN_LENGTH,
+    )
+
+
+@auth_router.post("/setup-admin", response_model=RegisterResponse)
+async def setup_admin(
+    request: RegisterRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+) -> RegisterResponse:
+    if len(request.password) < PASSWORD_MIN_LENGTH:
+        return RegisterResponse(
+            success=False,
+            message=f"Password must be at least {PASSWORD_MIN_LENGTH} characters",
+        )
+
+    try:
+        if has_users(db) or is_setup_completed(db):
+            return RegisterResponse(success=False, message="Setup already completed")
+
+        existing_user = get_user_by_username(db, request.username)
+        if existing_user:
+            return RegisterResponse(success=False, message="Username already exists")
+
+        username_namespace_error = validate_username_for_login_namespace(
+            db, request.username
+        )
+        if username_namespace_error:
+            return RegisterResponse(success=False, message=username_namespace_error)
+
+        email = None
+        if request.email:
+            email = normalize_email(request.email)
+            if not is_valid_email(email):
+                return RegisterResponse(success=False, message="Invalid email address")
+            email_namespace_error = validate_email_for_login_namespace(db, email)
+            if email_namespace_error:
+                return RegisterResponse(success=False, message=email_namespace_error)
+            existing_email_user = get_user_by_email(db, email)
+            if existing_email_user:
+                return RegisterResponse(success=False, message="Email already exists")
+
+        user = User(
+            username=request.username,
+            email=email,
+            password_hash=await hash_password_async(request.password),
+            is_admin=True,
+        )
+        db.add(user)
+        db.flush()
+
+        setup_setting = SystemSetting(key=SETUP_COMPLETED_SETTING_KEY, value="true")
+        db.add(setup_setting)
+
+        run_first_admin_setup_hook(
+            http_request.app, db, FirstAdminIdentity(user_id=int(user.id))
+        )
+        db.commit()
+        db.refresh(user)
+    except IntegrityError:
+        db.rollback()
+        return RegisterResponse(success=False, message="Setup already completed")
+    except Exception:
+        db.rollback()
+        raise
+
+    return RegisterResponse(
+        success=True,
+        message="Administrator account created successfully",
+        user={
+            "id": user.id,
+            "username": user.username,
+            "is_admin": bool(cast(Any, user.is_admin)),
+            "createdAt": (
+                cast(Any, user.created_at).isoformat()
+                if getattr(user, "created_at", None) is not None
+                else None
+            ),
+        },
+    )
+
+
+@auth_router.get("/register-switch", response_model=RegisterSwitchResponse)
+async def get_register_switch(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> RegisterSwitchResponse:
+    if not bool(cast(Any, user.is_admin)):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    enabled = is_registration_enabled(db)
+    return RegisterSwitchResponse(
+        success=True,
+        registration_enabled=enabled,
+        message="Registration switch fetched successfully",
+    )
+
+
+@auth_router.patch("/register-switch", response_model=RegisterSwitchResponse)
+async def update_register_switch(
+    request: RegisterSwitchRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RegisterSwitchResponse:
+    if not bool(cast(Any, user.is_admin)):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    set_registration_enabled(db, request.enabled)
+    return RegisterSwitchResponse(
+        success=True,
+        registration_enabled=request.enabled,
+        message="Registration switch updated successfully",
+    )
+
+
+def create_user(
+    db: Session,
+    username: str,
+    email: str,
+    password: str,
+    *,
+    password_hash: str | None = None,
+) -> User:
+    """Create a new user without default model configurations.
+
+    Users will use admin defaults via dynamic fallback logic until they set their own.
+    No pre-creation of UserModel or UserDefaultModel records.
+    """
+    if password_hash is None:
+        password_hash = hash_password(password)
+    user = User(username=username, email=email, password_hash=password_hash)
+    db.add(user)
+    db.flush()  # Get the user ID without committing
+    db.refresh(user)
+
+    # Commit everything together
+    db.commit()
+    return user
+
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    """Get user by username"""
+    return db.query(User).filter(User.username == username).first()
+
+
+def get_user_by_email(db: Session, email: str) -> Optional[User]:
+    normalized_email = normalize_email(email)
+    return db.query(User).filter(User.email == normalized_email).first()
+
+
+def validate_username_for_login_namespace(
+    db: Session, username: str, *, current_user_id: int | None = None
+) -> Optional[str]:
+    normalized_username = username.strip()
+    if is_valid_email(normalized_username):
+        return "Username cannot be an email address"
+
+    conflicting_email_user = get_user_by_email(db, normalized_username)
+    if (
+        conflicting_email_user is not None
+        and conflicting_email_user.id != current_user_id
+    ):
+        return "Username conflicts with an existing email"
+
+    return None
+
+
+def validate_email_for_login_namespace(
+    db: Session, email: str, *, current_user_id: int | None = None
+) -> Optional[str]:
+    normalized_email = normalize_email(email)
+    conflicting_username_user = get_user_by_username(db, normalized_email)
+    if (
+        conflicting_username_user is not None
+        and conflicting_username_user.id != current_user_id
+    ):
+        return "Email conflicts with an existing username"
+    return None
+
+
+def _normalized_preferences(user: User) -> Dict[str, Any]:
+    """The user's stored preferences as a plain dict, tolerating a NULL or
+    malformed value. ``preferences`` has no nested-type constraint (same
+    reasoning as apply_output_voice's isinstance guard on the ``voice``
+    value it holds), so a corrupted/hand-edited row could store a non-dict
+    JSON value here - ``dict(value or {})`` would raise on any of those
+    instead of degrading to an empty dict."""
+    preferences = cast(Any, user.preferences)
+    return dict(preferences) if isinstance(preferences, dict) else {}
+
+
+def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
+    expires = user.email_confirmation_expires_at
+    if isinstance(expires, datetime) and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    pending = (
+        user.pending_email
+        if isinstance(expires, datetime) and expires > datetime.now(timezone.utc)
+        else None
+    )
+    payload: Dict[str, Any] = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_admin": bool(cast(Any, user.is_admin)),
+        "has_password": not str(user.password_hash).startswith("!"),
+        "pending_email": pending,
+        "email_change_available": is_auth_email_configured(),
+        "email_confirmation_expire_minutes": get_email_confirmation_expire_minutes(),
+        "preferences": _normalized_preferences(user),
+    }
+    if include_login_time:
+        payload["loginTime"] = datetime.now(timezone.utc).timestamp()
+    return payload
+
+
+def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]:
+    """Resolve an identifier as email first, then fall back to username."""
+    login_identifier = identifier.strip()
+    if is_valid_email(login_identifier):
+        user = get_user_by_email(db, login_identifier)
+        if user is not None:
+            return user
+    return get_user_by_username(db, login_identifier)
+
+
+def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[str, Any]:
+    """Build detached response data before commit can expire ORM attributes."""
+    if user is None:
+        # Keep unknown-user failures on the same bcrypt timing floor as a
+        # wrong password for an existing account.
+        verify_dummy()
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    with observe_duration("xagent.auth.login.password_verify.duration"):
+        valid = verify_password(request.password, str(user.password_hash))
+    if not valid:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if needs_password_rehash(str(user.password_hash)):
+        setattr(user, "password_hash", hash_password(request.password))
+    with observe_duration("xagent.auth.login.token_creation.duration"):
+        identity = user_session_claims(user)
+        access_token = create_access_token(
+            data=identity,
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        )
+        token = create_refresh_token(data=identity)
+    setattr(user, "refresh_token", token)
+    setattr(
+        user,
+        "refresh_token_expires_at",
+        datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    return {
+        "success": True,
+        "message": "Login successful",
+        "user": serialize_auth_user(user, include_login_time=True),
+        "access_token": access_token,
+        "refresh_token": token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        "user_id": user.id,
+    }
+
+
+def _login_in_worker(
+    request: LoginRequest,
+    session_factory: SyncAuthSessionFactory,
+    client_host: str = "unknown",
+) -> Dict[str, Any]:
+    # The same thread creates, queries, commits and closes the Session.
+    with session_factory() as session:
+        with observe_duration("xagent.auth.login.sync_lookup.duration"):
+            user = get_user_by_login_identifier(session, request.username)
+        budgets = _login_budgets(client_host, request.username, user)
+        _enforce_budgets("login", budgets[1:])
+        previous_hash = str(user.password_hash) if user is not None else ""
+        previous_epoch = (
+            cast(str | None, user.session_epoch) if user is not None else None
+        )
+        response = _prepare_login_response(user, request)
+        assert user is not None  # The response builder rejects missing users.
+        upgraded_hash = str(user.password_hash)
+        expires_at = user.refresh_token_expires_at
+        assert expires_at is not None
+        with observe_duration("xagent.auth.login.sync_commit.duration"):
+            commit_refresh_credentials(
+                session,
+                user_id=int(response["user_id"]),
+                password_hash=previous_hash,
+                session_epoch=previous_epoch,
+                refresh_token=response["refresh_token"],
+                expires_at=cast(datetime, expires_at),
+                upgraded_password_hash=(
+                    upgraded_hash if upgraded_hash != previous_hash else None
+                ),
+            )
+        # Identity budgets are independent of the pre-DB source-IP admission.
+        for key, _ in budgets[1:]:
+            try:
+                _clear_login_failures(key)
+            except HTTPException:
+                logger.warning("Unable to clear a successful login's attempt budget")
+        # Do not access user here: expire_on_commit=True would issue another SELECT.
+        return response
+
+
+@auth_router.post("/login")
+async def login(
+    request: LoginRequest,
+    db: SyncAuthSessionFactory = Depends(get_auth_db),
+    http_request: Request = None,  # type: ignore[assignment]
+) -> Dict[str, Any]:
+    """Authenticate with a single worker-owned database transaction."""
+    started_at = time.perf_counter()
+    outcome = "error"
+    client_host = remote_ip_from_request(http_request) or "unknown"
+    ip_key, ip_limit = _login_ip_budget(client_host)
+    member = secrets.token_hex(16)
+    try:
+        # Reject floods before opening a DB session or occupying its worker.
+        await asyncio.to_thread(
+            _enforce_budgets, "login", ((ip_key, ip_limit),), member=member
+        )
+        response = await run_auth_db_worker(
+            "login_database_transaction",
+            lambda: _login_in_worker(request, db, client_host),
+        )
+        outcome = "succeeded"
+        try:
+            await asyncio.to_thread(_refund_login_ip, ip_key, member)
+        except HTTPException:
+            logger.warning("Unable to refund a successful login's IP reservation")
+        return response
+    except HTTPException:
+        outcome = "rejected"
+        raise
+    except Exception:
+        # SQL errors may contain bound refresh tokens. Never expose them to clients.
+        logger.exception("Login failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during login.",
+        )
+    finally:
+        observe_value(
+            "xagent.auth.login.total.duration",
+            (time.perf_counter() - started_at) * 1_000.0,
+            unit="ms",
+            attributes={"outcome": outcome},
+        )
+        increment_performance_counter(
+            "xagent.auth.login.requests",
+            attributes={"outcome": outcome},
+        )
+
+
+@auth_router.post("/register", response_model=RegisterResponse)
+async def register(
+    request: RegisterRequest, db: Session = Depends(get_db)
+) -> RegisterResponse:
+    """User registration endpoint with default configuration inheritance"""
+    try:
+        # Validate password length
+        if len(request.password) < PASSWORD_MIN_LENGTH:
+            return RegisterResponse(
+                success=False,
+                message=f"Password must be at least {PASSWORD_MIN_LENGTH} characters",
+            )
+
+        # Check if user already exists
+        existing_user = get_user_by_username(db, request.username)
+        if existing_user:
+            return RegisterResponse(success=False, message="Username already exists")
+
+        username_namespace_error = validate_username_for_login_namespace(
+            db, request.username
+        )
+        if username_namespace_error:
+            return RegisterResponse(success=False, message=username_namespace_error)
+
+        initialized = has_users(db)
+        if not initialized:
+            return RegisterResponse(
+                success=False,
+                message="System is not initialized. Please create the first admin account.",
+            )
+
+        if not is_registration_enabled(db):
+            return RegisterResponse(success=False, message="Registration is disabled")
+
+        if not request.email:
+            return RegisterResponse(success=False, message="Email is required")
+
+        email = normalize_email(request.email)
+        if not is_valid_email(email):
+            return RegisterResponse(success=False, message="Invalid email address")
+
+        email_namespace_error = validate_email_for_login_namespace(db, email)
+        if email_namespace_error:
+            return RegisterResponse(success=False, message=email_namespace_error)
+
+        existing_email_user = get_user_by_email(db, email)
+        if existing_email_user:
+            return RegisterResponse(success=False, message="Email already exists")
+
+        # Create new user with inherited defaults
+        user = create_user(
+            db,
+            request.username,
+            email,
+            request.password,
+            password_hash=await hash_password_async(request.password),
+        )
+
+        return RegisterResponse(
+            success=True,
+            message="Registration successful",
+            user={
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "createdAt": (
+                    cast(Any, user.created_at).isoformat()
+                    if getattr(user, "created_at", None) is not None
+                    else None
+                ),
+            },
+        )
+
+    except Exception:
+        # Same reasoning as login's handler: create_user's db.commit() binds
+        # password_hash as a SQL parameter, which a SQLAlchemy
+        # StatementError's default __str__ would otherwise put into str(e)
+        # and, via this response, into the client-facing error.
+        logger.exception("Registration failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during registration.",
+        )
+
+
+@auth_router.post("/forgot-password", response_model=ForgotPasswordResponse)
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+    http_request: Request = None,  # type: ignore[assignment]
+) -> ForgotPasswordResponse:
+    email = normalize_email(request.email)
+    if not is_valid_email(email):
+        return ForgotPasswordResponse(
+            success=False,
+            message="Please enter a valid email address",
+        )
+
+    await _enforce_password_recovery_rate_limit(
+        (("ip", remote_ip_from_request(http_request) or "unknown"), ("email", email)),
+    )
+
+    user = get_user_by_email(db, email)
+    if user is None:
+        return ForgotPasswordResponse(
+            success=True,
+            message="If the email exists, a password reset link has been sent",
+        )
+
+    reset_token = generate_password_reset_token()
+    reset_token_hash = hash_auth_token(reset_token)
+    reset_expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=get_password_reset_expire_minutes()
+    )
+
+    setattr(user, "password_reset_token_hash", reset_token_hash)
+    setattr(user, "password_reset_expires_at", reset_expires_at)
+    db.commit()
+
+    try:
+        reset_link = build_password_reset_url(reset_token)
+        await asyncio.to_thread(
+            send_password_reset_email,
+            email,
+            reset_link,
+            get_app_name(),
+        )
+    except Exception as exc:
+        setattr(user, "password_reset_token_hash", None)
+        setattr(user, "password_reset_expires_at", None)
+        db.commit()
+        logger.error("Failed to send password reset email to %s: %s", email, exc)
+
+    return ForgotPasswordResponse(
+        success=True,
+        message="If the email exists, a password reset link has been sent",
+    )
+
+
+@auth_router.post("/reset-password", response_model=ResetPasswordResponse)
+async def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+    http_request: Request = None,  # type: ignore[assignment]
+) -> ResetPasswordResponse:
+    if len(request.new_password) < PASSWORD_MIN_LENGTH:
+        return ResetPasswordResponse(
+            success=False,
+            message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
+        )
+
+    # Arbitrary token guesses must share the IP budget, not create fresh keys.
+    await _enforce_password_recovery_rate_limit(
+        (("ip", remote_ip_from_request(http_request) or "unknown"),),
+    )
+
+    token_hash = hash_auth_token(request.token)
+    user = db.query(User).filter(User.password_reset_token_hash == token_hash).first()
+    if user is None:
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
+
+    reset_expires_at = getattr(user, "password_reset_expires_at", None)
+    now = datetime.now(timezone.utc)
+    if reset_expires_at is None:
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
+    if (
+        hasattr(reset_expires_at, "tzinfo")
+        and getattr(reset_expires_at, "tzinfo", None) is not None
+    ):
+        if cast(Any, reset_expires_at) < now:
+            return ResetPasswordResponse(
+                success=False, message="Reset token has expired"
+            )
+    else:
+        if cast(Any, reset_expires_at) < now.replace(tzinfo=None):
+            return ResetPasswordResponse(
+                success=False, message="Reset token has expired"
+            )
+
+    new_hash = await hash_password_async(request.new_password)
+    changed = (
+        db.query(User)
+        .filter(
+            User.id == user.id,
+            User.password_reset_token_hash == token_hash,
+            User.password_reset_expires_at >= datetime.now(timezone.utc),
+        )
+        .update(
+            {
+                User.password_hash: new_hash,
+                User.password_reset_token_hash: None,
+                User.password_reset_expires_at: None,
+                User.refresh_token: None,
+                User.refresh_token_expires_at: None,
+                User.session_epoch: new_session_epoch(),
+                **email_confirmation_clear_values(),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
+    db.commit()
+
+    return ResetPasswordResponse(
+        success=True,
+        message="Password has been reset successfully",
+    )
+
+
+@auth_router.post("/change-password", response_model=ChangePasswordResponse)
+async def change_password(
+    request: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ChangePasswordResponse:
+    """Change user password endpoint"""
+    try:
+        # Verify current password
+        if not await verify_password_async(
+            request.current_password, str(user.password_hash)
+        ):
+            return ChangePasswordResponse(
+                success=False, message="Current password is incorrect"
+            )
+
+        # Validate new password
+        if len(request.new_password) < PASSWORD_MIN_LENGTH:
+            return ChangePasswordResponse(
+                success=False,
+                message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
+            )
+
+        previous_hash = str(user.password_hash)
+        new_hash = await hash_password_async(request.new_password)
+        changed = (
+            db.query(User)
+            .filter(User.id == user.id, User.password_hash == previous_hash)
+            .update(
+                {
+                    User.password_hash: new_hash,
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                    User.session_epoch: new_session_epoch(),
+                    **email_confirmation_clear_values(),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return ChangePasswordResponse(
+                success=False, message="Password changed; sign in again"
+            )
+        db.commit()
+
+        return ChangePasswordResponse(
+            success=True, message="Password updated successfully"
+        )
+
+    except Exception:
+        # Same reasoning as login's handler: the db.commit() above binds the
+        # new password_hash as a SQL parameter, which a SQLAlchemy
+        # StatementError's default __str__ would otherwise put into str(e)
+        # and, via this response, into the client-facing error.
+        logger.exception("Password update failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while updating the password.",
+        )
+
+
+@auth_router.get("/me", response_model=UserProfileResponse)
+async def get_current_user_profile(
+    user: User = Depends(get_current_user),
+) -> UserProfileResponse:
+    return UserProfileResponse(
+        success=True,
+        message="User profile fetched successfully",
+        user=serialize_auth_user(user),
+    )
+
+
+@auth_router.patch("/email", response_model=UpdateEmailResponse)
+async def update_current_user_email(
+    request: UpdateEmailRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdateEmailResponse:
+    has_password = not str(user.password_hash).startswith("!")
+    if not has_password:
+        return UpdateEmailResponse(
+            success=False,
+            message="Self-service email changes are unavailable for passwordless accounts; contact your administrator for assistance",
+            error_code="provider_managed",
+        )
+    email = normalize_email(request.email)
+    if not is_valid_email(email):
+        return UpdateEmailResponse(success=False, message="Invalid email address")
+    await asyncio.to_thread(
+        _enforce_budgets,
+        "email-change",
+        (
+            (
+                _budget_key("email-change-user", str(user.id)),
+                get_auth_recovery_pair_limit(),
+            ),
+            (
+                _budget_key("email-change-target", email),
+                get_email_change_target_limit(),
+            ),
+            (
+                _budget_key(
+                    "email-change-ip", remote_ip_from_request(http_request) or "unknown"
+                ),
+                get_auth_recovery_ip_limit(),
+            ),
+        ),
+    )
+    if not request.current_password:
+        return UpdateEmailResponse(
+            success=False, message="Current password is required"
+        )
+    if not await verify_password_async(
+        request.current_password, str(user.password_hash)
+    ):
+        return UpdateEmailResponse(
+            success=False, message="Current password is incorrect"
+        )
+
+    if email == normalize_email(str(user.email or "")):
+        return UpdateEmailResponse(
+            success=True,
+            unchanged=True,
+            message="Email is unchanged; any pending change still requires confirmation",
+            user=serialize_auth_user(user),
+        )
+
+    existing_user = get_user_by_email(db, email)
+    if existing_user and existing_user.id != user.id:
+        return UpdateEmailResponse(success=False, message="Email already exists")
+
+    email_namespace_error = validate_email_for_login_namespace(
+        db, email, current_user_id=int(user.id)
+    )
+    if email_namespace_error:
+        return UpdateEmailResponse(success=False, message=email_namespace_error)
+
+    if not is_auth_email_configured():
+        return UpdateEmailResponse(
+            success=False,
+            message="Ask your administrator to configure SMTP before changing your email",
+            error_code="smtp_not_configured",
+        )
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hash_auth_token(token)
+    user_id = int(user.id)
+    changed = (
+        db.query(User)
+        .filter(
+            User.id == user_id,
+            User.password_hash == str(user.password_hash),
+            User.session_epoch == user.session_epoch,
+        )
+        .update(
+            {
+                User.pending_email: email,
+                User.email_confirmation_hash: token_hash,
+                User.email_confirmation_expires_at: datetime.now(timezone.utc)
+                + timedelta(minutes=get_email_confirmation_expire_minutes()),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return UpdateEmailResponse(success=False, message="Please sign in again")
+    db.commit()
+    try:
+        await asyncio.to_thread(
+            send_email_change_confirmation, email, token, get_app_name()
+        )
+    except Exception:
+        db.query(User).filter(
+            User.id == user_id,
+            User.email_confirmation_hash == token_hash,
+        ).update(
+            email_confirmation_clear_values(),
+            synchronize_session=False,
+        )
+        db.commit()
+        # SMTP exceptions may include recipients or provider text; retain the
+        # traceback server-side, never project it into the API response.
+        logger.error(
+            "Unable to deliver email-change confirmation for user %s",
+            user_id,
+            exc_info=True,
+        )
+        return UpdateEmailResponse(
+            success=False, message="Unable to send confirmation email; try again later"
+        )
+    db.refresh(user)
+    return UpdateEmailResponse(
+        success=True,
+        pending_confirmation=True,
+        message="Enter the confirmation code sent to your new email address",
+        user=serialize_auth_user(user),
+    )
+
+
+@auth_router.post("/email/confirm", response_model=UpdateEmailResponse)
+async def confirm_current_user_email(
+    request: ConfirmEmailRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdateEmailResponse:
+    token_hash = hash_auth_token(request.token.strip())
+    now = datetime.now(timezone.utc)
+    candidate = (
+        db.query(User)
+        .filter(
+            User.id == user.id,
+            User.email_confirmation_hash == token_hash,
+            User.email_confirmation_expires_at > now,
+        )
+        .populate_existing()
+        .first()
+    )
+    if candidate is None or not candidate.pending_email:
+        return UpdateEmailResponse(
+            success=False, message="Invalid or expired confirmation code"
+        )
+    email = str(candidate.pending_email)
+    previous_email = str(candidate.email or "")
+    conflict = get_user_by_email(db, email)
+    if (
+        conflict is not None and conflict.id != user.id
+    ) or validate_email_for_login_namespace(db, email, current_user_id=int(user.id)):
+        return UpdateEmailResponse(
+            success=False, message="Email address is no longer available"
+        )
+    try:
+        changed = (
+            db.query(User)
+            .filter(
+                User.id == user.id,
+                User.email_confirmation_hash == token_hash,
+                User.email_confirmation_expires_at > now,
+            )
+            .update(
+                {
+                    User.email: email,
+                    **email_confirmation_clear_values(),
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return UpdateEmailResponse(
+                success=False, message="Invalid or expired confirmation code"
+            )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return UpdateEmailResponse(
+            success=False, message="Email address is no longer available"
+        )
+    db.refresh(user)
+    if previous_email:
+        try:
+            await asyncio.to_thread(
+                send_email_changed_notice, previous_email, get_app_name()
+            )
+        except Exception:
+            logger.warning(
+                "Unable to notify previous recovery address for user %s",
+                user.id,
+                exc_info=True,
+            )
+    return UpdateEmailResponse(
+        success=True,
+        message="Email updated successfully",
+        user=serialize_auth_user(user),
+    )
+
+
+def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> bool:
+    """Serialize concurrent preferences PATCHes for one user, in every
+    database - mirrors acquire_runtime_key_transition_fence's dual-dialect
+    pattern (services/api_keys.py). PostgreSQL/MySQL take a row-level
+    ``FOR UPDATE`` lock; SQLite ignores that clause, so a no-op write grabs
+    its write lock instead. Held until this transaction commits, so a
+    second concurrent PATCH's read-modify-write of the same JSON column
+    blocks here instead of reading stale data and silently dropping the
+    first request's disjoint fields on its own commit.
+
+    Returns ``False`` when the user no longer exists (deleted between the
+    caller resolving the id and this call), the same contract the
+    mirrored helper uses - letting the caller turn that into a clean 404
+    instead of an unhandled ``ObjectDeletedError`` from the subsequent
+    fetch."""
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(
+            text("UPDATE users SET id = id WHERE id = :user_id"),
+            {"user_id": user_id},
+        )
+        return db.query(User.id).filter(User.id == user_id).first() is not None
+    return (
+        db.query(User.id).filter(User.id == user_id).with_for_update().first()
+        is not None
+    )
+
+
+def _merge_user_preferences_locked(
+    user_id: int, updates: Dict[str, Any]
+) -> Dict[str, Any] | None:
+    """Entirely self-contained: opens and closes its own Session and never
+    touches a request-scoped `user`/`db`. This is required, not just
+    tidy: the lock wait this is built around is a real, potentially slow
+    blocking DB call under contention, so the endpoint runs this whole
+    operation through asyncio.to_thread and drains it via
+    await_task_settlement (the same primitive run_db_io_cancellation_safe
+    wraps, called directly here so the endpoint can still invalidate the
+    voice cache off a settled-but-cancelled result before that
+    cancellation propagates) - if the request is cancelled (client
+    disconnect, timeout) while this worker is mid-transaction, FastAPI
+    can tear down the request's own Session concurrently, and the
+    contract is exactly "operation must create/use/close its own Session
+    and return only detached data" so that race can't happen (see
+    db_runtime.py's docstring on it; this mirrors admin_users.py's
+    _delete_user_rows_sync).
+
+    Returns the serialized response payload (not the ORM object), built
+    BEFORE commit: Session.commit() defaults to expire_on_commit=True, so
+    any attribute access after commit would force a fresh SELECT - itself
+    a race, since the lock is released the instant commit() returns and a
+    concurrent delete could land in that gap. The preferences merge is
+    already reflected in the in-memory object the moment it's set, so
+    nothing here needs a post-commit read at all.
+
+    Returns ``None`` if the user no longer exists (deleted between the
+    caller resolving ``user_id`` and this call)."""
+    session_factory = get_session_local()
+    worker_db = session_factory()
+    try:
+        if not _lock_user_row_for_preferences_update(worker_db, user_id):
+            return None
+        # Loaded fresh, under the lock, in this operation's own session -
+        # not whatever `User` row the caller may have loaded earlier,
+        # which could be stale (a concurrent PATCH may have committed its
+        # own merge while this request was waiting on the lock).
+        worker_user = worker_db.get(User, user_id)
+        if worker_user is None:
+            return None
+        current_preferences = _normalized_preferences(worker_user)
+        for key, value in updates.items():
+            # An explicit `null` is this endpoint's only clear-a-field
+            # signal (see UpdatePreferencesRequest's blank-string
+            # rejection) - storing a literal `{key: None}` entry instead
+            # of deleting the key would have every future read replay a
+            # stale explicit-null forever. Note this doesn't apply to
+            # `goals: []`: an empty list is itself a valid value (not a
+            # clear signal) and is stored as-is, so `null` and `[]` are
+            # two different representations of "no goals" that can
+            # coexist - harmless today since nothing branches on the
+            # distinction, but worth knowing if that ever changes.
+            if value is None:
+                current_preferences.pop(key, None)
+            else:
+                current_preferences[key] = value
+        setattr(worker_user, "preferences", current_preferences)
+        payload = serialize_auth_user(worker_user)
+        worker_db.commit()
+        return payload
+    finally:
+        worker_db.close()
+
+
+@auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
+async def update_current_user_preferences(
+    request: UpdatePreferencesRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdatePreferencesResponse:
+    """Merge the given fields into the current user's stored preferences.
+    Each onboarding step (About you, Goals, Launch) calls this with only
+    its own fields - a merge, not a replace, so an earlier step's answer
+    survives a later step's PATCH."""
+    updates = request.model_dump(exclude_unset=True)
+    if not updates:
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialize_auth_user(user),
+        )
+
+    # Read before releasing `db` below: Session.rollback() unconditionally
+    # expires every object loaded through that session, `user` included
+    # (unlike expire_on_commit, this isn't conditional on a session
+    # setting), so touching `user.id` after release would force an
+    # implicit reload - reacquiring the very connection just released,
+    # synchronously on the event loop, defeating the point of releasing
+    # it at all, and raising ObjectDeletedError outright if the row was
+    # deleted concurrently in the meantime.
+    user_id = int(user.id)
+
+    # `db` is declared only to release it here, not to do any work with it
+    # directly: FastAPI's per-request dependency caching means this is the
+    # same (read-only, since get_current_user only did a SELECT) session
+    # get_current_user already used, and _merge_user_preferences_locked
+    # is about to open a second, independent session and block on a real
+    # row lock - without this, that session would sit idle-in-transaction,
+    # holding a pool slot, for the whole lock wait (issue #889, same
+    # pattern already used before chat.py's sandbox startup and
+    # workforce_creator.py's ReAct builder call). A read-only session
+    # should always release cleanly; treating a failure as a hard error
+    # (mirroring workforce_creator.py's own release_db_connection_if_clean
+    # call) surfaces that as a signal instead of silently holding the
+    # connection through the lock wait anyway.
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "preferences_update_unavailable",
+                "message": "Could not release the database before updating preferences.",
+            },
+        )
+
+    # run_db_io_cancellation_safe's own contract discards a settled result
+    # in favor of re-raising the caller's deferred cancellation (see its
+    # docstring), which would otherwise skip the cache invalidation below
+    # entirely - the merge already committed by the time that cancellation
+    # is observed, so the cache must still be invalidated before this
+    # function lets that cancellation propagate. propagate_deferred_
+    # cancellation (the same helper task_command_transport.py's heartbeat
+    # settlement uses) makes that ordering safe even if invalidation
+    # itself raises, or 404s below: cancellation always wins over a
+    # later exception or return, never the reverse.
+    worker = asyncio.get_running_loop().create_task(
+        asyncio.to_thread(_merge_user_preferences_locked, user_id, updates)
+    )
+    serialized_user, cancellation = await await_task_settlement(worker)
+    with propagate_deferred_cancellation(cancellation):
+        if serialized_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if "voice" in updates:
+            # A cached AgentService bakes voice into its system prompt at
+            # construction time and won't re-check preferences on later
+            # turns (see invalidate_cached_agents_for_owner's docstring),
+            # so an already-warm task would otherwise keep speaking in the
+            # old (or now-cleared) voice until incidental eviction/rebuild.
+            #
+            # The merge above already committed - this is best-effort
+            # follow-up, not part of "did the write succeed." An
+            # unguarded raise here would turn a successful PATCH into a
+            # client-visible 500 for a write that already happened,
+            # mirroring the exact bug _run_post_commit_oauth_side_effects
+            # (issue #1150) exists to prevent; same fix, same reasoning.
+            from ..services.agent_service_manager import get_agent_manager
+
+            try:
+                await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+            except Exception:
+                logger.warning(
+                    "Voice cache invalidation failed for user %s after a "
+                    "successful preferences write; a warm task may keep "
+                    "speaking in the old voice until incidental eviction",
+                    user_id,
+                    exc_info=True,
+                )
+
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialized_user,
+        )
+
+
+def _prepare_refresh_response(
+    user: User | None, request: RefreshTokenRequest
+) -> RefreshTokenResponse:
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    token = getattr(user, "refresh_token", None)
+    expires = getattr(user, "refresh_token_expires_at", None)
+    if token != request.refresh_token or expires is None:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    now = datetime.now(timezone.utc)
+    if getattr(expires, "tzinfo", None) is None:
+        now = now.replace(tzinfo=None)
+    if expires < now:
+        raise HTTPException(status_code=401, detail="Refresh token has expired")
+    identity = user_session_claims(user)
+    access_token = create_access_token(
+        data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    new_token = create_refresh_token(data=identity)
+    return RefreshTokenResponse(
+        success=True,
+        message="Token refreshed successfully",
+        access_token=access_token,
+        refresh_token=new_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+    )
+
+
+def _refresh_in_worker(
+    request: RefreshTokenRequest,
+    user_id: Any,
+    session_factory: SyncAuthSessionFactory,
+) -> RefreshTokenResponse:
+    with session_factory() as session:
+        user = session.query(User).filter(User.id == user_id).first()
+        response = _prepare_refresh_response(user, request)
+        assert user is not None
+        previous_epoch = user.session_epoch
+        # End the read snapshot before competing for a write. In SQLite this
+        # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
+        # below, not the preceding SELECT, is the authority on token consumption.
+        session.rollback()
+        now = datetime.now(timezone.utc)
+        changed = (
+            session.query(User)
+            .filter(
+                User.id == user_id,
+                User.refresh_token == request.refresh_token,
+                User.refresh_token_expires_at >= now,
+                User.session_epoch == previous_epoch,
+            )
+            .update(
+                {
+                    User.refresh_token: response.refresh_token,
+                    User.refresh_token_expires_at: now
+                    + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        session.commit()
+        return response
+
+
+@auth_router.post("/refresh", response_model=RefreshTokenResponse)
+async def refresh_token(
+    request: RefreshTokenRequest,
+    db: SyncAuthSessionFactory = Depends(get_auth_db),
+) -> RefreshTokenResponse:
+    """Refresh tokens without sharing a synchronous Session across threads."""
+    try:
+        payload = verify_refresh_token(request.refresh_token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        user_id = payload.get("user_id")
+        return await run_auth_db_worker(
+            "refresh_database_transaction",
+            lambda: _refresh_in_worker(request, user_id, db),
+        )
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        logger.exception("Token refresh failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token refresh is temporarily unavailable",
+        )
+
+
+@auth_router.post("/logout")
+async def logout(
+    request: Optional[LogoutRequest] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Revoke the user's rotating refresh session at logout."""
+    # A stale tab must not revoke a newer session that replaced its refresh
+    # token. Omitting the body preserves the endpoint's legacy revoke-all
+    # behavior for API clients that only send the access token.
+    if (
+        request is not None
+        and request.refresh_token is not None
+        and request.refresh_token != getattr(user, "refresh_token", None)
+    ):
+        return {"success": True, "message": "Logged out successfully"}
+    setattr(user, "refresh_token", None)
+    setattr(user, "refresh_token_expires_at", None)
+    db.commit()
+    return {"success": True, "message": "Logged out successfully"}
+
+
+@auth_router.get("/check")
+async def check_auth() -> Dict[str, Any]:
+    """Check authentication status endpoint"""
+    return {"success": True, "message": "Authentication API is working"}
+
+
+@auth_router.get("/verify")
+async def verify_current_token(
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Verify current token validity"""
+    return {
+        "success": True,
+        "message": "Token is valid",
+        "user": serialize_auth_user(current_user),
+    }
+
+
+def generic_oauth_login(
+    provider: str,
+    token: Optional[str] = None,
+    app_id: Optional[str] = None,
+    redirect: Optional[str] = None,
+    db: Optional[Session] = None,
+    db_provider: Optional[Any] = None,
+    account: Optional[str] = None,
+    force_google_consent: bool = False,
+) -> Any:
+    """Start ordinary OAuth with a per-state browser-binding cookie."""
+    return _generic_oauth_login(
+        provider,
+        token=token,
+        app_id=app_id,
+        redirect=redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=None,
+        resource_owner_key=None,
+        actor_flow_nonce=None,
+        account=account,
+        force_google_consent=force_google_consent,
+    )
+
+
+def _actor_oauth_cookie_name(nonce: str) -> str:
+    """Return a distinct cookie name for one signed flow nonce digest."""
+    return f"{_ACTOR_OAUTH_COOKIE_PREFIX}{nonce[:24]}"
+
+
+def _ordinary_oauth_cookie_name(nonce_digest: str) -> str:
+    """Return a distinct browser-binding cookie name for one OAuth state."""
+    return f"{_ORDINARY_OAUTH_STATE_COOKIE_PREFIX}{nonce_digest[:24]}"
+
+
+def is_actor_oauth_cookie_header(value: str) -> bool:
+    """Accept only a non-empty Set-Cookie header for an actor OAuth flow."""
+    name, separator, rest = value.partition("=")
+    cookie_value = rest.partition(";")[0].strip()
+    return (
+        separator == "="
+        and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+        and bool(cookie_value)
+    )
+
+
+def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
+    """Match the browser cookie to the configured callback URL."""
+    from urllib.parse import urlparse
+
+    redirect_uri = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    return redirect_uri.scheme.lower() == "https", redirect_uri.path or "/"
+
+
+def _encrypt_actor_owner_claim(owner_key: str) -> str:
+    """Encrypt one typed owner claim without ciphertext pass-through."""
+    from ...core.utils.encryption import get_cipher
+
+    envelope = json.dumps(
+        {"owner": owner_key, "version": _ACTOR_OWNER_CLAIM_VERSION},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return get_cipher().encrypt(envelope.encode()).decode()
+
+
+def _decrypt_actor_owner_claim(claim: str) -> str:
+    """Decrypt and validate one typed actor owner claim."""
+    from ...core.utils.encryption import decrypt_value_strict
+
+    decrypted = decrypt_value_strict(claim)
+    if decrypted == claim:
+        raise ValueError("actor owner claim is not encrypted")
+
+    envelope = json.loads(decrypted)
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"owner", "version"}
+        or type(envelope.get("version")) is not int
+        or envelope.get("version") != _ACTOR_OWNER_CLAIM_VERSION
+        or not isinstance(envelope.get("owner"), str)
+    ):
+        raise ValueError("invalid actor owner envelope")
+    return cast(str, envelope["owner"])
+
+
+def _actor_link_query(db: Session, *, user_id: int, provider: str, app_id: str) -> Any:
+    """Select the exact active personal link for one builtin app."""
+    from ..mcp_apps import require_builtin_oauth_server_definition
+    from ..models.mcp import UserMCPServer
+
+    server = require_builtin_oauth_server_definition(
+        db, app_id=app_id, provider=provider
+    )
+    return db.query(UserMCPServer).filter(
+        UserMCPServer.user_id == user_id,
+        UserMCPServer.mcpserver_id == int(server.id),
+        UserMCPServer.is_active.is_(True),
+    )
+
+
+def _require_one_actor_link(links: list[Any], app_id: str) -> None:
+    if len(links) != 1:
+        raise ValueError(
+            f"actor builtin OAuth app {app_id!r} requires exactly one active "
+            "personal MCP server link"
+        )
+
+
+def _require_actor_oauth_personal_link(
+    db: Session, *, user_id: int, provider: str, app_id: str
+) -> None:
+    """Require one canonical builtin definition and its active personal link."""
+    links = _actor_link_query(
+        db, user_id=user_id, provider=provider, app_id=app_id
+    ).all()
+    _require_one_actor_link(links, app_id)
+
+
+def _lock_actor_link(db: Session, *, user_id: int, provider: str, app_id: str) -> None:
+    """Lock one active personal link before actor credential persistence."""
+    links = (
+        _actor_link_query(db, user_id=user_id, provider=provider, app_id=app_id)
+        .with_for_update()
+        .all()
+    )
+    _require_one_actor_link(links, app_id)
+
+
+# Only values of this shape are shown or logged from a callback request. An
+# OAuth `error` is a short ASCII code by spec (RFC 6749 section 4.1.2.1), so
+# anything else is replaced instead of being echoed back.
+_OAUTH_CALLBACK_CODE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_MICROSOFT_ERROR_CODE_RE = re.compile(r"\bAADSTS[0-9]{1,10}\b", re.ASCII)
+_MAX_MICROSOFT_ERROR_CODES = 3
+_OAUTH_ACCESS_NOT_GRANTED_ERRORS = frozenset({"access_denied", "consent_required"})
+# AADSTS65004 is an ordinary "user declined to consent"; the admin-consent
+# codes mean the tenant requires an administrator to approve the app first.
+_MICROSOFT_ACCESS_NOT_GRANTED_CODES = (
+    frozenset({"AADSTS65004"}) | _MICROSOFT_ADMIN_CONSENT_ERROR_CODES
+)
+_OAUTH_TEMPORARY_ERRORS = frozenset({"server_error", "temporarily_unavailable"})
+_OAUTH_REQUEST_REJECTED_ERRORS = frozenset(
+    {
+        "invalid_client",
+        "invalid_request",
+        "invalid_scope",
+        "unauthorized_client",
+        "unsupported_response_type",
+    }
+)
+
+
+class _OAuthCallbackProviderError(NamedTuple):
+    """Display- and log-safe summary of a provider's error redirect."""
+
+    error: str
+    provider_codes: tuple[str, ...]
+
+
+def _safe_oauth_callback_code(value: object, fallback: str) -> str:
+    """Return ``value`` only when it is a short, code-shaped string."""
+    if isinstance(value, str) and _OAUTH_CALLBACK_CODE_RE.fullmatch(value):
+        return value
+    return fallback
+
+
+def _oauth_callback_provider_error(
+    provider: str, error: str | None, error_description: str | None
+) -> _OAuthCallbackProviderError | None:
+    """Reduce a provider error redirect to codes that are safe to show and log.
+
+    The free-text ``error_description`` is never kept: for Microsoft only the
+    AADSTS codes are extracted from it, because they are what an
+    administrator or support needs to identify the failure.
+    """
+    if not error:
+        return None
+    provider_codes: tuple[str, ...] = ()
+    if error_description and matches_provider_family(provider, "microsoft"):
+        found = _MICROSOFT_ERROR_CODE_RE.findall(error_description.upper())
+        provider_codes = tuple(dict.fromkeys(found))[:_MAX_MICROSOFT_ERROR_CODES]
+    return _OAuthCallbackProviderError(
+        error=_safe_oauth_callback_code(error, "unknown_error"),
+        provider_codes=provider_codes,
+    )
+
+
+def _log_oauth_callback_rejection(
+    provider: str,
+    reason: str,
+    *,
+    app_id: object = None,
+    actor_flow: bool | None = None,
+    provider_error: _OAuthCallbackProviderError | None = None,
+) -> None:
+    """Record why an OAuth callback did not connect.
+
+    Only code-shaped values are logged. The state, authorization code, flow
+    nonce, browser cookie, owner key, tokens and the provider's free-text
+    error_description never reach the log.
+    """
+    logger.warning(
+        "OAuth callback did not connect: provider=%s app_id=%s actor_flow=%s "
+        "reason=%s provider_error=%s provider_error_code=%s",
+        _safe_oauth_callback_code(provider, "invalid"),
+        "-" if app_id is None else _safe_oauth_callback_code(app_id, "invalid"),
+        "unknown" if actor_flow is None else str(actor_flow).lower(),
+        reason,
+        provider_error.error if provider_error is not None else "-",
+        ",".join(provider_error.provider_codes)
+        if provider_error is not None and provider_error.provider_codes
+        else "-",
+    )
+
+
+def _oauth_popup_feedback_response(title: str, *paragraphs: str) -> HTMLResponse:
+    """Render an actionable, uncacheable 400 page for the OAuth popup.
+
+    ``title`` and ``paragraphs`` are trusted HTML; callers escape every
+    request-derived value they include.
+    """
+    body = "".join(f"<p>{paragraph}</p>" for paragraph in paragraphs)
+    return HTMLResponse(
+        content=(
+            '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f"<title>{title}</title></head><body>"
+            f"<h1>{title}</h1>{body}"
+            '<p><button type="button" onclick="window.close()">'
+            "Close this window</button></p>"
+            "<p>If this window doesn't close, close it from your browser.</p>"
+            "</body></html>"
+        ),
+        status_code=400,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _actor_oauth_provider_error_response(
+    provider: str, provider_error: _OAuthCallbackProviderError
+) -> HTMLResponse:
+    """Explain a provider error on an actor flow and say what to do next."""
+    is_microsoft = matches_provider_family(provider, "microsoft")
+    codes = ", ".join((provider_error.error, *provider_error.provider_codes))
+    code_line = f"Error code: <code>{html.escape(codes)}</code>"
+    if provider_error.error in _OAUTH_ACCESS_NOT_GRANTED_ERRORS or not (
+        _MICROSOFT_ACCESS_NOT_GRANTED_CODES.isdisjoint(provider_error.provider_codes)
+    ):
+        next_step = (
+            "Close this window, select Connect again, and choose Accept on the "
+            "Microsoft permission screen. If your organization requires an "
+            "administrator to approve new apps, ask your Microsoft 365 admin "
+            "to approve it."
+            if is_microsoft
+            else "Close this window, select Connect again, and approve the "
+            "requested access."
+        )
+        return _oauth_popup_feedback_response(
+            "Permission was not granted",
+            "The app was not connected because the requested access was not granted.",
+            next_step,
+            code_line,
+        )
+    if provider_error.error in _OAUTH_TEMPORARY_ERRORS:
+        return _oauth_popup_feedback_response(
+            "The sign-in service is temporarily unavailable",
+            "The sign-in service could not complete the request right now.",
+            "Close this window and select Connect again in a few minutes.",
+            code_line,
+        )
+    if (
+        provider_error.error in _OAUTH_REQUEST_REJECTED_ERRORS
+        or provider_error.provider_codes
+    ):
+        admin = "your Microsoft 365 admin" if is_microsoft else "your administrator"
+        return _oauth_popup_feedback_response(
+            "The sign-in request was rejected",
+            "The sign-in service rejected this connection request.",
+            "Close this window and select Connect again. If it keeps "
+            f"happening, contact {admin} or support and include the error "
+            "code below.",
+            code_line,
+        )
+    return _oauth_popup_feedback_response(
+        "The sign-in did not complete",
+        "The sign-in service did not finish connecting the app.",
+        "Close this window and select Connect again.",
+        code_line,
+    )
+
+
+def _actor_oauth_flow_used_response() -> HTMLResponse:
+    """Explain a sign-in window whose single-use flow is gone."""
+    return _oauth_popup_feedback_response(
+        "This sign-in window has already been used",
+        "This sign-in link has already been used or has expired, so it can't "
+        "connect the app.",
+        "Close this window and select Connect again. If the app already shows "
+        "as connected, there is nothing else to do.",
+    )
+
+
+# Actor checks that fail when the callback does not come back to the browser
+# that started the flow.
+_ACTOR_OAUTH_BROWSER_CHECK_REASONS = frozenset({"cookie_missing", "cookie_mismatch"})
+# Actor checks on the user, the personal link and the catalog definition.
+# Starting the flow requires all of them, so they only fail when one of them
+# changed while the member was signing in.
+_ACTOR_OAUTH_CONNECTION_CHECK_REASONS = frozenset(
+    {"user_missing", "link_invalid", "catalog_invalid", "link_changed_after_exchange"}
+)
+
+
+def _actor_oauth_flow_rejected_response(reason: str) -> HTMLResponse:
+    """Explain an actor flow that failed one of its checks.
+
+    Only a failed browser check is fixed by connecting again from the same
+    browser. A connection that changed during the sign-in must be available
+    again before a new Connect can succeed. The remaining checks (the flow's
+    own claims and owner) get a plain retry.
+    """
+    if reason in _ACTOR_OAUTH_BROWSER_CHECK_REASONS:
+        explanation = (
+            "This sign-in could not be matched to this browser, so the app was "
+            "not connected. This can happen when it was started in a different "
+            "browser or browser profile."
+        )
+        next_step = "Close this window and select Connect again from the same browser."
+    elif reason in _ACTOR_OAUTH_CONNECTION_CHECK_REASONS:
+        explanation = (
+            "The connection this sign-in was started for was turned off, "
+            "removed or changed while you were signing in, so the app was "
+            "not connected."
+        )
+        next_step = (
+            "Close this window. If the app is still available to you, select "
+            "Connect again. Otherwise, contact your administrator."
+        )
+    else:
+        explanation = (
+            "This sign-in could not be verified, so the app was not connected."
+        )
+        next_step = (
+            "Close this window and select Connect again. If it keeps "
+            "happening, contact your administrator."
+        )
+    return _oauth_popup_feedback_response(
+        "This sign-in window can't finish connecting", explanation, next_step
+    )
+
+
+def _expired_actor_oauth_state(state: str, provider: str) -> dict[str, Any] | None:
+    """Return the claims of an actor OAuth state that is genuine but expired.
+
+    The state, its browser cookie and its single-use flow all expire together,
+    so a sign-in window that comes back after that fails ``verify_token``
+    before it can be recognized as an actor flow. The signature is still
+    checked here; only the expiry is not. The result only chooses which page
+    that window shows: it never authorizes a token exchange or a database
+    change.
+    """
+    try:
+        payload: dict[str, Any] = jwt.decode(
+            state,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except JWTError:
+        return None
+    expires_at = payload.get("exp")
+    if (
+        payload.get("type") != "oauth_state"
+        or payload.get("provider") != provider
+        or (
+            payload.get("actor_flow_nonce") is None
+            and payload.get("resource_owner_key") is None
+        )
+        or not isinstance(expires_at, (int, float))
+        or expires_at > time.time()
+    ):
+        return None
+    return payload
+
+
+def _google_gmail_error(provider: str, app_id: str | None) -> HTMLResponse | None:
+    """Block Gmail even when its persisted catalog row is absent."""
+    if (
+        provider.lower() == "google"
+        and app_id == "gmail"
+        and not get_google_restricted_scopes()
+    ):
+        return HTMLResponse(
+            content=(
+                "<h1>Cannot Connect</h1><p>This app is not currently available.</p>"
+            ),
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    return None
+
+
+def start_builtin_oauth_for_resource_owner(
+    *,
+    provider: str,
+    app_id: str,
+    user: User,
+    resource_owner_key: str,
+    redirect: str | None = None,
+    db: Session,
+    db_provider: Any,
+    account: str | None = None,
+    force_google_consent: bool = False,
+) -> Any:
+    """Start actor OAuth; the caller owns the surrounding transaction."""
+    if not isinstance(app_id, str) or not app_id.strip():
+        raise ValueError("actor builtin OAuth app_id must be a non-empty string")
+    if user.id is None:
+        raise ValueError("user must be persisted before starting actor OAuth")
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    if owner_key is None:  # pragma: no cover - normalization preserves only None
+        raise ValueError("resource_owner_key must not be null")
+    app_id = app_id.strip()
+    if error_response := _google_gmail_error(provider, app_id):
+        return error_response
+
+    _require_actor_oauth_personal_link(
+        db,
+        user_id=int(user.id),
+        provider=provider,
+        app_id=app_id,
+    )
+
+    browser_nonce = secrets.token_urlsafe(32)
+    nonce_digest = hashlib.sha256(browser_nonce.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + _ACTOR_OAUTH_FLOW_TTL
+    response = _generic_oauth_login(
+        provider,
+        token=None,
+        app_id=app_id,
+        redirect=redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=int(user.id),
+        resource_owner_key=owner_key,
+        actor_flow_nonce=nonce_digest,
+        account=account,
+        force_google_consent=force_google_consent,
+    )
+    if not isinstance(response, RedirectResponse):
+        return response
+    db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
+    cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
+    response.set_cookie(
+        _actor_oauth_cookie_name(nonce_digest),
+        browser_nonce,
+        max_age=int(_ACTOR_OAUTH_FLOW_TTL.total_seconds()),
+        secure=cookie_secure,
+        httponly=True,
+        samesite="lax",
+        path=cookie_path,
+    )
+    return response
+
+
+def _revoke_github_oauth_grant(
+    access_token: str, client_id: str, client_secret: str
+) -> None:
+    """Best-effort delete of one GitHub OAuth App grant.
+
+    GitHub's authorize endpoint silently 302-redirects straight back to the
+    callback -- skipping the "Authorize application" consent screen -- for
+    any account that has already granted this app the requested scopes.
+    Disconnecting only the local ``UserOAuth`` row leaves that grant alive
+    on GitHub's side, so the very next reconnect is silent too. Deleting the
+    grant here (not just the token: deleting the grant, unlike deleting a
+    single token, clears every token issued under it and makes GitHub show
+    the consent screen again on the next authorize request) restores the
+    expected "reconnect always re-prompts" behavior.
+
+    Never raises: this runs after the local disconnect has already
+    committed, so a dead token (404), an unreachable GitHub, or literally
+    anything else going wrong here must not surface as a failed disconnect
+    -- every caller up the chain (revoke_resolved_github_oauth_grant,
+    revoke_builtin_oauth_grant_if_unreferenced, revoke_builtin_oauth_grant)
+    documents that same guarantee and depends on it holding here at the leaf.
+
+    Deployments that restrict outbound traffic must allow api.github.com:
+    this is the one new outbound call a GitHub disconnect makes.
+    """
+    try:
+        response = requests.delete(
+            f"https://api.github.com/applications/{client_id}/grant",
+            auth=(client_id, client_secret),
+            json={"access_token": access_token},
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+    except Exception as exc:
+        # Broad except, not just requests.RequestException: "never raises"
+        # above is a real contract other functions rely on, not just a
+        # description of the common case. Not exc_info=True either way: the
+        # client_id above is embedded directly in the request URL, so a
+        # ConnectionError/Timeout's own str() -- which exc_info=True's
+        # traceback rendering includes -- would put it in the log. Same
+        # reasoning, same fix, as mcp.py's own provider revocation logging
+        # (exception_type only, never the full traceback).
+        logger.warning(
+            "GitHub OAuth grant revocation request failed (exception_type=%s)",
+            type(exc).__name__,
+        )
+        return
+    # 204: revoked. 404: GitHub already considers the token/grant gone
+    # (already revoked, expired, or never valid) -- also a successful outcome
+    # from the caller's point of view. 422 is deliberately NOT bucketed here:
+    # GitHub documents it for a malformed request or an abuse/rate-limit
+    # block, neither of which means the grant is actually gone, so it must
+    # surface as a genuine (still non-raising) failure instead of being
+    # silently treated the same as "already revoked".
+    if response.status_code == 204:
+        logger.info("GitHub OAuth grant revoked")
+    elif response.status_code != 404:
+        logger.warning(
+            "GitHub OAuth grant revocation returned unexpected status %s",
+            response.status_code,
+        )
+
+
+class BuiltinOAuthRevocation(NamedTuple):
+    """Everything needed to revoke one builtin OAuth grant after its local
+    ``UserOAuth`` row has already been deleted and committed, plus the
+    upstream identity (``provider_user_id``) needed to check whether another
+    local connection still needs that same grant alive -- see
+    :func:`has_other_builtin_oauth_reference`.
+    """
+
+    provider: str
+    access_token: str
+    client_id: str
+    client_secret: str
+    provider_user_id: str | None
+
+    def __repr__(self) -> str:
+        # The default NamedTuple repr would print access_token/client_secret
+        # in plain text -- a stray logger.debug(revocation) or an
+        # uncaught-exception traceback that includes this value as a local
+        # variable must not leak either one.
+        return (
+            f"BuiltinOAuthRevocation(provider={self.provider!r}, "
+            f"access_token=<redacted>, client_id={self.client_id!r}, "
+            f"client_secret=<redacted>, "
+            f"provider_user_id={self.provider_user_id!r})"
+        )
+
+
+def resolve_builtin_oauth_revocation(
+    db: Session,
+    *,
+    provider: str,
+    access_token: str,
+    provider_user_id: str | None,
+) -> BuiltinOAuthRevocation | None:
+    """Resolve one deleted ``UserOAuth`` row into a network-free revocation
+    record, decrypting the stored client_id/secret the same way
+    generic_oauth_login/generic_oauth_callback already do for this row.
+
+    Returns ``None`` when there's nothing to revoke -- an unsupported
+    provider, an empty token, no configured provider row, or a missing
+    secret -- so callers can skip revocation outright. Only reads the
+    database and makes no network call, so it is safe to call while still
+    holding a disconnect transaction's locks; do the actual provider call
+    (:func:`revoke_builtin_oauth_grant_if_unreferenced`) only after that
+    commits.
+    """
+    if provider != "github" or not access_token:
+        return None
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider)
+        .filter(OAuthProvider.provider_name == "github")
+        .one_or_none()
+    )
+    if not db_provider:
+        logger.warning(
+            "Skipping GitHub OAuth grant revocation: no github OAuthProvider "
+            "row is configured"
+        )
+        return None
+    # oauth_providers.client_id/client_secret are stored encrypted (or left
+    # blank to fall back to the GITHUB_CLIENT_ID/SECRET env vars) -- same
+    # resolution generic_oauth_login/generic_oauth_callback already use for
+    # this row, never the raw column value.
+    client_id = _resolve_oauth_secret(
+        "github", cast(Any, db_provider.client_id), "CLIENT_ID"
+    )
+    client_secret = _resolve_oauth_secret(
+        "github", cast(Any, db_provider.client_secret), "CLIENT_SECRET"
+    )
+    if not client_id or not client_secret:
+        # Every other skip reason here logs (missing provider row above,
+        # unreachable/failing GitHub in _revoke_github_oauth_grant) -- silence
+        # here would hide a real misconfiguration (e.g. only one of
+        # GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set) behind an
+        # indistinguishable "disconnect worked" outcome.
+        logger.warning(
+            "Skipping GitHub OAuth grant revocation: client_id/client_secret "
+            "could not be resolved"
+        )
+        return None
+    return BuiltinOAuthRevocation(
+        provider="github",
+        access_token=access_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        provider_user_id=provider_user_id,
+    )
+
+
+def has_other_builtin_oauth_reference(
+    db: Session, *, provider: str, provider_user_id: str | None
+) -> bool:
+    """True if any current ``UserOAuth`` row -- any local user, any owner
+    namespace -- still points at the same upstream (provider,
+    provider_user_id) identity.
+
+    GitHub's grant-delete revokes every token issued to that GitHub
+    account for this OAuth App, not just the one this disconnect deleted --
+    a different XAgent user (or actor namespace) connected to the *same*
+    upstream account would silently lose their own, still-active token.
+    This must be checked with a fresh read taken as late as possible (right
+    before the network call, never at snapshot/pre-commit time): the row
+    that matters may not exist yet when the disconnect that triggered this
+    revocation was itself committed -- for example a concurrent reconnect
+    (``generic_oauth_callback``) racing the same disconnect and committing a
+    replacement row in between. Checking late does not make this atomic
+    with that callback (there is no shared lock or generation fence between
+    the two paths), but it collapses the race window from "however long
+    until this best-effort revoke actually runs" down to the gap between
+    this query and the DELETE request, which is what makes checking here,
+    right before the call, meaningfully safer than checking at snapshot
+    time and calling it done.
+
+    ``provider_user_id=None`` (a provider whose callback records no stable
+    upstream id) can't prove anything either way -- treated as "no known
+    other reference" so the caller still revokes, matching this function's
+    behavior before this reference check existed, rather than silently
+    disabling revocation for such a provider.
+
+    Synchronous ORM work on ``db``: an async caller must run this directly
+    on the event loop (this module's normal, always-safe pattern for a
+    single fast query -- see the many un-offloaded ``db.query(...)`` calls
+    throughout mcp.py's own disconnect handlers), never inside
+    ``asyncio.to_thread`` with a request-scoped session it doesn't own. A
+    thread-offloaded operation on ``db`` must create and close its own
+    Session in the worker thread instead (see
+    ``services.db_runtime.run_db_io_cancellation_safe``'s own docstring for
+    why: a cancelled request's ``db.close()`` can otherwise race a worker
+    thread still mid-query on that same Session).
+    """
+    if not provider_user_id:
+        return False
+    candidates = (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.provider == provider,
+            UserOAuth.provider_user_id == provider_user_id,
+        )
+        .all()
+    )
+    return any(candidate.access_token for candidate in candidates)
+
+
+def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:
+    """Public, database-free entry point for one already-resolved revocation.
+
+    Takes the whole record rather than three same-typed positional strings
+    on purpose: ``access_token``/``client_id``/``client_secret`` are all
+    plain ``str`` and trivially transposable if passed as separate
+    positional arguments (as this function briefly did) -- passing the
+    record itself, unpacked only here at the one place that needs to, is
+    what actually rules that out for every caller.
+
+    Touches no Session and no shared state, so it's always safe to run
+    inside ``asyncio.to_thread`` regardless of what owns the caller's
+    database session. Never raises (see :func:`_revoke_github_oauth_grant`).
+
+    Does not itself check :func:`has_other_builtin_oauth_reference` --
+    every caller must have already confirmed that check passed. A
+    synchronous/off-event-loop caller should call
+    :func:`revoke_builtin_oauth_grant_if_unreferenced` instead, which does
+    both in one call; an async caller on the event loop should call
+    :func:`has_other_builtin_oauth_reference` directly (never via
+    ``asyncio.to_thread`` -- see that function's own docstring) and only
+    offload this pure network call, exactly like
+    :func:`revoke_builtin_oauth_grants` does.
+    """
+    _revoke_github_oauth_grant(
+        revocation.access_token, revocation.client_id, revocation.client_secret
+    )
+
+
+def revoke_builtin_oauth_grant_if_unreferenced(
+    db: Session, revocation: BuiltinOAuthRevocation
+) -> None:
+    """Best-effort provider-side revoke of one already-resolved builtin
+    OAuth grant, skipped if another local connection (any owner, any user)
+    still references the same upstream account.
+
+    Must run strictly after the disconnect that produced ``revocation`` has
+    committed: the reference check is a fresh read of current ``UserOAuth``
+    rows (see :func:`has_other_builtin_oauth_reference` for exactly what
+    that does and does not make safe). Never raises: unlike
+    :func:`revoke_resolved_github_oauth_grant`, the reference check here
+    does real database work that can fail (a dropped connection, a pool
+    timeout), and this function -- not just its network-only half --
+    promises never to raise, so that failure is caught here too, rolling
+    the session back first so a caller that keeps using ``db`` afterward
+    doesn't inherit a transaction Postgres has already poisoned.
+
+    For a fully synchronous caller only (Toby's disconnect path, via
+    :func:`revoke_builtin_oauth_grant`, and this module's own tests): the
+    Session it does real query work on is ``db``, the caller's own, on
+    whatever thread the caller itself is already running on. An async
+    caller must NOT hand this whole function to ``asyncio.to_thread`` with
+    its request-scoped session -- see :func:`has_other_builtin_oauth_reference`
+    and :func:`revoke_resolved_github_oauth_grant` for the safe async shape.
+    """
+    try:
+        if has_other_builtin_oauth_reference(
+            db,
+            provider=revocation.provider,
+            provider_user_id=revocation.provider_user_id,
+        ):
+            logger.info(
+                "Skipping GitHub OAuth grant revocation: another local "
+                "connection still references this account"
+            )
+            return
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "GitHub OAuth grant reference check failed (exception_type=%s)",
+            type(exc).__name__,
+        )
+        return
+    revoke_resolved_github_oauth_grant(revocation)
+
+
+def revoke_builtin_oauth_grant(
+    db: Session,
+    *,
+    provider: str,
+    access_token: str,
+    provider_user_id: str | None,
+) -> None:
+    """Best-effort provider-side revoke of one deleted ``UserOAuth`` row.
+
+    Called after the local disconnect has committed. Only GitHub is
+    implemented today (see :func:`_revoke_github_oauth_grant`); every other
+    provider is a deliberate no-op here -- add a branch as each provider's
+    own "silently reuses an existing grant" behavior needs the same fix.
+    Never raises. A fully synchronous convenience wrapper around
+    :func:`resolve_builtin_oauth_revocation` +
+    :func:`revoke_builtin_oauth_grant_if_unreferenced` for callers that
+    already run off the event loop (e.g. inside ``anyio.to_thread.run_sync``);
+    an async caller should call those two directly instead, so credential
+    resolution can happen before its commit and the reference check plus
+    network call after.
+    """
+    resolved = resolve_builtin_oauth_revocation(
+        db,
+        provider=provider,
+        access_token=access_token,
+        provider_user_id=provider_user_id,
+    )
+    if resolved is None:
+        return
+    revoke_builtin_oauth_grant_if_unreferenced(db, resolved)
+
+
+async def revoke_builtin_oauth_grants(
+    db: Session, revocations: list[BuiltinOAuthRevocation], *, context: str
+) -> None:
+    """Best-effort provider-side revoke of every already-resolved builtin
+    OAuth grant in ``revocations``, run strictly after the local disconnect
+    that produced them has committed.
+
+    The single shared implementation for every async disconnect endpoint
+    (mcp.py's ``delete_mcp_server`` and ``teardown_mcp_app_server``,
+    cloud_storage.py's ``delete_connected_account``) -- so the
+    reference-check-then-revoke sequence, and its cancellation-safety
+    shape, has exactly one place to get right instead of being copied at
+    each call site. Each entry's reference check
+    (:func:`has_other_builtin_oauth_reference`) runs synchronously on the
+    event loop against the caller's own ``db`` -- never via
+    ``asyncio.to_thread``, per that function's own docstring -- and only
+    the resulting network call is offloaded. Never raises: a dead network,
+    a still-live sibling reference, or a failed reference-check query must
+    not turn an already-successful local disconnect into a failed request.
+
+    ``context`` is folded into the warning log line so a failure can be
+    traced back to which disconnect path it came from.
+    """
+    for revocation in revocations:
+        try:
+            if has_other_builtin_oauth_reference(
+                db,
+                provider=revocation.provider,
+                provider_user_id=revocation.provider_user_id,
+            ):
+                logger.info(
+                    "Skipping GitHub OAuth grant revocation (%s): another "
+                    "local connection still references this account",
+                    context,
+                )
+                continue
+            await asyncio.to_thread(revoke_resolved_github_oauth_grant, revocation)
+        except Exception:
+            db.rollback()
+            logger.warning("Builtin OAuth grant revocation failed (%s)", context)
+
+
+def _generic_oauth_login(
+    provider: str,
+    *,
+    token: str | None,
+    app_id: str | None,
+    redirect: str | None,
+    db: Session | None,
+    db_provider: Any | None,
+    trusted_user_id: int | None,
+    resource_owner_key: str | None,
+    actor_flow_nonce: str | None,
+    account: str | None,
+    trusted_session_epoch: str | None = None,
+    force_google_consent: bool = False,
+) -> Any:
+    """Build an ordinary or trusted actor provider authorization redirect."""
+    if db is None:
+        raise RuntimeError("db session is required")
+    if not db_provider:
+        return HTMLResponse(
+            content="<h1>Error: Provider not configured</h1>", status_code=500
+        )
+
+    client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
+    if not client_id:
+        return _oauth_provider_config_error(
+            provider, [_oauth_env_name(provider, "CLIENT_ID")]
+        )
+    auth_url = db_provider.auth_url
+
+    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+
+    user_id = trusted_user_id
+    session_epoch: str | None = trusted_session_epoch
+    if user_id is None and token:
+        user = get_user_from_token(token, db)
+        if user:
+            user_id = int(user.id)
+            session_epoch = cast(str | None, user.session_epoch)
+
+    if not user_id:
+        return HTMLResponse(
+            content="<h1>Error: Not authenticated</h1><p>Please provide a valid token.</p>",
+            status_code=401,
+        )
+
+    if error_response := _google_gmail_error(provider, app_id):
+        return error_response
+
+    if not app_id:
+        from ..mcp_apps import requires_app_scoped_oauth_grant
+
+        # A bare (app_id-less) login persists to UserOAuth.provider==provider
+        # -- for a provider in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT whose
+        # sole app's app_id is that same provider string (e.g. github), that
+        # is the EXACT SAME key an app-scoped login uses. Without this
+        # guard, re-running the bare route would silently delete-and-replace
+        # a fully-scoped connection's grant with an identity-only one via
+        # generic_oauth_callback's delete-then-recreate step below, while
+        # the existing MCPServer/UserMCPServer row is left active and now
+        # backed by an under-scoped token. Facebook/Instagram are unaffected
+        # (their bare provider string "meta" is never itself a member of the
+        # set, only their app_ids "facebook"/"instagram" are).
+        #
+        # Checked after the config/auth checks above (not before) so an
+        # unauthenticated or misconfigured caller still gets the more
+        # specific 401/config-error response instead of a 404 that implies
+        # the connector itself doesn't support this route -- this still
+        # runs before any state token is minted below, which is the actual
+        # security property this guard needs to hold.
+        if requires_app_scoped_oauth_grant(provider):
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>This connector must be started from its catalog "
+                    "entry.</p>"
+                ),
+                status_code=404,
+            )
+
+    # A provider hosted on the customer's own account authorizes on that
+    # account's host; the validated label rides the signed state so the
+    # callback exchanges the code on the same account (oauth_account_hosts).
+    account_host = get_oauth_account_host(provider)
+    bound_account: str | None = None
+    if account_host is None and account is not None:
+        return _oauth_account_error_response(
+            f"{provider} does not take an account identifier."
+        )
+    if account_host is not None:
+        try:
+            account_endpoints = resolve_oauth_account_endpoints(account_host, account)
+        except OAuthAccountError as exc:
+            return _oauth_account_error_response(str(exc))
+        auth_url = account_endpoints.authorize_url
+        bound_account = account_endpoints.account
+
+    browser_state_nonce = (
+        secrets.token_urlsafe(32) if actor_flow_nonce is None else None
+    )
+    browser_nonce_hash: str | None = None
+    state_payload = {
+        "type": "oauth_state",
+        "user_id": user_id,
+        "provider": provider,
+        "app_id": app_id,
+        "redirect": redirect,
+        "session_epoch": session_epoch,
+    }
+    if browser_state_nonce is not None:
+        browser_nonce_hash = hashlib.sha256(
+            browser_state_nonce.encode("ascii")
+        ).hexdigest()
+        state_payload["browser_nonce_hash"] = browser_nonce_hash
+    if bound_account is not None:
+        state_payload["oauth_account"] = bound_account
+    # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
+    # the org level, with no per-app way to disable it (Setup > External
+    # Client Apps > Security > "Require Proof Key for Code Exchange" is
+    # locked once an org has it on); Employment Hero mandates it for every
+    # app from 2026-09-14. requires_pkce() (oauth_provider_quirks.py) is the
+    # shared predicate for this provider family, not just _is_salesforce_
+    # provider, since it's no longer Salesforce-only. The verifier rides
+    # inside this signed, short-lived state token rather than a new DB row,
+    # to avoid a schema change for this -- but `state` itself goes out as a
+    # URL query param on the redirect to the provider and back, so it lands
+    # in browser history/Referer headers/proxy logs. HS256 signing alone
+    # doesn't hide the payload (it's base64, not encrypted), so the verifier
+    # is encrypted here before being embedded, and decrypted back out in the
+    # callback below. The token exchange still requires the server-held
+    # client_secret regardless, so this is defense-in-depth on top of that,
+    # not the only thing standing between an interceptor and a token.
+    code_verifier = secrets.token_urlsafe(64) if requires_pkce(provider) else None
+    if code_verifier:
+        from ...core.utils.encryption import encrypt_value
+
+        try:
+            state_payload["code_verifier"] = encrypt_value(code_verifier)
+        except ValueError:
+            # get_cipher() raises this when ENCRYPTION_KEY is unset outside
+            # development -- every other provider's login route never calls
+            # encrypt_value at all, so this misconfiguration is otherwise
+            # invisible until the first PKCE-gated connect attempt (now
+            # Salesforce or Employment Hero, per requires_pkce() -- the
+            # provider name is interpolated below rather than hardcoded, so
+            # this stays accurate as that set grows). Not routed through
+            # _oauth_provider_config_error: that helper's "Missing X for
+            # provider Y" phrasing is written for a provider-prefixed env var
+            # (e.g. SALESFORCE_CLIENT_ID) and would misleadingly suggest a
+            # SALESFORCE_ENCRYPTION_KEY-style variable exists, when
+            # ENCRYPTION_KEY is a single global setting unrelated to any one
+            # provider.
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Server misconfigured</h1>"
+                    "<p>The ENCRYPTION_KEY environment variable is not set. "
+                    f"This is required to connect {html.escape(provider)}; set "
+                    "it and restart the backend.</p>"
+                ),
+                status_code=500,
+            )
+    if actor_flow_nonce is not None:
+        if resource_owner_key is None:
+            raise RuntimeError("actor OAuth flow requires an owner key")
+        try:
+            encrypted_owner_key = _encrypt_actor_owner_claim(resource_owner_key)
+        except ValueError:
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Server misconfigured</h1>"
+                    "<p>The ENCRYPTION_KEY environment variable is not set. "
+                    "This is required to connect an actor-owned account; set "
+                    "it and restart the backend.</p>"
+                ),
+                status_code=500,
+            )
+        state_payload.update(
+            resource_owner_key=encrypted_owner_key,
+            actor_flow_nonce=actor_flow_nonce,
+        )
+    app_scopes: list[str] | None = None
+    app_optional_scopes: list[str] = []
+    app_info: dict[str, Any] | None = None
+    from ..mcp_apps import get_app_by_id
+
+    if app_id:
+        app_info = get_app_by_id(db, app_id)
+        if app_info:
+            # Reject a hidden app here too, not only at the callback --
+            # otherwise a hidden connector's consent screen is still shown at
+            # the real provider (no security bypass, since the callback
+            # still blocks the connect, but a confusing UX: the app doesn't
+            # feel hidden if you can watch it start connecting). Unlike the
+            # callback's gate, an unknown app_id is deliberately left alone
+            # here too, for the same reason (e.g. gmail's bare-app-id flows).
+            from .mcp import _reject_hidden_catalog_app
+
+            try:
+                _reject_hidden_catalog_app(app_info)
+            except HTTPException:
+                return HTMLResponse(
+                    content=(
+                        "<h1>Cannot Connect</h1>"
+                        "<p>This app is not currently available.</p>"
+                    ),
+                    status_code=404,
+                )
+            if "oauth_scopes" in app_info:
+                app_scopes = app_info["oauth_scopes"]
+            app_optional_scopes = app_info.get("optional_oauth_scopes") or []
+
+    scopes, scope_str = _merged_oauth_scopes(
+        db_provider.default_scopes, app_scopes, provider
+    )
+    # Sent via the authorize request's own optional_scope parameter (see
+    # get_builtin_execution_fields_and_optional_scopes) rather than merged
+    # into `scopes` above: a scope tier-gated on the connected account's
+    # plan would otherwise block the whole authorization if the account
+    # can't grant it. Scopes already in the required set are dropped here
+    # too - not just a duplicate-avoidance nicety, but correctness: HubSpot
+    # blocks installation outright if the same scope appears in both `scope`
+    # and `optional_scope` on one authorize request. dict.fromkeys then
+    # dedupes what's left before joining, in case the registry ever lists a
+    # scope twice within optional_oauth_scopes itself.
+    required_scopes = set(scopes)
+    optional_scope_str = _oauth_scope_separator(provider).join(
+        sorted(
+            dict.fromkeys(
+                scope
+                for scope in app_optional_scopes
+                if scope and scope not in required_scopes
+            )
+        )
+    )
+
+    google_shared_has_refresh_token = False
+    google_restricted_scopes = False
+    google_shared_mode = (
+        get_google_shared_oauth_grants_enabled()
+        and provider.lower() == "google"
+        and isinstance(app_id, str)
+        and bool(app_id.strip())
+        and app_info is not None
+    )
+    if provider.lower() == "google":
+        google_restricted_scopes = get_google_restricted_scopes()
+        # Provider defaults and custom apps must obey the same review gate.
+        if not google_restricted_scopes and GOOGLE_RESTRICTED_SCOPES.intersection(
+            scopes + app_optional_scopes
+        ):
+            logger.warning("Rejected Google restricted scopes: app_id=%s", app_id)
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>Google restricted scopes are disabled in this environment.</p>"
+                ),
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        if google_shared_mode:
+            from ..services.google_oauth_grants import (
+                google_oauth_authorization_context,
+            )
+
+            context = google_oauth_authorization_context(
+                db,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+                oauth_client_id=client_id,
+                app_id=cast(str, app_id),
+            )
+            associated_scopes = set(context.associated_scopes)
+            if not google_restricted_scopes:
+                associated_scopes.difference_update(GOOGLE_RESTRICTED_SCOPES)
+            scopes = sorted(set(scopes).union(associated_scopes))
+            scope_str = _oauth_scope_separator(provider).join(scopes)
+            google_shared_has_refresh_token = context.has_refresh_token
+            state_payload.update(
+                google_shared_mode=True,
+                google_shared_scopes=scopes,
+            )
+            if force_google_consent:
+                state_payload["google_forced_consent"] = True
+
+    state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
+
+    from urllib.parse import urlencode
+
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    if provider.lower() == "google":
+        params["access_type"] = "offline"
+        # Closed environments must not aggregate historical restricted grants.
+        params["include_granted_scopes"] = (
+            "true" if google_restricted_scopes else "false"
+        )
+        # Repeated prompt=consent calls mint additional refresh tokens until
+        # Google evicts an older one. Once this owner/client boundary has a
+        # reusable token, account selection is enough; incremental scopes are
+        # requested explicitly above and the callback preserves that token.
+        params["prompt"] = (
+            "select_account"
+            if google_shared_mode
+            and google_shared_has_refresh_token
+            and not force_google_consent
+            else "consent"
+        )
+    if provider.lower() == "zoom":
+        params["prompt"] = "login"
+    if code_verifier:
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        params["code_challenge"] = (
+            base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        )
+        params["code_challenge_method"] = "S256"
+    if provider.lower() == "jira":
+        # Required by Atlassian's authorize endpoint for every 3LO app,
+        # regardless of scopes requested -- identifies the resource server
+        # the requested token is meant for (api.atlassian.com), not an
+        # actual audience restriction on this connector's own behalf.
+        params["audience"] = "api.atlassian.com"
+        # Atlassian does not silently re-prompt on a scope change like most
+        # providers here -- without forcing the consent screen, a user who
+        # previously granted a narrower scope set can be silently handed a
+        # token still limited to that earlier grant.
+        params["prompt"] = "consent"
+    if provider.lower() == "linear":
+        # Linear's OAuth docs confirm only that prompt=consent always shows
+        # the consent screen -- they don't document what happens by default
+        # on a scope-escalation request without it. Forcing consent
+        # sidesteps needing to know that default: a bare provider connect
+        # (read only) followed by an app-scoped connect (read+write) is
+        # guaranteed to end up with the broader grant either way.
+        params["prompt"] = "consent"
+    if provider.lower() == "myob":
+        # Unlike every other provider's prompt=consent above, this isn't
+        # about re-prompting for a broader grant -- MYOB only appends
+        # businessId (the company file the user picked) to the
+        # authorization redirect at all when the request forces the
+        # consent screen. Without this, the callback's businessId guard
+        # (see _normalize_myob_business_id) would reject every connection.
+        params["prompt"] = "consent"
+    meta_config_id = _meta_login_config_id(app_id) if provider.lower() == "meta" else ""
+    if meta_config_id:
+        params["config_id"] = meta_config_id
+    else:
+        if scope_str:
+            params["scope"] = scope_str
+        if optional_scope_str:
+            params["optional_scope"] = optional_scope_str
+
+    separator = "&" if "?" in auth_url else "?"
+    full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
+    response = RedirectResponse(full_auth_url)
+    if browser_state_nonce is not None:
+        from urllib.parse import urlsplit
+
+        assert browser_nonce_hash is not None
+        response.set_cookie(
+            _ordinary_oauth_cookie_name(browser_nonce_hash),
+            browser_state_nonce,
+            max_age=600,
+            httponly=True,
+            # Match the callback URL's transport, rather than an environment
+            # label. Development can run behind HTTPS and production can be
+            # reached over HTTP during local health checks; the cookie must
+            # follow the browser-visible OAuth origin.
+            secure=urlsplit(redirect_uri).scheme.lower() == "https",
+            samesite="lax",
+        )
+    return response
+
+
+class AppNotOAuthError(ValueError):
+    """Raised when an app routed through the OAuth flow is not builtin_oauth.
+
+    A dedicated subclass so the batch-connect loop can skip only this case while
+    still surfacing the genuine metadata-conflict ValueErrors _ensure_user_mcp_server
+    raises for legitimate OAuth apps.
+    """
+
+
+def _ensure_user_mcp_server(
+    db: Session, user_id: int, app_info: Dict[str, Any]
+) -> None:
+    """Ensure MCPServer and UserMCPServer records exist for an OAuth app."""
+    from sqlalchemy.exc import IntegrityError
+
+    from ..models.mcp import MCPServer, UserMCPServer
+
+    # Symmetric with the key-based gate in _ensure_catalog_app_server: only apps
+    # classified as builtin_oauth may land here. Otherwise a key-based app routed
+    # through OAuth would get a token injected but never its required_env API key.
+    if app_info.get("auth_type") != "builtin_oauth":
+        raise AppNotOAuthError(
+            f"App '{app_info.get('name')}' is not an OAuth app and cannot be "
+            "connected via the OAuth flow."
+        )
+
+    def _oauth_auth_metadata() -> dict[str, Any]:
+        metadata: dict[str, Any] = {"app_id": str(app_info["id"])}
+        provider = app_info.get("provider")
+        if provider:
+            metadata["provider"] = str(provider)
+        provenance = owned_catalog_marker(app_info)
+        if provenance is not None:
+            metadata["builtin_provenance"] = dict(provenance)
+        return metadata
+
+    def _ensure_server_matches_oauth_app(server: MCPServer) -> None:
+        if server.transport != "oauth":
+            raise ValueError(
+                f"OAuth app '{app_info['name']}' conflicts with an existing MCP server "
+                f"using transport '{server.transport}'. Delete or rename that custom "
+                "server before connecting the official OAuth app."
+            )
+
+        auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
+        expected_app_id = str(app_info["id"])
+        existing_app_id = auth.get("app_id")
+        if existing_app_id and str(existing_app_id) != expected_app_id:
+            raise ValueError(
+                f"OAuth app '{app_info['name']}' conflicts with MCP server metadata "
+                f"for app '{existing_app_id}'."
+            )
+
+        expected_provider = app_info.get("provider")
+        existing_provider = auth.get("provider")
+        if (
+            expected_provider
+            and existing_provider
+            and str(existing_provider) != str(expected_provider)
+        ):
+            raise ValueError(
+                f"OAuth app '{app_info['name']}' conflicts with MCP server provider "
+                f"'{existing_provider}'."
+            )
+
+        auth.update(_oauth_auth_metadata())
+        cast(Any, server).auth = auth
+        server.description = app_info.get("description") or server.description
+
+    mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
+    if not mcp_server:
+        # Caller-flush failures are not catalog-insert races to recover from.
+        db.flush()
+        if db.get_bind().dialect.name == "sqlite":
+            # In legacy SQLite mode SELECT/SAVEPOINT do not issue BEGIN. A
+            # zero-row write keeps RELEASE from committing the outer operation.
+            db.execute(text("UPDATE users SET id = id WHERE 1 = 0"))
+        try:
+            # A competing user's catalog insert must not roll back the caller's
+            # OAuth credential writes or release its session-generation lock.
+            # Add the candidate AFTER begin_nested's mandatory outer flush.
+            with db.begin_nested():
+                mcp_server = MCPServer(
+                    name=app_info["name"],
+                    description=app_info["description"],
+                    managed="external",
+                    transport="oauth",
+                    auth=_oauth_auth_metadata(),
+                )
+                db.add(mcp_server)
+                db.flush()
+        except IntegrityError:
+            mcp_server = (
+                db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
+            )
+            if not mcp_server:
+                raise
+
+    _ensure_server_matches_oauth_app(mcp_server)
+
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == mcp_server.id,
+        )
+        .first()
+    )
+
+    if not user_mcp:
+        user_mcp = UserMCPServer(
+            user_id=user_id, mcpserver_id=mcp_server.id, is_owner=True, is_active=True
+        )
+        db.add(user_mcp)
+
+
+def generic_oauth_callback(
+    provider: str,
+    request: Request,
+    db: Optional[Session] = None,
+    db_provider: Optional[Any] = None,
+) -> Any:
+    """Handle generic OAuth callback"""
+    # Computed once and reused at every Deputy-specific branch below
+    # (`provider` is this function's own parameter, never reassigned) --
+    # matches tools/config.py's refresh_oauth_token_if_needed's
+    # `normalized_provider` precedent, rather than re-lowering/re-comparing
+    # the same string five separate times across the function.
+    is_deputy = provider.lower() == "deputy"
+    is_myob = provider.lower() == "myob"
+    if db is None:
+        raise RuntimeError("db session is required")
+    if (
+        provider.lower() == "microsoft"
+        and request.query_params.get("admin_consent") is not None
+        # Entra ID's real /adminconsent return trip never carries a `code`
+        # (see _handle_microsoft_admin_consent_return's own docstring) --
+        # requiring its absence keeps an ordinary code-exchange callback
+        # that happens to also carry a stray admin_consent param (a stale
+        # bookmarked URL, browser-restored query string, etc.) from being
+        # misrouted here instead of processed as the real login it is.
+        and request.query_params.get("code") is None
+    ):
+        # Entra ID's /adminconsent return trip carries admin_consent=True/
+        # False and the original `state`, never a `code` -- must be handled
+        # before the code/state checks below, which would otherwise reject
+        # it as "Missing code or state".
+        return _handle_microsoft_admin_consent_return(request, db)
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    # MYOB appends this to the redirect itself, not the token response --
+    # captured from the raw request here (not deferred to after the token
+    # exchange, the way Deputy's `endpoint`/Salesforce's `instance_url` are
+    # read from token_data below) because it never appears anywhere else.
+    myob_business_id = (
+        _normalize_myob_business_id(request.query_params.get("businessId"))
+        if is_myob
+        else None
+    )
+    provider_error = _oauth_callback_provider_error(
+        provider, error, request.query_params.get("error_description")
+    )
+    provider_error_response = (
+        HTMLResponse(
+            content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
+        )
+        if error
+        else None
+    )
+
+    if provider_error_response is not None and not state:
+        _log_oauth_callback_rejection(
+            provider, "provider_error", provider_error=provider_error
+        )
+        return provider_error_response
+    if not state or (not code and provider_error_response is None):
+        _log_oauth_callback_rejection(
+            provider, "code_missing" if state else "state_missing"
+        )
+        return HTMLResponse(
+            content="<h1>Error: Missing code or state</h1>", status_code=400
+        )
+
+    payload = verify_token(state)
+    if (
+        not payload
+        or payload.get("type") != "oauth_state"
+        or payload.get("provider") != provider
+    ):
+        expired_actor_state = (
+            None if payload else _expired_actor_oauth_state(state, provider)
+        )
+        if expired_actor_state is not None:
+            # An actor sign-in window that came back after its flow expired
+            # (a reload, or a permission screen left open too long). Nothing
+            # is read or written: the page only says what to do next.
+            _log_oauth_callback_rejection(
+                provider,
+                "state_expired",
+                app_id=expired_actor_state.get("app_id"),
+                actor_flow=True,
+                provider_error=provider_error,
+            )
+            if provider_error is not None:
+                return _actor_oauth_provider_error_response(provider, provider_error)
+            return _actor_oauth_flow_used_response()
+        _log_oauth_callback_rejection(
+            provider, "state_invalid", provider_error=provider_error
+        )
+        if provider_error_response is not None:
+            return provider_error_response
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
+
+    browser_nonce_hash = payload.get("browser_nonce_hash")
+    is_actor_flow = (
+        payload.get("actor_flow_nonce") is not None
+        or payload.get("resource_owner_key") is not None
+    )
+    if not is_actor_flow and (
+        not isinstance(browser_nonce_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", browser_nonce_hash) is None
+    ):
+        _log_oauth_callback_rejection(provider, "state_browser_binding_required")
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
+    if browser_nonce_hash:
+        browser_nonce = request.cookies.get(
+            _ordinary_oauth_cookie_name(str(browser_nonce_hash))
+        )
+        if not browser_nonce or not secrets.compare_digest(
+            str(browser_nonce_hash),
+            hashlib.sha256(browser_nonce.encode("ascii", "ignore")).hexdigest(),
+        ):
+            _log_oauth_callback_rejection(provider, "state_browser_binding_failed")
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
+        try:
+            claimed = claim_oauth_state(db, state, expires_at=payload.get("exp"))
+        except SQLAlchemyError as exc:
+            # No provider exchange or credential write is allowed if the
+            # durable replay store cannot record this callback's claim.
+            logger.error(
+                "OAuth state replay protection is unavailable (%s)",
+                type(exc).__name__,
+            )
+            return HTMLResponse(
+                content="<h1>Connection temporarily unavailable</h1><p>Please try again.</p>",
+                status_code=503,
+            )
+        if not claimed:
+            _log_oauth_callback_rejection(provider, "state_consumed_or_expired")
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
+
+    actor_flow_nonce = payload.get("actor_flow_nonce")
+    actor_owner_claim = payload.get("resource_owner_key")
+    is_actor_flow = actor_flow_nonce is not None or actor_owner_claim is not None
+    if provider_error_response is not None and not is_actor_flow:
+        _log_oauth_callback_rejection(
+            provider,
+            "provider_error",
+            app_id=payload.get("app_id"),
+            actor_flow=False,
+            provider_error=provider_error,
+        )
+        if (
+            provider.lower() == "microsoft"
+            and error == "access_denied"
+            # Unlike `error`'s fixed OAuth2-spec lowercase vocabulary,
+            # error_subcode is a Microsoft-specific extension with no such
+            # guarantee -- casefold() the same way admin_consent is handled
+            # in _handle_microsoft_admin_consent_return below, so a
+            # differently-cased value doesn't silently miss this branch and
+            # fall back to the unhelpful generic error page.
+            and (request.query_params.get("error_subcode") or "").casefold() == "cancel"
+            and _microsoft_admin_consent_error(
+                request.query_params.get("error_description")
+            )
+            and db_provider is not None
+        ):
+            consent_app_id = payload.get("app_id")
+            # Enforce the same release gate the code-exchange path below
+            # applies to app_id (see _reject_hidden_catalog_app's call
+            # site further down) -- this branch returns before reaching
+            # that check, so without this a connector an admin just hid
+            # could still have a tenant-wide admin-consent URL minted and
+            # shown for it.
+            consent_app_info = None
+            if consent_app_id:
+                from .mcp import _reject_hidden_catalog_app
+
+                consent_app_info = get_app_by_id(db, consent_app_id)
+                if consent_app_info:
+                    try:
+                        _reject_hidden_catalog_app(consent_app_info)
+                    except HTTPException:
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Cannot Connect</h1>"
+                                "<p>This app is not currently available.</p>"
+                            ),
+                            status_code=404,
+                        )
+            admin_consent_url = _build_microsoft_admin_consent_url(
+                db_provider, consent_app_id, consent_app_info
+            )
+            if admin_consent_url:
+                return _microsoft_admin_consent_required_response(admin_consent_url)
+        return provider_error_response
+
+    user_id_claim = payload.get("user_id")
+    if user_id_claim is not None and (
+        type(user_id_claim) is not int or not 0 < user_id_claim <= _MAX_USER_ID
+    ):
+        # Reject malformed state before exchanging the provider code or
+        # mutating OAuth rows. ``User.id`` uses a signed database integer, so
+        # values accepted only by SQLite must also fail at this boundary.
+        _log_oauth_callback_rejection(
+            provider,
+            "state_invalid",
+            app_id=payload.get("app_id"),
+            actor_flow=is_actor_flow,
+            provider_error=provider_error,
+        )
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
+    user_id = user_id_claim
+    if not is_actor_flow and user_id is not None:
+        state_user = (
+            db.query(User).filter(User.id == user_id).populate_existing().first()
+        )
+        if state_user is None or not matches_user_session(state_user, payload):
+            _log_oauth_callback_rejection(
+                provider,
+                "state_session_mismatch",
+                app_id=payload.get("app_id"),
+                actor_flow=is_actor_flow,
+                provider_error=provider_error,
+            )
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
+    app_id = payload.get("app_id")
+    if error_response := _google_gmail_error(provider, app_id):
+        _log_oauth_callback_rejection(
+            provider,
+            "app_restricted",
+            app_id=app_id,
+            actor_flow=is_actor_flow,
+            provider_error=provider_error,
+        )
+        return error_response
+
+    encrypted_code_verifier = payload.get("code_verifier")
+    code_verifier = None
+    if encrypted_code_verifier:
+        from ...core.utils.encryption import decrypt_value_strict
+
+        # Strict, not the lenient decrypt_value: a verifier this can't open
+        # (e.g. ENCRYPTION_KEY rotated mid-flight, inside the state token's
+        # 10-minute window) must not silently fall back to sending the raw
+        # ciphertext to Salesforce as code_verifier -- that only surfaces as
+        # an opaque invalid_grant from Salesforce instead of a clear cause.
+        # Catching ValueError, not just its EncryptionDecodeError subclass:
+        # decrypt_value_strict's own get_cipher() call raises a bare
+        # ValueError when ENCRYPTION_KEY is unset outside development,
+        # which is exactly the same "surface it clearly" case, not just a
+        # token that fails to decrypt under a present key.
+        try:
+            code_verifier = decrypt_value_strict(encrypted_code_verifier)
+        except ValueError:
+            _log_oauth_callback_rejection(
+                provider,
+                "verifier_invalid",
+                app_id=app_id,
+                actor_flow=is_actor_flow,
+                provider_error=provider_error,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Session expired</h1><p>Please try connecting again.</p>"
+                ),
+                status_code=400,
+            )
+    resource_owner_key: str | None = None
+
+    if is_actor_flow:
+        # Each step names the check it is about to make, so a rejection can
+        # be logged by reason without logging any value of the flow itself.
+        rejection_reason = "claims_invalid"
+        try:
+            if (
+                not isinstance(actor_flow_nonce, str)
+                or len(actor_flow_nonce) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in actor_flow_nonce
+                )
+                or not isinstance(app_id, str)
+                or not app_id
+                or user_id is None
+            ):
+                raise ValueError("invalid actor OAuth claims")
+            rejection_reason = "owner_invalid"
+            if not isinstance(actor_owner_claim, str):
+                raise ValueError("missing actor owner")
+            resource_owner_key = normalize_user_oauth_resource_owner_key(
+                _decrypt_actor_owner_claim(actor_owner_claim)
+            )
+            if resource_owner_key is None:
+                raise ValueError("missing actor owner")
+            cookie_value = request.cookies.get(
+                _actor_oauth_cookie_name(actor_flow_nonce)
+            )
+            rejection_reason = (
+                "cookie_mismatch"
+                if isinstance(cookie_value, str) and cookie_value
+                else "cookie_missing"
+            )
+            cookie_digest = (
+                hashlib.sha256(cookie_value.encode()).hexdigest()
+                if isinstance(cookie_value, str)
+                else ""
+            )
+            if not secrets.compare_digest(cookie_digest, actor_flow_nonce):
+                raise ValueError("actor OAuth browser cookie mismatch")
+            rejection_reason = "user_missing"
+            if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
+                raise ValueError("actor OAuth user no longer exists")
+            rejection_reason = "link_invalid"
+            _require_actor_oauth_personal_link(
+                db,
+                user_id=user_id,
+                provider=provider,
+                app_id=app_id,
+            )
+        except ValueError as exc:
+            db.rollback()
+            if isinstance(exc, BuiltinOAuthServerDefinitionError):
+                rejection_reason = "catalog_invalid"
+            _log_oauth_callback_rejection(
+                provider,
+                rejection_reason,
+                app_id=app_id,
+                actor_flow=True,
+                provider_error=provider_error,
+            )
+            return _actor_oauth_flow_rejected_response(rejection_reason)
+
+        deleted = (
+            db.query(ActorOAuthFlowState)
+            .filter(
+                ActorOAuthFlowState.nonce == actor_flow_nonce,
+                ActorOAuthFlowState.expires_at > datetime.now(timezone.utc),
+            )
+            .delete(synchronize_session=False)
+        )
+        if deleted != 1:
+            db.rollback()
+            _log_oauth_callback_rejection(
+                provider,
+                "flow_used_or_expired",
+                app_id=app_id,
+                actor_flow=True,
+                provider_error=provider_error,
+            )
+            return _actor_oauth_flow_used_response()
+        # The nonce claim is durable before any provider exchange. A failed
+        # exchange cannot make the authorization code replayable.
+        db.commit()
+
+        if provider_error is not None:
+            # The flow is already consumed, so this page is the only answer
+            # this sign-in window will get: it says what to do next instead
+            # of a bare error code.
+            _log_oauth_callback_rejection(
+                provider,
+                "provider_error",
+                app_id=app_id,
+                actor_flow=True,
+                provider_error=provider_error,
+            )
+            return _actor_oauth_provider_error_response(provider, provider_error)
+
+    if not app_id:
+        from ..mcp_apps import requires_app_scoped_oauth_grant
+
+        # Symmetric to generic_oauth_login's own guard: that guard only
+        # stops a NEW bare state from being minted, so it can't protect a
+        # bare state that was already signed (and is still within its
+        # 10-minute TTL) before this guard was deployed, or a future
+        # internal caller that reaches this callback with an app_id-less
+        # state directly. Checked here, before any token exchange or the
+        # delete-then-recreate UserOAuth write below, so a bare grant can
+        # never replace an existing app-scoped one for these providers.
+        if requires_app_scoped_oauth_grant(provider):
+            _log_oauth_callback_rejection(
+                provider, "app_id_missing", actor_flow=is_actor_flow
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>This connector must be started from its catalog "
+                    "entry.</p>"
+                ),
+                status_code=404,
+            )
+
+    if app_id:
+        # Reject a hidden app before spending the authorization code against
+        # the real provider, not just before persisting -- is_visible_in_
+        # connector is also used as a release gate (e.g. an unverified
+        # builtin_oauth connector shipping hidden), and this builtin_oauth
+        # provider-redirect flow used to be the one connect path
+        # _reject_hidden_catalog_app's own docstring flagged as NOT enforcing
+        # that gate (#1203): an authenticated user who knew (or guessed) the
+        # app_id could still connect a hidden connector. Checked here, ahead
+        # of the token exchange below, rather than only later next to
+        # _ensure_user_mcp_server, so a hidden app never even reaches the
+        # provider -- matching the "indistinguishable from nonexistent" intent
+        # the helper already documents for its other two call sites. The bare
+        # (app_id-less) batch branch below cannot move this early: it doesn't
+        # know which apps share the provider until it queries them, so its
+        # own per-app check stays where it is.
+        from .mcp import _reject_hidden_catalog_app
+
+        # An app_id that resolves to no catalog row at all is left alone,
+        # deliberately not folded into this gate: several existing OAuth
+        # flows (e.g. gmail in the test suite) legitimately reach this
+        # callback with an app_id that has no PublicMCPApp row, and rely on
+        # falling through to a bare/provider-scoped grant rather than being
+        # rejected -- confirmed by running the full oauth test suite before
+        # settling on this narrower check. Only a row that exists AND is
+        # hidden is rejected here.
+        target_app_info = get_app_by_id(db, app_id)
+        if target_app_info:
+            try:
+                _reject_hidden_catalog_app(target_app_info)
+            except HTTPException:
+                _log_oauth_callback_rejection(
+                    provider, "app_hidden", app_id=app_id, actor_flow=is_actor_flow
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Cannot Connect</h1>"
+                        "<p>This app is not currently available.</p>"
+                    ),
+                    status_code=404,
+                )
+
+    if not db_provider:
+        _log_oauth_callback_rejection(
+            provider, "provider_not_configured", app_id=app_id, actor_flow=is_actor_flow
+        )
+        return HTMLResponse(
+            content="<h1>Error: Provider not configured</h1>", status_code=500
+        )
+
+    client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
+    client_secret = _resolve_oauth_secret(
+        provider, db_provider.client_secret, "CLIENT_SECRET"
+    )
+    missing_config = []
+    if not client_id:
+        missing_config.append(_oauth_env_name(provider, "CLIENT_ID"))
+    if not client_secret:
+        missing_config.append(_oauth_env_name(provider, "CLIENT_SECRET"))
+    if missing_config:
+        _log_oauth_callback_rejection(
+            provider, "provider_config_missing", app_id=app_id, actor_flow=is_actor_flow
+        )
+        return _oauth_provider_config_error(provider, missing_config)
+
+    if is_myob and not myob_business_id:
+        # myob_business_id was already extracted (and validated as a GUID)
+        # from the raw callback request, before this point -- unlike
+        # Deputy/Salesforce's own instance_url-shaped guards (checked further
+        # below, after their own token exchange), there is no token_data
+        # field this could instead be re-derived from post-exchange, so
+        # nothing is gained by waiting: a missing/malformed value here can
+        # only mean MYOB's own redirect never carried one (or carried a
+        # value astray of the documented GUID shape). Checked here, before
+        # the token exchange even starts, so a doomed connection attempt
+        # doesn't burn a network round trip to MYOB or consume the
+        # single-use authorization code for an outcome already decided.
+        _log_oauth_callback_rejection(
+            provider, "business_id_missing", app_id=app_id, actor_flow=is_actor_flow
+        )
+        return HTMLResponse(
+            content=(
+                "<h1>Error exchanging token</h1>"
+                f"<p>{html.escape(provider)} did not return a businessId. "
+                "Make sure the authorization request included "
+                "prompt=consent.</p>"
+            ),
+            status_code=400,
+        )
+
+    token_url = db_provider.token_url
+    userinfo_url = db_provider.userinfo_url
+
+    # The account bound at login comes only from the signed state, never
+    # from this callback's query string, and is re-resolved here since DNS
+    # may have changed since the redirect (oauth_account_hosts).
+    account_host = get_oauth_account_host(provider)
+    bound_account: str | None = None
+    if account_host is None and "oauth_account" in payload:
+        _log_oauth_callback_rejection(
+            provider, "account_unexpected", app_id=app_id, actor_flow=is_actor_flow
+        )
+        return _oauth_account_error_response(
+            f"{provider} does not take an account identifier."
+        )
+    if account_host is not None:
+        try:
+            account_endpoints = resolve_oauth_account_endpoints(
+                account_host, payload.get("oauth_account")
+            )
+        except OAuthAccountError as exc:
+            _log_oauth_callback_rejection(
+                provider, "account_invalid", app_id=app_id, actor_flow=is_actor_flow
+            )
+            return _oauth_account_error_response(str(exc))
+        token_url = account_endpoints.token_url
+        userinfo_url = account_endpoints.userinfo_url
+        bound_account = account_endpoints.account
+
+    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+
+    try:
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+        if code_verifier:
+            data["code_verifier"] = code_verifier
+        if account_host is not None:
+            data.update(account_host.token_params)
+        if is_deputy:
+            # Deputy's docs list `scope` as a required body param on the
+            # code-exchange request itself, not just the authorize redirect
+            # -- without it Deputy still exchanges the code but omits
+            # refresh_token from the response, matching the same
+            # requirement on the refresh leg in tools/config.py. Read from
+            # db_provider.default_scopes rather than a hardcoded literal,
+            # so an admin who edits this provider row's scopes doesn't
+            # leave the code-exchange/refresh requests silently still
+            # sending the old value. Not routed through the authorize
+            # redirect's _merge_oauth_scopes(default_scopes, app_scopes)
+            # above -- this leg only has db_provider in scope, not the
+            # per-app oauth_scopes override -- so an app-level scope
+            # override on the Deputy catalog row (none exists today) would
+            # be reflected in the authorize URL but not here. Revisit if
+            # one is ever added.
+            data["scope"] = (
+                " ".join(
+                    stripped
+                    for scope in db_provider.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
+                or "longlife_refresh_token"
+            )
+        if is_myob:
+            # MYOB's own docs list `scope` as a required body param here,
+            # with a worked example -- sent, unlike the Deputy branch above,
+            # from the app row's oauth_scopes rather than
+            # db_provider.default_scopes: MYOB's provider row deliberately
+            # carries no default_scopes of its own (see its registry row's
+            # comment), since every functional sme-* scope this connector
+            # needs is granular and app-specific. target_app_info is the
+            # same lookup already performed above (for the hidden-app
+            # check) when app_id is present; MYOB requires an app-scoped
+            # grant (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT), so a real
+            # connection always has one -- the `app_id and` guard only
+            # covers a hypothetical stale/crafted state token missing it,
+            # in which case there's nothing to source a scope from anyway.
+            myob_app_scopes = (
+                target_app_info.get("oauth_scopes")
+                if app_id and isinstance(target_app_info, dict)
+                else None
+            )
+            _, myob_scope_str = _merged_oauth_scopes(
+                db_provider.default_scopes, myob_app_scopes, provider
+            )
+            if myob_scope_str:
+                data["scope"] = myob_scope_str
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if requires_json_accept_header(provider):
+            headers["Accept"] = "application/json"
+        if account_host is not None:
+            headers.update(account_host.request_headers())
+        auth: tuple[str, str] | None = None
+        if provider.lower() == "zoom":
+            # Zoom's token endpoint requires HTTP Basic Auth for client
+            # credentials (client_id:client_secret, base64).
+            auth = (client_id, client_secret)
+        else:
+            data["client_id"] = client_id
+            data["client_secret"] = client_secret
+
+        params: dict[str, Any] | None = None
+        if matches_provider_family(
+            provider, "employment-hero"
+        ) and _is_employment_hero_token_url(token_url):
+            # Employment Hero's partner guide (developer.employmenthero.com
+            # /partner-guides) requires grant_type and redirect_uri as query
+            # parameters on the token URL itself, with only the credential/
+            # code fields (client_id, client_secret, code, code_verifier) in
+            # the form body -- unlike every other provider here, which sends
+            # the full RFC 6749 shape (all fields in the body). Popped out of
+            # `data` rather than duplicated, so they're never sent in both
+            # places. Gated on _is_employment_hero_token_url, not just the
+            # family match, for the same reason the identity-fetch branch
+            # below is: an admin-created "employment-hero"-family row's
+            # token_url isn't guaranteed to actually be Employment Hero's
+            # (see that function's docstring) -- applying this EH-specific
+            # wire quirk to a genuinely different token endpoint would
+            # break its exchange for no benefit, when falling back to the
+            # standard RFC 6749 body-only shape is what that endpoint
+            # actually expects.
+            params = {
+                "grant_type": data.pop("grant_type"),
+                "redirect_uri": data.pop("redirect_uri"),
+            }
+
+        # Atlassian's token endpoint requires a JSON body -- unlike every
+        # other provider here, it does not accept form-urlencoded and
+        # answers a form-encoded POST with a 400.
+        post_kwargs: dict[str, Any] = {"data": data}
+        if provider.lower() == "jira":
+            # In-place, not a full `headers = {...}` reassignment -- that
+            # would silently drop an Accept header set above by
+            # requires_json_accept_header(), matching the refresh-path
+            # branch in tools/config.py. Currently a latent distinction
+            # only (no provider needs both quirks at once yet).
+            headers["Content-Type"] = "application/json"
+            post_kwargs = {"json": data}
+        if bound_account is not None:
+            # The client secret and code go only to the bound account host.
+            post_kwargs["allow_redirects"] = False
+
+        token_response = requests.post(
+            token_url,
+            headers=headers,
+            timeout=10.0,
+            auth=auth,
+            params=params,
+            **post_kwargs,
+        )
+        try:
+            token_data = token_response.json()
+        except ValueError:
+            # The Accept-header quirk above only pushes providers toward a
+            # JSON body -- it doesn't guarantee one (a proxy stripping the
+            # header, a misconfigured enterprise server). Without this, a
+            # non-JSON body reaches the outer handler as a bare
+            # JSONDecodeError instead of the same clear, actionable message
+            # every other failure branch in this callback gives.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned a non-JSON "
+                "response (status %s)",
+                provider,
+                token_response.status_code,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned a response that "
+                    "could not be parsed.</p>"
+                ),
+                status_code=400,
+            )
+
+        if not isinstance(token_data, dict):
+            # A JSON-parseable but non-object body (a bare list/string/
+            # number) would otherwise reach `"error" in token_data` --
+            # which doesn't raise for a list/string (it does a membership/
+            # substring check, not a key check) -- and then
+            # `token_data.get("access_token")` below, which does raise
+            # (AttributeError) on anything but a dict. That would escape
+            # to the outer handler as an opaque 500 instead of the same
+            # clear, actionable 400 every other malformed-body case here
+            # gives -- the same class of gap the userinfo guards below
+            # close for that response.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned a non-object body (%s)",
+                provider,
+                type(token_data).__name__,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned an unexpected "
+                    "response.</p>"
+                ),
+                status_code=400,
+            )
+
+        if "error" in token_data:
+            # The response to the browser is deliberately trimmed to the
+            # allowlisted error/error_description fields (see
+            # _bounded_oauth_error_message's docstring) -- log the same
+            # allowlisted projection server-side rather than the raw dict,
+            # since a malformed/partial response can carry a live
+            # access_token alongside an error field, and logging the raw
+            # dict would put it in the server log instead of the browser.
+            logger.warning(
+                "OAuth token exchange failed for provider=%s: %s",
+                provider,
+                _redact_oauth_log_payload(token_data),
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{_bounded_oauth_error_message(token_data)}</p>"
+                ),
+                status_code=400,
+            )
+
+        if not 200 <= token_response.status_code < 300:
+            # A non-2xx response with no "error" key still isn't a
+            # successful exchange -- without this, a body that happens to
+            # be JSON-parseable and (coincidentally, or via a
+            # misbehaving proxy/gateway) carries an access_token-shaped
+            # field would be trusted as success purely because
+            # `"error" in token_data` was false, regardless of the HTTP
+            # status actually returned.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned status %s "
+                "with no explicit error field: %s",
+                provider,
+                token_response.status_code,
+                _redact_oauth_log_payload(token_data),
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned an unexpected "
+                    f"response (status {token_response.status_code}).</p>"
+                ),
+                status_code=400,
+            )
+
+        token_data = _exchange_meta_long_lived_token(
+            provider, token_url, token_data, client_id, client_secret
+        )
+        token_data = _normalize_intercom_token_response(provider, token_data)
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            # Without this, a token response that slips past the "error" in
+            # token_data check above (e.g. Intercom's error.list envelope,
+            # which doesn't use that key) would fall through to the
+            # persistence block below with access_token=None, hit
+            # UserOAuth.access_token's NOT NULL constraint, and surface as a
+            # raw SQLAlchemy IntegrityError message through the generic
+            # exception handler instead of a clear, actionable error.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned no access_token: %s",
+                provider,
+                _redact_oauth_log_payload(token_data),
+            )
+            message = f"{html.escape(provider)} did not return an access token."
+            detail = _extract_provider_error_message(token_data)
+            if detail:
+                message = f"{message} {html.escape(detail)}"
+            return HTMLResponse(
+                content=f"<h1>Error exchanging token</h1><p>{message}</p>",
+                status_code=400,
+            )
+
+        salesforce_instance_url = token_data.get("instance_url")
+        if _is_salesforce_provider(provider) and (
+            not isinstance(salesforce_instance_url, str) or not salesforce_instance_url
+        ):
+            # Every real Salesforce token exchange includes a non-empty
+            # string instance_url; anything else here (missing, empty, or a
+            # non-string value) means the response is unusable for this
+            # connector (launch_config.env_mapping requires it, so the
+            # server would come back unavailable/reconnect-required on the
+            # very next load) -- full host/scheme validation still only
+            # happens at use-time in salesforce.py's _instance_url(), this
+            # is just "is this even a plausible value to store" before
+            # committing it. Checked before the delete-then-recreate below,
+            # not after: that block unconditionally drops any existing
+            # UserOAuth row for this user+provider first, so letting a bad
+            # response through here would destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an instance_url.</p>"
+                ),
+                status_code=400,
+            )
+
+        deputy_instance_url = (
+            _normalize_deputy_endpoint(token_data.get("endpoint"))
+            if is_deputy
+            else None
+        )
+        if is_deputy and not deputy_instance_url:
+            # Same reasoning as the Salesforce instance_url guard above:
+            # every real Deputy token exchange includes a non-empty
+            # `endpoint` (Deputy's per-install API host); this connector's
+            # launch_config.env_mapping requires it, so letting a bad
+            # response through would just come back unavailable on the
+            # very next load, or -- worse, since this runs before the
+            # delete-then-recreate below -- destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an endpoint.</p>"
+                ),
+                status_code=400,
+            )
+
+        provider_user_id = None
+        email = None
+
+        if provider.lower() == "linear":
+            # Checked before the generic userinfo_url branch below (not
+            # "elif" on it), not just as an ordering nicety: Linear's
+            # provider row leaves userinfo_url empty today (GraphQL-only, no
+            # flat REST endpoint fits that branch), but if userinfo_url were
+            # ever populated on Linear's row (e.g. an admin edit), the
+            # generic branch's REST GET would run instead, fail silently
+            # against Linear's GraphQL-only API, and persist the connection
+            # as "healthy" with no identity. Checking the provider name
+            # first means this path always wins for Linear regardless of
+            # what userinfo_url holds -- see _fetch_linear_viewer_identity's
+            # docstring for why this is not just a label workaround.
+            try:
+                provider_user_id, email = _fetch_linear_viewer_identity(access_token)
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_linear_viewer_identity
+                # itself -- Linear's API responded, just not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Linear never actually
+                # responded, so attributing this to "the provider reported"
+                # would be misleading.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>Could not reach Linear to verify the connection: "
+                        f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif _is_salesforce_provider(provider):
+            # Salesforce's userinfo_url is deliberately left empty (see the
+            # registry row's comment: an extra round-trip just for a label
+            # this connector doesn't otherwise need), which also means
+            # provider_user_id stays NULL here -- and UserOAuth's unique
+            # constraint is (user_id, provider, provider_user_id), which
+            # SQL treats as non-conflicting across multiple NULLs. Every
+            # other provider gets real protection from that constraint
+            # because their provider_user_id is a real value; Salesforce
+            # would get none at all, letting concurrent callbacks for the
+            # same user leave more than one row with no error. The token
+            # response's own "id" field (Salesforce's identity URL, unique
+            # per org+user) closes that gap for free -- no extra network
+            # call, unlike a real userinfo lookup. This branch preempting
+            # the generic `elif userinfo_url and access_token` branch below
+            # is deliberate, not an oversight: it means the seeded row's
+            # user_id_path/email_path columns are dead by construction for
+            # Salesforce, which is fine -- Salesforce's userinfo endpoint is
+            # still reachable (salesforce_get_current_user calls it
+            # directly against the fixed USERINFO_URL host), it's just not
+            # used for callback-time identity, on purpose.
+            raw_provider_user_id = token_data.get("id")
+            # Every real Salesforce token response's "id" is a non-empty
+            # string URL; a non-string or empty value (a malformed/
+            # proxy-mangled response) would otherwise get str()-ified into
+            # the uniqueness key below instead of falling back to the same
+            # NULL-tolerant path a missing "id" already takes.
+            provider_user_id = (
+                raw_provider_user_id
+                if isinstance(raw_provider_user_id, str) and raw_provider_user_id
+                else None
+            )
+            if raw_provider_user_id and provider_user_id is None:
+                # Only a truthy-but-wrong-type "id" is anomalous enough to
+                # warn about -- a falsy one (missing entirely) is the
+                # already-expected, silent case every other provider using
+                # this same fallback also hits.
+                logger.warning(
+                    'Salesforce token response\'s "id" field was not a '
+                    "usable string (got %s); falling back to NULL "
+                    "provider_user_id for this grant",
+                    type(raw_provider_user_id).__name__,
+                )
+        elif is_deputy:
+            # Deputy's userinfo_url is deliberately left empty (see the
+            # registry row's comment) -- the host itself is per-account, so
+            # there is no fixed URL the generic `elif userinfo_url and
+            # access_token:` branch below could use. deputy_instance_url is
+            # guaranteed non-None here (guarded above; this branch can only
+            # be reached once that guard has already returned on a falsy
+            # value) -- asserted rather than left implicit so mypy narrows
+            # it from `str | None` to `str` for _fetch_deputy_identity's
+            # signature.
+            assert deputy_instance_url is not None
+            try:
+                provider_user_id, email = _fetch_deputy_identity(
+                    access_token, deputy_instance_url
+                )
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_deputy_identity
+                # itself -- Deputy's API responded, just not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Deputy never actually
+                # responded, so attributing this to "the provider reported"
+                # would be misleading. The client only sees str(e) (via the
+                # HTMLResponse below); the full traceback is logged here so
+                # an unexpected failure mode (not just a plain timeout) is
+                # still diagnosable server-side.
+                logger.error("Deputy identity verification failed", exc_info=True)
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>Could not reach Deputy to verify the connection: "
+                        f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif is_myob:
+            # MYOB's userinfo_url is deliberately left empty (see the
+            # registry row's comment) -- unlike Deputy/Linear, there's no
+            # extra round-trip to skip a fixed host for: MYOB's token
+            # response already embeds the identity inline as
+            # `user: {uid, username}`, so this only reads what's already in
+            # hand from the exchange above.
+            raw_user = token_data.get("user")
+            if isinstance(raw_user, dict):
+                raw_provider_user_id = raw_user.get("uid")
+                uid_str = (
+                    str(raw_provider_user_id)
+                    if isinstance(raw_provider_user_id, (str, int))
+                    and not isinstance(raw_provider_user_id, bool)
+                    else ""
+                )
+                provider_user_id = uid_str or None
+                if provider_user_id is None:
+                    if raw_provider_user_id:
+                        # Same "truthy but wrong type" convention as the
+                        # Salesforce branch above.
+                        logger.warning(
+                            "MYOB token response's user.uid was not a usable "
+                            "string/int (got %s); falling back to NULL "
+                            "provider_user_id for this grant",
+                            type(raw_provider_user_id).__name__,
+                        )
+                    else:
+                        # A missing/empty "uid" inside an otherwise-present
+                        # user object -- unlike Salesforce's own "id", which
+                        # real responses can legitimately omit, MYOB's
+                        # user.uid is documented as always present, so this
+                        # is genuinely malformed, not an expected variation.
+                        # Distinct from (and NOT covered by) the outer
+                        # "no usable user object" warning below, which only
+                        # fires when `user` itself isn't a dict at all --
+                        # a dict missing just "uid" never reaches that
+                        # branch.
+                        logger.warning(
+                            "MYOB token response's user object had no usable "
+                            "uid (got %s); connecting with no identity for "
+                            "this grant",
+                            type(raw_provider_user_id).__name__,
+                        )
+                raw_username = raw_user.get("username")
+                email = (
+                    raw_username
+                    if isinstance(raw_username, str) and raw_username
+                    else None
+                )
+            else:
+                # Every real MYOB token response embeds `user: {uid,
+                # username}` inline -- unlike Salesforce's optional "id",
+                # this is documented as always present, so a missing or
+                # malformed `user` object here means something is actually
+                # wrong with the response, not an expected per-provider
+                # variation. provider_user_id/email were already
+                # initialized to None above; this just makes the anomaly
+                # visible server-side instead of silently connecting with
+                # no identity.
+                logger.warning(
+                    "MYOB token response had no usable user object (got %s); "
+                    "connecting with no identity for this grant",
+                    type(raw_user).__name__,
+                )
+        elif matches_provider_family(
+            provider, "employment-hero"
+        ) and _is_employment_hero_token_url(token_url):
+            # Employment Hero's userinfo_url is deliberately left empty (see
+            # the registry row's comment) -- there's no OIDC-style "me"
+            # endpoint to point the generic `elif userinfo_url and
+            # access_token:` branch below at. Without a dedicated identity
+            # fetch here, provider_user_id would stay permanently NULL for
+            # every Employment Hero grant, the same gap Salesforce's
+            # token-id fallback above exists to close -- except Employment
+            # Hero's token response carries no equivalent "id" field, so
+            # _fetch_employment_hero_identity makes the extra request
+            # instead, mirroring Deputy/Linear's own dedicated fetches. The
+            # _is_employment_hero_token_url guard keeps this scoped to rows
+            # whose token_url is actually Employment Hero's own -- see that
+            # function's docstring.
+            try:
+                # No email slot -- Employment Hero grants are org-scoped,
+                # not user-scoped (see the function's docstring); `email`
+                # stays at its outer-scope None default.
+                provider_user_id = _fetch_employment_hero_identity(access_token)
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_employment_hero_
+                # identity itself -- Employment Hero's API responded, just
+                # not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Employment Hero never
+                # actually responded, so attributing this to "the provider
+                # reported" would be misleading.
+                logger.error(
+                    "Employment Hero identity verification failed", exc_info=True
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        "<p>Could not reach Employment Hero to verify the "
+                        f"connection: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif userinfo_url and access_token:
+            info_headers = {"Authorization": f"Bearer {access_token}"}
+            if account_host is not None:
+                info_headers.update(account_host.request_headers())
+            # Replace {{access_token}} placeholder if present
+            actual_url = userinfo_url.replace("{{access_token}}", access_token)
+            info_get_kwargs: dict[str, Any] = {}
+            if bound_account is not None:
+                # A redirect would skip the account host's private-network check.
+                info_get_kwargs["allow_redirects"] = False
+            info_response = requests.get(
+                actual_url, headers=info_headers, timeout=10.0, **info_get_kwargs
+            )
+            if info_response.status_code != 200:
+                # A non-200 userinfo response (401/403/429/5xx -- an
+                # expired/insufficiently-scoped token, or the provider's
+                # own outage) used to be silently skipped here, leaving
+                # provider_user_id/email at None and falling through to
+                # persist a "connected" account with no identity. On a
+                # reconnect, that replaces a previously working grant with
+                # a broken one while still reporting success to the user.
+                logger.warning(
+                    "OAuth userinfo fetch for provider=%s returned status %s",
+                    provider,
+                    info_response.status_code,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>{html.escape(provider)} could not be verified "
+                        f"(status {info_response.status_code}). Please try "
+                        "again.</p>"
+                    ),
+                    status_code=400,
+                )
+            try:
+                info_data = info_response.json()
+            except ValueError:
+                # Same reasoning as the token-exchange guard above: a
+                # non-JSON 200 body must not reach the unguarded .get()
+                # calls below as an unhelpful raw exception, and must not
+                # be silently treated as "no identity, proceed anyway."
+                logger.warning(
+                    "OAuth userinfo fetch for provider=%s returned a non-JSON response",
+                    provider,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>{html.escape(provider)} returned a response "
+                        "that could not be parsed. Please try again.</p>"
+                    ),
+                    status_code=400,
+                )
+            if not isinstance(info_data, dict):
+                logger.warning(
+                    "OAuth userinfo fetch for provider=%s returned a "
+                    "non-object body (%s)",
+                    provider,
+                    type(info_data).__name__,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>{html.escape(provider)} returned an "
+                        "unexpected response. Please try again.</p>"
+                    ),
+                    status_code=400,
+                )
+            if info_data.get("ok") is False:
+                # Slack-style APIs answer HTTP 200 with {"ok": false,
+                # "error": ...} on failure; a status check alone would
+                # treat a bad/revoked token as success and persist a
+                # "connected" account with no identity. Fail the
+                # callback instead. Providers without Slack semantics
+                # never carry an "ok" key, so they are unaffected.
+                escaped_error = html.escape(
+                    str(info_data.get("error") or "unknown error")
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {escaped_error}</p>"
+                    ),
+                    status_code=400,
+                )
+            envelope = account_host.userinfo_envelope if account_host else None
+            if envelope is not None:
+                nested_info = info_data.get(envelope)
+                info_data = nested_info if isinstance(nested_info, dict) else {}
+            provider_user_id = info_data.get(db_provider.user_id_path or "id")
+            email = info_data.get(db_provider.email_path or "email")
+
+        if bound_account is not None and not provider_user_id:
+            # Fail closed before any write: an account-bound grant without an
+            # identity could not be told apart from another account's.
+            _log_oauth_callback_rejection(
+                provider,
+                "account_identity_missing",
+                app_id=app_id,
+                actor_flow=is_actor_flow,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error verifying the connected account</h1>"
+                    f"<p>{html.escape(provider)} did not return an account "
+                    "identity.</p>"
+                ),
+                status_code=400,
+            )
+
+        if is_actor_flow:
+            assert user_id is not None
+            assert isinstance(app_id, str)
+
+            try:
+                # Provider I/O can overlap a personal disconnect. Recheck and
+                # lock the exact link before persisting the actor credential.
+                _lock_actor_link(
+                    db,
+                    user_id=user_id,
+                    provider=provider,
+                    app_id=app_id,
+                )
+            except ValueError:
+                db.rollback()
+                rejection_reason = "link_changed_after_exchange"
+                _log_oauth_callback_rejection(
+                    provider,
+                    rejection_reason,
+                    app_id=app_id,
+                    actor_flow=True,
+                )
+                return _actor_oauth_flow_rejected_response(rejection_reason)
+
+        provision_gmail_after_shared_callback = False
+        if user_id:
+            if is_actor_flow:
+                # Serialize replacement in the stable user namespace.
+                db.query(User.id).filter(User.id == user_id).with_for_update().one()
+
+            # Provider I/O happened after the initial generation check. Lock
+            # only now, before credential writes, so a reset wins this race.
+            if (
+                not is_actor_flow
+                and user_id_claim is not None
+                and not lock_current_session_epoch(
+                    db, user_id_claim, payload.get("session_epoch")
+                )
+            ):
+                db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "session_epoch_changed_after_exchange",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                    provider_error=provider_error,
+                )
+                return HTMLResponse(
+                    content="<h1>Error: Invalid or expired state</h1>", status_code=400
+                )
+            google_shared_scopes_claim = payload.get("google_shared_scopes")
+            google_shared_state = bool(
+                provider.lower() == "google"
+                and payload.get("google_shared_mode") is True
+                and isinstance(app_id, str)
+                and app_id.strip()
+                and target_app_info is not None
+                and isinstance(google_shared_scopes_claim, list)
+                and google_shared_scopes_claim
+                and all(
+                    isinstance(scope, str) and bool(scope.strip())
+                    for scope in google_shared_scopes_claim
+                )
+            )
+            google_shared_callback = bool(
+                get_google_shared_oauth_grants_enabled() and google_shared_state
+            )
+            if google_shared_callback and not provider_user_id:
+                db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "shared_google_subject_missing",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        "<p>Google did not return an account identity. Please try "
+                        "again.</p>"
+                    ),
+                    status_code=400,
+                )
+            connector_key = app_id or provider
+            if google_shared_state:
+                # Preserve an exact same-subject legacy row so an incremental
+                # response that omits refresh_token can reuse the credential
+                # proved by the previous callback. Never reuse it after the
+                # user selects another Google account.
+                oauth_account = (
+                    scoped_user_oauth_query(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                    )
+                    .filter(
+                        UserOAuth.provider == connector_key,
+                        UserOAuth.provider_user_id == str(provider_user_id),
+                    )
+                    .order_by(UserOAuth.id.desc())
+                    .first()
+                )
+                if oauth_account is None:
+                    oauth_account = _matching_gmail_reconnect_tombstone(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                        connector_key=connector_key,
+                        provider_user_id=provider_user_id,
+                        email=email,
+                    )
+            else:
+                oauth_account = _matching_gmail_reconnect_tombstone(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    connector_key=connector_key,
+                    provider_user_id=provider_user_id,
+                    email=email,
+                )
+            if (
+                google_shared_state
+                and not google_shared_callback
+                and not token_data.get("refresh_token")
+                and (
+                    oauth_account is None
+                    or not getattr(oauth_account, "refresh_token", None)
+                )
+            ):
+                db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "shared_google_rollout_changed",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Google connection rollout changed</h1>"
+                        "<p>Please close this window and connect again.</p>"
+                    ),
+                    status_code=409,
+                )
+            if google_shared_state:
+                from ..services.google_oauth_grants import (
+                    lock_google_shared_accounts_for_app_replacement,
+                )
+
+                # Runtime refresh/mirroring locks the shared row before any
+                # legacy mirror. Take that same outer lock before the generic
+                # callback queries, deletes, or replaces the app-local row;
+                # the service writer alone is too late for a subject switch.
+                lock_google_shared_accounts_for_app_replacement(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    app_id=cast(str, app_id),
+                )
+            if oauth_account is None:
+                if connector_key == "google":
+                    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+                    grant_owned_account = (
+                        scoped_user_oauth_query(
+                            db,
+                            user_id=user_id,
+                            resource_owner_key=resource_owner_key,
+                        )
+                        .join(
+                            GoogleOAuthGrant,
+                            GoogleOAuthGrant.oauth_account_id == UserOAuth.id,
+                        )
+                        .filter(
+                            UserOAuth.provider == "google",
+                            UserOAuth.provider_user_id == str(provider_user_id),
+                        )
+                        .first()
+                    )
+                    if grant_owned_account is not None:
+                        db.rollback()
+                        _log_oauth_callback_rejection(
+                            provider,
+                            "shared_google_row_replacement_rejected",
+                            app_id=app_id,
+                            actor_flow=is_actor_flow,
+                        )
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Cannot replace a shared Google connection</h1>"
+                                "<p>Reconnect this account from a Google connector "
+                                "instead.</p>"
+                            ),
+                            status_code=409,
+                        )
+                    grant_account_ids = db.query(GoogleOAuthGrant.oauth_account_id)
+                    (
+                        scoped_user_oauth_query(
+                            db,
+                            user_id=user_id,
+                            resource_owner_key=resource_owner_key,
+                        )
+                        .filter(
+                            UserOAuth.provider == connector_key,
+                            ~UserOAuth.id.in_(grant_account_ids),
+                        )
+                        .delete(synchronize_session=False)
+                    )
+                else:
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                        providers=[connector_key],
+                    )
+                oauth_account = UserOAuth(
+                    user_id=user_id,
+                    provider=connector_key,
+                    resource_owner_key=resource_owner_key,
+                )
+                db.add(oauth_account)
+            else:
+                # Preserve the matching tombstone's primary key, but retain
+                # the callback's replace-all semantics for any other Gmail
+                # rows in the ordinary namespace.
+                (
+                    scoped_user_oauth_query(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                    )
+                    .filter(
+                        UserOAuth.provider == connector_key,
+                        UserOAuth.id != int(oauth_account.id),
+                    )
+                    .delete(synchronize_session=False)
+                )
+
+            setattr(
+                oauth_account,
+                "provider_user_id",
+                str(provider_user_id) if provider_user_id else None,
+            )
+
+            setattr(oauth_account, "access_token", access_token)
+            setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
+            # Most providers return "scope" as a single space/comma-joined
+            # string, but Linear OAuth applications created before December
+            # 1, 2023 return it as a list of strings -- UserOAuth.scope is a
+            # plain String column, so committing a list there would raise
+            # at flush time instead of saving a valid connection. Always
+            # join with a space regardless of provider: `_oauth_scope_separator`
+            # governs only the outbound authorize-request format (comma for
+            # Linear/Meta), and the two readers of this column already split
+            # on a space, so reusing that separator here would make the
+            # stored format provider-dependent and silently mis-parse every
+            # Linear row wherever this column is read.
+            token_scope = token_data.get("scope", "")
+            if isinstance(token_scope, list):
+                token_scope = " ".join(str(scope) for scope in token_scope)
+            if google_shared_state and not get_google_restricted_scopes():
+                from ..services.google_oauth_grants import (
+                    normalize_google_oauth_scopes,
+                )
+
+                token_scope = " ".join(
+                    sorted(
+                        normalize_google_oauth_scopes(token_scope).difference(
+                            GOOGLE_RESTRICTED_SCOPES
+                        )
+                    )
+                )
+            setattr(oauth_account, "scope", token_scope)
+            setattr(oauth_account, "email", email)
+            if not google_shared_state:
+                setattr(oauth_account, "refresh_token", None)
+            if "refresh_token" in token_data:
+                setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+            # Salesforce returns the per-org API host here instead of using a
+            # fixed domain -- no other provider (besides Deputy, handled
+            # explicitly below) sends this key. A callback fully replaces
+            # credential metadata even when it revives a Gmail tombstone, so
+            # token_data.get() returning None for every other provider is the
+            # correct final value rather than stale state to preserve.
+            resolved_instance_url = token_data.get("instance_url")
+            if is_deputy:
+                # Deputy's equivalent is `endpoint`, not `instance_url`, and
+                # arrives without a scheme -- deputy_instance_url is the
+                # already-guarded, normalized value from above (Deputy
+                # can't reach this branch without it).
+                resolved_instance_url = deputy_instance_url
+            elif is_myob:
+                # MYOB's equivalent is the company file GUID from the
+                # authorization redirect, not anything in token_data --
+                # myob_business_id is the already-guarded value from above
+                # (MYOB can't reach this branch without it).
+                resolved_instance_url = myob_business_id
+            elif bound_account is not None:
+                # The account bound at login, never a token-response value.
+                resolved_instance_url = bound_account
+            setattr(oauth_account, "instance_url", resolved_instance_url)
+            setattr(oauth_account, "expires_at", None)
+            if "expires_in" in token_data:
+                setattr(
+                    oauth_account,
+                    "expires_at",
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=int(token_data["expires_in"])),
+                )
+
+            if google_shared_callback:
+                from ..services.google_oauth_grants import (
+                    GoogleOAuthRefreshTokenRequired,
+                    GoogleOAuthScopeConsentRequired,
+                    write_google_shared_oauth_callback,
+                )
+
+                try:
+                    _shared_account, oauth_account, _association = (
+                        write_google_shared_oauth_callback(
+                            db,
+                            user_id=user_id,
+                            resource_owner_key=resource_owner_key,
+                            oauth_client_id=client_id,
+                            app_id=cast(str, app_id),
+                            google_subject=str(provider_user_id),
+                            access_token=access_token,
+                            refresh_token=(
+                                str(token_data["refresh_token"])
+                                if token_data.get("refresh_token")
+                                else None
+                            ),
+                            granted_scopes=token_scope,
+                            requested_scopes=cast(
+                                list[str], google_shared_scopes_claim
+                            ),
+                            email=str(email) if email else None,
+                            token_type=str(token_data.get("token_type", "Bearer")),
+                            expires_at=cast(datetime | None, oauth_account.expires_at),
+                            legacy_oauth_account=oauth_account,
+                        )
+                    )
+                    if resource_owner_key is None:
+                        from ..services.google_oauth_grants import (
+                            scope_valid_gmail_accounts_for_shared_google_oauth,
+                        )
+
+                        provision_gmail_after_shared_callback = bool(
+                            scope_valid_gmail_accounts_for_shared_google_oauth(
+                                db, oauth_account=_shared_account
+                            )
+                        )
+                except GoogleOAuthRefreshTokenRequired:
+                    db.rollback()
+                    if payload.get("google_forced_consent") is True:
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Google did not provide offline access</h1>"
+                                "<p>Please remove this app from your Google Account "
+                                "permissions, then connect it again.</p>"
+                            ),
+                            status_code=400,
+                        )
+                    retry_user = db.get(User, user_id)
+                    if retry_user is None:
+                        return HTMLResponse(
+                            content="<h1>Error: Invalid or expired state</h1>",
+                            status_code=400,
+                        )
+                    if is_actor_flow:
+                        assert resource_owner_key is not None
+                        try:
+                            retry_response = start_builtin_oauth_for_resource_owner(
+                                provider=provider,
+                                app_id=cast(str, app_id),
+                                user=retry_user,
+                                resource_owner_key=resource_owner_key,
+                                redirect=payload.get("redirect"),
+                                db=db,
+                                db_provider=db_provider,
+                                force_google_consent=True,
+                            )
+                        except ValueError:
+                            db.rollback()
+                            rejection_reason = "link_changed_before_consent_retry"
+                            _log_oauth_callback_rejection(
+                                provider,
+                                rejection_reason,
+                                app_id=app_id,
+                                actor_flow=True,
+                            )
+                            return _actor_oauth_flow_rejected_response(rejection_reason)
+                        if isinstance(retry_response, RedirectResponse):
+                            # This callback is the transaction owner for the
+                            # replacement actor flow. Persist its new nonce
+                            # before returning the redirect and browser cookie.
+                            db.commit()
+                        else:
+                            db.rollback()
+                        return retry_response
+                    return _generic_oauth_login(
+                        provider,
+                        token=None,
+                        app_id=cast(str, app_id),
+                        redirect=payload.get("redirect"),
+                        db=db,
+                        db_provider=db_provider,
+                        trusted_user_id=user_id,
+                        trusted_session_epoch=cast(
+                            str | None, payload.get("session_epoch")
+                        ),
+                        resource_owner_key=None,
+                        actor_flow_nonce=None,
+                        account=None,
+                        force_google_consent=True,
+                    )
+                except GoogleOAuthScopeConsentRequired as exc:
+                    db.rollback()
+                    _log_oauth_callback_rejection(
+                        provider,
+                        "shared_google_scopes_declined",
+                        app_id=app_id,
+                        actor_flow=is_actor_flow,
+                    )
+                    missing = ", ".join(
+                        html.escape(scope) for scope in exc.missing_scopes
+                    )
+                    return HTMLResponse(
+                        content=(
+                            "<h1>Required Google permissions were not granted</h1>"
+                            f"<p>Please reconnect and approve: {missing}</p>"
+                        ),
+                        status_code=400,
+                    )
+                except (ValueError, IntegrityError) as exc:
+                    db.rollback()
+                    logger.warning(
+                        "Rejected shared Google callback: app_id=%s "
+                        "actor_flow=%s reason=%s",
+                        app_id,
+                        is_actor_flow,
+                        exc,
+                    )
+                    return HTMLResponse(
+                        content=(
+                            "<h1>Google connection could not be saved</h1>"
+                            "<p>The authorization response could not be safely "
+                            "stored. Please try connecting again.</p>"
+                        ),
+                        status_code=400,
+                    )
+
+            from ..mcp_apps import get_all_mcp_apps
+            from .mcp import _reject_hidden_catalog_app
+
+            if app_id and not is_actor_flow:
+                # Reuse target_app_info from the earlier hidden-app-gate
+                # check above rather than re-fetching by app_id: nothing
+                # mutates public_mcp_apps between there and here, so a second
+                # fetch would just be redundant, not more correct.
+                app_info = target_app_info
+                # A concurrent personal disconnect must win. Actor callbacks
+                # persist only the credential and never recreate its link.
+                if app_info and not is_actor_flow:
+                    # A stale/crafted app_id in the OAuth state can point at a
+                    # non-oauth app. Fail with a clear error instead of a generic
+                    # 500 after the user already completed provider consent —
+                    # symmetric with the batch branch's AppNotOAuthError catch.
+                    try:
+                        _ensure_user_mcp_server(db, user_id, app_info)
+                    except AppNotOAuthError:
+                        db.rollback()
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Cannot Connect</h1>"
+                                "<p>This app is not an OAuth app.</p>"
+                            ),
+                            status_code=400,
+                        )
+            elif not app_id:
+                from ..mcp_apps import requires_app_scoped_oauth_grant
+
+                apps = [
+                    app
+                    for app in get_all_mcp_apps(db)
+                    if app.get("provider") == provider
+                ]
+                for app_info in apps:
+                    # Same release-gate enforcement as the single-app branch
+                    # above (same shared helper, so there is one source of
+                    # truth for this check), but a hidden app must not abort
+                    # the whole bare batch connect — skip it and keep
+                    # connecting the other visible apps under the same
+                    # provider, matching the mis-tagged-app skip below.
+                    try:
+                        _reject_hidden_catalog_app(app_info)
+                    except HTTPException:
+                        logger.info(
+                            "Skipping hidden app %s during bare %s OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+                        continue
+                    # This bare app_id-less login only ever requests
+                    # db_provider.default_scopes (see the app_scopes=None
+                    # branch above), never an app's own oauth_scopes. Creating
+                    # a UserMCPServer row here for an app that requires an
+                    # app-scoped grant would leave an orphan the agent runtime
+                    # picks up directly (bypassing the connected-state check)
+                    # and can never resolve a token for; see
+                    # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                    if requires_app_scoped_oauth_grant(app_info):
+                        logger.info(
+                            "Skipping app-scoped-only app %s during bare %s "
+                            "OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+                        continue
+                    # A mis-tagged non-oauth app sharing this provider must not
+                    # abort the whole batch login: skip it and keep connecting
+                    # the legitimate oauth apps under the same provider. Only the
+                    # not-oauth case is skipped; genuine metadata-conflict
+                    # ValueErrors still propagate as before.
+                    try:
+                        _ensure_user_mcp_server(db, user_id, app_info)
+                    except AppNotOAuthError:
+                        logger.warning(
+                            "Skipping non-oauth app %s during %s OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+
+            db.commit()
+            # Everything past the commit belongs in the helper, which cannot
+            # change what this callback returns. Add new post-commit work
+            # there, not here.
+            if not is_actor_flow:
+                side_effect_kwargs: dict[str, Any] = {}
+                if provision_gmail_after_shared_callback:
+                    side_effect_kwargs["provision_gmail"] = True
+                _run_post_commit_oauth_side_effects(
+                    db,
+                    user_id=user_id,
+                    connector_key=(app_id or provider),
+                    **side_effect_kwargs,
+                )
+
+        from urllib.parse import urlparse
+
+        redirect_url = payload.get("redirect")
+        target_origin = "window.location.origin"
+        if redirect_url:
+            try:
+                parsed = urlparse(redirect_url)
+                if parsed.scheme and parsed.netloc:
+                    target_origin = script_safe_json(
+                        f"{parsed.scheme}://{parsed.netloc}"
+                    )
+            except Exception:
+                pass
+
+        return HTMLResponse(
+            content=f"""
+        <html>
+            <head>
+                <title>Connected</title>
+                <script>
+                    window.opener.postMessage({{
+                        type: 'oauth-success',
+                        email: {script_safe_json(email)},
+                        provider: {script_safe_json(app_id or provider)}
+                    }}, {target_origin});
+                    window.close();
+                </script>
+            </head>
+            <body>
+                <h1>Connected Successfully</h1>
+                <p>You can close this window now.</p>
+            </body>
+        </html>
+        """
+        )
+    except Exception:
+        # str(e) is not rendered to the client: db.add(oauth_account)/db.commit()
+        # above persist the just-obtained access/refresh token as bound SQL
+        # parameters, and a SQLAlchemy StatementError's default __str__
+        # includes those bound values -- a DB error here (constraint
+        # violation, connection drop, oversized field) would otherwise echo
+        # the plaintext token back to the browser in this 500 response.
+        # hide_parameters=True on the engine (models/database.py) now hides
+        # it there too, but this handler doesn't rely on that alone.
+        # logger.exception still captures it server-side for debugging.
+        logger.exception("Generic OAuth callback failed")
+        return HTMLResponse(
+            content="<h1>Authentication Failed</h1><p>An unexpected error occurred "
+            "while connecting this account. Please try again.</p>",
+            status_code=500,
+        )
+
+
+# --- Unified OAuth Routes ---
+
+
+def oauth_login(
+    provider: str,
+    token: Optional[str] = None,
+    app_id: Optional[str] = None,
+    redirect: Optional[str] = None,
+    account: Optional[str] = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    """In-process adapter; never expose its token argument as an HTTP query."""
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if not db_provider:
+        return HTMLResponse(
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
+        )
+
+    # But now everything can be routed through generic
+    return generic_oauth_login(
+        provider, token, app_id, redirect, db, db_provider, account=account
+    )
+
+
+class OAuthLaunchRequest(BaseModel):
+    """Connector options only; authentication belongs in the Bearer header."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: str | None = Field(default=None, max_length=255)
+    redirect: str | None = Field(default=None, max_length=4096)
+    account: str | None = Field(default=None, max_length=255)
+
+
+_OAUTH_LAUNCH_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+_OAUTH_LAUNCH_TTL_SECONDS = 30
+
+
+@auth_router.get("/{provider}/login")
+def redeem_oauth_launch(
+    provider: str,
+    request: Request,
+    ticket: str | None = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Redeem one short-lived proof in a top-level browser navigation.
+
+    Setting the state cookie here avoids depending on third-party cookies in
+    cross-site fetches (for example hitoby.ai calling cloud.xagent.co).
+    """
+    from ..services.oauth_launch import consume_oauth_launch_ticket
+
+    if "token" in request.query_params or "access_token" in request.query_params:
+        return JSONResponse(
+            {
+                "detail": "Start connector authorization with a Bearer-authenticated POST."
+            },
+            status_code=410,
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    try:
+        payload = verify_token(ticket) if ticket else None
+    except (TypeError, ValueError, OverflowError):
+        payload = None
+    if (
+        not payload
+        or payload.get("type") != "oauth_launch"
+        or payload.get("provider") != provider
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    user_id = payload.get("user_id")
+    if type(user_id) is not int or not 0 < user_id <= 2**31 - 1:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    user = db.get(User, user_id)
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    try:
+        options = OAuthLaunchRequest.model_validate(payload.get("options"))
+    except ValueError:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        ) from None
+    try:
+        consumed = consume_oauth_launch_ticket(db, payload)
+    except SQLAlchemyError:
+        raise HTTPException(
+            503, "Authorization temporarily unavailable", headers=_OAUTH_LAUNCH_HEADERS
+        ) from None
+    if not consumed:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    # Ticket consumption commits before any later work. Re-read after that
+    # boundary so a simultaneous password change cannot restore the old epoch.
+    db.expire_all()
+    user = db.get(User, user_id)
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if db_provider is None:
+        raise HTTPException(400, "Unsupported provider", headers=_OAUTH_LAUNCH_HEADERS)
+    response = _generic_oauth_login(
+        provider,
+        token=None,
+        app_id=options.app_id,
+        redirect=options.redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=int(user.id),
+        trusted_session_epoch=cast(str | None, user.session_epoch),
+        resource_owner_key=None,
+        actor_flow_nonce=None,
+        account=options.account,
+    )
+    response.headers.update(_OAUTH_LAUNCH_HEADERS)
+    return response
+
+
+@auth_router.post("/{provider}/login")
+def start_oauth_authorization(
+    provider: str,
+    request: Request,
+    payload: OAuthLaunchRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Any:
+    """Issue a single-use navigation proof, never a reusable access credential."""
+    from ..models.oauth_provider import OAuthProvider
+
+    private_headers = _OAUTH_LAUNCH_HEADERS
+    if "token" in request.query_params or "access_token" in request.query_params:
+        raise HTTPException(
+            status_code=400,
+            detail="Login credentials must not be included in the URL.",
+            headers=private_headers,
+        )
+    # Existing connector manifests put the non-secret app/return options in
+    # the query. Accept those on POST too, without ambiguous body overrides.
+    payload = payload or OAuthLaunchRequest()
+    options = payload.model_dump()
+    for name in ("app_id", "redirect", "account"):
+        if name not in request.query_params:
+            continue
+        value = request.query_params[name]
+        if name in payload.model_fields_set and options[name] != value:
+            raise HTTPException(
+                400, "Conflicting authorization options", headers=private_headers
+            )
+        options[name] = value
+    try:
+        payload = OAuthLaunchRequest.model_validate(options)
+    except ValueError:
+        raise HTTPException(
+            400, "Invalid authorization options", headers=private_headers
+        ) from None
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if db_provider is None:
+        raise HTTPException(
+            status_code=400, detail="Unsupported provider", headers=private_headers
+        )
+    callback = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    if (
+        callback.scheme not in {"http", "https"}
+        or not callback.netloc
+        or callback.username
+        or callback.password
+    ):
+        raise HTTPException(
+            400, "Invalid OAuth callback configuration", headers=private_headers
+        )
+    callback_origin = f"{callback.scheme}://{callback.netloc}"
+    from urllib.parse import quote, urlencode
+
+    ticket = create_access_token(
+        {
+            **user_session_claims(user),
+            "type": "oauth_launch",
+            "provider": provider,
+            "jti": secrets.token_urlsafe(24),
+            "options": payload.model_dump(),
+        },
+        expires_delta=timedelta(seconds=_OAUTH_LAUNCH_TTL_SECONDS),
+    )
+    # Relative to the configured API base, resolved by the frontend. Do not
+    # trust arbitrary forwarded Host headers to choose a credential destination.
+    path = f"/api/auth/{quote(provider, safe='')}/login?{urlencode({'ticket': ticket})}"
+    return JSONResponse(
+        {"authorization_url": path, "callback_origin": callback_origin},
+        headers=private_headers,
+    )
+
+
+@auth_router.get("/{provider}/callback")
+def oauth_callback(
+    provider: str, request: Request, db: Session = Depends(get_db)
+) -> Any:
+    """Unified entry point for OAuth callback"""
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if not db_provider:
+        return HTMLResponse(
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
+        )
+
+    return generic_oauth_callback(provider, request, db, db_provider)
+
+
+from .oidc_google import router as google_oidc_router  # noqa: E402
+
+auth_router.include_router(google_oidc_router)

@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1.6
+ARG NODE_VERSION=22
+
+############################
+# Dependencies
+############################
+FROM node:${NODE_VERSION}-bookworm-slim AS dependencies
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+############################
+# Builder
+############################
+FROM node:${NODE_VERSION}-bookworm-slim AS builder
+WORKDIR /app
+
+# Build arguments for API URL configuration
+# Default to empty string for relative paths (works behind reverse proxy)
+ARG NEXT_PUBLIC_API_URL=
+ARG NEXT_PUBLIC_WS_URL=
+ARG NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=
+
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY . .
+
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+ENV NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL}
+ENV NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN}
+# This image serves the frontend via a Node server, so build the standalone
+# output rather than the default static export used by the pip/uvx deployment.
+ENV NEXT_OUTPUT=standalone
+RUN npm run build
+
+############################
+# Runner - Node.js
+############################
+FROM node:${NODE_VERSION}-bookworm-slim AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+# Copy built files from standalone output
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})" || exit 1
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]

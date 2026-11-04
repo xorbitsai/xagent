@@ -1,0 +1,1034 @@
+"""
+Tests for ImageGenerationToolCore class
+"""
+
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+from xagent.core.model.image.base import BaseImageModel
+from xagent.core.tools.core.image_tool import ImageGenerationToolCore
+from xagent.core.workspace import ExternalUploadStagingError, TaskWorkspace
+
+
+@pytest.fixture
+def mock_image_model():
+    """Create a mock image model for testing"""
+    model = Mock(spec=BaseImageModel)
+    model.generate_image = AsyncMock(
+        return_value={
+            "image_url": "https://example.com/test_image.jpg",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+            "task_metric": {"total_time": 2.5},
+            "request_id": "test_request_id",
+        }
+    )
+    return model
+
+
+@pytest.fixture
+def mock_image_models():
+    """Create multiple mock image models for testing"""
+    model1 = Mock(spec=BaseImageModel)
+    model1.generate_image = AsyncMock(
+        return_value={
+            "image_url": "https://example.com/image1.jpg",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+            "request_id": "req1",
+        }
+    )
+
+    model2 = Mock(spec=BaseImageModel)
+    model2.generate_image = AsyncMock(
+        return_value={
+            "image_url": "https://example.com/image2.jpg",
+            "usage": {"input_tokens": 15, "output_tokens": 25},
+            "request_id": "req2",
+        }
+    )
+
+    return {"model1": model1, "model2": model2}
+
+
+@pytest.fixture
+def mock_workspace():
+    """Create a mock workspace for testing"""
+    workspace = Mock()
+    workspace.output_dir = Path("/tmp/test_workspace/output")
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Mock auto_register_files to return a proper context manager
+    @contextmanager
+    def auto_register_files():
+        yield workspace
+
+    workspace.auto_register_files = auto_register_files
+    # Mock get_file_id_from_path to return a valid file_id
+    workspace.get_file_id_from_path = Mock(return_value="test-file-id")
+
+    return workspace
+
+
+@pytest.fixture
+def image_tool_core(mock_image_models, mock_workspace):
+    """Create ImageGenerationToolCore instance for testing"""
+    return ImageGenerationToolCore(
+        mock_image_models,
+        {"model1": "Test model 1", "model2": "Test model 2"},
+        mock_workspace,
+    )
+
+
+@pytest.fixture
+def edit_image_tool(mock_image_models, mock_workspace):
+    """Create ImageGenerationToolCore configured for edit operations."""
+    mock_image_models["model1"].edit_image = AsyncMock(
+        return_value={
+            "image_url": "https://example.com/edited_image.jpg",
+            "usage": {"input_tokens": 15, "output_tokens": 25},
+            "request_id": "edit_req1",
+        }
+    )
+    mock_image_models["model1"].has_ability = Mock(return_value=True)
+    return ImageGenerationToolCore(
+        mock_image_models, {"model1": "Test model 1"}, mock_workspace
+    )
+
+
+def _setup_edit_http_mock(mock_get):
+    """Configure mock HTTP response for image download in edit tests."""
+    mock_response = Mock()
+    mock_response.status = 200
+    mock_response.headers = {}
+
+    async def mock_iter_chunked(chunk_size):
+        for chunk in [b"fake_edited_image_data"]:
+            yield chunk
+
+    mock_response.content.iter_chunked = mock_iter_chunked
+    mock_get.return_value.__aenter__.return_value = mock_response
+
+
+class TestImageGenerationToolCore:
+    """Test cases for ImageGenerationToolCore class"""
+
+    def test_generate_description_enforces_single_canvas_and_copy_budget(self):
+        description = ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION
+
+        assert "one single final" in description
+        assert "one continuous canvas" in description
+        assert "contact sheet" in description
+        assert "one exact headline" in description
+        assert "one concise CTA" in description
+        assert "file_id through the images parameter" in description
+        assert "Use only references the user supplied" in description
+        # The curb this description exists for.
+        assert "not go looking" in description
+        # The official source is the third origin static-visual-design sanctions;
+        # dropping it here would forbid what the skill requires.
+        assert "brand's own official source" in description
+        # Without the authenticity guard the carve-out reads as "go fetch a logo"
+        # in every run where the skill is not loaded.
+        assert "plausible-looking search result" in description
+        assert "never take" in description and "other tasks" in description
+
+    def test_edit_description_restricts_reference_sources(self):
+        # generate_image routes reference-based work here, so the restriction has
+        # to hold on both descriptions or the model just switches tools.
+        description = ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION
+
+        assert "Use only images the user supplied" in description
+        assert "not go looking" in description
+        assert "brand's own official source" in description
+        assert "plausible-looking search result" in description
+        assert "never take" in description and "other tasks" in description
+        assert "never present a generative edit as exact" in description
+        # Loaded with or without the skill, so it must not offer the weaker gate
+        # the skill closed: #942 deleted logo_overlay as brittle.
+        assert "composite deterministically" not in description
+        assert "ask the user to arrange" in description
+
+    def test_init_with_models(self, mock_image_models, mock_workspace):
+        """Test ImageGenerationToolCore initialization with models"""
+        tool = ImageGenerationToolCore(mock_image_models, workspace=mock_workspace)
+        assert tool._image_models == mock_image_models
+        assert len(tool._image_models) == 2
+
+    def test_init_with_empty_models(self, mock_workspace):
+        """Test ImageGenerationToolCore initialization with empty models"""
+        tool = ImageGenerationToolCore({}, workspace=mock_workspace)
+        assert tool._image_models == {}
+        assert len(tool._image_models) == 0
+
+    def test_init_without_workspace(self, mock_image_models):
+        """Test ImageGenerationToolCore initialization without workspace"""
+        tool = ImageGenerationToolCore(mock_image_models)
+        assert tool._image_models == mock_image_models
+        assert tool._workspace is None
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_with_default_model(
+        self, mock_get, image_tool_core, mock_image_models
+    ):
+        """Test image generation with default model"""
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await image_tool_core.generate_image("A test prompt")
+
+        assert result["success"] is True
+        assert result["image_path"] is not None
+        assert result["model_used"] == "model1"
+        assert result["usage"] == {"input_tokens": 10, "output_tokens": 20}
+        assert result["request_id"] == "req1"
+        assert result["saved_to_workspace"] is True
+        assert result["artifacts"] == [
+            {
+                "type": "image",
+                "file_id": "test-file-id",
+                "filename": result["image_path"].split("/")[-1],
+                "mime_type": "image/jpeg",
+                "display": "inline",
+            }
+        ]
+
+        # Verify the first model was used (default behavior)
+        mock_image_models["model1"].generate_image.assert_called_once_with(
+            prompt="A test prompt", size="1024*1024", negative_prompt=""
+        )
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_with_specific_model(
+        self, mock_get, image_tool_core, mock_image_models
+    ):
+        """Test image generation with specific model"""
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await image_tool_core.generate_image(
+            "A test prompt", model_id="model2"
+        )
+
+        assert result["success"] is True
+        assert result["image_path"] is not None
+        assert result["model_used"] == "model2"
+        assert result["saved_to_workspace"] is True
+
+        # Verify the specified model was used
+        mock_image_models["model2"].generate_image.assert_called_once_with(
+            prompt="A test prompt", size="1024*1024", negative_prompt=""
+        )
+        mock_image_models["model1"].generate_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_image_with_no_models(self, mock_workspace):
+        """Test image generation with no models available"""
+        tool = ImageGenerationToolCore({}, workspace=mock_workspace)
+        result = await tool.generate_image("A test prompt")
+
+        assert result["success"] is False
+        assert "No available image models with generate capabilities" in result["error"]
+        assert "Configured image models:" in result["error"]
+        assert result["image_path"] is None
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_with_images_delegates_to_edit_image(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Reference images sent to generate_image should use edit_image."""
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        mock_image_models["model1"].has_ability = Mock(
+            side_effect=lambda ability: ability in {"generate", "edit"}
+        )
+        _setup_edit_http_mock(mock_get)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        result = await tool.generate_image(
+            "Keep the same cabin composition, but make it a night scene",
+            images=[
+                "https://example.com/source.jpg",
+                "https://example.com/style.jpg",
+            ],
+            size="1024*576",
+            aspect_ratio="16:9",
+            negative_prompt="blurry",
+        )
+
+        assert result["success"] is True
+        assert result["model_used"] == "model1"
+        mock_image_models["model1"].generate_image.assert_not_called()
+        mock_image_models["model1"].edit_image.assert_called_once_with(
+            prompt="Keep the same cabin composition, but make it a night scene",
+            image_url=[
+                "https://example.com/source.jpg",
+                "https://example.com/style.jpg",
+            ],
+            size="1024*576",
+            negative_prompt="blurry",
+            aspect_ratio="16:9",
+        )
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_with_workspace(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image generation with workspace (should download and save)"""
+        # Create tool with workspace
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["success"] is True
+        assert result["image_path"] is not None
+        assert result["saved_to_workspace"] is True
+        assert "generated_image_" in result["image_path"]
+        assert result["artifacts"][0]["file_id"] == "test-file-id"
+        assert "preview_url" not in result["artifacts"][0]
+        assert "markdown_ref" not in result["artifacts"][0]
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_download_image_with_default_timeout(self, mock_get, mock_workspace):
+        """Test image download with default timeout (30 seconds)"""
+        # Create tool with workspace
+        tool = ImageGenerationToolCore({}, {}, mock_workspace)
+
+        # Mock HTTP response
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool._download_image("https://example.com/test.png")
+
+        assert result is not None
+        assert "generated_image_" in result
+        assert result.endswith(".png")
+
+        # Verify timeout was set to default 30 seconds
+        mock_get.assert_called_once()
+        # The timeout is passed as aiohttp.ClientTimeout object in the session
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_download_image_with_custom_timeout(self, mock_get, mock_workspace):
+        """Test image download with custom timeout"""
+        # Create tool with workspace
+        tool = ImageGenerationToolCore({}, {}, mock_workspace)
+
+        # Mock HTTP response
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        # Test with custom timeout
+        result = await tool._download_image("https://example.com/test.png", timeout=60)
+
+        assert result is not None
+        assert "generated_image_" in result
+        assert result.endswith(".png")
+
+        # Verify timeout was set to 60 seconds
+        mock_get.assert_called_once()
+        # The timeout is passed as aiohttp.ClientTimeout object in the session
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_download_image_with_custom_timeout_parameter(
+        self, mock_get, mock_workspace
+    ):
+        """Test that core class accepts custom timeout parameter"""
+        # Create tool with workspace
+        tool = ImageGenerationToolCore({}, {}, mock_workspace)
+
+        # Mock HTTP response
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        # Test with custom timeout parameter
+        result = await tool._download_image("https://example.com/test.png", timeout=120)
+
+        assert result is not None
+        assert "generated_image_" in result
+        assert result.endswith(".png")
+
+        # Verify the call was made
+        mock_get.assert_called_once()
+
+    def test_list_available_models(self, image_tool_core, mock_image_models):
+        """Test listing available models"""
+        result = image_tool_core.list_available_models()
+
+        assert result["success"] is True
+        assert result["count"] == 2
+        assert len(result["models"]) == 2
+
+        # Check that all model IDs are present
+        model_ids = [model["model_id"] for model in result["models"]]
+        assert "model1" in model_ids
+        assert "model2" in model_ids
+
+        # Check model availability and descriptions
+        for model in result["models"]:
+            assert model["available"] is True
+            assert "description" in model
+            assert len(model["description"]) > 0
+
+        # Check specific descriptions
+        model1_info = next(m for m in result["models"] if m["model_id"] == "model1")
+        model2_info = next(m for m in result["models"] if m["model_id"] == "model2")
+        assert model1_info["description"] == "Test model 1"
+        assert model2_info["description"] == "Test model 2"
+
+    def test_list_available_models_empty(self, mock_workspace):
+        """Test listing available models when no models are configured"""
+        tool = ImageGenerationToolCore({}, workspace=mock_workspace)
+        result = tool.list_available_models()
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["models"] == []
+
+    def test_get_model_with_id(self, image_tool_core, mock_image_models):
+        """Test _get_model method with specific model ID"""
+        model = image_tool_core._get_model("model2")
+        assert model == mock_image_models["model2"]
+
+    def test_get_model_with_default(self, image_tool_core, mock_image_models):
+        """Test _get_model method with default model"""
+        model = image_tool_core._get_model()
+        assert model == mock_image_models["model1"]  # First model
+
+    def test_get_model_with_nonexistent_id(self, image_tool_core, mock_image_models):
+        """Test _get_model method with non-existent model ID"""
+        model = image_tool_core._get_model("nonexistent")
+        assert model == mock_image_models["model1"]  # Should return default
+
+    def test_get_model_with_empty_models(self, mock_workspace):
+        """Test _get_model method with no models"""
+        tool = ImageGenerationToolCore({}, workspace=mock_workspace)
+        model = tool._get_model()
+        assert model is None
+
+    def test_model_info_text_generation(self, mock_workspace):
+        """Test that model info text is generated correctly"""
+        # Create mock image models with descriptions
+        mock_model1 = Mock(spec=BaseImageModel)
+        mock_model2 = Mock(spec=BaseImageModel)
+
+        image_models = {
+            "model1": mock_model1,
+            "model2": mock_model2,
+        }
+
+        model_descriptions = {
+            "model1": "Test model 1 description",
+            "model2": "Test model 2 description",
+        }
+
+        image_tool = ImageGenerationToolCore(
+            image_models,  # pyright: ignore[reportArgumentType]
+            model_descriptions,
+            workspace=mock_workspace,
+        )
+
+        # Check that model info text was generated during initialization
+        assert hasattr(image_tool, "_model_info_text")
+
+        # Verify the format
+        model_info = image_tool._model_info_text
+        lines = model_info.split("\n")
+
+        # Should have one line per model
+        assert len(lines) == 2
+        assert "- model1: Test model 1 description ✎" in lines
+        assert "- model2: Test model 2 description ✎" in lines
+
+    def test_model_info_text_generation_without_descriptions(self, mock_workspace):
+        """Test model info text generation when models have no descriptions"""
+        mock_models = {"model1": Mock(spec=BaseImageModel)}
+
+        # Create tool without descriptions
+        image_tool = ImageGenerationToolCore(
+            mock_models,  # pyright: ignore[reportArgumentType]
+            {},
+            workspace=mock_workspace,
+        )
+
+        # Check that it handles missing descriptions gracefully
+        model_info = image_tool._model_info_text
+        assert "- model1: No description available" in model_info
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_success(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test successful image editing"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 15, "output_tokens": 25},
+                "request_id": "edit_req1",
+            }
+        )
+        # Add has_ability method to indicate edit capability
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+        )
+
+        assert result["success"] is True
+        assert result["image_path"] is not None
+        assert result["model_used"] == "model1"
+        assert result["usage"] == {"input_tokens": 15, "output_tokens": 25}
+        assert result["request_id"] == "edit_req1"
+        assert result["saved_to_workspace"] is True
+        assert result["artifacts"][0]["type"] == "image"
+        assert result["artifacts"][0]["file_id"] == "test-file-id"
+        assert "preview_url" not in result["artifacts"][0]
+        assert "markdown_ref" not in result["artifacts"][0]
+
+        # Verify the model's edit_image was called
+        mock_image_models["model1"].edit_image.assert_called_once_with(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            size="1024*1024",
+            negative_prompt="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_image_with_no_edit_models(
+        self, mock_image_models, mock_workspace
+    ):
+        """Test image editing when no models support editing"""
+        # Models don't have has_ability method or don't support editing
+        for model in mock_image_models.values():
+            model.has_ability = Mock(return_value=False)
+
+        tool = ImageGenerationToolCore(mock_image_models, workspace=mock_workspace)
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+        )
+
+        assert result["success"] is False
+        assert "No available image models with edit capabilities" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_edit_image_with_model_error(self, mock_image_models, mock_workspace):
+        """Test image editing when model raises an exception"""
+        # Configure mock model to support editing but raise error
+        mock_image_models["model1"].edit_image = AsyncMock(
+            side_effect=Exception("Edit model error")
+        )
+        # Add has_ability method to indicate edit capability
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(mock_image_models, workspace=mock_workspace)
+
+        result = await tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+        )
+
+        assert result["success"] is False
+        assert result["error"] == "Edit model error"
+        assert result["model_used"] == "model1"
+
+    @pytest.mark.asyncio
+    async def test_edit_image_stages_file_ref_and_cleans_up(
+        self, mock_image_models, tmp_path
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        staged_path = workspace_root / ".staged" / "source.png"
+        staged_path.parent.mkdir()
+        staged_path.write_bytes(b"source")
+
+        workspace = Mock()
+        workspace.workspace_dir = workspace_root
+        workspace.output_dir = workspace_root / "output"
+        workspace.output_dir.mkdir()
+        workspace.resolve_path_with_search = Mock(
+            side_effect=lambda value: (
+                staged_path
+                if value == str(staged_path)
+                else (_ for _ in ()).throw(FileNotFoundError(value))
+            )
+        )
+        workspace.stage_path_for_external_upload = Mock(return_value=staged_path)
+        workspace.stage_file_for_external_upload = Mock()
+        workspace.discard_staged_external_upload = Mock()
+
+        @contextmanager
+        def auto_register_files():
+            yield workspace
+
+        workspace.auto_register_files = auto_register_files
+        model = mock_image_models["model1"]
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(return_value={"image_url": None})
+        tool = ImageGenerationToolCore({"model1": model}, workspace=workspace)
+
+        result = await tool.edit_image(
+            prompt="edit",
+            image_url="file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
+        )
+
+        assert result["success"] is True
+        workspace.stage_path_for_external_upload.assert_called_once_with(
+            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
+            max_bytes=100 * 1024 * 1024,
+            host_private=True,
+        )
+        workspace.stage_file_for_external_upload.assert_not_called()
+        model.edit_image.assert_awaited_once()
+        assert model.edit_image.await_args.kwargs["image_url"] == str(staged_path)
+        workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
+
+    @pytest.mark.asyncio
+    async def test_edit_image_uses_private_staging_with_real_workspace(
+        self, mock_image_models, tmp_path
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        source = workspace.output_dir / "source.png"
+        source.write_bytes(b"image")
+        observed: dict[str, Path] = {}
+
+        async def edit_image(**kwargs):
+            staged = Path(kwargs["image_url"])
+            assert staged.is_file()
+            assert not staged.is_relative_to(workspace.workspace_dir)
+            observed["staged"] = staged
+            return {"image_url": None}
+
+        model = mock_image_models["model1"]
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(side_effect=edit_image)
+        tool = ImageGenerationToolCore({"model1": model}, workspace=workspace)
+
+        result = await tool.edit_image(
+            prompt="edit",
+            image_url="output/source.png",
+        )
+
+        assert result["success"] is True
+        assert not observed["staged"].exists()
+
+    @pytest.mark.asyncio
+    async def test_edit_image_discards_staged_input_when_provider_fails(
+        self, mock_image_models, tmp_path
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        staged_path = workspace_root / ".staged" / "source.png"
+        staged_path.parent.mkdir()
+        staged_path.write_bytes(b"source")
+        workspace = Mock()
+        workspace.workspace_dir = workspace_root
+        workspace.output_dir = workspace_root / "output"
+        workspace.output_dir.mkdir()
+        workspace.stage_path_for_external_upload = Mock(return_value=staged_path)
+        workspace.resolve_path_with_search = Mock(return_value=staged_path)
+        workspace.discard_staged_external_upload = Mock()
+
+        @contextmanager
+        def auto_register_files():
+            yield workspace
+
+        workspace.auto_register_files = auto_register_files
+        model = mock_image_models["model1"]
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(side_effect=RuntimeError("provider failed"))
+        tool = ImageGenerationToolCore({"model1": model}, workspace=workspace)
+
+        result = await tool.edit_image(prompt="edit", image_url="output/source.png")
+
+        assert result["success"] is False
+        workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
+
+    def test_edit_image_rejects_arbitrary_absolute_path(
+        self, mock_image_models, tmp_path
+    ):
+        workspace = Mock()
+        workspace.workspace_dir = tmp_path
+        workspace.resolve_path_with_search = Mock(
+            side_effect=ValueError("outside workspace")
+        )
+        workspace.stage_path_for_external_upload = Mock(
+            side_effect=ValueError("outside workspace")
+        )
+        workspace.stage_file_for_external_upload = Mock()
+        tool = ImageGenerationToolCore(mock_image_models, workspace=workspace)
+
+        with pytest.raises(ValueError, match="Access denied"):
+            tool._resolve_edit_image_path("/etc/passwd", [])
+
+        workspace.stage_path_for_external_upload.assert_called_once_with(
+            "/etc/passwd",
+            max_bytes=100 * 1024 * 1024,
+            host_private=True,
+        )
+        workspace.stage_file_for_external_upload.assert_not_called()
+
+    def test_edit_image_preserves_staging_failure_reason(
+        self, mock_image_models, tmp_path
+    ):
+        workspace = Mock()
+        workspace.workspace_dir = tmp_path
+        workspace.stage_path_for_external_upload = Mock(
+            side_effect=ExternalUploadStagingError("staging is read-only")
+        )
+        tool = ImageGenerationToolCore(mock_image_models, workspace=workspace)
+
+        with pytest.raises(ExternalUploadStagingError, match="staging is read-only"):
+            tool._resolve_edit_image_path("output/source.png", [])
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_with_multiple_images(
+        self, mock_get, mock_image_models, mock_workspace
+    ):
+        """Test image editing with multiple input images"""
+        # Configure mock model to support editing
+        mock_image_models["model1"].edit_image = AsyncMock(
+            return_value={
+                "image_url": "https://example.com/edited_image.jpg",
+                "usage": {"input_tokens": 20, "output_tokens": 30},
+                "request_id": "edit_req2",
+            }
+        )
+        # Add has_ability method to indicate edit capability
+        mock_image_models["model1"].has_ability = Mock(return_value=True)
+
+        tool = ImageGenerationToolCore(
+            mock_image_models, {"model1": "Test model 1"}, mock_workspace
+        )
+
+        # Mock HTTP response for image download
+        mock_response = Mock()
+        mock_response.status = 200
+        mock_response.headers = {}
+
+        # Create async iterator for chunks
+        async def mock_iter_chunked(chunk_size):
+            for chunk in [b"fake_edited_image_data"]:
+                yield chunk
+
+        mock_response.content.iter_chunked = mock_iter_chunked
+        mock_get.return_value.__aenter__.return_value = mock_response
+
+        result = await tool.edit_image(
+            prompt="Combine these images",
+            image_url=[
+                "https://example.com/image1.jpg",
+                "https://example.com/image2.jpg",
+            ],
+        )
+
+        assert result["success"] is True
+        assert result["image_path"] is not None
+        assert result["saved_to_workspace"] is True
+
+        # Verify the model's edit_image was called with list
+        mock_image_models["model1"].edit_image.assert_called_once_with(
+            prompt="Combine these images",
+            image_url=[
+                "https://example.com/image1.jpg",
+                "https://example.com/image2.jpg",
+            ],
+            size="1024*1024",
+            negative_prompt="",
+        )
+
+    @pytest.mark.parametrize(
+        "edit_kwargs,expected_kwargs",
+        [
+            ({"size": "2048*2048"}, {"size": "2048*2048"}),
+            ({"width": 1920, "height": 1080}, {"width": 1920, "height": 1080}),
+            ({"resolution": "1920x1080"}, {"resolution": "1920x1080"}),
+            ({"aspect_ratio": "16:9"}, {"aspect_ratio": "16:9"}),
+            (
+                {"size": "2048*2048", "aspect_ratio": "1:1"},
+                {"size": "2048*2048", "aspect_ratio": "1:1"},
+            ),
+        ],
+        ids=["size", "width_height", "resolution", "aspect_ratio", "size_and_aspect"],
+    )
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_size_parameters(
+        self, mock_get, edit_image_tool, mock_image_models, edit_kwargs, expected_kwargs
+    ):
+        """Test image editing with various size parameter combinations."""
+        _setup_edit_http_mock(mock_get)
+
+        result = await edit_image_tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+            **edit_kwargs,
+        )
+
+        assert result["success"] is True
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        for key, value in expected_kwargs.items():
+            assert call_kwargs[key] == value
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_default_size_is_passed(
+        self, mock_get, edit_image_tool, mock_image_models
+    ):
+        """Test that default size is passed to the model (consistent with generate_image)."""
+        _setup_edit_http_mock(mock_get)
+
+        result = await edit_image_tool.edit_image(
+            prompt="Make it look like a painting",
+            image_url="https://example.com/original.jpg",
+        )
+
+        assert result["success"] is True
+        mock_image_models["model1"].edit_image.assert_called_once()
+        call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
+        assert "size" in call_kwargs
+        assert call_kwargs["size"] == "1024*1024"
+
+
+def _transparency_tool(mock_workspace, *, supports: bool):
+    """Single-model tool whose provider either emits alpha or cannot."""
+    model = Mock(spec=BaseImageModel)
+    model.generate_image = AsyncMock(
+        return_value={"image_url": "https://example.com/out.png", "usage": {}}
+    )
+    model.edit_image = AsyncMock(
+        return_value={"image_url": "https://example.com/out.png", "usage": {}}
+    )
+    model.has_ability = Mock(return_value=True)
+    # Explicit because Mock(spec=...) would otherwise answer this property with
+    # a truthy Mock and silently claim the capability.
+    model.supports_transparent_background = supports
+    tool = ImageGenerationToolCore({"m": model}, {"m": "Test model"}, mock_workspace)
+    return tool, model
+
+
+class TestTransparentBackground:
+    """Served natively where the provider supports it, refused where it does not."""
+
+    def test_descriptions_document_the_parameter(self):
+        for description in (
+            ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION,
+            ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION,
+        ):
+            assert "transparent_background" in description
+            # The model has to know prompt wording alone never produces alpha,
+            # or it will keep asking for transparency in prose.
+            assert "does NOT work" in description
+            assert "◻" in description
+
+    @pytest.mark.asyncio
+    async def test_capable_model_receives_the_flag(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=True)
+
+        result = await tool.generate_image(
+            prompt="a rocket icon", transparent_background=True
+        )
+
+        assert result["success"] is True
+        assert model.generate_image.call_args.kwargs["transparent_background"] is True
+
+    @pytest.mark.asyncio
+    async def test_incapable_model_is_refused_not_downgraded(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=False)
+
+        result = await tool.generate_image(
+            prompt="a rocket icon", transparent_background=True
+        )
+
+        # Returning an opaque image as though it had worked is the failure this
+        # guard exists to prevent.
+        assert result["success"] is False
+        assert "transparent background" in result["error"]
+        model.generate_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refusal_says_no_model_can_when_none_can(self, mock_workspace):
+        tool, _ = _transparency_tool(mock_workspace, supports=False)
+
+        result = await tool.generate_image(prompt="x", transparent_background=True)
+
+        # Without this the caller can only retry blindly against the same model.
+        assert "No configured image model" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_a_capable_model_when_one_exists(self, mock_workspace):
+        capable = Mock(spec=BaseImageModel)
+        capable.has_ability = Mock(return_value=True)
+        capable.supports_transparent_background = True
+        plain = Mock(spec=BaseImageModel)
+        plain.has_ability = Mock(return_value=True)
+        plain.generate_image = AsyncMock(return_value={"image_url": "u", "usage": {}})
+        plain.supports_transparent_background = False
+        tool = ImageGenerationToolCore(
+            {"plain": plain, "gpt-image-1": capable}, {}, mock_workspace
+        )
+
+        result = await tool.generate_image(
+            prompt="x", model_id="plain", transparent_background=True
+        )
+
+        assert result["success"] is False
+        assert "gpt-image-1" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_flag_sent_when_not_requested(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=True)
+
+        await tool.generate_image(prompt="a rocket icon")
+
+        assert "transparent_background" not in model.generate_image.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_edit_path_is_gated_too(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=False)
+
+        result = await tool.edit_image(
+            prompt="cut the product out",
+            image_url="https://example.com/in.png",
+            transparent_background=True,
+        )
+
+        assert result["success"] is False
+        model.edit_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reference_images_carry_the_request_into_editing(
+        self, mock_workspace
+    ):
+        tool, model = _transparency_tool(mock_workspace, supports=True)
+
+        # generate_image delegates to edit_image when references are supplied;
+        # dropping the flag there would silently return an opaque image.
+        await tool.generate_image(
+            prompt="cut this out",
+            images="https://example.com/ref.png",
+            transparent_background=True,
+        )
+
+        assert model.edit_image.call_args.kwargs["transparent_background"] is True
+
+    def test_listing_reports_the_capability(self, mock_workspace):
+        capable, _ = _transparency_tool(mock_workspace, supports=True)
+        plain, _ = _transparency_tool(mock_workspace, supports=False)
+
+        assert (
+            capable.list_available_models()["models"][0][
+                "supports_transparent_background"
+            ]
+            is True
+        )
+        assert (
+            plain.list_available_models()["models"][0][
+                "supports_transparent_background"
+            ]
+            is False
+        )
+        # The legend the descriptions explain has to actually appear.
+        assert "◻" in capable._model_info_text
+        assert "◻" not in plain._model_info_text

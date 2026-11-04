@@ -1,0 +1,100 @@
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+from .database import Base
+
+# The R6 lease-recovery sweep (task_lease_recovery.py) selects rows with this
+# exact predicate every tick, both to page task_ids
+# (reconcile_orphaned_pending_deliveries_isolated) and to close one task's
+# rows inside its own recovery transaction
+# (reconcile_orphaned_pending_deliveries_no_commit). Almost every row settles
+# out of "pending" quickly, so the predicate is highly selective and a
+# partial index keeps the sweep from scanning the whole table as it grows.
+_PENDING_DELIVERY_CLAUSE = text("delivery_status = 'pending'")
+_USER_TURN_CLAUSE = text("role = 'user'")
+
+
+class TaskChatMessage(Base):  # type: ignore
+    """Persisted transcript message for a task chat session."""
+
+    __tablename__ = "task_chat_messages"
+    __table_args__ = (
+        Index(
+            "uq_task_chat_messages_task_role_turn_id",
+            "task_id",
+            "role",
+            "turn_id",
+            unique=True,
+            sqlite_where=_USER_TURN_CLAUSE,
+            postgresql_where=_USER_TURN_CLAUSE,
+        ),
+        # task_id: the per-task reconciliation call (used both from the
+        # lease-recovery fenced transaction and from the isolated sweep's
+        # per-task pass) filters on task_id equality alongside the
+        # delivery_status predicate. created_at: the sweep's initial scan
+        # additionally filters "created_at < created_before" (rows younger
+        # than one lease TTL are left for their own run to settle) and pages
+        # results ordered by task_id, so created_at is carried as a second
+        # key rather than its own index -- it is never queried without the
+        # delivery_status/task_id predicates already narrowing to a handful
+        # of rows.
+        Index(
+            "ix_task_chat_messages_pending_delivery",
+            "task_id",
+            "created_at",
+            sqlite_where=_PENDING_DELIVERY_CLAUSE,
+            postgresql_where=_PENDING_DELIVERY_CLAUSE,
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role = Column(String(32), nullable=False)
+    content = Column(Text, nullable=False)
+    message_type = Column(String(64), nullable=False)
+    interactions = Column(JSON, nullable=True)
+    # Identity of the assistant TraceEvent this row was written from, so
+    # historical replay can drop the trace twin of a question instead of
+    # printing the same clarification form twice (#2292). NULL on rows
+    # written before the column existed; replay derives those instead.
+    source_event_id = Column(String(255), nullable=True)
+    # Stable per-user-turn identity shared with user_message trace events. Used
+    # by historical replay to reconcile trace rows with transcript rows without
+    # collapsing distinct turns that happen to share text/attachments.
+    turn_id = Column(String(64), nullable=True, index=True)
+    # Durable handoff outcome for retry-safe user-message delivery. Legacy
+    # rows remain NULL and are treated as already delivered.
+    delivery_status = Column(String(32), nullable=True)
+    # Per-message attachments (uploaded files). For user messages this is the
+    # list of files the user attached when sending this turn. Stored as JSON so
+    # the original file metadata (file_id, name, size, type) is available for
+    # historical replay without having to re-derive it from the message body.
+    attachments = Column(JSON, nullable=True)
+    # Transitional projection identity; NULL for legacy transcript rows.
+    execution_event_id = Column(String(36), nullable=True, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    task = relationship("Task", back_populates="chat_messages")
+    user = relationship("User", back_populates="chat_messages")
+
+    def __repr__(self) -> str:
+        return (
+            f"<TaskChatMessage(id={self.id}, task_id={self.task_id}, "
+            f"role='{self.role}', message_type='{self.message_type}')>"
+        )

@@ -1,0 +1,912 @@
+import enum
+from typing import Any, Collection
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import (
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import deferred, relationship
+from sqlalchemy.sql import func
+
+from .database import Base
+
+# Trace payload columns are jsonb on PostgreSQL (#1248): jsonb decodes JSON
+# escapes to native text at write time, so it rejects at INSERT the two
+# shapes a plain json column stored happily and then failed to read back
+# through ->> (#1149) -- the NUL escape and either half of an unpaired
+# UTF-16 surrogate. Producers sanitize those code points away before the
+# write (web/utils/json_payload_sanitizer.py); this type is the backstop
+# that keeps any unsanitized path from planting a payload the database
+# cannot read. Existing json columns are converted by the
+# 20260813_trace_json_columns_to_jsonb migration. Other dialects keep the
+# generic JSON type.
+TRACE_PAYLOAD_JSON = JSON().with_variant(JSONB(), "postgresql")
+
+
+class TaskStatus(enum.Enum):
+    """Task status enumeration"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    WAITING_FOR_USER = "waiting_for_user"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class TaskStatusEnumDriftError(RuntimeError):
+    """The live database's ``taskstatus`` enum does not carry the same labels
+    as ``TaskStatus``. Raised during database startup, before the process
+    begins serving, because a mismatch here has no runtime remedy: writing a
+    label the database does not have fails at the write, in request context,
+    after the caller already believes the transition happened.
+    """
+
+
+#: The Alembic revision that adds ``WAITING_FOR_USER`` to a native
+#: ``taskstatus`` enum created before that member existed. Named in the
+#: remediation text below so an operator reading a startup failure has an
+#: exact revision rather than a description; pinned against the revision file
+#: itself by
+#: tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py.
+#: This revision only backfills the ``WAITING_FOR_USER`` label. Each future
+#: ``TaskStatus`` member needs its own ``ALTER TYPE ... ADD VALUE``
+#: migration, and this constant needs updating to name it, or the
+#: remediation text above keeps pointing an operator at a revision that
+#: does not add the label they are missing.
+TASKSTATUS_ENUM_REPAIR_REVISION = "20260901_taskstatus_waiting_for_user"
+
+_MISSING_LABEL_REMEDY = (
+    "Upgrade this database to the Alembic head: revision "
+    f"{TASKSTATUS_ENUM_REPAIR_REVISION} adds WAITING_FOR_USER to the type "
+    "backing tasks.status. A label no revision adds needs one written; to "
+    "repair a database by hand instead, run ALTER TYPE <the type tasks.status "
+    "is declared with> ADD VALUE IF NOT EXISTS '<label>' for each missing "
+    "label, then restart this process."
+)
+
+
+def check_task_status_enum_drift(bind: Connection) -> None:
+    """Refuse to serve when the live ``taskstatus`` enum's labels disagree
+    with the labels ``Task.status`` is declared with.
+
+    A no-op on every backend other than PostgreSQL: ``pg_enum`` is a
+    PostgreSQL system catalog, and the other backends this repo supports
+    store the ``Enum`` column as a plain string, checked at the ORM layer
+    instead.
+
+    Takes the caller's connection rather than opening its own, and runs from
+    ``_initialize_database_schema`` (``models/database.py``) after
+    ``try_upgrade_db`` and inside ``database_startup_lock``. Three properties
+    follow from that placement and are the reason for it. A migration that
+    adds a ``TaskStatus`` label via ``ALTER TYPE ... ADD VALUE`` has already
+    run by the time this check reads the catalog, so shipping one cannot
+    trip this check into a crash loop -- revision
+    ``20260901_taskstatus_waiting_for_user`` is that migration for
+    ``WAITING_FOR_USER``. The connection is the startup lock's
+    own, so this check adds no failure mode of its own beyond the ones
+    schema initialization already has. And no second backend worker can
+    observe a half-initialized database while it runs.
+
+    Unlike ``validate_builtin_public_mcp_apps`` (``builtin_mcp_registry.py``),
+    which runs from the same place and only reports drift, this one raises.
+    Catalog drift there is configuration that an operator can reconcile while
+    the process serves; a missing enum label is a write that will fail after
+    a caller already believes a status transition succeeded, so the process
+    must not begin serving at all.
+
+    Keyed on the ``tasks`` table's existence rather than on an empty live
+    label set, because two different situations produce that same empty
+    set and only one of them is drift. "Nothing has been created yet" is
+    not; "``tasks`` is present and its ``status`` column yields no enum
+    labels" is, and it stays caught: the column is gone (``DROP TYPE ...
+    CASCADE`` takes the column with the type), or ``status`` is not an
+    enum column at all. Both of those report every ``TaskStatus`` member
+    as missing and refuse to serve, which is the direction to fail in.
+    Callers that run schema creation first (the startup path does) always
+    find ``tasks`` present; the guard covers a caller that passes a bind
+    whose schema has not been created.
+
+    Reads the labels off ``tasks.status``'s own type rather than off
+    whichever type happens to be named ``taskstatus``. ``to_regclass``
+    resolves the unqualified ``tasks`` exactly as the ``has_table("tasks")``
+    guard above does, ``pg_attribute`` names the column, and ``atttypid``
+    is the type that column is declared with -- one resolution, not two
+    that can disagree. Matching on the type name would be the second,
+    independent one: PostgreSQL resolves relation names and type names
+    against ``search_path`` separately, so with ``search_path = shadow,
+    public``, a ``shadow.taskstatus`` and a ``public.tasks`` whose column
+    uses ``public.taskstatus`` send the two lookups to different schemas.
+    A complete copy in ``shadow`` would then hide a label genuinely missing
+    from the type the column uses, and an extra label on that copy would
+    reject a correct deployment.
+
+    Expected labels come from ``Task.__table__.c.status.type.enums`` --
+    the ``Enum`` column's own declared labels -- rather than from
+    ``{member.name for member in TaskStatus}``. Today the two sets are
+    equal, because the column has no ``values_callable`` and SQLAlchemy's
+    default is to persist member names. If the column is ever given a
+    ``values_callable`` that persists something else (member values, for
+    instance), the column's declared labels stop matching the member-name
+    set, and only the column is still the live database's contract.
+    """
+
+    if bind.dialect.name != "postgresql":
+        return
+
+    if not sa_inspect(bind).has_table("tasks"):
+        return  # schema not created yet -- nothing to compare
+
+    live_labels = set(
+        bind.scalars(
+            text(
+                "SELECT e.enumlabel "
+                "FROM pg_catalog.pg_attribute a "
+                "JOIN pg_catalog.pg_enum e ON e.enumtypid = a.atttypid "
+                "WHERE a.attrelid = pg_catalog.to_regclass('tasks') "
+                "AND a.attname = 'status'"
+            )
+        )
+    )
+
+    expected_labels = set(Task.__table__.c.status.type.enums)
+    if live_labels == expected_labels:
+        return
+
+    missing = sorted(expected_labels - live_labels)
+    extra = sorted(live_labels - expected_labels)
+    if missing and extra:
+        remedy = (
+            f"{_MISSING_LABEL_REMEDY} The unexpected label(s) indicate this "
+            "process is older than the database and cannot be reconciled by "
+            "a migration, since PostgreSQL has no ALTER TYPE ... DROP VALUE."
+        )
+    elif missing:
+        remedy = _MISSING_LABEL_REMEDY
+    else:
+        remedy = (
+            "No migration can remove them -- PostgreSQL has no ALTER TYPE ... "
+            "DROP VALUE -- so this process is older than the database it is "
+            "pointed at."
+        )
+    raise TaskStatusEnumDriftError(
+        "PostgreSQL 'taskstatus' enum type has drifted from TaskStatus: "
+        f"missing labels {missing}, unexpected labels {extra}. {remedy}"
+    )
+
+
+class DAGExecutionPhase(enum.Enum):
+    """DAG execution phase enumeration"""
+
+    PLANNING = "planning"
+    EXECUTING = "executing"
+    CHECKING = "checking"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class StepStatus(enum.Enum):
+    """Step status enumeration"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ANALYZED = "analyzed"
+
+
+class ExecutionMode(enum.Enum):
+    """Execution mode enumeration"""
+
+    FLASH = "flash"  # Simple, quick tasks (single_call pattern)
+    BALANCED = "balanced"  # Most everyday tasks (react pattern)
+    THINK = "think"  # Complex, multi-step tasks (dag_plan_execute pattern)
+    AUTO = "auto"  # Let agent choose final answer, ReAct, or DAG
+
+
+class AgentType(enum.Enum):
+    """Agent type enumeration"""
+
+    STANDARD = "standard"  # Standard purpose agent
+
+
+class Task(Base):  # type: ignore
+    """Task model"""
+
+    __tablename__ = "tasks"
+    __table_args__ = (
+        Index("ix_tasks_agent_id_source", "agent_id", "source"),
+        Index(
+            "ix_tasks_status_lease_expires_at",
+            "status",
+            "lease_expires_at",
+            "id",
+        ),
+        # The task-level marker for the protocol version of the interaction
+        # row this task's readers should expect. NULL means "no v1 row was
+        # staged for the current wait" and readers fall back to the legacy
+        # transcript path; 1 means a protocol v1 interaction row exists.
+        #
+        # Every online-built shape now carries this CHECK: a create_all
+        # fresh install, a PostgreSQL database that walked the migration
+        # chain, and a SQLite database that walked the migration chain --
+        # the last of those via upgrade() rebuilding the table with
+        # batch_alter_table, the same technique downgrade() already used to
+        # remove the CHECK, since a plain CHECK-add raises
+        # NotImplementedError on SQLite. The one shape that still lacks it
+        # is an offline (--sql generation) SQLite upgrade script: a
+        # batch_alter_table rebuild cannot render under --sql mode on
+        # either dialect, and offline SQL support is a hard requirement, so
+        # that branch has no path to the CHECK. That remaining asymmetry is
+        # asserted as expected, not merely left uncovered -- see
+        # test_offline_upgrade_sqlite_emits_add_column_only in
+        # tests/alembic/test_20260810_add_task_interaction_protocol_version.py.
+        #
+        # SQLite is the default self-hosted backend (get_database_url()
+        # falls back to it when DATABASE_URL is unset); PostgreSQL is the
+        # recommended backend at production scale.
+        #
+        # Unlike task_interaction_requests' floor-plus-active-pin split
+        # (which lets terminated rows carry future versions), this is a
+        # single mutable current-wait pointer with no historical rows, so an
+        # unconditional NULL-or-1 pin is the whole contract.
+        CheckConstraint(
+            "interaction_protocol_version IS NULL OR interaction_protocol_version = 1",
+            name="ck_tasks_interaction_protocol_version",
+        ),
+        # Deleted tasks leave retained files under web_task_<id>. Never give
+        # their workspace identity to a later task on SQLite.
+        {"sqlite_autoincrement": True},
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    description = Column(Text)
+    # Production creation remains legacy; version 2 is exercised by migration
+    # tests until the event readers are ready for production routing.
+    conversation_storage_version = Column(
+        Integer,
+        CheckConstraint(
+            "conversation_storage_version IN (1, 2)",
+            name="ck_tasks_conversation_storage_version",
+        ),
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    conversation_event_sequence = Column(
+        BigInteger,
+        CheckConstraint(
+            "conversation_event_sequence >= 0",
+            name="ck_tasks_conversation_event_sequence",
+        ),
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    # sqlalchemy.Enum(TaskStatus) with no values_callable persists member
+    # *names* (e.g. "WAITING_FOR_USER"), not member values
+    # ("waiting_for_user"). validate_strings=True rejects a raw string that
+    # is not one of those names at bind time (StatementError/LookupError,
+    # symmetric on SQLite and PostgreSQL); it is a second-layer guard behind
+    # TaskStatusPredicate below and does not change the DDL. It does not
+    # cover raw-SQL writes that bypass the ORM/Core bind path -- those stay
+    # covered by the storage-layer sentinels in
+    # tests/web/services/test_task_status_storage.py.
+    status: Any = Column(
+        Enum(TaskStatus, validate_strings=True), default=TaskStatus.PENDING
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    # Retention anchor: the time of the last *conversational* activity on this
+    # task, written only when a row is persisted to ``task_chat_messages``
+    # (the insert paths in chat_history_service, via
+    # ``services.task_retention.touch_task_last_activity``). Owner: #2562.
+    #
+    # "Conversational" means it landed in the transcript the user reads. That
+    # includes system notices rendered as assistant turns -- an interruption
+    # or failure message moves this column, because the user sees it. It
+    # excludes everything that never reaches the transcript, which is the
+    # class ``updated_at`` cannot distinguish.
+    #
+    # ``updated_at`` above cannot serve this purpose: it carries
+    # ``onupdate=func.now()``, so every unrelated write to this row advances
+    # it -- the token tracker's periodic counter writes
+    # (tracking/task_tracker.py), lease acquisition and heartbeat renewal,
+    # completion writes, and checkpoint-pointer maintenance. A retention
+    # period anchored on it would be postponed indefinitely by execution
+    # bookkeeping that no user ever saw.
+    #
+    # NULL on rows written before this column existed *and* not yet reached
+    # by the backfill in revision 20260922_task_last_activity_at, and on any
+    # task that has never carried a message. Readers must not treat NULL as
+    # "infinitely recent" -- ``retention_anchor()`` coalesces it to
+    # ``created_at`` so a message-less task cannot become immortal. The
+    # column deliberately carries no server default: one would have made
+    # ``ALTER TABLE`` stamp every pre-existing row with the migration's own
+    # clock, which is exactly the value the backfill exists to avoid.
+    #
+    # No index yet. The set-scanning consumer is the purge job (#2563), not
+    # the read-only preview in this revision, and a plain CREATE INDEX on a
+    # multi-million-row ``tasks`` table takes a lock for its duration --
+    # PostgreSQL wants CONCURRENTLY, which cannot run inside Alembic's
+    # migration transaction. Whoever adds the scan adds the index, with the
+    # deployment procedure that goes with it.
+    last_activity_at = Column(DateTime(timezone=True), nullable=True)
+    # When the retention purge last removed this task's execution trace
+    # (#2565). The conversation survives trace expiry and can take new turns,
+    # which write new trace rows, so this does not mean "has no steps": it
+    # means the steps from before this moment were removed and a steps read
+    # may be incomplete. NULL when retention never touched the trace.
+    traces_expired_at = Column(DateTime(timezone=True), nullable=True)
+    runner_id = Column(String(255), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    last_checkpoint_event_id = Column(String(255), nullable=True)
+    # Exact-row anchor: the primary key of the trace_events row that
+    # last_checkpoint_event_id names. Readers that find this set can load the
+    # checkpoint by primary key instead of re-resolving the legacy string
+    # column against the row set. This FK forms a cycle with
+    # trace_events.task_id -> tasks.id: it must be named, or an unnamed
+    # constraint in that cycle raises CircularDependencyError on backends
+    # whose create_all/drop_all doesn't go through Alembic (e.g. PostgreSQL
+    # in this repo's CI and dev paths); and it must be use_alter=True, or
+    # SQLAlchemy can't topologically sort DROP order across the cycle and a
+    # SQLite database with FK enforcement on (this repo's default -- see
+    # apply_sqlite_concurrency_pragmas) fails mid-drop_all with a DROP TABLE
+    # error on an unrelated table further down the (corrupted) drop order.
+    #
+    # Indexed because PostgreSQL checks this FK on every trace_events delete
+    # (checkpoint pruning, task deletion, retention purge) by looking tasks
+    # up on this column; without the index each deleted trace row is a full
+    # scan of tasks. Built by 20261031_task_checkpoint_pointer_index.
+    last_checkpoint_trace_event_id = Column(
+        Integer,
+        ForeignKey(
+            "trace_events.id",
+            name="fk_tasks_last_checkpoint_trace_event_id",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    # Monotonic task-control identity. ``run_id`` changes for each new turn,
+    # while pause/resume transitions retain it and advance ``state_version``.
+    # Clients use the version to ignore stale WebSocket status events.
+    run_id = Column(String(64), nullable=True, index=True)
+    state_version = Column(Integer, nullable=False, default=0, server_default="0")
+    control_state = Column(
+        String(32), nullable=False, default="idle", server_default="idle"
+    )
+    # Identity of the lease attempt that currently owns this row. Written
+    # only by acquire_task_lease_no_commit (a fresh uuid per claim) and
+    # cleared by the lease release/recovery writers. A non-NULL value does
+    # not mean that attempt is still running -- it means no writer has
+    # cleared it since. Readers that need liveness must consult runner_id
+    # and lease_expires_at, not this column.
+    #
+    # Deliberately a bare nullable column: no FK, no CHECK, no UNIQUE. It is
+    # never a WHERE predicate -- consumers read the row by primary key and
+    # compare in Python -- so an index would be pure write cost.
+    lease_attempt_id = Column(String(64), nullable=True)
+
+    # Protocol version of the interaction row that will back this task's
+    # current wait. Three writer groups are spoken for. The three wait
+    # finalizers will write it (1 when a row was staged, NULL when staging
+    # degraded) and have no writer yet. The four legacy-resume injection
+    # sites (the two WebSocket sites, the A2A resume-input path, and the
+    # v1 reply resume-input path) retire the row they answered and clear
+    # this column back to NULL in the same transaction, the clear
+    # conditioned on no active row for that run remaining afterwards;
+    # that writer already exists in task_interaction_close.py
+    # (close_legacy_resume_interaction). The three resume-abandonment
+    # paths have no row to retire and only reconcile the column, under
+    # the same condition; that writer also already exists in
+    # task_interaction_close.py
+    # (clear_interaction_marker_if_unpaired), called from the A2A prelease
+    # restore (a2a.py), the WebSocket lease restore (websocket.py), and
+    # the v1 reply prelease restore (task_reply.py), all
+    # production-reachable. Readers will need to gate on status ==
+    # WAITING_FOR_USER first: a task that left the waiting state by a path
+    # with no injection site (cancel, delete, failure, TTL reclaim, admin
+    # cleanup) will be able to carry a stale 1, and the next wait will
+    # overwrite it either way.
+    #
+    # Why a column on tasks rather than an EXISTS over
+    # task_interaction_requests: the read surface's first check is
+    # "interaction_protocol_version is NULL -> legacy path, ask the
+    # interaction table nothing; any other value -> ask the rich view,
+    # which is the only place that knows whether an active native row
+    # exists". All four call sites that ask already hold a loaded Task
+    # row when they need the answer, so the NULL check is a free
+    # attribute access -- while an EXISTS derivation would cost one
+    # cross-table query per waiting-status read, on paths that include the
+    # websocket's synchronous snapshot, which asks once and reuses the
+    # answer for both events it emits. The fourth call site runs in a
+    # worker-owned short session of its own rather than a request-scoped
+    # one, but it resolves and loads the same Task row before asking, so
+    # the same free-attribute-access argument applies to it unchanged.
+    # ``task_interaction_close.active_interaction_id_sync`` reads this same
+    # marker too, ahead of the interaction-table query it guards, but it is
+    # not one of the four above: it never holds a loaded Task row, so it
+    # pays for its own single-column primary-key query rather than getting
+    # the check for free. That is the trade against the alternative it
+    # replaced -- an uncached catalog inspection plus a two-table join --
+    # not a violation of the free-access argument above, which is about the
+    # read surface specifically.
+    # While every waiting task predates the native protocol (and during
+    # any rollback), the marker is NULL for all of them and the
+    # interaction table receives zero queries from the read path.
+    #
+    # Falling back to the legacy transcript is gated on the interaction
+    # slot being unclaimed, not on the structured side having failed to
+    # produce a question. Exactly two situations count as unclaimed: the
+    # interaction table does not exist yet, or this task has no active
+    # native row **on its current run**. As long as one active native row
+    # on this task's current run holds the slot, the read surface never
+    # falls back -- whether or not that row can be read. A row left
+    # behind by an earlier run does not hold the slot: the read
+    # surface's active-row predicate compares the row's run against the
+    # task's, so a stale one is invisible and the legacy fallback is
+    # correct there.
+    interaction_protocol_version = Column(Integer, nullable=True)
+
+    # Model configuration
+    model_name = Column(String(255), nullable=True)  # Main model used for the task
+    small_fast_model_name = Column(
+        String(255), nullable=True
+    )  # Small/fast model if configured
+    visual_model_name = Column(String(255), nullable=True)  # Visual model if configured
+    compact_model_name = Column(
+        String(255), nullable=True
+    )  # Compact model if configured
+
+    # Internal model identifiers (preferred over *_model_name for selection)
+    model_id = Column(String(255), nullable=True)
+    small_fast_model_id = Column(String(255), nullable=True)
+    visual_model_id = Column(String(255), nullable=True)
+    compact_model_id = Column(String(255), nullable=True)
+
+    # Agent configuration
+    agent_id = Column(
+        Integer, ForeignKey("agents.id"), nullable=True
+    )  # Agent Builder agent ID
+    agent_type = Column(
+        String(20), default=AgentType.STANDARD.value, nullable=True
+    )  # SQLite compatible
+    agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
+    connector_runtime_selected_refs = Column(JSON, nullable=True, default=list)
+
+    # Execution mode configuration
+    execution_mode = Column(
+        String(20), default=ExecutionMode.AUTO.value, nullable=True
+    )  # "flash" | "balanced" | "think" | "auto"
+    process_description = Column(
+        Text, nullable=True
+    )  # Process mode: detailed process description
+    examples = Column(JSON, nullable=True)  # Process mode: input/output examples
+
+    # Channel configuration
+    channel_id = Column(
+        Integer, ForeignKey("user_channels.id", ondelete="SET NULL"), nullable=True
+    )
+    channel_name = Column(String(100), nullable=True)
+    # External Telegram sender that owns this channel task. A channel may allow
+    # multiple Telegram accounts, so channel_id alone is not an authorization
+    # boundary for conversation history.
+    telegram_user_id = Column(String(32), nullable=True, index=True)
+
+    # Token usage statistics
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    llm_calls = Column(Integer, default=0)
+    token_usage_details = Column(JSON, nullable=True)  # Detailed breakdown
+
+    # Semantic result, separate from control status. NULL means unreported
+    # (including legacy rows), not proof that the user's goal was completed.
+    completion_outcome = Column(String(20), nullable=True)
+
+    # ----- SDK surface fields (read/written by /v1/* endpoints) -----
+    # The four columns below are populated by SDK-driven task lifecycles
+    # (see web/api/v1/tasks.py). Legacy task creation paths
+    # (chat.py / websocket.py / widget.py) intentionally leave them at
+    # their defaults: legacy consumers don't read these, and SDK
+    # consumers only see tasks they themselves created.
+
+    # Latest-turn user input as plaintext. Updated each time the SDK
+    # appends a message via POST /v1/chat/tasks/{id}/messages.
+    input = Column(Text, nullable=True)
+
+    # Latest-turn assistant output as plaintext, written when the
+    # background execution finishes a turn successfully.
+    output = Column(Text, nullable=True)
+
+    # Last failure reason when status transitions to FAILED.
+    error_message = Column(Text, nullable=True)
+
+    # Call origin classifier: 'internal' (web UI / WS / legacy),
+    # 'sdk' (POST /v1/chat/tasks), 'a2a' (agent-to-agent calls),
+    # 'trigger' (agent triggers), 'widget' (embedded chat widget), or
+    # 'shared_link' (public share chat).
+    # Default 'internal' so legacy code paths -- which never specify
+    # this field on Task(...) -- are auto-classified correctly. Both
+    # ``default`` (Python-level, fires on ORM INSERT) and
+    # ``server_default`` (DB-level DDL, fires for raw SQL INSERT and
+    # for any future ALTER ADD COLUMN against this Column) are set so
+    # the schema produced by ``Base.metadata.create_all()`` (used by
+    # dev/test init_db) stays identical to what alembic produces in
+    # production. Indexed for adoption-metrics queries
+    # (SELECT count(*) FROM tasks WHERE source='sdk' AND created_at>...).
+    source = Column(
+        String(20),
+        default="internal",
+        server_default="internal",
+        nullable=True,
+        index=True,
+    )
+
+    # The kind of SDK credential that created the task: NULL for a runtime
+    # (agent or workforce) key and for every path that is not the SDK,
+    # 'personal' for a personal key. Written once, when the task is created.
+    # The v1 task scopes match on it: a runtime key reaches only NULL rows,
+    # a personal key only its holder's 'personal' rows.
+    sdk_credential_kind = Column(
+        String(16),
+        CheckConstraint(
+            "sdk_credential_kind IS NULL OR sdk_credential_kind = 'personal'",
+            name="ck_tasks_sdk_credential_kind",
+        ),
+        nullable=True,
+    )
+
+    # The dispatch class the caller declared at creation, stored as sent whether
+    # or not a deployment accepts it; acceptance is decided as each command is
+    # enqueued.
+    requested_dispatch_class = Column(String(16), nullable=True)
+
+    # The priority the caller declared at creation, as sent; NULL means none.
+    # Commands inherit it. Its only writer is the SDK task-creation endpoint,
+    # which checks the range first, so copying it to a command does not.
+    # Deferred, so a query for tasks does not select it.
+    dispatch_priority = deferred(Column(SmallInteger, nullable=True))
+
+    # Visibility flag for discovery surfaces such as sidebar/history/search.
+    # Hidden tasks still use normal owner/admin access by exact task_id.
+    is_visible = Column(
+        Boolean,
+        default=True,
+        server_default="1",
+        nullable=False,
+        index=True,
+    )
+
+    @property
+    def execution_mode_enum(self) -> ExecutionMode:
+        """Get execution_mode as enum with fallback"""
+        try:
+            return (
+                ExecutionMode(self.execution_mode)
+                if self.execution_mode
+                else ExecutionMode.AUTO
+            )
+        except ValueError:
+            return ExecutionMode.AUTO
+
+    @execution_mode_enum.setter
+    def execution_mode_enum(self, value: ExecutionMode) -> None:
+        """Set execution_mode from enum"""
+        setattr(self, "execution_mode", value.value if value else None)
+
+    @property
+    def agent_type_enum(self) -> AgentType:
+        """Get agent_type as enum with fallback"""
+        try:
+            return AgentType(self.agent_type) if self.agent_type else AgentType.STANDARD
+        except ValueError:
+            return AgentType.STANDARD
+
+    @agent_type_enum.setter
+    def agent_type_enum(self, value: AgentType) -> None:
+        """Set agent_type from enum"""
+        # Use setattr to avoid mypy Column type checking
+        setattr(self, "agent_type", value.value if value else None)
+
+    # Relationships
+    user = relationship("User", back_populates="tasks")
+    agent = relationship(
+        "Agent",
+        primaryjoin="Task.agent_id == Agent.id",
+        foreign_keys=[agent_id],
+        viewonly=True,
+    )
+    dag_executions = relationship("DAGExecution", back_populates="task")
+    chat_messages = relationship(
+        "TaskChatMessage",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskChatMessage.id",
+    )
+    uploaded_files = relationship("UploadedFile", back_populates="task")
+
+    def __repr__(self) -> str:
+        return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+def _require_task_status(status: Any) -> TaskStatus:
+    if not isinstance(status, TaskStatus):
+        raise TypeError(f"expected TaskStatus, got {type(status).__name__}")
+    return status
+
+
+def _require_task_status_members(
+    statuses: Collection[TaskStatus],
+) -> tuple[TaskStatus, ...]:
+    if statuses is None or isinstance(statuses, (TaskStatus, str)):
+        raise TypeError(
+            "expected a collection of TaskStatus members, got "
+            f"{type(statuses).__name__}; wrap a single member in a list"
+        )
+    members = tuple(statuses)
+    if not members:
+        raise ValueError("task status predicate requires at least one TaskStatus")
+    for status in members:
+        _require_task_status(status)
+    return members
+
+
+class TaskStatusPredicate:
+    """Typed entry points for every SQL predicate and write value against
+    ``Task.status``.
+
+    The column stores ``TaskStatus`` member names, not member values (see
+    the ``status`` column comment). A raw string literal reaching an
+    ORM/Core comparison or write fails at bind time with ``StatementError``
+    wrapping ``LookupError`` (see the column comment above for why that
+    holds on both backends); raw ``text()`` SQL bypasses that bind layer
+    and is covered instead by the storage-layer sentinels in
+    ``tests/web/services/test_task_status_storage.py``.
+
+    A typed ``TaskStatus`` member compared directly against ``Task.status``
+    is legitimate and common in this codebase; it compiles to exactly what
+    the methods below compile to (pinned by the equivalence tests in
+    ``test_task_status_storage.py``). The methods below are the required
+    entry point for value-sourced or dynamic statuses -- anything that is
+    not a literal ``TaskStatus`` member in the source -- because they turn
+    a non-``TaskStatus`` input into a construction-time ``TypeError``
+    instead of a query-time failure. What is actually enforced repo-wide is
+    narrower still: the literal-predicate scan in
+    ``tests/web/services/test_task_status_literal_predicates.py`` bans a
+    raw string literal placed beside ``Task.status``; adoption of the
+    methods below at the safe-but-unconverted typed sites above is not
+    enforced and is not claimed.
+    """
+
+    @staticmethod
+    def eq(status: TaskStatus) -> Any:
+        """``Task.status == status``."""
+        _require_task_status(status)
+        return Task.status == status
+
+    @staticmethod
+    def ne(status: TaskStatus) -> Any:
+        """``Task.status != status``."""
+        _require_task_status(status)
+        return Task.status != status
+
+    @staticmethod
+    def in_(statuses: Collection[TaskStatus]) -> Any:
+        """``Task.status IN (...)``; a single member compiles to ``==``."""
+        members = _require_task_status_members(statuses)
+        if len(members) == 1:
+            return Task.status == members[0]
+        return Task.status.in_(members)
+
+    @staticmethod
+    def not_in(statuses: Collection[TaskStatus]) -> Any:
+        """``Task.status NOT IN (...)``; a single member compiles to ``!=``."""
+        members = _require_task_status_members(statuses)
+        if len(members) == 1:
+            return Task.status != members[0]
+        return Task.status.notin_(members)
+
+    @staticmethod
+    def value(status: TaskStatus) -> TaskStatus:
+        """Validate one status before it is passed to ``.values(status=...)``.
+
+        Every call site today already passes a typed ``TaskStatus``, so this
+        check does no runtime work under a type-checked call graph; it exists
+        for callers whose status is dynamically sourced, and to give guarded
+        write sites a compliant expression to wrap.
+        """
+        return _require_task_status(status)
+
+
+task_status_predicate = TaskStatusPredicate()
+
+
+class TaskConnectorRuntimeContext(Base):  # type: ignore
+    """Task-bound non-secret runtime context for one connector."""
+
+    __tablename__ = "task_connector_runtime_contexts"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "connector_type",
+            "connector_id",
+            name="uq_task_connector_runtime_contexts_ref",
+        ),
+        Index("ix_task_connector_runtime_contexts_task_id", "task_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(
+        Integer,
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_type = Column(String(32), nullable=False)
+    connector_id = Column(Integer, nullable=False)
+    context = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    task = relationship("Task")
+
+    def __repr__(self) -> str:
+        return (
+            "<TaskConnectorRuntimeContext("
+            f"task_id={self.task_id}, "
+            f"connector_type='{self.connector_type}', "
+            f"connector_id={self.connector_id})>"
+        )
+
+
+class DAGExecution(Base):  # type: ignore
+    """DAG execution status model"""
+
+    __tablename__ = "dag_executions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, unique=True)
+    phase: Column[DAGExecutionPhase] = Column(
+        Enum(DAGExecutionPhase), default=DAGExecutionPhase.PLANNING
+    )
+    progress_percentage = Column(Float, default=0.0)
+    completed_steps = Column(Integer, default=0)
+    total_steps = Column(Integer, default=0)
+    execution_time = Column(Float)  # Total execution time in seconds
+    start_time = Column(DateTime(timezone=True))
+    end_time = Column(DateTime(timezone=True))
+    current_plan = Column(JSON)  # Store the current plan data
+    skipped_steps = Column(JSON)  # Store list of skipped step IDs
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    # Relationships
+    task = relationship("Task", back_populates="dag_executions")
+
+    def __repr__(self) -> str:
+        return f"<DAGExecution(id={self.id}, task_id={self.task_id}, phase='{self.phase}')>"
+
+
+class TraceEvent(Base):  # type: ignore
+    """Unified trace event model for consistent storage and WebSocket transmission"""
+
+    __tablename__ = "trace_events"
+    # Checkpoint pruning and latest-checkpoint loading both filter by
+    # task_id + event_type on every checkpoint write/resume.
+    __table_args__ = (
+        Index("ix_trace_events_task_id_event_type", "task_id", "event_type"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    build_id = Column(String(255), nullable=True, index=True)  # Build session ID
+    event_id = Column(String(255), nullable=False)  # UUID for the trace event
+    event_type = Column(
+        String(100), nullable=False
+    )  # Event type string (e.g., "dag_execute_start")
+    timestamp = Column(DateTime(timezone=True), nullable=False)  # Event timestamp
+    step_id = Column(String(255), nullable=True)  # Optional step ID
+    parent_event_id = Column(
+        String(255), nullable=True
+    )  # Parent event ID for hierarchy
+    data = Column(TRACE_PAYLOAD_JSON, nullable=False)  # Event data payload
+
+    # Relationships. foreign_keys is explicit because tasks and trace_events
+    # now have two FK paths between them (this task_id, and
+    # Task.last_checkpoint_trace_event_id pointing back) -- without it,
+    # SQLAlchemy can't pick a join condition for this relationship.
+    task = relationship("Task", foreign_keys=[task_id])
+
+    def __repr__(self) -> str:
+        return f"<TraceEvent(id={self.id}, event_type='{self.event_type}', task_id={self.task_id})>"
+
+
+class TraceMessageBlob(Base):  # type: ignore
+    """Deduplicated message payload referenced by checkpoint trace events."""
+
+    __tablename__ = "trace_message_blobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "message_hash",
+            name="uq_trace_message_blobs_task_hash",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    execution_id = Column(String(255), nullable=False, index=True)
+    message_hash = Column(String(80), nullable=False)
+    message_data = Column(TRACE_PAYLOAD_JSON, nullable=False)
+    message_bytes = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    task = relationship("Task")
+
+    def __repr__(self) -> str:
+        return (
+            "<TraceMessageBlob("
+            f"id={self.id}, task_id={self.task_id}, message_hash='{self.message_hash}'"
+            ")>"
+        )
+
+
+class TraceCheckpointBlob(Base):  # type: ignore
+    """Deduplicated checkpoint field payload referenced by trace events."""
+
+    __tablename__ = "trace_checkpoint_blobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "blob_kind",
+            "blob_hash",
+            name="uq_trace_checkpoint_blobs_task_kind_hash",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    execution_id = Column(String(255), nullable=False, index=True)
+    blob_kind = Column(String(255), nullable=False, index=True)
+    blob_hash = Column(String(80), nullable=False)
+    blob_data = Column(TRACE_PAYLOAD_JSON, nullable=False)
+    blob_bytes = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    task = relationship("Task")
+
+    def __repr__(self) -> str:
+        return (
+            "<TraceCheckpointBlob("
+            f"id={self.id}, task_id={self.task_id}, "
+            f"blob_kind='{self.blob_kind}', blob_hash='{self.blob_hash}'"
+            ")>"
+        )

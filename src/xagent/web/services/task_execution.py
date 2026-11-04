@@ -1,0 +1,6285 @@
+"""Background task execution, resume, and settlement without API route dependencies.
+
+Cross-repo public API
+---------------------
+The names in ``__all__`` are the runner entrypoints this module exports to
+the downstream deployment layer in xorbitsai/xagent-saas
+(``xagent_saas.services.external_input_dispatch`` and its runtime
+diagnostics), not only to this repo's API routes:
+
+* ``execute_resume_background`` -- resume after an interrupt or a deferred
+  user message. The downstream external-input path calls it directly and
+  passes its keyword set, including the ``preacquired_*`` lease hand-off.
+* ``BackgroundTaskManager`` / ``background_task_manager`` -- the downstream
+  drives the resume reservation protocol on it: ``reserve_resume``,
+  ``register_reserved_resume(task_id, task, run_id=...)``, and
+  ``release_resume_reservation``, and reads ``running_tasks`` to pick the
+  ``previous_task`` it hands to a resume.
+* ``execute_task_background`` -- start a task's first turn. The sibling
+  runner entrypoint; not imported downstream today, pinned alongside so the
+  two runner signatures evolve under the same review.
+
+Their parameter lists and defaults are pinned by
+``tests/web/services/test_task_execution_public_contract.py``. Adding,
+renaming, removing, or reordering a parameter is a cross-repo contract change
+(issue #2390): update the pinned test deliberately, ship the change either
+with a one-release shim that still accepts the old keywords and warns, or with
+an early failure whose message names the replacement, and land the matching
+consumer change in xagent-saas in the same release. Relocating one of these
+names must keep it importable from this module.
+"""
+
+import asyncio
+import enum
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import stat
+import tempfile
+import time
+import uuid
+import weakref
+from collections import Counter
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+    get_args,
+    overload,
+)
+from urllib.parse import unquote
+
+from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy.orm import Session
+
+from ...config import (
+    get_uploads_dir,
+)
+from ...core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointUnavailableError,
+)
+from ...core.agent.interruption import InterruptionReason
+from ...core.agent.runner import (
+    InjectionDisposition,
+    UserMessageInjectionOutcome,
+    classify_injection,
+    track_user_message_injection,
+)
+from ...core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
+    ExecutionScope,
+    ExecutionScopeContext,
+    ExecutionScopeNotProvided,
+    resolve_execution_scope,
+)
+from ...core.file_ref import build_file_ref
+from ...core.workspace import _is_sandbox_prepared
+from ..models.database import (
+    get_db,
+    get_session_local,
+)
+from ..models.task import Task, TaskStatus, task_status_predicate
+from ..models.uploaded_file import UploadedFile
+from .llm_utils import AutoModelUnavailableError
+from .release_hold import release_hold
+from .routine_history_provenance import (
+    load_routine_history_turn_id,
+    routine_history_turn_id,
+)
+from .task_auto_recovery import (
+    InterruptionDecision,
+    InterruptionOutcome,
+    InterruptionSettlementDeferred,
+    apply_interruption_outcome_no_commit,
+    decide_interruption,
+    interruption_pause_result,
+    settlement_interruption_for_failure,
+    settlement_interruption_for_result,
+)
+from .task_dispatch_cap import (
+    DispatchCapSnapshot,
+    DispatchPolicy,
+    TenantListingRequired,
+)
+from .task_events import DeliveryNotifier, publish_task_event
+from .task_execution_event_writer import (
+    FactWitness,
+    fact_witness_committed_no_commit,
+    stage_result_fact_no_commit,
+)
+from .task_lease_service import (
+    current_task_lease,
+    lock_task_lease_for_settlement_no_commit,
+    lock_task_lease_no_commit,
+    log_unknown_tool_effect_settlement,
+    task_lease_attempt_predicate,
+)
+from .task_settlement_report import RecordedInterruption, SettlementReport
+
+if TYPE_CHECKING:
+    from .task_setup_snapshot import TaskSetupSnapshot
+
+from ...core.file_storage.keys import (
+    build_task_output_storage_key,
+)
+from ..user_isolated_memory import UserContext
+from ..utils.json_payload_sanitizer import sanitize_json_payload
+from .assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
+    assistant_history_values_for_persistence,
+    safe_str,
+)
+from .chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
+    mark_user_message_delivery_sync,
+    withdraw_pending_user_message_delivery_sync,
+)
+from .client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    CLIENT_SAFE_VALIDATION_ERROR,
+    CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
+    ClientErrorCode,
+    client_error_message,
+)
+from .db_runtime import (
+    await_task_settlement,
+    drain_async_task_cancellation_safe,
+    is_database_pool_timeout,
+    propagate_deferred_cancellation,
+    run_db_io_cancellation_safe,
+)
+from .db_write_retry import (
+    bound_rerun_lock_wait_no_commit,
+    connection_was_lost,
+    retry_db_write_async,
+)
+from .execution_event_signals import report_commit_failure, report_unknown_outcome
+from .execution_result_projection import (
+    FailedResultPresentation,
+    completion_outcome_for_status,
+    present_failed_result,
+    project_execution_result_for_channel,
+)
+from .file_reference_output_service import (
+    reconcile_assistant_file_references,
+)
+from .file_turn import (
+    append_prompt_context_block,
+    build_prompt_context_block,
+    normalize_filename,
+    prompt_context_from_agent_config,
+    resolve_turn_file_infos,
+)
+from .mcp_runtime import (
+    MCPActorExecutionIdentity,
+    MCPBuiltinOAuthActorPolicy,
+)
+from .task_execution_controller import (
+    NON_RESUMABLE_STATUSES,
+    TaskControlSnapshot,
+    TaskControlState,
+    apply_task_control_transition,
+    task_execution_controller,
+)
+from .task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
+    close_legacy_resume_interaction_sync,
+)
+from .task_lease_service import (
+    TaskLease,
+    TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
+    acquire_task_lease_cancellation_safe,
+    acquire_task_lease_no_commit,
+    bind_task_lease_context,
+    release_task_lease_no_commit,
+    run_task_lease_heartbeat,
+    run_while_task_lease_owned,
+    stop_task_lease_heartbeat,
+)
+from .uploaded_file_store import (
+    StagedUploadedFile,
+    SupersededObjectCleanupClaim,
+    UploadedFileStore,
+    UploadedFileVersionSnapshot,
+    _uploaded_file_version_match_predicates,
+    cleanup_superseded_uploaded_file_objects,
+    compensate_staged_uploaded_files,
+    snapshot_uploaded_file_version,
+    stage_uploaded_file_from_local_path,
+)
+from .workforce_runtime import (
+    sync_workforce_run_status,
+)
+
+# Cross-repo entrypoints; see the module docstring before changing this list
+# or any signature it names.
+__all__ = [
+    "BackgroundTaskManager",
+    "background_task_manager",
+    "execute_resume_background",
+    "execute_task_background",
+]
+
+logger = logging.getLogger(__name__)
+
+# A deferred delivery's notice is sent even while its resume is being
+# cancelled; a client that stops reading must not hold the canceller longer.
+_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS = 5.0
+
+
+_pause_accepted_task_ids: set[int] = set()
+
+
+def _mark_task_pause_accepted(task_id: int) -> None:
+    _pause_accepted_task_ids.add(int(task_id))
+
+
+def _clear_task_pause_accepted(task_id: int) -> None:
+    _pause_accepted_task_ids.discard(int(task_id))
+
+
+def _is_task_pause_accepted(task_id: int) -> bool:
+    return int(task_id) in _pause_accepted_task_ids
+
+
+def _waiting_or_paused_event_fields(status: TaskStatus) -> tuple[str, str]:
+    """Event type and default message for a task settled at WAITING_FOR_USER
+    or PAUSED. Shared by the live-lease restore broadcast and the
+    historical-replay status reassertion so both present identical labels
+    for the same status."""
+
+    if status == TaskStatus.WAITING_FOR_USER:
+        return "task_waiting_for_user", "Task waiting for user response"
+    return "task_paused", "Task paused"
+
+
+def _task_status_payload(db: Session, task_id: int) -> dict[str, Any] | None:
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        return None
+    return {
+        "id": task_id,
+        "status": task.status.value,
+    }
+
+
+def _task_error_payload(
+    db: Session,
+    task_id: int,
+    message: str,
+    *,
+    event_type: str = "error",
+    error_code: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": event_type,
+        "message": message,
+    }
+    if error_code is not None:
+        payload["error_code"] = error_code
+    task_payload = _task_status_payload(db, task_id)
+    if task_payload is not None:
+        payload["task"] = task_payload
+    return payload
+
+
+def _admit_asserted_code(
+    task_id: int,
+    asserted_code: object,
+    listed: frozenset[ClientErrorCode],
+    *,
+    component: str,
+    conflicts: bool = False,
+) -> ClientErrorCode | None:
+    """Return the caller-asserted code a frame builder may write, or ``None``.
+
+    The one rule for every builder that takes ``asserted_code``: the value
+    must be a ``ClientErrorCode`` member in that builder's own listed set,
+    and must not conflict with anything else the caller passed. An equal
+    plain string or a same-valued member of another enum fails the first
+    test. Anything else is dropped and logged with its stack, never raised:
+    a bad optional argument costs that argument and nothing else.
+    """
+
+    if asserted_code is None:
+        return None
+    # The type check comes first: an unhashable value would raise inside the
+    # membership test.
+    if (
+        conflicts
+        or not isinstance(asserted_code, ClientErrorCode)
+        or asserted_code not in listed
+    ):
+        logger.error(
+            "task_id=%s component=%s dropped=asserted_code value=%r; "
+            "the frame is still sent without it",
+            task_id,
+            component,
+            asserted_code,
+            stack_info=True,
+        )
+        return None
+    return asserted_code
+
+
+# Codes a caller states from an outcome it proved itself, as opposed to
+# ``code``, which is projected from an exception. Add a member in the change
+# that adds the call site asserting it; the runtime set is derived from this.
+CallerAssertedTerminalCode = Literal[ClientErrorCode.EXTERNAL_TURN_INTERRUPTED]
+_CALLER_ASSERTED_TERMINAL_CODES: frozenset[ClientErrorCode] = frozenset(
+    get_args(CallerAssertedTerminalCode)
+)
+
+
+def create_terminal_task_error_event(
+    task_id: int,
+    message: str,
+    *,
+    code: str | None = None,
+    asserted_code: CallerAssertedTerminalCode | None = None,
+) -> dict[str, Any]:
+    """Shape an error event after the exact lease owner commits FAILED.
+
+    ``code`` is written only when it survives validation, so a caller that
+    passes neither argument still gets the same six-key frame, and a caller
+    that passes something unusable gets that same frame rather than an
+    exception. This runs on the reporting path of an already-failed task,
+    and the one call site that passes ``code`` evaluates it inside the
+    ``except Exception`` that only logs a failed broadcast -- so raising here
+    would cost the terminal frame outright and leave the user on the silent
+    failure this path exists to remove. A bad optional argument costs that
+    argument and nothing else. The rejection is logged with its stack.
+
+    ``code`` must be a connector-runtime code or ``AUTO_MODEL_UNAVAILABLE``.
+
+    ``asserted_code`` is the other way a code reaches this frame: the caller
+    states an outcome it proved itself, for example the external cancel core
+    once its target turn ended interrupted. It must be a
+    ``ClientErrorCode`` member listed in ``CallerAssertedTerminalCode``; an
+    equal plain string or a same-valued member of another enum is dropped.
+    The two arguments are exclusive: when both are passed, ``asserted_code``
+    is dropped and ``code`` is validated as usual, so a projected failure is
+    never relabelled by an assertion.
+    """
+
+    # The exclusivity check reads ``code`` as passed, before its own gate
+    # below can clear it: an assertion never rides along with a projected
+    # failure, valid or not.
+    admitted_code = _admit_asserted_code(
+        task_id,
+        asserted_code,
+        _CALLER_ASSERTED_TERMINAL_CODES,
+        component="terminal-error-frame",
+        conflicts=code is not None,
+    )
+
+    # Python annotations are not enforced at run time, so the mypy gate on the
+    # signature above is not the whole door: a caller that routes through Any
+    # (a dict from JSON, a **kwargs splat) type-checks clean and would reach
+    # this function with a value of the wrong shape. Name the contract here
+    # instead.
+    #
+    # ConnectorRuntimeError types its code as a bare str and stores it
+    # unvalidated, so "only the eight module constants reach here" is a fact
+    # about today's raise sites, not a property the code holds. The type
+    # check comes first for the same reason: annotations are not enforced,
+    # and an unhashable value would raise inside the membership test on a
+    # path whose whole point is that it never raises.
+    if code is not None and (
+        not isinstance(code, str)
+        or (
+            code not in CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+            and code != ClientErrorCode.AUTO_MODEL_UNAVAILABLE.value
+        )
+    ):
+        logger.error(
+            "task_id=%s component=terminal-error-frame dropped=code "
+            "value=%r; the frame is still sent without it",
+            task_id,
+            code,
+            stack_info=True,
+        )
+        code = None
+
+    event: dict[str, Any] = {
+        "type": "task_error",
+        "message": message,
+        "task_id": task_id,
+        "task": {
+            "id": task_id,
+            "status": TaskStatus.FAILED.value,
+        },
+        "error": message,
+        "timestamp": datetime.now(timezone.utc).timestamp(),
+    }
+    if code is not None:
+        event["code"] = code
+    elif admitted_code is not None:
+        event["code"] = admitted_code.value
+    return event
+
+
+# Codes a caller states on the ``agent_error`` frame that reports an
+# external-scope command's terminal outcome to the task's anonymous audience.
+# Same rule as ``CallerAssertedTerminalCode``: add a member in the change that
+# adds the call site asserting it; the runtime set is derived from this. The
+# two sets are disjoint: a code names one outcome on one kind of frame.
+CallerAssertedCommandErrorCode = Literal[ClientErrorCode.EXTERNAL_STOP_NOT_APPLIED]
+_CALLER_ASSERTED_COMMAND_ERROR_CODES: frozenset[ClientErrorCode] = frozenset(
+    get_args(CallerAssertedCommandErrorCode)
+)
+
+
+def create_external_command_error_event(
+    task_id: int,
+    message: str,
+    *,
+    asserted_code: CallerAssertedCommandErrorCode | None = None,
+) -> dict[str, Any]:
+    """Shape the ``agent_error`` an external-scope command's terminal outcome sends.
+
+    When an external-scope command's terminal failure is reported to the
+    task's audience, this is the frame. Not every one is reported: a cancel
+    rejection whose reason is not in
+    ``EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS``, and any cancel whose
+    target already completed, end silently. The audience is anonymous, so the
+    frame carries the sentence, the task id and the time, and never the
+    durable command identity or the exception text.
+    ``asserted_code`` is the one way a code reaches it, written as
+    ``error_code`` - the field clients already read on ``agent_error`` - so a
+    client that does not render server prose still names the outcome. It is
+    admitted only from ``CallerAssertedCommandErrorCode``.
+    """
+
+    admitted_code = _admit_asserted_code(
+        task_id,
+        asserted_code,
+        _CALLER_ASSERTED_COMMAND_ERROR_CODES,
+        component="external-command-error-frame",
+    )
+    event: dict[str, Any] = {
+        "type": "agent_error",
+        "message": message,
+        "task_id": task_id,
+        "timestamp": datetime.now(timezone.utc).timestamp(),
+    }
+    if admitted_code is not None:
+        event["error_code"] = admitted_code.value
+    return event
+
+
+class ClientVisibleError(Exception):
+    """Marker: this exception's text was written for the end user.
+
+    Raise a subclass - never a bare builtin - when the message itself is the
+    actionable answer ("authentication required", "access denied"). Everything
+    else reaching a client-facing handler is treated as incidental and
+    redacted, so forgetting the marker fails closed.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        error_code: ClientErrorCode = ClientErrorCode.MESSAGE_PROCESSING_FAILED,
+    ) -> None:
+        if type(self) is ClientVisibleError:
+            raise TypeError("ClientVisibleError must be subclassed")
+        self.error_code = error_code
+        super().__init__(*args)
+
+
+class ClientVisibleValidationError(ClientVisibleError, ValueError):
+    """A validation failure whose text is safe to show the sender."""
+
+
+class _DeferredInjectionRejectedRetryableError(RuntimeError):
+    """The deferred message was not accepted; nothing was written for it.
+
+    ``fenced`` is True when an earlier uncertain input still fences the run
+    (``REJECTED_RETRYABLE``), and False when a read-back proved this write
+    absent, which leaves the context unfenced.
+    """
+
+    def __init__(self, message: str, *, fenced: bool) -> None:
+        super().__init__(message)
+        self.fenced = fenced
+
+
+def _resume_cancel_settlement_error(task_source: str | None) -> str:
+    """Settlement text for a cancelled resume, matching a cancelled run.
+
+    An external visitor reads this text in the transcript, and the external
+    cancel command recognizes it as its own settled outcome.
+    """
+    from .external_task_cancel import (
+        EXTERNAL_TASK_SOURCE,
+        EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+    )
+
+    if task_source == EXTERNAL_TASK_SOURCE:
+        return EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    return "resume execution cancelled"
+
+
+def client_safe_error_message(
+    error: BaseException,
+    *,
+    fallback: str = CLIENT_SAFE_VALIDATION_ERROR,
+) -> str:
+    """The only way an exception may become text a chat client can see.
+
+    ``tests/web/api/test_websocket_client_safe_errors.py`` enforces this for
+    the shapes it recognizes: delivery producers and known error-event payloads
+    handed to ``send_personal_message``, ``broadcast_to_task`` or ``send_text``.
+
+    The sweep recognizes the client egress shapes used by this module,
+    including terminal task helpers, dict-spread overrides, both ``message``
+    and ``error`` fields, and the deferred-delivery wrapper. It is still a
+    deliberately small static check rather than general data-flow analysis;
+    for example, a payload ``type`` built from a variable remains outside its
+    scope (#1547).
+
+    Read a passing sweep as "the recognized egress shapes are clean", never
+    as "arbitrary Python data flow cannot reach a client raw".
+    """
+    if isinstance(error, AutoModelUnavailableError):
+        return client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
+    if not isinstance(error, ClientVisibleError):
+        return fallback
+    message = str(error)
+    return message if message.strip() else fallback
+
+
+@overload
+def _terminal_task_error_payload(
+    task_id: int,
+    message: str,
+    *,
+    event_type: str = "agent_error",
+    expected_run_id: str | None = None,
+    only_if_running: Literal[False] = False,
+    turn_id: str | None = None,
+) -> dict[str, Any]: ...
+
+
+@overload
+def _terminal_task_error_payload(
+    task_id: int,
+    message: str,
+    *,
+    event_type: str = "agent_error",
+    expected_run_id: str | None = None,
+    only_if_running: Literal[True],
+    turn_id: str | None = None,
+) -> dict[str, Any] | None: ...
+
+
+def _terminal_task_error_payload(
+    task_id: int,
+    message: str,
+    *,
+    event_type: str = "agent_error",
+    expected_run_id: str | None = None,
+    only_if_running: bool = False,
+    turn_id: str | None = None,
+) -> dict[str, Any] | None:
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    canonical = False
+    # Set once the write has committed or was skipped; a failure after that
+    # (reading the payload to return) did not lose a fact.
+    write_settled = False
+    try:
+        from .task_execution_event_writer import uses_execution_events
+
+        canonical = uses_execution_events(db, task_id)
+        failed_control_state = TaskControlState.FAILED.value
+        current_version = func.coalesce(Task.state_version, 0)
+        statement = (
+            update(Task)
+            .where(Task.id == task_id)
+            # This legacy helper has no concrete TaskLease. It may only settle
+            # an ownerless row; a RUNNING row with any owner belongs to the
+            # lease-aware orchestrator and must be left untouched.
+            .where(Task.runner_id.is_(None))
+            .values(
+                status=TaskStatus.FAILED,
+                lease_expires_at=None,
+                last_heartbeat_at=datetime.now(timezone.utc),
+                control_state=failed_control_state,
+                state_version=case(
+                    (
+                        or_(
+                            Task.status != TaskStatus.FAILED,
+                            Task.control_state != failed_control_state,
+                        ),
+                        current_version + 1,
+                    ),
+                    else_=current_version,
+                ),
+                error_message=message,
+            )
+        )
+        if expected_run_id is not None:
+            statement = statement.where(Task.run_id == expected_run_id)
+        if only_if_running:
+            statement = statement.where(Task.status == TaskStatus.RUNNING)
+
+        result = db.execute(statement.execution_options(synchronize_session=False))
+        if int(getattr(result, "rowcount", 0) or 0) != 1:
+            db.rollback()
+            write_settled = True
+            current_payload = _task_error_payload(
+                db,
+                task_id,
+                CLIENT_SAFE_TASK_FAILURE,
+                event_type=event_type,
+            )
+            logger.info(
+                "Ignoring unfenced terminal error for task %s run %s; "
+                "current status is %s",
+                task_id,
+                expected_run_id,
+                (current_payload.get("task") or {}).get("status"),
+            )
+            return None if only_if_running else current_payload
+
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None:
+            history_turn_id = routine_history_turn_id(
+                task,
+                turn_id,
+                expected_run_id=expected_run_id or cast(str | None, task.run_id),
+            )
+            sync_workforce_run_status(db, task, TaskStatus.FAILED)
+            # Persist the error as an assistant message so failures that
+            # happen before agent execution starts (no trace events, e.g.
+            # sandbox capacity rejection) survive a history reload instead
+            # of degrading to a generic "Unknown error" bubble.
+            task_user_id = getattr(task, "user_id", None)
+            if task_user_id is not None:
+                from .chat_history_service import (
+                    persist_assistant_message_no_commit,
+                )
+
+                try:
+                    persist_assistant_message_no_commit(
+                        db,
+                        task_id=task_id,
+                        user_id=int(task_user_id),
+                        content=CLIENT_SAFE_TASK_FAILURE,
+                        message_type=TASK_FAILURE_MESSAGE_TYPE,
+                        turn_id=history_turn_id,
+                    )
+                except Exception:
+                    if task.conversation_storage_version == 2:
+                        raise
+                    logger.warning(
+                        "Failed to persist terminal error chat message",
+                        exc_info=True,
+                    )
+            if canonical:
+                db.refresh(task)
+                stage_result_fact_no_commit(
+                    db,
+                    task,
+                    {"error": message},
+                    turn_id=history_turn_id,
+                )
+            db.commit()
+        write_settled = True
+        return _task_error_payload(
+            db,
+            task_id,
+            CLIENT_SAFE_TASK_FAILURE,
+            event_type=event_type,
+        )
+    except Exception as exc:
+        db.rollback()
+        if canonical:
+            from ...core.agent.checkpoint import ExecutionEventPersistenceError
+
+            if not write_settled:
+                report_commit_failure(
+                    "terminal_failure",
+                    exc,
+                    task_id=task_id,
+                    run_id=expected_run_id,
+                    retried=False,
+                )
+            raise ExecutionEventPersistenceError(
+                "Terminal failure event commit failed"
+            ) from exc
+        logger.warning("Failed to persist terminal task error", exc_info=True)
+        return {
+            "type": event_type,
+            "message": CLIENT_SAFE_TASK_FAILURE,
+            "task": {
+                "id": task_id,
+                "status": TaskStatus.FAILED.value,
+            },
+        }
+    finally:
+        db.close()
+
+
+def create_stream_event(
+    event_type: str,
+    task_id: Union[int, str],
+    data: Dict[str, Any],
+    timestamp: Optional[Any] = None,
+    *,
+    event_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a stream event, preserving a producer-supplied event identity."""
+    resolved_event_id = (
+        event_id if isinstance(event_id, str) and event_id else str(uuid.uuid4())
+    )
+    return {
+        "type": "trace_event",
+        "event_id": resolved_event_id,
+        "event_type": event_type,
+        "task_id": task_id,
+        "timestamp": _stream_timestamp(timestamp),
+        "data": data,
+    }
+
+
+def create_final_answer_stream_event(
+    event_type: str,
+    task_id: Union[int, str],
+    data: Dict[str, Any],
+    timestamp: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Create final-answer UI stream envelopes without changing their protocol."""
+
+    payload = dict(data)
+    payload.pop("type", None)
+    payload.pop("event_id", None)
+    payload.pop("task_id", None)
+    return {
+        "type": event_type,
+        "event_id": str(uuid.uuid4()),
+        "task_id": task_id,
+        "timestamp": _stream_timestamp(timestamp),
+        **payload,
+    }
+
+
+def _stream_timestamp(timestamp: Optional[Any] = None) -> float:
+    # Convert timestamp to Unix timestamp if it's a datetime
+    if timestamp is None:
+        return datetime.now(timezone.utc).timestamp()
+    if isinstance(timestamp, datetime):
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.timestamp()
+    if not isinstance(timestamp, (int, float)):
+        return datetime.now(timezone.utc).timestamp()
+    return float(timestamp)
+
+
+def _outbound_message_business_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare a message effect without attributing a replay to its new run."""
+    metadata = dict(data.get("metadata") or {})
+    for key in ("step_id", "dag_step_id", "turn_id"):
+        metadata.pop(key, None)
+    if "tool_calls" in metadata:
+        metadata["tool_calls"] = [
+            {
+                key: value
+                for key, value in source.items()
+                if key not in {"step_id", "dag_step_id", "turn_id"}
+            }
+            for source in metadata["tool_calls"]
+        ]
+    return {
+        "message": data.get("message"),
+        "message_type": data.get("message_type"),
+        "expect_response": data.get("expect_response"),
+        "visible": data.get("visible"),
+        "metadata": metadata,
+    }
+
+
+def _persist_agent_outbound_event(
+    task_id: int,
+    event: Dict[str, Any],
+    *,
+    turn_id: str | None = None,
+    authoritative: bool = False,
+    rerun: bool = False,
+) -> None:
+    """Persist agent outbound events and durable waiting prompts.
+
+    ``rerun`` marks a retry of an authoritative write that failed transiently.
+    """
+
+    from ..models.task import Task as DatabaseTask
+    from ..models.task import TraceEvent as DatabaseTraceEvent
+    from .chat_history_service import persist_assistant_message_no_commit
+
+    execution_event_id: str | None = None
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        if rerun:
+            bound_rerun_lock_wait_no_commit(db)
+        lease = current_task_lease()
+        if authoritative and event.get("type") == "final_answer_delta":
+            # Chunks are ephemeral; complete answers and stream boundaries are
+            # durable. Check ownership without serializing every chunk against
+            # fact writers. Publication already occurs outside the transaction.
+            if lease is not None and (
+                lease.task_id != task_id
+                or db.query(DatabaseTask.id)
+                .filter(
+                    DatabaseTask.id == task_id,
+                    DatabaseTask.runner_id == lease.runner_id,
+                    DatabaseTask.run_id == lease.run_id,
+                    task_lease_attempt_predicate(lease),
+                )
+                .first()
+                is None
+            ):
+                raise TaskLeaseLostError("Outbound event producer lost its task lease")
+            return
+        event_data = event.get("data")
+        if authoritative and event_data is None:
+            event_data = dict(event)
+        data: Dict[str, Any] = cast(
+            Dict[str, Any], event_data if isinstance(event_data, dict) else {}
+        )
+        # This function builds its own TraceEvent row instead of going
+        # through stage_trace_event_row (see that module's "known bypass"
+        # note), so it must sanitize for itself: PostgreSQL's jsonb rejects
+        # NUL and unpaired-surrogate code points at INSERT (#1248).
+        data = sanitize_json_payload(data)
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            event_time = datetime.fromtimestamp(float(timestamp), timezone.utc)
+        else:
+            event_time = datetime.now(timezone.utc)
+
+        trace_event = DatabaseTraceEvent(
+            task_id=task_id,
+            event_id=str(data.get("event_id") or event.get("event_id") or uuid.uuid4()),
+            event_type=str(
+                event.get("event_type") or event.get("type") or "agent_message"
+            ),
+            timestamp=event_time,
+            step_id=str(data["step_id"]) if data.get("step_id") else None,
+            parent_event_id=None,
+            data=data,
+        )
+        if lease is not None and (
+            lease.task_id != task_id or not lock_task_lease_no_commit(db, lease)
+        ):
+            raise TaskLeaseLostError("Outbound event producer lost its task lease")
+        if authoritative:
+            from ..models.task_execution_event import TaskExecutionEvent
+            from .task_execution_event_store import (
+                ExecutionEventConflict,
+                lock_task_execution_events_no_commit,
+            )
+            from .task_execution_event_writer import append_fact_no_commit
+
+            lock_task_execution_events_no_commit(db, task_id)
+            task = db.get(DatabaseTask, task_id)
+            assert task is not None
+            metadata = data.get("metadata") or {}
+            sources = metadata.get("tool_calls") or [metadata]
+            if all(source.get("tool_attempt_id") for source in sources):
+                existing = (
+                    db.query(TaskExecutionEvent)
+                    .filter(
+                        TaskExecutionEvent.task_id == task_id,
+                        TaskExecutionEvent.scope_id == "root",
+                        TaskExecutionEvent.idempotency_key
+                        == f"outbound:{trace_event.event_id}",
+                    )
+                    .first()
+                )
+                if existing is not None:
+                    original_payload = cast(Dict[str, Any], existing.payload)
+                    if existing.kind != trace_event.event_type or (
+                        json.dumps(
+                            _outbound_message_business_payload(
+                                original_payload["data"]
+                            ),
+                            sort_keys=True,
+                        )
+                        != json.dumps(
+                            _outbound_message_business_payload(data), sort_keys=True
+                        )
+                    ):
+                        raise ExecutionEventConflict(
+                            "Tool message identity identifies a different message"
+                        )
+                    # The fact and its projections committed together. Reuse
+                    # the envelope, but permit retransmission after a crash
+                    # between commit and broadcast. Do not execute a new send.
+                    from .task_event_display import convert_display_event
+
+                    public_event = convert_display_event(existing)
+                    assert public_event is not None
+                    event.clear()
+                    event.update(public_event)
+                    db.commit()
+                    return
+            fact = append_fact_no_commit(
+                db,
+                task_id=task_id,
+                kind=str(trace_event.event_type),
+                key=f"outbound:{trace_event.event_id}",
+                run_id=cast(str | None, task.run_id),
+                assistant_message_id=metadata.get("assistant_message_id"),
+                tool_attempt_id=metadata.get("tool_attempt_id"),
+                turn_id=turn_id,
+                payload={"data": data, "protocol_event_id": trace_event.event_id},
+                occurred_at=event_time,
+            )
+            setattr(trace_event, "data", fact.payload["data"])
+            if trace_event.event_type.startswith("final_answer_"):
+                from .task_event_display import convert_display_event
+
+                public_event = convert_display_event(fact)
+                assert public_event is not None
+                db.commit()
+                event.clear()
+                event.update(public_event)
+                return
+            execution_event_id = cast(str, fact.event_id)
+            data = cast(Dict[str, Any], fact.payload)["data"]
+            setattr(trace_event, "timestamp", fact.occurred_at)
+            # Protocol replay retains the original envelope as well as the
+            # same chat projection. The task lock serializes both lookups.
+            event.update(
+                create_stream_event(
+                    str(fact.kind),
+                    task_id,
+                    data,
+                    timestamp=fact.occurred_at,
+                    event_id=cast(Dict[str, Any], fact.payload)["protocol_event_id"],
+                )
+            )
+        if not authoritative or not (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                DatabaseTraceEvent.event_id == trace_event.event_id,
+            )
+            .first()
+        ):
+            db.add(trace_event)
+
+        if bool(data.get("expect_response")):
+            task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
+            message = str(data.get("message") or "")
+            task_user_id = _task_user_id(task) if task else None
+            if task and task_user_id is not None and message:
+                metadata = data.get("metadata") if isinstance(data, dict) else {}
+                interactions = (
+                    metadata.get("interactions")
+                    if isinstance(metadata, dict)
+                    and isinstance(metadata.get("interactions"), list)
+                    else None
+                )
+                persist_assistant_message_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_user_id,
+                    content=message,
+                    message_type="question",
+                    interactions=interactions,
+                    source_event_id=str(trace_event.event_id),
+                    execution_event_id=execution_event_id,
+                    turn_id=turn_id,
+                )
+
+        if authoritative:
+            from .task_event_display import convert_display_event
+
+            public_event = convert_display_event(fact)
+            assert public_event is not None
+            event.clear()
+            event.update(public_event)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        if authoritative:
+            from ...core.agent.checkpoint import ExecutionEventPersistenceError
+
+            raise ExecutionEventPersistenceError(
+                "Outbound event commit failed"
+            ) from exc
+        if isinstance(exc, TaskLeaseLostError):
+            raise
+        logger.exception(
+            "Failed to persist agent outbound message for task %s", task_id
+        )
+    finally:
+        db.close()
+
+
+def _agent_outbound_event_type(payload: Dict[str, Any]) -> str:
+    message_type = str(payload.get("message_type") or "info")
+    if bool(payload.get("expect_response")) or message_type == "question":
+        return "agent_message"
+    return "agent_progress"
+
+
+def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
+    """Repair the completed stream payload using task-scoped durable FileRefs."""
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        task = db.query(Task).filter(Task.id == int(task_id)).first()
+        task_user_id = _task_user_id(task) if task is not None else None
+        if task_user_id is None:
+            return content
+        return str(
+            reconcile_assistant_file_references(
+                db,
+                task_id=int(task_id),
+                user_id=task_user_id,
+                content=content,
+            )
+        )
+    finally:
+        db.close()
+
+
+async def _persist_authoritative_outbound_event(
+    task_id: int,
+    event: Dict[str, Any],
+    *,
+    turn_id: str | None = None,
+) -> None:
+    """Persist an authoritative outbound event, rerunning transient failures.
+
+    A retryable failure may have committed. Each attempt writes a fresh copy
+    of ``event``, so its protocol id and payload are unchanged and a committed
+    attempt replays its fact and chat row instead of appending again. Some
+    branches rewrite the event they are given before COMMIT, so ``event`` is
+    left alone until an attempt succeeds and is then replaced by its copy.
+    """
+
+    attempts = 0
+
+    async def attempt() -> Dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        candidate = deepcopy(event)
+        rerun = attempts > 1
+        await run_db_io_cancellation_safe(
+            lambda: _persist_agent_outbound_event(
+                task_id,
+                candidate,
+                turn_id=turn_id,
+                authoritative=True,
+                rerun=rerun,
+            )
+        )
+        return candidate
+
+    try:
+        persisted = await retry_db_write_async(attempt, site="outbound")
+    except Exception as exc:
+        lease = current_task_lease()
+        report_commit_failure(
+            "outbound",
+            exc,
+            task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
+            retried=attempts > 1,
+        )
+        raise
+    event.clear()
+    event.update(persisted)
+
+
+def make_agent_outbound_handler(
+    task_id: int,
+    *,
+    authoritative: bool = False,
+    turn_id: str | None = None,
+) -> Any:
+    """Create a web bridge for agent agent-to-user messages."""
+
+    async def handle_outbound_message(payload: Dict[str, Any]) -> Dict[str, Any] | None:
+        payload_type = str(payload.get("type") or "")
+        if payload_type in {
+            "final_answer_start",
+            "final_answer_delta",
+            "final_answer_end",
+            "final_answer_error",
+        }:
+            if payload_type == "final_answer_end" and isinstance(
+                payload.get("content"), str
+            ):
+                payload = dict(payload)
+                payload["content"] = await asyncio.to_thread(
+                    _reconcile_streamed_final_answer,
+                    task_id,
+                    str(payload["content"]),
+                )
+            final_answer_event = create_final_answer_stream_event(
+                payload_type, task_id, dict(payload)
+            )
+            if authoritative:
+                await _persist_authoritative_outbound_event(
+                    task_id, final_answer_event, turn_id=turn_id
+                )
+            await publish_task_event(final_answer_event, task_id)
+            return None
+
+        if payload.get("visible") is False:
+            return None
+
+        event_type = _agent_outbound_event_type(payload)
+        event = create_stream_event(
+            event_type,
+            task_id,
+            {
+                "event_id": payload.get("event_id"),
+                "step_id": payload.get("step_id"),
+                "execution_id": payload.get("execution_id"),
+                "message": payload.get("message"),
+                "message_type": payload.get("message_type", "info"),
+                "expect_response": bool(payload.get("expect_response", False)),
+                "display": "chat" if event_type == "agent_message" else "timeline",
+                "visible": bool(payload.get("visible", True)),
+                "metadata": payload.get("metadata") or {},
+            },
+            event_id=payload.get("event_id"),
+        )
+        if authoritative:
+            await _persist_authoritative_outbound_event(task_id, event, turn_id=turn_id)
+        else:
+            await run_db_io_cancellation_safe(
+                lambda: _persist_agent_outbound_event(task_id, event, turn_id=turn_id)
+            )
+        await publish_task_event(event, task_id)
+        return cast(Dict[str, Any], event["data"]) if authoritative else None
+
+    return handle_outbound_message
+
+
+def _build_output_file_id(relative_path: str) -> str:
+    del relative_path
+    return str(uuid.uuid4())
+
+
+def _resolve_output_storage_path(raw_path: str) -> Optional[tuple[Any, str]]:
+    if not raw_path:
+        return None
+
+    path_candidate = Path(raw_path)
+    if path_candidate.exists() and path_candidate.is_file():
+        resolved = path_candidate.resolve()
+    else:
+        resolved = (get_uploads_dir() / raw_path.lstrip("/")).resolve()
+        if not resolved.exists() or not resolved.is_file():
+            return None
+
+    uploads_root = get_uploads_dir().resolve()
+    try:
+        relative_path = str(resolved.relative_to(uploads_root))
+    except ValueError:
+        return None
+
+    return resolved, relative_path
+
+
+def _map_link_token_to_file_id(
+    token: str, path_to_file_id: Dict[str, str]
+) -> Optional[str]:
+    raw = token.strip()
+    if not raw:
+        return None
+
+    direct_candidates = [
+        raw,
+        raw.lstrip("/"),
+        raw.replace("%2F", "/").lstrip("/"),
+        unquote(raw),
+    ]
+
+    expanded_candidates: list[str] = []
+    for candidate in direct_candidates:
+        if not candidate:
+            continue
+        if candidate not in expanded_candidates:
+            expanded_candidates.append(candidate)
+        if candidate.startswith("file:"):
+            stripped = candidate[5:].lstrip("/")
+            if stripped and stripped not in expanded_candidates:
+                expanded_candidates.append(stripped)
+        for prefix in ("preview/", "/preview/", "uploads/", "/uploads/"):
+            if candidate.startswith(prefix):
+                stripped = candidate[len(prefix) :].lstrip("/")
+                if stripped and stripped not in expanded_candidates:
+                    expanded_candidates.append(stripped)
+
+    for candidate in expanded_candidates:
+        mapped = path_to_file_id.get(candidate)
+        if mapped:
+            return mapped
+    return None
+
+
+def _rewrite_file_links_to_file_id(
+    output_text: Any, path_to_file_id: Dict[str, str]
+) -> Any:
+    if not isinstance(output_text, str) or not output_text:
+        return output_text
+
+    def replace_link(match: re.Match[str]) -> str:
+        token = match.group(1).strip()
+        mapped_file_id = _map_link_token_to_file_id(token, path_to_file_id)
+        if mapped_file_id:
+            return f"(file:{mapped_file_id})"
+        return match.group(0)
+
+    def replace_legacy_link(match: re.Match[str]) -> str:
+        token = match.group(1).strip()
+        mapped_file_id = _map_link_token_to_file_id(token, path_to_file_id)
+        if mapped_file_id:
+            return f"(file:{mapped_file_id})"
+        return match.group(0)
+
+    rewritten_output = re.sub(r"\(file:([^)]+)\)", replace_link, output_text)
+    rewritten_output = re.sub(
+        r"\(((?:/?preview|/?uploads)/[^)\s]+)\)",
+        replace_legacy_link,
+        rewritten_output,
+    )
+    rewritten_output = re.sub(
+        r"\((/?(?:input|output|temp)/[^)\s]+|/?(?:user_\d+/)?(?:web_task_\d+|task_\d+)/(?:input|output|temp)/[^)\s]+)\)",
+        replace_legacy_link,
+        rewritten_output,
+    )
+    return rewritten_output
+
+
+def _add_file_link_aliases(
+    path_to_file_id: Dict[str, str], relative_path: str, file_id: str
+) -> None:
+    normalized_relative_path = relative_path.lstrip("/")
+    if not normalized_relative_path:
+        return
+
+    for prefix in ("", "/", "preview/", "/preview/", "uploads/", "/uploads/"):
+        _set_file_link_alias(
+            path_to_file_id, f"{prefix}{normalized_relative_path}", file_id
+        )
+
+    basename = Path(normalized_relative_path).name
+    if basename and basename != normalized_relative_path:
+        _set_file_link_alias(path_to_file_id, basename, file_id)
+
+    parts = Path(normalized_relative_path).parts
+    task_local_parts: tuple[str, ...] = ()
+    if (
+        len(parts) >= 3
+        and parts[0].startswith("user_")
+        and (parts[1].startswith("web_task_") or parts[1].startswith("task_"))
+    ):
+        without_user = "/".join(parts[1:])
+        if without_user:
+            _add_file_link_aliases(path_to_file_id, without_user, file_id)
+        task_local_parts = parts[2:]
+    elif len(parts) >= 2 and (
+        parts[0].startswith("web_task_") or parts[0].startswith("task_")
+    ):
+        task_local_parts = parts[1:]
+
+    if task_local_parts and task_local_parts[0] in {"input", "output", "temp"}:
+        task_local_path = "/".join(task_local_parts)
+        _set_file_link_alias(path_to_file_id, task_local_path, file_id)
+        _set_file_link_alias(path_to_file_id, f"/{task_local_path}", file_id)
+
+
+def _set_file_link_alias(
+    path_to_file_id: Dict[str, str], alias: str, file_id: str
+) -> None:
+    existing_file_id = path_to_file_id.get(alias)
+    if existing_file_id is None or existing_file_id == file_id:
+        path_to_file_id[alias] = file_id
+        return
+
+    # A bare ``file:report.txt`` link is ambiguous when multiple outputs can
+    # claim the same alias. Keep scoped aliases but disable ambiguous rewriting
+    # so we never point the user at the wrong artifact. The empty string is a
+    # sticky sentinel for this alias: once ambiguous, later registrations cannot
+    # reclaim it for a single file.
+    path_to_file_id[alias] = ""
+
+
+def _uploaded_file_record_in_task_scope(
+    file_record: Any, task_id: int, task_user_id: int
+) -> bool:
+    try:
+        record_user_id = int(getattr(file_record, "user_id"))
+    except (TypeError, ValueError):
+        return False
+
+    if record_user_id != int(task_user_id):
+        return False
+
+    if getattr(file_record, "detached_reason", None) is not None:
+        return False
+    record_task_id = getattr(file_record, "task_id", None)
+    if record_task_id is None:
+        return True
+
+    try:
+        return int(record_task_id) == int(task_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _output_path_in_current_task_scope(
+    relative_path: str, task_id: int, task_user_id: int
+) -> bool:
+    parts = Path(relative_path.lstrip("/")).parts
+    task_dirs = {f"web_task_{task_id}", f"task_{task_id}"}
+
+    if len(parts) >= 4 and parts[0] == f"user_{task_user_id}":
+        # Scoped workspaces insert ExecutionScope.workspace_segments between
+        # the user root and the task dir
+        # (user_{id}/{segment}.../web_task_{id}/output/...); accept the task
+        # dir at any depth after the user root so scoped outputs are not
+        # misclassified as foreign. Keep scanning past a component that
+        # merely LOOKS like the task dir — a scope segment may legitimately
+        # be named like one (the segment charset allows it), and an early
+        # verdict on it would reject the real task dir further down.
+        for index in range(1, len(parts) - 2):
+            if parts[index] in task_dirs and parts[index + 1] == "output":
+                return True
+
+    return len(parts) >= 3 and parts[0] in task_dirs and parts[1] == "output"
+
+
+def _normalize_workspace_relative_path(relative_path: str) -> str:
+    normalized = relative_path.strip().lstrip("/")
+    path_parts = [part for part in Path(normalized).parts if part not in ("", ".")]
+    if not path_parts or ".." in path_parts:
+        return Path(normalized).name or "output"
+
+    if path_parts[0].startswith("user_"):
+        path_parts = path_parts[1:]
+
+    if path_parts and (
+        path_parts[0].startswith("web_task_") or path_parts[0].startswith("task_")
+    ):
+        path_parts = path_parts[1:]
+
+    return "/".join(path_parts) if path_parts else "output"
+
+
+def _workspace_category_from_relative_path(relative_path: str) -> str:
+    path_parts = Path(relative_path).parts
+    return path_parts[0] if path_parts else "output"
+
+
+@dataclass(frozen=True)
+class _OutputFileRecordSnapshot:
+    """Detached durable metadata used to plan one output registration."""
+
+    version: UploadedFileVersionSnapshot
+    file_id: str
+    filename: str
+    storage_key: str | None
+    mime_type: str | None
+    file_size: int
+    workspace_relative_path: str | None
+    workspace_category: str | None
+
+
+@dataclass(frozen=True)
+class _TaskOutputStageRequest:
+    """One validated local output whose bytes still need durable staging."""
+
+    item_index: int
+    resolved_path: Path
+    raw_paths: tuple[str, ...]
+    item_file_id: str
+    filename: str
+    normalized_relative_path: str
+    workspace_relative_path: str
+    workspace_category: str
+    existing: _OutputFileRecordSnapshot | None
+
+
+@dataclass(frozen=True)
+class _ResolvedTaskOutputInput:
+    """Filesystem-resolved input that is safe to inspect with a short Session."""
+
+    item_index: int
+    item_file_id: str
+    item_filename: str
+    item_relative_path: str
+    raw_paths: tuple[str, ...]
+    resolved_info: tuple[Path, str] | None
+
+
+@dataclass(frozen=True)
+class _PreparedTaskOutputMutation:
+    """One already-durable object awaiting the fenced metadata transaction."""
+
+    staged: StagedUploadedFile
+    expected: UploadedFileVersionSnapshot | None
+
+
+@dataclass(frozen=True)
+class _PreparedTaskFileOutputs:
+    """Detached result of the no-Session durable-output phase."""
+
+    normalized_outputs: tuple[dict[str, Any], ...]
+    path_to_file_id: tuple[tuple[str, str], ...]
+    mutations: tuple[_PreparedTaskOutputMutation, ...]
+
+    @property
+    def staged_files(self) -> tuple[StagedUploadedFile, ...]:
+        return tuple(mutation.staged for mutation in self.mutations)
+
+
+def _snapshot_output_file(record: UploadedFile) -> _OutputFileRecordSnapshot:
+    return _OutputFileRecordSnapshot(
+        version=snapshot_uploaded_file_version(record),
+        file_id=str(record.file_id),
+        filename=str(record.filename),
+        storage_key=(
+            str(record.storage_key) if record.storage_key is not None else None
+        ),
+        mime_type=str(record.mime_type) if record.mime_type is not None else None,
+        file_size=int(record.file_size or 0),
+        workspace_relative_path=(
+            str(record.workspace_relative_path)
+            if record.workspace_relative_path is not None
+            else None
+        ),
+        workspace_category=(
+            str(record.workspace_category)
+            if record.workspace_category is not None
+            else None
+        ),
+    )
+
+
+def _prepared_output_ref(
+    *,
+    file_id: str,
+    filename: str,
+    mime_type: str | None,
+    file_size: int,
+) -> dict[str, Any]:
+    return build_file_ref(
+        file_id=file_id,
+        filename=filename,
+        mime_type=mime_type,
+        size=file_size,
+    )
+
+
+def _prepare_task_file_outputs_isolated(
+    *,
+    task_id: int,
+    task_user_id: int | None,
+    file_outputs: Any,
+    resolved_scope_segments: tuple[str, ...],
+) -> _PreparedTaskFileOutputs:
+    """Stage task output bytes without retaining a Session or task-row lock.
+
+    The first phase only snapshots existing metadata.  The Session is closed
+    before checksum/object-storage work begins.  A later exact-run transaction
+    applies these detached mutations together with the terminal task state.
+    """
+
+    if isinstance(file_outputs, str):
+        file_outputs = [file_outputs] if file_outputs.strip() else []
+    if not isinstance(file_outputs, list) or not file_outputs:
+        return _PreparedTaskFileOutputs((), (), ())
+
+    SessionLocal = get_session_local()
+    resolved_task_user_id = task_user_id
+    if resolved_task_user_id is None:
+        with SessionLocal() as db:
+            resolved_task_user_id = (
+                db.query(Task.user_id).filter(Task.id == task_id).scalar()
+            )
+        if resolved_task_user_id is None:
+            return _PreparedTaskFileOutputs((), (), ())
+    owner_user_id = int(resolved_task_user_id)
+
+    # Parse and resolve every candidate before opening the metadata Session.
+    # Local files may be backed by slow network mounts; even existence checks
+    # must not pin a database connection.
+    resolved_inputs: list[_ResolvedTaskOutputInput] = []
+    for item_index, item in enumerate(file_outputs):
+        item_file_id = ""
+        item_filename = ""
+        item_relative_path = ""
+        raw_paths: list[str] = []
+        if isinstance(item, str):
+            raw_paths = [item]
+        elif isinstance(item, dict):
+            if isinstance(item.get("file_id"), str):
+                item_file_id = str(item["file_id"]).strip()
+            if isinstance(item.get("filename"), str):
+                item_filename = str(item["filename"])
+            for key in ("file_path", "download_path", "relative_path", "path"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_paths.append(value)
+                    if key == "relative_path":
+                        item_relative_path = value
+        else:
+            continue
+
+        resolved_info: tuple[Path, str] | None = None
+        for raw_path in raw_paths:
+            candidate = _resolve_output_storage_path(raw_path)
+            if candidate is not None:
+                resolved_info = (Path(candidate[0]), str(candidate[1]))
+                break
+        resolved_inputs.append(
+            _ResolvedTaskOutputInput(
+                item_index=item_index,
+                item_file_id=item_file_id,
+                item_filename=item_filename,
+                item_relative_path=item_relative_path,
+                raw_paths=tuple(raw_paths),
+                resolved_info=resolved_info,
+            )
+        )
+
+    stage_requests: list[_TaskOutputStageRequest] = []
+    immediate_outputs: list[
+        tuple[int, dict[str, Any], tuple[str, ...], str | None]
+    ] = []
+    with SessionLocal() as db:
+        for resolved_input in resolved_inputs:
+            if resolved_input.resolved_info is None:
+                if not resolved_input.item_file_id:
+                    continue
+                record = (
+                    db.query(UploadedFile)
+                    .filter(
+                        UploadedFile.file_id == resolved_input.item_file_id,
+                        UploadedFile.user_id == owner_user_id,
+                        UploadedFile.detached_reason.is_(None),
+                        or_(
+                            UploadedFile.task_id == task_id,
+                            UploadedFile.task_id.is_(None),
+                        ),
+                        UploadedFile.storage_status != "compensating",
+                    )
+                    .first()
+                )
+                if record is None:
+                    logger.warning(
+                        "Skipping file output outside task/user scope: %s",
+                        resolved_input.item_file_id,
+                    )
+                    continue
+                snapshot = _snapshot_output_file(record)
+                immediate_outputs.append(
+                    (
+                        resolved_input.item_index,
+                        _prepared_output_ref(
+                            file_id=snapshot.file_id,
+                            filename=(
+                                resolved_input.item_filename or snapshot.filename
+                            ),
+                            mime_type=snapshot.mime_type,
+                            file_size=snapshot.file_size,
+                        ),
+                        resolved_input.raw_paths,
+                        snapshot.workspace_relative_path,
+                    )
+                )
+                continue
+
+            resolved_path, relative_path = resolved_input.resolved_info
+            normalized_relative_path = relative_path.lstrip("/")
+            record = (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.storage_path == str(resolved_path),
+                    UploadedFile.storage_status != "compensating",
+                )
+                .first()
+            )
+            if record is not None and not _uploaded_file_record_in_task_scope(
+                record,
+                task_id,
+                owner_user_id,
+            ):
+                logger.warning(
+                    "Skipping file output record outside task/user scope: %s",
+                    getattr(record, "file_id", str(resolved_path)),
+                )
+                continue
+
+            if record is not None and not _output_path_in_current_task_scope(
+                normalized_relative_path,
+                task_id,
+                owner_user_id,
+            ):
+                snapshot = _snapshot_output_file(record)
+                if snapshot.workspace_category != "output":
+                    logger.warning(
+                        "Skipping registered file output outside output category: %s",
+                        snapshot.file_id,
+                    )
+                    continue
+                immediate_outputs.append(
+                    (
+                        resolved_input.item_index,
+                        _prepared_output_ref(
+                            file_id=snapshot.file_id,
+                            filename=(
+                                resolved_input.item_filename or snapshot.filename
+                            ),
+                            mime_type=snapshot.mime_type,
+                            file_size=snapshot.file_size,
+                        ),
+                        resolved_input.raw_paths,
+                        snapshot.workspace_relative_path,
+                    )
+                )
+                continue
+
+            if not _output_path_in_current_task_scope(
+                normalized_relative_path,
+                task_id,
+                owner_user_id,
+            ):
+                logger.warning(
+                    "Skipping file output outside current task output scope: %s",
+                    relative_path,
+                )
+                continue
+
+            workspace_relative_path = _normalize_workspace_relative_path(
+                resolved_input.item_relative_path or normalized_relative_path
+            )
+            workspace_category = _workspace_category_from_relative_path(
+                workspace_relative_path
+            )
+            if record is None and resolved_input.item_file_id:
+                record = (
+                    db.query(UploadedFile)
+                    .filter(
+                        UploadedFile.file_id == resolved_input.item_file_id,
+                        UploadedFile.user_id == owner_user_id,
+                        UploadedFile.detached_reason.is_(None),
+                        or_(
+                            UploadedFile.task_id == task_id,
+                            UploadedFile.task_id.is_(None),
+                        ),
+                        UploadedFile.storage_status != "compensating",
+                    )
+                    .first()
+                )
+            existing = _snapshot_output_file(record) if record is not None else None
+            stage_requests.append(
+                _TaskOutputStageRequest(
+                    item_index=resolved_input.item_index,
+                    resolved_path=resolved_path,
+                    raw_paths=resolved_input.raw_paths,
+                    item_file_id=resolved_input.item_file_id,
+                    filename=(resolved_input.item_filename or resolved_path.name),
+                    normalized_relative_path=normalized_relative_path,
+                    workspace_relative_path=workspace_relative_path,
+                    workspace_category=workspace_category,
+                    existing=existing,
+                )
+            )
+
+    normalized_by_index: dict[int, dict[str, Any]] = {
+        index: output for index, output, _raw_paths, _relative in immediate_outputs
+    }
+    path_to_file_id: dict[str, str] = {}
+    for (
+        index,
+        output,
+        immediate_raw_paths,
+        immediate_relative_path,
+    ) in immediate_outputs:
+        del index
+        file_id = str(output["file_id"])
+        for raw_path in immediate_raw_paths:
+            stripped = raw_path.strip()
+            if stripped:
+                _set_file_link_alias(path_to_file_id, stripped, file_id)
+                _set_file_link_alias(path_to_file_id, stripped.lstrip("/"), file_id)
+        if immediate_relative_path:
+            _add_file_link_aliases(
+                path_to_file_id,
+                immediate_relative_path,
+                file_id,
+            )
+
+    mutations: list[_PreparedTaskOutputMutation] = []
+    staged_by_path: dict[str, StagedUploadedFile] = {}
+    try:
+        for request in stage_requests:
+            path_key = str(request.resolved_path)
+            staged = staged_by_path.get(path_key)
+            if staged is None:
+                existing_file_id = (
+                    request.existing.file_id if request.existing is not None else ""
+                )
+                file_id = (
+                    existing_file_id
+                    or request.item_file_id
+                    or _build_output_file_id(request.workspace_relative_path)
+                )
+                # Every staged output gets an immutable generation key,
+                # including first insert. Competing preparations can therefore
+                # compensate only their own object and committed cleanup never
+                # needs to reuse a superseded key.
+                key_relative_path = (
+                    f"_versions/{uuid.uuid4().hex}/{request.workspace_relative_path}"
+                )
+                staged = stage_uploaded_file_from_local_path(
+                    local_path=request.resolved_path,
+                    user_id=int(resolved_task_user_id),
+                    task_id=task_id,
+                    file_id=file_id,
+                    filename=request.filename,
+                    mime_type=None,
+                    storage_key=build_task_output_storage_key(
+                        int(resolved_task_user_id),
+                        task_id,
+                        file_id,
+                        key_relative_path,
+                        scope_segments=resolved_scope_segments,
+                    ),
+                    workspace_relative_path=request.workspace_relative_path,
+                    workspace_category=request.workspace_category,
+                    execution_scope=ExecutionScope(
+                        workspace_segments=resolved_scope_segments,
+                        isolate_external_dirs=bool(resolved_scope_segments),
+                    ),
+                )
+                staged_by_path[path_key] = staged
+                mutations.append(
+                    _PreparedTaskOutputMutation(
+                        staged=staged,
+                        expected=(
+                            request.existing.version
+                            if request.existing is not None
+                            else None
+                        ),
+                    )
+                )
+
+            normalized_by_index[request.item_index] = _prepared_output_ref(
+                file_id=staged.file_id,
+                filename=request.filename or staged.filename,
+                mime_type=staged.mime_type,
+                file_size=staged.file_size,
+            )
+            if request.item_file_id:
+                path_to_file_id[request.item_file_id] = staged.file_id
+            for raw_path in request.raw_paths:
+                stripped = raw_path.strip()
+                if stripped:
+                    _set_file_link_alias(path_to_file_id, stripped, staged.file_id)
+                    _set_file_link_alias(
+                        path_to_file_id,
+                        stripped.lstrip("/"),
+                        staged.file_id,
+                    )
+            _set_file_link_alias(
+                path_to_file_id,
+                str(request.resolved_path),
+                staged.file_id,
+            )
+            _add_file_link_aliases(
+                path_to_file_id,
+                request.normalized_relative_path,
+                staged.file_id,
+            )
+            if request.workspace_relative_path != request.normalized_relative_path:
+                _add_file_link_aliases(
+                    path_to_file_id,
+                    request.workspace_relative_path,
+                    staged.file_id,
+                )
+    except Exception:
+        compensate_staged_uploaded_files(tuple(staged_by_path.values()))
+        raise
+
+    return _PreparedTaskFileOutputs(
+        normalized_outputs=tuple(
+            normalized_by_index[index] for index in sorted(normalized_by_index)
+        ),
+        path_to_file_id=tuple(path_to_file_id.items()),
+        mutations=tuple(mutations),
+    )
+
+
+def _apply_prepared_task_file_outputs(
+    db: Session,
+    prepared: _PreparedTaskFileOutputs,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, str],
+    tuple[SupersededObjectCleanupClaim, ...],
+]:
+    """Apply metadata only; the caller owns the exact-run transaction."""
+
+    store = UploadedFileStore(db)
+    cleanup_claims: list[SupersededObjectCleanupClaim] = []
+    for mutation in prepared.mutations:
+        applied = store.upsert_already_durable(
+            mutation.staged,
+            expected=mutation.expected,
+        )
+        if applied.superseded_cleanup_claim is not None:
+            cleanup_claims.append(applied.superseded_cleanup_claim)
+    return (
+        [deepcopy(output) for output in prepared.normalized_outputs],
+        dict(prepared.path_to_file_id),
+        tuple(cleanup_claims),
+    )
+
+
+def _settle_prepared_task_file_outputs(
+    prepared: _PreparedTaskFileOutputs,
+    *,
+    metadata_committed: bool,
+    cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = (),
+) -> None:
+    """Complete the object-storage side of the two-phase registration."""
+
+    if metadata_committed:
+        try:
+            failed_cleanup_claims = cleanup_superseded_uploaded_file_objects(
+                cleanup_claims
+            )
+        except Exception:
+            # The metadata transaction is already committed. Object cleanup is
+            # post-commit garbage collection and must never reclassify that
+            # durable success as a failed task execution.
+            logger.exception(
+                "Failed to clean up superseded task output objects after commit"
+            )
+            return
+        if failed_cleanup_claims:
+            logger.warning(
+                "Retained %s superseded task output object(s) because reference, "
+                "backend, or deletion state was unknown",
+                len(failed_cleanup_claims),
+            )
+        return
+    try:
+        failed_staged_files = compensate_staged_uploaded_files(prepared.staged_files)
+    except Exception:
+        # Settlement runs from finalizers' ``finally`` blocks. A best-effort
+        # compensation failure must not replace the original transaction error
+        # that caused rollback.
+        logger.exception("Failed to compensate staged task output objects")
+        return
+    if failed_staged_files:
+        logger.warning(
+            "Failed to compensate %s staged task output object(s)",
+            len(failed_staged_files),
+        )
+
+
+async def _prepare_task_file_outputs_cancellation_safe(
+    *,
+    task_id: int,
+    task_user_id: int | None,
+    file_outputs: Any,
+    resolved_scope_segments: tuple[str, ...],
+) -> _PreparedTaskFileOutputs:
+    """Drain staging and compensate its late result before propagating cancel."""
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _prepare_task_file_outputs_isolated,
+            task_id=task_id,
+            task_user_id=task_user_id,
+            file_outputs=file_outputs,
+            resolved_scope_segments=resolved_scope_segments,
+        )
+    )
+    prepared, cancellation = await await_task_settlement(worker)
+    if cancellation is None:
+        return prepared
+    try:
+        await run_db_io_cancellation_safe(
+            lambda: _settle_prepared_task_file_outputs(
+                prepared,
+                metadata_committed=False,
+            )
+        )
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(
+            "Failed to compensate task %s outputs after cancelled staging",
+            task_id,
+        )
+    raise cancellation
+
+
+def _task_user_id(task: Any) -> int | None:
+    user_id = getattr(task, "user_id", None)
+    if user_id is None:
+        return None
+    return int(cast(Any, user_id))
+
+
+@dataclass(frozen=True)
+class _TaskExecutionFinalization:
+    normalized_outputs: list[dict[str, Any]]
+    ai_response: Any
+    chat_response: Any
+    waiting_for_control: bool
+    terminal_state_committed: bool
+    final_task_status: str
+    broadcast_meta: dict[str, Any]
+    late_result: bool = False
+    # The committed control identity, plus the recorded reason when an
+    # interruption paused the run.
+    report: SettlementReport = field(default_factory=SettlementReport)
+    error_code: str | None = None
+    error_details: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ChatMessageWitness:
+    """A legacy transcript row inserted by one finalize transaction.
+
+    Matched by its whole staged content, not only its id: SQLite can reuse
+    the rowid of a rolled-back insert for another writer's message.
+    """
+
+    task_id: int
+    message_id: int
+    role: str
+    message_type: str
+    content: str
+
+
+_FinalizationWitness = Union[FactWitness, _ChatMessageWitness]
+
+# Bound the read-back's wait for an in-flight COMMIT on PostgreSQL. SQLite's
+# busy timeout bounds the same wait there.
+_FINALIZATION_READ_BACK_LOCK_TIMEOUT = "5s"
+
+
+def _finalization_witness_committed(witness: _FinalizationWitness) -> bool:
+    """Read back one finalize witness after waiting for in-flight COMMITs."""
+    from ..models.chat_message import TaskChatMessage
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+
+    with get_session_local()() as read_db:
+        try:
+            if read_db.get_bind().dialect.name == "postgresql":
+                read_db.execute(
+                    text("SELECT set_config('lock_timeout', :lock, true)"),
+                    {"lock": _FINALIZATION_READ_BACK_LOCK_TIMEOUT},
+                )
+            # The finalize transaction held this task row until its COMMIT
+            # resolved; taking the same lock first waits for that outcome.
+            # It is this session's only lock, so it cannot invert an order.
+            lock_task_execution_events_no_commit(read_db, witness.task_id)
+            if isinstance(witness, FactWitness):
+                return fact_witness_committed_no_commit(read_db, witness)
+            return (
+                read_db.scalar(
+                    select(TaskChatMessage.id).where(
+                        TaskChatMessage.id == witness.message_id,
+                        TaskChatMessage.task_id == witness.task_id,
+                        TaskChatMessage.role == witness.role,
+                        TaskChatMessage.message_type == witness.message_type,
+                        TaskChatMessage.content == witness.content,
+                    )
+                )
+                is not None
+            )
+        finally:
+            read_db.rollback()
+
+
+def _commit_finalization_or_reconcile(
+    finalize_db: Session,
+    *,
+    task_id: int,
+    witness: _FinalizationWitness | None,
+    run_id: str | None = None,
+    storage: str = "unknown",
+) -> None:
+    """Commit one result transition, or prove an unacknowledged COMMIT applied.
+
+    A driver can raise after the server committed. Without this read-back the
+    run would be reported as a setup/run failure that the fenced settlement
+    cannot apply (the row is no longer RUNNING), so neither the result nor a
+    failure would ever be announced.
+
+    Only a row this transaction inserted proves its COMMIT: the task row's
+    status/state version cannot, because a rolled-back FAILED result releases
+    the row to a coordinator cancel that commits the same FAILED state and
+    version without this result. The transaction is atomic, so its witness
+    row stands for every write in it. Without a witness (a legacy branch
+    that inserts no row, or a replayed fact), or when the read-back cannot
+    decide, the commit error is re-raised unchanged.
+
+    Operator signals (``report_unknown_outcome``, with the task's ``run_id``
+    and ``storage``): ``finalize_ack_reconciled`` when the read-back proves
+    the commit applied, and ``finalize_ack_unresolved`` when the commit error
+    is re-raised although it is not known whether the commit applied (no
+    witness to read back, or the read-back itself failed) and the commit
+    error is a dropped connection (``connection_was_lost``), the only
+    failure that can hide an applied COMMIT. A read-back that completes and
+    finds the witness absent, or any other commit error (a deadlock, a
+    serialization failure, a locked SQLite database), means the commit did
+    not apply: a plain failure, not reported here.
+    """
+    try:
+        finalize_db.commit()
+        return
+    except Exception as commit_error:
+        try:
+            finalize_db.rollback()
+        except Exception:
+            logger.warning(
+                "Task %s finalization rollback failed after a commit error",
+                task_id,
+                exc_info=True,
+            )
+        # Only a dropped connection can lose the acknowledgement of a COMMIT
+        # that applied; any other commit error is the server refusing it.
+        may_have_applied = connection_was_lost(commit_error)
+        committed = False
+        read_back_failed = False
+        if witness is not None:
+            try:
+                committed = _finalization_witness_committed(witness)
+            except Exception:
+                logger.warning(
+                    "Task %s finalization commit read-back failed",
+                    task_id,
+                    exc_info=True,
+                )
+                read_back_failed = True
+        if not committed:
+            if may_have_applied and (witness is None or read_back_failed):
+                report_unknown_outcome(
+                    "finalize_ack_unresolved",
+                    task_id=task_id,
+                    run_id=run_id,
+                    storage=storage,
+                )
+            raise commit_error
+        report_unknown_outcome(
+            "finalize_ack_reconciled",
+            task_id=task_id,
+            run_id=run_id,
+            storage=storage,
+            level=logging.INFO,
+        )
+
+
+def _finalization_broadcast_meta(task: Task) -> dict[str, Any]:
+    """Read the result broadcast fields from the flushed, uncommitted row.
+
+    Taken before COMMIT so a reconciled commit never lazy-loads expired
+    attributes through a session whose rollback may have failed. The flush
+    makes ``updated_at`` (set by the database) the value being committed.
+    """
+    return {
+        "id": int(task.id),
+        "title": task.title,
+        "description": task.description,
+        "execution_mode": getattr(task, "execution_mode", None),
+        "updated_at": task.updated_at,
+        "completion_outcome": task.completion_outcome,
+    }
+
+
+def _decide_result_interruption(
+    db: Session, task: Task, result: dict[str, Any]
+) -> InterruptionDecision | None:
+    """Decide the interruption an unsuccessful result reports, if any.
+
+    Only a RUNNING row is decided; anything else keeps its own settlement.
+    An unresolvable checkpoint raises ``InterruptionSettlementDeferred``.
+    """
+
+    if task.status != TaskStatus.RUNNING:
+        return None
+    reason = settlement_interruption_for_result(result)
+    if reason is None:
+        return None
+    return decide_interruption(db, task=task, reason=reason)
+
+
+def _apply_result_interruption(
+    db: Session,
+    task: Task,
+    decision: InterruptionDecision,
+    result: dict[str, Any],
+) -> RecordedInterruption | None:
+    return apply_interruption_outcome_no_commit(
+        db,
+        task=task,
+        decision=decision,
+        error=safe_str(result.get("error")).strip() or None,
+    )
+
+
+def _finalize_task_execution_result_isolated(
+    *,
+    task_id: int,
+    task_user_id: int | None,
+    pre_run_status: TaskStatus,
+    result: dict[str, Any],
+    expected_run_id: str | None,
+    task_lease: TaskLease | None,
+    resolved_scope_segments: tuple[str, ...],
+    prepared_outputs: _PreparedTaskFileOutputs | None = None,
+    turn_id: str | None = None,
+) -> _TaskExecutionFinalization:
+    """Persist one task result in a worker-owned, ownership-fenced session."""
+    from .chat_history_service import persist_assistant_message_no_commit
+
+    if prepared_outputs is None:
+        resolved_output_user_id = task_user_id
+        if resolved_output_user_id is None:
+            SessionLocal = get_session_local()
+            with SessionLocal() as lookup_db:
+                resolved_output_user_id = (
+                    lookup_db.query(Task.user_id).filter(Task.id == task_id).scalar()
+                )
+        prepared_outputs = (
+            _prepare_task_file_outputs_isolated(
+                task_id=task_id,
+                task_user_id=int(resolved_output_user_id),
+                file_outputs=result.get("file_outputs", []),
+                resolved_scope_segments=resolved_scope_segments,
+            )
+            if resolved_output_user_id is not None
+            else _PreparedTaskFileOutputs((), (), ())
+        )
+
+    SessionLocal = get_session_local()
+    finalize_db = SessionLocal()
+    metadata_committed = False
+    cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
+    try:
+        default_response = "Task completed" if result.get("success", False) else ""
+        chat_response = result.get("chat_response")
+        if isinstance(chat_response, dict):
+            ai_response = chat_response.get("message") or result.get(
+                "output", default_response
+            )
+        else:
+            ai_response = result.get("output", default_response)
+
+        task_query = finalize_db.query(Task).filter(Task.id == task_id)
+        if task_lease is not None:
+            if task_lease.run_id is None:
+                logger.warning(
+                    "Task %s result has an unfenced lease; refusing finalization",
+                    task_id,
+                )
+                task_updated = None
+                late_result = True
+            else:
+                lock_task_lease_for_settlement_no_commit(finalize_db, task_lease)
+                task_updated = (
+                    task_query.filter(
+                        Task.runner_id == task_lease.runner_id,
+                        task_lease_attempt_predicate(task_lease),
+                        Task.run_id == task_lease.run_id,
+                    )
+                    .with_for_update()
+                    .first()
+                )
+                late_result = task_updated is None
+        else:
+            # Legacy callers have no concrete owner identity and may only
+            # finalize an ownerless task row.
+            task_query = task_query.filter(Task.runner_id.is_(None))
+            if expected_run_id is not None:
+                task_query = task_query.filter(Task.run_id == expected_run_id)
+            task_updated = task_query.with_for_update().first()
+            late_result = task_updated is None
+
+        if late_result:
+            finalize_db.rollback()
+            logger.info(
+                "Ignoring late task result for task %s run %s; ownership changed",
+                task_id,
+                expected_run_id,
+            )
+            return _TaskExecutionFinalization(
+                normalized_outputs=[],
+                ai_response=ai_response,
+                chat_response=chat_response,
+                waiting_for_control=False,
+                terminal_state_committed=False,
+                final_task_status=pre_run_status.value,
+                broadcast_meta={},
+                late_result=True,
+            )
+
+        turn_id = routine_history_turn_id(
+            task_updated,
+            turn_id,
+            expected_run_id=(
+                task_lease.run_id if task_lease is not None else expected_run_id
+            ),
+        )
+
+        (
+            normalized_outputs,
+            path_to_file_id,
+            cleanup_claims,
+        ) = _apply_prepared_task_file_outputs(finalize_db, prepared_outputs)
+        ai_response = _rewrite_file_links_to_file_id(ai_response, path_to_file_id)
+        if task_user_id is not None:
+            ai_response = reconcile_assistant_file_references(
+                finalize_db,
+                task_id=task_id,
+                user_id=task_user_id,
+                content=ai_response,
+            )
+            if isinstance(chat_response, dict) and chat_response.get("message"):
+                chat_response = {**chat_response, "message": ai_response}
+
+        waiting_for_control = False
+        terminal_state_committed = False
+        # Only a pause or wait transition owns this transaction. Canceled,
+        # failed and already-paused tasks ignore the late result and roll back
+        # its files.
+        control_commit_pending = False
+        interruption_pause_reason: InterruptionReason | None = None
+        interruption_recovery: RecordedInterruption | None = None
+        final_control_snapshot: TaskControlSnapshot | None = None
+        final_task_status = pre_run_status.value
+        # Set only when this transaction settles the result as FAILED.
+        presentation: FailedResultPresentation | None = None
+        # Set when it fails the run as an unknown tool effect; reported only
+        # once the transaction has committed.
+        unknown_tool_effect: InterruptionDecision | None = None
+
+        if task_updated is not None:
+            task_agent_config: dict[str, Any] = (
+                task_updated.agent_config
+                if isinstance(task_updated.agent_config, dict)
+                else {}
+            )
+            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED" or (
+                result.get("injection_outcome_unknown")
+                and task_updated.status == TaskStatus.FAILED
+            ):
+                waiting_for_control = True
+                logger.info(
+                    "Task %s was canceled while execution was in flight; "
+                    "ignoring the late result",
+                    task_id,
+                )
+            elif task_updated.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                # Settled terminal while this run was still in flight, without
+                # the A2A marker above -- an external cancel that finalized
+                # FAILED after its wait for the runner timed out, for one. The
+                # lease fence still matches in coordinator context, where
+                # settlement leaves ownership to the coordinator, so a late
+                # interrupt must not resurrect the row as PAUSED, nor a late
+                # success rewrite FAILED as COMPLETED.
+                waiting_for_control = True
+                logger.info(
+                    "Task %s already settled %s; ignoring the late %s result",
+                    task_id,
+                    task_updated.status.value,
+                    result.get("status") or "execution",
+                )
+            elif result.get("status") == "waiting_for_user" and not result.get(
+                "injection_outcome_unknown"
+            ):
+                next_control_state = (
+                    TaskControlState.RESUME_REQUESTED
+                    if task_updated.control_state
+                    == TaskControlState.RESUME_REQUESTED.value
+                    else TaskControlState.WAITING_FOR_USER
+                )
+                final_control_snapshot = apply_task_control_transition(
+                    task_updated,
+                    next_control_state,
+                    status=TaskStatus.WAITING_FOR_USER,
+                    expected_run_id=expected_run_id,
+                )
+                sync_workforce_run_status(
+                    finalize_db,
+                    task_updated,
+                    task_updated.status,
+                )
+                terminal_state_committed = True
+                waiting_for_control = True
+                control_commit_pending = True
+            elif (
+                result.get("injection_outcome_unknown")
+                and (
+                    result.get("success", False)
+                    or result.get("status") == "waiting_for_user"
+                )
+            ) or result.get("status") == "interrupted":
+                # A resume requested mid-run carries input that was already
+                # accepted. Its handoff acquires the lease without reading this
+                # state and resumes from the checkpoint, even when later input
+                # became unknown, so keep the row saying a resume is coming.
+                next_control_state = (
+                    TaskControlState.RESUME_REQUESTED
+                    if task_updated.control_state
+                    == TaskControlState.RESUME_REQUESTED.value
+                    else TaskControlState.PAUSED
+                )
+                final_control_snapshot = apply_task_control_transition(
+                    task_updated,
+                    next_control_state,
+                    status=TaskStatus.PAUSED,
+                    expected_run_id=expected_run_id,
+                )
+                sync_workforce_run_status(
+                    finalize_db,
+                    task_updated,
+                    task_updated.status,
+                )
+                terminal_state_committed = True
+                waiting_for_control = True
+                control_commit_pending = True
+            elif task_updated.status not in {
+                TaskStatus.PAUSED,
+                TaskStatus.WAITING_FOR_USER,
+            }:
+                # Only an owned run is paused: its lease settlement releases it.
+                interruption = (
+                    _decide_result_interruption(finalize_db, task_updated, result)
+                    if task_lease is not None
+                    else None
+                )
+                if interruption is not None and interruption.pause:
+                    # A recoverable run interrupted by a system cause rests
+                    # PAUSED for its user to resume, as lease recovery
+                    # leaves it; the scheduler's settlement releases it.
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        TaskControlState.PAUSED,
+                        status=TaskStatus.PAUSED,
+                        expected_run_id=expected_run_id,
+                    )
+                    interruption_recovery = _apply_result_interruption(
+                        finalize_db, task_updated, interruption, result
+                    )
+                    interruption_pause_reason = interruption.reason
+                    terminal_state_committed = True
+                    waiting_for_control = True
+                    control_commit_pending = True
+                else:
+                    final_status = (
+                        TaskStatus.COMPLETED
+                        if result.get("success", False)
+                        else TaskStatus.FAILED
+                    )
+                    final_control_snapshot = apply_task_control_transition(
+                        task_updated,
+                        TaskControlState.COMPLETED
+                        if final_status == TaskStatus.COMPLETED
+                        else TaskControlState.FAILED,
+                        status=final_status,
+                        expected_run_id=expected_run_id,
+                    )
+                    setattr(
+                        task_updated,
+                        "completion_outcome",
+                        completion_outcome_for_status(result, final_status),
+                    )
+                    if final_status == TaskStatus.FAILED:
+                        presentation = present_failed_result(result)
+                        setattr(
+                            task_updated,
+                            "error_message",
+                            presentation.diagnostic_error
+                            or safe_str(ai_response).strip()
+                            or CLIENT_SAFE_TASK_FAILURE,
+                        )
+                        if presentation.visible_text is not None:
+                            ai_response = presentation.visible_text
+                    sync_workforce_run_status(
+                        finalize_db,
+                        task_updated,
+                        task_updated.status,
+                    )
+                    if interruption is not None:
+                        _apply_result_interruption(
+                            finalize_db, task_updated, interruption, result
+                        )
+                        if (
+                            interruption.outcome
+                            is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+                        ):
+                            unknown_tool_effect = interruption
+            else:
+                waiting_for_control = True
+                terminal_state_committed = True
+
+            final_task_status = task_updated.status.value
+            preserve_unknown_result = (
+                bool(result.get("injection_outcome_unknown"))
+                and bool(result.get("success", False))
+                and task_updated.status == TaskStatus.PAUSED
+            )
+            # A legacy row inserted by this transaction; V2 uses its result
+            # fact instead. Wait and pause transitions insert no legacy row.
+            legacy_witness: _ChatMessageWitness | None = None
+            result_commit_pending = control_commit_pending
+            if not waiting_for_control or preserve_unknown_result:
+                if task_user_id is None:
+                    raise ValueError(
+                        f"Task {task_id}: cannot persist assistant message "
+                        "without a resolved user_id"
+                    )
+                history_content, history_message_type = (
+                    assistant_history_values_for_persistence(
+                        content=safe_str(ai_response),
+                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                        is_failure=task_updated.status == TaskStatus.FAILED,
+                    )
+                )
+                # Shared readers may observe completion before scheduler
+                # cleanup runs. Publish its durable output in this same
+                # fenced transaction as the terminal state and transcript.
+                # This also runs locally: finish_turn later writes the same
+                # assistant content (or clears output on failure).
+                setattr(
+                    task_updated,
+                    "output",
+                    history_content
+                    if task_updated.status == TaskStatus.COMPLETED
+                    or (preserve_unknown_result and result.get("success", False))
+                    else None,
+                )
+                assistant_message = persist_assistant_message_no_commit(
+                    finalize_db,
+                    task_id=task_id,
+                    user_id=task_user_id,
+                    content=history_content,
+                    message_type=history_message_type,
+                    interactions=(
+                        chat_response.get("interactions")
+                        if isinstance(chat_response, dict)
+                        and task_updated.status != TaskStatus.FAILED
+                        else None
+                    ),
+                    turn_id=turn_id,
+                    content_is_reconciled=True,
+                )
+                if (
+                    assistant_message is not None
+                    and task_updated.conversation_storage_version != 2
+                ):
+                    finalize_db.flush()
+                    legacy_witness = _ChatMessageWitness(
+                        task_id=task_id,
+                        message_id=int(assistant_message.id),
+                        role=str(assistant_message.role),
+                        message_type=str(assistant_message.message_type),
+                        content=str(assistant_message.content),
+                    )
+                result_commit_pending = True
+
+            if result_commit_pending:
+                fact_witness = stage_result_fact_no_commit(
+                    finalize_db,
+                    task_updated,
+                    interruption_pause_result()
+                    if interruption_pause_reason is not None
+                    else result,
+                    turn_id=turn_id,
+                )
+                finalize_db.flush()
+                broadcast_meta = _finalization_broadcast_meta(task_updated)
+                # Read before COMMIT: the row's attributes expire on a failed one.
+                finalize_storage = (
+                    "v2" if task_updated.conversation_storage_version == 2 else "v1"
+                )
+                finalize_run_id = (
+                    task_lease.run_id if task_lease is not None else expected_run_id
+                )
+                _commit_finalization_or_reconcile(
+                    finalize_db,
+                    task_id=task_id,
+                    # Ownerless legacy callers keep failing on a commit error.
+                    witness=(
+                        (fact_witness or legacy_witness)
+                        if task_lease is not None
+                        else None
+                    ),
+                    run_id=finalize_run_id,
+                    storage=finalize_storage,
+                )
+                metadata_committed = True
+                terminal_state_committed = True
+                if unknown_tool_effect is not None:
+                    # Committed, or its lost acknowledgement proven applied.
+                    log_unknown_tool_effect_settlement(
+                        task_id,
+                        finalize_run_id,
+                        unknown_tool_effect.unknown_tool_attempt_id,
+                    )
+            else:
+                broadcast_meta = _finalization_broadcast_meta(task_updated)
+        else:
+            broadcast_meta = {
+                "id": task_id,
+                "title": None,
+                "description": None,
+                "execution_mode": None,
+                "updated_at": None,
+                "completion_outcome": None,
+            }
+
+        return _TaskExecutionFinalization(
+            normalized_outputs=normalized_outputs,
+            ai_response=ai_response,
+            chat_response=chat_response,
+            waiting_for_control=waiting_for_control,
+            terminal_state_committed=terminal_state_committed,
+            final_task_status=final_task_status,
+            broadcast_meta=broadcast_meta,
+            report=SettlementReport(
+                control_state=(
+                    final_control_snapshot.as_dict()
+                    if final_control_snapshot is not None
+                    else {}
+                ),
+                paused_for=interruption_pause_reason,
+                recovery=interruption_recovery,
+            ),
+            error_code=(
+                presentation.error_code
+                if presentation is not None
+                else result.get("error_code")
+            ),
+            error_details=(
+                presentation.error_details
+                if presentation is not None
+                else result.get("error_details")
+            ),
+        )
+    finally:
+        try:
+            finalize_db.close()
+        finally:
+            _settle_prepared_task_file_outputs(
+                prepared_outputs,
+                metadata_committed=metadata_committed,
+                cleanup_claims=cleanup_claims,
+            )
+
+
+def _has_display_message_override(context: Dict[str, Any]) -> bool:
+    if "display_message" in context or "display_user_message" in context:
+        return True
+    request_context = context.get("request_context")
+    return isinstance(request_context, dict) and (
+        "display_message" in request_context
+        or "display_user_message" in request_context
+    )
+
+
+async def execute_task_background(
+    task_id: int,
+    user_message: str,
+    context: Dict[str, Any] | None,
+    agent_manager: Any,
+    task_owner_user_id: int | None,
+    before_message_id: int | None = None,
+    llm_user_message: Optional[str] = None,
+    task_setup_snapshot: Optional["TaskSetupSnapshot"] = None,
+    expected_run_id: str | None = None,
+    task_lease: TaskLease | None = None,
+    resolved_execution_scope: Union[
+        ExecutionScope, None, ExecutionScopeNotProvided
+    ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+) -> None:
+    """Execute one task without checking out a DB connection on the event loop.
+
+    Setup and finalization use worker-owned short Sessions. The long-running
+    agent await receives only detached runtime state and primitive identifiers.
+    """
+    from .task_execution_context_service import (
+        materialize_task_execution_recovery_state,
+    )
+    from .task_setup_snapshot import load_task_setup_snapshot_sync
+
+    terminal_state_committed = False
+    history_turn_id: str | None = None
+    try:
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
+            execution_scope = await run_db_io_cancellation_safe(
+                lambda: resolve_execution_scope(task_id)
+            )
+        else:
+            execution_scope = cast(
+                Optional[ExecutionScope],
+                resolved_execution_scope,
+            )
+
+        snapshot = task_setup_snapshot
+        if snapshot is None:
+            snapshot = await run_db_io_cancellation_safe(
+                lambda: load_task_setup_snapshot_sync(
+                    task_id,
+                    task_owner_user_id,
+                    before_message_id=before_message_id,
+                    before_turn_id=(
+                        context.get("turn_id")
+                        if isinstance(context, dict) and before_message_id is not None
+                        else None
+                    ),
+                )
+            )
+        if snapshot is None:
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
+
+        context_dict = context if isinstance(context, dict) else {}
+        current_turn_id = (
+            context_dict.get("turn_id")
+            if isinstance(context_dict.get("turn_id"), str)
+            and context_dict.get("turn_id")
+            else None
+        )
+        execution_run_id = (
+            task_lease.run_id
+            if task_lease is not None
+            else expected_run_id or snapshot.task.run_id
+        )
+        history_turn_id = routine_history_turn_id(
+            snapshot.task,
+            current_turn_id,
+            expected_run_id=execution_run_id,
+        )
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None
+        if (
+            mcp_runtime_authorization_policy is not None
+            and task_lease is not None
+            and task_lease.task_id == task_id
+        ):
+            try:
+                mcp_actor_execution_identity = MCPActorExecutionIdentity(
+                    task_id=task_id,
+                    run_id=task_lease.run_id,  # type: ignore[arg-type]
+                    turn_id=context_dict.get("turn_id"),  # type: ignore[arg-type]
+                    lease_attempt_id=task_lease.attempt_id,  # type: ignore[arg-type]
+                )
+            except ValueError:
+                # Only execution-scoped actor stdio requires this complete
+                # fence. Per-call stdio and existing OAuth remain available.
+                mcp_actor_execution_identity = None
+        logger.info(f"Background task execution started for task {task_id}")
+        task_user_id = snapshot.task.user_id
+        user = snapshot.runtime_user
+
+        # The task OWNER (from snapshot / DB) is the runtime identity. A passed
+        # ``task_owner_user_id`` must equal it -- it may never override the
+        # owner, or the task would run as the wrong user (e.g. an admin acting
+        # on someone else's task would get the admin's models / tools / OAuth).
+        # All callers pass the owner; a mismatch is a programming error, so
+        # reject it rather than silently continue.
+        if (
+            task_owner_user_id is not None
+            and task_user_id is not None
+            and task_owner_user_id != task_user_id
+        ):
+            raise ValueError(
+                f"execute_task_background: passed task_owner_user_id "
+                f"{task_owner_user_id} does not match task {task_id} owner "
+                f"{task_user_id}; refusing to run as the wrong user"
+            )
+        effective_user_id = task_user_id
+
+        with UserContext(effective_user_id), ExecutionScopeContext(execution_scope):
+            # Get agent service. ``effective_user_id`` is the task owner
+            # (authoritative above); pass it as the runtime identity so the
+            # agent's models / tools resolve as the owner, not any acting admin.
+            agent_service = await agent_manager.get_agent_for_task(
+                task_id,
+                None,
+                user=user,
+                task_setup_snapshot=snapshot,
+                task_owner_user_id=effective_user_id,
+                connector_runtime_turn_id=context_dict.get("turn_id")
+                if isinstance(context_dict.get("turn_id"), str)
+                else None,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                mcp_actor_execution_identity=mcp_actor_execution_identity,
+                resolved_execution_scope=execution_scope,
+            )
+            if hasattr(agent_service, "set_outbound_message_handler"):
+                agent_service.set_outbound_message_handler(
+                    make_agent_outbound_handler(
+                        task_id,
+                        authoritative=getattr(
+                            agent_service.tracer, "records_execution_events", False
+                        )
+                        is True,
+                        turn_id=history_turn_id,
+                    )
+                )
+            agent_service.set_conversation_history(
+                [dict(message) for message in snapshot.conversation_history],
+                watermark=snapshot.conversation_watermark,
+                event_watermark=snapshot.conversation_event_watermark,
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                snapshot.execution_recovery
+            )
+            execution_context_messages = recovery_state.get("messages", [])
+            agent_service.set_execution_context_messages(execution_context_messages)
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
+            await run_db_io_cancellation_safe(
+                lambda: _register_uploaded_files_for_agent(
+                    agent_service,
+                    context_dict.get("file_info", []),
+                )
+            )
+
+            # Execute the next turn under the same task/thread id.
+            actual_task_id = str(task_id)
+            prompt_context = prompt_context_from_agent_config(
+                getattr(snapshot.task, "agent_config", None)
+            )
+            prompt_context_block = build_prompt_context_block(prompt_context)
+            task_for_agent = append_prompt_context_block(
+                llm_user_message or user_message, prompt_context
+            )
+            if prompt_context_block is not None:
+                # Field names and trust level only; values stay out of logs.
+                logger.info(
+                    "task %s prompt_context fields=%s signed=%s",
+                    task_id,
+                    sorted(prompt_context["data"]),
+                    prompt_context["signed"],
+                )
+            # ``task_source`` and ``run_id`` are server-owned execution
+            # identities: the first selects the MCP approval registration,
+            # the second names the lease an approval is recorded under. This
+            # context is caller supplied, so both keys are overwritten rather
+            # than defaulted -- a client must not be able to relabel its task
+            # into (or out of) another source's approval policy, nor claim a
+            # different execution lease.
+            agent_context = dict(context_dict)
+            turn_run_id = (
+                task_lease.run_id if task_lease is not None else expected_run_id
+            )
+            if turn_run_id is not None:
+                # Both keys or neither: a registered source presenting an
+                # incomplete identity (``task_source`` with no ``run_id``)
+                # is refused before dispatch, which would turn a
+                # registration on this path into a hard outage for every
+                # MCP call -- strictly worse than leaving both unbound,
+                # where the call simply passes through ungated.
+                agent_context["task_source"] = snapshot.task.source
+                agent_context["run_id"] = turn_run_id
+            else:
+                agent_context.pop("task_source", None)
+                agent_context.pop("run_id", None)
+            # The model text may carry server-added context (uploaded files, the
+            # prompt-context block). Whenever it differs from the transcript text,
+            # record the transcript text as the display message for the
+            # user_message trace event; a display message the caller set wins.
+            if task_for_agent != user_message and not _has_display_message_override(
+                agent_context
+            ):
+                agent_context["display_message"] = user_message
+            result = await agent_manager.execute_task(
+                agent_service=agent_service,
+                task=task_for_agent,
+                context=agent_context,
+                task_id=actual_task_id,
+                tracking_task_id=str(task_id),
+                db_session=None,
+                manage_task_lease=False,
+                task_lease=task_lease,
+            )
+
+        finalize_run_id = (
+            task_lease.run_id if task_lease is not None else expected_run_id
+        )
+        finalization_worker = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: _finalize_task_execution_result_isolated(
+                    task_id=task_id,
+                    task_user_id=effective_user_id,
+                    pre_run_status=cast(TaskStatus, snapshot.task.status),
+                    result=result,
+                    expected_run_id=finalize_run_id,
+                    task_lease=task_lease,
+                    resolved_scope_segments=(
+                        execution_scope.workspace_segments
+                        if execution_scope is not None
+                        else ()
+                    ),
+                    turn_id=history_turn_id,
+                )
+            )
+        )
+        finalized, finalization_cancellation = await await_task_settlement(
+            finalization_worker
+        )
+        with propagate_deferred_cancellation(finalization_cancellation):
+            if finalized.late_result:
+                return
+
+            normalized_outputs = finalized.normalized_outputs
+            if normalized_outputs:
+                result["file_outputs"] = normalized_outputs
+            ai_response = finalized.ai_response
+            chat_response = finalized.chat_response
+            waiting_for_control = finalized.waiting_for_control
+            terminal_state_committed = finalized.terminal_state_committed
+            final_task_status = finalized.final_task_status
+            broadcast_meta = finalized.broadcast_meta
+            broadcast_agent_meta = {
+                "agent_id": snapshot.task.agent_id,
+                "agent_name": (
+                    snapshot.agent.name if snapshot.agent is not None else None
+                ),
+                "agent_logo_url": None,
+            }
+
+            # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
+
+            control_event_state = finalized.report.control_state
+
+            if waiting_for_control:
+                await publish_task_event(
+                    create_stream_event(
+                        "task_info",
+                        task_id,
+                        {
+                            "id": broadcast_meta["id"],
+                            "title": broadcast_meta["title"],
+                            "description": broadcast_meta["description"],
+                            "status": final_task_status,
+                            "completion_outcome": broadcast_meta.get(
+                                "completion_outcome"
+                            ),
+                            "execution_mode": broadcast_meta["execution_mode"],
+                            "agent_id": broadcast_agent_meta["agent_id"],
+                            "agent_name": broadcast_agent_meta["agent_name"],
+                            "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
+                            **control_event_state,
+                        },
+                        broadcast_meta["updated_at"] or None,
+                    ),
+                    task_id,
+                )
+                from .task_orchestrator import publish_settlement_pause
+
+                await publish_settlement_pause(task_id, finalized.report)
+                logger.info(
+                    "Background task %s left %s for v2 control",
+                    task_id,
+                    final_task_status,
+                )
+                return
+
+            # Send task completion event (includes agent response info)
+            from .task_event_display import publish_task_result
+
+            await publish_task_result(
+                {
+                    "task": {
+                        "id": broadcast_meta["id"],
+                        "title": broadcast_meta["title"],
+                        "status": final_task_status,
+                        "description": broadcast_meta["description"],
+                    },
+                    "completion_outcome": broadcast_meta.get("completion_outcome"),
+                    "result": ai_response,
+                    "output": ai_response,
+                    "file_outputs": normalized_outputs,
+                    "success": result.get("success", False),
+                    # Machine-readable failure classification (e.g. "quota_exceeded"
+                    # or "model_error") plus its structured details, so the client
+                    # can localise and branch instead of parsing the message. Absent
+                    # for normal turns.
+                    "error_code": finalized.error_code,
+                    "error_details": finalized.error_details,
+                    **control_event_state,
+                    "type": "task_completed",
+                    "chat_response": chat_response
+                    if isinstance(chat_response, dict)
+                    else None,
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                },
+                task_id,
+            )
+            logger.info(f"Background task {task_id} execution completed")
+
+    except Exception as e:
+        # The outer try also spans the post-terminal steps -- assistant
+        # message persistence and the completion / paused broadcasts --
+        # that run *after* the task status was already committed terminal
+        # (COMPLETED above). ``_terminal_task_error_payload`` writes FAILED
+        # + the real error_message unconditionally, so gate it on the
+        # task's current status: only a task still RUNNING is a genuine
+        # execution failure. Otherwise a failed post-completion broadcast
+        # would rewrite an already-COMPLETED task as FAILED and store the
+        # broadcast error as the task's failure cause.
+        if task_lease is not None:
+            if terminal_state_committed:
+                logger.warning(
+                    "Background task %s post-terminal step failed; "
+                    "task state left unchanged: %s",
+                    task_id,
+                    e,
+                    exc_info=True,
+                )
+                return
+
+            if is_database_pool_timeout(e):
+                # The orchestrator owns the concrete lease and will retain it
+                # for TTL recovery. Broadcasting FAILED here would contradict
+                # the durable RUNNING + fenced-lease state.
+                logger.error(
+                    "task_id=%s component=execution database pool checkout "
+                    "timed out; retaining exact lease for TTL recovery without "
+                    "broadcasting task_error: %s",
+                    task_id,
+                    e,
+                    exc_info=True,
+                )
+                # Unsettled evidence is recorded once, by ``_schedule_bg``,
+                # which defers this same timeout to TTL recovery.
+                raise
+
+            logger.error(
+                "Background task %s execution failed: %s",
+                task_id,
+                e,
+                exc_info=True,
+            )
+            # The concrete run/runner lease belongs to the orchestrator. Let
+            # its single worker-owned settlement transaction persist failure
+            # and release the lease before it emits any terminal event. Doing
+            # either DB work or a broadcast here could race a replacement run.
+            raise
+
+        error_message = str(e)
+        if isinstance(e, AutoModelUnavailableError):
+            error_code = ClientErrorCode.AUTO_MODEL_UNAVAILABLE
+        elif isinstance(e, ClientVisibleError):
+            error_code = e.error_code
+        else:
+            error_code = ClientErrorCode.TASK_EXECUTION_FAILED
+        safe_error_message = client_error_message(error_code)
+        terminal_payload = await run_db_io_cancellation_safe(
+            lambda: _terminal_task_error_payload(
+                task_id,
+                error_message,
+                event_type="task_error",
+                expected_run_id=expected_run_id,
+                only_if_running=True,
+                turn_id=history_turn_id,
+            )
+        )
+
+        if terminal_payload is None:
+            # Terminal state already committed; the exception came from a
+            # best-effort post-completion step. Observe it without touching
+            # the row or emitting a contradictory task_error. ``finish_turn``
+            # still reconciles the terminal fields afterward.
+            logger.warning(
+                f"Background task {task_id} post-terminal step failed; "
+                f"task state left unchanged: {e}",
+                exc_info=True,
+            )
+        else:
+            logger.error(
+                f"Background task {task_id} execution failed: {e}", exc_info=True
+            )
+            # Genuine failure: _terminal_task_error_payload persists FAILED
+            # + the real error_message for diagnostics. Replace every
+            # client-visible copy in the notification payload: the spread
+            # already carries ``message``, while older clients also read
+            # ``error``.
+            try:
+                await publish_task_event(
+                    {
+                        **terminal_payload,
+                        "task_id": task_id,
+                        "message": safe_error_message,
+                        "error": safe_error_message,
+                        "error_code": error_code.value,
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    },
+                    task_id,
+                )
+            except Exception as broadcast_error:
+                logger.error(f"Failed to send error notification: {broadcast_error}")
+    except asyncio.CancelledError as cancellation:
+        deferred_error = cancellation.__cause__
+        if deferred_error is not None and not isinstance(
+            deferred_error, asyncio.CancelledError
+        ):
+            logger.warning(
+                "Background task %s cancelled after deferred work failed: %s",
+                task_id,
+                deferred_error,
+                exc_info=(
+                    type(deferred_error),
+                    deferred_error,
+                    deferred_error.__traceback__,
+                ),
+            )
+        else:
+            logger.info("Background task %s cancelled", task_id)
+        raise
+    finally:
+        # Clean up background task record
+        _clear_task_pause_accepted(task_id)
+        background_task_manager.cleanup_task(task_id)
+        try:
+            agent_manager.note_runtime_settled(task_id)
+        except Exception:
+            logger.warning(
+                "Settling the cached runtime for task %s failed",
+                task_id,
+                exc_info=True,
+            )
+
+
+def _latest_result_user_turn_id(result: Dict[str, Any]) -> str | None:
+    agent_result = result.get("agent_result")
+    if not isinstance(agent_result, dict):
+        return None
+    context = agent_result.get("context")
+    messages = (
+        context.get("messages")
+        if isinstance(context, dict)
+        else getattr(context, "messages", None)
+    )
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "user":
+            continue
+        metadata = (
+            message.get("metadata")
+            if isinstance(message, dict)
+            else getattr(message, "metadata", None)
+        )
+        if isinstance(metadata, dict):
+            turn_id = metadata.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                return turn_id
+    return None
+
+
+def _acquire_resume_task_lease(
+    task_id: int,
+    task_owner_user_id: int | None,
+    expected_run_id: str | None,
+    *,
+    prior_status_out: list[TaskStatus] | None = None,
+    refuse_terminal_status: bool = False,
+    run_not_resumable_out: list[bool] | None = None,
+    ended_status_out: list[TaskStatus] | None = None,
+    history_turn_id_out: list[str | None] | None = None,
+) -> TaskLease | None:
+    """Validate and claim a resume lease in one worker transaction.
+
+    ``prior_status_out``, when given, receives the task's status as read
+    here -- before the lease-acquiring update below flips it to RUNNING.
+    A checkpoint read failure later in the resume attempt needs this to
+    restore the task instead of falling through to a terminal FAILED. It
+    is an out parameter rather than part of the return value because this
+    function is called through ``acquire_task_lease_cancellation_safe``,
+    whose acquire/cleanup pair is typed for a bare ``TaskLease``.
+
+    ``refuse_terminal_status`` adds ``status NOT IN (FAILED, COMPLETED)`` to
+    the claim UPDATE, so a run that ended after the caller's snapshot is
+    never flipped back to RUNNING. When the claim is refused and the row is
+    in one of those statuses or on another run -- the fenced run is not
+    resumable either way -- ``run_not_resumable_out`` receives ``True``; a
+    refusal by a live owner of the same run leaves it empty. The caller only
+    uses the distinction to say which one it was. ``ended_status_out``
+    additionally receives the row's status when the refusal found it in one
+    of those statuses, whatever its run: the one case where a message that
+    was never injected can be withdrawn and delivered as a new turn instead.
+    """
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None and history_turn_id_out is not None:
+            history_turn_id_out.append(
+                routine_history_turn_id(
+                    task,
+                    None,
+                    expected_run_id=expected_run_id or cast(str | None, task.run_id),
+                )
+            )
+        if (
+            task is not None
+            and task_owner_user_id is not None
+            and int(task.user_id) != task_owner_user_id
+        ):
+            raise ValueError(
+                f"execute_resume_background: passed task_owner_user_id "
+                f"{task_owner_user_id} does not match task {task_id} "
+                f"owner {int(task.user_id)}; refusing to resume as the "
+                "wrong user"
+            )
+        if task is not None and prior_status_out is not None:
+            prior_status_out.append(TaskStatus(task.status))
+        lease = acquire_task_lease_no_commit(
+            db,
+            task_id,
+            expected_run_id=expected_run_id,
+            claim_predicates=(
+                (task_status_predicate.not_in(NON_RESUMABLE_STATUSES),)
+                if refuse_terminal_status
+                else ()
+            ),
+        )
+        if lease is None:
+            if refuse_terminal_status and (
+                run_not_resumable_out is not None or ended_status_out is not None
+            ):
+                current = db.execute(
+                    select(Task.status, Task.run_id).where(Task.id == task_id)
+                ).first()
+                if (
+                    run_not_resumable_out is not None
+                    and current is not None
+                    and (
+                        current.status in NON_RESUMABLE_STATUSES
+                        or current.run_id != expected_run_id
+                    )
+                ):
+                    run_not_resumable_out.append(True)
+                if (
+                    ended_status_out is not None
+                    and current is not None
+                    and current.status in NON_RESUMABLE_STATUSES
+                ):
+                    ended_status_out.append(TaskStatus(current.status))
+            db.commit()
+            return None
+        if task is not None:
+            db.expire(task)
+            db.refresh(task)
+            sync_workforce_run_status(db, task, TaskStatus.RUNNING)
+        db.commit()
+        return lease
+
+
+def _restore_resumed_task_lease_to_prior_status(
+    lease: TaskLease,
+    *,
+    status: TaskStatus,
+) -> bool:
+    """Release the exact resume lease back to its pre-acquisition status.
+
+    A checkpoint read failure during resume must not silently downgrade a
+    paused/waiting task to a terminal FAILED. Uses the same exact-lease
+    WHERE fence (task id + runner id + run id) as the TTL reaper, so the
+    two can never both release the same row -- whichever loses the race
+    affects zero rows instead of double-releasing. The commit below is
+    unconditional, unlike the A2A prelease restore: when the fence excludes
+    every row, the UPDATE affects zero rows and this commits that no-op
+    rather than rolling back. That unconditional commit is unrelated to the
+    protocol-marker clear below, which is conditioned on ``restored``: a
+    fence miss means this call lost the race for the row and must not touch
+    a marker some other winner now owns.
+    """
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        restored = release_task_lease_no_commit(db, lease, status=status)
+        if restored:
+            # This is a resume abandonment, not a completion: no injection
+            # ran, so there is no interaction row to close here, only a
+            # marker to reconcile if it no longer names an active row. See
+            # clear_interaction_marker_if_unpaired's docstring for the
+            # NOT EXISTS semantics. No lock read precedes this statement --
+            # release_task_lease_no_commit's own tasks UPDATE writes only
+            # non-key columns and is already the first statement this
+            # transaction directs at tasks or task_interaction_requests, so
+            # it already satisfies the ordering and strength obligation a
+            # dedicated lock read would.
+            assert lease.run_id is not None
+            clear_interaction_marker_if_unpaired(
+                db, task_id=lease.task_id, run_id=lease.run_id
+            )
+        db.commit()
+        return restored
+
+
+def _finalize_resumed_task(
+    task_id: int,
+    *,
+    status: str,
+    success: bool,
+    output: str,
+    task_owner_user_id: int | None,
+    result: Dict[str, Any],
+    task_lease: TaskLease,
+    prepared_outputs: _PreparedTaskFileOutputs,
+) -> dict[str, Any]:
+    """Persist one fenced resumed result in a single worker transaction."""
+    from ..models.agent import Agent
+    from .chat_history_service import persist_assistant_message_no_commit
+    from .task_orchestrator import sync_trigger_run_status
+
+    finalized: dict[str, Any] = {
+        "task_title": None,
+        "task_description": None,
+        "task_execution_mode": None,
+        "task_agent_id": None,
+        "agent_name": None,
+        "agent_logo_url": None,
+        "final_status": TaskStatus.RUNNING.value,
+        "lease_released": False,
+        "report": SettlementReport(),
+        "normalized_outputs": [],
+        "output": output,
+        # A failed result's presentation replaces these; every other outcome
+        # forwards the result's own coded fields.
+        "error_code": result.get("error_code"),
+        "error_details": result.get("error_details"),
+        "late_result": False,
+    }
+    if task_lease.run_id is None:
+        _settle_prepared_task_file_outputs(
+            prepared_outputs,
+            metadata_committed=False,
+        )
+        finalized["late_result"] = True
+        return finalized
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    metadata_committed = False
+    cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
+    try:
+        lock_task_lease_for_settlement_no_commit(db, task_lease)
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.runner_id == task_lease.runner_id,
+                task_lease_attempt_predicate(task_lease),
+                Task.run_id == task_lease.run_id,
+            )
+            .with_for_update()
+            .first()
+        )
+        if task is None:
+            finalized["late_result"] = True
+            return finalized
+        result_turn_id = routine_history_turn_id(
+            task,
+            _latest_result_user_turn_id(result),
+            expected_run_id=task_lease.run_id,
+        )
+        if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            # Explicit cancellation/failure already owns the terminal result,
+            # whatever this run returned -- including a late interrupt, which
+            # must not turn the row back into PAUSED (see the same guard in
+            # ``_finalize_task_execution_result_isolated``).
+            #
+            # As a late result, the caller leaves a carried delivery where it
+            # is rather than marking it completed: this run's result was
+            # discarded, so "applied" is not proven. DISPATCHED already means
+            # "do not resend"; a still-PENDING row is advanced to that by the
+            # orphan sweep once the task is quiescent.
+            if not release_task_lease_no_commit(db, task_lease, status=task.status):
+                db.rollback()
+                finalized["late_result"] = True
+                return finalized
+            db.commit()
+            finalized["late_result"] = True
+            return finalized
+
+        (
+            normalized_outputs,
+            path_to_file_id,
+            cleanup_claims,
+        ) = _apply_prepared_task_file_outputs(db, prepared_outputs)
+        if normalized_outputs:
+            output = _rewrite_file_links_to_file_id(output, path_to_file_id)
+        if task_owner_user_id is not None:
+            output = reconcile_assistant_file_references(
+                db,
+                task_id=task_id,
+                user_id=task_owner_user_id,
+                content=output,
+            )
+        finalized["normalized_outputs"] = normalized_outputs
+        finalized["output"] = output
+
+        finalized["task_title"] = cast(Any, task.title)
+        finalized["task_description"] = cast(Any, task.description)
+        finalized["task_execution_mode"] = cast(Any, task.execution_mode)
+        finalized["task_agent_id"] = cast(Any, task.agent_id)
+        if task.agent_id is not None:
+            agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+            if agent is not None:
+                finalized["agent_name"] = cast(Any, agent.name)
+                finalized["agent_logo_url"] = cast(Any, agent.logo_url)
+
+        interruption: InterruptionDecision | None = None
+        pause_reason: InterruptionReason | None = None
+        pause_recovery: RecordedInterruption | None = None
+        if result.get("injection_outcome_unknown") and (
+            success or status in {"waiting_for_user", "interrupted"}
+        ):
+            final_task_status = TaskStatus.PAUSED
+        elif status == "waiting_for_user":
+            final_task_status = TaskStatus.WAITING_FOR_USER
+        elif status == "interrupted":
+            final_task_status = TaskStatus.PAUSED
+        elif success:
+            final_task_status = TaskStatus.COMPLETED
+        else:
+            interruption = _decide_result_interruption(db, task, result)
+            final_task_status = (
+                TaskStatus.PAUSED
+                if interruption is not None and interruption.pause
+                else TaskStatus.FAILED
+            )
+
+        control_snapshot = apply_task_control_transition(
+            task,
+            {
+                TaskStatus.WAITING_FOR_USER: TaskControlState.WAITING_FOR_USER,
+                TaskStatus.PAUSED: TaskControlState.PAUSED,
+                TaskStatus.COMPLETED: TaskControlState.COMPLETED,
+                TaskStatus.FAILED: TaskControlState.FAILED,
+            }[final_task_status],
+            status=final_task_status,
+            expected_run_id=task_lease.run_id,
+        )
+
+        setattr(
+            task,
+            "completion_outcome",
+            completion_outcome_for_status(result, final_task_status),
+        )
+        finalized["completion_outcome"] = task.completion_outcome
+
+        if success and output.strip() and task_owner_user_id is not None:
+            persist_assistant_message_no_commit(
+                db,
+                task_id=task_id,
+                user_id=task_owner_user_id,
+                content=output,
+                message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                turn_id=result_turn_id,
+                content_is_reconciled=True,
+            )
+            orm_task = cast(Any, task)
+            orm_task.output = output
+            orm_task.error_message = None
+        elif final_task_status == TaskStatus.FAILED:
+            presentation = present_failed_result(result)
+            if task_owner_user_id is not None:
+                persist_assistant_message_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_owner_user_id,
+                    content=CLIENT_SAFE_TASK_FAILURE,
+                    message_type=TASK_FAILURE_MESSAGE_TYPE,
+                    turn_id=result_turn_id,
+                    content_is_reconciled=True,
+                )
+            orm_task = cast(Any, task)
+            orm_task.output = None
+            orm_task.error_message = (
+                presentation.diagnostic_error or output or CLIENT_SAFE_TASK_FAILURE
+            )
+            finalized["output"] = (
+                presentation.visible_text
+                if presentation.visible_text is not None
+                else output
+            )
+            finalized["error_code"] = presentation.error_code
+            finalized["error_details"] = presentation.error_details
+
+        if interruption is not None:
+            # Projects the workforce run itself for a pause.
+            if not interruption.pause:
+                sync_workforce_run_status(db, task, final_task_status)
+            recorded = _apply_result_interruption(db, task, interruption, result)
+            if interruption.pause:
+                pause_reason = interruption.reason
+                pause_recovery = recorded
+        else:
+            sync_workforce_run_status(db, task, final_task_status)
+        if final_task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            # As ``finish_turn`` does for a new run: a trigger run left
+            # RUNNING by a user pause or a wait for the user ends with the
+            # resumed run. A pause leaves it as is, or projects it above.
+            sync_trigger_run_status(db, task, final_task_status)
+        lease_released = release_task_lease_no_commit(
+            db,
+            task_lease,
+            status=final_task_status,
+        )
+        if not lease_released:
+            db.rollback()
+            finalized["late_result"] = True
+            return finalized
+        stage_result_fact_no_commit(
+            db,
+            task,
+            interruption_pause_result() if pause_reason is not None else result,
+            turn_id=result_turn_id,
+        )
+        if task.channel_id is not None and final_task_status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.WAITING_FOR_USER,
+        }:
+            # A channel turn whose run paused and resumed: its START stores
+            # the answer the leaf would have (first writer wins), so a channel
+            # still waiting for it gets the leaf's projection, questions and
+            # coded failure text included.
+            from .shared_channel_execution import (
+                channel_durable_result,
+                stamp_channel_result_no_commit,
+            )
+
+            # Best effort: a failed stamp never undoes the settlement; the
+            # channel then falls back to the task row. The stamp only assigns
+            # the START's result, so it is flushed (and the savepoint
+            # released) inside the ``try``: a failing UPDATE is caught too.
+            stamp = db.begin_nested()
+            try:
+                stamp_channel_result_no_commit(
+                    db,
+                    task_id=task_id,
+                    run_id=task_lease.run_id,
+                    channel_result=channel_durable_result(
+                        result,
+                        project_execution_result_for_channel(result),
+                        # The text this transaction stored, file links
+                        # rewritten.
+                        transcript=output if success and output.strip() else None,
+                    ),
+                )
+                db.flush()
+                stamp.commit()
+            except Exception:
+                stamp.rollback()
+                logger.exception(
+                    "Storing the channel result of resumed task %s failed; "
+                    "its channel reads the task row instead",
+                    task_id,
+                )
+        # A lost acknowledgement here is not reconciled yet: the lease is
+        # released in this transaction, so only the result fact's witness
+        # (returned above) can prove the commit. That belongs with the
+        # same-identity retry work. Until then a COMMIT that fails on a
+        # dropped connection may have applied, so it is reported as an
+        # unreconciled outcome; any other commit error did not apply.
+        # Read before COMMIT: the row's attributes expire on a failed one.
+        resume_storage = "v2" if task.conversation_storage_version == 2 else "v1"
+        try:
+            db.commit()
+        except Exception as commit_error:
+            if connection_was_lost(commit_error):
+                report_unknown_outcome(
+                    "resume_finalize_unreconciled",
+                    task_id=task_id,
+                    run_id=task_lease.run_id,
+                    storage=resume_storage,
+                )
+            raise
+        metadata_committed = True
+        if (
+            interruption is not None
+            and interruption.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+        ):
+            log_unknown_tool_effect_settlement(
+                task_id, task_lease.run_id, interruption.unknown_tool_attempt_id
+            )
+        finalized["lease_released"] = True
+        finalized["final_status"] = final_task_status.value
+        # Filled only now that the commit succeeded.
+        finalized["report"] = SettlementReport(
+            control_state=control_snapshot.as_dict(),
+            paused_for=pause_reason,
+            recovery=pause_recovery,
+        )
+        return finalized
+    finally:
+        try:
+            db.close()
+        finally:
+            _settle_prepared_task_file_outputs(
+                prepared_outputs,
+                metadata_committed=metadata_committed,
+                cleanup_claims=cleanup_claims,
+            )
+
+
+def _settle_resumed_task_lease(
+    lease: TaskLease,
+    *,
+    error_message: str | None,
+    turn_id: str | None = None,
+    interruption: InterruptionReason | None = None,
+    report: SettlementReport | None = None,
+) -> bool:
+    """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
+    from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    from .external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    from .task_orchestrator import settle_task_lease_isolated
+
+    if error_message == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
+        # Written for the external visitor, as a cancelled run writes it.
+        return settle_task_lease_isolated(
+            lease,
+            error_message=error_message,
+            client_error_message=error_message,
+            client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+            turn_id=turn_id,
+            report=report,
+        )
+    return settle_task_lease_isolated(
+        lease,
+        error_message=error_message,
+        turn_id=turn_id,
+        interruption=interruption,
+        report=report,
+    )
+
+
+async def publish_message_outcome_unknown_notice(task_id: int, turn_id: str) -> None:
+    """Tell every subscriber of the task a message's outcome is unknown.
+
+    For when the sender cannot be answered personally. It carries only ids,
+    the error code and the generic client-safe text, never the message body.
+    Best effort: a failure is logged, never raised.
+    """
+
+    notice = {
+        "type": "error",
+        "task_id": task_id,
+        "client_message_id": turn_id,
+        "turn_id": turn_id,
+        "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+        "message": client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+    }
+    try:
+        await publish_task_event(
+            {**notice, "timestamp": datetime.now(timezone.utc).timestamp()},
+            task_id,
+        )
+    except Exception:
+        logger.warning(
+            "task %s outcome-unknown notice for message %s was not published",
+            task_id,
+            turn_id,
+            exc_info=True,
+        )
+
+
+async def execute_resume_background(
+    task_id: int,
+    agent_service: Any,
+    task_owner_user_id: int | None,
+    previous_task: Optional[asyncio.Task] = None,
+    pending_user_message: Optional[Dict[str, Any]] = None,
+    delivery_turn_id: str | None = None,
+    delivery_already_dispatched: bool = False,
+    delivery_notifier: DeliveryNotifier | None = None,
+    # Defaulting to None is a structurally open door, not exercised by any
+    # caller today: acquire_task_lease_no_commit (task_lease_service.py)
+    # mints a fresh uuid for a None here, so a future call site that
+    # forgets to pass its own run id would silently claim a lease under a
+    # run nobody else knows about instead of failing loudly.
+    expected_run_id: str | None = None,
+    resolved_execution_scope: Union[
+        ExecutionScope, None, ExecutionScopeNotProvided
+    ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    preacquired_lease: TaskLease | None = None,
+    preacquired_heartbeat_stop: asyncio.Event | None = None,
+    preacquired_heartbeat_task: (asyncio.Task[TaskLeaseHeartbeatOutcome] | None) = None,
+    preacquired_prior_status: TaskStatus | None = None,
+    # Appended, never inserted: this function has no ``*`` separator and a
+    # downstream caller (xagent-saas ``external_input_dispatch``) binds it by
+    # keyword against a pinned parameter order, so a new parameter goes last
+    # or it shifts every positional slot after it.
+    #
+    # The task row's own ``source``, read by the caller that already holds an
+    # authoritative row for this task. It is overlaid onto the restored
+    # checkpoint metadata so a resumed MCP approval is evaluated under the
+    # source it was gated for. ``None`` means "this caller has no trusted
+    # value", never "this task has no source": the runner's overlay ignores a
+    # None and keeps whatever the checkpoint carries.
+    trusted_task_source: str | None = None,
+    # Appended for the same reason. True for a message handoff: its run must
+    # never be resumed once it ended (FAILED or COMPLETED), so the lease claim
+    # refuses those statuses atomically. A recovered delivery (a retried
+    # command whose pending row an earlier attempt claimed) then settles as
+    # outcome unknown; see ``delivery_claimed_fresh`` for a fresh one.
+    refuse_terminal_status: bool = False,
+    # Appended for the same reason. True when the caller claimed the delivery
+    # row itself in this attempt (a fresh message), so no earlier attempt can
+    # have applied it. Only meaningful with ``refuse_terminal_status``: a
+    # claim refused because the run ended then withdraws the row, which was
+    # never injected, so the message can be accepted as a new turn; any other
+    # refusal keeps the ordinary failed-delivery answer.
+    delivery_claimed_fresh: bool = False,
+) -> None:
+    """Resume an agent execution after an interrupt/user-message checkpoint.
+
+    ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
+    resume executes as (``UserContext``), not the acting principal.
+    """
+    from .agent_service_manager import caller_facing_execution_metadata
+
+    resume_owner_task = asyncio.current_task()
+    if resume_owner_task is None:
+        raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+
+    lease_stop_event = preacquired_heartbeat_stop
+    lease_heartbeat_task = preacquired_heartbeat_task
+    lease: TaskLease | None = preacquired_lease
+    lease_was_preacquired = preacquired_lease is not None
+    lease_released = False
+    settlement_error: str | None = None
+    settlement_interruption: InterruptionReason | None = None
+    broadcast_error_message: str | None = None
+    defer_db_cleanup_to_ttl_recovery = False
+    # A fenced rejection keeps the uncertain run paused instead of failing it.
+    pause_rejected_lease = False
+    # The status this task held before a lease claim flipped it to RUNNING;
+    # the checkpoint-unavailable/refused recovery path below restores to
+    # this instead of a terminal FAILED. Captured at acquisition when this
+    # call claims the lease, and handed over by the claimant when the lease
+    # was preacquired -- a caller that claims the lease elsewhere owns the
+    # same obligation, or its resume would answer a transient read failure
+    # by downgrading a still-resumable task.
+    resume_prior_status: TaskStatus | None = None
+    restore_lease_to_prior_status: TaskStatus | None = None
+    result: Dict[str, Any] | None = None
+    prepared_outputs: _PreparedTaskFileOutputs | None = None
+    # Token tracking + mid-run quota gate for the resumed segment (resume had
+    # neither before, so a resumed run escaped mid-run enforcement entirely).
+    resume_tracker = None
+    normalized_outputs: list[Dict[str, str]] = []
+    output = ""
+    success = False
+    final_status = TaskStatus.RUNNING.value
+    task_title: str | None = None
+    task_description: str | None = None
+    task_execution_mode: str | None = None
+    task_agent_id: int | None = None
+    agent_name: str | None = None
+    agent_logo_url: str | None = None
+    delivery_outcome_unknown = False
+    delivery_was_dispatched = delivery_already_dispatched
+    # Set when a cancellation or lease loss lands after the deferred turn was
+    # durably accepted; the handlers below record the acceptance.
+    delivery_accepted_unrecorded = False
+    history_turn_id = delivery_turn_id
+
+    async def notify_deferred_delivery(
+        accepted: bool,
+        message: str | None = None,
+        *,
+        error_code: ClientErrorCode | None = None,
+        retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
+    ) -> None:
+        if delivery_notifier is None:
+            return
+        try:
+            async with asyncio.timeout(_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS):
+                if delivery_outcome_unknown:
+                    await delivery_notifier(
+                        turn_id=delivery_turn_id,
+                        accepted=False,
+                        message=client_error_message(
+                            ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                        ),
+                        error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                        retry_with_new_id=False,
+                        rejection_outcome="outcome_unknown",
+                    )
+                    return
+                await delivery_notifier(
+                    turn_id=delivery_turn_id,
+                    accepted=accepted,
+                    message=message,
+                    error_code=error_code.value if error_code is not None else None,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
+                )
+        except Exception:
+            # Delivery state is durable; a disconnected client will retry the
+            # same id and recover the result from that state.
+            logger.warning(
+                "Could not send deferred delivery acknowledgement for task %s",
+                task_id,
+                exc_info=True,
+            )
+
+    async def record_accepted_delivery() -> None:
+        """Record a durably accepted turn whose resume did not proceed.
+
+        The marker and its notice finish before a cancellation that arrives
+        meanwhile propagates; see ``fail_deferred_delivery``.
+        """
+        nonlocal delivery_accepted_unrecorded
+        if not delivery_accepted_unrecorded:
+            return
+        delivery_accepted_unrecorded = False
+
+        async def record() -> None:
+            if delivery_turn_id is not None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_DISPATCHED,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "delivery marker failed after an interrupted accepted "
+                        "deferred message for task %s turn %s",
+                        task_id,
+                        delivery_turn_id,
+                        exc_info=True,
+                    )
+            await notify_deferred_delivery(True)
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(record()))
+
+    async def mark_deferred_delivery_failed() -> bool:
+        """Persist a failed delivery without amplifying pool exhaustion."""
+        nonlocal defer_db_cleanup_to_ttl_recovery
+        if delivery_turn_id is None or delivery_was_dispatched:
+            return True
+        try:
+            await run_db_io_cancellation_safe(
+                lambda: mark_user_message_delivery_sync(
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_OUTCOME_UNKNOWN
+                    if delivery_outcome_unknown
+                    else DELIVERY_FAILED,
+                )
+            )
+            return True
+        except Exception as delivery_error:
+            if not is_database_pool_timeout(delivery_error):
+                raise
+            defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+            logger.error(
+                "task_id=%s component=resume-delivery database pool checkout "
+                "timed out; skipping immediate settlement and retaining lease "
+                "for TTL recovery: %s",
+                task_id,
+                delivery_error,
+                exc_info=True,
+            )
+            return False
+
+    async def fail_deferred_delivery(
+        message: str | None = None,
+        *,
+        error_code: ClientErrorCode | None = None,
+        retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
+    ) -> None:
+        """Persist a failed or unknown delivery, then tell the client.
+
+        A canceller may cancel again while the write commits: cancel_task
+        re-cancels once its wait times out. Once the outcome is durable the
+        client must still hear it, so the write and its notice finish before
+        that cancellation propagates.
+        """
+
+        async def settle() -> None:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(
+                    False,
+                    message,
+                    error_code=error_code,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
+                )
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(settle()))
+
+    try:
+        preacquired_resources = (
+            preacquired_lease,
+            preacquired_heartbeat_stop,
+            preacquired_heartbeat_task,
+        )
+        if any(resource is not None for resource in preacquired_resources) and not all(
+            resource is not None for resource in preacquired_resources
+        ):
+            raise ValueError(
+                "A preacquired resume lease, heartbeat stop event, and heartbeat "
+                "task must be transferred together"
+            )
+        if preacquired_lease is not None:
+            if preacquired_lease.task_id != task_id or preacquired_lease.run_id is None:
+                raise ValueError(
+                    "A preacquired resume lease must match the task and exact run"
+                )
+            if (
+                expected_run_id is not None
+                and preacquired_lease.run_id != expected_run_id
+            ):
+                raise ValueError(
+                    "The preacquired resume lease does not match expected_run_id"
+                )
+            # Adopt the claimant's pre-acquisition status so the recovery
+            # path below is wired on this entry too, not only when this
+            # call claimed the lease itself.
+            resume_prior_status = preacquired_prior_status
+        if previous_task is not None and not previous_task.done():
+            try:
+                await previous_task
+            except Exception as e:
+                logger.warning(
+                    f"Previous background task {task_id} ended before resume: {e}"
+                )
+
+        background_task_manager.promote_resume_task(task_id, resume_owner_task)
+
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
+            execution_scope = await run_db_io_cancellation_safe(
+                lambda: resolve_execution_scope(task_id)
+            )
+        else:
+            execution_scope = cast(
+                Optional[ExecutionScope],
+                resolved_execution_scope,
+            )
+
+        if lease is None:
+            prior_status_box: list[TaskStatus] = []
+            run_not_resumable_box: list[bool] = []
+            ended_status_box: list[TaskStatus] = []
+            history_turn_id_box: list[str | None] = []
+            lease = await acquire_task_lease_cancellation_safe(
+                lambda: _acquire_resume_task_lease(
+                    task_id,
+                    task_owner_user_id,
+                    expected_run_id,
+                    prior_status_out=prior_status_box,
+                    refuse_terminal_status=refuse_terminal_status,
+                    run_not_resumable_out=run_not_resumable_box,
+                    ended_status_out=ended_status_box,
+                    history_turn_id_out=history_turn_id_box,
+                ),
+                lambda acquired: _settle_resumed_task_lease(
+                    acquired,
+                    error_message="resume cancelled during lease acquisition",
+                    turn_id=delivery_turn_id,
+                ),
+            )
+            if prior_status_box:
+                resume_prior_status = prior_status_box[0]
+            if history_turn_id_box:
+                history_turn_id = history_turn_id_box[0] or delivery_turn_id
+            if (
+                lease is None
+                and refuse_terminal_status
+                and delivery_claimed_fresh
+                and ended_status_box
+                and delivery_turn_id is not None
+                and not delivery_was_dispatched
+            ):
+                # A fresh message whose run ended before this claim. Its row
+                # was claimed by this very handoff and the message was never
+                # written into the run, so withdrawing the row is safe and
+                # lets the message be accepted as a new turn: a durable
+                # command's retry finds no row and appends it (a caller with
+                # a delivery notifier, which production does not route here,
+                # is told to resend). The ended run is not resumed.
+                fresh_turn_id = delivery_turn_id
+                withdrawn = False
+                try:
+                    withdrawn = await run_db_io_cancellation_safe(
+                        lambda: withdraw_pending_user_message_delivery_sync(
+                            task_id, fresh_turn_id
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Task %s resume of run %s refused: its run ended; could "
+                        "not withdraw undelivered message %s",
+                        task_id,
+                        expected_run_id,
+                        fresh_turn_id,
+                        exc_info=True,
+                    )
+                if withdrawn:
+                    logger.info(
+                        "Task %s resume of run %s refused: its run ended (%s); "
+                        "withdrew undelivered message %s so it can start a new "
+                        "turn",
+                        task_id,
+                        expected_run_id,
+                        ended_status_box[0].value,
+                        fresh_turn_id,
+                    )
+                    await notify_deferred_delivery(
+                        False,
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                        retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
+                    )
+                    return
+                # The row is no longer this handoff's to withdraw (another
+                # writer settled it), or the withdrawal failed and it is still
+                # pending. Neither proves anything about delivery any more, so
+                # settle it the conservative way below.
+            if (
+                lease is None
+                and refuse_terminal_status
+                and (not delivery_claimed_fresh or ended_status_box)
+            ):
+                # A recovered delivery: an earlier attempt claimed its row and
+                # may already have applied the turn, so a refused resume is
+                # never recorded as failed, which would invite a resend. The
+                # run is not resumed either way; the task keeps the state its
+                # last writer gave it. A fresh message reaches here only when
+                # its run ended: after it was injected (the notice below), or
+                # when its row could not be withdrawn above. Any other refusal
+                # of a fresh message keeps the ordinary answer further down.
+                refusal = (
+                    "its run ended or was replaced"
+                    if run_not_resumable_box
+                    else "another runner owns the lease"
+                )
+                if delivery_turn_id is None:
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                    )
+                elif delivery_was_dispatched:
+                    # The injection already landed in the run's checkpoint
+                    # and the sender was told it was accepted, but no resume
+                    # will answer it. Tell the task's audience its outcome is
+                    # unknown, as the durable answer does for a lost origin.
+                    # Known limitation: the notice is best effort, and the
+                    # command already completed as accepted, so a same-id
+                    # resend is still answered accepted.
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s; delivery %s was "
+                        "already accepted, publishing an outcome-unknown notice",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                        delivery_turn_id,
+                    )
+                    await publish_message_outcome_unknown_notice(
+                        task_id, delivery_turn_id
+                    )
+                else:
+                    delivery_outcome_unknown = True
+                    try:
+                        unknown_transition = await run_db_io_cancellation_safe(
+                            lambda: mark_user_message_delivery_sync(
+                                task_id,
+                                delivery_turn_id,
+                                DELIVERY_OUTCOME_UNKNOWN,
+                            )
+                        )
+                    except Exception:
+                        # Returning here keeps a possibly COMPLETED task out
+                        # of the generic failure handler below. The row stays
+                        # pending, so the retried command settles it again.
+                        logger.warning(
+                            "Task %s resume of run %s refused: %s; could not "
+                            "record delivery %s as outcome unknown",
+                            task_id,
+                            expected_run_id,
+                            refusal,
+                            delivery_turn_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if unknown_transition.status is None:
+                            # No row to record, so nothing was recorded. A
+                            # raised withdrawal above does not prove the row
+                            # still pending: its DELETE can commit with only
+                            # the acknowledgement lost. That message was never
+                            # injected; the retry finds no row and appends it
+                            # as a new turn.
+                            logger.warning(
+                                "Task %s resume of run %s refused: %s; "
+                                "delivery %s has no row left to record as "
+                                "outcome unknown (already withdrawn)",
+                                task_id,
+                                expected_run_id,
+                                refusal,
+                                delivery_turn_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Task %s resume of run %s refused: %s; recorded "
+                                "delivery %s as outcome unknown",
+                                task_id,
+                                expected_run_id,
+                                refusal,
+                                delivery_turn_id,
+                            )
+                    await notify_deferred_delivery(False)
+                return
+            if lease is None:
+                logger.info(
+                    "Task %s resume skipped; another runner owns the lease", task_id
+                )
+                if delivery_turn_id is not None and not delivery_was_dispatched:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_FAILED,
+                        )
+                    )
+                    await notify_deferred_delivery(
+                        False,
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                        retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
+                    )
+                await publish_task_event(
+                    {
+                        "type": "agent_error",
+                        "message": client_error_message(ClientErrorCode.TASK_BUSY),
+                        "error_code": ClientErrorCode.TASK_BUSY.value,
+                        "task": {"id": task_id, "status": TaskStatus.RUNNING.value},
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    },
+                    task_id,
+                )
+                return
+            lease_stop_event = asyncio.Event()
+            lease_heartbeat_task = asyncio.create_task(
+                run_task_lease_heartbeat(lease, lease_stop_event)
+            )
+        else:
+            # The caller acquired and committed this exact lease before
+            # injecting a checkpoint message. Ownership of both lease and
+            # heartbeat transfers atomically to this background task; a second
+            # acquisition would either self-block on a size-1 pool or create a
+            # second runner identity for the same resume.
+            assert lease_stop_event is not None
+            assert lease_heartbeat_task is not None
+
+        if lease_was_preacquired:
+            history_turn_id = await run_db_io_cancellation_safe(
+                lambda: load_routine_history_turn_id(
+                    task_id,
+                    delivery_turn_id,
+                    expected_run_id=(
+                        lease.run_id if lease is not None else expected_run_id
+                    ),
+                )
+            )
+
+        # The resumed agent may have been rebuilt from history with no
+        # outbound message handler, in which case the runtime drops the
+        # next question with only a warning (#1328). Install the
+        # task-scoped handler before anything below can build or run the
+        # agent's runner; re-setting an equivalent handler on a caller
+        # that already installed one is harmless.
+        if hasattr(agent_service, "set_outbound_message_handler"):
+            agent_service.set_outbound_message_handler(
+                make_agent_outbound_handler(
+                    task_id,
+                    authoritative=getattr(
+                        agent_service.tracer, "records_execution_events", False
+                    )
+                    is True,
+                    turn_id=history_turn_id,
+                )
+            )
+
+        # Every resume route shares this point, including task commands and
+        # no-attachment channel turns. Materialize authorized pre-upgrade
+        # input symlinks before the non-root sandbox can observe them.
+        await run_db_io_cancellation_safe(
+            lambda: _prepare_workspace_inputs_for_agent(agent_service)
+        )
+
+        # The task row can become RUNNING before the original AgentRunner has
+        # created a context/checkpoint. Retry an early failed injection only
+        # after that original execution has settled and persisted its state.
+        # Acquire the execution lease first: otherwise a non-owner worker could
+        # persist the injection and acknowledge it, then discover that it is
+        # not allowed to run the resume.
+        if pending_user_message is not None:
+            assert lease_heartbeat_task is not None
+            with track_user_message_injection() as attempt:
+                try:
+                    with bind_task_lease_context(lease):
+                        posted = await run_while_task_lease_owned(
+                            agent_service.post_user_message(
+                                str(task_id),
+                                execution_message=pending_user_message.get(
+                                    "execution_message"
+                                ),
+                                display_message=pending_user_message.get(
+                                    "display_message"
+                                ),
+                                files=pending_user_message.get("files"),
+                                turn_id=pending_user_message.get("turn_id"),
+                                request_interrupt=False,
+                                reason="deferred websocket user message",
+                            ),
+                            lease_heartbeat_task,
+                        )
+                except BaseException as injection_error:
+                    disposition = classify_injection(
+                        attempt.outcome, error=injection_error
+                    )
+                    if (
+                        disposition is InjectionDisposition.ACCEPTED
+                        and isinstance(injection_error, Exception)
+                        and not isinstance(injection_error, TaskLeaseLostError)
+                    ):
+                        # The turn is durable; only a later projection (such
+                        # as the registry event) failed. Continue as accepted.
+                        logger.warning(
+                            "post-acceptance injection error for deferred "
+                            "message on task %s",
+                            task_id,
+                            exc_info=True,
+                        )
+                        posted = attempt.outcome
+                    elif disposition is (
+                        InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+                    ) and isinstance(injection_error, Exception):
+                        raise _DeferredInjectionRejectedRetryableError(
+                            "The user message was not accepted",
+                            fenced=attempt.outcome
+                            is UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                        ) from injection_error
+                    else:
+                        delivery_outcome_unknown = (
+                            disposition is InjectionDisposition.UNKNOWN
+                        )
+                        if disposition is InjectionDisposition.ACCEPTED:
+                            # Cancellation or lease loss after the durable
+                            # write: the handlers below record acceptance.
+                            delivery_was_dispatched = True
+                            delivery_accepted_unrecorded = True
+                        raise
+                else:
+                    disposition = classify_injection(attempt.outcome, posted=posted)
+            delivery_outcome_unknown = disposition is InjectionDisposition.UNKNOWN
+            if disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE:
+                raise _DeferredInjectionRejectedRetryableError(
+                    "The user message was not accepted by a fenced execution",
+                    fenced=True,
+                )
+            if disposition is InjectionDisposition.UNKNOWN:
+                raise RuntimeError("The user message injection outcome is unknown")
+            if disposition is InjectionDisposition.DEFER:
+                raise RuntimeError(
+                    "The user message was saved, but no resumable execution "
+                    "checkpoint became available."
+                )
+            delivery_was_dispatched = True
+            # Unconditional and not nested inside the delivery_turn_id branch
+            # below: retiring this run's active interaction row and clearing
+            # the task's protocol marker has nothing to do with whether a
+            # delivery-ack turn id is present. Borrowing that condition would
+            # give the close a gate it has no reason to have. Bound to a
+            # plain local first, not read from lease inside the lambda below:
+            # a narrowing assert on an enclosing-scope variable does not
+            # apply inside a nested closure.
+            assert lease.run_id is not None
+            close_run_id = lease.run_id
+            # Read by the online handler before this message was injected,
+            # and carried here rather than read now for the opposite reason
+            # to the one it looks like: the injection is not still to come,
+            # it is the post_user_message call above and has already
+            # committed by this line. Injecting is what resumes the agent,
+            # so a read here could name a question the resumed agent has
+            # staged since, not the one the message answered. Bound to a
+            # plain local before the lambda below, like close_run_id above.
+            close_interaction_id = pending_user_message.get("interaction_id")
+            # Distinct from the "unconditional" argument above, which is
+            # only about not borrowing the delivery_turn_id branch's
+            # condition: this task can itself be retried across runs with
+            # the same pending_user_message, and post_user_message reports
+            # that retry explicitly as a replay instead of a bare truthy
+            # `posted`. What the guard buys here is narrower than at the
+            # sites that read their own id: the id carried above is a
+            # primary key the first attempt already retired, and the close
+            # statement binds to it, so on a replay the close would be a
+            # no-op rather than a retirement of a live question. The guard
+            # stays as defense in depth -- it is what keeps this site safe
+            # if it ever stops carrying the id forward and starts deriving
+            # its own. See task_interaction_close's module docstring for
+            # the rule, the other sites, and why the v1 reply resume-input
+            # path's guard is defense in depth.
+            if posted is UserMessageInjectionOutcome.POSTED_FRESH:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: close_legacy_resume_interaction_sync(
+                            task_id=task_id,
+                            run_id=close_run_id,
+                            interaction_id=close_interaction_id,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "legacy resume interaction close failed after deferred "
+                        "message seal for task %s run %s",
+                        task_id,
+                        close_run_id,
+                        exc_info=True,
+                    )
+                except asyncio.CancelledError:
+                    # See run_db_io_cancellation_safe's docstring: it drains
+                    # its worker to completion before propagating a
+                    # cancellation raised while awaiting it, so the
+                    # close-and-clear transaction has already committed or
+                    # failed by the time this branch runs. Only the log
+                    # statement was interrupted.
+                    logger.warning(
+                        "legacy resume interaction close was cancelled after "
+                        "deferred message seal for task %s run %s; continuing "
+                        "resume",
+                        task_id,
+                        close_run_id,
+                    )
+            if delivery_turn_id is not None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_DISPATCHED,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "delivery marker failed after deferred message seal "
+                        "for task %s turn %s",
+                        task_id,
+                        delivery_turn_id,
+                        exc_info=True,
+                    )
+                except asyncio.CancelledError:
+                    # Once the checkpoint write has accepted this turn, task
+                    # cancellation must not turn that durable success into a
+                    # failed delivery. Continue the registered resume; the
+                    # marker is monotonic and can be reconciled from the
+                    # checkpoint on retry.
+                    logger.warning(
+                        "delivery marker was cancelled after deferred message "
+                        "seal for task %s turn %s; continuing resume",
+                        task_id,
+                        delivery_turn_id,
+                    )
+            # The turn is accepted and the cancel branch has nothing left to
+            # announce for it, so a cancel must not cut this notice short.
+            await drain_async_task_cancellation_safe(
+                asyncio.create_task(notify_deferred_delivery(True))
+            )
+
+        # Resume is now durable: lease acquisition committed RUNNING. Do not
+        # announce it earlier from the WebSocket request handler.
+        await publish_task_event(
+            {
+                "type": "task_resumed",
+                "task_id": task_id,
+                "message": "Task resumed",
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            task_id,
+        )
+
+        # Track tokens and enforce the mid-run quota gate on the resumed segment
+        # too. Best-effort: a tracking hiccup must never block the resume.
+        try:
+            from ..tracking.task_tracker import TaskTracker
+
+            resume_tracker = TaskTracker(
+                task_id=int(task_id),
+                expected_run_id=lease.run_id,
+                expected_runner_id=lease.runner_id,
+                expected_attempt_id=lease.attempt_id,
+            )
+            await resume_tracker.start_tracking()
+            agent_service.set_interrupt_checker(
+                resume_tracker.interrupt_reason_for_quota
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"execute_resume_background: token tracking unavailable "
+                f"for task {task_id}: {e}"
+            )
+            resume_tracker = None
+
+        assert lease_heartbeat_task is not None
+        with (
+            UserContext(task_owner_user_id),
+            ExecutionScopeContext(execution_scope),
+            bind_task_lease_context(lease),
+        ):
+            result = await run_while_task_lease_owned(
+                agent_service.resume_execution_by_id(
+                    str(task_id),
+                    metadata={
+                        "task_source": trusted_task_source,
+                        "run_id": lease.run_id,
+                    },
+                ),
+                lease_heartbeat_task,
+            )
+
+        if result is None:
+            raise RuntimeError(
+                f"No resumable execution checkpoint was found for task {task_id}."
+            )
+
+        # If the mid-run quota gate stopped the resumed run, surface the reason
+        # the way the start gate does instead of a silent flip to PAUSED.
+        if resume_tracker is not None and isinstance(result, dict):
+            _quota_reason = getattr(resume_tracker, "quota_interrupt_reason", None)
+            if _quota_reason:
+                result = {
+                    **result,
+                    "success": False,
+                    "status": "quota_exceeded",
+                    "output": _quota_reason,
+                    "error": _quota_reason,
+                    # A mid-run interrupt is always the quota checker, so forward
+                    # the code the way the start gate does (see chat.py).
+                    "error_code": "quota_exceeded",
+                }
+
+        status = str(result.get("status") or "")
+        success = bool(result.get("success", False))
+        output = str(result.get("output") or result.get("error") or "")
+
+        # Final usage belongs to this exact run. Persist it while the run still
+        # owns the lease, then stop heartbeat before the atomic result/lease
+        # finalizer. If the usage checkout itself times out, its exception is
+        # handled below and the lease is deliberately retained for TTL recovery
+        # instead of performing a second checkout against the exhausted pool.
+        if resume_tracker is not None:
+            tracker_to_complete = resume_tracker
+            resume_tracker = None
+            agent_service.set_interrupt_checker(None)
+            await tracker_to_complete.complete_tracking()
+
+        # Output object storage can be arbitrarily slow. Stage and checksum it
+        # while this exact runner's heartbeat is still active; after heartbeat
+        # shutdown only the short fenced metadata/lease transaction remains.
+        prepared_outputs = await _prepare_task_file_outputs_cancellation_safe(
+            task_id=task_id,
+            task_user_id=task_owner_user_id,
+            file_outputs=result.get("file_outputs", []),
+            resolved_scope_segments=(
+                execution_scope.workspace_segments
+                if execution_scope is not None
+                else ()
+            ),
+        )
+
+        heartbeat_outcome = await stop_task_lease_heartbeat(
+            lease_heartbeat_task, lease_stop_event
+        )
+        lease_heartbeat_task = None
+        lease_stop_event = None
+        if (
+            isinstance(heartbeat_outcome, TaskLeaseHeartbeatOutcome)
+            and heartbeat_outcome.requires_ttl_recovery
+        ):
+            defer_db_cleanup_to_ttl_recovery = True
+            logger.error(
+                "task_id=%s component=resume-heartbeat unhealthy before "
+                "finalization; retaining lease for TTL recovery (lost=%s, "
+                "pool_timeout=%s)",
+                task_id,
+                heartbeat_outcome.lease_lost,
+                heartbeat_outcome.pool_timeout is not None,
+            )
+            if heartbeat_outcome.pool_timeout is not None:
+                raise heartbeat_outcome.pool_timeout
+            # A replacement owner already holds the task. Do not persist or
+            # broadcast this stale runner's result.
+            return
+
+        outputs_for_finalizer = prepared_outputs
+        try:
+            finalized = await run_db_io_cancellation_safe(
+                lambda: _finalize_resumed_task(
+                    task_id,
+                    status=status,
+                    success=success,
+                    output=output,
+                    task_owner_user_id=task_owner_user_id,
+                    result=result,
+                    task_lease=lease,
+                    prepared_outputs=outputs_for_finalizer,
+                )
+            )
+        finally:
+            # Once invoked, the fenced finalizer owns success cleanup or
+            # compensation, including cancellation-safe late completion.
+            prepared_outputs = None
+        if finalized["late_result"]:
+            logger.info(
+                "Ignoring late resume result for task %s run %s; ownership changed",
+                task_id,
+                lease.run_id,
+            )
+            # Ownership was already checked inside the fenced finalizer. There
+            # is no lease from this run left to settle, and another checkout
+            # would only race the replacement run.
+            lease_released = True
+            return
+        normalized_outputs = finalized["normalized_outputs"]
+        output = finalized["output"]
+        if normalized_outputs:
+            result["file_outputs"] = normalized_outputs
+        task_title = finalized["task_title"]
+        task_description = finalized["task_description"]
+        task_execution_mode = finalized["task_execution_mode"]
+        task_agent_id = finalized["task_agent_id"]
+        agent_name = finalized["agent_name"]
+        agent_logo_url = finalized["agent_logo_url"]
+        final_status = finalized["final_status"]
+        lease_released = bool(finalized["lease_released"])
+        report = finalized["report"]
+
+        if delivery_turn_id is not None:
+            await run_db_io_cancellation_safe(
+                lambda: mark_user_message_delivery_sync(
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_COMPLETED,
+                )
+            )
+
+        if final_status in {TaskStatus.PAUSED.value, TaskStatus.WAITING_FOR_USER.value}:
+            await publish_task_event(
+                create_stream_event(
+                    "task_info",
+                    task_id,
+                    {
+                        "id": task_id,
+                        "title": task_title,
+                        "description": task_description,
+                        "status": final_status,
+                        "execution_mode": task_execution_mode,
+                        "agent_id": task_agent_id,
+                        "agent_name": agent_name,
+                        "agent_logo_url": agent_logo_url,
+                        **report.control_state,
+                    },
+                ),
+                task_id,
+            )
+            from .task_orchestrator import publish_settlement_pause
+
+            await publish_settlement_pause(task_id, report)
+            return
+
+        from .task_event_display import publish_task_result
+
+        await publish_task_result(
+            {
+                "task": {
+                    "id": task_id,
+                    "title": task_title,
+                    "status": final_status,
+                    "description": task_description,
+                },
+                "result": output,
+                "output": output,
+                "completion_outcome": finalized.get("completion_outcome"),
+                "file_outputs": normalized_outputs,
+                "success": success,
+                # Forward the coded reason so a mid-run quota interrupt on a
+                # resumed run pops the same dialog as the start-gate path. A
+                # recorded model-provider failure carries "model_error" here.
+                "error_code": finalized.get("error_code"),
+                "error_details": finalized.get("error_details"),
+                **report.control_state,
+                "type": "task_completed",
+                # The owner's socket, not the operator trace: fold the raw
+                # memory availability reason.
+                "metadata": caller_facing_execution_metadata(
+                    result.get("metadata", {})
+                ),
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            task_id,
+        )
+    except TaskLeaseLostError:
+        if delivery_outcome_unknown:
+            await fail_deferred_delivery()
+        await record_accepted_delivery()
+        defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+        logger.warning(
+            "Task %s resume execution cancelled after lease ownership loss",
+            task_id,
+        )
+        return
+    except asyncio.CancelledError:
+        settlement_error = _resume_cancel_settlement_error(trusted_task_source)
+        logger.info(f"V2 resume background task {task_id} cancelled")
+        await record_accepted_delivery()
+        if delivery_turn_id is not None and not delivery_was_dispatched:
+            await fail_deferred_delivery(
+                client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                retry_with_new_id=True,
+                rejection_outcome="not_accepted",
+            )
+        raise
+    except Exception as e:
+        error_message = str(e)
+        if is_database_pool_timeout(e):
+            # The failed operation already waited on an exhausted checkout.
+            # Any delivery/status/settlement write here would immediately
+            # request another connection. Keep the exact lease fenced until
+            # TTL recovery and leave a pending delivery reclaimable.
+            defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+            recovery_action = (
+                "retaining lease for TTL recovery"
+                if defer_db_cleanup_to_ttl_recovery
+                else "leaving durable state for retry"
+            )
+            logger.error(
+                "task_id=%s component=resume database pool checkout timed out; "
+                "skipping immediate DB cleanup and %s: %s",
+                task_id,
+                recovery_action,
+                e,
+                exc_info=True,
+            )
+            # The durable state remains RUNNING under the exact lease (or is
+            # otherwise left reclaimable when no lease was acquired). Do not
+            # emit the generic FAILED/task_error payload below.
+            return
+        elif isinstance(e, InterruptionSettlementDeferred):
+            # The result's settlement could not resolve the run's checkpoint.
+            # Failing it here could fail a resumable run; keep the exact
+            # lease and let TTL recovery decide once the read works.
+            defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+            report_unknown_outcome(
+                "settlement_deferred",
+                task_id=task_id,
+                run_id=lease.run_id if lease is not None else None,
+            )
+            logger.error(
+                "task_id=%s component=resume interrupted run's checkpoint "
+                "unresolvable; retaining lease for TTL recovery: %s",
+                task_id,
+                e,
+                # The chained cause is the actual read failure.
+                exc_info=e,
+            )
+            return
+        elif delivery_outcome_unknown:
+            await fail_deferred_delivery()
+        elif isinstance(e, _DeferredInjectionRejectedRetryableError):
+            # Nothing was written for this message, so it is never failed or
+            # resumed for. A fence left by an earlier uncertain input keeps the
+            # task paused for the user. Without one (a read-back proved this
+            # write absent) the task returns to its prior resting status; a
+            # prior status that cannot be restored without re-running or
+            # re-announcing a result is paused instead.
+            if (
+                not e.fenced
+                and lease is not None
+                and not lease_released
+                and resume_prior_status
+                in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}
+            ):
+                restore_lease_to_prior_status = resume_prior_status
+            else:
+                pause_rejected_lease = True
+            logger.warning(
+                "Task %s deferred message was not accepted (fenced=%s)",
+                task_id,
+                e.fenced,
+            )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                await fail_deferred_delivery(
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
+        elif (
+            isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
+            and lease is not None
+            and not lease_released
+            and resume_prior_status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}
+        ):
+            # Not pool exhaustion (handled above) but still a read that
+            # could not be completed, or a partition this reader was not
+            # authoritative for -- retryable, not a policy decision this
+            # task made. Restore it to whatever it was before this resume
+            # attempt claimed the lease instead of a terminal FAILED; the
+            # finally block below performs the actual write once the
+            # heartbeat has stopped. RUNNING is never a restore target:
+            # ``release_task_lease_no_commit`` refuses to release a lease
+            # back to RUNNING, so a prior status of RUNNING (an abandoned
+            # lease this attempt stole via TTL expiry) falls through to the
+            # settle/FAILED branch below instead of dead-ending here.
+            restore_lease_to_prior_status = resume_prior_status
+            logger.error(
+                "task_id=%s component=resume checkpoint could not be read; "
+                "restoring prior status %s: %s",
+                task_id,
+                resume_prior_status.value,
+                e,
+                exc_info=True,
+            )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                await fail_deferred_delivery(
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
+        else:
+            logger.error(
+                "V2 resume background task %s failed: %s",
+                task_id,
+                e,
+                exc_info=True,
+            )
+            settlement_error = error_message
+            # A recoverable run that was interrupted (mostly a
+            # checkpoint/event write or the database failing; LLM failures
+            # arrive as results) is paused, not failed. Known and narrow: a
+            # non-LLM transport error escaping setup code (say an HTTP
+            # timeout) can also match the LLM classifier here.
+            settlement_interruption = settlement_interruption_for_failure(e)
+            broadcast_error_message = client_safe_error_message(
+                e,
+                fallback=CLIENT_SAFE_TASK_FAILURE,
+            )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                await fail_deferred_delivery(
+                    CLIENT_SAFE_VALIDATION_ERROR,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
+            current_snapshot = None
+            if (
+                lease is None
+                and not defer_db_cleanup_to_ttl_recovery
+                and expected_run_id is not None
+            ):
+                current_snapshot = await task_execution_controller.snapshot(task_id)
+            if (
+                current_snapshot is not None
+                and current_snapshot.run_id != expected_run_id
+            ):
+                logger.info(
+                    "Suppressing late resume error for task %s run %s; "
+                    "current run is %s",
+                    task_id,
+                    expected_run_id,
+                    current_snapshot.run_id,
+                )
+                return
+        if lease is None:
+            if broadcast_error_message is not None:
+                await publish_task_event(
+                    create_terminal_task_error_event(
+                        task_id,
+                        broadcast_error_message,
+                    ),
+                    task_id,
+                )
+            else:
+                await publish_task_event(
+                    create_terminal_task_error_event(
+                        task_id,
+                        CLIENT_SAFE_TASK_FAILURE,
+                    ),
+                    task_id,
+                )
+    finally:
+
+        async def finalize_resume_resources() -> None:
+            nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
+            nonlocal settlement_error
+            nonlocal prepared_outputs
+            settlement_returned = False
+
+            try:
+                # Finalize any tracker that did not reach the normal completion
+                # point, then release any unfinished lease through worker-owned
+                # short Sessions.
+                if resume_tracker is not None:
+                    agent_service.set_interrupt_checker(None)
+                    try:
+                        if defer_db_cleanup_to_ttl_recovery:
+                            # Do not initiate a final usage checkout immediately
+                            # after a pool timeout. Stop/drain only the periodic
+                            # loop.
+                            await resume_tracker.stop_periodic_updates()
+                        else:
+                            await resume_tracker.complete_tracking()
+                    except Exception as e:  # noqa: BLE001
+                        if is_database_pool_timeout(e):
+                            defer_db_cleanup_to_ttl_recovery = (
+                                lease is not None and not lease_released
+                            )
+                            logger.error(
+                                "task_id=%s component=resume-tracker database "
+                                "pool checkout timed out; retaining lease for "
+                                "TTL recovery: %s",
+                                task_id,
+                                e,
+                                exc_info=True,
+                            )
+                        else:
+                            logger.warning(
+                                "execute_resume_background: token tracking "
+                                "completion failed for task %s: %s",
+                                task_id,
+                                e,
+                            )
+                if lease_heartbeat_task is not None or lease_stop_event is not None:
+                    try:
+                        heartbeat_outcome = await stop_task_lease_heartbeat(
+                            lease_heartbeat_task,
+                            lease_stop_event,
+                        )
+                        if (
+                            isinstance(heartbeat_outcome, TaskLeaseHeartbeatOutcome)
+                            and heartbeat_outcome.requires_ttl_recovery
+                        ):
+                            defer_db_cleanup_to_ttl_recovery = (
+                                lease is not None and not lease_released
+                            )
+                            logger.error(
+                                "task_id=%s component=resume-heartbeat unhealthy "
+                                "during cleanup; retaining lease for TTL "
+                                "recovery (lost=%s, pool_timeout=%s)",
+                                task_id,
+                                heartbeat_outcome.lease_lost,
+                                heartbeat_outcome.pool_timeout is not None,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "resume heartbeat shutdown failed for task %s",
+                            task_id,
+                            exc_info=True,
+                        )
+                if prepared_outputs is not None:
+                    outputs_to_compensate = prepared_outputs
+                    prepared_outputs = None
+                    await run_db_io_cancellation_safe(
+                        lambda: _settle_prepared_task_file_outputs(
+                            outputs_to_compensate,
+                            metadata_committed=False,
+                        )
+                    )
+                if (
+                    lease is not None
+                    and not lease_released
+                    and not defer_db_cleanup_to_ttl_recovery
+                    and restore_lease_to_prior_status is not None
+                ):
+                    try:
+                        restored = await run_db_io_cancellation_safe(
+                            lambda: _restore_resumed_task_lease_to_prior_status(
+                                lease,
+                                status=restore_lease_to_prior_status,
+                            )
+                        )
+                        if restored:
+                            lease_released = True
+                    except Exception:
+                        logger.error(
+                            "resume lease restore-to-prior-status failed for "
+                            "task %s; retaining lease for TTL recovery",
+                            task_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if restored:
+                            # Correct the optimistic RUNNING state a client
+                            # may still be showing after the lease claim
+                            # above flipped it, before this failure restored
+                            # the prior status. Best-effort: a missed
+                            # broadcast does not change the restore result
+                            # that already committed.
+                            try:
+                                restored_snapshot = (
+                                    await task_execution_controller.snapshot(task_id)
+                                )
+                                event_type, message = _waiting_or_paused_event_fields(
+                                    restore_lease_to_prior_status
+                                )
+                                await publish_task_event(
+                                    {
+                                        "task_id": task_id,
+                                        "message": message,
+                                        "timestamp": datetime.now(
+                                            timezone.utc
+                                        ).timestamp(),
+                                        **(
+                                            restored_snapshot.as_dict()
+                                            if restored_snapshot is not None
+                                            else {}
+                                        ),
+                                        "type": event_type,
+                                    },
+                                    task_id,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "resume lease restore-to-prior-status "
+                                    "broadcast failed for task %s",
+                                    task_id,
+                                    exc_info=True,
+                                )
+                        else:
+                            logger.warning(
+                                "task_id=%s component=resume restore to prior "
+                                "status %s affected no rows; the task row no "
+                                "longer matches this lease fence (runner_id=%s "
+                                "run_id=%s), so another releaser now owns its "
+                                "status",
+                                task_id,
+                                restore_lease_to_prior_status.value,
+                                lease.runner_id,
+                                lease.run_id,
+                            )
+                elif (
+                    lease is not None
+                    and not lease_released
+                    and not defer_db_cleanup_to_ttl_recovery
+                ):
+                    try:
+                        explicit_cancel = background_task_manager.cancel_was_requested(
+                            resume_owner_task
+                        )
+                        pause_for_input = (
+                            delivery_outcome_unknown or pause_rejected_lease
+                        )
+                        if explicit_cancel and pause_for_input:
+                            # An explicit cancel wins over the uncertain-input
+                            # pause: the task fails as cancelled while the
+                            # delivery keeps its recorded outcome (an unknown
+                            # one is never resendable).
+                            settlement_error = (
+                                settlement_error
+                                or _resume_cancel_settlement_error(trusted_task_source)
+                            )
+                        settlement_report = SettlementReport()
+                        if pause_for_input and not explicit_cancel:
+                            from .task_orchestrator import pause_unknown_task_lease
+
+                            settled = await pause_unknown_task_lease(
+                                lease,
+                                message=(
+                                    "Input outcome unknown; execution paused"
+                                    if delivery_outcome_unknown
+                                    else "Input was not accepted; execution paused"
+                                ),
+                            )
+                        else:
+                            settled = await run_db_io_cancellation_safe(
+                                lambda: _settle_resumed_task_lease(
+                                    lease,
+                                    error_message=settlement_error,
+                                    turn_id=history_turn_id,
+                                    # An explicit cancel is not an
+                                    # interruption to resume from.
+                                    interruption=(
+                                        None
+                                        if explicit_cancel
+                                        else settlement_interruption
+                                    ),
+                                    report=settlement_report,
+                                )
+                            )
+                        # Returned, not raised: no retention to record, even
+                        # for ``False`` -- it also means a pre-existing
+                        # terminal or control outcome was reconciled and
+                        # released, or a cancel path (external, A2A, question
+                        # cancel) already released this run. Same rule as
+                        # ``_schedule_bg``.
+                        settlement_returned = True
+                        if settled:
+                            lease_released = True
+                            if settlement_report.paused:
+                                from .task_orchestrator import (
+                                    publish_settlement_pause,
+                                )
+
+                                await publish_settlement_pause(
+                                    task_id, settlement_report
+                                )
+                            elif broadcast_error_message is not None:
+                                try:
+                                    from .task_event_display import publish_task_result
+
+                                    await publish_task_result(
+                                        {
+                                            **create_terminal_task_error_event(
+                                                task_id,
+                                                broadcast_error_message,
+                                            ),
+                                            **settlement_report.control_state,
+                                        },
+                                        task_id,
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "task %s resume failure was committed but "
+                                        "its terminal broadcast failed",
+                                        task_id,
+                                        exc_info=True,
+                                    )
+                    except Exception as settle_err:
+                        if isinstance(settle_err, InterruptionSettlementDeferred):
+                            # Raised by the settlement itself; the run-phase
+                            # catch above returns before settling, so this is
+                            # a different occurrence from that one.
+                            report_unknown_outcome(
+                                "settlement_deferred",
+                                task_id=task_id,
+                                run_id=lease.run_id,
+                            )
+                        logger.error(
+                            "resume lease settlement failed for task %s; "
+                            "retaining lease for TTL recovery",
+                            task_id,
+                            exc_info=True,
+                        )
+            finally:
+                # Every "retaining lease for TTL recovery" branch above (pool
+                # timeouts, unhealthy heartbeat, unresolvable checkpoint, a
+                # restore that failed or matched no row, a settlement that
+                # raised) ends here with the lease unreleased. Settlement is
+                # then unproven, whatever the counts say once this handle
+                # leaves the manager.
+                if lease is not None and not lease_released and not settlement_returned:
+                    release_hold.record_unsettled(
+                        "resume_lease",
+                        f"task:{task_id}",
+                        "run lease retained for TTL recovery",
+                    )
+                _clear_task_pause_accepted(task_id)
+                background_task_manager.cleanup_task(
+                    task_id,
+                    expected_task=resume_owner_task,
+                )
+                try:
+                    from .agent_service_manager import get_agent_manager
+
+                    get_agent_manager().note_runtime_settled(task_id)
+                except Exception:
+                    logger.warning(
+                        "Settling the cached runtime for task %s failed",
+                        task_id,
+                        exc_info=True,
+                    )
+
+        cleanup_task = asyncio.create_task(finalize_resume_resources())
+        await drain_async_task_cancellation_safe(cleanup_task)
+
+
+@dataclass(frozen=True)
+class BackgroundTaskCancelOutcome:
+    """Whether cancellation was requested from live process-local task work."""
+
+    requested: bool
+
+
+class ResumeReservationOutcome(str, enum.Enum):
+    """Result of trying to take the single live-control resume slot."""
+
+    RESERVED = "reserved"
+    # Another caller owns the pre-registration window. Its transition or
+    # coordinator registration may still fail, so this is not yet proof that
+    # the task is resuming.
+    RESERVATION_HELD = "reservation_held"
+    # A registered resume coordinator is already responsible for the task.
+    COORDINATOR_RUNNING = "coordinator_running"
+    # This process no longer admits new background work.
+    SHUTTING_DOWN = "shutting_down"
+
+
+class AnyResumeRun:
+    """Marker admitting a coordinator for *any* run as idempotency evidence.
+
+    Distinguishes "do not check the run" from an explicit ``None``, which
+    means "this task has no run id, so only a coordinator registered without
+    one is evidence". Without the marker a caller that simply had no run id
+    to hand would silently accept a coordinator belonging to a different run.
+    """
+
+    __slots__ = ()
+
+
+ANY_RESUME_RUN = AnyResumeRun()
+
+
+class DispatchReservation:
+    __slots__ = ("task_id", "released")
+
+    def __init__(self, task_id: int) -> None:
+        self.task_id = task_id
+        self.released = False
+
+
+def _running_loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
+class BackgroundTaskManager:
+    """Manages background task execution, ensuring only one background process per task at a time"""
+
+    def __init__(self) -> None:
+        # task_id -> asyncio.Task
+        self.running_tasks: dict[int, asyncio.Task] = {}
+        # Resume coordinators are deliberately tracked separately while they
+        # wait for the current execution. Replacing ``running_tasks[task_id]``
+        # too early creates a cycle: the original execution waits for the new
+        # resume task while that resume task waits for the original execution.
+        self.resume_tasks: dict[int, asyncio.Task] = {}
+        # The coordinator is evidence only for the exact run it was created
+        # to resume. A lingering old-run task must not complete a command for
+        # a newer run as an idempotent success.
+        self._resume_run_ids: dict[int, str | None] = {}
+        self._resume_reservations: set[int] = set()
+        self._resume_owner_started_at: dict[int, float] = {}
+        # Tasks cancelled through ``cancel_task``: an explicit stop request,
+        # as opposed to shutdown or lease-loss cancellation. Recorded before
+        # ``Task.cancel()`` so the cancelled task's own cleanup can read it.
+        self._explicitly_cancelled: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
+        self._shutting_down = False
+        self._shutdown_lock = asyncio.Lock()
+        # Every execution task this process started, by identity: one object
+        # counts once as started and once as finished however many times it
+        # is registered. Live members are the in-flight executions.
+        self._counted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
+        # Window counts for the per-process diagnostics line. Written by
+        # registration and by done callbacks, zeroed by ``drain_window_counts``
+        # and when ``start_accepting`` opens a new lifespan. ``shutdown`` keeps
+        # them so cancellations during shutdown are still reported.
+        self._window_started = 0
+        self._window_finished_ok = 0
+        self._window_finished_failed = 0
+        self._window_finished_cancelled = 0
+        # Every live execution handle by task id, whatever registry table it
+        # sits in. A handle leaves only through its own done callback, so an
+        # execution counts until it has finished unwinding, not merely until it
+        # called ``cleanup_task``. Kept apart from ``_counted_tasks``, which is
+        # not keyed by task id and so cannot answer whether a task is active.
+        self._live_executions: dict[int, set[asyncio.Task]] = {}
+        # One entry per in-flight dispatch attempt that took a slot for a task
+        # and has not yet seen its execution registered or the attempt end.
+        self._dispatch_reservations: Counter[int] = Counter()
+        # The tenant key of each task that took its slot from the dispatcher,
+        # read and written on the event-loop thread only. The cap snapshot is
+        # the one place that drops entries: a task that has left the active set
+        # is removed at the next snapshot. A task that releases its slot and
+        # re-enters the active set outside the dispatcher before that snapshot
+        # keeps its old key; that affects the per-tenant counts of the
+        # diagnostics line, the fair-share ranking and the tenant cap.
+        self._slot_keys: dict[int, str] = {}
+        # Time this process spent at its dispatch cap, for the diagnostics
+        # line's ``gate_held_s``. Observed at every cap snapshot and at each
+        # drain; between two observations the earlier one's state is assumed.
+        # Zeroed by ``drain_gate_held_seconds`` and by ``start_accepting``;
+        # ``shutdown`` keeps the total for the final line.
+        self._cap_clock: Callable[[], float] = _running_loop_time
+        self._cap_last_policy: DispatchPolicy | None = None
+        self._cap_closed_since: float | None = None
+        self._cap_closed_total = 0.0
+
+    def _track_live_execution(self, task_id: int, task: asyncio.Task) -> None:
+        self._live_executions.setdefault(task_id, set()).add(task)
+        # Both callers run this before they register the cleanup callback, so
+        # the handle has left the table by the time cleanup signals a freed slot.
+        task.add_done_callback(
+            lambda finished: self._drop_live_execution(task_id, finished)
+        )
+
+    def _drop_live_execution(self, task_id: int, task: asyncio.Task) -> None:
+        handles = self._live_executions.get(task_id)
+        if handles is None:
+            return
+        handles.discard(task)
+        if not handles:
+            del self._live_executions[task_id]
+
+    def _active_task_ids(self) -> frozenset[int]:
+        return (
+            frozenset(self._live_executions)
+            | frozenset(self.resume_tasks)
+            | frozenset(self._dispatch_reservations)
+        )
+
+    def holds_execution(self, task_id: int) -> bool:
+        """Whether an execution of this process holds ``task_id``'s slot now.
+
+        An execution holds it from its registration (``register_task`` or
+        ``register_reserved_resume``) until its handle has finished, and a resume
+        coordinator until the manager drops it. A dispatch token alone does not:
+        these are the tables of the active set other than the tokens. Read-only
+        and with no await, so the answer is the state at the moment of the call.
+        """
+        return task_id in self._live_executions or task_id in self.resume_tasks
+
+    def _record_cap_state(self, closed: bool, now: float) -> None:
+        since = self._cap_closed_since
+        if closed:
+            if since is None:
+                self._cap_closed_since = now
+        elif since is not None:
+            self._cap_closed_total += max(0.0, now - since)
+            self._cap_closed_since = None
+
+    def _observe_current_cap_state(self, now: float) -> None:
+        policy = self._cap_last_policy
+        if policy is None:
+            return
+        self._record_cap_state(
+            DispatchCapSnapshot(
+                policy=policy,
+                active_ids=self._active_task_ids(),
+                held=release_hold.closed,
+            ).closed,
+            now,
+        )
+
+    def _tenant_occupancy(self, active: frozenset[int]) -> Counter[str]:
+        """The active tasks that took their slot from the dispatcher, per tenant key.
+
+        Read-only. A task started outside the dispatcher has no key and counts
+        for no tenant.
+        """
+        return Counter(
+            key for task_id, key in self._slot_keys.items() if task_id in active
+        )
+
+    def slot_tenant_counts(self) -> tuple[int, int]:
+        """How many tenants hold dispatcher slots, and the most slots one holds.
+
+        Reads the active set without taking a cap snapshot, so it does not
+        move the cap clock, and never changes ``_slot_keys``.
+        """
+        occupancy = self._tenant_occupancy(self._active_task_ids())
+        if not occupancy:
+            return (0, 0)
+        return (len(occupancy), max(occupancy.values()))
+
+    def dispatch_cap_snapshot(self, policy: DispatchPolicy) -> DispatchCapSnapshot:
+        active = self._active_task_ids()
+        for task_id in [t for t in self._slot_keys if t not in active]:
+            del self._slot_keys[task_id]
+        snapshot = DispatchCapSnapshot(
+            policy=policy,
+            active_ids=active,
+            held=release_hold.closed,
+            occupancy=dict(self._tenant_occupancy(active)),
+        )
+        self._cap_last_policy = policy
+        self._record_cap_state(snapshot.closed, self._cap_clock())
+        return snapshot
+
+    def reserve_dispatch_slot(
+        self,
+        task_id: int,
+        *,
+        policy: DispatchPolicy,
+        interactive: bool,
+        fairness_key: str | None = None,
+        queued_tenants: Mapping[str, int] | None = None,
+        require_listing: bool = False,
+    ) -> DispatchReservation | None:
+        """Take a slot for ``task_id`` unless the policy keeps it from this command.
+
+        ``interactive`` is the class of the command that wants the slot; a
+        batch command is refused from the batch line on, an interactive one
+        only at the limit. Between the two lines, given ``queued_tenants`` (the
+        oldest queued command id of each queued tenant, as the selection that
+        picked the command listed them), the tenant that holds the most slots
+        here is refused a new slot (``DispatchCapSnapshot.capped_tenant``). When
+        ``require_listing`` is true and no listing came with the command,
+        ``TenantListingRequired`` is raised instead of taking a slot between
+        the two lines, so that the caller selects again with the listing.
+        Reads the active set and adds the token with no await in between, so
+        concurrent dispatch attempts cannot both take the last slot. Records
+        ``fairness_key`` for a task that was not yet active; a task already in
+        the active set keeps its recorded key. A refusal or a raise leaves no
+        trace.
+        """
+
+        snapshot = self.dispatch_cap_snapshot(policy)
+        if not snapshot.admits(task_id, interactive=interactive):
+            return None
+        if task_id not in snapshot.active_ids:
+            if queued_tenants is None:
+                if require_listing and snapshot.in_reserve_band:
+                    raise TenantListingRequired
+            else:
+                capped = snapshot.capped_tenant(queued_tenants)
+                if capped is not None and fairness_key == capped:
+                    return None
+        if fairness_key is not None and task_id not in snapshot.active_ids:
+            self._slot_keys[task_id] = fairness_key
+        self._dispatch_reservations[task_id] += 1
+        return DispatchReservation(task_id)
+
+    def release_dispatch_slot(self, token: DispatchReservation | None) -> None:
+        if token is None or token.released:
+            return
+        token.released = True
+        remaining = self._dispatch_reservations.get(token.task_id, 0) - 1
+        if remaining > 0:
+            self._dispatch_reservations[token.task_id] = remaining
+        else:
+            self._dispatch_reservations.pop(token.task_id, None)
+
+    def start_accepting(self) -> None:
+        """Reopen admission for a new application lifespan."""
+
+        if (
+            self._shutdown_lock.locked()
+            or self.running_tasks
+            or self.resume_tasks
+            or self._resume_run_ids
+            or self._resume_reservations
+            or self._resume_owner_started_at
+            or self._live_executions
+            or self._dispatch_reservations
+        ):
+            raise RuntimeError("Background task manager still owns background work")
+        # asyncio synchronization primitives are bound to the event loop that
+        # first contends on them. A new application lifespan may use a new loop,
+        # so an idle manager must not retain the previous lifespan's lock.
+        self._shutdown_lock = asyncio.Lock()
+        self._shutting_down = False
+        self._slot_keys.clear()
+        self.drain_window_counts()
+        self._cap_last_policy = None
+        self._cap_closed_since = None
+        self._cap_closed_total = 0.0
+
+    async def wait_for_previous(self, task_id: int) -> None:
+        """Wait for previous background task of this task to complete"""
+        if task_id in self.running_tasks:
+            old_task = self.running_tasks[task_id]
+            current_task = asyncio.current_task()
+            if current_task is not None and old_task is current_task:
+                return
+            if not old_task.done():
+                logger.info(
+                    f"Waiting for previous background task {task_id} to complete..."
+                )
+                try:
+                    await asyncio.shield(old_task)
+                    logger.info(f"Previous background task {task_id} completed")
+                except Exception as e:
+                    logger.warning(
+                        f"Previous background task {task_id} ended with error: {e}"
+                    )
+
+    def register_task(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        *,
+        failure_flag: Callable[[], bool] | None = None,
+    ) -> None:
+        """Register new background task and count it as a started execution.
+
+        ``failure_flag`` reports a failure the task handled itself and then
+        returned from normally; it is read once, when the task finishes, and
+        must be a cheap read of state the task already holds. Without it only
+        an exception escaping the task counts as a failure. The manager logs
+        that exception exactly once, with its traceback, and asyncio adds no
+        second report; a path that also awaits the handle may log it again
+        there.
+        """
+        if self._shutting_down:
+            task.cancel()
+            raise RuntimeError("Background task manager is shutting down")
+        # Counted from here, so a handle that track_execution cancels still
+        # leaves the table through its own done callback.
+        self._track_live_execution(task_id, task)
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.track_execution(task)
+        self.running_tasks[task_id] = task
+        # Execution may run in a lease-guard child task, whose finally block
+        # cannot remove this still-running outer owner. Release the registration
+        # when its actual owner finishes, including failure or early cancellation.
+        # Fence by identity so an old completion cannot remove a newer run.
+        task.add_done_callback(
+            lambda finished: self.cleanup_task(task_id, expected_task=finished)
+        )
+        self._count_execution_start(task_id, task, failure_flag)
+        logger.info(f"Registered background task for task {task_id}")
+
+    def resume_admission_state(
+        self,
+        task_id: int,
+        *,
+        expected_run_id: str | None | AnyResumeRun,
+    ) -> ResumeReservationOutcome | None:
+        """Classify existing resume ownership without taking an empty slot.
+
+        Returns ``None`` when the slot is free. Not a pure read: a coordinator
+        that has already finished is reclaimed here, dropping both its task
+        and its registered run id, so a finished registration never reports
+        the slot as occupied.
+
+        ``expected_run_id`` is the evidence axis. Pass :data:`ANY_RESUME_RUN`
+        to accept a coordinator for any run; an explicit ``None`` means the
+        task has no run id and only a coordinator registered without one
+        counts.
+        """
+
+        if self._shutting_down:
+            return ResumeReservationOutcome.SHUTTING_DOWN
+        if task_id in self._resume_reservations:
+            return ResumeReservationOutcome.RESERVATION_HELD
+        existing = self.resume_tasks.get(task_id)
+        if existing is not None and not existing.done():
+            registered_run_id = self._resume_run_ids.get(task_id)
+            if (
+                isinstance(expected_run_id, AnyResumeRun)
+                or registered_run_id == expected_run_id
+            ):
+                return ResumeReservationOutcome.COORDINATOR_RUNNING
+            # The task id is still locally occupied, but by a coordinator for
+            # another run. It is not evidence that this run is resuming and it
+            # is not safe to overwrite its registration.
+            return ResumeReservationOutcome.RESERVATION_HELD
+        if existing is not None:
+            self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
+        return None
+
+    def resume_holder_age_seconds(self, task_id: int) -> float | None:
+        """Return the local resume-slot holder's monotonic age, if known."""
+
+        started_at = self._resume_owner_started_at.get(task_id)
+        if started_at is None:
+            return None
+        return max(0.0, time.monotonic() - started_at)
+
+    def try_reserve_resume(
+        self,
+        task_id: int,
+        *,
+        expected_run_id: str | None | AnyResumeRun,
+    ) -> ResumeReservationOutcome:
+        """Atomically classify admission to the live-control resume slot."""
+
+        # Keep this inspect-and-add block synchronous: asyncio task switches
+        # can only happen at ``await``, so it is the in-process atomic guard.
+        existing_state = self.resume_admission_state(
+            task_id,
+            expected_run_id=expected_run_id,
+        )
+        if existing_state is not None:
+            return existing_state
+        self._resume_reservations.add(task_id)
+        self._resume_owner_started_at[task_id] = time.monotonic()
+        return ResumeReservationOutcome.RESERVED
+
+    def reserve_resume(self, task_id: int) -> bool:
+        """Boolean compatibility wrapper for callers that cannot classify.
+
+        Keeps the pre-classification contract: any unfinished coordinator
+        reports the slot as taken, whichever run it belongs to.
+        """
+
+        return (
+            self.try_reserve_resume(task_id, expected_run_id=ANY_RESUME_RUN)
+            is ResumeReservationOutcome.RESERVED
+        )
+
+    def register_reserved_resume(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        *,
+        run_id: str | None,
+    ) -> None:
+        if self._shutting_down:
+            task.cancel()
+            raise RuntimeError("Background task manager is shutting down")
+        if task_id not in self._resume_reservations:
+            raise RuntimeError(f"Task {task_id} has no reserved resume slot")
+        # Counted from here, so a handle that track_execution cancels still
+        # leaves the table through its own done callback.
+        self._track_live_execution(task_id, task)
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.track_execution(task)
+        self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.setdefault(task_id, time.monotonic())
+        self.resume_tasks[task_id] = task
+        self._resume_run_ids[task_id] = run_id
+        # Cancellation before the coroutine starts skips its finally block.
+        # Use the same owner fence as execution completion, including after
+        # this coordinator has been promoted into running_tasks.
+        task.add_done_callback(
+            lambda finished: self.cleanup_task(task_id, expected_task=finished)
+        )
+        logger.info("Registered resume coordinator for task %s", task_id)
+
+    def release_resume_reservation(self, task_id: int) -> None:
+        if self._shutting_down:
+            return
+        self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.pop(task_id, None)
+
+    def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
+        """Make a resume coordinator the task's execution and count it as started.
+
+        It is counted without a failure flag: only an exception escaping the
+        coordinator counts as failed, and that exception is logged as for
+        ``register_task``.
+        """
+
+        if self._shutting_down:
+            raise RuntimeError("Background task manager is shutting down")
+        existing = self.resume_tasks.get(task_id)
+        if existing is not task:
+            raise RuntimeError(
+                f"Task {task_id} resume coordinator is not registered or no longer current"
+            )
+        self.running_tasks[task_id] = task
+        self._count_execution_start(task_id, task, None)
+        logger.info("Promoted resume coordinator for task %s", task_id)
+
+    def _count_execution_start(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        failure_flag: Callable[[], bool] | None,
+    ) -> None:
+        if task in self._counted_tasks:
+            return
+        self._counted_tasks.add(task)
+        self._window_started += 1
+        task.add_done_callback(
+            lambda finished: self._count_execution_finish(
+                task_id, finished, failure_flag
+            )
+        )
+
+    def _count_execution_finish(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        failure_flag: Callable[[], bool] | None,
+    ) -> None:
+        # Deliberately independent of ``cleanup_task`` and ``_shutting_down``:
+        # tasks cancelled by ``shutdown`` are still counted.
+        if task.cancelled():
+            self._window_finished_cancelled += 1
+            return
+        exc = task.exception()
+        if exc is not None:
+            # Reading the exception marks it retrieved, which silences
+            # asyncio's "Task exception was never retrieved" report for a
+            # handle nobody awaits. Report it here instead; this callback is
+            # attached once per task object, so it is reported once.
+            logger.error(
+                "Background execution for task %s raised", task_id, exc_info=exc
+            )
+        failed = exc is not None
+        if not failed and failure_flag is not None:
+            try:
+                failed = bool(failure_flag())
+            except Exception:
+                logger.exception("Execution failure flag raised; counting as failed")
+                failed = True
+        if failed:
+            self._window_finished_failed += 1
+        else:
+            self._window_finished_ok += 1
+
+    def release_counts(self) -> dict[str, int]:
+        """Everything this manager still owns, for a planned-restart idle check.
+
+        Read-only. Live handles count until their own done callback runs, so
+        an execution is counted until it has finished unwinding; resume
+        coordinators also count while they wait for the execution they will
+        replace, and reservations cover the window before registration. The
+        tables overlap (a registered coordinator is also a live handle), which
+        is harmless: only "all zero" is used as evidence.
+        """
+
+        return {
+            "live_executions": sum(
+                len(handles) for handles in self._live_executions.values()
+            ),
+            "resume_coordinators": sum(
+                1 for task in self.resume_tasks.values() if not task.done()
+            ),
+            "resume_reservations": len(self._resume_reservations),
+            "dispatch_reservations": sum(self._dispatch_reservations.values()),
+        }
+
+    def inflight_counts(self) -> tuple[int, int]:
+        """Return (executions in flight, resume coordinators not yet executing).
+
+        The two numbers are disjoint: a promoted coordinator is an execution.
+        Counts objects, not task ids, so an older execution still finishing
+        after its task id was registered again is included.
+        """
+
+        inflight = sum(1 for task in list(self._counted_tasks) if not task.done())
+        resuming = sum(
+            1
+            for task in list(self.resume_tasks.values())
+            if not task.done() and task not in self._counted_tasks
+        )
+        return inflight, resuming
+
+    def drain_window_counts(self) -> tuple[int, int, int, int]:
+        """Return and zero (started, finished ok, failed, cancelled) since the last drain.
+
+        "failed" means the task raised, or reported through its failure flag
+        that it handled a failure. "ok" is every other non-cancelled finish,
+        which includes runs that paused, lost their lease, or whose agent
+        reported an unsuccessful result without raising. A resume coordinator
+        is counted without a failure flag, so a resume run that handles its
+        own failure and returns normally counts as "ok".
+        """
+
+        counts = (
+            self._window_started,
+            self._window_finished_ok,
+            self._window_finished_failed,
+            self._window_finished_cancelled,
+        )
+        self._window_started = 0
+        self._window_finished_ok = 0
+        self._window_finished_failed = 0
+        self._window_finished_cancelled = 0
+        return counts
+
+    def drain_gate_held_seconds(self, now: float) -> float:
+        """Return and zero the seconds at the dispatch cap since the last drain.
+
+        Observes the cap once more at ``now``. A closed interval still open is
+        split: the part up to ``now`` is returned and the rest counts towards
+        the next drain. ``0.0`` in a process that never built a cap snapshot.
+        """
+
+        self._observe_current_cap_state(now)
+        held = self._cap_closed_total
+        since = self._cap_closed_since
+        if since is not None:
+            held += max(0.0, now - since)
+            self._cap_closed_since = now
+        self._cap_closed_total = 0.0
+        return held
+
+    def cleanup_task(
+        self,
+        task_id: int,
+        *,
+        expected_task: asyncio.Task | None = None,
+    ) -> None:
+        """Clean up completed background task"""
+        if self._shutting_down:
+            return
+        current = expected_task or asyncio.current_task()
+
+        def owns_registration(task: asyncio.Task) -> bool:
+            if expected_task is not None:
+                return task is expected_task
+            return task.done() or task is current
+
+        task = self.running_tasks.get(task_id)
+        if task is not None and owns_registration(task):
+            self.running_tasks.pop(task_id, None)
+            logger.info(f"Cleaned up background task for task {task_id}")
+        resume_task = self.resume_tasks.get(task_id)
+        if resume_task is not None and owns_registration(resume_task):
+            self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
+            logger.info("Cleaned up resume coordinator for task %s", task_id)
+        from .task_command_transport import notify_dispatcher_slot_freed
+
+        notify_dispatcher_slot_freed()
+
+    async def cancel_task(
+        self,
+        task_id: int,
+        timeout_seconds: float = 0.5,
+    ) -> BackgroundTaskCancelOutcome:
+        tasks = {
+            task
+            for task in (
+                self.running_tasks.get(task_id),
+                self.resume_tasks.get(task_id),
+            )
+            if task is not None
+        }
+        if not self._shutting_down:
+            # A cancel can race the await between reservation and coordinator
+            # registration. Clear that pre-registration owner even when there
+            # is no asyncio task to cancel yet.
+            self._resume_reservations.discard(task_id)
+            self._resume_owner_started_at.pop(task_id, None)
+        if not tasks:
+            if not self._shutting_down:
+                from .task_command_transport import notify_dispatcher_slot_freed
+
+                notify_dispatcher_slot_freed()
+            return BackgroundTaskCancelOutcome(requested=False)
+
+        requested = False
+        for task in tasks:
+            if task.done():
+                continue
+            self._explicitly_cancelled.add(task)
+            requested = task.cancel() or requested
+            try:
+                await asyncio.wait_for(task, timeout=timeout_seconds)
+            except asyncio.CancelledError:
+                logger.info(f"Cancelled background task for task {task_id}")
+            except asyncio.TimeoutError:
+                logger.info(
+                    f"Cancellation timeout for task {task_id}; continuing cleanup"
+                )
+            except RuntimeError as e:
+                logger.warning(
+                    f"Background task {task_id} cancellation runtime warning: {e}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Background task {task_id} raised during cancellation: {e}"
+                )
+
+        if not self._shutting_down:
+            self.running_tasks.pop(task_id, None)
+            self.resume_tasks.pop(task_id, None)
+            self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
+            from .task_command_transport import notify_dispatcher_slot_freed
+
+            notify_dispatcher_slot_freed()
+        return BackgroundTaskCancelOutcome(requested=requested)
+
+    def cancel_was_requested(self, task: asyncio.Task | None) -> bool:
+        """Whether ``task`` was cancelled by an explicit ``cancel_task`` call."""
+
+        return task is not None and task in self._explicitly_cancelled
+
+    @property
+    def shutting_down(self) -> bool:
+        """Whether ``shutdown`` has started cancelling the owned tasks."""
+
+        return self._shutting_down
+
+    async def shutdown(self) -> None:
+        """Fence new work, cancel every owned task, and drain its cleanup."""
+
+        self._shutting_down = True
+        async with self._shutdown_lock:
+            current = asyncio.current_task()
+            tasks = {
+                task
+                for task in (*self.running_tasks.values(), *self.resume_tasks.values())
+                if task is not current
+            }
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            async def drain_tasks() -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            cleanup_task = asyncio.create_task(drain_tasks())
+            try:
+                await drain_async_task_cancellation_safe(cleanup_task)
+            finally:
+                # ``drain_async_task_cancellation_safe`` reaches this block only
+                # after the owned cleanup task has settled, even when shutdown's
+                # caller is cancelled.
+                self.running_tasks.clear()
+                self.resume_tasks.clear()
+                self._resume_run_ids.clear()
+                self._resume_reservations.clear()
+                self._resume_owner_started_at.clear()
+                self._live_executions.clear()
+                self._dispatch_reservations.clear()
+                self._slot_keys.clear()
+                # The tables are empty now; close any cap interval here so
+                # the final diagnostics line does not count later shutdown
+                # steps as time at the cap.
+                self._observe_current_cap_state(self._cap_clock())
+
+
+background_task_manager = BackgroundTaskManager()
+
+
+def _copy_durable_input_to_workspace(source: Path, target: Path, *, mode: int) -> None:
+    """Publish one regular durable input as a private task-local copy."""
+
+    source_flags = (
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_fd = os.open(source, source_flags)
+    temp_fd = -1
+    temp_path: Path | None = None
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Durable task inputs must be regular files")
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        os.fchmod(temp_fd, mode)
+        with (
+            os.fdopen(source_fd, "rb", closefd=True) as source_file,
+            os.fdopen(temp_fd, "wb", closefd=True) as target_file,
+        ):
+            source_fd = -1
+            temp_fd = -1
+            shutil.copyfileobj(source_file, target_file)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _task_input_copy_mode(workspace: Any) -> int:
+    """Use sandbox-prepared permissions before the workspace widens group read."""
+
+    workspace_dir = getattr(workspace, "workspace_dir", None)
+    if workspace_dir is None:
+        return 0o644
+    try:
+        root_stat = Path(workspace_dir).resolve().stat()
+    except OSError:
+        return 0o644
+    if _is_sandbox_prepared(root_stat):
+        return 0o600
+    return 0o644
+
+
+def _workspace_owner_and_task(workspace: Any) -> tuple[int, int] | None:
+    """Return the validated durable owner/task identity for a workspace."""
+
+    owner_user_id = getattr(workspace, "owner_user_id", None)
+    task_id = getattr(workspace, "db_task_id", None)
+    if task_id is None:
+        task_id = getattr(workspace, "current_task_id", None)
+    if (
+        not isinstance(owner_user_id, int)
+        or isinstance(owner_user_id, bool)
+        or not isinstance(task_id, int)
+        or isinstance(task_id, bool)
+    ):
+        return None
+    return owner_user_id, task_id
+
+
+def _materialize_legacy_task_input_symlinks(
+    workspace: Any, input_dir: Path, *, copy_mode: int
+) -> None:
+    """Replace authorized pre-upgrade input symlinks with task-local copies."""
+
+    owner_and_task = _workspace_owner_and_task(workspace)
+    if owner_and_task is None:
+        return
+    owner_user_id, task_id = owner_and_task
+
+    legacy_links: dict[Path, Path] = {}
+    try:
+        entries = tuple(input_dir.iterdir())
+    except OSError:
+        logger.warning(
+            "Failed to inspect legacy task inputs in %s", input_dir, exc_info=True
+        )
+        return
+    for candidate in entries:
+        try:
+            if not candidate.is_symlink():
+                continue
+            raw_target = Path(os.readlink(candidate))
+        except OSError:
+            continue
+        if not raw_target.is_absolute():
+            raw_target = candidate.parent / raw_target
+        legacy_links[candidate] = Path(os.path.realpath(raw_target))
+    if not legacy_links:
+        return
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        linked_sources = set(legacy_links.values())
+        file_ids = [
+            str(row.file_id)
+            for row in db.query(UploadedFile.file_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id == owner_user_id,
+                UploadedFile.task_id == task_id,
+                UploadedFile.storage_status != "compensating",
+            )
+            .all()
+            if Path(os.path.realpath(str(row.storage_path))) in linked_sources
+        ]
+        file_infos: List[Dict[str, Any]] = []
+        if file_ids:
+            file_infos, _missing = resolve_turn_file_infos(
+                file_ids=file_ids,
+                owner_user_id=owner_user_id,
+                task_id=task_id,
+                db=db,
+            )
+
+    authorized_sources: dict[Path, dict[str, Any]] = {}
+    for file_info in file_infos:
+        raw_source_path = str(file_info.get("path") or "")
+        if not raw_source_path:
+            continue
+        source_path = Path(raw_source_path)
+        authorized_sources[Path(os.path.realpath(source_path))] = file_info
+
+    for candidate, linked_source in legacy_links.items():
+        matched_file_info = authorized_sources.get(linked_source)
+        if matched_file_info is None:
+            logger.warning(
+                "Leaving unmatched legacy task input symlink unchanged: %s -> %s",
+                candidate,
+                linked_source,
+            )
+            continue
+        source_path = Path(str(matched_file_info["path"]))
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            registration = workspace.describe_file_registration(str(candidate))
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=str(matched_file_info["file_id"]),
+            )
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=str(matched_file_info["file_id"]),
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to materialize legacy task input: storage=%s input_path=%s",
+                source_path,
+                candidate,
+                exc_info=True,
+            )
+            continue
+        logger.info(
+            "Materialized legacy task input: storage=%s input_path=%s",
+            source_path,
+            candidate,
+        )
+
+
+def _prepare_workspace_inputs_for_agent(
+    agent_service: Any,
+) -> tuple[Any, Path, int] | None:
+    """Prepare task-local inputs shared by starts, resumes, and channels."""
+    workspace = getattr(agent_service, "workspace", None)
+    if not workspace:
+        return None
+
+    raw_input_dir = getattr(workspace, "input_dir", None)
+    if not isinstance(raw_input_dir, (str, os.PathLike)):
+        return None
+    input_dir = Path(raw_input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    copy_mode = _task_input_copy_mode(workspace)
+    _materialize_legacy_task_input_symlinks(
+        workspace,
+        input_dir,
+        copy_mode=copy_mode,
+    )
+    return workspace, input_dir, copy_mode
+
+
+def _persist_durable_input_workspace_binding(
+    workspace: Any,
+    registration: Any,
+    *,
+    file_id: str,
+) -> bool:
+    """Persist a task-local input path so cold workspaces can reuse it."""
+
+    owner_and_task = _workspace_owner_and_task(workspace)
+    if owner_and_task is None:
+        return False
+    owner_user_id, task_id = owner_and_task
+    relative_path = str(getattr(registration, "relative_path", "") or "")
+    category = str(getattr(registration, "category", "") or "")
+    if category != "input" or not relative_path.startswith("input/"):
+        raise ValueError("Durable task input binding must stay under input/")
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        record = (
+            db.query(UploadedFile)
+            .filter(
+                UploadedFile.file_id == file_id,
+                UploadedFile.user_id == owner_user_id,
+                UploadedFile.task_id == task_id,
+                UploadedFile.detached_reason.is_(None),
+                UploadedFile.storage_status != "compensating",
+            )
+            .one_or_none()
+        )
+        if record is None:
+            raise ValueError("Durable task input metadata is unavailable")
+        existing_category = (
+            str(record.workspace_category)
+            if record.workspace_category is not None
+            else None
+        )
+        if existing_category not in (None, "input"):
+            return False
+        snapshot = snapshot_uploaded_file_version(record)
+        updated = (
+            db.query(UploadedFile)
+            .filter(*_uploaded_file_version_match_predicates(snapshot))
+            .update(
+                {
+                    UploadedFile.workspace_relative_path: relative_path,
+                    UploadedFile.workspace_category: category,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            raise RuntimeError("Durable task input metadata changed concurrently")
+        db.commit()
+        return True
+
+
+def _try_persist_durable_input_workspace_binding(
+    workspace: Any,
+    registration: Any,
+    *,
+    file_id: str,
+) -> None:
+    """Best-effort cold-start optimization after the in-memory bind succeeds."""
+
+    try:
+        _persist_durable_input_workspace_binding(
+            workspace,
+            registration,
+            file_id=file_id,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to persist durable workspace input binding: file_id=%s path=%s",
+            file_id,
+            getattr(registration, "relative_path", None),
+            exc_info=True,
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _existing_input_path(
+    candidate: Path,
+    *,
+    input_dir: Path,
+    source_path: Path,
+    file_info: Dict[str, Any],
+) -> Path | None:
+    """Return a reusable input only when it still contains the durable bytes."""
+
+    try:
+        candidate_stat = candidate.lstat()
+        if (
+            candidate.parent.resolve() != input_dir.resolve()
+            or not stat.S_ISREG(candidate_stat.st_mode)
+            or candidate.is_symlink()
+        ):
+            return None
+        raw_expected_size = file_info.get("size")
+        expected_size = (
+            int(raw_expected_size)
+            if raw_expected_size is not None
+            else source_path.stat().st_size
+        )
+        if candidate_stat.st_size != expected_size:
+            return None
+        expected_checksum = str(file_info.get("checksum") or "").removeprefix("sha256:")
+        candidate_checksum = _sha256_file(candidate)
+        if len(expected_checksum) == 64:
+            return (
+                candidate if candidate_checksum == expected_checksum.lower() else None
+            )
+        return candidate if candidate_checksum == _sha256_file(source_path) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _register_uploaded_files_for_agent(
+    agent_service: Any,
+    file_info_list: List[Dict[str, Any]],
+) -> None:
+    """Bind already-durable inputs to the workspace without another upload."""
+
+    prepared = _prepare_workspace_inputs_for_agent(agent_service)
+    if prepared is None:
+        return
+    workspace, input_dir, copy_mode = prepared
+
+    for file_info in file_info_list:
+        file_id = str(file_info.get("file_id") or "")
+        source_path = Path(str(file_info.get("path") or ""))
+        if not file_id:
+            logger.warning(
+                "Skipping unavailable uploaded file for workspace: %s", file_info
+            )
+            continue
+
+        candidate: Path | None = None
+        reused_candidate = False
+        restored_candidate = False
+        resolve_file_id = getattr(workspace, "resolve_file_id", None)
+        if callable(resolve_file_id):
+            try:
+                previously_bound = resolve_file_id(file_id)
+                if isinstance(previously_bound, (str, os.PathLike)):
+                    candidate = _existing_input_path(
+                        Path(previously_bound),
+                        input_dir=input_dir,
+                        source_path=source_path,
+                        file_info=file_info,
+                    )
+                    if candidate is not None:
+                        reused_candidate = True
+            except (OSError, ValueError):
+                # A stale or backend-specific binding must not make an
+                # otherwise valid durable upload unavailable. Fall back to
+                # collision-safe materialization below.
+                candidate = None
+
+        normalized_file_name = normalize_filename(
+            Path(str(file_info.get("name") or source_path.name)).name
+        )
+        persisted_relative_path = str(
+            file_info.get("workspace_relative_path") or ""
+        ).strip()
+        persisted_category = str(file_info.get("workspace_category") or "").strip()
+        if (
+            candidate is None
+            and persisted_category == "input"
+            and persisted_relative_path
+        ):
+            relative_candidate = Path(persisted_relative_path)
+            if (
+                not relative_candidate.is_absolute()
+                and ".." not in relative_candidate.parts
+                and relative_candidate.parts[:1] == ("input",)
+            ):
+                restored_path = input_dir.parent / relative_candidate
+                candidate = _existing_input_path(
+                    restored_path,
+                    input_dir=input_dir,
+                    source_path=source_path,
+                    file_info=file_info,
+                )
+                if candidate is not None:
+                    restored_candidate = True
+
+        if candidate is None:
+            candidate = input_dir / normalized_file_name
+            suffix_idx = 1
+            stem, ext = candidate.stem, candidate.suffix
+            while candidate.exists() or candidate.is_symlink():
+                try:
+                    if candidate.resolve() == source_path.resolve():
+                        break
+                except OSError:
+                    pass
+                candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                suffix_idx += 1
+
+        copied_candidate = False
+        if reused_candidate:
+            # Re-attempt the best-effort persistence so a transient database
+            # failure on the first turn does not cause a cold-start duplicate.
+            registration = workspace.describe_file_registration(str(candidate))
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=file_id,
+            )
+            # ``resolve_file_id`` returned this task workspace's existing
+            # binding. It is already registered and permission-prepared; a
+            # second bind would only reopen a sandbox-writable pathname and
+            # create an avoidable check/use race.
+            file_info["workspace_path"] = str(candidate)
+            logger.info(
+                "Reused agent workspace file binding: file_id=%s input_path=%s",
+                file_id,
+                candidate,
+            )
+            continue
+        if restored_candidate:
+            registration = workspace.describe_file_registration(str(candidate))
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=file_id,
+            )
+            file_info["workspace_path"] = str(candidate)
+            logger.info(
+                "Restored agent workspace file binding: file_id=%s input_path=%s",
+                file_id,
+                candidate,
+            )
+            continue
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            copied_candidate = True
+        except (OSError, ValueError):
+            if not source_path.exists():
+                logger.warning(
+                    "Skipping unavailable uploaded file for workspace: %s",
+                    file_info,
+                )
+                continue
+            raise
+
+        registration = workspace.describe_file_registration(str(candidate))
+        try:
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+        except BaseException:
+            if copied_candidate:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove unbound durable workspace input %s",
+                        candidate,
+                        exc_info=True,
+                    )
+            raise
+        _try_persist_durable_input_workspace_binding(
+            workspace,
+            registration,
+            file_id=file_id,
+        )
+        file_info["workspace_path"] = str(candidate)
+        file_info["workspace_relative_path"] = registration.relative_path
+        file_info["workspace_category"] = registration.category
+        logger.info(
+            "File registered for agent workspace: storage=%s input_path=%s",
+            source_path,
+            candidate,
+        )

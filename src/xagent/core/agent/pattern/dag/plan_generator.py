@@ -1,0 +1,977 @@
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from ...context.enrichment import (
+    latest_pending_user_response,
+    pending_user_responses,
+    top_level_user_request,
+)
+from ...language import (
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_PLAN,
+    detect_prose_script_mismatch,
+    detect_response_language_script_mismatch,
+    effective_output_language,
+    normalize_response_language_label,
+    plan_language_rules,
+    render_structured_request_language_policy,
+    request_context_output_language,
+    serialize_pending_user_response,
+)
+from ...result import normalize_tool_failure_code
+from ..base import (
+    RequiredToolCallError,
+    append_user_message_preserving_turns,
+    extract_required_tool_arguments,
+    truncate_prompt_preview,
+)
+
+logger = logging.getLogger(__name__)
+
+MAX_PLAN_TOOL_CALL_ATTEMPTS = 2
+PLAN_GENERATION_REQUIRED_TOOL_MESSAGE = (
+    "Plan generation failed because the model did not return the required "
+    "planning tool call. Please retry."
+)
+# Shared by the planner system prompt and every step-field schema description so
+# their coverage cannot drift apart. The sources named here must stay the same
+# ones grounding.step_intent_not_fact_rule lets decide at execution time.
+PRESUPPOSED_ANSWER_CLAUSE = (
+    "a fact, finding, conclusion, recommendation, or workaround that only "
+    "this step's own tool results or its dependency results can establish"
+)
+
+
+class PlanValidationError(ValueError):
+    """Raised when a DAG execution plan is structurally invalid."""
+
+
+class PlanToolArgumentsError(ValueError):
+    """Raised when the required plan tool call has unusable arguments."""
+
+    def __init__(self, message: str, *, arguments: str | None = None) -> None:
+        self.arguments = arguments
+        super().__init__(message)
+
+
+class PlanLanguageMismatchError(PlanValidationError):
+    """Raised when generated plan prose contradicts its language declaration."""
+
+    def __init__(self, message: str, *, response_language: str) -> None:
+        self.response_language = response_language
+        super().__init__(message)
+
+
+@dataclass
+class PlanStep:
+    """Serializable DAG step used by the execution runtime."""
+
+    id: str
+    task: str
+    dependencies: list[str] = field(default_factory=list)
+    description: str | None = None
+    termination_condition: str | None = None
+    completion_evidence: str | None = None
+    tool_names: list[str] = field(default_factory=list)
+    # One of: pending, running, completed, failed, interrupted,
+    # clarification_invalidated. clarification_invalidated marks a step
+    # whose question was superseded by another step's question in the
+    # same concurrent batch before it reached the user; the step is not
+    # terminal and becomes schedulable again once the batch settles.
+    # waiting_for_user is never a step status -- a step waiting on the
+    # user stays "running" here, and only the owning pattern's own
+    # status field moves to "waiting_for_user".
+    status: str = "pending"
+    result: Any = None
+    error: str | None = None
+    failure_code: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "task": self.task,
+            "dependencies": list(self.dependencies),
+            "description": self.description,
+            "termination_condition": self.termination_condition,
+            "completion_evidence": self.completion_evidence,
+            "tool_names": list(self.tool_names),
+            "status": self.status,
+            "result": self.result,
+            "error": self.error,
+            "failure_code": self.failure_code,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlanStep":
+        tool_names = normalize_tool_names(data)
+        return cls(
+            id=str(data["id"]),
+            task=str(data["task"]),
+            dependencies=list(data.get("dependencies", [])),
+            description=(
+                str(data["description"])
+                if data.get("description") is not None
+                else None
+            ),
+            termination_condition=(
+                str(data["termination_condition"])
+                if data.get("termination_condition") is not None
+                else None
+            ),
+            completion_evidence=normalize_completion_evidence(data),
+            tool_names=tool_names,
+            status=str(data.get("status", "pending")),
+            result=data.get("result"),
+            error=data.get("error"),
+            failure_code=normalize_tool_failure_code(data.get("failure_code")),
+        )
+
+
+@dataclass
+class ExecutionPlan:
+    """Minimal execution plan for DAGPattern."""
+
+    steps: list[PlanStep]
+
+    def validate(self) -> "ExecutionPlan":
+        if not self.steps:
+            raise PlanValidationError(
+                "DAG execution plan must contain at least one step."
+            )
+
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for step in self.steps:
+            if not step.id.strip():
+                raise PlanValidationError("DAG step id must not be empty.")
+            if not step.task.strip():
+                raise PlanValidationError(f"DAG step {step.id} task must not be empty.")
+            if step.id in seen:
+                duplicates.add(step.id)
+            seen.add(step.id)
+        if duplicates:
+            duplicate_list = ", ".join(sorted(duplicates))
+            raise PlanValidationError(f"DAG step ids must be unique: {duplicate_list}.")
+
+        for step in self.steps:
+            for dependency in step.dependencies:
+                if dependency not in seen:
+                    raise PlanValidationError(
+                        f"DAG step {step.id} depends on unknown step {dependency}."
+                    )
+
+        graph = {step.id: list(step.dependencies) for step in self.steps}
+        visited: set[str] = set()
+
+        for step in self.steps:
+            if step.id in visited:
+                continue
+            visiting: set[str] = set()
+            stack: list[tuple[str, bool]] = [(step.id, False)]
+            while stack:
+                step_id, expanded = stack.pop()
+                if expanded:
+                    visiting.discard(step_id)
+                    visited.add(step_id)
+                    continue
+                if step_id in visited:
+                    continue
+                if step_id in visiting:
+                    raise PlanValidationError(
+                        f"DAG execution plan contains a dependency cycle at {step_id}."
+                    )
+                visiting.add(step_id)
+                stack.append((step_id, True))
+                for dependency in reversed(graph[step_id]):
+                    stack.append((dependency, False))
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"steps": [step.to_dict() for step in self.steps]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExecutionPlan":
+        return cls(steps=[PlanStep.from_dict(item) for item in data.get("steps", [])])
+
+
+@dataclass
+class PlanGenerationRequest:
+    """Structured input for DAG plan generation and replan flows."""
+
+    context: Any
+    execution_id: str | None = None
+    replan: bool = False
+    completed_step_results: dict[str, Any] = field(default_factory=dict)
+    previous_plan: ExecutionPlan | None = None
+    available_tool_names: list[str] = field(default_factory=list)
+    completion_feedback: str | None = None
+    reply_driven: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "replan": self.replan,
+            "reply_driven": self.reply_driven,
+            "completed_step_results": dict(self.completed_step_results),
+            "previous_plan": (
+                self.previous_plan.to_dict() if self.previous_plan is not None else None
+            ),
+            "available_tool_names": list(self.available_tool_names),
+            "completion_feedback": self.completion_feedback,
+        }
+
+
+class PlanGenerator(ABC):
+    """Abstract plan generator used by DAGPattern."""
+
+    @abstractmethod
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        """Build an execution plan from the current root context."""
+
+
+class CallablePlanGenerator(PlanGenerator):
+    """Wraps a simple callable as a PlanGenerator."""
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self.fn = fn
+
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        payload = self.fn(request=request, llm=llm)
+        if inspect.isawaitable(payload):
+            payload = await payload
+        return coerce_execution_plan(payload)
+
+
+class LLMPlanGenerator(PlanGenerator):
+    """Minimal LLM-backed plan generator for the v2 DAG runtime."""
+
+    PLAN_TOOL_NAME = "generate_execution_plan"
+
+    async def generate_plan(
+        self,
+        *,
+        request: PlanGenerationRequest,
+        llm: Any,
+    ) -> ExecutionPlan:
+        plan_tools = [self._plan_tool_schema()]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a DAG execution plan by calling the "
+                    f"{self.PLAN_TOOL_NAME} tool exactly once. Each step requires "
+                    '"id", "task", "dependencies", "termination_condition", '
+                    '"completion_evidence", and "tool_names"; "description" is '
+                    "optional but strongly recommended. "
+                    "dependencies is required for every step; "
+                    "use an empty array only for true entry steps that do not "
+                    "need any prior output. If a step uses data, files, decisions, "
+                    "analysis, or artifacts produced by another step, it must "
+                    "depend on that producing step. For example, screenshot or "
+                    "render steps must depend on the step that creates the HTML "
+                    "or file they render, and final synthesis steps must depend "
+                    "on the research or build steps they summarize. When selected "
+                    "skill guidance requires preparation, reference acquisition, "
+                    "brief locking, inspection, or another shared prerequisite, "
+                    "represent that ordering explicitly: every downstream step "
+                    "that uses the shared input must depend on it. Do not run "
+                    "artifact generation in parallel with unresolved shared "
+                    "inputs. Parallelize only after the shared prerequisite is "
+                    "complete. Use task as "
+                    "the short node title, "
+                    "description for the concrete work to perform, and tool_names "
+                    "for the step's suggested execution tool scope. Use "
+                    "termination_condition for the exact stop rule that tells the "
+                    "step executor when this step is done and what kind of result "
+                    "it must report. "
+                    "The termination_condition must be concrete and action-specific; "
+                    "do not use vague wording such as 'when complete' or 'when the "
+                    "task is done'. Concrete means specific about the action to take "
+                    "and the shape of the result, never about the substance of "
+                    "information the step has not obtained yet: description and "
+                    "termination_condition are declarations of execution intent, so "
+                    "they must not state, assume, or pre-write "
+                    f"{PRESUPPOSED_ANSWER_CLAUSE}. Facts the user already supplied "
+                    "in their messages may be carried into a step as given. When a "
+                    "step's outcome depends on what it finds, write only the "
+                    "decision the executor must make, not the answer for each "
+                    "branch: say 'summarize whatever the lookup returns, and if it "
+                    "returns nothing, report that' instead of naming the fallback "
+                    "content yourself. If the information a step needs may be "
+                    "unavailable, or a prior step's result may not support this "
+                    "step's premise, state that reporting the gap as the agent's own "
+                    "instructions direct counts as that step completing normally; "
+                    "never supply a substitute answer to keep a step from looking "
+                    "empty. For artifact-producing steps, name an exact path "
+                    "only when the user requires that path or the tool accepts it as "
+                    "an argument; otherwise refer to the artifact returned by the "
+                    "tool. State that the step must call final_answer after the "
+                    "condition is satisfied. Put review, "
+                    "verification, rendering, optimization, and final synthesis in "
+                    "separate dependent steps unless this step explicitly owns that "
+                    "work. Use completion_evidence for a short natural-language "
+                    "proof that this specific step is done, usually naming the "
+                    "successful tool result fields to check. Do not use global "
+                    "effect labels or invented fixed filenames. For auto-named "
+                    "outputs, say that the tool returned a usable path. Keep "
+                    "completion_evidence under 160 characters. If a workflow needs "
+                    "several tool actions and only the last one proves completion, "
+                    "split those actions into dependent steps. Few-shot examples: "
+                    "auto-named output evidence: 'The generator returned success=true "
+                    "and a non-empty path or URL for the created asset.' explicit "
+                    "path evidence: 'The writer returned success=true for the "
+                    "requested output path.' non-file evidence: 'The tool returned "
+                    "the requested answer data successfully.' tool_names "
+                    "must only contain exact names from available_tool_names. "
+                    "Include the best matching available tools for every step "
+                    "that needs tool use. Leave tool_names empty only for pure "
+                    "reasoning, summarization, or formatting steps that can be "
+                    "completed from provided context and dependency results. Do "
+                    "not put skill names, artifact types, programming languages, "
+                    "or made-up tools in tool_names. tool_names are not hard "
+                    "limits, but they define the expected tool scope for the "
+                    "step executor; choose them carefully so the executor does "
+                    "not need to perform sibling or downstream step work. "
+                    "Set response_language to the natural language that "
+                    "user-facing prose should use for this request. If the "
+                    "user prompt includes an output_language_policy field, "
+                    "follow it exactly and make response_language match it. "
+                    "Emit response_language before steps in the tool arguments so "
+                    "it anchors every plan field generated after it. Determine it "
+                    "from latest_user_request and pending_response, not from "
+                    "the surrounding context. "
+                    "For Chinese requests, response_language must be Simplified "
+                    "Chinese or Traditional Chinese to match the request script; "
+                    "do not use generic Chinese. "
+                    "The messages array, selected skill context, retrieved "
+                    "memories, examples, URLs, and source content are "
+                    "supporting context only and must not change the plan "
+                    "language. "
+                    f"{plan_language_rules()} "
+                    "Keep ids stable across replans when a completed step can "
+                    "be reused. A replan response must be a complete, "
+                    "self-contained execution plan, not a delta: every "
+                    "dependency id must also appear in the returned steps. "
+                    "Include completed steps that new work depends on so their "
+                    "results can be reused. "
+                    # Gated on the same condition _build_prompt uses to emit the
+                    # field: with a null previous_plan the sentence has no referent.
+                    + (
+                        "The previous_plan field is the prior "
+                        "version's declared execution intent, not established fact: "
+                        "its task, description, termination_condition, and "
+                        "completion_evidence state what that plan meant to do, and a "
+                        "step in it was just judged incomplete. Reuse it for step "
+                        "ids, ordering, and continuity only; do not carry a "
+                        "conclusion, recommendation, or workaround stated in that "
+                        "text into the new plan or into the final answer unless "
+                        "completed_step_results supports it."
+                        if request.previous_plan is not None
+                        else ""
+                    )
+                    + (
+                        " pending_responses are the user's authoritative "
+                        "answers to questions steps asked, newest last: if "
+                        "any declines, cancels, or narrows the work, drop or "
+                        "modify the remaining steps and do not re-emit work "
+                        "an answer rejected."
+                        if request.reply_driven
+                        else ""
+                    )
+                ),
+            },
+            {"role": "user", "content": self._build_prompt(request)},
+        ]
+
+        def finalize(plan: ExecutionPlan) -> ExecutionPlan:
+            return self._filter_suggested_tools(
+                plan=plan,
+                available_tool_names=request.available_tool_names,
+            )
+
+        retry_feedback: str | None = None
+        # A plan that only triggered the soft language nudge stays usable, so a
+        # worse second attempt must not turn a working plan into a hard failure.
+        nudged_plan: ExecutionPlan | None = None
+        for attempt in range(MAX_PLAN_TOOL_CALL_ATTEMPTS):
+            attempt_messages = list(messages)
+            if retry_feedback:
+                attempt_messages = append_user_message_preserving_turns(
+                    attempt_messages,
+                    content=retry_feedback,
+                    section_title="Required tool retry feedback",
+                )
+            response = await llm.chat(
+                messages=attempt_messages,
+                tools=plan_tools,
+                tool_choice="required",
+                thinking={"type": "disabled", "enable": False},
+            )
+            try:
+                plan_arguments = self._extract_tool_arguments(
+                    response,
+                    self.PLAN_TOOL_NAME,
+                    attempts=attempt + 1,
+                )
+            except RequiredToolCallError:
+                if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
+                    raise
+                retry_feedback = self._required_tool_call_retry_feedback(
+                    self.PLAN_TOOL_NAME
+                )
+                logger.warning(
+                    "LLMPlanGenerator response omitted required %s tool call; "
+                    "retrying plan generation. execution_id=%s attempt=%s",
+                    self.PLAN_TOOL_NAME,
+                    request.execution_id,
+                    attempt + 1,
+                )
+                continue
+            except PlanToolArgumentsError as exc:
+                if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
+                    raise
+                retry_feedback = self._invalid_tool_arguments_retry_feedback(exc)
+                logger.warning(
+                    "LLMPlanGenerator response included invalid %s arguments; "
+                    "retrying plan generation. execution_id=%s error=%s",
+                    self.PLAN_TOOL_NAME,
+                    request.execution_id,
+                    exc,
+                )
+                continue
+            try:
+                plan = coerce_execution_plan(plan_arguments)
+                self._validate_plan_language(
+                    context=request.context,
+                    plan=plan,
+                    plan_arguments=plan_arguments,
+                )
+            except PlanValidationError as exc:
+                if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
+                    raise
+                retry_feedback = self._invalid_plan_retry_feedback(exc)
+                logger.warning(
+                    "LLMPlanGenerator response contained an invalid DAG plan; "
+                    "retrying plan generation. execution_id=%s error=%s",
+                    request.execution_id,
+                    exc,
+                )
+                continue
+            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS and not (
+                self._has_external_language_authority(request.context)
+            ):
+                reminder = self._request_language_reminder(request.context, plan)
+                if reminder is not None:
+                    retry_feedback = reminder
+                    nudged_plan = plan
+                    logger.info(
+                        "LLMPlanGenerator plan language may not match the request; "
+                        "asking the planner to re-check once. execution_id=%s",
+                        request.execution_id,
+                    )
+                    continue
+            return finalize(plan)
+        raise RuntimeError("LLMPlanGenerator retry loop exited unexpectedly.")
+
+    def _filter_suggested_tools(
+        self,
+        *,
+        plan: ExecutionPlan,
+        available_tool_names: list[str],
+    ) -> ExecutionPlan:
+        available = {name.strip() for name in available_tool_names if name.strip()}
+        if not available:
+            for step in plan.steps:
+                step.tool_names = []
+            return plan
+
+        for step in plan.steps:
+            original_tool_names = list(step.tool_names)
+            step.tool_names = [name for name in step.tool_names if name in available]
+            dropped = [
+                name for name in original_tool_names if name not in step.tool_names
+            ]
+            if dropped:
+                logger.info(
+                    "Dropped invalid DAG suggested tool names for step %s: %s. "
+                    "Available tools: %s",
+                    step.id,
+                    dropped,
+                    sorted(available),
+                )
+        return plan
+
+    def _plan_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.PLAN_TOOL_NAME,
+                "description": "Submit the DAG execution plan.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        # Keep response_language first. Tool arguments are emitted
+                        # autoregressively by supported models, so committing to the
+                        # language before generating plan prose gives every later
+                        # field a concrete anchor without another LLM call.
+                        "response_language": {
+                            "type": "string",
+                            "description": (
+                                "Emit this field before steps. Natural language to "
+                                "use for all plan text, user-facing prose, and "
+                                "persisted tool-argument prose produced by the plan, "
+                                "for example English, Simplified Chinese, Traditional "
+                                "Chinese, or Spanish. Determine it only from "
+                                "latest_user_request, pending_response, and "
+                                "output_language_policy. For Chinese requests, "
+                                "choose Simplified Chinese or Traditional Chinese to "
+                                "match the request script; do not use generic Chinese. "
+                                "If output_language_policy names a language, match it."
+                            ),
+                        },
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "task": {
+                                        "type": "string",
+                                        "description": (
+                                            "Short title naming the work this step "
+                                            "performs. It reaches the step executor "
+                                            "as instruction, so it must not state or "
+                                            f"pre-write {PRESUPPOSED_ANSWER_CLAUSE}."
+                                        ),
+                                    },
+                                    "dependencies": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "description": {
+                                        "type": "string",
+                                        "description": (
+                                            "Concrete step instructions shown in the "
+                                            "execution plan. Describe the action to "
+                                            "perform and the shape of the result, "
+                                            "not the substance of information this "
+                                            "step has not obtained yet. Do not state "
+                                            f"or pre-write {PRESUPPOSED_ANSWER_CLAUSE}"
+                                            "; facts the "
+                                            "user already supplied may be restated. "
+                                            "When the outcome depends on what the "
+                                            "step finds, write the decision to make, "
+                                            "not the answer for each branch."
+                                        ),
+                                    },
+                                    "termination_condition": {
+                                        "type": "string",
+                                        "description": (
+                                            "Concrete stop rule for this step. It must "
+                                            "state the exact condition that means this "
+                                            "step is finished and what kind of result "
+                                            "final_answer should report. Avoid vague "
+                                            "conditions such as 'when complete'. Do "
+                                            "not encode the answer: it must not "
+                                            "assert or presuppose "
+                                            f"{PRESUPPOSED_ANSWER_CLAUSE}. If the "
+                                            "needed information may be unavailable, "
+                                            "or a prior result may not support this "
+                                            "step's premise, treat reporting that gap "
+                                            "as the agent's instructions direct as "
+                                            "satisfying this condition."
+                                        ),
+                                    },
+                                    "tool_names": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": (
+                                            "Suggested execution tool scope for this "
+                                            "step. Each name must exactly match one of the "
+                                            "available_tool_names from the prompt. "
+                                            "Use an empty array only when the step can "
+                                            "be completed without tools."
+                                        ),
+                                    },
+                                    "completion_evidence": {
+                                        "type": "string",
+                                        "description": (
+                                            "Short natural-language proof that this "
+                                            "step is finished. Do not use global effect "
+                                            "labels. For tool steps, describe the "
+                                            "successful tool result fields that prove "
+                                            "completion; avoid invented fixed filenames "
+                                            "for auto-named outputs. It names what "
+                                            "proves completion, not what the step will "
+                                            "find, so it must not state or pre-write "
+                                            f"{PRESUPPOSED_ANSWER_CLAUSE}."
+                                        ),
+                                    },
+                                },
+                                "required": [
+                                    "id",
+                                    "task",
+                                    "dependencies",
+                                    "termination_condition",
+                                    "completion_evidence",
+                                    "tool_names",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["response_language", "steps"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _build_prompt(self, request: PlanGenerationRequest) -> str:
+        canonical_request = top_level_user_request(request.context)
+        pending_response = latest_pending_user_response(request.context)
+        # Scoped to reply-driven replans: the helper spans the whole root
+        # context, so any other call must keep the payload byte-identical.
+        all_pending_responses = (
+            pending_user_responses(request.context) if request.reply_driven else []
+        )
+        expected_language, language_source = self._language_authority(request.context)
+        latest_messages = [
+            {"role": message.role, "content": message.content}
+            for message in request.context.messages
+            if getattr(message, "role", None) in {"user", "assistant", "tool"}
+        ]
+        payload = {
+            "execution_id": request.execution_id,
+            "replan": request.replan,
+            # Quoted whole: the planner picks response_language from this field,
+            # and "messages" below already carries the full text anyway.
+            "latest_user_request": canonical_request.language_text,
+            "pending_response": (
+                serialize_pending_user_response(pending_response)
+                if pending_response is not None
+                else None
+            ),
+            "pending_responses": [
+                {
+                    "step_id": response.step_id,
+                    "question": response.question,
+                    "answer": response.answer,
+                }
+                for response in all_pending_responses
+            ],
+            "output_language_policy": render_structured_request_language_policy(
+                request_field="latest_user_request",
+                pending_field="pending_response",
+                output_language=(
+                    None
+                    if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
+                    else expected_language
+                ),
+            ),
+            "messages": latest_messages,
+            "retrieved_memory_context": request.context.metadata.get(
+                "retrieved_memory_context"
+            ),
+            "selected_skill": request.context.metadata.get("selected_skill"),
+            "selected_skill_context": request.context.metadata.get(
+                "selected_skill_context"
+            ),
+            "completed_step_results": request.completed_step_results,
+            "previous_plan": (
+                request.previous_plan.to_dict()
+                if request.previous_plan is not None
+                else None
+            ),
+            "available_tool_names": list(request.available_tool_names),
+            "completion_feedback": request.completion_feedback,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _language_authority(context: Any) -> tuple[str, str]:
+        """Return language value/source and migrate legacy direct-DAG metadata."""
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return "", ""
+        language = effective_output_language(context)
+        source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+        if (
+            language
+            and not source
+            and metadata.get("pattern") == "dag_plan_execute"
+            and language != request_context_output_language(metadata)
+        ):
+            source = OUTPUT_LANGUAGE_SOURCE_PLAN
+            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = source
+        return language, source
+
+    @staticmethod
+    def _has_external_language_authority(context: Any) -> bool:
+        """Whether an API caller pinned the output language via request_context."""
+        language, _ = LLMPlanGenerator._language_authority(context)
+        metadata = getattr(context, "metadata", None)
+        return bool(language) and language == request_context_output_language(metadata)
+
+    @staticmethod
+    def _step_prose(step: PlanStep) -> str:
+        return "\n".join(
+            value
+            for value in (
+                step.task,
+                step.description or "",
+                step.termination_condition or "",
+                step.completion_evidence or "",
+            )
+            if value
+        )
+
+    @staticmethod
+    def _validate_plan_language(
+        *,
+        context: Any,
+        plan: ExecutionPlan,
+        plan_arguments: dict[str, Any],
+    ) -> None:
+        response_language = normalize_response_language_label(
+            str(plan_arguments.get("response_language") or "")
+        )
+        if not response_language:
+            raise PlanLanguageMismatchError(
+                "response_language must be a supported, non-empty language label.",
+                response_language="",
+            )
+
+        expected_language, language_source = LLMPlanGenerator._language_authority(
+            context
+        )
+        if (
+            expected_language
+            and language_source != OUTPUT_LANGUAGE_SOURCE_PLAN
+            and response_language != expected_language
+        ):
+            raise PlanLanguageMismatchError(
+                f"response_language is {response_language}, but the current output "
+                f"language policy requires {expected_language}.",
+                response_language=expected_language,
+            )
+
+        for step in plan.steps:
+            mismatch = detect_response_language_script_mismatch(
+                response_language, LLMPlanGenerator._step_prose(step)
+            )
+            if mismatch is not None:
+                raise PlanLanguageMismatchError(
+                    f"response_language is {response_language}, but plan step "
+                    f"{step.id!r} has predominantly {mismatch.observed_script}-script "
+                    f"user-facing text ({mismatch.han_count} Han characters versus "
+                    f"{mismatch.latin_count} Latin letters).",
+                    response_language=response_language,
+                )
+
+    @staticmethod
+    def _request_language_reminder(context: Any, plan: ExecutionPlan) -> str | None:
+        """Return one retry nudge when plan prose looks off-script for the request.
+
+        Script comparison cannot tell a biased plan from a request that legitimately
+        asks for another language, so it may only nudge once, never reject a plan.
+        """
+        request = top_level_user_request(context).language_text
+        for step in plan.steps:
+            mismatch = detect_prose_script_mismatch(
+                request, LLMPlanGenerator._step_prose(step)
+            )
+            if mismatch is None:
+                continue
+            return (
+                f"Plan step {step.id!r} is written in predominantly "
+                f"{mismatch.observed_script} script, which does not match the "
+                "script of the latest user request. Re-read latest_user_request "
+                "and pending_response "
+                "above and decide the output language from that request alone, "
+                "including any language change it asks for explicitly or "
+                f"implicitly. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "
+                "once. If that language is still correct for this request, keep it "
+                "and return the same plan language."
+            )
+        return None
+
+    def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
+        return (
+            f"The previous response did not call the required {tool_name} tool. "
+            f"Call {tool_name} exactly once with a complete executable plan. "
+            "Do not answer in natural language."
+        )
+
+    def _invalid_tool_arguments_retry_feedback(
+        self, error: PlanToolArgumentsError
+    ) -> str:
+        argument_preview = (
+            truncate_prompt_preview(error.arguments, limit=1200)
+            if error.arguments
+            else ""
+        )
+        return (
+            f"The previous {self.PLAN_TOOL_NAME} tool call could not be used "
+            f"because its arguments were invalid JSON: {error}. Call "
+            f"{self.PLAN_TOOL_NAME} again exactly once. The tool arguments must "
+            "be one complete valid JSON object matching the tool schema. Do not "
+            "truncate string values or split the JSON across multiple tool calls."
+            + (
+                f"\nInvalid arguments preview:\n```json\n{argument_preview}\n```"
+                if argument_preview
+                else ""
+            )
+        )
+
+    def _invalid_plan_retry_feedback(self, error: PlanValidationError) -> str:
+        if isinstance(error, PlanLanguageMismatchError):
+            language = error.response_language or "the supported target language"
+            return (
+                f"The previous {self.PLAN_TOOL_NAME} call returned plan prose that "
+                f"did not match its language declaration: {error} Call "
+                f"{self.PLAN_TOOL_NAME} again exactly once. Emit response_language "
+                f"first, set it to {language}, and write every step task, "
+                "description, termination_condition, and completion_evidence in "
+                f"{language}."
+            )
+        return (
+            f"The previous {self.PLAN_TOOL_NAME} call returned an invalid DAG "
+            f"plan: {error} Call {self.PLAN_TOOL_NAME} again exactly once with "
+            "a complete, self-contained plan. Every dependency id must be "
+            "present in the returned steps. On a replan, include any completed "
+            "steps that new work depends on and preserve their ids. Do not "
+            "return only the newly added steps."
+        )
+
+    def _extract_tool_arguments(
+        self,
+        response: Any,
+        tool_name: str,
+        *,
+        attempts: int = 1,
+    ) -> dict[str, Any]:
+        arguments = extract_required_tool_arguments(
+            response,
+            tool_name=tool_name,
+            owner="LLMPlanGenerator",
+            attempts=attempts,
+            user_message=PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
+        )
+        return self._coerce_arguments(arguments)
+
+    def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if not isinstance(arguments, str):
+            raise PlanToolArgumentsError(
+                "Tool call arguments must be an object or JSON string."
+            )
+        try:
+            payload = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise PlanToolArgumentsError(
+                "Tool call arguments must be valid JSON.",
+                arguments=arguments,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PlanToolArgumentsError(
+                "Tool call arguments must decode to an object.",
+                arguments=arguments,
+            )
+        return payload
+
+
+def normalize_tool_names(data: dict[str, Any]) -> list[str]:
+    raw_tools = data.get("tool_names")
+    if raw_tools is None and data.get("tool_name") is not None:
+        raw_tools = [data.get("tool_name")]
+    if raw_tools is None:
+        raw_tools = data.get("tools", [])
+    if isinstance(raw_tools, str):
+        raw_items: list[Any] = [raw_tools]
+    elif isinstance(raw_tools, list):
+        raw_items = raw_tools
+    else:
+        raw_items = []
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        name: str | None = None
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict):
+            if isinstance(item.get("function"), dict):
+                name = item["function"].get("name")
+            else:
+                value = item.get("name") or item.get("tool_name")
+                name = str(value) if value is not None else None
+        if name is None:
+            continue
+        stripped = name.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            names.append(stripped)
+    return names
+
+
+def normalize_completion_evidence(data: dict[str, Any]) -> str | None:
+    raw_evidence = data.get("completion_evidence")
+    if raw_evidence is not None:
+        evidence = str(raw_evidence).strip()
+        return evidence or None
+
+    legacy_effects = data.get("expected_effects")
+    if isinstance(legacy_effects, str):
+        evidence = legacy_effects.strip()
+        return evidence or None
+    if isinstance(legacy_effects, list):
+        parts = [item.strip() for item in legacy_effects if isinstance(item, str)]
+        evidence = "; ".join(part for part in parts if part)
+        return evidence or None
+    return None
+
+
+def coerce_execution_plan(payload: Any) -> ExecutionPlan:
+    """Normalize common plan payloads into ExecutionPlan."""
+    if isinstance(payload, ExecutionPlan):
+        return payload.validate()
+    if isinstance(payload, dict):
+        if "steps" in payload:
+            return ExecutionPlan.from_dict(payload).validate()
+        if {"id", "task"} <= set(payload):
+            return ExecutionPlan(steps=[PlanStep.from_dict(payload)]).validate()
+    if isinstance(payload, list):
+        return ExecutionPlan(
+            steps=[
+                item
+                if isinstance(item, PlanStep)
+                else PlanStep.from_dict(item)
+                if isinstance(item, dict)
+                else PlanStep(id=f"step_{index}", task=str(item))
+                for index, item in enumerate(payload)
+            ]
+        ).validate()
+    raise TypeError(f"Unsupported plan payload: {type(payload).__name__}")

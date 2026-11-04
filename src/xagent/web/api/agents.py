@@ -1,0 +1,2077 @@
+"""Agent Builder API endpoints for creating and managing custom AI agents."""
+
+import logging
+import secrets
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional, cast
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import String
+from sqlalchemy import cast as sql_cast
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
+from ...core.agent.language import (
+    detect_prose_script_mismatch,
+    render_structured_request_language_policy,
+)
+from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
+from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.tools.core.document_search import find_missing_knowledge_bases
+from ...core.tracing import create_agent_tracer
+from ..auth_dependencies import get_current_user, is_admin_user
+from ..models.agent import Agent, AgentOrigin, AgentStatus
+from ..models.chat_message import TaskChatMessage
+from ..models.database import get_db, release_db_connection_if_clean
+from ..models.model import Model as DBModel
+from ..models.task import Task
+from ..models.user import User
+from ..schemas.agent import PromptContextFieldDeclaration, PromptContextFieldList
+from ..schemas.agent_api_key import (
+    APIKeyGenerateResponse,
+    APIKeyMetadataResponse,
+    APIKeyRevokeResponse,
+)
+from ..schemas.widget import WidgetAllowedDomain
+from ..services import agent_prompt as agent_prompt_service
+from ..services.agent_access import (
+    AccessibleAgent,
+    accessible_agent_permissions,
+    list_accessible_agents,
+    query_accessible_agents,
+)
+from ..services.agent_management import (
+    AgentManagementRuntime,
+    AgentManagementService,
+    AgentWorkforceConflictError,
+    DuplicateAgentNameError,
+    TemplateNotFoundError,
+    TemplateQuickAccessRaceError,
+    WorkforceTemplateNotSupportedError,
+    is_agent_name_unique_violation,
+)
+from ..services.agent_store import (
+    AgentStore,
+    UnsharedConnectorsError,
+    UnsharedKnowledgeBasesError,
+    new_widget_key,
+)
+from ..services.agent_team_scope import (
+    get_agent_team_scope,
+    owned_agent_clause,
+    owns_agent,
+)
+from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.execution_budget import budget_policy_provider
+from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
+from ..services.workforce_access import get_visible_agent_ids
+from ..tools.config import WebToolConfig
+from ..user_isolated_memory import UserContext
+from .auth import VALID_USER_VOICES
+from .templates import get_or_create_template_stats, increment_template_used_count
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+
+# ===== Pydantic Models =====
+
+
+class AgentCreateRequest(BaseModel):
+    """Request model for creating a new agent."""
+
+    name: str = Field(..., min_length=1, max_length=200, description="Agent name")
+    description: Optional[str] = Field(None, description="Agent description")
+    instructions: Optional[str] = Field(None, description="System instructions/prompt")
+    execution_mode: Optional[str] = Field(
+        "balanced", description="Execution mode: flash, balanced, think, or auto"
+    )
+    models: Optional[dict] = Field(
+        None, description="Model config: {general, small_fast, visual, compact}"
+    )
+    knowledge_bases: List[str] = Field(
+        default_factory=list, description="Knowledge base names"
+    )
+    skills: List[str] = Field(default_factory=list, description="Skill names")
+    tool_categories: List[str] = Field(
+        default_factory=list, description="Tool category names"
+    )
+    suggested_prompts: List[str] = Field(
+        default_factory=list, description="Suggested prompt examples for users"
+    )
+    prompt_context_fields: PromptContextFieldList = Field(
+        default_factory=list,
+        description=(
+            "Fields unsigned callers (the widget entry and personal keys) "
+            "may pass to prompt context"
+        ),
+    )
+    logo_base64: Optional[str] = Field(
+        None, description="Logo image as base64 data URL"
+    )
+    visibility: Optional[Literal["team", "admins"]] = None
+
+
+class AgentUpdateRequest(BaseModel):
+    """Request model for updating an agent."""
+
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    execution_mode: Optional[str] = Field(
+        None, description="Execution mode: flash, balanced, think, or auto"
+    )
+    models: Optional[dict] = None
+    knowledge_bases: Optional[List[str]] = None
+    skills: Optional[List[str]] = None
+    tool_categories: Optional[List[str]] = None
+    suggested_prompts: Optional[List[str]] = Field(
+        None, description="Suggested prompt examples for users"
+    )
+    prompt_context_fields: Optional[PromptContextFieldList] = Field(
+        None, description="None leaves the current declarations unchanged"
+    )
+    logo_base64: Optional[str] = None
+    widget_enabled: Optional[bool] = None
+    allowed_domains: Optional[List[WidgetAllowedDomain]] = None
+    visibility: Optional[Literal["team", "admins"]] = Field(
+        None, description="Team visibility: 'team' or 'admins' (team admins only)"
+    )
+
+
+class AgentResponse(BaseModel):
+    """Response model for agent data."""
+
+    id: int
+    user_id: int
+    team_id: Optional[int] = None
+    name: str
+    description: Optional[str]
+    instructions: Optional[str]
+    template_id: Optional[str] = None
+    execution_mode: str
+    models: Optional[dict]
+    knowledge_bases: List[str]
+    skills: List[str]
+    tool_categories: List[str]
+    suggested_prompts: List[str]
+    prompt_context_fields: List[PromptContextFieldDeclaration]
+    logo_url: Optional[str]
+    status: str
+    visibility: str
+    published_at: Optional[str]
+    created_at: str
+    updated_at: str
+    widget_enabled: bool
+    allowed_domains: List[str]
+    share_enabled: bool
+    share_updated_at: Optional[str]
+    # False when an admin is viewing another user's agent read-only (#783 follow-up):
+    # writes stay owner-only, so the builder disables editing instead of letting a
+    # save fail with "Agent not found".
+    readonly: bool = False
+    can_edit: bool = True
+
+
+class AgentListItem(BaseModel):
+    """Simplified agent model for list views."""
+
+    id: int
+    team_id: Optional[int] = None
+    name: str
+    description: Optional[str]
+    template_id: Optional[str] = None
+    logo_url: Optional[str]
+    suggested_prompts: List[str] = []
+    status: str
+    visibility: str = "team"
+    created_at: str
+    updated_at: str
+    widget_enabled: bool
+    allowed_domains: List[str]
+    share_enabled: bool
+    share_updated_at: Optional[str]
+    access: str = "owner"
+    readonly: bool = False
+    can_edit: bool = True
+    can_publish: bool = True
+    can_delete: bool = True
+
+
+class AgentListStatusCounts(BaseModel):
+    """Status totals for the active search and ownership scope."""
+
+    all: int
+    enabled: int
+    drafts: int
+
+
+class AgentListPage(BaseModel):
+    """Database-paginated response used by the Agent management page."""
+
+    items: List[AgentListItem]
+    page: int
+    size: int
+    total: int
+    pages: int
+    visible_total: int
+    status_counts: AgentListStatusCounts
+    ownership: Literal["all", "mine", "others"]
+    can_view_others: bool
+
+
+class AgentShareLinkResponse(BaseModel):
+    """Owner-only share link state, including the raw token."""
+
+    agent_id: int
+    share_enabled: bool
+    share_token: Optional[str]
+    share_updated_at: Optional[str]
+
+
+def _workforce_template_not_supported_response() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail="This template creates a workforce, not a single agent; "
+        "use it from the Templates page instead",
+    )
+
+
+def _unshared_error_response(
+    error: UnsharedConnectorsError | UnsharedKnowledgeBasesError,
+) -> HTTPException:
+    if isinstance(error, UnsharedConnectorsError):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "message": "Agent uses connectors not shared with or resolvable by the team",
+                "unshared_connectors": error.connectors,
+            },
+        )
+    return HTTPException(
+        status_code=422,
+        detail={
+            "message": "Agent uses knowledge bases not shared with the team",
+            "unshared_knowledge_bases": error.knowledge_bases,
+        },
+    )
+
+
+class AgentWidgetKeyResponse(BaseModel):
+    """Owner-only widget embed credential state, including the raw key."""
+
+    agent_id: int
+    widget_enabled: bool
+    widget_key: str
+
+
+class PublishResponse(BaseModel):
+    """Response model for publish/unpublish operations."""
+
+    message: str
+    agent: AgentResponse
+
+
+class OptimizeInstructionsRequest(BaseModel):
+    """Request model for optimizing agent instructions."""
+
+    instructions: str = Field(..., description="Draft instructions to optimize")
+    model_id: Optional[int] = Field(
+        None, description="Model ID to use for optimization"
+    )
+
+
+KNOWLEDGE_TOOL_CATEGORY = "knowledge"
+
+KB_PRIORITY_PROMPT = (
+    "\n\n[Knowledge Base Instructions]\n"
+    "You have access to the following knowledge base(s). "
+    "When answering user questions, you MUST first search the knowledge base(s) "
+    "using the available knowledge tools before relying on your own knowledge. "
+    "Always prioritize information retrieved from the knowledge base(s) over "
+    "your built-in knowledge. If the knowledge base does not contain relevant "
+    "information, you may then use your own knowledge to answer, but clearly "
+    "indicate that the answer is not from the knowledge base."
+)
+
+
+def _ensure_shareable_agent(agent: Agent | None) -> Agent:
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status.value != "published":
+        raise HTTPException(
+            status_code=400, detail="Only published agents can be shared"
+        )
+    return agent
+
+
+def _new_share_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _serialize_share_link_response(agent: Agent) -> AgentShareLinkResponse:
+    return AgentShareLinkResponse(
+        agent_id=int(agent.id),
+        share_enabled=bool(agent.share_enabled),
+        share_token=agent.share_token,
+        share_updated_at=agent.share_updated_at.isoformat()
+        if agent.share_updated_at
+        else None,
+    )
+
+
+# Re-exported from core.agent.voice_policy (not defined here) so a
+# delegated AgentTool child - built in core/tools/adapters/vibe/agent_tool.py,
+# which cannot import a web route module - applies the exact same policy.
+# See VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py for the
+# schema-level source of truth this module-level check guards.
+_VOICE_INSTRUCTIONS = _core_voice_instructions
+if set(_VOICE_INSTRUCTIONS) != VALID_USER_VOICES:
+    # A plain assert would be stripped under `python -O`, silently losing
+    # this consistency guarantee in production rather than failing loudly.
+    raise ValueError(
+        "core.agent.voice_policy._VOICE_INSTRUCTIONS must define exactly the "
+        "voices UpdatePreferencesRequest accepts (api/auth.py's "
+        "VALID_USER_VOICES) - otherwise a valid, storable voice preference "
+        "could silently have no prompt effect."
+    )
+
+
+# ===== Helper Functions =====
+
+
+def _validate_knowledge_base_tools(
+    knowledge_bases: List[str], tool_categories: List[str]
+) -> None:
+    """Raise HTTPException if knowledge bases are selected without the knowledge tool category."""
+    if knowledge_bases and KNOWLEDGE_TOOL_CATEGORY not in tool_categories:
+        raise HTTPException(
+            status_code=400,
+            detail="Knowledge bases are selected but the Knowledge tool category is not enabled. Please enable the Knowledge tools before saving.",
+        )
+
+
+async def _validate_knowledge_bases_exist(
+    knowledge_bases: List[str], current_user: User
+) -> None:
+    """Raise HTTPException if any selected knowledge base is not visible to the user."""
+    missing = await find_missing_knowledge_bases(
+        knowledge_bases,
+        user_id=int(current_user.id),
+        is_admin=bool(current_user.is_admin),
+    )
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Knowledge base(s) not found or not visible to this user: "
+                + ", ".join(missing)
+            ),
+        )
+
+
+def _serialize_agent_list_item(
+    store: AgentStore,
+    accessible_agent: AccessibleAgent,
+) -> dict[str, Any]:
+    item = store.agent_to_list_item_dict(accessible_agent.agent)
+    item.update(accessible_agent_permissions(accessible_agent))
+    return item
+
+
+def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
+    """Save logo image and return URL."""
+    if not base64_data:
+        return None
+
+    try:
+        import base64
+
+        # Parse data URL
+        if not base64_data.startswith("data:image"):
+            logger.warning(f"Invalid image data URL for agent {agent_id}")
+            return None
+
+        # Extract the base64 part
+        header, encoded = base64_data.split(",", 1)
+        image_data = base64.b64decode(encoded)
+
+        # Determine file extension from data URL
+        if "png" in header:
+            ext = "png"
+        elif "jpeg" in header or "jpg" in header:
+            ext = "jpg"
+        elif "webp" in header:
+            ext = "webp"
+        else:
+            ext = "png"
+
+        # Create uploads directory if needed
+        upload_dir = get_uploads_dir() / "agent_logos"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save file. The filename includes a unique suffix (rather than just
+        # the agent id) so replacing a logo yields a new URL - browsers cache
+        # images by URL, and a deterministic name kept serving the stale
+        # cached image after a re-upload even though the file on disk had
+        # changed.
+        filename = f"agent_{agent_id}_{uuid.uuid4().hex[:8]}.{ext}"
+        filepath = upload_dir / filename
+        with open(filepath, "wb") as f:
+            f.write(image_data)
+
+        # Return URL
+        return f"/uploads/agent_logos/{filename}"
+
+    except Exception as e:
+        logger.error(f"Failed to save logo for agent {agent_id}: {e}")
+        return None
+
+
+def _delete_logo(logo_url: str) -> None:
+    """Delete logo file."""
+    try:
+        if not logo_url or not logo_url.startswith("/uploads/"):
+            return
+        # logo_url is a URL path (e.g. "/uploads/agent_logos/agent_1_ab12cd34.png"),
+        # not a filesystem path - resolve it against the configured uploads
+        # root rather than the process's CWD, which get_uploads_dir() may not match.
+        uploads_dir = get_uploads_dir().resolve()
+        try:
+            filepath = (uploads_dir / logo_url[len("/uploads/") :]).resolve()
+            filepath.relative_to(uploads_dir)
+        except ValueError:
+            # Path escapes the uploads directory (e.g. via "..") - refuse rather
+            # than delete an arbitrary file outside the intended root.
+            logger.warning(f"Refused to delete logo outside uploads dir: {logo_url}")
+            return
+        if filepath.is_file():
+            filepath.unlink()
+    except Exception as e:
+        logger.error(f"Failed to delete logo {logo_url}: {e}")
+
+
+def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> Agent:
+    """Resolve an agent_id against the caller's ownership, raising 404 otherwise.
+
+    Why 404 instead of 403 when ownership doesn't match:
+        Returning 403 ("forbidden") would leak that an agent with this id
+        exists, just owned by somebody else. The /v1/* surface design (and
+        general best practice for multi-tenant resources) is to fold
+        "missing" and "not yours" into the same 404 response so callers
+        cannot enumerate other users' agent ids.
+
+    Args:
+        agent_id: Path parameter from the route.
+        current_user: Authenticated user from ``Depends(get_current_user)``.
+        db: SQLAlchemy session.
+
+    Returns:
+        The :class:`Agent` row, guaranteed to belong to ``current_user``.
+
+    Raises:
+        HTTPException 404: agent does not exist, or exists but belongs to
+            another user.
+    """
+    agent = (
+        db.query(Agent)
+        .filter(
+            Agent.id == agent_id,
+            owned_agent_clause(
+                int(current_user.id), get_agent_team_scope(db, int(current_user.id))
+            ),
+            Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
+        .first()
+    )
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+# ===== Endpoints =====
+
+
+@router.post("/optimize-instructions")
+async def optimize_instructions(
+    request: OptimizeInstructionsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, str]:
+    """Optimize agent instructions using an LLM."""
+    try:
+        # Get model storage
+        model_storage = UserAwareModelStorage(db)
+        user_id = int(current_user.id)
+
+        # Get LLM (use provided model_id or default)
+        llm = None
+        if request.model_id:
+            llm = model_storage.get_llm_by_id(str(request.model_id), user_id)
+
+        if not llm:
+            # Get default LLM
+            default_llm, _, _, _ = model_storage.get_configured_defaults(user_id)
+            llm = default_llm
+
+        if not llm:
+            # Fallback to system default if user has no default
+            default_llm, _, _, _ = model_storage.get_configured_defaults(None)
+            llm = default_llm
+
+        if not llm:
+            raise HTTPException(
+                status_code=400, detail="No LLM available for optimization"
+            )
+
+        # Construct prompt
+        system_prompt = (
+            "You are an expert agent builder and prompt engineer. "
+            "Your task is to refine and optimize the user's draft instructions for an AI agent. "
+            "The output should be clear, structured, and effective for an LLM to follow. "
+            "Do not include any conversational filler. Just output the optimized instructions. "
+            "Use draft_instructions as the independent user request. "
+            "The surrounding API prompt is written in English only as an execution "
+            "environment; it is not language evidence for the optimized instructions. "
+            f"{render_structured_request_language_policy(request_field='draft_instructions', pending_field='pending_response', output_language=None)}"
+        )
+
+        user_prompt = f"draft_instructions:\n{request.instructions}"
+
+        # Call LLM
+        response = await llm.chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+
+        if isinstance(response, dict) and "content" in response:
+            content = str(response["content"])
+        else:
+            content = response if isinstance(response, str) else str(response)
+
+        mismatch = detect_prose_script_mismatch(request.instructions, content)
+        if mismatch is not None:
+            logger.warning(
+                "Instruction optimization returned %s-script prose for a "
+                "%s-script draft; returning the original draft",
+                mismatch.observed_script,
+                mismatch.expected_script,
+            )
+            content = request.instructions
+
+        return {"optimized_instructions": content}
+
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
+    except Exception as e:
+        logger.error(f"Failed to optimize instructions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentFromTemplateRequest(BaseModel):
+    template_id: str
+    name: Optional[str] = None
+
+
+class ResolvedTemplateAgentResponse(BaseModel):
+    """Result of the get-or-create resolve flow for a template's agent."""
+
+    agent: AgentResponse
+    # True when this call minted (and published) a fresh agent; False when an
+    # existing agent for this template was reused.
+    created: bool
+
+
+@router.post("/from-template/resolve", response_model=ResolvedTemplateAgentResponse)
+async def resolve_agent_from_template(
+    data: AgentFromTemplateRequest,
+    fastapi_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ResolvedTemplateAgentResponse:
+    """Get-or-create the caller's quick-access agent for a template,
+    atomically.
+
+    Reuses the caller's own existing quick-access agent for this template
+    as-is (never silently republishing a draft - see the note on
+    ``_resolve_agent_from_template_sync``), or creates and publishes a new
+    one, disambiguating the name server-side on collision. Idempotent per
+    (user, template) for this flow specifically: unlike the plain
+    POST /from-template (used by the workforce-builder UI to mint several
+    named instances of one template), repeat calls here return the same
+    agent, backed by a DB-level unique index scoped to this flow's own
+    origin marker.
+
+    ``name`` only seeds a freshly created agent; on reuse it is ignored and
+    the existing agent's own name is returned as-is (see
+    ``AgentManagementService.resolve_agent_from_template``).
+    """
+    user_id = int(current_user.id)
+    is_admin = bool(current_user.is_admin)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creation requires a clean request database transaction",
+        )
+
+    template_manager = getattr(fastapi_request.app.state, "template_manager", None)
+    try:
+        snapshot, created = await AgentManagementRuntime(
+            template_manager=template_manager
+        ).resolve_agent_from_template(
+            user_id=user_id,
+            is_admin=is_admin,
+            template_id=data.template_id,
+            name=data.name,
+        )
+        if created:
+            # This endpoint is the entry point for two frontend flows that
+            # never touch /use or /use-as-workforce, the two endpoints that
+            # otherwise record usage: the marketplace Hire flow AND the
+            # task page's quick-access template picker
+            # (frontend/src/app/task/page.tsx, resolveAgentForTemplate).
+            # Both genuinely put the template into use, so counting either
+            # here is correct - without this, used_count would stay
+            # permanently stale for any template only ever adopted through
+            # one of these paths, which matters because the featured
+            # section's hero ranking (templates/page.tsx) sorts by exactly
+            # that count. An analytics-counter failure must not fail an
+            # already-successful agent creation, so it's caught and logged
+            # the same way use_template_as_workforce's counter update is.
+            try:
+                get_or_create_template_stats(db, data.template_id)
+                increment_template_used_count(db, data.template_id)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Failed to record used_count for template_id=%s after "
+                    "successfully resolving a fresh agent for user_id=%s",
+                    data.template_id,
+                    user_id,
+                )
+        return ResolvedTemplateAgentResponse(
+            agent=AgentResponse.model_validate(snapshot.to_response_dict()),
+            created=created,
+        )
+    except TemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except WorkforceTemplateNotSupportedError:
+        raise _workforce_template_not_supported_response()
+    except DuplicateAgentNameError:
+        raise HTTPException(
+            status_code=400, detail="Agent with this name already exists"
+        )
+    except TemplateQuickAccessRaceError:
+        # Distinct from the name-collision case above: every one of
+        # TEMPLATE_RESOLVE_RACE_RETRIES concurrent attempts lost the
+        # (user_id, template_id) quick-access race to another request, with
+        # no name collision involved at all - "already exists" would be
+        # misleading here since the client never even chose a name.
+        raise HTTPException(
+            status_code=409,
+            detail="Too many concurrent requests for this template; please retry",
+        )
+    except Exception as e:
+        logger.exception(f"Failed to resolve agent from template {data.template_id}")
+        raise HTTPException(
+            status_code=500, detail="Failed to resolve agent from template"
+        ) from e
+
+
+@router.post("/from-template", response_model=AgentResponse)
+async def create_agent_from_template(
+    data: AgentFromTemplateRequest,
+    fastapi_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Create an agent from a template (session-auth wrapper for /v1/agents/from-template)."""
+    user_id = int(current_user.id)
+    is_admin = bool(current_user.is_admin)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creation requires a clean request database transaction",
+        )
+
+    template_manager = getattr(fastapi_request.app.state, "template_manager", None)
+    try:
+        result = await AgentManagementRuntime(
+            template_manager=template_manager
+        ).create_agent_from_template(
+            user_id=user_id,
+            is_admin=is_admin,
+            template_id=data.template_id,
+            name=data.name,
+            description=None,
+            instructions=None,
+            execution_mode=None,
+            models=None,
+            knowledge_bases=None,
+            skills=None,
+            tool_categories=None,
+            suggested_prompts=None,
+            generate_runtime_key=False,
+        )
+        return AgentResponse.model_validate(result.agent.to_response_dict())
+    except TemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except WorkforceTemplateNotSupportedError:
+        raise _workforce_template_not_supported_response()
+    except DuplicateAgentNameError:
+        raise HTTPException(
+            status_code=400, detail="Agent with this name already exists"
+        )
+    except Exception as e:
+        logger.error(f"Failed to create agent from template: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("", response_model=AgentResponse)
+async def create_agent(
+    agent_data: AgentCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Create a new custom agent."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        # Check for duplicate name
+        if store.agent_name_exists(user_id, agent_data.name):
+            raise HTTPException(
+                status_code=400, detail="Agent with this name already exists"
+            )
+
+        _validate_knowledge_base_tools(
+            agent_data.knowledge_bases, agent_data.tool_categories
+        )
+        await _validate_knowledge_bases_exist(agent_data.knowledge_bases, current_user)
+
+        # agent_name_exists above is a fast-path pre-check, not the source of
+        # truth: uq_agents_user_id_name_active is what actually prevents a
+        # concurrent-request race, so the insert itself can still raise
+        # IntegrityError here.
+        try:
+            agent = store.create_agent(
+                user_id=user_id,
+                name=agent_data.name,
+                description=agent_data.description,
+                instructions=agent_data.instructions,
+                execution_mode=agent_data.execution_mode or "graph",
+                models=agent_data.models,
+                knowledge_bases=agent_data.knowledge_bases,
+                skills=agent_data.skills,
+                tool_categories=agent_data.tool_categories,
+                suggested_prompts=agent_data.suggested_prompts,
+                prompt_context_fields=[
+                    declaration.model_dump()
+                    for declaration in agent_data.prompt_context_fields
+                ],
+                visibility=agent_data.visibility,
+            )
+        except IntegrityError as exc:
+            db.rollback()
+            if not is_agent_name_unique_violation(exc):
+                raise
+            raise HTTPException(
+                status_code=400, detail="Agent with this name already exists"
+            ) from exc
+
+        # Save logo if provided
+        if agent_data.logo_base64:
+            logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
+            if logo_url:
+                agent = (
+                    store.update_agent_fields(
+                        user_id, int(agent.id), {"logo_url": logo_url}
+                    )
+                    or agent
+                )
+
+        logger.info(f"Created agent {agent.id} for user {current_user.id}")
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
+
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to create agent: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("", response_model=List[AgentListItem] | AgentListPage)
+async def list_agents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    search: Optional[str] = None,
+    page: Optional[int] = Query(None, ge=1),
+    size: int = Query(12, ge=1, le=100),
+    status: Literal["all", "enabled", "drafts"] = "all",
+    sort: Literal["updated", "name"] = "updated",
+    ownership: Literal["auto", "all", "mine", "others"] = "auto",
+) -> List[AgentListItem] | AgentListPage:
+    """List agents visible to the current user.
+
+    The response remains the legacy array when ``page`` is omitted because
+    several compact pickers consume this endpoint. Supplying ``page`` opts
+    into database-side filtering, sorting, and pagination for the management
+    page, so an administrator never has to load every platform Agent.
+    """
+    try:
+        store = AgentStore(db)
+        raw_keyword = (search or "").strip()
+        keyword = raw_keyword.lower()
+        legacy_keyword = raw_keyword.casefold()
+        if page is not None:
+            user_id = int(current_user.id)
+            team_scope = get_agent_team_scope(db, user_id)
+            can_view_others = bool(
+                current_user.is_admin
+                or (team_scope is not None and team_scope.is_team_admin)
+            )
+            effective_ownership: Literal["all", "mine", "others"]
+            if ownership == "auto":
+                effective_ownership = "mine" if can_view_others else "all"
+            else:
+                effective_ownership = ownership
+
+            if effective_ownership == "others" and not can_view_others:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Administrator privileges required to list other users' agents",
+                )
+
+            query = query_accessible_agents(
+                db,
+                current_user,
+                purpose="agent_list",
+            )
+
+            visible_total = query.count()
+
+            if keyword:
+                # Treat SQL wildcard characters as ordinary search text, just
+                # like the legacy in-memory substring filter does.
+                escaped_keyword = (
+                    keyword.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                pattern = f"%{escaped_keyword}%"
+                query = query.filter(
+                    or_(
+                        func.lower(Agent.name).like(pattern, escape="\\"),
+                        func.lower(Agent.description).like(pattern, escape="\\"),
+                    )
+                )
+
+            if effective_ownership == "mine":
+                query = query.filter(Agent.user_id == user_id)
+            elif effective_ownership == "others":
+                query = query.filter(Agent.user_id != user_id)
+
+            status_column = Agent.__table__.c.status
+            status_rows = (
+                query.with_entities(status_column, func.count(Agent.id))
+                .group_by(status_column)
+                .all()
+            )
+            status_totals = {
+                getattr(agent_status, "value", agent_status): int(count)
+                for agent_status, count in status_rows
+            }
+            all_count = sum(status_totals.values())
+            enabled_count = status_totals.get("published", 0)
+            status_counts = AgentListStatusCounts(
+                all=all_count,
+                enabled=enabled_count,
+                drafts=all_count - enabled_count,
+            )
+
+            if status == "enabled":
+                query = query.filter(status_column == AgentStatus.PUBLISHED.value)
+                total = status_counts.enabled
+            elif status == "drafts":
+                query = query.filter(status_column != AgentStatus.PUBLISHED.value)
+                total = status_counts.drafts
+            else:
+                total = status_counts.all
+
+            pages = max((total + size - 1) // size, 1)
+            current_page = min(page, pages)
+            if sort == "name":
+                query = query.order_by(func.lower(Agent.name).asc(), Agent.id.asc())
+            else:
+                query = query.order_by(Agent.updated_at.desc(), Agent.id.desc())
+            rows = query.offset((current_page - 1) * size).limit(size).all()
+
+            items: List[AgentListItem] = []
+            for agent in rows:
+                if owns_agent(agent, user_id, team_scope):
+                    accessible = AccessibleAgent(
+                        agent=agent,
+                        access="owner",
+                        can_edit=True,
+                        can_publish=True,
+                        can_delete=True,
+                    )
+                else:
+                    accessible = AccessibleAgent(
+                        agent=agent,
+                        access="policy",
+                        can_edit=False,
+                        can_publish=False,
+                        can_delete=False,
+                    )
+                items.append(
+                    AgentListItem.model_validate(
+                        _serialize_agent_list_item(store, accessible)
+                    )
+                )
+
+            return AgentListPage(
+                items=items,
+                page=current_page,
+                size=size,
+                total=total,
+                pages=pages,
+                visible_total=visible_total,
+                status_counts=status_counts,
+                ownership=effective_ownership,
+                can_view_others=can_view_others,
+            )
+
+        legacy_items = [
+            _serialize_agent_list_item(store, item)
+            for item in list_accessible_agents(
+                db,
+                current_user,
+                purpose="agent_list",
+            )
+            if not legacy_keyword
+            or legacy_keyword in (item.agent.name or "").casefold()
+            or legacy_keyword in (item.agent.description or "").casefold()
+        ]
+        return [AgentListItem.model_validate(item) for item in legacy_items]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list agents: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_id}", response_model=AgentResponse)
+async def get_agent(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Get agent details."""
+    try:
+        store = AgentStore(db)
+        response = store.get_agent_response(int(current_user.id), agent_id)
+        readonly = False
+        if response is None:
+            # Owner path missed. Admins may read any agent; other users may read
+            # agents shared to them read-only via policy (e.g. workforce policies)
+            # — the same agents the list endpoint now links to. Check the policy
+            # id set directly instead of materializing every accessible agent.
+            if is_admin_user(current_user):
+                response = store.get_agent_response_for_admin(agent_id)
+                readonly = response is not None
+            else:
+                visible_ids = get_visible_agent_ids(db, current_user, "agent_list")
+                if visible_ids and agent_id in visible_ids:
+                    response = store.get_agent_response_for_admin(agent_id)
+                    readonly = response is not None
+        if response is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        result = AgentResponse.model_validate(response)
+        if readonly:
+            result.readonly = True
+            result.can_edit = False
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentPreviewTaskResponse(BaseModel):
+    task_id: int
+    config_key: str | None
+    message: str
+    attachments: list[dict[str, Any]]
+
+
+class AgentPreviewTaskBinding(BaseModel):
+    task_id: int = Field(gt=0)
+
+
+@router.get("/{agent_id}/preview-task", response_model=AgentPreviewTaskResponse | None)
+async def get_agent_preview_task(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentPreviewTaskResponse | None:
+    """Find this editor's latest preview, without exposing teammates' transcripts."""
+    user_id = int(current_user.id)
+    if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    task = (
+        db.query(Task)
+        .filter(
+            Task.user_id == user_id,
+            Task.is_visible.is_(False),
+            # A task is allocated before attachment upload. Until a user turn
+            # is persisted it is only staging, not a restorable preview. Keep
+            # submitted failed/unknown turns: they still contain the sample.
+            db.query(TaskChatMessage.id)
+            .filter(
+                TaskChatMessage.task_id == Task.id,
+                TaskChatMessage.role == "user",
+            )
+            .exists(),
+            # Compare serialized JSON scalars, never cast client JSON to an
+            # integer/bool: malformed legacy values must not break PostgreSQL
+            # history reads. SQLite serializes JSON true as 1.
+            sql_cast(Task.agent_config["is_preview"], String).in_(("true", "1")),
+            or_(
+                sql_cast(Task.agent_config["preview_agent_id"], String)
+                == str(agent_id),
+                sql_cast(Task.agent_config["preview_history_agent_id"], String)
+                == str(agent_id),
+            ),
+        )
+        .order_by(Task.id.desc())
+        .first()
+    )
+    if task is None:
+        return None
+    sample = (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
+        .order_by(TaskChatMessage.id.asc())
+        .first()
+    )
+    config = cast(dict[str, Any], task.agent_config or {})
+    key = config.get("preview_config_key")
+    return AgentPreviewTaskResponse(
+        task_id=int(task.id),
+        config_key=key if isinstance(key, str) else None,
+        # Retry the original submitted sample even if delivery failed or is
+        # unknown. A pre-upload staging task was excluded by the query above.
+        message=str(sample.content) if sample is not None else "",
+        attachments=(sample.attachments or []) if sample is not None else [],
+    )
+
+
+@router.put("/{agent_id}/preview-task", status_code=204)
+async def bind_agent_preview_task(
+    agent_id: int,
+    binding: AgentPreviewTaskBinding,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Associate a pre-save preview after creating the agent; never reparent it."""
+    user_id = int(current_user.id)
+    if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    task = (
+        db.query(Task)
+        .filter(Task.id == binding.task_id, Task.user_id == user_id)
+        .with_for_update()
+        .first()
+    )
+    config = cast(dict[str, Any], task.agent_config or {}) if task is not None else {}
+    if task is None or task.is_visible or config.get("is_preview") is not True:
+        raise HTTPException(status_code=404, detail="Preview task not found")
+    if any(
+        config.get(key) not in (None, agent_id)
+        for key in ("preview_agent_id", "preview_history_agent_id")
+    ):
+        raise HTTPException(status_code=409, detail="Preview belongs to another agent")
+    # History association is deliberately separate from preview_agent_id: binding
+    # must not change the tool/runtime identity of a preview already executing.
+    task.agent_config = {**config, "preview_history_agent_id": agent_id}  # type: ignore[assignment]
+    db.commit()
+
+
+@router.put("/{agent_id}", response_model=AgentResponse)
+async def update_agent(
+    agent_id: int,
+    agent_data: AgentUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Update an existing agent."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        # Resolve team scope once and reuse it for the read, the name check,
+        # and the write, instead of re-resolving (extra TeamMember query) and
+        # re-SELECTing the agent inside each store call.
+        team_scope = get_agent_team_scope(db, user_id)
+        agent = store.get_owned_agent(user_id, agent_id, team_scope)
+
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        # Validate knowledge base + tool category consistency
+        effective_kb = (
+            agent_data.knowledge_bases
+            if agent_data.knowledge_bases is not None
+            else (agent.knowledge_bases or [])
+        )
+        effective_tools = (
+            agent_data.tool_categories
+            if agent_data.tool_categories is not None
+            else (agent.tool_categories or [])
+        )
+        _validate_knowledge_base_tools(effective_kb, effective_tools)  # type: ignore[arg-type]
+        await _validate_knowledge_bases_exist(effective_kb, current_user)  # type: ignore[arg-type]
+
+        # Update fields
+        updates: dict[str, object] = {}
+        if agent_data.name is not None:
+            # Check for duplicate name (excluding current agent)
+            if store.agent_name_exists(
+                user_id,
+                agent_data.name,
+                exclude_agent_id=agent_id,
+                team_scope=team_scope,
+            ):
+                raise HTTPException(
+                    status_code=400, detail="Agent with this name already exists"
+                )
+            updates["name"] = agent_data.name
+
+        if agent_data.description is not None:
+            updates["description"] = agent_data.description
+        if agent_data.instructions is not None:
+            updates["instructions"] = agent_data.instructions
+        if agent_data.models is not None:
+            updates["models"] = agent_data.models
+        if agent_data.knowledge_bases is not None:
+            updates["knowledge_bases"] = agent_data.knowledge_bases
+        if agent_data.skills is not None:
+            updates["skills"] = agent_data.skills
+        if agent_data.tool_categories is not None:
+            updates["tool_categories"] = agent_data.tool_categories
+        if agent_data.execution_mode is not None:
+            updates["execution_mode"] = agent_data.execution_mode
+        if agent_data.suggested_prompts is not None:
+            updates["suggested_prompts"] = agent_data.suggested_prompts
+        if agent_data.prompt_context_fields is not None:
+            updates["prompt_context_fields"] = [
+                declaration.model_dump()
+                for declaration in agent_data.prompt_context_fields
+            ]
+        if agent_data.widget_enabled is not None:
+            updates["widget_enabled"] = agent_data.widget_enabled
+            # Widget-enabled agents always carry an embed credential; heal
+            # rows that predate the widget_key column.
+            if agent_data.widget_enabled and not agent.widget_key:
+                updates["widget_key"] = new_widget_key()
+        if agent_data.allowed_domains is not None:
+            updates["allowed_domains"] = agent_data.allowed_domains
+        if agent_data.visibility is not None:
+            updates["visibility"] = agent_data.visibility
+
+        # Handle logo
+        if agent_data.logo_base64 is not None:
+            # Delete old logo
+            if agent.logo_url:
+                _delete_logo(agent.logo_url)  # type: ignore[arg-type]
+
+            # Save new logo
+            logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
+            updates["logo_url"] = logo_url
+
+        if updates:
+            # agent_name_exists above is a fast-path pre-check, not the source
+            # of truth: uq_agents_user_id_name_active is what actually
+            # prevents a concurrent-rename race, so the write itself can
+            # still raise IntegrityError here (see the matching handling in
+            # create_agent above).
+            try:
+                agent = (
+                    store.update_agent_fields(
+                        user_id,
+                        agent_id,
+                        updates,
+                        team_scope=team_scope,
+                        agent=agent,
+                    )
+                    or agent
+                )
+            except IntegrityError as exc:
+                db.rollback()
+                if not is_agent_name_unique_violation(exc):
+                    raise
+                raise HTTPException(
+                    status_code=400, detail="Agent with this name already exists"
+                ) from exc
+
+        logger.info(f"Updated agent {agent_id} for user {current_user.id}")
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
+
+    except HTTPException:
+        raise
+    except (UnsharedConnectorsError, UnsharedKnowledgeBasesError) as e:
+        db.rollback()
+        raise _unshared_error_response(e) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to update agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PromoteTeamRequest(BaseModel):
+    """Request model for promoting a personal agent to team-owned."""
+
+    visibility: Literal["team", "admins"] = "team"
+
+
+@router.post("/{agent_id}/promote-team", response_model=AgentResponse)
+async def promote_agent_to_team(
+    agent_id: int,
+    body: PromoteTeamRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Promote a personal agent to team-owned.
+
+    Requires a team scope (the caller belongs to a team). Fails with 422 and
+    the offending connectors when the agent selects connectors not yet shared
+    with the team.
+    """
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        scope = get_agent_team_scope(db, user_id)
+        if scope is None:
+            raise HTTPException(status_code=400, detail="No team to promote into")
+        visibility = (body or PromoteTeamRequest()).visibility
+        agent = store.promote_agent_to_team(
+            user_id, agent_id, scope, visibility=visibility
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
+    except HTTPException:
+        raise
+    except (UnsharedConnectorsError, UnsharedKnowledgeBasesError) as e:
+        db.rollback()
+        raise _unshared_error_response(e) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"Failed to promote agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/{agent_id}/demote-personal", response_model=AgentResponse)
+async def demote_agent_to_personal(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentResponse:
+    """Revert a team agent back to personal ownership."""
+    try:
+        store = AgentStore(db)
+        agent = store.demote_agent_to_personal(int(current_user.id), agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"Failed to demote agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.delete("/{agent_id}")
+def delete_agent(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Delete an agent."""
+    try:
+        result = AgentManagementService(db).delete_agent(
+            actor=current_user,
+            agent_id=agent_id,
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        if result.logo_url:
+            try:
+                _delete_logo(result.logo_url)
+            except Exception:
+                logger.warning(
+                    "Failed to delete logo after deleting agent %s",
+                    agent_id,
+                    exc_info=True,
+                )
+        logger.info(f"Deleted agent {agent_id} for user {current_user.id}")
+        return {"message": "Agent deleted successfully"}
+
+    except AgentWorkforceConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agent_in_use_by_workforce",
+                "message": "Agent is used by one or more workforces.",
+                "references": [
+                    {
+                        "workforce_id": reference.workforce_id,
+                        "name": reference.name,
+                        "status": reference.status,
+                        "roles": list(reference.roles),
+                        "can_edit": reference.can_edit,
+                        "can_discard": reference.can_discard,
+                    }
+                    for reference in exc.references
+                ],
+                "has_hidden_references": exc.has_hidden_references,
+            },
+        ) from None
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to delete agent %s", agent_id)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "agent_delete_failed",
+                "message": "Failed to delete agent",
+            },
+        ) from None
+
+
+@router.post("/{agent_id}/publish", response_model=PublishResponse)
+async def publish_agent(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PublishResponse:
+    """Publish an agent (make it publicly accessible)."""
+    try:
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
+
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        if agent.status.value == "published":
+            return PublishResponse(
+                message="Agent is already published",
+                agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
+            )
+
+        agent = store.publish_agent(int(current_user.id), agent_id) or agent
+
+        logger.info(f"Published agent {agent_id} for user {current_user.id}")
+        return PublishResponse(
+            message="Agent published successfully",
+            agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to publish agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/unpublish", response_model=PublishResponse)
+async def unpublish_agent(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PublishResponse:
+    """Unpublish an agent (revert to draft status)."""
+    try:
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
+
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        if agent.status.value != "published":
+            return PublishResponse(
+                message="Agent is not published",
+                agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
+            )
+
+        agent = store.unpublish_agent(int(current_user.id), agent_id) or agent
+
+        logger.info(f"Unpublished agent {agent_id} for user {current_user.id}")
+        return PublishResponse(
+            message="Agent unpublished successfully",
+            agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to unpublish agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_id}/share-link", response_model=AgentShareLinkResponse)
+async def get_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Return the current owner-only share link state for an agent."""
+    try:
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get share link for agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/share-link", response_model=AgentShareLinkResponse)
+async def enable_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Create or re-enable a share link for a published agent."""
+    try:
+        store = AgentStore(db)
+        agent = _ensure_shareable_agent(
+            store.get_owned_agent(int(current_user.id), agent_id)
+        )
+        now = datetime.now(timezone.utc)
+        updates: dict[str, Any] = {
+            "share_enabled": True,
+            "share_updated_at": now,
+        }
+        if not agent.share_token:
+            updates["share_token"] = _new_share_token()
+        updated_agent = store.update_agent_fields(
+            int(current_user.id), agent_id, updates
+        )
+        if updated_agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(updated_agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to enable share link for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/share-link/rotate", response_model=AgentShareLinkResponse)
+async def rotate_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Rotate the public share link for a published agent."""
+    try:
+        store = AgentStore(db)
+        _ensure_shareable_agent(store.get_owned_agent(int(current_user.id), agent_id))
+        agent = store.update_agent_fields(
+            int(current_user.id),
+            agent_id,
+            {
+                "share_enabled": True,
+                "share_token": _new_share_token(),
+                "share_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to rotate share link for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{agent_id}/share-link", response_model=AgentShareLinkResponse)
+async def disable_agent_share_link(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentShareLinkResponse:
+    """Disable and revoke the public share link for an agent."""
+    try:
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent = store.update_agent_fields(
+            int(current_user.id),
+            agent_id,
+            {
+                "share_enabled": False,
+                "share_token": None,
+                "share_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return _serialize_share_link_response(agent)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to disable share link for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_id}/widget-key", response_model=AgentWidgetKeyResponse)
+async def get_agent_widget_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentWidgetKeyResponse:
+    """Return the owner-only widget embed key, generating one if missing."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if not agent.widget_key:
+            agent = store.update_agent_fields(
+                user_id, agent_id, {"widget_key": new_widget_key()}
+            )
+            if agent is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentWidgetKeyResponse(
+            agent_id=int(agent.id),
+            widget_enabled=bool(agent.widget_enabled),
+            widget_key=str(agent.widget_key),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get widget key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/widget-key/rotate", response_model=AgentWidgetKeyResponse)
+async def rotate_agent_widget_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentWidgetKeyResponse:
+    """Rotate the widget embed key, invalidating already-deployed snippets."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        if store.get_owned_agent(user_id, agent_id) is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent = store.update_agent_fields(
+            user_id, agent_id, {"widget_key": new_widget_key()}
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return AgentWidgetKeyResponse(
+            agent_id=int(agent.id),
+            widget_enabled=bool(agent.widget_enabled),
+            widget_key=str(agent.widget_key),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to rotate widget key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{agent_id}/logo", response_model=dict)
+async def upload_agent_logo(
+    agent_id: int,
+    logo_base64: str = Body(..., description="Logo image as base64 data URL"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Upload or update agent logo."""
+    try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
+
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+
+        # Delete old logo
+        if agent.logo_url:
+            _delete_logo(agent.logo_url)  # type: ignore[arg-type]
+
+        # Save new logo
+        logo_url = _save_logo(logo_base64, agent.id)  # type: ignore[arg-type]
+        if not logo_url:
+            raise HTTPException(status_code=400, detail="Failed to save logo")
+
+        store.update_agent_fields(user_id, agent_id, {"logo_url": logo_url})
+
+        logger.info(f"Updated logo for agent {agent_id}")
+        return {"logo_url": logo_url}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to upload logo for agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== API Key Endpoints (legacy single-key surface, compat-only) =====
+#
+# Three sibling endpoints (POST/GET/DELETE) at /api/agents/{agent_id}/api-key
+# let the agent owner manage the SDK key. All three share JWT auth via
+# ``get_current_user`` and gate ownership through ``_get_owned_agent_or_404``;
+# the unsuccessful-ownership path returns 404 (not 403) so the existence of
+# another user's agent is not leaked. See the SDK design doc §5 for the
+# product-level contract and §10 for the security rationale.
+#
+# Deliberately parallel, not stale: the frontend dashboard manages keys
+# exclusively through the multi-key admin surface at
+# ``/api/agent-api-keys`` (see ``api/agent_api_keys.py``) and has zero
+# callers left for this trio -- but this one remains the stable, versioned
+# contract external SDK/REST callers are pinned to, so it can't be removed
+# just because the UI moved on. Semantics here are intentionally still
+# "one key" flavored under the hood (POST revokes *every* active key on
+# the agent, GET returns the most-recently-created non-paused one) even
+# though the underlying table now allows multiple simultaneous keys.
+
+
+@router.post("/{agent_id}/api-key", response_model=APIKeyGenerateResponse)
+async def generate_agent_api_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIKeyGenerateResponse:
+    """Generate or rotate the SDK API key for an agent.
+
+    If an active (non-revoked) key already exists for the agent, this
+    endpoint revokes it and inserts a new active row in a single
+    transaction. The new ``full_key`` is returned exactly once in the
+    response; the plaintext secret is never persisted server-side, only
+    its one-way verifier.
+
+    Args:
+        agent_id: Path parameter; the target agent's primary key.
+        current_user: Resolved from the ``Authorization: Bearer <JWT>``
+            header by ``get_current_user``.
+        db: SQLAlchemy session injected by FastAPI.
+
+    Returns:
+        :class:`APIKeyGenerateResponse` containing ``full_key`` (one-shot
+        plaintext), ``key_prefix``, and ``created_at``.
+
+    Raises:
+        HTTPException 401: missing or invalid JWT.
+        HTTPException 404: agent does not exist or does not belong to the
+            caller (deliberate to avoid leaking agent existence).
+        HTTPException 409: ``rotation_conflict`` -- a ``key_prefix``
+            collision on insert (astronomically rare; the prefix
+            keyspace is large, this is defense-in-depth).
+        HTTPException 500: any other unexpected error; transaction
+            rolled back.
+
+    Notes:
+        - Transactional shape mirrors ``auth.setup_admin`` and
+          ``custom_api.create_custom_api`` -- we collect all writes in the
+          session and commit once. Rotations serialize on the agent row so
+          each request snapshots and revokes a coherent set of active keys.
+          An agent may still hold multiple simultaneously-active keys through
+          the multi-key endpoints; two racing legacy rotations both succeed
+          sequentially, and the later rotation leaves its key active.
+        - Logs include the ``key_prefix`` only -- never the ``full_key``,
+          the secret half, or the stored verifier.
+    """
+    try:
+        # Ownership gate. Raises 404 on miss; never reveals "exists but
+        # not yours" vs "does not exist".
+        _get_owned_agent_or_404(agent_id, current_user, db)
+
+        return AgentApiKeyService(db).rotate_key(agent_id)
+
+    except HTTPException:
+        raise
+    except KeyRotationConflict as e:
+        # key_prefix collision on insert -- the only remaining trigger
+        # now that the partial unique index this used to also catch is
+        # gone. Surface as 409 rather than a generic 500 so the client
+        # can retry without alarm. Internal SQL message stays in the log
+        # only.
+        logger.warning(f"Concurrent API key rotation race for agent {agent_id}: {e}")
+        raise HTTPException(status_code=409, detail="rotation_conflict")
+    except Exception as e:
+        # Sanitize: do NOT echo str(e) to the client -- it could leak
+        # internal table names, SQL error wording, or storage backend
+        # identity. Full diagnostic stays in the server log.
+        logger.error(f"Failed to generate API key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{agent_id}/api-key", response_model=APIKeyMetadataResponse)
+async def get_agent_api_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIKeyMetadataResponse:
+    """Return metadata for the agent's currently active API key.
+
+    Returns the public-safe prefix and a display-only ``masked_key``.
+    The plaintext secret is unrecoverable by design -- if the owner has
+    lost it, they must POST to rotate.
+
+    Args:
+        agent_id: Path parameter.
+        current_user: Resolved from JWT.
+        db: SQLAlchemy session.
+
+    Returns:
+        :class:`APIKeyMetadataResponse` with ``key_prefix``, ``masked_key``,
+        and ``created_at``.
+
+    Raises:
+        HTTPException 401: missing or invalid JWT.
+        HTTPException 404: agent missing / not owned; or owned but has no
+            active key. Both shapes use the same status code so the
+            caller cannot distinguish "agent doesn't exist" from "no key
+            generated yet". The ``detail`` differentiates so the UI can
+            render "未生成" instead of "agent not found".
+    """
+    try:
+        _get_owned_agent_or_404(agent_id, current_user, db)
+
+        metadata = AgentApiKeyService(db).get_metadata(agent_id)
+        if metadata is None:
+            # "Has the owner generated a key yet?" answered with 404 so
+            # the UI catches and renders the empty state.
+            raise HTTPException(status_code=404, detail="no_active_key")
+
+        return metadata
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Sanitize: do NOT echo str(e) to the client (see POST handler note).
+        logger.error(f"Failed to read API key for agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/{agent_id}/api-key", response_model=APIKeyRevokeResponse)
+async def revoke_agent_api_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIKeyRevokeResponse:
+    """Soft-revoke the agent's active API key.
+
+    Idempotent: calling DELETE on an agent with no active key still
+    returns HTTP 200 with ``revoked=false``. This lets clients call
+    DELETE blindly without first getting it to check existence.
+
+    Args:
+        agent_id: Path parameter.
+        current_user: Resolved from JWT.
+        db: SQLAlchemy session.
+
+    Returns:
+        :class:`APIKeyRevokeResponse` with:
+          - ``revoked=true, revoked_at=<now>`` if an active key was just revoked.
+          - ``revoked=false, revoked_at=null`` if no active key existed.
+
+    Raises:
+        HTTPException 401: missing or invalid JWT.
+        HTTPException 404: agent missing / not owned.
+
+    Notes:
+        Revoked rows stay in the table forever (we only flip ``revoked_at``).
+        The audit trail of "when was a key created and when was it
+        revoked" is the entire point of soft-delete here; hard-deleting
+        would also lose the ability to answer "is this old hash one
+        we issued?" during incident response.
+    """
+    try:
+        _get_owned_agent_or_404(agent_id, current_user, db)
+
+        return AgentApiKeyService(db).revoke_key(agent_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Sanitize: do NOT echo str(e) to the client (see POST handler note).
+        logger.error(f"Failed to revoke API key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ===== Preview Models =====
+
+
+class AgentPreviewRequest(BaseModel):
+    """Request model for agent preview."""
+
+    instructions: Optional[str] = Field(None, description="System instructions/prompt")
+    execution_mode: Optional[str] = Field(
+        "balanced", description="Execution mode: flash, balanced, think, or auto"
+    )
+    models: Optional[dict] = Field(
+        None, description="Model config: {general, small_fast, visual, compact}"
+    )
+    knowledge_bases: List[str] = Field(
+        default_factory=list, description="Knowledge base names"
+    )
+    skills: List[str] = Field(default_factory=list, description="Skill names")
+    # ``None`` (field omitted) keeps the legacy "unconfigured" semantics
+    # (full default tool set); ``[]`` means the caller explicitly selected
+    # zero tools. This mirrors how ``Agent.tool_categories`` is read at
+    # runtime, so a preview behaves like the saved agent would.
+    tool_categories: Optional[List[str]] = Field(
+        None, description="Tool category names"
+    )
+    message: str = Field(..., description="User message to preview")
+
+
+class AgentPreviewResponse(BaseModel):
+    """Response model for agent preview."""
+
+    response: str
+    status: str
+
+
+# ===== Preview Endpoint =====
+
+
+@router.post("/preview", response_model=AgentPreviewResponse)
+async def preview_agent(
+    request: AgentPreviewRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentPreviewResponse:
+    """Preview agent response without saving to database."""
+    try:
+        # Resolve LLMs from model IDs
+        default_llm = None
+        fast_llm = None
+        vision_llm = None
+        compact_llm = None
+
+        if request.models:
+            model_config = request.models
+            storage = UserAwareModelStorage(db)
+
+            if model_config.get("general"):
+                general_model = (
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["general"])
+                    .first()
+                )
+                if general_model:
+                    default_llm = storage.get_llm_by_name_with_access(
+                        str(general_model.model_id), int(current_user.id)
+                    )
+            if model_config.get("small_fast"):
+                fast_model = (
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["small_fast"])
+                    .first()
+                )
+                if fast_model:
+                    fast_llm = storage.get_llm_by_name_with_access(
+                        str(fast_model.model_id), int(current_user.id)
+                    )
+            if model_config.get("visual"):
+                visual_model = (
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["visual"])
+                    .first()
+                )
+                if visual_model:
+                    vision_llm = storage.get_llm_by_name_with_access(
+                        str(visual_model.model_id), int(current_user.id)
+                    )
+            if model_config.get("compact"):
+                compact_model = (
+                    db.query(DBModel)
+                    .filter(DBModel.id == model_config["compact"])
+                    .first()
+                )
+                if compact_model:
+                    compact_llm = storage.get_llm_by_name_with_access(
+                        str(compact_model.model_id), int(current_user.id)
+                    )
+
+        if not default_llm:
+            raise HTTPException(
+                status_code=400, detail="General model is required for preview"
+            )
+
+        # Create tool config with allowed collections, skills, and tools
+        # WebToolConfig expects db and request, pass a minimal dict-like request object
+        class MinimalRequest:
+            def __init__(self, user_id: int) -> None:
+                self.user = type("obj", (), {"id": user_id})()
+
+        # Generate unique task_id for each preview to avoid workspace conflicts
+        preview_task_id = f"preview_{uuid.uuid4().hex[:8]}"
+
+        # Scope the preview's tools to the agent's selection. Without a
+        # spec, WebToolConfig builds the unrestricted tool set — including
+        # every Custom API / MCP server the *user* has configured — so the
+        # preview could call APIs the agent never selected (issues #798 /
+        # #117). Explicit categories mirror the runtime chat path; the
+        # omitted/None (legacy "unconfigured") case follows the
+        # delegated-agent path instead — every built-in tool, but no
+        # user-level Custom API registry — which is stricter than the
+        # direct-chat runtime (that path intentionally keeps legacy full
+        # access): a preview must never expose APIs the agent being
+        # previewed did not select.
+        from ...core.tools.adapters.vibe.selection_spec import (
+            ToolSelectionSpec,
+            should_load_mcp_server_configs,
+        )
+
+        tool_selection_spec = ToolSelectionSpec.from_raw(
+            tool_categories=request.tool_categories,
+            exclude_custom_api_when_unconfigured=True,
+        )
+
+        current_user_voice = agent_prompt_service.voice_from_runtime_user(current_user)
+        tool_config = WebToolConfig(
+            db=db,
+            request=MinimalRequest(int(current_user.id)),
+            llm=default_llm,
+            user_id=int(current_user.id),
+            is_admin=bool(current_user.is_admin),
+            allowed_collections=request.knowledge_bases
+            if request.knowledge_bases is not None
+            else None,
+            allowed_skills=request.skills if request.skills is not None else None,
+            tool_selection_spec=tool_selection_spec,
+            include_mcp_tools=should_load_mcp_server_configs(tool_selection_spec),
+            task_id=preview_task_id,
+            workspace_base_dir=str(get_uploads_dir() / "preview"),
+            # A preview request carries tool_categories, not an agent id, so
+            # there is no governing agent to key team connector visibility
+            # on. The live agent (once promoted) can still diverge from
+            # this preview for a team connector -- a known, accepted gap.
+            connector_team_id=None,
+            # Threaded through so a delegated AgentTool child the preview
+            # calls also honors the previewing user's voice (see
+            # BaseToolConfig.get_voice's docstring).
+            voice=current_user_voice,
+        )
+
+        # Determine execution mode (default to "think")
+        execution_mode = request.execution_mode or "think"
+
+        pattern = get_agent_pattern_for_execution_mode(execution_mode)
+
+        tracer = create_agent_tracer(
+            task_id=preview_task_id,
+            user_id=int(current_user.id),
+            trace_name=f"xagent-web-agent-preview-{preview_task_id}",
+            session_id=preview_task_id,
+            tags=["xagent", "web", "preview", "agent-builder"],
+            metadata={
+                "source": "xagent-web",
+                "task_id": preview_task_id,
+                "is_preview": True,
+                "preview_transport": "rest",
+            },
+        )
+
+        enhanced_system_prompt = agent_prompt_service.enhance_system_prompt_with_kb(
+            request.instructions if request.instructions else None,
+            request.knowledge_bases if request.knowledge_bases is not None else None,
+        )
+        enhanced_system_prompt = agent_prompt_service.apply_user_voice(
+            enhanced_system_prompt, current_user_voice
+        )
+
+        # Create agent service (Langfuse only, no database/websocket logging)
+        memory = InMemoryMemoryStore()
+        agent_service = AgentService(
+            budget_policy_provider=budget_policy_provider(
+                user_id=int(current_user.id), task_id=preview_task_id, scope=None
+            ),
+            name="preview_agent",
+            llm=default_llm,
+            fast_llm=fast_llm,
+            vision_llm=vision_llm,
+            compact_llm=compact_llm,
+            memory=memory,
+            tool_config=tool_config,
+            pattern=pattern,
+            id=preview_task_id,
+            enable_workspace=True,  # Both patterns support workspace
+            workspace_base_dir=str(get_uploads_dir() / "preview"),
+            task_id=preview_task_id,  # Add task_id for proper tool initialization
+            tracer=tracer,
+            system_prompt=enhanced_system_prompt,
+            memory_enabled=False,
+        )
+
+        # Execute task with system prompt in context
+        execution_context = {}
+        if enhanced_system_prompt:
+            execution_context["system_prompt"] = enhanced_system_prompt
+
+        with UserContext(int(current_user.id)):
+            result = await agent_service.execute_task(
+                task=request.message,
+                context=execution_context if execution_context else None,
+                task_id=preview_task_id,
+            )
+
+        return AgentPreviewResponse(
+            response=result.get("output", "No response generated"),
+            status=result.get("status", "unknown"),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to preview agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

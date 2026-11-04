@@ -1,0 +1,4816 @@
+"""Task-scoped AgentService construction, caching, and execution."""
+
+import asyncio
+import logging
+import os
+import time
+from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass
+from itertools import count
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
+
+from fastapi import HTTPException
+from sqlalchemy import or_, update
+from sqlalchemy.orm import Session
+
+from ...config import (
+    get_external_upload_dirs,
+    get_shared_task_execution_enabled,
+)
+from ...core.agent.context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+)
+from ...core.agent.service import AgentService
+from ...core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
+    ExecutionScope,
+    ExecutionScopeNotProvided,
+    ScopeFingerprint,
+    get_execution_scope,
+    resolve_execution_scope,
+    scope_fingerprint,
+)
+from ...core.memory.access_scope import (
+    MemoryAccessScope,
+    bind_memory_access_scope,
+)
+from ...core.memory.base import MemoryStore
+from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.model.chat.basic.adapter import attach_chat_retry_wrapper
+from ...core.model.chat.basic.base import BaseLLM
+from ...core.model.chat.basic.deepseek import DeepSeekLLM
+from ...core.model.chat.basic.openai import OpenAILLM
+from ...core.model.chat.basic.zhipu import ZhipuLLM
+from ...core.model.providers import is_placeholder_api_key
+from ...core.task_runtime import (
+    EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    TaskRuntimeContext,
+)
+from ...core.tools.adapters.vibe.config import (
+    MCPFailurePolicy,
+    RequiredMCPUnavailableError,
+)
+from ...core.tools.adapters.vibe.selection_spec import (
+    should_load_mcp_server_configs,
+    with_mcp_tools,
+)
+from ...core.utils.setup_metrics import agent_setup
+from ...sandbox import SandboxMountIntent
+from ..dynamic_memory_store import get_memory_store
+from ..memory_lifecycle import MemoryUnavailableError
+from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
+from ..models.database import (
+    get_session_local,
+    release_db_connection_if_clean,
+)
+from ..models.model import Model as DBModel
+from ..models.task import Task, TaskStatus
+from ..models.user import User
+from ..sandbox_keys import (
+    USER_LIFECYCLE_TYPE,
+    make_user_lifecycle_id,
+    make_user_sandbox_key,
+    parse_user_sandbox_key,
+)
+from ..tracing import create_task_tracer
+from ..user_isolated_memory import UserContext
+from .agent_access import list_accessible_published_agents
+from .agent_team_scope import (
+    get_agent_team_scope,
+    owned_agent_clause,
+    resolve_authorized_agent,
+)
+from .channel_runtime import ChannelTaskMode
+from .chat_history_service import (
+    load_task_transcript_window,
+)
+from .db_runtime import (
+    drain_async_task_cancellation_safe,
+    is_database_pool_timeout,
+    run_db_io_cancellation_safe,
+)
+from .execution_budget import budget_policy_provider
+from .llm_utils import AutoModelUnavailableError, resolve_llms_from_names
+from .managed_file_ref import ensure_uploaded_file_local_path
+from .mcp_runtime import (
+    MCPActorExecutionIdentity,
+    MCPBuiltinOAuthActorPolicy,
+    MCPBuiltinOAuthActorPolicyMismatchError,
+    MCPBuiltinOAuthActorPolicyRequiredError,
+)
+from .memory_availability import (
+    GENERIC_MEMORY_AVAILABILITY_REASON as GENERIC_MEMORY_AVAILABILITY_REASON,
+)
+from .memory_availability import (
+    MEMORY_AVAILABILITY_REASON_METADATA_KEY,
+    MEMORY_AVAILABLE_METADATA_KEY,
+)
+from .memory_availability import (
+    PUBLIC_MEMORY_AVAILABILITY_REASONS as PUBLIC_MEMORY_AVAILABILITY_REASONS,
+)
+from .memory_availability import (
+    caller_facing_execution_metadata as caller_facing_execution_metadata,
+)
+from .memory_availability import (
+    public_memory_availability_reason,
+)
+from .memory_binding import (
+    MemoryBindingResolutionError,
+    MemoryStoreBinding,
+    MemoryTaskBindingRequest,
+    MemoryToolAssemblyRequest,
+    MemoryToolFactory,
+    resolve_trusted_memory_binding,
+)
+from .memory_policy import (
+    MEMORY_BINDING_RESOLUTION_FAILURE_REASON,
+    MEMORY_POLICY_BINDING_FAILURE_REASON,
+    MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON,
+    MEMORY_POLICY_TASK_MISSING_REASON,
+    MemoryPolicyRequest,
+    memory_retrieval_scope_fingerprint,
+    resolve_trusted_memory_policy,
+)
+from .release_hold import release_hold
+from .task_execution_context_service import (
+    load_task_execution_recovery_state,
+    materialize_task_execution_recovery_state,
+)
+from .task_lease_service import (
+    TaskLease,
+    TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
+    acquire_task_lease_cancellation_safe,
+    acquire_task_lease_isolated,
+    bind_task_lease_context,
+    run_task_lease_heartbeat,
+    run_while_task_lease_owned,
+    stop_task_lease_heartbeat,
+    task_lease_attempt_predicate,
+)
+from .task_runtime import (
+    FILE_OPERATION_ACCESS_VERSION_KEY,
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    TaskRuntimeExtensionError,
+    build_task_runtime,
+    mcp_runtime_authorization_policy_identity,
+    mcp_runtime_authorization_policy_required,
+    registered_task_extensions,
+)
+from .task_setup_snapshot import (
+    MemoryPolicyTaskFields,
+    RuntimeUserFields,
+    TaskModelOverride,
+    TaskOwnerMismatchError,
+    TaskSetupSnapshot,
+    detach_runtime_user_fields,
+    load_memory_policy_task_fields_sync,
+    load_task_setup_snapshot_sync,
+)
+from .task_workspace_cleanup import (
+    WorkspaceCleanupTarget,
+    capture_workspace_cleanup_target,
+    remove_task_workspace,
+)
+from .workforce_runtime import (
+    WorkforceTaskRuntime,
+    release_task_lease_with_workforce_sync,
+    resolve_workforce_task_runtime,
+    sync_workforce_run_status_for_task_id_isolated,
+)
+from .workspace_binding import (
+    build_chat_workspace_binding,
+    canonical_workspace_base,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Depth of the per-task recently evicted scope fingerprints used to detect cycles.
+_EVICTED_FINGERPRINT_MEMORY = 4
+_MEMORY_METADATA_INPUT_UNSET = object()
+
+
+def _is_published_agent(agent: Agent) -> bool:
+    return getattr(agent.status, "value", agent.status) == AgentStatus.PUBLISHED.value
+
+
+def _load_agent_for_task_runtime(
+    db: Session,
+    task: Task,
+    workforce_runtime: WorkforceTaskRuntime | None = None,
+) -> Agent | None:
+    task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
+    if task_agent_id is None:
+        return None
+
+    agent = db.query(Agent).filter(Agent.id == task_agent_id).first()
+    if agent is None:
+        return None
+    if is_workforce_generated_manager_agent(agent):
+        if (
+            workforce_runtime is not None
+            and workforce_runtime.manager_agent_id == task_agent_id
+        ):
+            return agent
+        return None
+    # Team-scoped ownership keyed on the task owner: a teammate's task may run
+    # a team-visible agent; admins-only stays hidden from non-admins.
+    task_user_id = int(task.user_id)
+    owned = (
+        db.query(Agent)
+        .filter(
+            Agent.id == task_agent_id,
+            owned_agent_clause(task_user_id, get_agent_team_scope(db, task_user_id)),
+        )
+        .first()
+    )
+    if owned is not None:
+        return owned
+    if (
+        workforce_runtime is not None
+        and workforce_runtime.manager_agent_id == task_agent_id
+    ):
+        return agent
+    if not _is_published_agent(agent):
+        return None
+
+    user = db.query(User).filter(User.id == task.user_id).first()
+    if user is None:
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            db,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
+
+
+@dataclass(frozen=True)
+class AgentServiceMemoryPolicy:
+    memory: MemoryStore
+    memory_enabled: bool
+    memory_available: bool = True
+    memory_availability_reason: str | None = None
+    memory_access_scope: MemoryAccessScope | None = None
+    backend_identity: str | None = None
+    route_generation: str | None = None
+    memory_tools_factory: Callable[..., list[Any]] | None = None
+
+    @property
+    def public_availability_reason(self) -> str | None:
+        """The reason as a caller may see it."""
+        return public_memory_availability_reason(self.memory_availability_reason)
+
+    def execution_metadata(
+        self,
+        *,
+        ambient_owner_user_id: int | None | object = _MEMORY_METADATA_INPUT_UNSET,
+        ambient_execution_scope: ExecutionScope | None | object = (
+            _MEMORY_METADATA_INPUT_UNSET
+        ),
+    ) -> dict[str, Any]:
+        """Caller-safe availability for checkpoints and task trace metadata.
+
+        Empty while memory is available, so an ordinary task's trace is
+        unchanged. Execution metadata is checkpointed and can later reach
+        owner-facing trace APIs, so a trusted host's arbitrary diagnostic must
+        be folded before persistence. The raw reason remains available on this
+        policy object for operator logging only.
+        """
+        metadata: dict[str, Any] = {}
+        if (
+            ambient_owner_user_id is not _MEMORY_METADATA_INPUT_UNSET
+            and ambient_execution_scope is not _MEMORY_METADATA_INPUT_UNSET
+        ):
+            metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] = (
+                memory_retrieval_scope_fingerprint(
+                    enabled=self.memory_enabled and self.memory_available,
+                    access_scope=self.memory_access_scope,
+                    ambient_owner_user_id=cast(
+                        int | None,
+                        ambient_owner_user_id,
+                    ),
+                    ambient_execution_scope=cast(
+                        ExecutionScope | None,
+                        ambient_execution_scope,
+                    ),
+                    backend_identity=self.backend_identity,
+                    route_generation=self.route_generation,
+                )
+            )
+        if not self.memory_available:
+            metadata.update(
+                {
+                    MEMORY_AVAILABLE_METADATA_KEY: False,
+                    MEMORY_AVAILABILITY_REASON_METADATA_KEY: (
+                        self.public_availability_reason
+                    ),
+                }
+            )
+        return metadata
+
+
+def _optional_task_int(task: Any, field: str) -> int | None:
+    value = getattr(task, field, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _adapt_memory_tools_factory(
+    factory: MemoryToolFactory | None,
+) -> Callable[..., list[Any]] | None:
+    """Adapt the public frozen request contract to the core runtime callback."""
+
+    if factory is None:
+        return None
+
+    def build_tools(
+        *,
+        memory_store: MemoryStore,
+        task: str,
+        runtime: Any | None,
+        context: Any | None,
+    ) -> list[Any]:
+        tools = factory(
+            MemoryToolAssemblyRequest(
+                memory_store=memory_store,
+                task=task,
+                runtime=runtime,
+                context=context,
+            )
+        )
+        if isinstance(tools, (str, bytes)) or not isinstance(tools, Sequence):
+            raise TypeError("memory tools factory must return a sequence")
+        return list(tools)
+
+    return build_tools
+
+
+def _inert_memory_policy(reason: str) -> AgentServiceMemoryPolicy:
+    return AgentServiceMemoryPolicy(
+        memory=InMemoryMemoryStore(),
+        memory_enabled=False,
+        memory_available=False,
+        memory_availability_reason=reason,
+    )
+
+
+def _compose_memory_binding(
+    *,
+    binding: MemoryStoreBinding,
+    policy_scope: MemoryAccessScope | None,
+    enabled: bool,
+    availability_reason: str | None,
+) -> AgentServiceMemoryPolicy:
+    """Combine backend selection with the legacy eligibility authority.
+
+    A host may keep its existing policy resolver as the scope authority while
+    the new binding resolver selects only a backend. If both resolvers provide
+    scopes they must agree exactly; two different identity authorities are
+    rejected instead of being nested or silently preferred.
+    """
+
+    binding_scope = binding.access_scope
+    if (
+        binding_scope is not None
+        and policy_scope is not None
+        and binding_scope != policy_scope
+    ):
+        return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+    if binding_scope is not None:
+        selected_scope = binding_scope
+        memory = binding.store
+    elif policy_scope is not None:
+        selected_scope = policy_scope
+        try:
+            memory = bind_memory_access_scope(binding.store, policy_scope)
+        except Exception:
+            logger.warning("Trusted memory access-scope binding failed")
+            return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+    else:
+        selected_scope = None
+        memory = binding.store
+
+    return AgentServiceMemoryPolicy(
+        memory=memory,
+        memory_enabled=enabled,
+        memory_available=True,
+        memory_availability_reason=availability_reason,
+        memory_access_scope=selected_scope,
+        backend_identity=binding.backend_identity,
+        route_generation=binding.route_generation,
+        memory_tools_factory=_adapt_memory_tools_factory(binding.memory_tools_factory),
+    )
+
+
+def resolve_agent_service_memory_policy(
+    *,
+    task: Optional[Any] = None,
+    agent_config: Optional[Mapping[str, Any]] = None,
+) -> AgentServiceMemoryPolicy:
+    """Resolve the memory store and enablement for an AgentService runtime."""
+    config = agent_config
+    if config is None:
+        task_config = getattr(task, "agent_config", None)
+        config = task_config if isinstance(task_config, Mapping) else {}
+
+    is_preview = config.get("is_preview") is True
+    default_enabled = not is_preview and not (
+        task is not None and getattr(task, "agent_id", None)
+    )
+    source = getattr(task, "source", None)
+    override = resolve_trusted_memory_policy(
+        MemoryPolicyRequest(
+            task_id=_optional_task_int(task, "id"),
+            user_id=_optional_task_int(task, "user_id"),
+            agent_id=_optional_task_int(task, "agent_id"),
+            source=source if isinstance(source, str) else None,
+            is_preview=is_preview,
+        )
+    )
+    enabled = default_enabled if override is None else override.enabled
+    use_in_memory = (is_preview and not enabled) or (
+        override is not None and not override.available
+    )
+    if use_in_memory:
+        if override is not None and not override.available:
+            logger.warning(
+                "Trusted memory policy made persistent memory unavailable (%s)",
+                public_memory_availability_reason(override.reason),
+            )
+        return AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=enabled,
+            memory_available=True if override is None else override.available,
+            memory_availability_reason=None if override is None else override.reason,
+        )
+
+    binding_request = MemoryTaskBindingRequest(
+        task_id=_optional_task_int(task, "id"),
+        user_id=_optional_task_int(task, "user_id"),
+        agent_id=_optional_task_int(task, "agent_id"),
+        source=source if isinstance(source, str) else None,
+        is_preview=is_preview,
+    )
+    try:
+        binding = resolve_trusted_memory_binding(binding_request)
+    except MemoryBindingResolutionError:
+        return _inert_memory_policy(MEMORY_BINDING_RESOLUTION_FAILURE_REASON)
+
+    policy_scope = override.memory_access_scope if override is not None else None
+    if binding is not None:
+        return _compose_memory_binding(
+            binding=binding,
+            policy_scope=policy_scope,
+            enabled=enabled,
+            availability_reason=None if override is None else override.reason,
+        )
+
+    try:
+        memory: MemoryStore = get_memory_store()
+    except MemoryUnavailableError as error:
+        # Persistent memory is fenced off -- blocked on repair, awaiting a
+        # restart, or transiently unavailable. The task still starts; it simply
+        # runs with memory disabled and an inert store, so nothing reads from or
+        # writes to the storage that admission refused.
+        logger.warning(
+            "Task memory unavailable (%s); running with memory disabled",
+            error.status.state.value,
+        )
+        return AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=False,
+            memory_available=False,
+            memory_availability_reason=error.status.state.value,
+        )
+
+    access_scope = policy_scope
+    if access_scope is not None:
+        try:
+            memory = bind_memory_access_scope(memory, access_scope)
+        except Exception:
+            logger.warning("Trusted memory access-scope binding failed")
+            return AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=MEMORY_POLICY_BINDING_FAILURE_REASON,
+            )
+
+    return AgentServiceMemoryPolicy(
+        memory=memory,
+        memory_enabled=enabled,
+        memory_available=True if override is None else override.available,
+        memory_availability_reason=None if override is None else override.reason,
+        memory_access_scope=access_scope,
+    )
+
+
+async def resolve_agent_service_memory_policy_async(
+    *,
+    task: Optional[Any] = None,
+    agent_config: Optional[Mapping[str, Any]] = None,
+) -> AgentServiceMemoryPolicy:
+    """Resolve runtime memory without blocking the asyncio event loop.
+
+    ``get_memory_store`` re-reads the global memory embedding authority
+    through synchronous SQLAlchemy queries to check for vector-space drift.
+    Task setup supplies detached task/config data here, while the worker owns
+    the short database Session used by the store manager.
+    """
+
+    return await run_db_io_cancellation_safe(
+        lambda: resolve_agent_service_memory_policy(
+            task=task,
+            agent_config=agent_config,
+        )
+    )
+
+
+def create_default_llm() -> Optional[BaseLLM]:
+    """Create a default LLM instance based on environment configuration"""
+    try:
+        # For OpenAI: allow empty string API key (use is not None check)
+        # For Zhipu: don't allow empty string API key (use truthy check)
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        zhipu_api_key = os.getenv("ZHIPU_API_KEY")
+        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+
+        # Similarly for base_url: prefer OPENAI_BASE_URL if it exists (even if empty string)
+        # Only fallback to ZHIPU_BASE_URL if OPENAI_BASE_URL is None
+        openai_base_url = os.getenv("OPENAI_BASE_URL")
+        zhipu_base_url = os.getenv("ZHIPU_BASE_URL")
+        deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL")
+
+        # For model_name: prefer OPENAI_MODEL if it exists (even if empty string)
+        # Only fallback to ZHIPU_MODEL_NAME if OPENAI_MODEL is None
+        openai_model = os.getenv("OPENAI_MODEL")
+        zhipu_model = os.getenv("ZHIPU_MODEL_NAME")
+        deepseek_model = os.getenv("DEEPSEEK_MODEL_NAME")
+
+        # Check if Zhipu
+        zhipu_models = {
+            "glm-4.7",
+            "glm-4.7-flashx",
+            "glm-4.6",
+            "glm-4.5-air",
+            "glm-4.5-airx",
+            "glm-4-long",
+            "glm-4-flashx-250414",
+            "glm-4.7-flash",
+            "glm-4-Flash-250414",
+        }
+        is_zhipu = (
+            zhipu_base_url
+            and any(
+                domain in zhipu_base_url.lower()
+                for domain in {"zhipu", "bigmodel.cn", "api.z.ai"}
+            )
+        ) or (
+            zhipu_model
+            and any(zhipu_model.lower().strip() in x.lower() for x in zhipu_models)
+        )
+
+        if is_zhipu:
+            if zhipu_api_key:
+                logger.info(f"Using Zhipu LLM with model: {zhipu_model}")
+                # Use automatic thinking mode (None) by default
+                thinking_mode_env = os.getenv("ZHIPU_THINKING_MODE", "auto").lower()
+                thinking_mode = (
+                    None if thinking_mode_env == "auto" else thinking_mode_env == "true"
+                )
+                return attach_chat_retry_wrapper(
+                    ZhipuLLM(
+                        model_name=zhipu_model or "glm-4.7-flash",
+                        api_key=zhipu_api_key,
+                        base_url=zhipu_base_url,
+                        thinking_mode=thinking_mode,
+                    )
+                )
+            else:
+                logger.error(
+                    "Zhipu API key not found in environment variables. Set ZHIPU_API_KEY to enable Zhipu LLM functionality."
+                )
+                return None
+        elif openai_api_key is not None and (
+            openai_api_key == "" or not is_placeholder_api_key(openai_api_key)
+        ):
+            logger.info(f"Using OpenAI LLM with model: {openai_model}")
+            return attach_chat_retry_wrapper(
+                OpenAILLM(
+                    model_name=openai_model or "gpt-4o-mini",
+                    base_url=openai_base_url,
+                    api_key=openai_api_key,
+                )
+            )
+        elif deepseek_api_key and not is_placeholder_api_key(deepseek_api_key):
+            logger.info(f"Using DeepSeek LLM with model: {deepseek_model}")
+            return attach_chat_retry_wrapper(
+                DeepSeekLLM(
+                    model_name=deepseek_model or "deepseek-v4-flash",
+                    base_url=deepseek_base_url,
+                    api_key=deepseek_api_key,
+                )
+            )
+
+        # No LLM available - AgentService will run without DAG pattern
+        logger.error(
+            "No API key found in environment variables. Set OPENAI_API_KEY, ZHIPU_API_KEY, or DEEPSEEK_API_KEY to enable LLM functionality."
+        )
+        return None
+
+    except Exception as e:
+        logger.error(f"Failed to create default LLM: {e}")
+        return None
+
+
+def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
+    """Whether the caller's spec actually asked for MCP tools.
+
+    Default agents (no spec, or ``_SpecAll``) should NOT trigger the
+    MCP server DB query + per-server session init in
+    ``WebToolConfig``. Only an explicit ``"mcp"`` plain entry or a
+    ``"mcp:<server>"`` sub-category entry in the user's selection
+    means MCP loading is wanted; anything else keeps the legacy
+    no-MCP behaviour for cost reasons.
+
+    Returns ``False`` for ``None`` (no spec / legacy caller),
+    ``_SpecAll`` (no restriction means "build registered defaults",
+    NOT "ALL including MCP"), and ``_SpecNone`` (zero tools). Only a
+    ``_SpecByCategories`` whose normalized policy includes MCP (plain
+    ``"mcp"`` category or a scoped ``mcp_servers``) wants MCP loading;
+    this defers to the spec's own ``includes_mcp()`` dispatch.
+    """
+    return should_load_mcp_server_configs(tool_selection_spec)
+
+
+def _task_model_override_excluded_categories(
+    snapshot: Optional[TaskSetupSnapshot],
+) -> frozenset[str]:
+    """Tool categories this run's task model override explicitly excluded.
+
+    The one reader of the requested exclusion set, shared by both tool-build
+    readers. It comes from the snapshot's ``model_override`` because
+    ``tool_categories`` alone cannot tell "an agent created before it had an
+    ``mcp`` category" (an actor-marked task re-adds it) from "this run
+    explicitly excluded ``mcp``" (it must not). A snapshot without an
+    override means "nothing excluded", so the legacy behaviour is unchanged.
+
+    An exclusion only ever *removes* tools: it turns off the actor-marked
+    plain-``mcp`` add-back and the forced MCP config load. It is not a scoped
+    selection -- an explicit ``mcp:<server>`` entry is left alone and still
+    loads that server (see ``TaskModelOverride.excluded_tool_categories``).
+    """
+    if snapshot is None or snapshot.model_override is None:
+        return frozenset()
+    return snapshot.model_override.excluded_tool_categories
+
+
+def _build_tool_selection_spec_for_task(
+    agent_config: Optional[dict],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+    *,
+    task_id: int,
+    omit_published_agent_tools: bool = False,
+    include_mcp_tools: bool = False,
+    excluded_tool_categories: frozenset[str] = frozenset(),
+) -> Any:
+    """Single SSOT normalizer for chat reconstruct + snapshot paths.
+
+    Both ``_build_tools_for_task`` (reconstruct) and
+    ``get_agent_for_task`` (snapshot) translate the same raw inputs
+    (``agent_config['tool_categories']`` + optional workforce worker
+    tool names) into a :class:`ToolSelectionSpec`. Centralising the
+    call here keeps the two paths in lockstep and avoids the 30-line
+    copy / paste that used to live in each.
+
+    ``excluded_tool_categories`` is the task model override's requested
+    exclusion set (see ``_task_model_override_excluded_categories``); a plain
+    ``mcp`` entry in it suppresses the actor-marked MCP add-back below.
+    """
+    from ...core.tools.adapters.vibe.selection_spec import (
+        ToolSelectionSpec,
+        without_published_agent_tools,
+    )
+
+    tool_categories = agent_config.get("tool_categories") if agent_config else None
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=tool_categories,
+        # Two orthogonal inputs for the workforce delegation case:
+        #   - published_agent_ids declares the published-agent creator
+        #     should run, scoped to the worker agents (dispatch);
+        #   - name_allowlist narrows its output to the worker tool names
+        #     (filter). The creator's own config.allowed_agent_ids does
+        #     the per-agent DB filtering.
+        published_agent_ids=(
+            list(workforce_runtime.allowed_agent_ids) if workforce_runtime else None
+        ),
+        name_allowlist=(
+            workforce_runtime.worker_tool_names if workforce_runtime else None
+        ),
+        extras_only_when_unconfigured=workforce_runtime is not None,
+    )
+    if include_mcp_tools and "mcp" not in excluded_tool_categories:
+        # An explicit "mcp" exclusion from the task model override wins over
+        # the actor-marked add-back (see
+        # ``_task_model_override_excluded_categories``).
+        spec = with_mcp_tools(spec)
+    if omit_published_agent_tools:
+        spec = without_published_agent_tools(spec)
+    if spec.is_all():
+        logger.info(
+            f"Task {task_id} has no tool_categories restriction "
+            "(legacy 'unconfigured' semantics) -- full default tool set will be built"
+        )
+    else:
+        logger.info(
+            f"Task {task_id} tool selection spec: "
+            f"{type(spec).__name__} with categories={tool_categories}"
+        )
+    return spec
+
+
+def _mcp_failure_policy_for_task_source(source: object) -> MCPFailurePolicy:
+    """Map the persisted task source to its MCP setup contract."""
+    if type(source) is str and source == "trigger":
+        return MCPFailurePolicy.STRICT
+    return MCPFailurePolicy.BEST_EFFORT
+
+
+def _build_allowed_external_dirs(
+    user_id: Optional[int],
+    *,
+    only_existing: bool = False,
+    scope: Optional[ExecutionScope] = None,
+) -> list[str]:
+    """Build the allowed_external_dirs list for AgentService / tool
+    workspace_config.
+
+    Without this whitelist, file tools (read_file, read_csv_file,
+    list_files, ...) restrict themselves to the per-task workspace dir
+    and reject every uploaded file with "outside the allowed directory".
+
+    The list always contains:
+      - the user's upload directory ``<uploads>/user_<id>``
+        (when ``only_existing`` is True, only if that directory exists)
+      - any directories returned by ``get_external_upload_dirs()`` (used
+        for shared knowledge bases configured at the deployment level)
+    """
+    dirs: list[str] = []
+    if user_id is not None:
+        # Default: the shared user-level upload dir, so already-uploaded
+        # KB files stay reachable from every scope. With
+        # ``isolate_external_dirs`` the entry becomes the scoped subtree,
+        # keeping upload writes and the mount/enforcement allowlist
+        # consistent per scope. Deployment-level external dirs
+        # (XAGENT_EXTERNAL_UPLOAD_DIRS) are not user-root derived and stay
+        # shared either way.
+        segments = (
+            scope.workspace_segments
+            if scope is not None and scope.isolate_external_dirs
+            else ()
+        )
+        # Probe the same spelling that gets appended: with a symlinked
+        # uploads dir the raw and canonical spellings can name different
+        # directories, and the gate has to answer for the one handed on.
+        user_upload_dir = canonical_workspace_base(user_id, segments)
+        if not only_existing or Path(user_upload_dir).exists():
+            dirs.append(user_upload_dir)
+    dirs.extend([str(d) for d in get_external_upload_dirs()])
+    return dirs
+
+
+def _build_workforce_system_prompt(
+    base_system_prompt: Optional[str],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+) -> Optional[str]:
+    prompts = []
+    if workforce_runtime and workforce_runtime.manager_system_prompt:
+        prompts.append(workforce_runtime.manager_system_prompt)
+    if base_system_prompt:
+        prompts.append(base_system_prompt)
+    return "\n\n".join(prompts) if prompts else None
+
+
+def _int_id_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+async def create_default_tools(
+    db: Optional[Session],
+    request: Any = None,
+    user: Optional[Union[User, RuntimeUserFields]] = None,
+    task_id: Optional[str] = None,
+    workspace_owner_id: Optional[int] = None,
+    allowed_collections: Optional[List[str]] = None,
+    allowed_skills: Optional[List[str]] = None,
+    excluded_agent_id: Optional[int] = None,
+    vision_model: Optional[Any] = None,
+    sandbox: Optional[Any] = None,
+    llm: Optional[Any] = None,
+    tool_selection_spec: Optional[Any] = None,
+    allowed_agent_ids: Optional[List[int]] = None,
+    agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    parent_task_id: Optional[str] = None,
+    parent_tracer: Optional[Any] = None,
+    agent_call_stack: Optional[List[int]] = None,
+    scope: Optional[ExecutionScope] = None,
+    task_runtime_context: TaskRuntimeContext | None = None,
+    connector_runtime_turn_id: Optional[str] = None,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    force_mcp_tools: bool = False,
+    mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+    mcp_load_summary_tracer: Optional[Any] = None,
+    mcp_load_summary_trace_task_id: Optional[str] = None,
+    connector_team_id: Optional[int] = None,
+    db_task_id: Optional[int] = None,
+    file_operation_access_version: Any = None,
+    agent_creator_user_id: Optional[int] = None,
+    declared_knowledge_bases: Optional[List[str]] = None,
+) -> tuple[list[Any], Any]:
+    """Create default tools and tool_config for AgentService using ToolFactory.
+
+    ``selection_spec`` (a :class:`ToolSelectionSpec` or ``None``) is
+    propagated into the ``WebToolConfig`` so :func:`ToolFactory.create_all_tools`
+    can skip creators (and their internal DB / network I/O) for tool
+    categories / MCP servers the agent does not need. ``None`` preserves
+    the original "build everything" behavior for backward compat.
+
+    ``connector_team_id`` is the *governing agent's* owning team, never the
+    calling user's own team membership. It threads into ``WebToolConfig`` so
+    the connector-visibility team-scope hook (when installed) resolves that
+    team's connectors instead of the run owner's personal set only.
+
+    ``db_task_id`` and ``file_operation_access_version`` are appended to the
+    historical positional signature. Runtime callers pass them by keyword so
+    File Operation receives trusted task and rollout authority without shifting
+    existing positional integrations.
+
+    ``agent_creator_user_id`` and ``declared_knowledge_bases`` thread the same
+    governing agent's creator and its *stored* ``knowledge_bases`` list
+    alongside ``connector_team_id`` into ``WebToolConfig``, so the
+    knowledge-base search path can resolve a declared name against the
+    governing team, fall back to the creator's own collection, and report a
+    name the team never received rather than reaching for the runner's own
+    same-named collection. ``declared_knowledge_bases`` is read from the same
+    place ``allowed_collections`` already is (the agent's own configuration)
+    and is never the model-supplied value on a search request -- the two stay
+    distinct all the way to the resolution point.
+    """
+    if not user:
+        raise ValueError("User is required for tool creation")
+    if not task_id:
+        raise ValueError("Task ID is required for tool creation")
+
+    # Create a WebToolConfig to properly initialize tools
+    from ..tools.config import WebToolConfig
+    from .actor_mcp_runtime import production_actor_mcp_stdio_connection_adapter
+    from .agent_prompt import voice_from_runtime_user
+
+    db_factory = None
+    if db is None:
+        from ..models.database import get_session_local
+
+        db_factory = get_session_local()
+
+    owner_id = (
+        int(workspace_owner_id) if workspace_owner_id is not None else int(user.id)
+    )
+
+    # Build allowed external directories so file tools can reach the task owner's
+    # uploads (see _build_allowed_external_dirs docstring).
+    allowed_external_dirs = _build_allowed_external_dirs(owner_id, scope=scope)
+    scope_segments = scope.workspace_segments if scope is not None else ()
+    durable_storage_segments = (
+        scope.durable_storage_segments if scope is not None else ()
+    )
+
+    tool_config = WebToolConfig(
+        db=db,
+        request=request,
+        db_factory=db_factory,
+        user=user,
+        llm=llm,
+        user_id=int(user.id),
+        is_admin=bool(user.is_admin),
+        workspace_config={
+            "base_dir": canonical_workspace_base(owner_id, scope_segments),
+            "task_id": task_id,
+            "db_task_id": db_task_id
+            if db_task_id is not None
+            else _int_id_or_none(task_id),
+            FILE_OPERATION_ACCESS_VERSION_KEY: file_operation_access_version,
+            "user_id": owner_id,
+            "allowed_external_dirs": allowed_external_dirs,
+            "scope_segments": scope_segments,
+            "durable_storage_segments": durable_storage_segments,
+        },
+        execution_scope=scope,
+        # Actor-marked tasks must load their exact owner-scoped builtin
+        # servers. Ordinary agents retain the explicit-category cost gate.
+        include_mcp_tools=force_mcp_tools or _spec_wants_mcp(tool_selection_spec),
+        task_id=task_id,  # Pass task_id for browser session tracking
+        browser_tools_enabled=True,  # Enable browser automation tools
+        allowed_collections=allowed_collections,  # Agent Builder knowledge bases
+        allowed_skills=allowed_skills,  # Agent Builder skills
+        vision_model=vision_model,  # Pass task-specific vision model
+        tool_selection_spec=tool_selection_spec,  # Preferred SSOT typed spec
+        allowed_agent_ids=allowed_agent_ids,
+        agent_tool_overrides=agent_tool_overrides,
+        enable_global_agent_tools=enable_global_agent_tools,
+        allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        parent_task_id=parent_task_id,
+        parent_tracer=parent_tracer,
+        agent_call_stack=agent_call_stack,
+        voice=voice_from_runtime_user(user),
+        connector_runtime_turn_id=connector_runtime_turn_id,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=(
+            production_actor_mcp_stdio_connection_adapter()
+            if mcp_runtime_authorization_policy is not None
+            else None
+        ),
+        mcp_actor_execution_identity=mcp_actor_execution_identity,
+        mcp_failure_policy=mcp_failure_policy,
+        mcp_load_summary_tracer=mcp_load_summary_tracer,
+        mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
+        connector_team_id=connector_team_id,
+        agent_creator_user_id=agent_creator_user_id,
+        declared_knowledge_bases=declared_knowledge_bases,
+    )
+
+    # Store excluded_agent_id in tool_config for agent tool filtering
+    if excluded_agent_id:
+        tool_config._excluded_agent_id = excluded_agent_id
+
+    # Use sandbox if available
+    if sandbox:
+        tool_config.set_sandbox(sandbox)
+
+    from ...core.tools.adapters.vibe.factory import ToolFactory
+
+    workspace_config_getter = getattr(tool_config, "get_workspace_config", None)
+    workspace_config = (
+        workspace_config_getter() if callable(workspace_config_getter) else None
+    )
+    try:
+        workspace = await ToolFactory.create_workspace_async(tool_config, strict=True)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}") from exc
+    if workspace_config and workspace is None:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}")
+
+    runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
+    if task_runtime_context is not None and registered_task_extensions():
+        try:
+            runtime_contribution = await build_task_runtime(
+                task_runtime_context.with_workspace(workspace)
+            )
+        except TaskRuntimeExtensionError as exc:
+            # Runtime tools are optional enrichment. A broken out-of-tree
+            # provider must not prevent every task from constructing its core
+            # tool set; lifecycle and metadata endpoints remain fail-closed.
+            logger.error(
+                "Ignoring failed task runtime contribution from extension '%s' "
+                "while building tools for task %s",
+                exc.extension,
+                task_id,
+                exc_info=True,
+            )
+        except Exception:
+            logger.exception(
+                "Ignoring unexpected task runtime setup failure while building "
+                "tools for task %s",
+                task_id,
+            )
+    tool_config.set_task_runtime_contribution(runtime_contribution)
+
+    # Use ToolFactory to create proper xagent tools
+    tools = await ToolFactory.create_all_tools(tool_config)
+
+    logger.info(f"Created {len(tools)} default tools using ToolFactory")
+    return tools, tool_config
+
+
+def _task_runtime_context(
+    *,
+    task_id: int,
+    user_id: int,
+    source: Any,
+) -> TaskRuntimeContext:
+    return TaskRuntimeContext(
+        task_id=task_id,
+        user_id=user_id,
+        source=str(source) if source is not None else None,
+        session_factory=get_session_local(),
+    )
+
+
+def _task_runtime_context_for_tool_build(
+    *,
+    task_id: int,
+    user_id: int,
+    source: Any,
+) -> TaskRuntimeContext | None:
+    """Avoid constructing a DB session factory on the no-provider hot path."""
+
+    if not registered_task_extensions():
+        return None
+    return _task_runtime_context(
+        task_id=task_id,
+        user_id=user_id,
+        source=source,
+    )
+
+
+def _file_operation_access_version_from_agent_config(agent_config: Any) -> Any:
+    """Read the server marker without trusting malformed JSON column values."""
+
+    if not isinstance(agent_config, Mapping):
+        return None
+    return agent_config.get(FILE_OPERATION_ACCESS_VERSION_KEY)
+
+
+def _selected_file_ids_from_agent_config(
+    agent_config: Any,
+) -> list[str]:
+    if not isinstance(agent_config, dict):
+        return []
+    raw_file_ids = agent_config.get(SELECTED_FILE_IDS_AGENT_CONFIG_KEY)
+    if not isinstance(raw_file_ids, list):
+        return []
+    return [
+        str(file_id)
+        for file_id in raw_file_ids
+        if isinstance(file_id, str) and file_id.strip()
+    ]
+
+
+def _register_selected_task_files_isolated(
+    workspace: Any,
+    *,
+    task_id: int,
+    task_owner_id: int,
+    selected_file_ids: list[str],
+) -> None:
+    """Materialize selected files between short read and registration phases."""
+    if not selected_file_ids:
+        return
+
+    from ..models.database import get_session_local
+    from ..models.uploaded_file import UploadedFile
+    from .uploaded_file_store import (
+        UploadedFileVersionSnapshot,
+        snapshot_uploaded_file_version,
+    )
+
+    SessionLocal = get_session_local()
+    selected_files: list[UploadedFileVersionSnapshot] = []
+    with SessionLocal() as file_db:
+        for selected_file_id in selected_file_ids:
+            uploaded_file = (
+                file_db.query(UploadedFile)
+                .filter(
+                    UploadedFile.file_id == selected_file_id,
+                    UploadedFile.user_id == task_owner_id,
+                    UploadedFile.storage_status != "compensating",
+                    UploadedFile.detached_reason.is_(None),
+                    or_(
+                        UploadedFile.task_id == task_id,
+                        UploadedFile.task_id.is_(None),
+                    ),
+                )
+                .first()
+            )
+            if uploaded_file is None:
+                continue
+            selected_files.append(snapshot_uploaded_file_version(uploaded_file))
+
+    registrations: list[tuple[str, Optional[str]]] = []
+    for selected_file in selected_files:
+        source_path = ensure_uploaded_file_local_path(selected_file)
+        if source_path is None or not source_path.exists() or not source_path.is_file():
+            continue
+
+        registrations.append(
+            (
+                str(source_path.resolve()),
+                selected_file.file_id,
+            )
+        )
+
+    if registrations:
+        workspace.register_files(registrations)
+
+
+async def update_task_title_from_agent(
+    agent_service: AgentService,
+    task_id: int,
+    *,
+    task_lease: TaskLease | None = None,
+) -> bool:
+    """Update task title with generated task_name from agent service.
+
+    This is a clean separation of concerns:
+    - Core layer (AgentService) provides task info via get_task_info()
+    - Web layer handles database updates
+
+    Args:
+        agent_service: The agent service that executed the task
+        task_id: The task ID to update
+    Returns:
+        True if title was updated, False otherwise
+    """
+    try:
+        # Get task info from core layer (clean API)
+        task_info = agent_service.get_task_info()
+
+        if not task_info:
+            logger.debug(f"No task info available for task {task_id}")
+            return False
+
+        task_name = task_info.get("task_name")
+        if not task_name:
+            logger.debug(f"No task_name in task info for task {task_id}")
+            return False
+
+        # Title persistence owns a short Session on a worker. A saturated
+        # QueuePool must not block the asyncio loop after the agent finishes.
+        return await run_db_io_cancellation_safe(
+            lambda: _update_task_title_isolated(
+                task_id,
+                str(task_name),
+                task_lease=task_lease,
+            )
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Failed to update task title for task {task_id}: {e}", exc_info=True
+        )
+        return False
+
+
+def _update_task_title_isolated(
+    task_id: int,
+    task_name: str,
+    *,
+    task_lease: TaskLease | None = None,
+) -> bool:
+    """Persist a generated title under an optional exact lease fence."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as title_db:
+        if task_lease is not None:
+            if task_lease.run_id is None:
+                return False
+            updated = title_db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.runner_id == task_lease.runner_id,
+                    task_lease_attempt_predicate(task_lease),
+                    Task.run_id == task_lease.run_id,
+                    Task.title != task_name,
+                )
+                .values(title=task_name)
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(updated, "rowcount", 0) or 0) != 1:
+                title_db.rollback()
+                return False
+            title_db.commit()
+            logger.info(
+                "Updated task %s title under run %s",
+                task_id,
+                task_lease.run_id,
+            )
+            return True
+
+        task_record = title_db.query(Task).filter(Task.id == task_id).first()
+        if task_record is None:
+            logger.warning("No task record found for task_id=%s", task_id)
+            return False
+        if task_record.title == task_name:
+            logger.debug("Task title already matches: '%s'", task_record.title)
+            return False
+        old_title = str(task_record.title)
+        setattr(task_record, "title", task_name)
+        title_db.commit()
+        logger.info(
+            "Updated task %s title from '%s' to '%s'",
+            task_id,
+            old_title,
+            task_name,
+        )
+        return True
+
+
+def _load_task_run_gate_user_id_isolated(task_id: int) -> int | None:
+    """Load the detached quota-gate input in a worker-owned short Session."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as gate_db:
+        gate_task = gate_db.query(Task).filter(Task.id == task_id).first()
+        if gate_task is None:
+            logger.warning("Quota gate: task %s not found; allowing run", task_id)
+            return None
+        user_id = getattr(gate_task, "user_id", None)
+        return int(user_id) if user_id is not None else None
+
+
+def _load_task_public_run_quota_config_isolated(
+    task_id: int,
+) -> dict[str, Any] | None:
+    """Load the public-run-quota markers in a worker-owned short Session.
+
+    Returns the task's ``agent_config`` only when it marks a public run that
+    bills the owner — a share task (``auth_mode == "share"``, #973) or a widget
+    task (``auth_mode == "widget"``, #1108); ``None`` skips the quota gate for
+    everything else. Kept separate from
+    :func:`_load_task_run_gate_user_id_isolated` so the owner gate's return
+    contract (an ``int | None`` that tests monkeypatch) stays untouched.
+    """
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as quota_db:
+        agent_config = (
+            quota_db.query(Task.agent_config).filter(Task.id == task_id).scalar()
+        )
+        if isinstance(agent_config, Mapping) and agent_config.get("auth_mode") in (
+            "share",
+            "widget",
+        ):
+            return dict(agent_config)
+        return None
+
+
+def _coerce_optional_entity_id(value: Any) -> int | None:
+    """Coerce an agent_config entity marker to a positive ``int``, else ``None``.
+
+    Entity markers are database primary keys — always positive integers — so
+    this accepts only a non-``bool`` ``int`` or an all-digits string, both
+    ``> 0``. Anything else (a float like ``1.9`` that would silently truncate
+    onto a real entity's bucket, ``0`` / negatives that mint impossible
+    buckets, ``inf`` whose ``int()`` raises ``OverflowError``, or injected
+    junk) degrades to "unkeyable" — the caller then admits that one task —
+    rather than keying the wrong bucket or raising into the chokepoint's broad
+    ``except``, which would log a scary "failed open" and disable the gate.
+    ``bool`` is rejected explicitly: ``True`` is an ``int`` subclass that would
+    otherwise coerce to ``1``.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _public_run_denial_channel(quota_config: Mapping[str, Any]) -> str | None:
+    """Charge the run quota for a public (share/widget) task; name any refusal.
+
+    NOT a speculative query despite the name: admitting consumes a slot in
+    every bucket consulted (``allow_run`` / ``widget_run_denial_reason`` hit
+    them on the admit path), so calling this twice charges twice.
+
+    Returns the quota that refused the run — ``"share"``, ``"widget"`` (the
+    owner's budget for that embed), or ``"widget-ip"`` (the per-caller
+    sub-quota within one widget) — so the caller can pick a message the reader
+    can actually act on, or ``None`` when the run is admitted (or cannot be
+    keyed, matching the original share behaviour of falling through rather
+    than blocking a run it cannot attribute).
+
+    Share tasks carry a server-minted ``guest_id`` and are gated per link +
+    per guest (#973). Widget tasks are gated per entity plus the creator IP
+    the backend stamped into ``agent_config`` at task creation (#1108) — their
+    ``guest_id`` is client-supplied (rotatable at will), so the stamped IP is
+    the per-abuser dimension; without it a single-IP caller could drain the
+    whole rolling entity quota and lock every other visitor out (a multi-IP
+    abuser rotating ~entity/ip addresses still can, same as the share path's
+    per-guest quota). Tasks created before the IP marker existed carry ``None``
+    and are bounded by the entity quota alone.
+
+    Entity markers are coerced defensively: the widget-create path stamps them
+    server-side and the sanitizer strips the client copies, but a malformed
+    value must degrade to "unkeyable → admit this task" here rather than take
+    the gate down.
+    """
+    from .share_rate_limit import (
+        entity_rate_limit_key,
+        get_share_rate_limiter,
+    )
+
+    auth_mode = quota_config.get("auth_mode")
+    limiter = get_share_rate_limiter()
+
+    if auth_mode == "widget":
+        entity_key = entity_rate_limit_key(
+            _coerce_optional_entity_id(quota_config.get("widget_agent_id")),
+            _coerce_optional_entity_id(quota_config.get("widget_workforce_id")),
+        )
+        if entity_key is None:
+            return None
+        client_ip = quota_config.get("widget_client_ip")
+        reason = limiter.widget_run_denial_reason(
+            entity_key, client_ip if isinstance(client_ip, str) and client_ip else None
+        )
+        if reason is None:
+            return None
+        return "widget-ip" if reason == "ip" else "widget"
+
+    if auth_mode == "share":
+        guest_id = quota_config.get("guest_id")
+        share_key = entity_rate_limit_key(
+            _coerce_optional_entity_id(quota_config.get("share_agent_id")),
+            _coerce_optional_entity_id(quota_config.get("share_workforce_id")),
+        )
+        if not share_key or not isinstance(guest_id, str) or not guest_id:
+            return None
+        return None if limiter.allow_run(share_key, guest_id) else "share"
+
+    # The loader only returns share/widget configs; admit anything else so a
+    # future auth mode fails open here (visibly unmetered) rather than
+    # silently borrowing another channel's buckets.
+    logger.warning(
+        "Public run quota gate saw unexpected auth_mode %r; admitting", auth_mode
+    )
+    return None
+
+
+def _check_task_run_gate_on_event_loop(
+    user_id: int | None,
+) -> str | dict[str, Any] | None:
+    """Invoke the legacy start hook on its established event-loop thread."""
+    from ..models.database import get_session_local
+    from .quota_hooks import check_run_gate
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as gate_db:
+        gate_reason = check_run_gate(gate_db, user_id)
+        if isinstance(gate_reason, Mapping):
+            return dict(gate_reason)
+        return str(gate_reason) if gate_reason is not None else None
+
+
+def _release_managed_task_lease_isolated(
+    lease: TaskLease,
+    *,
+    status: TaskStatus,
+) -> bool:
+    """Release a manager-owned lease without reusing the caller Session."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as lease_db:
+        return release_task_lease_with_workforce_sync(
+            lease_db,
+            lease,
+            status=status,
+        )
+
+
+_RuntimeDBResult = TypeVar("_RuntimeDBResult")
+
+
+class _AgentRuntimeSessionBoundaryError(RuntimeError):
+    """The caller Session cannot yield its connection to a runtime worker."""
+
+
+def _release_agent_runtime_caller_session(caller_db: Optional[Session]) -> None:
+    """Establish the caller/worker Session handoff invariant.
+
+    Runtime database operations always open their own short-lived Session. A
+    legacy caller may still pass a request-owned Session after authorization or
+    message persistence; release its read-only transaction before any runtime
+    worker can request another pool slot. Pending writes are rejected instead
+    of being rolled back implicitly.
+    """
+
+    if isinstance(caller_db, Session) and not release_db_connection_if_clean(caller_db):
+        raise _AgentRuntimeSessionBoundaryError(
+            "Cannot start agent runtime database work while the caller "
+            "database session has pending writes"
+        )
+
+
+async def _run_agent_runtime_db_io(
+    caller_db: Optional[Session],
+    operation: Callable[[], _RuntimeDBResult],
+) -> _RuntimeDBResult:
+    """Run worker-owned DB work after releasing a clean caller transaction."""
+
+    _release_agent_runtime_caller_session(caller_db)
+    return await run_db_io_cancellation_safe(operation)
+
+
+async def _load_task_setup_snapshot_for_agent(
+    task_id: int,
+    task_owner_user_id: Optional[int],
+    caller_db: Optional[Session],
+) -> Optional[TaskSetupSnapshot]:
+    """Load one detached setup snapshot without a nested pool checkout.
+
+    Legacy transports still pass a request-owned Session. They may use it for
+    authorization or task lookup before this boundary, so a clean read
+    transaction must return its connection before the worker opens the short
+    Session owned by ``load_task_setup_snapshot_sync``. Pending writes are not
+    rolled back; callers must settle them before starting agent construction.
+    """
+
+    return await _run_agent_runtime_db_io(
+        caller_db, lambda: load_task_setup_snapshot_sync(task_id, task_owner_user_id)
+    )
+
+
+async def _load_memory_policy_task_fields_for_agent(
+    task_id: int,
+    task_owner_user_id: int | None,
+    caller_db: Session | None,
+) -> MemoryPolicyTaskFields | None:
+    """Load the authoritative warm-cache policy projection off the loop."""
+
+    return await _run_agent_runtime_db_io(
+        caller_db,
+        lambda: load_memory_policy_task_fields_sync(
+            task_id,
+            task_owner_user_id,
+        ),
+    )
+
+
+# Bound invalidation waits for an unlocked but FIFO-queued build lock.
+_INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
+
+# Process-local acquisition identity. This intentionally outlives individual
+# manager instances: a delayed cleanup may resolve the current global manager
+# only after its original manager was replaced. Reusing a token then would
+# recreate the same ABA hazard as removing and rebuilding one task entry.
+_agent_run_generation_counter = count(1)
+
+# A cached runtime that no execution is using is dropped once this long has
+# passed since it was last acquired, its execution last ended, or its turn last
+# settled. The window keeps a quick follow-up turn on the warm instance.
+_IDLE_RUNTIME_MAX_AGE_SECONDS = 120.0
+# The soft cap never drops a runtime active within this many seconds, which
+# covers the gap between ``get_agent_for_task`` returning and the execution
+# registering itself.
+_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS = 30.0
+# A paused or waiting-for-user execution still owns its slot for a later
+# resume, so its runtime is kept much longer.
+_IDLE_RESUMABLE_MAX_AGE_SECONDS = 1800.0
+# Most idle-but-not-yet-expired runtimes one process keeps once they are older
+# than ``_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS``; the least recently active go
+# first once the count is exceeded.
+_IDLE_RUNTIME_SOFT_CAP = 128
+_IDLE_SWEEP_INTERVAL_SECONDS = 60.0
+
+
+class AgentServiceManager:
+    """Manage AgentService instances for different tasks"""
+
+    def __init__(self, request: Optional[Any] = None) -> None:
+        self._agents: Dict[int, AgentService] = {}
+        # Building an AgentService performs multiple awaits (snapshot/tool/
+        # sandbox setup). Two WebSocket connections can otherwise both observe
+        # a cache miss, build different execution registries for the same task,
+        # and leave pause/message control attached to the instance that loses
+        # the final cache assignment.
+        self._agent_build_locks: Dict[int, asyncio.Lock] = {}
+        # Owner (runtime identity) each cached AgentService was built for. A
+        # task_id-keyed cache must not silently hand back an instance built
+        # under a different user (e.g. once built with the wrong identity).
+        self._agent_owner_ids: Dict[int, Optional[int]] = {}
+        # Run generation that currently owns each cached runtime.
+        self._agent_run_ids: Dict[int, str] = {}
+        # Which *acquisition* of that run owns the runtime. The run id alone
+        # cannot answer this: a resume claims the same run deliberately (so a
+        # waiting checkpoint stays readable), which makes two acquisitions of
+        # one run indistinguishable by id. A previous turn's late cleanup then
+        # matched the resume's runtime and evicted it mid-execution. Bumped on
+        # every acquisition, so a cleanup scheduled by an earlier one no longer
+        # recognizes the runtime and correctly does nothing. Tokens come from
+        # a process-local sequence rather than this removable per-task map, so
+        # eviction and manager replacement cannot make an old token current.
+        self._agent_run_generations: Dict[int, int] = {}
+        # ``_monotonic()`` of each task's latest acquisition, execution end,
+        # settled turn, or sweep that saw it running. The idle sweep measures
+        # a runtime's idle time from it; a missing entry counts as idle
+        # forever.
+        self._agent_last_active_at: Dict[int, float] = {}
+        # Clock used for idle accounting; replaceable so tests need not sleep.
+        self._monotonic: Callable[[], float] = time.monotonic
+        # Periodic idle sweep, started lazily from the first acquisition so it
+        # always runs on the event loop that owns this manager's runtimes.
+        self._idle_sweep_task: Optional["asyncio.Task[None]"] = None
+        # Keep only the owner needed to retry a failed workspace cleanup.
+        self._agent_cleanup_owner_ids: Dict[int, int] = {}
+        self._agent_sandbox_keys: Dict[int, str] = {}
+        # Lease provider each cached AgentService's sandbox tools were built
+        # against, keyed the same as ``_agent_sandbox_keys`` (same lifetime,
+        # always written/popped together). Lets ``_acquire_sandbox_task``
+        # attach by object identity (``SandboxManager.attach_provider``)
+        # instead of by key existence alone, so a provider that was replaced
+        # by a rebuild (mismatch reconcile, sweep, capacity eviction,
+        # release-to-zero) is caught even though the key still resolves to a
+        # live -- but different -- provider (ABA).
+        self._agent_sandbox_providers: Dict[int, Any] = {}
+        # ExecutionScope fingerprint each cached AgentService was built
+        # under (None sentinel = unscoped). Sandbox keys and workspace
+        # paths are baked in at build time, so a task reassigned to a
+        # different scope between turns must evict and rebuild instead of
+        # silently executing in the old scope's namespace.
+        self._agent_scope_fingerprints: Dict[int, Optional[ScopeFingerprint]] = {}
+        # Task model override (``apply_task_model_override``) each cached
+        # AgentService was built from, with the service it belongs to. Its
+        # slots and tools hold that override's models, so a request carrying
+        # a different override -- or none -- must evict and rebuild.
+        self._agent_model_overrides: Dict[
+            int, tuple[AgentService, TaskModelOverride]
+        ] = {}
+        # Ephemeral trusted actor policy bound once to an actor-marked task.
+        # The durable task marker survives restarts; the credential owner does
+        # not, so generic reconstruction remains unsupported.
+        self._mcp_actor_policies: Dict[int, MCPBuiltinOAuthActorPolicy] = {}
+        # Recently evicted fingerprints per task (bounded): resolving back
+        # to any of them points at a resolver cycling between scopes, which
+        # silently rebuilds the agent every turn and defeats the cache. The
+        # bounded memory catches cycles up to its depth (A->B->A and longer
+        # A->B->C->A style periods), not just the immediate flap.
+        self._agent_evicted_scope_fingerprints: Dict[
+            int, deque[Optional[ScopeFingerprint]]
+        ] = {}
+        self._default_llm = create_default_llm()
+        self.request = request
+
+    @staticmethod
+    def _parse_sandbox_key(sandbox_key: str) -> tuple[str, str]:
+        """Split a recorded sandbox key into sandbox-manager lifecycle parts.
+
+        Round-trips through the shared key helpers so the format lives in
+        exactly one place; scoped keys (``user:{owner}:{suffix}``) map to
+        the composite lifecycle id ``{owner}:{suffix}``.
+        """
+        owner_id, suffix = parse_user_sandbox_key(sandbox_key)
+        return USER_LIFECYCLE_TYPE, make_user_lifecycle_id(owner_id, suffix)
+
+    async def _acquire_sandbox_task(self, task_id: Optional[str]) -> Optional[str]:
+        """Attach the task to its sandbox lifecycle for the execution.
+
+        Returns the sandbox key on success, or None when the task runs
+        without sandbox tracking (sandbox disabled, local-execution
+        fallback, or no recorded sandbox for the task). The key is only
+        ever read from the per-task map recorded at sandbox build time —
+        never re-derived from the owner id, because a reconstructed
+        owner-only key would silently miss a scope-suffixed sandbox and
+        skip the ref-count attach.
+
+        When a lease provider was recorded alongside the key, attaches by
+        object identity (``SandboxManager.attach_provider``) rather than
+        key existence alone: the key can still resolve to a live provider
+        after the original one was replaced by a rebuild (mismatch
+        reconcile, sweep, capacity eviction, release-to-zero), and identity
+        is the only way to catch that the cached agent's tools were built
+        against the now-superseded object (ABA). Falls back to the
+        existence-only ``attach()`` when no provider was recorded (e.g. a
+        cache entry from before this field existed).
+
+        Raises:
+            RuntimeError: The task's agent was built with a sandbox lease
+                provider (recorded key, or key+provider) that has since
+                been reclaimed or replaced by the idle sweep, capacity
+                eviction, or a reconcile rebuild. Running anyway would hit
+                deleted containers or a torn-down provider with cryptic
+                tool errors; failing clearly lets a retry rebuild the agent
+                and transparently recreate the sandbox.
+        """
+        if task_id is None:
+            return None
+        try:
+            task_key = int(task_id)
+        except (TypeError, ValueError):
+            return None
+
+        sandbox_key = self._agent_sandbox_keys.get(task_key)
+        if sandbox_key is None:
+            return None
+
+        from ..sandbox_manager import get_sandbox_manager
+
+        sandbox_mgr = get_sandbox_manager()
+        if sandbox_mgr is None:
+            return None
+
+        lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
+        provider = self._agent_sandbox_providers.get(task_key)
+        if provider is not None:
+            attached = await sandbox_mgr.attach_provider(
+                lifecycle_type, lifecycle_id, provider
+            )
+        else:
+            attached = await sandbox_mgr.attach(lifecycle_type, lifecycle_id)
+        if attached:
+            return sandbox_key
+
+        # Evict the stale cached agent so a retry rebuilds its tools
+        # against a freshly created sandbox.
+        self._agents.pop(task_key, None)
+        self._agent_owner_ids.pop(task_key, None)
+        self._agent_sandbox_keys.pop(task_key, None)
+        self._agent_sandbox_providers.pop(task_key, None)
+        self._agent_scope_fingerprints.pop(task_key, None)
+        self._agent_model_overrides.pop(task_key, None)
+        raise RuntimeError(
+            f"The sandbox for task {task_key} was reclaimed before "
+            "execution started (idle reclamation or capacity "
+            "eviction). Please retry the task; the sandbox will be "
+            "recreated automatically."
+        )
+
+    def _evict_agents_for_sandbox(self, sandbox_key: str) -> None:
+        """Drop cached AgentService objects that were built with this sandbox.
+
+        Only agents whose recorded key matches are evicted. The key is
+        recorded at build time and never re-derived, so a cached agent
+        without a recorded key was built for local execution and holds no
+        reference to the released sandbox (the former owner-id supplement
+        existed only for the removed owner-key attach fallback). Scoped and
+        unscoped keys under the same owner are distinct sandboxes, so
+        releasing one never evicts the other's agents.
+        """
+        task_ids = {
+            task_key
+            for task_key, agent_sandbox_key in self._agent_sandbox_keys.items()
+            if agent_sandbox_key == sandbox_key
+        }
+
+        for task_key in task_ids:
+            self._agents.pop(task_key, None)
+            self._agent_owner_ids.pop(task_key, None)
+            self._agent_sandbox_keys.pop(task_key, None)
+            self._agent_sandbox_providers.pop(task_key, None)
+            self._agent_scope_fingerprints.pop(task_key, None)
+            self._agent_model_overrides.pop(task_key, None)
+            logger.info(
+                "Evicted cached AgentService for task %s after releasing sandbox %s",
+                task_key,
+                sandbox_key,
+            )
+
+    async def _get_or_create_task_sandbox(
+        self,
+        *,
+        task_id: int,
+        workspace_owner_id: int,
+        mount_intent: Optional[SandboxMountIntent],
+        scope: Optional[ExecutionScope] = None,
+        prepare_root: Optional[str] = None,
+    ) -> Any | None:
+        """Get the task's sandbox lease provider, or None when sandboxing is disabled.
+
+        When ``scope`` carries a ``sandbox_key_suffix``, the lifecycle key
+        becomes ``user:{owner}:{suffix}`` — a separate container family per
+        scope under the same platform user. Unscoped execution keeps
+        producing ``user:{owner}`` and reuses today's containers untouched.
+
+        ``prepare_root`` (``ChatWorkspaceBinding.prepare_root``) is the
+        on-host directory that must exist for this task's own files — the
+        pre-fold mount root, which folding may have re-rooted ``mount_intent``
+        onto a shallower, shared ancestor (see ``build_chat_workspace_binding``).
+
+        Once sandboxing is enabled, every sandbox acquisition failure fails
+        closed. Capacity exhaustion, lifecycle contract violations, and
+        runtime/service failures must never downgrade a task to host-local
+        execution. ``None`` is returned only when the deployment explicitly
+        disables sandboxing and no manager exists.
+
+        Raises:
+            SandboxCapacityError: The container cap is reached and nothing is
+                evictable.
+            SandboxContractError: The sandbox lifecycle contract was violated
+                (e.g. a runtime-config conflict or a container that needs
+                recovery before use); re-raised for both scoped and unscoped
+                tasks, never downgraded to local execution.
+            Exception: Sandbox creation failed; re-raised instead of running
+                the task on the host.
+        """
+        from ..sandbox_manager import (
+            SandboxCapacityError,
+            SandboxContractError,
+            get_sandbox_manager,
+        )
+
+        sandbox_mgr = get_sandbox_manager()
+        if not sandbox_mgr:
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            return None
+
+        suffix = scope.sandbox_key_suffix if scope is not None else None
+        scoped = suffix is not None
+        try:
+            sandbox = await sandbox_mgr.get_or_create_lease_provider(
+                USER_LIFECYCLE_TYPE,
+                make_user_lifecycle_id(workspace_owner_id, suffix),
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
+            )
+        except SandboxCapacityError as e:
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            logger.warning(
+                "Sandbox capacity reached for workspace owner %s; "
+                "rejecting task %s (scoped=%s): %s",
+                workspace_owner_id,
+                task_id,
+                scoped,
+                e,
+            )
+            raise
+        except SandboxContractError as e:
+            # Fail closed for scoped and unscoped tasks alike: a contract
+            # violation means the desired mount/runtime spec could not be
+            # honored, and the local-execution fallback below exists for
+            # sandbox-service *unavailability*, not for a misconfigured or
+            # conflicting spec. Silently running such a task on the host
+            # would be a bigger surprise than failing the task outright.
+            #
+            # One documented exception, and it is not a downgrade: a *worker*
+            # slot that cannot be provisioned degrades to its own lifecycle's
+            # primary sandbox (``SandboxLeaseProvider.get_worker_sandbox``),
+            # the same correctly scoped container this task already holds.
+            # That costs a concurrency slot, never a trust boundary. What
+            # reaches this handler is the task's own sandbox, where there is
+            # nothing safe to degrade to.
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            logger.error(
+                "Sandbox lifecycle contract violated for task %s (workspace "
+                "owner %s, scoped=%s); failing closed instead of falling "
+                "back to local execution: %s",
+                task_id,
+                workspace_owner_id,
+                scoped,
+                e,
+            )
+            raise
+        except Exception as e:
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            logger.error(
+                "Sandbox creation failed for task %s (workspace owner %s, "
+                "scoped=%s); failing closed instead of running the workload "
+                "locally: %s",
+                task_id,
+                workspace_owner_id,
+                scoped,
+                e,
+            )
+            raise
+
+        self._agent_sandbox_keys[task_id] = make_user_sandbox_key(
+            workspace_owner_id, suffix
+        )
+        self._agent_sandbox_providers[task_id] = sandbox
+        return sandbox
+
+    async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
+        if sandbox_key is None:
+            return
+
+        from ..sandbox_manager import get_sandbox_manager
+
+        sandbox_mgr = get_sandbox_manager()
+        if sandbox_mgr is None:
+            return
+
+        lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
+        try:
+            await sandbox_mgr.release(
+                lifecycle_type,
+                lifecycle_id,
+                on_last_release=lambda: self._evict_agents_for_sandbox(sandbox_key),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to release sandbox %s: %s",
+                sandbox_key,
+                exc,
+            )
+
+    def _get_task_llm_ids(self, task: Task, db: Session) -> List[Optional[str]]:
+        """Return internal model_id identifiers for a task (never provider model_name)."""
+        from .llm_utils import CoreStorage, make_normalize_model_id
+
+        core_storage = CoreStorage(db, DBModel)
+
+        _normalize = make_normalize_model_id(core_storage)
+
+        return [
+            _normalize(
+                getattr(task, "model_id", None), getattr(task, "model_name", None)
+            ),
+            _normalize(
+                getattr(task, "small_fast_model_id", None),
+                getattr(task, "small_fast_model_name", None),
+            ),
+            _normalize(
+                getattr(task, "visual_model_id", None),
+                getattr(task, "visual_model_name", None),
+            ),
+            _normalize(
+                getattr(task, "compact_model_id", None),
+                getattr(task, "compact_model_name", None),
+            ),
+        ]
+
+    def set_task_llms(
+        self, task_id: int, llm_ids: Optional[List[Optional[str]]], db: Session
+    ) -> None:
+        """Set LLM configuration for a specific task (configuration now stored in Task table)"""
+        logger.info(f"set_task_llms called for task {task_id} with llm_ids: {llm_ids}")
+        # Configuration is now stored in Task table, this method is kept for backward compatibility
+        # If AgentService already exists, update its LLM configuration
+        if task_id in self._agents:
+            if self._cached_model_override(task_id) is not None:
+                # Built from a caller-selected override: swapping in the
+                # task's configured (unguarded) models would undo it for the
+                # rest of this run. The next build follows its own snapshot.
+                logger.info(
+                    "Leaving the models of task %s unchanged: its AgentService "
+                    "runs on a task model override",
+                    task_id,
+                )
+                return
+            # This method doesn't have user context, use None for user_id
+            default_llm, fast_llm, vision_llm, compact_llm = resolve_llms_from_names(
+                llm_ids, db, None
+            )
+            agent = self._agents[task_id]
+            agent.llm = default_llm
+            agent.fast_llm = fast_llm
+            agent.vision_llm = vision_llm
+            agent.compact_llm = compact_llm
+            logger.info(
+                f"Updated LLM configuration for existing AgentService task {task_id}: default={default_llm.model_name if default_llm else None}, compact={compact_llm.model_name if compact_llm else None}"
+            )
+
+    def set_task_memory_similarity_threshold(
+        self, task_id: int, threshold: Optional[float]
+    ) -> None:
+        """Set memory similarity threshold for a specific task's agent"""
+        if task_id in self._agents:
+            agent = self._agents[task_id]
+            agent.memory_similarity_threshold = threshold
+            logger.info(
+                f"Set memory similarity threshold for task {task_id}: {threshold}"
+            )
+        else:
+            logger.warning(
+                f"Cannot set memory similarity threshold for non-existent task {task_id}"
+            )
+
+    def _load_persisted_conversation_history(self, task_id: int, db: Session) -> None:
+        """Hydrate an agent's chat transcript from persisted task chat messages."""
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+
+        transcript_window = load_task_transcript_window(db, task_id)
+        conversation_history = transcript_window.messages
+        if not conversation_history:
+            return
+
+        agent.set_conversation_history(
+            conversation_history,
+            watermark=transcript_window.watermark,
+            event_watermark=transcript_window.event_watermark,
+        )
+        logger.info(
+            f"Loaded {len(conversation_history)} persisted chat messages for task {task_id}"
+        )
+
+    async def _load_persisted_execution_context(
+        self, task_id: int, db: Session
+    ) -> None:
+        """Hydrate an agent with persisted reusable execution context."""
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+
+        recovery_state = await load_task_execution_recovery_state(db, task_id)
+        execution_context_messages = recovery_state.get("messages", [])
+        if not execution_context_messages:
+            execution_context_messages = []
+
+        agent.set_execution_context_messages(execution_context_messages)
+        skill_context = recovery_state.get("skill_context")
+        agent.set_recovered_skill_context(skill_context)
+        logger.info(
+            f"Loaded {len(execution_context_messages)} persisted execution context messages for task {task_id}"
+        )
+        if skill_context:
+            logger.info(f"Loaded recovered skill context for task {task_id}")
+
+    # NOTE: The legacy ``_load_agent_builder_config`` instance method
+    # used to live here; its body became a one-line delegate to
+    # ``llm_utils.load_agent_builder_config`` after the runtime-config
+    # refactor and no production caller remained (the snapshot loader
+    # and ``_resolve_task_runtime_config`` both call the module-level
+    # helper directly). Removed to avoid a zero-value wrapper that
+    # only existed as a test-mock surface; tests now patch
+    # ``llm_utils.load_agent_builder_config`` directly.
+
+    @staticmethod
+    def _pick_default_llm_with_warning(
+        default_llm: Optional[BaseLLM],
+        *,
+        task_id: int,
+        has_agent_builder_config: bool,
+        agent_id: Optional[int],
+        saved_model_ids: Optional[dict],
+        user_id: Optional[int],
+        saved_model_descriptors: Optional[dict] = None,
+    ) -> BaseLLM:
+        """Return the default LLM and log a context-rich WARNING.
+
+        Used when no per-task / per-agent LLM could be resolved (e.g. the
+        agent's saved model is unavailable or the caller has no access).
+
+        ``saved_model_descriptors`` (when provided) carries human-readable
+        ``model_id`` / ``model_name`` per slot, which is more useful in logs
+        than the bare ``DBModel.id`` pks recorded in ``saved_model_ids``.
+        """
+        if default_llm is None:
+            if has_agent_builder_config:
+                saved_models_for_log = saved_model_descriptors or saved_model_ids or {}
+                logger.error(
+                    "Agent builder model unavailable and no global default LLM is configured. "
+                    "task_id=%s agent_id=%s agent_saved_models=%s user_id=%s",
+                    task_id,
+                    agent_id,
+                    saved_models_for_log,
+                    user_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent model configuration is unavailable and no global "
+                        "default model is configured."
+                    ),
+                )
+            logger.error(
+                "Task %s has no valid LLM configuration and no default LLM", task_id
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="No valid LLM configuration is available for this task.",
+            )
+
+        fallback_model = (
+            getattr(default_llm, "model_name", None) or type(default_llm).__name__
+        )
+        if has_agent_builder_config:
+            saved_models_for_log = saved_model_descriptors or saved_model_ids or {}
+            logger.warning(
+                "Agent builder model unavailable, falling back to default LLM. "
+                "task_id=%s agent_id=%s agent_saved_models=%s user_id=%s fallback_model=%s",
+                task_id,
+                agent_id,
+                saved_models_for_log,
+                user_id,
+                fallback_model,
+            )
+        else:
+            logger.warning(
+                "Task %s has no valid LLM configuration, using default LLM %s",
+                task_id,
+                fallback_model,
+            )
+        return default_llm
+
+    @staticmethod
+    def _merge_agent_builder_llms(
+        baseline_llms: tuple[
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+        ],
+        agent_llms: tuple[
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+        ],
+    ) -> tuple[
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+    ]:
+        """Overlay agent LLMs without discarding already resolved task LLMs."""
+        return cast(
+            tuple[
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+            ],
+            tuple(
+                agent_llm or baseline_llm
+                for baseline_llm, agent_llm in zip(baseline_llms, agent_llms)
+            ),
+        )
+
+    def _resolve_task_runtime_config(
+        self,
+        *,
+        task_id: int,
+        task: Task,
+        db: Session,
+        user: Optional[User],
+    ) -> dict[str, Any]:
+        """Resolve task / agent-builder LLMs and execution pattern.
+
+        Thin main-loop wrapper around
+        ``llm_utils.resolve_task_runtime_config_core``. Adds the
+        diagnostic logging and the
+        ``_pick_default_llm_with_warning`` fallback that the worker-
+        thread snapshot loader cannot run (the fallback raises
+        ``HTTPException``, which would propagate badly out of a
+        thread).
+
+        Used by ``_reconstruct_agent_from_history`` on the
+        main-loop reconstruct path. The normal-creation path
+        (``get_agent_for_task``) consumes a ``TaskSetupSnapshot``
+        which goes through the same core helper off-loop.
+        """
+        from .llm_utils import resolve_task_runtime_config_core
+
+        logger.info(
+            "Task %s record: agent_type=%s, model_name=%s, compact_model_name=%s",
+            task_id,
+            task.agent_type,
+            task.model_name,
+            task.compact_model_name,
+        )
+
+        user_id_for_resolution: Optional[int] = (
+            int(user.id)
+            if user and user.id is not None
+            else int(task.user_id)
+            if task.user_id is not None
+            else None
+        )
+        core = resolve_task_runtime_config_core(
+            task, db, user_id=user_id_for_resolution
+        )
+
+        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
+
+        logger.info(
+            "Task %s execution_mode=%s -> pattern=%s",
+            task_id,
+            getattr(task, "execution_mode", None),
+            core.task_pattern,
+        )
+        if core.agent_fields is not None:
+            logger.info(
+                "Task %s using Agent Builder config: %s",
+                task_id,
+                core.agent_fields.name,
+            )
+            if core.workforce is not None:
+                # Workforce task keeps its own execution_mode rather
+                # than inheriting from agent_config; surface that so
+                # on-call doesn't confuse it with the legacy override.
+                logger.info(
+                    "Workforce task %s keeping task execution mode -> pattern=%s",
+                    task_id,
+                    core.task_pattern,
+                )
+            else:
+                logger.info(
+                    "Task %s using Agent Builder execution mode: %s -> pattern=%s",
+                    task_id,
+                    (core.agent_config or {}).get("execution_mode"),
+                    core.task_pattern,
+                )
+        elif core.agent_config is not None:
+            # Inline agent_config path (build-preview tasks routed
+            # through normal task flow with config embedded in the row).
+            logger.info(
+                "Task %s using inline Agent Builder config: execution_mode=%s -> pattern=%s",
+                task_id,
+                core.agent_config.get("execution_mode"),
+                core.task_pattern,
+            )
+
+        if not task_llm:
+            task_llm = self._pick_default_llm_with_warning(
+                self._default_llm,
+                task_id=task_id,
+                has_agent_builder_config=core.has_agent_builder_config,
+                agent_id=getattr(task, "agent_id", None),
+                saved_model_ids=(core.agent_config or {}).get("saved_model_ids"),
+                saved_model_descriptors=(core.agent_config or {}).get(
+                    "saved_model_descriptors"
+                ),
+                user_id=user_id_for_resolution,
+            )
+
+        logger.info(
+            "Successfully loaded LLM configuration for task %s: compact_llm=%s",
+            task_id,
+            task_compact_llm.model_name if task_compact_llm else None,
+        )
+        return {
+            "agent_config": core.agent_config,
+            "task_llm": task_llm,
+            "task_fast_llm": task_fast_llm,
+            "task_vision_llm": task_vision_llm,
+            "task_compact_llm": task_compact_llm,
+            "task_pattern": core.task_pattern,
+            "has_agent_builder_config": core.has_agent_builder_config,
+        }
+
+    def _load_task_inline_agent_config(self, task: Task) -> Optional[dict[str, Any]]:
+        if not isinstance(task.agent_config, dict):
+            return None
+
+        inline_config = task.agent_config
+        if not any(
+            key in inline_config
+            for key in ("instructions", "knowledge_bases", "skills", "tool_categories")
+        ):
+            return None
+
+        return {
+            "llms": (None, None, None, None),
+            "execution_mode": getattr(task, "execution_mode", None) or "balanced",
+            "instructions": inline_config.get("instructions"),
+            "skills": inline_config.get("skills") or [],
+            "knowledge_bases": inline_config.get("knowledge_bases") or [],
+            "tool_categories": inline_config.get("tool_categories"),
+            "memory_similarity_threshold": inline_config.get(
+                "memory_similarity_threshold"
+            ),
+            "is_preview": inline_config.get("is_preview"),
+            "preview_agent_id": inline_config.get("preview_agent_id"),
+        }
+
+    async def _build_tools_for_task(
+        self,
+        *,
+        task_id: int,
+        task: Any,
+        db: Optional[Session],
+        user: Union[User, RuntimeUserFields],
+        agent_config: Optional[dict],
+        task_llm: Optional[BaseLLM],
+        task_vision_llm: Optional[BaseLLM],
+        parent_tracer: Optional[Any] = None,
+        scope: Optional[ExecutionScope] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    ) -> tuple[list[Any], Any]:
+        """Build the tool set configured for a web task."""
+        excluded_tool_categories = _task_model_override_excluded_categories(
+            task_setup_snapshot
+        )
+        if task_setup_snapshot is not None:
+            workforce_runtime = task_setup_snapshot.workforce_runtime
+            excluded_agent_id = task_setup_snapshot.excluded_agent_id
+            connector_team_id = (
+                task_setup_snapshot.agent.team_id
+                if task_setup_snapshot.agent is not None
+                else None
+            )
+            # Same agent as connector_team_id above -- both are read off the
+            # same frozen AgentRuntimeFields snapshot, so they can never
+            # describe two different agents.
+            agent_creator_user_id = (
+                task_setup_snapshot.agent.agent_creator_user_id
+                if task_setup_snapshot.agent is not None
+                else None
+            )
+        else:
+            if db is None:
+                raise ValueError("Database session or task snapshot is required")
+            workforce_runtime = resolve_workforce_task_runtime(db, task)
+            excluded_agent_id = None
+            current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
+            # Hardening, not a pinned invariant: this branch is not reachable
+            # from production today (the only caller always supplies a
+            # snapshot). Capture the team id before the exclusion branches
+            # below can reassign ``current_agent`` to an unpublished preview
+            # agent, so a future snapshot-less path cannot silently key the
+            # tool set on the preview agent's team instead of the governing
+            # agent's.
+            # Explicit int(...)/None-check here, unlike the two snapshot-branch
+            # sites above and below: current_agent is a live ORM row (its
+            # team_id is a Column), not the frozen AgentRuntimeFields snapshot
+            # those two already read as a typed Optional[int].
+            connector_team_id = (
+                int(current_agent.team_id)
+                if current_agent is not None and current_agent.team_id is not None
+                else None
+            )
+            # Captured alongside connector_team_id, for the same reason: both
+            # must describe the agent resolved above, never a preview agent
+            # substituted into ``current_agent`` by a branch further down.
+            agent_creator_user_id = (
+                int(current_agent.user_id) if current_agent is not None else None
+            )
+            if current_agent and _is_published_agent(current_agent):
+                excluded_agent_id = int(current_agent.id)
+                logger.info(
+                    f"Task {task_id} is associated with published agent "
+                    f"{current_agent.id} ({current_agent.name}), will exclude from "
+                    "agent tools"
+                )
+            elif agent_config and agent_config.get("preview_agent_id"):
+                preview_user_id = int(task.user_id)
+                current_agent = resolve_authorized_agent(
+                    db,
+                    preview_user_id,
+                    agent_config.get("preview_agent_id"),
+                )
+                if current_agent and current_agent.status == AgentStatus.PUBLISHED:
+                    excluded_agent_id = int(current_agent.id)
+                    logger.info(
+                        f"Preview task {task_id} is for published agent "
+                        f"{current_agent.id} ({current_agent.name}), will exclude from "
+                        "agent tools"
+                    )
+
+        actor_execution = mcp_runtime_authorization_policy is not None
+        tool_selection_spec = _build_tool_selection_spec_for_task(
+            agent_config,
+            workforce_runtime,
+            task_id=task_id,
+            omit_published_agent_tools=actor_execution,
+            include_mcp_tools=actor_execution,
+            excluded_tool_categories=excluded_tool_categories,
+        )
+        workspace_owner_id = int(task.user_id)
+        # Actor-logical access policy + CA mount intent, built by
+        # the single shared projection (see build_chat_workspace_binding's
+        # docstring for the covered/covering/disjoint folding it applies).
+        workspace_binding = build_chat_workspace_binding(workspace_owner_id, scope)
+
+        # Sandbox startup is container/network work that can take seconds;
+        # don't hold this session's read transaction (and its pool slot)
+        # across it (issue #889).
+        if db is not None:
+            release_db_connection_if_clean(db)
+        sandbox = await self._get_or_create_task_sandbox(
+            task_id=task_id,
+            workspace_owner_id=workspace_owner_id,
+            mount_intent=workspace_binding.mount_intent,
+            scope=scope,
+            prepare_root=workspace_binding.prepare_root,
+        )
+
+        return await create_default_tools(
+            db,
+            request=self.request,
+            user=user,
+            task_id=f"web_task_{task_id}",
+            db_task_id=task_id,
+            workspace_owner_id=int(task.user_id),
+            file_operation_access_version=(
+                _file_operation_access_version_from_agent_config(task.agent_config)
+            ),
+            scope=scope,
+            task_runtime_context=_task_runtime_context_for_tool_build(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                source=getattr(task, "source", None),
+            ),
+            allowed_collections=agent_config["knowledge_bases"]
+            if agent_config
+            else None,
+            allowed_skills=agent_config["skills"] if agent_config else None,
+            tool_selection_spec=tool_selection_spec,
+            excluded_agent_id=excluded_agent_id,
+            vision_model=task_vision_llm,
+            sandbox=sandbox,
+            llm=task_llm,
+            allowed_agent_ids=workforce_runtime.allowed_agent_ids
+            if workforce_runtime
+            else None,
+            agent_tool_overrides=workforce_runtime.agent_tool_overrides
+            if workforce_runtime
+            else None,
+            enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+            if workforce_runtime
+            else True,
+            allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+            if workforce_runtime
+            else False,
+            parent_task_id=str(task_id) if workforce_runtime else None,
+            parent_tracer=parent_tracer if workforce_runtime else None,
+            agent_call_stack=workforce_runtime.agent_call_stack
+            if workforce_runtime
+            else None,
+            connector_runtime_turn_id=connector_runtime_turn_id,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+            mcp_actor_execution_identity=mcp_actor_execution_identity,
+            # Same override exclusion as the selection-spec add-back above;
+            # only removes tools (see
+            # ``_task_model_override_excluded_categories``).
+            force_mcp_tools=actor_execution and "mcp" not in excluded_tool_categories,
+            mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
+            mcp_load_summary_tracer=parent_tracer,
+            mcp_load_summary_trace_task_id=str(task_id),
+            connector_team_id=connector_team_id,
+            agent_creator_user_id=agent_creator_user_id,
+            declared_knowledge_bases=agent_config["knowledge_bases"]
+            if agent_config
+            else None,
+        )
+
+    @agent_setup.measure()
+    async def get_agent_for_task(
+        self,
+        task_id: int,
+        db: Optional[Session] = None,
+        user: Optional[Union[User, RuntimeUserFields]] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        task_owner_user_id: Optional[int] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+        task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
+        resolved_execution_scope: Union[
+            ExecutionScope, None, ExecutionScopeNotProvided
+        ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    ) -> AgentService:
+        self._ensure_idle_sweep_task()
+        lock = self._agent_build_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._agent_build_locks[task_id] = lock
+        async with lock:
+            agent = await self._get_agent_for_task_unlocked(
+                task_id,
+                db=db,
+                user=user,
+                task_setup_snapshot=task_setup_snapshot,
+                task_owner_user_id=task_owner_user_id,
+                connector_runtime_turn_id=connector_runtime_turn_id,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                mcp_actor_execution_identity=mcp_actor_execution_identity,
+                task_mode=task_mode,
+                resolved_execution_scope=resolved_execution_scope,
+            )
+            if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
+                self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
+            self._agent_run_generations[task_id] = next(_agent_run_generation_counter)
+            self._agent_last_active_at[task_id] = self._monotonic()
+            return agent
+
+    async def _get_agent_for_task_unlocked(
+        self,
+        task_id: int,
+        db: Optional[Session] = None,
+        user: Optional[Union[User, RuntimeUserFields]] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        task_owner_user_id: Optional[int] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+        task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
+        resolved_execution_scope: Union[
+            ExecutionScope, None, ExecutionScopeNotProvided
+        ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    ) -> AgentService:
+        """Get or create AgentService instance for specific task.
+
+        ``task_setup_snapshot`` is an off-loop snapshot loaded by the
+        upstream caller (``_schedule_bg._runner``). When provided, the
+        in-method ``asyncio.to_thread(load_task_setup_snapshot_sync,
+        ...)`` is skipped -- the snapshot is reused directly. WS
+        callers and any caller that hasn't adopted the snapshot
+        plumbing pass ``None`` and the Step-3 in-method thread call
+        runs as before.
+
+        ``task_owner_user_id`` is the task OWNER's id — the runtime identity
+        the agent runs as (models, tools, OAuth, UserContext). It differs from
+        the acting principal (``user``) when an admin operates on another
+        user's task; callers that loaded/authorized the task should pass it.
+        When omitted it falls back to the snapshot owner, then the task row's
+        owner, then ``user.id``.
+
+        ``task_mode=ACTOR_INTERACTION`` permits reconstruction only after the
+        channel boundary claims the exact waiting actor task as a new run.
+        """
+        # Track whether this invocation already tried the worker-owned snapshot
+        # boundary. Active-task reconstruction and normal creation must share
+        # that single read instead of probing history on the event loop and
+        # then checking out another connection for the full snapshot.
+        task_setup_snapshot_load_attempted = task_setup_snapshot is not None
+
+        # Normalize every cache-miss onto the detached snapshot before the
+        # legacy request Session performs owner/task reads. This keeps its
+        # synchronous QueuePool waits off the event loop and makes one snapshot
+        # the SSOT for existence, owner, runtime identity, configuration, and
+        # reconstruction state. A missing row retains the legacy auto-create
+        # fallback below.
+        if task_setup_snapshot is None and task_id not in self._agents:
+            task_setup_snapshot_load_attempted = True
+            task_setup_snapshot = await _load_task_setup_snapshot_for_agent(
+                task_id,
+                task_owner_user_id,
+                db,
+            )
+
+        persisted_agent_config = (
+            task_setup_snapshot.task.agent_config
+            if task_setup_snapshot is not None
+            else None
+        )
+        actor_marked = (
+            task_id in self._mcp_actor_policies
+            or mcp_runtime_authorization_policy_required(persisted_agent_config)
+        )
+        persisted_policy_identity = mcp_runtime_authorization_policy_identity(
+            persisted_agent_config
+        )
+        if actor_marked and mcp_runtime_authorization_policy is None:
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} requires an MCP runtime authorization policy; "
+                "generic reuse and reconstruction are unsupported"
+            )
+        if mcp_runtime_authorization_policy is not None:
+            if not actor_marked:
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} is not marked for MCP actor execution"
+                )
+            if (
+                persisted_policy_identity is not None
+                and persisted_policy_identity
+                != mcp_runtime_authorization_policy.resource_owner_key
+            ):
+                raise MCPBuiltinOAuthActorPolicyMismatchError(
+                    f"Task {task_id} MCP actor policy does not match its durable identity"
+                )
+            if (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and persisted_policy_identity is None
+            ):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} has no durable MCP actor policy identity"
+                )
+
+            bound_policy = self._mcp_actor_policies.get(task_id)
+            if (
+                bound_policy is not None
+                and bound_policy != mcp_runtime_authorization_policy
+            ):
+                raise MCPBuiltinOAuthActorPolicyMismatchError(
+                    f"Task {task_id} MCP actor policy does not match its "
+                    "task-lifetime binding"
+                )
+            if bound_policy is None:
+                self._mcp_actor_policies[task_id] = mcp_runtime_authorization_policy
+
+        if actor_marked and task_setup_snapshot is not None:
+            if (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and task_setup_snapshot.task.agent_id is not None
+                and task_setup_snapshot.agent is None
+            ):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} claimed agent is unavailable"
+                )
+
+            marked_status = task_setup_snapshot.task.status
+            fresh_direct_build = marked_status in {
+                TaskStatus.PENDING,
+                TaskStatus.RUNNING,
+            } and not (
+                marked_status == TaskStatus.RUNNING
+                and task_setup_snapshot.has_reconstructable_history
+            )
+            actor_interaction_reconstruction = (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and marked_status == TaskStatus.RUNNING
+            )
+            if not (fresh_direct_build or actor_interaction_reconstruction):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} actor-marked reuse or reconstruction is unsupported"
+                )
+
+        # Resolve the runtime identity (OWNER). Everything below — snapshot
+        # load, model resolution, tool config, UserContext — runs as this
+        # identity, never the acting principal. Precedence: explicit owner →
+        # snapshot owner → the task row's owner (authoritative) → the acting
+        # ``user`` as a last resort. Deriving the owner from the task row means
+        # callers that pass only the acting ``user`` (e.g. WS resume / execute
+        # / pause handlers, which authorize the task separately) still run as
+        # the owner, not an admin acting on someone else's task.
+        runtime_user_id: Optional[int] = task_owner_user_id
+        if runtime_user_id is None and task_setup_snapshot is not None:
+            runtime_user_id = int(task_setup_snapshot.task.user_id)
+        if runtime_user_id is None and db is not None:
+            try:
+                owner_row = db.query(Task.user_id).filter(Task.id == task_id).first()
+                if owner_row is not None and owner_row[0] is not None:
+                    runtime_user_id = int(owner_row[0])
+            except Exception:
+                runtime_user_id = None
+        if runtime_user_id is None and user is not None and user.id is not None:
+            runtime_user_id = int(user.id)
+        # Runtime identity for tool policy. Once a detached snapshot exists,
+        # never retain the caller's ORM User: releasing its Session expires the
+        # row, and later attribute access would silently re-checkout the request
+        # connection across async tool construction. The request identity is an
+        # actor/authorization input; the snapshot owner is the runtime identity.
+        runtime_user: Optional[Union[User, RuntimeUserFields]] = user
+        if task_setup_snapshot is not None:
+            snapshot_user = task_setup_snapshot.runtime_user
+            if (
+                snapshot_user is not None
+                and runtime_user_id is not None
+                and snapshot_user.id == runtime_user_id
+            ):
+                runtime_user = snapshot_user
+            else:
+                runtime_user = None
+        elif (
+            runtime_user_id is not None
+            and db is not None
+            and (user is None or user.id is None or int(user.id) != runtime_user_id)
+        ):
+            runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
+        # Detach immediately, whatever the source (the passthrough `user`
+        # default above, or the fresh query just above): the very next
+        # statement below can release `db` (resolve_execution_scope via
+        # _run_agent_runtime_db_io, whose first action is
+        # release_db_connection_if_clean - see _run_agent_runtime_caller_
+        # session), which unconditionally expires every object loaded
+        # through it. A live User surviving past that point would turn
+        # a later attribute read (e.g. voice_from_runtime_user) into an
+        # implicit reload on the event loop - detaching here is the
+        # first point where it's possible: no session-releasing call ran
+        # between `runtime_user` being resolved above and here (an
+        # earlier one, for the cache-miss snapshot load, only runs
+        # before `runtime_user` exists at all, and re-checks out a fresh
+        # connection for the query above regardless). Detaching later,
+        # inside a failure branch after a release already ran, is too
+        # late to help (the row is already expired by then).
+        if isinstance(runtime_user, User):
+            runtime_user = detach_runtime_user_fields(runtime_user)
+
+        # One turn resolves once. Orchestrated execute/resume callers pass the
+        # resolved value explicitly, including ``None`` for an intentionally
+        # unscoped turn. Legacy callers omit it and retain the contextvar-first
+        # fallback used by channels and direct WS paths.
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
+            scope = get_execution_scope()
+            if scope is None:
+                scope = await _run_agent_runtime_db_io(
+                    db,
+                    lambda: resolve_execution_scope(task_id),
+                )
+        else:
+            scope = cast(Optional[ExecutionScope], resolved_execution_scope)
+        fingerprint = scope_fingerprint(scope)
+
+        # Owner invariant: evict a cached AgentService built for a different
+        # owner so we rebuild it under the correct runtime identity instead of
+        # silently reusing the wrong one.
+        if (
+            task_id in self._agents
+            and self._agent_owner_ids.get(task_id) != runtime_user_id
+        ):
+            logger.warning(
+                "Evicting cached AgentService for task %s: built for owner %s, requested %s",
+                task_id,
+                self._agent_owner_ids.get(task_id),
+                runtime_user_id,
+            )
+            # The evicted instance was built for the wrong owner; its workspace
+            # lives under that owner's user-scoped path
+            # (``user_{owner}/web_task_{task_id}``), a different directory from
+            # the correct owner's. Clean it up so no wrong-owner workspace
+            # residue is left behind -- this cannot touch the rebuilt owner's
+            # workspace. Eviction itself must proceed even if cleanup fails.
+            try:
+                self._agents[task_id].cleanup_workspace()
+            except Exception as e:
+                logger.warning(
+                    "Failed to clean up workspace while evicting wrong-owner "
+                    "AgentService for task %s: %s",
+                    task_id,
+                    e,
+                )
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
+
+        # Scope invariant: the cached instance baked its sandbox key (and,
+        # later, workspace paths and memory dimensions) in at build time.
+        # If the embedder reassigned the task to a different scope between
+        # turns, reusing the instance would silently execute in the old
+        # scope's namespace — evict and rebuild instead. The workspace is
+        # NOT cleaned up here: same owner, and the old scope's data must
+        # survive a scope reassignment.
+        if (
+            task_id in self._agents
+            and self._agent_scope_fingerprints.get(task_id) != fingerprint
+        ):
+            evicted_fingerprint = self._agent_scope_fingerprints.get(task_id)
+            recently_evicted = self._agent_evicted_scope_fingerprints.setdefault(
+                task_id, deque(maxlen=_EVICTED_FINGERPRINT_MEMORY)
+            )
+            if fingerprint in recently_evicted:
+                logger.warning(
+                    "Execution scope for task %s cycled back to recently "
+                    "evicted fingerprint %s (now evicting %s): probable "
+                    "resolver bug — a resolver cycling between scopes "
+                    "rebuilds the agent every turn and defeats the per-task "
+                    "cache.",
+                    task_id,
+                    fingerprint,
+                    evicted_fingerprint,
+                )
+            else:
+                logger.warning(
+                    "Evicting cached AgentService for task %s: built under "
+                    "scope fingerprint %s, resolved %s",
+                    task_id,
+                    evicted_fingerprint,
+                    fingerprint,
+                )
+            recently_evicted.append(evicted_fingerprint)
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
+
+        # Model override invariant: the cached instance holds the models it
+        # was built with, in its slots and in its tools. A request carrying a
+        # task model override must not be served by an instance built from
+        # other models, and one built from an override must not serve a new
+        # run that did not bring it; evict and rebuild instead. A lookup
+        # without an override while that instance's run is in progress or
+        # waiting -- pause, resume, a reply injected into the waiting run --
+        # keeps reaching it. The workspace is NOT cleaned up here: same owner.
+        requested_model_override = (
+            task_setup_snapshot.model_override
+            if task_setup_snapshot is not None
+            else None
+        )
+        cached_model_override = (
+            self._cached_model_override(task_id) if task_id in self._agents else None
+        )
+        if (
+            task_id in self._agents
+            and cached_model_override is not requested_model_override
+            and requested_model_override is None
+            and self._agent_run_in_progress(task_id)
+        ):
+            requested_model_override = cached_model_override
+        if (
+            task_id in self._agents
+            and cached_model_override is not requested_model_override
+        ):
+            logger.info(
+                "Rebuilding cached AgentService for task %s: its task model "
+                "override differs from the request's",
+                task_id,
+            )
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
+
+        # A cache hit re-checks owner, scope and model override invariants; memory policy
+        # is resolved on construction. Remembered here so the fall-through can
+        # reconcile the cached service before it is handed to the next turn.
+        rebuilt_this_call = task_id not in self._agents
+        if task_id not in self._agents:
+            # Check if task exists in database
+            task_exists = task_setup_snapshot is not None
+            # ``task`` is widened to ``Task | _TaskFields | None`` because
+            # the LLM-config block below rebinds it from an ORM ``Task``
+            # to a frozen ``_TaskFields`` once the snapshot lands.
+            # Downstream consumers only read primitive attributes
+            # (``user_id``, ``agent_id``, ``agent_config``, ``status``)
+            # which both types expose identically.
+            task: Any = (
+                task_setup_snapshot.task if task_setup_snapshot is not None else None
+            )
+            if task_setup_snapshot is None and db is not None:
+                try:
+                    task = db.query(Task).filter(Task.id == task_id).first()
+                    task_exists = task is not None
+                    if task_exists:
+                        # The pre-query worker observed no row. A concurrent
+                        # creator may have committed it before this legacy
+                        # fallback query, so permit one fresh snapshot load.
+                        task_setup_snapshot_load_attempted = False
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to check task existence for task {task_id}: {e}"
+                    )
+                    task_exists = False
+                    task = None
+
+            if not task_exists:
+                # Create new task record if it doesn't exist
+                if db is not None and user is not None:
+                    try:
+                        new_task = Task(
+                            user_id=user.id,  # Use actual user ID
+                            title=f"Task {task_id}",
+                            description="Auto-created task",
+                            status=TaskStatus.PENDING,
+                            connector_runtime_selected_refs=[],
+                        )
+                        db.add(new_task)
+                        db.commit()
+                        db.refresh(new_task)
+                        task_setup_snapshot_load_attempted = False
+                        logger.info(
+                            f"Created new task record for task {task_id} with user_id={user.id}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to create task record for task {task_id}: {e}"
+                        )
+            else:
+                should_reconstruct = task is not None and task.status in [
+                    TaskStatus.RUNNING,
+                    TaskStatus.PAUSED,
+                    TaskStatus.WAITING_FOR_USER,
+                ]
+                if should_reconstruct:
+                    try:
+                        if task_setup_snapshot is None:
+                            task_setup_snapshot_load_attempted = True
+                            task_setup_snapshot = (
+                                await _load_task_setup_snapshot_for_agent(
+                                    task_id,
+                                    runtime_user_id,
+                                    db,
+                                )
+                            )
+                            if task_setup_snapshot is not None:
+                                task = task_setup_snapshot.task
+                                runtime_user_id = int(task_setup_snapshot.task.user_id)
+                                runtime_user = task_setup_snapshot.runtime_user
+                            else:
+                                logger.info(
+                                    "Task %s disappeared before reconstruction "
+                                    "snapshot loading; skipping reconstruction",
+                                    task_id,
+                                )
+                                should_reconstruct = False
+
+                        # Brand-new SDK task pre-check: ``begin_turn`` flips
+                        # the task to RUNNING before this code runs, but a
+                        # freshly-created task has no history to recover. The
+                        # worker snapshot already owns both history probes, so
+                        # reuse its detached boolean here instead of querying
+                        # the request Session on the event loop.
+                        if (
+                            should_reconstruct
+                            and task is not None
+                            and task.status == TaskStatus.RUNNING
+                            and task_setup_snapshot is not None
+                            and not task_setup_snapshot.has_reconstructable_history
+                        ):
+                            logger.info(
+                                f"Task {task_id} is RUNNING but has no "
+                                "reconstructable history (no trace events, no "
+                                "DAG plan); skipping reconstruct and going to "
+                                "normal creation."
+                            )
+                            should_reconstruct = False
+
+                        if should_reconstruct:
+                            await self._reconstruct_agent_from_history(
+                                task_id,
+                                db,
+                                scope=scope,
+                                task_setup_snapshot=task_setup_snapshot,
+                                connector_runtime_turn_id=connector_runtime_turn_id,
+                                mcp_runtime_authorization_policy=(
+                                    mcp_runtime_authorization_policy
+                                ),
+                                mcp_actor_execution_identity=(
+                                    mcp_actor_execution_identity
+                                ),
+                            )
+                            self._agent_owner_ids[task_id] = runtime_user_id
+                            self._agent_scope_fingerprints[task_id] = fingerprint
+                            self._record_model_override(
+                                task_id, requested_model_override
+                            )
+                            self._sync_connector_runtime_turn(
+                                task_id, connector_runtime_turn_id
+                            )
+                            self._sync_mcp_actor_execution_identity(
+                                task_id, mcp_actor_execution_identity
+                            )
+                            self._sync_execution_scope(task_id, scope)
+                            return self._agents[task_id]
+                    except (
+                        AutoModelUnavailableError,
+                        HTTPException,
+                        TaskOwnerMismatchError,
+                        _AgentRuntimeSessionBoundaryError,
+                    ):
+                        raise
+                    except RequiredMCPUnavailableError:
+                        self._agents.pop(task_id, None)
+                        self._agent_owner_ids.pop(task_id, None)
+                        self._agent_sandbox_keys.pop(task_id, None)
+                        self._agent_sandbox_providers.pop(task_id, None)
+                        self._agent_scope_fingerprints.pop(task_id, None)
+                        self._agent_model_overrides.pop(task_id, None)
+                        raise
+                    except Exception as e:
+                        # Clean up any partial reconstruction that might have occurred
+                        if task_id in self._agents:
+                            logger.info(
+                                f"Cleaning up partially reconstructed agent for task {task_id}"
+                            )
+                            del self._agents[task_id]
+                            self._agent_owner_ids.pop(task_id, None)
+                            self._agent_sandbox_keys.pop(task_id, None)
+                            self._agent_sandbox_providers.pop(task_id, None)
+                            self._agent_scope_fingerprints.pop(task_id, None)
+                            self._agent_model_overrides.pop(task_id, None)
+                        if is_database_pool_timeout(e):
+                            raise
+                        logger.warning(
+                            f"Failed to reconstruct agent from history for task {task_id}: {e}"
+                        )
+                        # Continue with normal agent creation
+
+            # Create tracer with all necessary handlers
+            tracer = create_task_tracer(task_id, user_id=runtime_user_id)
+
+            # Load the contiguous synchronous DB block (Task row,
+            # per-task LLM resolution, optional Agent Builder lookup
+            # with its 0-4 ``DBModel`` queries and 0-4 user-aware LLM
+            # access checks) on a worker thread so the main event
+            # loop stays responsive. Same set of reads the inline
+            # code used to do; see ``load_task_setup_snapshot_sync``
+            # for the strict no-ORM-leak invariant.
+            logger.info(f"Loading LLM configuration for task {task_id} from database")
+            agent_config: Optional[dict] = None
+            task_pattern = "dag_plan_execute"
+            use_dag = True  # Default to DAG pattern (for backward compatibility)
+            excluded_agent_id: Optional[int] = None
+            snapshot: Optional[TaskSetupSnapshot] = None
+            try:
+                if task_setup_snapshot is not None:
+                    # Caller already loaded the snapshot off-loop
+                    # (typically ``_schedule_bg._runner``). Reuse it
+                    # instead of re-spinning a worker thread. The loader's
+                    # owner guard is bypassed on this branch, so re-assert it
+                    # here: the snapshot's owner must match the runtime owner,
+                    # or tools / model / UserContext would split from the
+                    # workspace owner.
+                    if (
+                        runtime_user_id is not None
+                        and int(task_setup_snapshot.task.user_id) != runtime_user_id
+                    ):
+                        raise TaskOwnerMismatchError(
+                            task_id,
+                            runtime_user_id,
+                            int(task_setup_snapshot.task.user_id),
+                        )
+                    snapshot = task_setup_snapshot
+                elif not task_setup_snapshot_load_attempted:
+                    task_setup_snapshot_load_attempted = True
+                    snapshot = await _load_task_setup_snapshot_for_agent(
+                        task_id,
+                        runtime_user_id,
+                        db,
+                    )
+                    if snapshot is not None:
+                        runtime_user_id = int(snapshot.task.user_id)
+                        runtime_user = snapshot.runtime_user
+
+                if snapshot is not None:
+                    task = snapshot.task
+                    logger.info(
+                        f"Task {task_id} record: agent_type={task.agent_type}, "
+                        f"model_name={task.model_name}, "
+                        f"compact_model_name={task.compact_model_name}"
+                    )
+                    task_pattern = snapshot.task_pattern
+                    logger.info(
+                        f"Task {task_id} execution_mode={task.execution_mode} "
+                        f"-> pattern={task_pattern}"
+                    )
+                    task_llm = snapshot.task_llm
+                    task_fast_llm = snapshot.task_fast_llm
+                    task_vision_llm = snapshot.task_vision_llm
+                    task_compact_llm = snapshot.task_compact_llm
+                    agent_config = snapshot.agent_config
+                    excluded_agent_id = snapshot.excluded_agent_id
+
+                    if snapshot.agent is not None:
+                        logger.info(
+                            f"Task {task_id} using Agent Builder config: {snapshot.agent.name}"
+                        )
+                        if agent_config is not None:
+                            logger.info(
+                                f"Task {task_id} using Agent Builder execution "
+                                f"mode: {agent_config.get('execution_mode')} "
+                                f"-> pattern={task_pattern}"
+                            )
+
+                    if not task_llm:
+                        # Two failure modes, two different policies:
+                        #
+                        # 1. Agent-builder agent whose configured models
+                        #    can't be resolved → fail-fast via the
+                        #    shared diagnostic helper. This is a real
+                        #    configuration error (the agent row points
+                        #    at models the runtime can't load); the
+                        #    helper raises HTTPException(500) with
+                        #    saved-model metadata in the log so
+                        #    on-call can trace back to the agent row.
+                        #
+                        # 2. Plain task with no agent-builder layer and
+                        #    no resolvable LLM (e.g. the deployment
+                        #    runs with no LLM env keys at all, or the
+                        #    task is tool-only and never calls an
+                        #    LLM) → silent fallback to ``self._default_llm``
+                        #    even if that itself is None. Some tasks
+                        #    legitimately never invoke an LLM; we
+                        #    cannot turn that case into a 500 without
+                        #    breaking those callers.
+                        if snapshot.agent is not None:
+                            user_id_for_fallback: Optional[int] = (
+                                runtime_user_id
+                                if runtime_user_id is not None
+                                else task.user_id
+                            )
+                            task_llm = self._pick_default_llm_with_warning(
+                                self._default_llm,
+                                task_id=task_id,
+                                has_agent_builder_config=True,
+                                agent_id=task.agent_id,
+                                saved_model_ids=(agent_config or {}).get(
+                                    "saved_model_ids"
+                                ),
+                                saved_model_descriptors=(agent_config or {}).get(
+                                    "saved_model_descriptors"
+                                ),
+                                user_id=user_id_for_fallback,
+                            )
+                        else:
+                            logger.warning(
+                                f"Task {task_id} has no valid LLM configuration; "
+                                "using default LLM (may be None for tool-only tasks)"
+                            )
+                            task_llm = self._default_llm
+
+                    logger.info(
+                        f"Successfully loaded LLM configuration for task {task_id}: "
+                        f"compact_llm="
+                        f"{task_compact_llm.model_name if task_compact_llm else None}"
+                    )
+                else:
+                    # Task row vanished between the existence check and
+                    # the snapshot read. Fall back to the original
+                    # defaults so we still produce a usable AgentService.
+                    logger.error(f"Task {task_id} not found in database!")
+                    task_llm = self._default_llm
+                    task_fast_llm = None
+                    task_vision_llm = None
+                    task_compact_llm = None
+            except (
+                AutoModelUnavailableError,
+                HTTPException,
+                TaskOwnerMismatchError,
+                _AgentRuntimeSessionBoundaryError,
+            ):
+                # Owner mismatch is an identity/authorization fault, not a
+                # recoverable "LLM config failed to load" -- it must not fall
+                # through to the default-LLM path, which would build the
+                # runtime as the wrong user. Propagate it.
+                raise
+            except Exception as e:
+                if is_database_pool_timeout(e):
+                    raise
+                logger.error(
+                    f"Failed to load LLM configuration from task {task_id} database: {e}"
+                )
+                task_llm = self._default_llm
+                task_fast_llm = None
+                task_vision_llm = None
+                task_compact_llm = None
+            llm_info = "database LLM configuration"
+
+            try:
+                # Runtime creation depends on the OWNER identity, not the
+                # acting principal -- guard on the resolved runtime user.
+                if runtime_user is None:
+                    raise ValueError(
+                        "Task owner / runtime user is required for agent creation"
+                    )
+
+                if snapshot is None and db is None:
+                    raise ValueError(
+                        "Task snapshot or database session is required for agent creation"
+                    )
+
+                # ``excluded_agent_id`` for the legacy task-agent
+                # (published-agent) case is pre-computed by the snapshot
+                # loader (same SELECT as LLM resolution). Surface the log
+                # line here so on-call still sees the exclusion in
+                # production logs.
+                if (
+                    excluded_agent_id is not None
+                    and snapshot is not None
+                    and snapshot.agent is not None
+                ):
+                    logger.info(
+                        f"Task {task_id} is associated with published agent "
+                        f"{snapshot.agent.id} ({snapshot.agent.name}), "
+                        "will exclude from agent tools"
+                    )
+
+                workforce_runtime = (
+                    snapshot.workforce_runtime
+                    if snapshot is not None
+                    else resolve_workforce_task_runtime(db, task)
+                    if db is not None and task is not None
+                    else None
+                )
+                # ``runtime_user_id`` is resolved from the persisted task owner
+                # above and remains authoritative even when this path uses a
+                # detached snapshot rather than a live ``Task`` ORM object.
+                if runtime_user_id is None:
+                    raise ValueError(f"Task {task_id} has no resolved owner")
+                workspace_owner_id = int(runtime_user_id)
+                scope_segments = scope.workspace_segments if scope is not None else ()
+                # Actor-logical access policy + CA mount intent,
+                # built by the single shared projection (see
+                # build_chat_workspace_binding's docstring for the
+                # covered/covering/disjoint folding it applies).
+                workspace_binding = build_chat_workspace_binding(
+                    workspace_owner_id, scope
+                )
+
+                # Sandbox startup is container/network work that can take
+                # seconds; don't hold this session's read transaction (and
+                # its pool slot) across it (issue #889).
+                if db is not None:
+                    release_db_connection_if_clean(db)
+                sandbox = await self._get_or_create_task_sandbox(
+                    task_id=task_id,
+                    workspace_owner_id=workspace_owner_id,
+                    mount_intent=workspace_binding.mount_intent,
+                    scope=scope,
+                    prepare_root=workspace_binding.prepare_root,
+                )
+
+                excluded_tool_categories = _task_model_override_excluded_categories(
+                    snapshot
+                )
+                tool_selection_spec = _build_tool_selection_spec_for_task(
+                    agent_config,
+                    workforce_runtime,
+                    task_id=task_id,
+                    omit_published_agent_tools=actor_marked,
+                    include_mcp_tools=actor_marked,
+                    excluded_tool_categories=excluded_tool_categories,
+                )
+
+                tools = await create_default_tools(
+                    db,
+                    request=self.request,
+                    # Owner, not the acting principal: tool config (models,
+                    # OAuth, KB/MCP/SQL visibility, is_admin scope) must be the
+                    # task owner's. The is_admin tri-state in WebToolConfig keeps
+                    # ``request``'s admin from widening this back.
+                    user=runtime_user,
+                    task_id=f"web_task_{task_id}",
+                    db_task_id=task_id,
+                    workspace_owner_id=workspace_owner_id,
+                    file_operation_access_version=(
+                        _file_operation_access_version_from_agent_config(
+                            getattr(task, "agent_config", None)
+                        )
+                    ),
+                    scope=scope,
+                    task_runtime_context=_task_runtime_context_for_tool_build(
+                        task_id=task_id,
+                        user_id=workspace_owner_id,
+                        source=getattr(
+                            task
+                            if task is not None
+                            else getattr(snapshot, "task", None),
+                            "source",
+                            None,
+                        ),
+                    ),
+                    allowed_collections=agent_config["knowledge_bases"]
+                    if agent_config
+                    else None,
+                    allowed_skills=agent_config["skills"] if agent_config else None,
+                    tool_selection_spec=tool_selection_spec,
+                    excluded_agent_id=excluded_agent_id,
+                    vision_model=task_vision_llm,  # Pass task-specific vision model
+                    sandbox=sandbox,
+                    llm=task_llm,  # Pass task-specific LLM
+                    allowed_agent_ids=workforce_runtime.allowed_agent_ids
+                    if workforce_runtime
+                    else None,
+                    agent_tool_overrides=workforce_runtime.agent_tool_overrides
+                    if workforce_runtime
+                    else None,
+                    enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+                    if workforce_runtime
+                    else True,
+                    allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+                    if workforce_runtime
+                    else False,
+                    parent_task_id=str(task_id) if workforce_runtime else None,
+                    parent_tracer=tracer if workforce_runtime else None,
+                    agent_call_stack=workforce_runtime.agent_call_stack
+                    if workforce_runtime
+                    else None,
+                    connector_runtime_turn_id=connector_runtime_turn_id,
+                    mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                    mcp_actor_execution_identity=mcp_actor_execution_identity,
+                    # Same override exclusion as the selection-spec add-back
+                    # above; only removes tools (see
+                    # ``_task_model_override_excluded_categories``).
+                    force_mcp_tools=actor_marked
+                    and "mcp" not in excluded_tool_categories,
+                    mcp_failure_policy=_mcp_failure_policy_for_task_source(
+                        task.source if task is not None else None
+                    ),
+                    mcp_load_summary_tracer=tracer,
+                    mcp_load_summary_trace_task_id=str(task_id),
+                    connector_team_id=(
+                        snapshot.agent.team_id
+                        if snapshot is not None and snapshot.agent is not None
+                        else None
+                    ),
+                    # Same agent as connector_team_id immediately above -- both
+                    # read off the same snapshot, so a governing team is never
+                    # paired with another agent's creator. This is the one of
+                    # the three derivation points that does not have its own
+                    # named local variable; it is folded straight into this
+                    # call because that is how connector_team_id already reads
+                    # here.
+                    agent_creator_user_id=(
+                        snapshot.agent.agent_creator_user_id
+                        if snapshot is not None and snapshot.agent is not None
+                        else None
+                    ),
+                    declared_knowledge_bases=agent_config["knowledge_bases"]
+                    if agent_config
+                    else None,
+                )
+
+                with UserContext(runtime_user_id):
+                    # Unpack tools and tool_config from create_default_tools
+                    tools_list, tool_config = tools
+
+                    # Get system prompt from agent config (if available)
+                    from .agent_prompt import (
+                        apply_user_voice,
+                        enhance_system_prompt_with_kb,
+                        voice_from_runtime_user,
+                    )
+
+                    system_prompt = (
+                        agent_config.get("instructions") if agent_config else None
+                    )
+                    kb_list = (
+                        agent_config.get("knowledge_bases") if agent_config else None
+                    )
+                    system_prompt = enhance_system_prompt_with_kb(
+                        system_prompt, kb_list
+                    )
+                    system_prompt = _build_workforce_system_prompt(
+                        system_prompt, workforce_runtime
+                    )
+                    # `runtime_user` (not a fresh query) - see
+                    # apply_user_voice's docstring for why: this session may
+                    # already be released back to the pool by this point
+                    # (release_db_connection_if_clean above).
+                    system_prompt = apply_user_voice(
+                        system_prompt, voice_from_runtime_user(runtime_user)
+                    )
+
+                    # Extract memory similarity threshold from agent config
+                    memory_similarity_threshold = None
+                    if agent_config and "memory_similarity_threshold" in agent_config:
+                        memory_similarity_threshold = agent_config[
+                            "memory_similarity_threshold"
+                        ]
+                    memory_policy = await resolve_agent_service_memory_policy_async(
+                        task=task,
+                        agent_config=agent_config,
+                    )
+
+                    # Build allowed external directories for the task owner's uploads.
+                    allowed_external_dirs = _build_allowed_external_dirs(
+                        workspace_owner_id,
+                        scope=scope,
+                    )
+
+                    # Reuse the workspace prepared off the event-loop thread.
+                    self._agents[task_id] = AgentService(
+                        budget_policy_provider=budget_policy_provider(
+                            user_id=int(runtime_user.id),
+                            task_id=str(task_id),
+                            scope=scope,
+                        ),
+                        name=f"web_chat_agent_task_{task_id}",
+                        id=f"web_task_{task_id}",  # Use task ID only for workspace
+                        llm=task_llm,
+                        fast_llm=task_fast_llm,
+                        vision_llm=task_vision_llm,
+                        compact_llm=task_compact_llm,
+                        tools=tools_list,
+                        tool_config=tool_config,  # Pass tool_config for proper multi-tenancy
+                        memory=memory_policy.memory,
+                        pattern=task_pattern,  # Use pattern instead of use_dag_pattern
+                        tracer=tracer,
+                        enable_workspace=True,  # Enable workspace functionality
+                        workspace_base_dir=canonical_workspace_base(
+                            workspace_owner_id, scope_segments
+                        ),  # Use user- (and scope-) isolated base directory
+                        allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
+                        scope_segments=scope_segments,
+                        task_id=str(task_id),  # Pass task_id for proper tracing
+                        memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
+                        memory_enabled=memory_policy.memory_enabled,
+                        memory_available=memory_policy.memory_available,
+                        memory_availability_reason=memory_policy.public_availability_reason,
+                        memory_tools_factory=memory_policy.memory_tools_factory,
+                        execution_metadata=memory_policy.execution_metadata(
+                            ambient_owner_user_id=runtime_user_id,
+                            ambient_execution_scope=scope,
+                        ),
+                        system_prompt=system_prompt,  # Pass agent builder instructions
+                        workspace=(
+                            tool_config.get_task_runtime_workspace()
+                            if tool_config is not None
+                            else None
+                        ),
+                    )
+                    try:
+                        self._sweep_idle_runtimes(
+                            reason="insert", just_inserted=task_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Idle runtime sweep after building the runtime for "
+                            "task %s failed",
+                            task_id,
+                            exc_info=True,
+                        )
+
+                    selected_file_ids = _selected_file_ids_from_agent_config(
+                        task.agent_config if task is not None else None
+                    )
+
+                    workspace = self._agents[task_id].workspace
+                    if selected_file_ids and workspace is not None:
+                        await run_db_io_cancellation_safe(
+                            lambda: _register_selected_task_files_isolated(
+                                workspace,
+                                task_id=task_id,
+                                task_owner_id=int(runtime_user.id),
+                                selected_file_ids=selected_file_ids,
+                            )
+                        )
+
+                pattern_info = (
+                    f"with DAG pattern and workspace using {llm_info}"
+                    if use_dag
+                    else "with workspace (no LLM configured)"
+                )
+                logger.info(
+                    f"Created new AgentService for task {task_id} {pattern_info}"
+                )
+
+                if task_exists and snapshot is not None:
+                    agent_service = self._agents[task_id]
+                    agent_service.set_conversation_history(
+                        [dict(message) for message in snapshot.conversation_history],
+                        watermark=snapshot.conversation_watermark,
+                        event_watermark=snapshot.conversation_event_watermark,
+                    )
+                    recovery_state = await materialize_task_execution_recovery_state(
+                        snapshot.execution_recovery
+                    )
+                    agent_service.set_execution_context_messages(
+                        recovery_state.get("messages", [])
+                    )
+                    agent_service.set_recovered_skill_context(
+                        recovery_state.get("skill_context")
+                    )
+                elif task_exists and db is not None:
+                    self._load_persisted_conversation_history(task_id, db)
+                    await self._load_persisted_execution_context(task_id, db)
+
+            except Exception as e:
+                # ``exc_info`` because this arm absorbs any wrapped fault --
+                # a durable-storage one from attachment restore included --
+                # whose provider cause lives only in ``__cause__`` (#1467).
+                # It re-raises, so nothing but the log line changes.
+                logger.error(
+                    f"Failed to create AgentService for task {task_id}: {e}",
+                    exc_info=True,
+                )
+                # Re-raise the exception - no fallback logic allowed
+                raise
+
+        if not rebuilt_this_call:
+            policy_task: Any | None
+            policy_lookup_failure_reason: str | None = None
+            if task_setup_snapshot is not None:
+                policy_task = task_setup_snapshot.task
+                persisted_agent_config = task_setup_snapshot.agent_config
+            else:
+                try:
+                    policy_task = await _load_memory_policy_task_fields_for_agent(
+                        task_id,
+                        runtime_user_id,
+                        db,
+                    )
+                    if policy_task is None:
+                        policy_lookup_failure_reason = MEMORY_POLICY_TASK_MISSING_REASON
+                        persisted_agent_config = None
+                    else:
+                        persisted_agent_config = policy_task.agent_config
+                except TaskOwnerMismatchError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Failed to refresh memory eligibility for cached task %s; "
+                        "this turn runs with memory disabled",
+                        task_id,
+                    )
+                    policy_task = None
+                    persisted_agent_config = None
+                    policy_lookup_failure_reason = (
+                        MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON
+                    )
+            await self._reconcile_cached_agent_memory_policy(
+                task_id,
+                task=policy_task,
+                agent_config=persisted_agent_config,
+                ambient_owner_user_id=runtime_user_id,
+                ambient_execution_scope=scope,
+                lookup_failure_reason=policy_lookup_failure_reason,
+            )
+
+        self._agent_owner_ids[task_id] = runtime_user_id
+        self._agent_scope_fingerprints[task_id] = fingerprint
+        self._record_model_override(task_id, requested_model_override)
+        self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
+        self._sync_mcp_actor_execution_identity(task_id, mcp_actor_execution_identity)
+        self._sync_execution_scope(task_id, scope)
+        return self._agents[task_id]
+
+    def _agent_run_in_progress(self, task_id: int) -> bool:
+        """Whether the cached AgentService has a running or resumable execution."""
+        agent = self._agents.get(task_id)
+        try:
+            status = agent.get_execution_status(str(task_id))  # type: ignore[union-attr]
+            if not status:
+                return False
+            return bool(status.get("is_running") or status.get("is_resumable"))
+        except Exception:  # noqa: BLE001 - unknown: keep the run reachable
+            return True
+
+    def _cached_model_override(self, task_id: int) -> Optional[TaskModelOverride]:
+        """The task model override the cached AgentService was built from."""
+        entry = self._agent_model_overrides.get(task_id)
+        if entry is None or entry[0] is not self._agents.get(task_id):
+            return None
+        return entry[1]
+
+    def _record_model_override(
+        self, task_id: int, override: Optional[TaskModelOverride]
+    ) -> None:
+        agent = self._agents.get(task_id)
+        if agent is None or override is None:
+            self._agent_model_overrides.pop(task_id, None)
+        else:
+            self._agent_model_overrides[task_id] = (agent, override)
+
+    async def _reconcile_cached_agent_memory_policy(
+        self,
+        task_id: int,
+        *,
+        task: Optional[Any],
+        agent_config: Optional[Mapping[str, Any]],
+        ambient_owner_user_id: int | None,
+        ambient_execution_scope: ExecutionScope | None,
+        lookup_failure_reason: str | None = None,
+    ) -> None:
+        """Re-resolve memory policy for a cached AgentService before its turn.
+
+        The cache-hit path checks owner, scope and model override invariants, so
+        without this a service built while memory was serving would keep
+        ``memory_enabled``, its published store and its execution-scoped
+        memory tools for the rest of its life -- reading and writing through
+        the adapter built for a vector space the authority no longer
+        describes.
+
+        This resolution is also the cross-worker signal. It reaches
+        ``get_memory_store()``, whose drift check re-reads the shared
+        authority row, so an authority change an administrator made, or a
+        revocation another worker already performed, advances *this* worker's
+        publication generation too -- and from that point every proxy this
+        worker has handed out fails closed on its own process-local check,
+        including one a cached agent is already holding. That is the
+        non-obvious part: nothing else on the cache-hit path re-reads the
+        shared authority, so a worker that is not building agents would never
+        learn. It costs exactly the one authority read the manager's drift
+        check already performs, and nothing is added to any per-operation
+        path: ``RevocableMemoryStore._live()`` stays lock-free and never
+        touches the database.
+
+        The minimal task projection passed here contains every field that
+        decides eligibility, so reconciliation is deliberately bidirectional:
+        preview and Agent Builder transitions can disable and later re-enable
+        memory without rebuilding the rest of the runtime.  Resolution awaits
+        first; applying the complete policy does not await and runs under the
+        per-task build lock.
+
+        An operation already past its ``_live()`` check completes. That is
+        inherent to any revocation boundary -- the check cannot un-issue a
+        call that is already inside the store -- and the deployment contract
+        already requires quiescing writers for a vector-space change, so
+        nothing here tries to abort work in flight.
+        """
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+
+        if lookup_failure_reason is not None:
+            policy = AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=lookup_failure_reason,
+            )
+        else:
+            policy = await resolve_agent_service_memory_policy_async(
+                task=task,
+                agent_config=agent_config,
+            )
+        execution_metadata = policy.execution_metadata(
+            ambient_owner_user_id=ambient_owner_user_id,
+            ambient_execution_scope=ambient_execution_scope,
+        )
+        if not policy.memory_available:
+            agent.revoke_memory(
+                inert_store=policy.memory,
+                availability_reason=policy.public_availability_reason,
+                execution_metadata=execution_metadata,
+            )
+        else:
+            agent.apply_memory_policy(
+                memory=policy.memory,
+                enabled=policy.memory_enabled,
+                available=True,
+                availability_reason=policy.public_availability_reason,
+                memory_tools_factory=policy.memory_tools_factory,
+                execution_metadata=execution_metadata,
+            )
+        if not policy.memory_available:
+            logger.warning(
+                "Reconciled cached AgentService for task %s onto an inert "
+                "memory store (%s); this turn runs with memory disabled",
+                task_id,
+                policy.memory_availability_reason,
+            )
+
+    def _sync_connector_runtime_turn(
+        self, task_id: int, connector_runtime_turn_id: Optional[str]
+    ) -> None:
+        if not connector_runtime_turn_id:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s: no turn id",
+                task_id,
+            )
+            return
+
+        agent = self._agents.get(task_id)
+        if agent is None:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s turn %s: agent is not cached",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            return
+
+        tool_config = agent.tool_config
+        if tool_config is None:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s turn %s: "
+                "agent has no tool config",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            return
+
+        if tool_config.set_connector_runtime_turn_id(connector_runtime_turn_id):
+            logger.info(
+                "Refreshing connector runtime tools for task %s turn %s",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            agent.invalidate_tools()
+        else:
+            logger.debug(
+                "Connector runtime tools already use task %s turn %s",
+                task_id,
+                connector_runtime_turn_id,
+            )
+
+    def _sync_mcp_actor_execution_identity(
+        self,
+        task_id: int,
+        identity: MCPActorExecutionIdentity | None,
+    ) -> None:
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+        tool_config = getattr(agent, "tool_config", None)
+        if tool_config is None or not hasattr(
+            tool_config, "set_mcp_actor_execution_identity"
+        ):
+            return
+        if tool_config.set_mcp_actor_execution_identity(identity):
+            logger.info(
+                "Refreshing actor MCP tools for task %s execution identity",
+                task_id,
+            )
+            agent.invalidate_tools()
+
+    def _sync_execution_scope(
+        self, task_id: int, scope: Optional[ExecutionScope]
+    ) -> None:
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+        # getattr/hasattr, not direct access: pause/resume off-turn builds
+        # store agents whose config is a DefaultToolConfig (no
+        # set_execution_scope), and the cached-return path this runs on must
+        # not blow up into the reconstruct fallback for them.
+        tool_config = getattr(agent, "tool_config", None)
+        if tool_config is None or not hasattr(tool_config, "set_execution_scope"):
+            return
+        if tool_config.set_execution_scope(scope):
+            logger.info(
+                "Refreshing tools for task %s: execution scope advanced", task_id
+            )
+            agent.invalidate_tools()
+
+    async def invalidate_cached_agents_for_owner(self, owner_user_id: int) -> None:
+        """Evict every cached AgentService owned by ``owner_user_id`` that
+        is not currently mid-execution.
+
+        A cached AgentService bakes its system prompt in at construction
+        time (``AgentService.__init__`` -> ``self._base_system_prompt``)
+        and the cache-hit path only re-checks owner/scope invariants, not
+        preferences - so a voice PATCH would otherwise be silently ignored
+        by every already-warm task until incidental eviction/rebuild.
+        Call this right after committing a voice change so the next turn
+        on each affected task rebuilds from a fresh snapshot instead.
+
+        Two races this must not create, both found by review on the first
+        version of this method:
+
+        - Popping a task's AgentService while it has an in-flight
+          execution orphans that execution - the next live-control call
+          (stop/interrupt/message) builds a *new* AgentService with an
+          empty execution registry, disconnected from the real run
+          (get_agent_for_task/_get_agent_for_task_unlocked). Guarded by
+          checking get_execution_status before evicting: is_running or
+          is_resumable (paused/waiting-for-user, which still holds the
+          slot for a resume) means this task's eviction is deferred, not
+          forced - the same tolerance for eventual (not immediate) cache
+          consistency already accepted for the cross-process case tracked
+          in issue #1639.
+        - Racing a concurrent build (get_agent_for_task, guarded by
+          _agent_build_locks) is not just "which one goes first": a build
+          already past its old-voice prompt construction has nothing left
+          for a same-moment pop to invalidate, and would then overwrite
+          this eviction with the stale-voice result the instant it
+          finishes. Checking the same per-task lock's locked() before
+          deciding this task's fate detects the common case of that race
+          without blocking on it: a build already in flight (sandbox
+          startup, remote MCP init - multi-second work) would otherwise
+          serialize every one of this owner's *other* concurrent tasks'
+          invalidation behind it with no timeout, turning one voice PATCH
+          into a multi-second stall. locked() alone isn't quite enough,
+          though: asyncio.Lock is FIFO-fair, so a second get_agent_for_task
+          call already queued behind an in-flight build for the *same*
+          task_id can leave locked() briefly False the instant the first
+          build releases, while acquire() still queues behind that second
+          waiter rather than taking the fast path - an unbounded `async
+          with lock` here would then block for that waiter's own build
+          duration too. Bounding the acquire itself with a short timeout
+          closes that gap without reintroducing the original stall: on a
+          genuinely free lock the acquire is immediate (well under the
+          bound); on a busy one - contended or merely FIFO-queued - it
+          defers, same as the locked() check catches directly. A busy/
+          timed-out lock defers this task's eviction, the same tolerance-
+          for-eventual-consistency already used for an in-flight execution
+          above - a later voice PATCH from the same user, or an unrelated
+          eviction (task removal, owner/scope change), still catches the
+          stale-voice result once the build finishes; absent either of
+          those, it persists for the cached instance's remaining lifetime.
+
+        Mirrors the scope-fingerprint-mismatch eviction above: the
+        workspace is deliberately NOT cleaned up here (same owner, same
+        on-disk data must survive the rebuild) - only the manager's cache
+        bookkeeping is cleared, and only for tasks actually evicted.
+        """
+        stale_task_ids = [
+            task_id
+            for task_id, cached_owner_id in self._agent_owner_ids.items()
+            if cached_owner_id == owner_user_id
+        ]
+        evicted_task_ids: List[int] = []
+        deferred_task_ids: List[int] = []
+        for task_id in stale_task_ids:
+            lock = self._agent_build_locks.get(task_id)
+            # A lock already held means a build is in flight for this
+            # task - defer rather than block on it (see docstring); only
+            # ever create a fresh lock (never contended, so never blocks)
+            # for the case where invalidation reaches a task_id no build
+            # has touched yet.
+            if lock is not None and lock.locked():
+                deferred_task_ids.append(task_id)
+                continue
+            if lock is None:
+                lock = asyncio.Lock()
+                self._agent_build_locks[task_id] = lock
+            try:
+                # Bounded, not `async with lock:` - see docstring's FIFO-
+                # fairness note. A free lock acquires immediately, well
+                # under this bound; only a contended/queued one times out.
+                await asyncio.wait_for(
+                    lock.acquire(), timeout=_INVALIDATION_LOCK_ACQUIRE_TIMEOUT
+                )
+            except TimeoutError:
+                deferred_task_ids.append(task_id)
+                continue
+            try:
+                agent = self._agents.get(task_id)
+                if agent is not None:
+                    status = agent.get_execution_status(str(task_id))
+                    if status is not None and (
+                        status.get("is_running") or status.get("is_resumable")
+                    ):
+                        deferred_task_ids.append(task_id)
+                        continue
+                self._agents.pop(task_id, None)
+                self._agent_owner_ids.pop(task_id, None)
+                self._agent_sandbox_keys.pop(task_id, None)
+                self._agent_sandbox_providers.pop(task_id, None)
+                self._agent_scope_fingerprints.pop(task_id, None)
+                self._agent_model_overrides.pop(task_id, None)
+                self._agent_evicted_scope_fingerprints.pop(task_id, None)
+                evicted_task_ids.append(task_id)
+            finally:
+                lock.release()
+        if evicted_task_ids:
+            logger.info(
+                "Invalidated %d cached AgentService(s) for user %s after a "
+                "preference change: %s",
+                len(evicted_task_ids),
+                owner_user_id,
+                evicted_task_ids,
+            )
+        if deferred_task_ids:
+            logger.info(
+                "Deferred cache invalidation for %d in-flight task(s) for "
+                "user %s after a preference change - will pick up the new "
+                "preferences on a later eviction/rebuild: %s",
+                len(deferred_task_ids),
+                owner_user_id,
+                deferred_task_ids,
+            )
+
+    def _runtime_bookkeeping_maps(self) -> tuple[dict[int, Any], ...]:
+        """Per-task maps stored alongside a cached runtime, besides the idle clock."""
+        return (
+            self._agents,
+            self._agent_owner_ids,
+            self._agent_sandbox_keys,
+            self._agent_sandbox_providers,
+            self._agent_scope_fingerprints,
+            self._agent_model_overrides,
+            self._agent_run_ids,
+            self._agent_run_generations,
+            self._agent_evicted_scope_fingerprints,
+        )
+
+    def _forget_runtime(self, task_id: int) -> None:
+        """Drop every per-task cache entry for a runtime this process is done with.
+
+        Clears the cached ``AgentService`` and all bookkeeping stored with it,
+        but neither the workspace nor ``_agent_cleanup_owner_ids`` (a failed
+        workspace cleanup still needs its owner) nor ``_mcp_actor_policies``
+        and ``_agent_build_locks`` (their own owners decide when those go).
+        """
+        for bookkeeping in self._runtime_bookkeeping_maps():
+            bookkeeping.pop(task_id, None)
+        self._agent_last_active_at.pop(task_id, None)
+
+    def _prune_build_lock(self, task_id: int) -> None:
+        """Drop a task's build lock once nothing can still depend on it.
+
+        Removed only when the task has no cached runtime, the lock is neither
+        held nor awaited (replacing a lock someone is queued on would let a
+        second builder bypass single-flight), and the task has not been
+        acquired within the minimum idle age.
+        """
+        if task_id in self._agents:
+            return
+        lock = self._agent_build_locks.get(task_id)
+        if lock is None or lock.locked() or getattr(lock, "_waiters", None):
+            return
+        active_at = self._agent_last_active_at.get(task_id)
+        if (
+            active_at is not None
+            and self._monotonic() - active_at < _IDLE_RUNTIME_MAX_AGE_SECONDS
+        ):
+            return
+        self._agent_build_locks.pop(task_id, None)
+
+    def _sweep_idle_runtimes(
+        self, *, reason: str, just_inserted: Optional[int] = None
+    ) -> None:
+        """Drop cached runtimes that nothing in this process is using.
+
+        Synchronous and never awaits, so the decision and the removal are one
+        atomic step on the event loop. A cached runtime is kept when its task
+        is the one just inserted, an MCP actor task (those are released only
+        by ``remove_agent``), holds its build lock, has an execution running,
+        or reports a status that cannot be read. Otherwise it is dropped once
+        it has been idle -- measured from its latest acquisition, execution
+        end or settled turn -- for ``_IDLE_RUNTIME_MAX_AGE_SECONDS``, or
+        ``_IDLE_RESUMABLE_MAX_AGE_SECONDS`` when a paused or waiting execution
+        may still resume on it. A running runtime's idle clock is refreshed by
+        every sweep that observes it.
+
+        After that, if more than ``_IDLE_RUNTIME_SOFT_CAP`` runtimes remain
+        that are droppable, not yet old enough to expire and idle for at least
+        ``_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS``, the least recently active
+        among them are dropped as well. Runtimes protected above, resumable, or
+        more recently active than that floor never count towards the cap and
+        are never dropped by it.
+
+        Leftover per-task bookkeeping of tasks without a cached runtime (for
+        example after sandbox eviction) is cleared under the same lock and
+        idle-age conditions, and unused build locks are pruned last.
+        """
+        now = self._monotonic()
+
+        def idle_seconds(task_id: int) -> float:
+            active_at = self._agent_last_active_at.get(task_id)
+            return float("inf") if active_at is None else now - active_at
+
+        def build_lock_held(task_id: int) -> bool:
+            lock = self._agent_build_locks.get(task_id)
+            return lock is not None and lock.locked()
+
+        young_droppable: List[tuple[float, int]] = []
+        for task_id, agent in list(self._agents.items()):
+            if task_id == just_inserted or task_id in self._mcp_actor_policies:
+                continue
+            if build_lock_held(task_id):
+                continue
+            try:
+                status = agent.get_execution_status(str(task_id))
+            except Exception:
+                logger.debug(
+                    "Keeping cached AgentService for task %s: execution status "
+                    "is unavailable",
+                    task_id,
+                    exc_info=True,
+                )
+                continue
+            if status and status.get("is_running"):
+                self._agent_last_active_at[task_id] = now
+                continue
+            resumable = bool(status and status.get("is_resumable"))
+            max_age = (
+                _IDLE_RESUMABLE_MAX_AGE_SECONDS
+                if resumable
+                else _IDLE_RUNTIME_MAX_AGE_SECONDS
+            )
+            idle = idle_seconds(task_id)
+            if idle >= max_age:
+                self._forget_runtime(task_id)
+                logger.info(
+                    "Evicted idle cached AgentService for task %s (idle %.0fs, %s)",
+                    task_id,
+                    idle,
+                    reason,
+                )
+            elif not resumable and idle >= _IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS:
+                young_droppable.append((self._agent_last_active_at[task_id], task_id))
+
+        overflow = len(young_droppable) - _IDLE_RUNTIME_SOFT_CAP
+        if overflow > 0:
+            young_droppable.sort()
+            for _, task_id in young_droppable[:overflow]:
+                idle = idle_seconds(task_id)
+                self._forget_runtime(task_id)
+                logger.info(
+                    "Evicted idle cached AgentService for task %s (idle %.0fs, %s)",
+                    task_id,
+                    idle,
+                    f"{reason}, soft cap",
+                )
+
+        leftover_task_ids = set().union(
+            *self._runtime_bookkeeping_maps(), self._agent_last_active_at
+        ) - set(self._agents)
+        for task_id in leftover_task_ids:
+            if (
+                task_id in self._mcp_actor_policies
+                or build_lock_held(task_id)
+                or idle_seconds(task_id) < _IDLE_RUNTIME_MAX_AGE_SECONDS
+            ):
+                continue
+            self._forget_runtime(task_id)
+
+        for task_id in [
+            t for t in list(self._agent_build_locks) if t not in self._agents
+        ]:
+            self._prune_build_lock(task_id)
+
+    def note_runtime_settled(self, task_id: int) -> None:
+        """Run one idle sweep because a turn for ``task_id`` just finished.
+
+        Settling refreshes the task's idle clock, so a follow-up within the
+        idle window reuses the warm runtime; the runtime is then dropped by
+        the same idle rules as any other. A task without a cached runtime gets
+        no entry. Must be called on the event-loop thread; calling it from a
+        worker thread raises ``RuntimeError`` instead of mutating the caches
+        concurrently.
+        """
+        asyncio.get_running_loop()
+        logger.debug("Cached runtime for task %s settled", task_id)
+        if task_id in self._agents:
+            self._agent_last_active_at[task_id] = self._monotonic()
+        self._sweep_idle_runtimes(reason="settled")
+
+    def _ensure_idle_sweep_task(self) -> None:
+        """Start this manager's periodic idle sweep on the running event loop."""
+        loop = asyncio.get_running_loop()
+        task = self._idle_sweep_task
+        if task is not None and not task.done() and task.get_loop() is loop:
+            return
+        self._idle_sweep_task = loop.create_task(self._idle_sweep_loop())
+
+    async def _idle_sweep_loop(self) -> None:
+        """Sweep periodically until the manager is replaced."""
+        while True:
+            await asyncio.sleep(_IDLE_SWEEP_INTERVAL_SECONDS)
+            if _global_agent_manager is not self:
+                return
+            try:
+                self._sweep_idle_runtimes(reason="periodic")
+            except Exception:
+                logger.warning("Periodic idle runtime sweep failed", exc_info=True)
+
+    def current_run_generation(self, task_id: int) -> Optional[int]:
+        """Which acquisition of this task's runtime is current, if any.
+
+        A caller that will schedule cleanup for the runtime it just acquired
+        reads this and passes it back as ``expected_run_generation``, so its
+        cleanup cannot evict a runtime a *later* acquisition owns. Needed
+        because a resume deliberately re-claims the same run id, which leaves
+        the id unable to tell two acquisitions apart.
+        """
+        return self._agent_run_generations.get(task_id)
+
+    def remove_agent(
+        self,
+        task_id: int,
+        user_id: Optional[int] = None,
+        *,
+        expected_run_id: Optional[str] = None,
+        expected_run_generation: Optional[int] = None,
+        workspace_target: Optional[WorkspaceCleanupTarget] = None,
+    ) -> None:
+        """Clean a task runtime only for the run that scheduled cleanup.
+
+        ``workspace_target`` is used only when no agent is cached: a cached one
+        knows its own workspace path and needs no capture. Deletion callers
+        pass a target captured before the task row was deleted, because the
+        path is no longer derivable once the row is gone.
+        """
+        current_run_id = self._agent_run_ids.get(task_id)
+        current_generation = self._agent_run_generations.get(task_id)
+        build_lock = self._agent_build_locks.get(task_id)
+        # Checked before the run-id comparison and independently of it: within
+        # one run, the generation is the only thing that distinguishes the
+        # acquisition that scheduled this cleanup from a later one that now
+        # owns the runtime.
+        if (
+            expected_run_generation is not None
+            and current_generation is not None
+            and current_generation != expected_run_generation
+        ):
+            logger.info(
+                "Skipping stale runtime cleanup for task %s generation %s; "
+                "current generation is %s",
+                task_id,
+                expected_run_generation,
+                current_generation,
+            )
+            return
+        if expected_run_id is not None and (
+            (current_run_id is not None and current_run_id != expected_run_id)
+            or (build_lock is not None and build_lock.locked())
+        ):
+            logger.info(
+                "Skipping stale runtime cleanup for task %s run %s; current run is %s",
+                task_id,
+                expected_run_id,
+                current_run_id,
+            )
+            return
+
+        agent = self._agents.get(task_id)
+        cleanup_user_id = user_id
+        if cleanup_user_id is None:
+            cleanup_user_id = self._agent_owner_ids.get(task_id)
+        if cleanup_user_id is None:
+            cleanup_user_id = self._agent_cleanup_owner_ids.get(task_id)
+
+        cleanup_succeeded = False
+        try:
+            if agent is not None:
+                workspace = agent.workspace
+                workspace_path = (
+                    str(workspace.workspace_dir) if workspace is not None else None
+                )
+                if workspace_path:
+                    logger.info(
+                        "Deleting workspace path for task %s: %s",
+                        task_id,
+                        workspace_path,
+                    )
+                agent.cleanup_workspace()
+                logger.info("Cleaned up workspace for task %s", task_id)
+            else:
+                self._cleanup_workspace_directory(
+                    task_id, cleanup_user_id, target=workspace_target
+                )
+            cleanup_succeeded = True
+        finally:
+            if cleanup_succeeded:
+                self._agent_cleanup_owner_ids.pop(task_id, None)
+            elif cleanup_user_id is not None:
+                self._agent_cleanup_owner_ids[task_id] = cleanup_user_id
+
+            self._agents.pop(task_id, None)
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_run_ids.pop(task_id, None)
+            self._agent_run_generations.pop(task_id, None)
+            self._agent_last_active_at.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
+            self._agent_evicted_scope_fingerprints.pop(task_id, None)
+            self._mcp_actor_policies.pop(task_id, None)
+
+            # Do not replace a lock held by an in-flight builder: a fresh lock
+            # would let another caller bypass single-flight and race it.
+            build_lock = self._agent_build_locks.get(task_id)
+            if build_lock is not None and not build_lock.locked():
+                self._agent_build_locks.pop(task_id, None)
+            logger.info("Removed AgentService runtime for task %s", task_id)
+
+    async def execute_task(
+        self,
+        agent_service: "AgentService",
+        task: str,
+        context: Optional[Dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        tracking_task_id: Optional[str] = None,
+        db_session: Optional[Any] = None,
+        *,
+        manage_task_lease: bool = True,
+        task_lease: TaskLease | None = None,
+        task_lease_heartbeat_task: (
+            asyncio.Task[TaskLeaseHeartbeatOutcome] | None
+        ) = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute task with automatic token tracking.
+
+        This method wraps the agent's execute_task with token tracking when a
+        ``tracking_task_id`` (or ``task_id`` fallback) is provided. Database
+        work owns isolated short Sessions; ``db_session`` remains only for
+        backward-compatible callers and is never used for runtime I/O.
+
+        Args:
+            agent_service: The AgentService instance to use
+            task: Task description
+            context: Optional context data
+            task_id: Optional task identifier passed to agent execution
+            tracking_task_id: Optional task identifier used only for token tracking
+            db_session: Optional legacy caller Session. It must have no pending
+                writes; any read-only transaction is released before runtime
+                workers request their own short-lived Sessions.
+            manage_task_lease: When False, skip acquire/release/heartbeat here.
+                ``TaskTurnOrchestrator._schedule_bg`` already owns the lease
+                lifecycle for REST/SDK turns; a nested acquire can return
+                ``running_elsewhere`` or release the row before
+                ``execute_task_background`` / ``finish_turn`` land the terminal
+                snapshot, leaving tasks stuck RUNNING for SDK clients.
+            task_lease: Lease owned by an outer orchestrator. Its run id fences
+                tracker writes when this method does not manage the lease.
+                Under shared task execution a run must hold a lease: either
+                this one, or one acquired here for a task id when
+                ``manage_task_lease`` is true.
+            task_lease_heartbeat_task: Heartbeat owned by an inline transport
+                for ``task_lease``. When provided, definitive ownership loss
+                cancels and drains agent execution before this method returns.
+
+        Returns:
+            Execution result dictionary
+
+        Raises:
+            RuntimeError: Shared task execution is enabled and the run would
+                hold no task lease.
+        """
+        # Initialize tracker if db_session and task_id are provided
+        tracker = None
+        tracker_task_id = tracking_task_id or task_id
+        # Shared workers fence checkpoints, command results and task
+        # settlement by the current lease. A run without one would write them
+        # unfenced, so refuse it before any side effect instead of running it.
+        if (
+            task_lease is None
+            and not (manage_task_lease and tracker_task_id)
+            and get_shared_task_execution_enabled()
+        ):
+            raise RuntimeError(
+                "Shared task execution requires a task lease: pass task_lease "
+                "or let execute_task manage the lease for a task id."
+            )
+        lease = None
+        lease_stop_event = None
+        lease_heartbeat_task = None
+        result: Dict[str, Any] | None = None
+        sandbox_task_key = None
+        lease_ownership_lost = False
+
+        # Establish the caller/worker handoff before the first isolated quota,
+        # lease, workforce, or tracker checkout. A read-only legacy Session may
+        # otherwise pin one slot while the worker waits for a second.
+        _release_agent_runtime_caller_session(db_session)
+
+        # Quota gate: refuse to start a run when the team is out of monthly
+        # quota. Non-pool hook errors fail open. A pool checkout timeout propagates
+        # before this method performs further DB-backed runtime work, preventing an
+        # immediate cascade into workforce/tracker checkouts. Only the task lookup
+        # moves to a DB worker here. The application callback keeps its established
+        # event-loop affinity; its remaining blocking risk is tracked separately.
+        if tracker_task_id:
+            try:
+                gate_user_id = await run_db_io_cancellation_safe(
+                    lambda: _load_task_run_gate_user_id_isolated(int(tracker_task_id))
+                )
+                gate_reason = (
+                    _check_task_run_gate_on_event_loop(gate_user_id)
+                    if gate_user_id is not None
+                    else None
+                )
+                if gate_reason:
+                    # The gate returns either a plain message or a structured
+                    # mapping ({code, metric, limit, plan, message}). Surface the
+                    # message as `output` (what every result consumer shows as
+                    # the assistant reply) and forward the structured fields as
+                    # error_code/error_details so the client can localise and
+                    # branch (e.g. Free vs paid) without parsing the message.
+                    if isinstance(gate_reason, Mapping):
+                        reason_message = str(gate_reason.get("message") or "")
+                        error_code = gate_reason.get("code")
+                        error_details = dict(gate_reason)
+                    else:
+                        # Legacy/plain-string path: a hook that returns a bare
+                        # message (the pre-structured shape) is assumed to be a
+                        # quota refusal. The only shipped hook returns a Mapping,
+                        # so this stays for back-compat with string-returning
+                        # app layers.
+                        reason_message = str(gate_reason)
+                        error_code = "quota_exceeded"
+                        error_details = None
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": reason_message,
+                        "error": reason_message,
+                        "error_code": error_code,
+                        "error_details": error_details,
+                    }
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    logger.error(
+                        "task_id=%s component=quota-gate database pool checkout "
+                        "timed out; terminating before further runtime database "
+                        "work: %s",
+                        tracker_task_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
+                logger.warning("Quota gate check failed open", exc_info=True)
+
+        # Per-link run quota (#973 share, #1108 widget): the run gate above
+        # bounds the OWNER's team quota, but every anonymous public run bills
+        # the owner, so one public link could still drain the whole team quota.
+        # This adds a rolling per-entity ceiling on top, keyed off the markers
+        # stamped into agent_config at task creation. Only public tasks are
+        # gated; fails open (availability) like the run gate above, with the
+        # same pool-timeout escalation so a stalled pool doesn't cascade.
+        if tracker_task_id:
+            quota_config: Mapping[str, Any] | None = None
+            try:
+                quota_config = await run_db_io_cancellation_safe(
+                    lambda: _load_task_public_run_quota_config_isolated(
+                        int(tracker_task_id)
+                    )
+                )
+                denied_channel = (
+                    _public_run_denial_channel(quota_config)
+                    if quota_config is not None
+                    else None
+                )
+                if denied_channel is not None:
+                    # Channel-specific copy + error_code: a widget visitor on a
+                    # third-party page has no "shared link", and analytics need
+                    # to tell which public channel was throttled. The per-caller
+                    # sub-quota gets its own copy because it is the one refusal
+                    # the reader can act on — waiting clears it, whereas an
+                    # exhausted owner budget does not.
+                    if denied_channel == "widget-ip":
+                        reason_message = (
+                            "Too many requests from your network. "
+                            "Please wait a little while and try again."
+                        )
+                        quota_error_code = "widget_run_ip_quota_exceeded"
+                    elif denied_channel == "widget":
+                        reason_message = (
+                            "This widget has reached its usage limit. "
+                            "Please try again later."
+                        )
+                        quota_error_code = "widget_run_quota_exceeded"
+                    else:
+                        reason_message = (
+                            "This shared link has reached its usage limit. "
+                            "Please try again later."
+                        )
+                        quota_error_code = "share_run_quota_exceeded"
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": reason_message,
+                        "error": reason_message,
+                        "error_code": quota_error_code,
+                        "error_details": None,
+                    }
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    logger.error(
+                        "task_id=%s component=public-run-quota-gate database "
+                        "pool checkout timed out; terminating before further "
+                        "runtime database work: %s",
+                        tracker_task_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
+                failed_mode = (
+                    quota_config.get("auth_mode")
+                    if isinstance(quota_config, Mapping)
+                    else None
+                )
+                logger.warning(
+                    "Public run quota check failed open (auth_mode=%s)",
+                    failed_mode,
+                    exc_info=True,
+                )
+
+        if manage_task_lease and tracker_task_id:
+            from .task_execution_controller import (
+                task_execution_controller,
+            )
+
+            async with task_execution_controller.command(int(tracker_task_id)):
+                lease = await acquire_task_lease_cancellation_safe(
+                    lambda: acquire_task_lease_isolated(int(tracker_task_id)),
+                    lambda acquired: _release_managed_task_lease_isolated(
+                        acquired,
+                        status=TaskStatus.FAILED,
+                    ),
+                )
+            if lease is None:
+                return {
+                    "success": False,
+                    "status": "running_elsewhere",
+                    "error": "Task is already running on another worker.",
+                }
+            lease_stop_event = asyncio.Event()
+            lease_heartbeat_task = asyncio.create_task(
+                run_task_lease_heartbeat(lease, lease_stop_event)
+            )
+
+        pre_run_pool_timeout: BaseException | None = None
+        try:
+            if tracker_task_id and (lease is not None or task_lease is None):
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: sync_workforce_run_status_for_task_id_isolated(
+                            int(tracker_task_id),
+                            TaskStatus.RUNNING,
+                            task_lease=lease,
+                        )
+                    )
+                except Exception as exc:
+                    if is_database_pool_timeout(exc):
+                        pre_run_pool_timeout = exc
+                        logger.error(
+                            "task_id=%s component=workforce-status database pool "
+                            "checkout timed out; terminating before tracker startup "
+                            "and retaining any acquired lease for TTL recovery: %s",
+                            tracker_task_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise
+                    logger.debug(
+                        "Failed to sync workforce run status after lease acquisition",
+                        exc_info=True,
+                    )
+            if tracker_task_id:
+                try:
+                    from ..tracking.task_tracker import TaskTracker
+
+                    tracking_lease = lease or task_lease
+                    tracker = TaskTracker(
+                        task_id=int(tracker_task_id),
+                        expected_run_id=(
+                            tracking_lease.run_id
+                            if tracking_lease is not None
+                            else None
+                        ),
+                        expected_attempt_id=(
+                            tracking_lease.attempt_id
+                            if tracking_lease is not None
+                            else None
+                        ),
+                        expected_runner_id=(
+                            tracking_lease.runner_id
+                            if tracking_lease is not None
+                            else None
+                        ),
+                    )
+                    await tracker.start_tracking()
+                    # Enforce quota mid-run: the pattern loop polls this every step
+                    # (each LLM reply / tool call) and stops the run once its live
+                    # cost would push the team over quota, instead of only metering at
+                    # completion. Cleared in the finally so a reused agent_service
+                    # never keeps a finished run's tracker as its checker.
+                    agent_service.set_interrupt_checker(
+                        tracker.interrupt_reason_for_quota
+                    )
+                    logger.info(f"Started token tracking for task {tracker_task_id}")
+                except Exception as exc:
+                    if is_database_pool_timeout(exc):
+                        pre_run_pool_timeout = exc
+                        tracker = None
+                        logger.error(
+                            "task_id=%s component=tracker-start database pool "
+                            "checkout timed out; terminating before execution and "
+                            "retaining any acquired lease for TTL recovery: %s",
+                            tracker_task_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise
+                    logger.warning(
+                        "Failed to start token tracking for task %s: %s",
+                        tracker_task_id,
+                        exc,
+                    )
+                    tracker = None
+
+            # Inside the try so a reclaimed-sandbox raise still runs the
+            # finally (heartbeat stop, lease release, tracker completion);
+            # _release_sandbox_task(None) is a no-op when nothing attached.
+            sandbox_task_key = await self._acquire_sandbox_task(tracker_task_id)
+
+            logger.info(
+                f"=== About to execute task: task_id={task_id}, has_db_session={db_session is not None} ==="
+            )
+
+            # Execute the task. The lease ContextVar is bound at the runtime
+            # owner rather than on the cached AgentService/trace handler so a
+            # reused service observes the exact current run.
+            execution_lease = lease or task_lease
+
+            async def execute_agent_task() -> Dict[str, Any]:
+                if execution_lease is None:
+                    return await agent_service.execute_task(
+                        task=task,
+                        context=context,
+                        task_id=task_id,
+                    )
+                with bind_task_lease_context(execution_lease):
+                    return await agent_service.execute_task(
+                        task=task,
+                        context=context,
+                        task_id=task_id,
+                    )
+
+            async def execute_owned_turn() -> Dict[str, Any]:
+                turn_result = await execute_agent_task()
+
+                # If a mid-run quota gate stopped the run, surface the reason
+                # the way the start gate does instead of silently pausing.
+                if tracker is not None and isinstance(turn_result, dict):
+                    quota_reason = getattr(
+                        tracker,
+                        "quota_interrupt_reason",
+                        None,
+                    )
+                    if quota_reason:
+                        turn_result = {
+                            **turn_result,
+                            "success": False,
+                            "status": "quota_exceeded",
+                            "output": quota_reason,
+                            "error": quota_reason,
+                            "error_code": "quota_exceeded",
+                        }
+
+                logger.info(
+                    "=== Task executed successfully, updating title if needed ==="
+                )
+                if task_id and turn_result.get("success"):
+                    await update_task_title_from_agent(
+                        agent_service,
+                        int(task_id),
+                        task_lease=execution_lease,
+                    )
+                return turn_result
+
+            execution_heartbeat_task = lease_heartbeat_task or task_lease_heartbeat_task
+            try:
+                if execution_heartbeat_task is None:
+                    result = await execute_owned_turn()
+                else:
+                    result = await run_while_task_lease_owned(
+                        execute_owned_turn(),
+                        execution_heartbeat_task,
+                    )
+            except TaskLeaseLostError:
+                lease_ownership_lost = True
+                raise
+
+            return result
+        finally:
+
+            async def finalize_execution_resources() -> None:
+                nonlocal lease_ownership_lost
+
+                # The execution has ended; restart the idle window so the
+                # runtime survives until the entrypoint settles it.
+                try:
+                    finished_task_key = (
+                        int(tracker_task_id) if tracker_task_id else None
+                    )
+                except (TypeError, ValueError):
+                    finished_task_key = None
+                if finished_task_key is not None and finished_task_key in self._agents:
+                    self._agent_last_active_at[finished_task_key] = self._monotonic()
+
+                tracker_pool_timeout: Exception | None = None
+                heartbeat_pool_timeout: BaseException | None = None
+                heartbeat_lost = False
+                primary_error: BaseException | None = None
+                # Set only by a confirmed release of the lease this manager
+                # acquired; anything else leaves that lease to TTL recovery.
+                managed_lease_released = False
+                try:
+                    # Persist usage before stopping/releasing the lease. Otherwise a
+                    # replacement run can acquire ownership and then receive a late
+                    # usage write from this completed run.
+                    if tracker:
+                        # Drop the mid-run quota checker before metering so a reused
+                        # agent_service can't keep calling this finished run's
+                        # tracker.
+                        agent_service.set_interrupt_checker(None)
+                        try:
+                            if lease_ownership_lost:
+                                await tracker.stop_periodic_updates()
+                            else:
+                                await tracker.complete_tracking()
+                                logger.info(
+                                    "Completed token tracking for task %s",
+                                    tracker_task_id,
+                                )
+                        except Exception as e:
+                            if is_database_pool_timeout(e):
+                                tracker_pool_timeout = e
+                                logger.error(
+                                    "task_id=%s component=tracker database pool "
+                                    "checkout timed out; retaining lease for TTL "
+                                    "recovery: %s",
+                                    tracker_task_id,
+                                    e,
+                                    exc_info=True,
+                                )
+                            else:
+                                logger.error(
+                                    "Failed to complete token tracking for task %s: %s",
+                                    tracker_task_id,
+                                    e,
+                                )
+
+                    heartbeat_outcome = await stop_task_lease_heartbeat(
+                        lease_heartbeat_task,
+                        lease_stop_event,
+                    )
+                    if isinstance(heartbeat_outcome, TaskLeaseHeartbeatOutcome):
+                        heartbeat_pool_timeout = heartbeat_outcome.pool_timeout
+                        heartbeat_lost = heartbeat_outcome.lease_lost
+                        if heartbeat_outcome.requires_ttl_recovery:
+                            logger.error(
+                                "task_id=%s component=lease-heartbeat unhealthy "
+                                "at shutdown; retaining lease for TTL recovery "
+                                "(lost=%s, pool_timeout=%s)",
+                                tracker_task_id,
+                                heartbeat_lost,
+                                heartbeat_pool_timeout is not None,
+                            )
+                    if heartbeat_lost:
+                        lease_ownership_lost = True
+                        raise TaskLeaseLostError(
+                            "task execution result rejected after lease "
+                            "ownership was lost"
+                        )
+                    if (
+                        manage_task_lease
+                        and lease
+                        and pre_run_pool_timeout is None
+                        and tracker_pool_timeout is None
+                        and heartbeat_pool_timeout is None
+                        and not heartbeat_lost
+                        and not lease_ownership_lost
+                    ):
+                        if result is None:
+                            final_status = TaskStatus.FAILED
+                        else:
+                            status = str(result.get("status") or "")
+                            if status == "waiting_for_user":
+                                final_status = TaskStatus.WAITING_FOR_USER
+                            elif status == "interrupted":
+                                final_status = TaskStatus.PAUSED
+                            elif result.get("success", False):
+                                final_status = TaskStatus.COMPLETED
+                            else:
+                                final_status = TaskStatus.FAILED
+                        managed_lease_released = bool(
+                            await run_db_io_cancellation_safe(
+                                lambda: _release_managed_task_lease_isolated(
+                                    lease,
+                                    status=final_status,
+                                )
+                            )
+                        )
+                    if pre_run_pool_timeout is not None:
+                        raise pre_run_pool_timeout
+                    if tracker_pool_timeout is not None:
+                        raise tracker_pool_timeout
+                    if heartbeat_pool_timeout is not None:
+                        raise heartbeat_pool_timeout
+                except BaseException as exc:
+                    primary_error = exc
+
+                if (
+                    manage_task_lease
+                    and lease is not None
+                    and not managed_lease_released
+                ):
+                    # Lease loss, an unhealthy heartbeat, a pool timeout or a
+                    # failed release: the manager's own run is retained for
+                    # TTL recovery, which a pooled release must not read as
+                    # settled.
+                    release_hold.record_unsettled(
+                        "managed_execution_lease",
+                        f"task:{tracker_task_id}",
+                        "manager-acquired lease not released; left to TTL recovery",
+                    )
+
+                try:
+                    await self._release_sandbox_task(sandbox_task_key)
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    logger.error(
+                        "Failed to release sandbox while another execution cleanup "
+                        "error was already in flight",
+                        exc_info=True,
+                    )
+
+                if primary_error is not None:
+                    raise primary_error
+
+            cleanup_task = asyncio.create_task(finalize_execution_resources())
+            await drain_async_task_cancellation_safe(cleanup_task)
+
+    def _cleanup_workspace_directory(
+        self,
+        task_id: int,
+        user_id: Optional[int] = None,
+        *,
+        target: Optional[WorkspaceCleanupTarget] = None,
+    ) -> None:
+        """Clean up workspace directory for a task when agent is not in memory.
+
+        ``target`` is a capture taken while the task row still existed. Without
+        one this resolves the candidates now, which is correct only while the
+        row is still there -- see ``task_workspace_cleanup``.
+        """
+
+        if target is None:
+            target = capture_workspace_cleanup_target(task_id, user_id)
+        remove_task_workspace(target)
+
+    async def _reconstruct_agent_from_history(
+        self,
+        task_id: int,
+        db: Optional[Session],
+        scope: Optional[ExecutionScope] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    ) -> None:
+        """Reconstruct from the detached task-runtime snapshot.
+
+        Legacy callers may omit the snapshot; that fallback loads the same
+        snapshot through a worker-owned short Session before any runtime work.
+        """
+        try:
+            snapshot = task_setup_snapshot
+            if snapshot is None:
+                snapshot = await run_db_io_cancellation_safe(
+                    lambda: load_task_setup_snapshot_sync(task_id, None)
+                )
+            if snapshot is None:
+                raise ValueError(
+                    f"Task {task_id} not found during agent reconstruction"
+                )
+
+            tracer_events = [
+                dict(event) for event in snapshot.reconstruction.tracer_events
+            ]
+            plan_state = (
+                dict(snapshot.reconstruction.plan_state)
+                if snapshot.reconstruction.plan_state is not None
+                else None
+            )
+            if not tracer_events and plan_state is None:
+                logger.info(
+                    "No historical data found for task %s, will create new agent",
+                    task_id,
+                )
+                raise ValueError(f"No historical data found for task {task_id}")
+
+            task = snapshot.task
+            user = snapshot.runtime_user
+            user_id = int(task.user_id)
+            if user is None:
+                raise ValueError("User context is required for agent reconstruction")
+
+            task_llm = snapshot.task_llm
+            if task_llm is None:
+                task_llm = self._pick_default_llm_with_warning(
+                    self._default_llm,
+                    task_id=task_id,
+                    has_agent_builder_config=snapshot.agent is not None,
+                    agent_id=task.agent_id,
+                    saved_model_ids=(snapshot.agent_config or {}).get(
+                        "saved_model_ids"
+                    ),
+                    saved_model_descriptors=(snapshot.agent_config or {}).get(
+                        "saved_model_descriptors"
+                    ),
+                    user_id=user_id,
+                )
+
+            tracer = create_task_tracer(task_id, user_id=user_id)
+            tools_list, tool_config = await self._build_tools_for_task(
+                task_id=task_id,
+                task=task,
+                db=db,
+                user=user,
+                agent_config=snapshot.agent_config,
+                task_llm=task_llm,
+                task_vision_llm=snapshot.task_vision_llm,
+                parent_tracer=tracer,
+                scope=scope,
+                task_setup_snapshot=snapshot,
+                connector_runtime_turn_id=connector_runtime_turn_id,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                mcp_actor_execution_identity=mcp_actor_execution_identity,
+            )
+
+            from .agent_prompt import (
+                apply_user_voice,
+                enhance_system_prompt_with_kb,
+                voice_from_runtime_user,
+            )
+
+            agent_config = snapshot.agent_config
+            system_prompt = agent_config.get("instructions") if agent_config else None
+            kb_list = agent_config.get("knowledge_bases") if agent_config else None
+            system_prompt = enhance_system_prompt_with_kb(system_prompt, kb_list)
+            system_prompt = _build_workforce_system_prompt(
+                system_prompt,
+                snapshot.workforce_runtime,
+            )
+            system_prompt = apply_user_voice(
+                system_prompt, voice_from_runtime_user(snapshot.runtime_user)
+            )
+            memory_similarity_threshold = (
+                agent_config.get("memory_similarity_threshold")
+                if agent_config
+                else None
+            )
+            memory_policy = await resolve_agent_service_memory_policy_async(
+                task=task,
+                agent_config=agent_config,
+            )
+            allowed_external_dirs = _build_allowed_external_dirs(
+                user_id,
+                scope=scope,
+            )
+            scope_segments = scope.workspace_segments if scope is not None else ()
+
+            with UserContext(user_id):
+                self._agents[task_id] = AgentService(
+                    budget_policy_provider=budget_policy_provider(
+                        user_id=int(user_id), task_id=str(task_id), scope=scope
+                    ),
+                    name=f"reconstructed_agent_task_{task_id}",
+                    id=f"web_task_{task_id}",
+                    llm=task_llm,
+                    fast_llm=snapshot.task_fast_llm,
+                    vision_llm=snapshot.task_vision_llm,
+                    compact_llm=snapshot.task_compact_llm,
+                    tools=tools_list,
+                    tool_config=tool_config,
+                    memory=memory_policy.memory,
+                    pattern=snapshot.task_pattern,
+                    tracer=tracer,
+                    system_prompt=system_prompt,
+                    enable_workspace=True,
+                    workspace_base_dir=canonical_workspace_base(
+                        user_id, scope_segments
+                    ),
+                    allowed_external_dirs=allowed_external_dirs,
+                    scope_segments=scope_segments,
+                    task_id=str(task_id),
+                    memory_similarity_threshold=memory_similarity_threshold,
+                    memory_enabled=memory_policy.memory_enabled,
+                    memory_available=memory_policy.memory_available,
+                    memory_availability_reason=memory_policy.public_availability_reason,
+                    memory_tools_factory=memory_policy.memory_tools_factory,
+                    execution_metadata=memory_policy.execution_metadata(
+                        ambient_owner_user_id=user_id,
+                        ambient_execution_scope=scope,
+                    ),
+                    workspace=(
+                        tool_config.get_task_runtime_workspace()
+                        if tool_config is not None
+                        else None
+                    ),
+                )
+            try:
+                self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)
+            except Exception:
+                logger.warning(
+                    "Idle runtime sweep after building the runtime for task %s failed",
+                    task_id,
+                    exc_info=True,
+                )
+
+            agent_service = self._agents[task_id]
+            await agent_service.reconstruct_from_history(
+                str(task_id),
+                tracer_events,
+                plan_state,
+            )
+            agent_service.set_conversation_history(
+                [dict(message) for message in snapshot.conversation_history],
+                watermark=snapshot.conversation_watermark,
+                event_watermark=snapshot.conversation_event_watermark,
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                snapshot.execution_recovery
+            )
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
+            logger.info(
+                "Successfully reconstructed agent for task %s from history",
+                task_id,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"Failed to reconstruct agent from history for task {task_id}: {e}"
+            )
+            raise
+
+    def get_agent_workspace_files(self, task_id: int) -> Dict[str, Any]:
+        """Get workspace files for a task"""
+        if task_id not in self._agents:
+            raise ValueError(f"No agent found for task {task_id}")
+
+        return self._agents[task_id].get_workspace_files()
+
+    def get_agent_output_files(self, task_id: int) -> List[Dict[str, Any]]:
+        """Get output files for a task"""
+        if task_id not in self._agents:
+            raise ValueError(f"No agent found for task {task_id}")
+
+        return self._agents[task_id].get_output_files()
+
+
+_global_agent_manager = None
+
+
+def get_agent_manager(request: Any = None) -> AgentServiceManager:
+    """Get AgentServiceManager instance with request context."""
+    global _global_agent_manager
+    if _global_agent_manager is None:
+        _global_agent_manager = AgentServiceManager(request=request)
+    else:
+        # Update request if provided
+        if request is not None:
+            _global_agent_manager.request = request
+    return _global_agent_manager

@@ -1,0 +1,2452 @@
+from __future__ import annotations
+
+import copy
+import sqlite3
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from threading import Barrier
+from typing import Any
+
+import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool, StaticPool
+
+from scripts.convert_trace_checkpoint_messages import convert_trace_checkpoint_messages
+from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
+from xagent.core.agent.trace import (
+    TraceAction,
+    TraceCategory,
+    TraceEvent,
+    TraceEventType,
+    TraceScope,
+)
+from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
+from xagent.web.models.database import Base
+from xagent.web.models.task import (
+    Task,
+    TaskStatus,
+    TraceCheckpointBlob,
+)
+from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
+from xagent.web.models.task import (
+    TraceMessageBlob,
+)
+from xagent.web.models.user import User
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
+from xagent.web.services.trace_message_storage import (
+    CHECKPOINT_BLOB_REF_ENCODING,
+    LEDGER_REFS_ENCODING,
+    MESSAGE_REFS_DECODE_ERROR_KEY,
+    MESSAGE_REFS_ENCODING,
+    TOOL_LEDGER_RECORD_KIND,
+    CheckpointMessageDecodeError,
+    canonical_json_hash,
+    decode_trace_event_data,
+    decode_trace_events_data,
+    encode_checkpoint_data_for_storage,
+    encode_checkpoint_messages_for_storage,
+)
+
+
+def _session_factory() -> sessionmaker[Session]:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def _sqlite_driver_connection(db: Session) -> sqlite3.Connection:
+    raw_connection = db.connection().connection
+    return (
+        getattr(raw_connection, "driver_connection", None)
+        or getattr(raw_connection, "connection", None)
+        or raw_connection
+    )
+
+
+def _create_task(db: Session) -> Task:
+    user = User(username="tester", password_hash="hashed_password", is_admin=False)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    task = Task(
+        user_id=int(user.id),
+        title="Checkpoint task",
+        description="Checkpoint task",
+        status=TaskStatus.PENDING,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _checkpoint_data(execution_id: str, messages: Any) -> dict[str, Any]:
+    return {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "root_execution_id": execution_id,
+        "execution_id": execution_id,
+        "label": "after_llm",
+        "snapshot": {
+            "type": "checkpoint",
+            "label": "after_llm",
+            "execution_id": execution_id,
+            "context": {"messages": messages},
+            "pattern": "ReActPattern",
+            "pattern_state": {"current_iteration": 1},
+        },
+    }
+
+
+def _checkpoint_data_with_large_fields(
+    execution_id: str,
+    messages: Any,
+    *,
+    tool_ledger: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = _checkpoint_data(execution_id, messages)
+    data["snapshot"]["pattern_state"]["tool_ledger"] = tool_ledger or {
+        "tool-1": {"result": "large tool output"}
+    }
+    data["snapshot"]["context"]["metadata"] = metadata or {
+        "retrieved_memories": {"react_memory": "large memory context"}
+    }
+    return data
+
+
+def _get_db_factory(SessionLocal: sessionmaker[Session]) -> Iterator[Session]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def test_message_refs_codec_round_trips_and_dedupes_blobs() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        encoded = encode_checkpoint_messages_for_storage(
+            db,
+            task_id=int(task.id),
+            data=_checkpoint_data("exec-1", messages),
+        )
+        db.flush()
+
+        refs_payload = encoded["snapshot"]["context"]["messages"]
+        assert refs_payload["__encoding"] == MESSAGE_REFS_ENCODING
+        assert refs_payload["count"] == 3
+        assert refs_payload["hash"] == canonical_json_hash(refs_payload["refs"])
+        assert len(refs_payload["refs"]) == 3
+        assert db.query(TraceMessageBlob).count() == 2
+
+        decoded = decode_trace_event_data(
+            db,
+            task_id=int(task.id),
+            data=encoded,
+            strict=True,
+        )
+        assert decoded["snapshot"]["context"]["messages"] == messages
+    finally:
+        db.close()
+
+
+def test_message_refs_decoder_passes_old_inline_messages_through() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        data = _checkpoint_data("exec-old", [{"role": "user", "content": "old"}])
+
+        decoded = decode_trace_event_data(
+            db,
+            task_id=int(task.id),
+            data=data,
+            strict=True,
+        )
+
+        assert decoded == data
+    finally:
+        db.close()
+
+
+def test_message_refs_decoder_rejects_missing_blob() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        data = _checkpoint_data(
+            "exec-missing",
+            {
+                "__encoding": MESSAGE_REFS_ENCODING,
+                "count": 1,
+                "hash": canonical_json_hash(["sha256:missing"]),
+                "refs": ["sha256:missing"],
+            },
+        )
+
+        with pytest.raises(CheckpointMessageDecodeError):
+            decode_trace_event_data(db, task_id=int(task.id), data=data, strict=True)
+
+        fallback = decode_trace_event_data(
+            db,
+            task_id=int(task.id),
+            data=data,
+            strict=False,
+        )
+        assert MESSAGE_REFS_DECODE_ERROR_KEY in fallback
+    finally:
+        db.close()
+
+
+def test_message_refs_decoder_rejects_malformed_refs_payload() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        data = _checkpoint_data(
+            "exec-malformed",
+            {
+                "__encoding": MESSAGE_REFS_ENCODING,
+                "count": "1",
+                "refs": ["sha256:missing"],
+            },
+        )
+
+        with pytest.raises(CheckpointMessageDecodeError):
+            decode_trace_event_data(db, task_id=int(task.id), data=data, strict=True)
+    finally:
+        db.close()
+
+
+def test_message_refs_decoder_rejects_count_and_sequence_mismatch() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        count_mismatch = _checkpoint_data(
+            "exec-bad-count",
+            {
+                "__encoding": MESSAGE_REFS_ENCODING,
+                "count": 2,
+                "hash": canonical_json_hash(["sha256:missing"]),
+                "refs": ["sha256:missing"],
+            },
+        )
+        sequence_mismatch = _checkpoint_data(
+            "exec-bad-sequence",
+            {
+                "__encoding": MESSAGE_REFS_ENCODING,
+                "count": 1,
+                "hash": canonical_json_hash(["sha256:different"]),
+                "refs": ["sha256:missing"],
+            },
+        )
+
+        with pytest.raises(CheckpointMessageDecodeError):
+            decode_trace_event_data(
+                db,
+                task_id=int(task.id),
+                data=count_mismatch,
+                strict=True,
+            )
+        with pytest.raises(CheckpointMessageDecodeError):
+            decode_trace_event_data(
+                db,
+                task_id=int(task.id),
+                data=sequence_mismatch,
+                strict=True,
+            )
+    finally:
+        db.close()
+
+
+def test_checkpoint_blob_refs_round_trip_and_dedupe() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        messages = [{"role": "user", "content": "hello"}]
+        tool_ledger = {"call-1": {"result": "same output"}}
+        metadata = {"retrieved_memories": {"react_memory": "same memory"}}
+        data = _checkpoint_data_with_large_fields(
+            "exec-fields",
+            messages,
+            tool_ledger=tool_ledger,
+            metadata=metadata,
+        )
+
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=int(task.id),
+            data=data,
+        )
+        db.flush()
+
+        stored_messages = encoded["snapshot"]["context"]["messages"]
+        stored_tool_ledger = encoded["snapshot"]["pattern_state"]["tool_ledger"]
+        stored_metadata = encoded["snapshot"]["context"]["metadata"]
+        assert stored_messages["__encoding"] == MESSAGE_REFS_ENCODING
+        assert stored_tool_ledger == {
+            "__encoding": LEDGER_REFS_ENCODING,
+            "count": 1,
+            "records": [["call-1", canonical_json_hash(tool_ledger["call-1"])]],
+        }
+        assert stored_metadata == {
+            "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
+            "kind": "context.metadata",
+            "hash": canonical_json_hash(metadata),
+        }
+        assert db.query(TraceMessageBlob).count() == 1
+        assert db.query(TraceCheckpointBlob).count() == 2
+
+        encoded_again = encode_checkpoint_data_for_storage(
+            db,
+            task_id=int(task.id),
+            data=data,
+        )
+        db.flush()
+        assert (
+            encoded_again["snapshot"]["pattern_state"]["tool_ledger"]
+            == stored_tool_ledger
+        )
+        assert db.query(TraceCheckpointBlob).count() == 2
+
+        decoded = decode_trace_event_data(
+            db,
+            task_id=int(task.id),
+            data=encoded,
+            strict=True,
+        )
+        assert decoded["snapshot"]["context"]["messages"] == messages
+        assert decoded["snapshot"]["pattern_state"]["tool_ledger"] == tool_ledger
+        assert decoded["snapshot"]["context"]["metadata"] == metadata
+    finally:
+        db.close()
+
+
+def test_decode_trace_events_data_batches_blob_queries() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        first_messages = [{"role": "user", "content": "hello"}]
+        second_messages = [
+            *first_messages,
+            {"role": "assistant", "content": "hi"},
+        ]
+        shared_tool_ledger = {"call-1": {"result": "same output"}}
+        first = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields(
+                "exec-batch",
+                first_messages,
+                tool_ledger=shared_tool_ledger,
+            ),
+        )
+        second = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields(
+                "exec-batch",
+                second_messages,
+                tool_ledger=shared_tool_ledger,
+            ),
+        )
+        db.flush()
+
+        statements: list[str] = []
+        engine = SessionLocal.kw["bind"]
+
+        def capture_statement(
+            conn: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            if (
+                "trace_message_blobs" in statement
+                or "trace_checkpoint_blobs" in statement
+            ):
+                statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", capture_statement)
+        try:
+            decoded = decode_trace_events_data(
+                db,
+                task_id=task_id,
+                data_items=[first, second],
+                strict=True,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_statement)
+
+        assert decoded[0]["snapshot"]["context"]["messages"] == first_messages
+        assert decoded[1]["snapshot"]["context"]["messages"] == second_messages
+        assert len(statements) == 3
+    finally:
+        db.close()
+
+
+def test_decode_trace_events_data_degrades_when_bulk_lookup_fails() -> None:
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [{"role": "user", "content": "hello"}]
+        item = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields("exec-degrade", messages),
+        )
+        db.flush()
+
+        boom = RuntimeError("bulk lookup boom")
+
+        # Non-strict: a failed bulk lookup must not drop the event; it degrades to
+        # per-ref blob queries and still resolves the messages.
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=boom):
+            decoded = decode_trace_events_data(
+                db, task_id=task_id, data_items=[item], strict=False
+            )
+        assert len(decoded) == 1
+        assert decoded[0]["snapshot"]["context"]["messages"] == messages
+
+        # Strict: the failure surfaces instead of being swallowed.
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=boom):
+            with pytest.raises(RuntimeError):
+                decode_trace_events_data(
+                    db, task_id=task_id, data_items=[item], strict=True
+                )
+    finally:
+        db.close()
+
+
+def test_ledger_records_decode_without_bulk_lookup() -> None:
+    """The no-prefetch fallback resolves per-record ledger refs correctly."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        tool_ledger = {
+            f"call-{index}": {
+                "tool_call_id": f"call-{index}",
+                "result": f"output-{index}",
+            }
+            for index in range(5)
+        }
+        item = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields(
+                "exec-ledger-fallback",
+                [{"role": "user", "content": "hello"}],
+                tool_ledger=tool_ledger,
+            ),
+        )
+        db.flush()
+        assert (
+            item["snapshot"]["pattern_state"]["tool_ledger"]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+
+        boom = RuntimeError("bulk lookup boom")
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=boom):
+            decoded = decode_trace_events_data(
+                db, task_id=task_id, data_items=[item], strict=False
+            )
+
+        assert decoded[0]["snapshot"]["pattern_state"]["tool_ledger"] == tool_ledger
+        assert list(decoded[0]["snapshot"]["pattern_state"]["tool_ledger"]) == list(
+            tool_ledger
+        )
+    finally:
+        db.close()
+
+
+def test_blob_lookups_respect_sqlite_bind_parameter_limit() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    raw_connection = _sqlite_driver_connection(db)
+    previous_limit = raw_connection.setlimit(
+        sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+        50,
+    )
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        big_messages = [
+            {"role": "user", "content": f"large-history-{index}"} for index in range(60)
+        ]
+        big_checkpoint = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields(
+                "exec-limit-big",
+                big_messages,
+                metadata={"memory": "big"},
+            ),
+        )
+
+        checkpoints = [big_checkpoint]
+        for index in range(60):
+            checkpoints.append(
+                encode_checkpoint_data_for_storage(
+                    db,
+                    task_id=task_id,
+                    data=_checkpoint_data_with_large_fields(
+                        f"exec-limit-{index}",
+                        [{"role": "user", "content": f"small-history-{index}"}],
+                        tool_ledger={f"tool-{index}": {"result": f"value-{index}"}},
+                        metadata={"memory": f"value-{index}"},
+                    ),
+                )
+            )
+        db.flush()
+
+        decoded = decode_trace_events_data(
+            db,
+            task_id=task_id,
+            data_items=checkpoints,
+            strict=True,
+        )
+        assert decoded[0]["snapshot"]["context"]["messages"] == big_messages
+
+        single_decoded = decode_trace_event_data(
+            db,
+            task_id=task_id,
+            data=big_checkpoint,
+            strict=True,
+        )
+        assert single_decoded["snapshot"]["context"]["messages"] == big_messages
+    finally:
+        raw_connection.setlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+            previous_limit,
+        )
+        db.close()
+
+
+def test_bulk_decode_can_skip_blob_hash_verification() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [{"role": "user", "content": "original"}]
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data("exec-tampered", messages),
+        )
+        db.flush()
+
+        message_ref = encoded["snapshot"]["context"]["messages"]["refs"][0]
+        blob = (
+            db.query(TraceMessageBlob)
+            .filter(
+                TraceMessageBlob.task_id == task_id,
+                TraceMessageBlob.message_hash == message_ref,
+            )
+            .one()
+        )
+        blob.message_data = {"role": "user", "content": "tampered"}
+        db.flush()
+
+        decoded = decode_trace_events_data(
+            db,
+            task_id=task_id,
+            data_items=[encoded],
+            strict=False,
+        )
+        assert decoded[0]["snapshot"]["context"]["messages"] == [
+            {"role": "user", "content": "tampered"}
+        ]
+
+        with pytest.raises(CheckpointMessageDecodeError):
+            decode_trace_events_data(
+                db,
+                task_id=task_id,
+                data_items=[encoded],
+                strict=True,
+            )
+    finally:
+        db.close()
+
+
+def test_checkpoint_blob_refs_decoder_passes_old_inline_fields_through() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        data = _checkpoint_data_with_large_fields(
+            "exec-old-fields",
+            [{"role": "user", "content": "old"}],
+        )
+
+        decoded = decode_trace_event_data(
+            db,
+            task_id=int(task.id),
+            data=data,
+            strict=True,
+        )
+
+        assert decoded == data
+    finally:
+        db.close()
+
+
+def test_checkpoint_blob_refs_decoder_rejects_missing_blob() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        data = _checkpoint_data(
+            "exec-missing-field", [{"role": "user", "content": "x"}]
+        )
+        data["snapshot"]["pattern_state"]["tool_ledger"] = {
+            "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
+            "kind": "pattern_state.tool_ledger",
+            "hash": "sha256:missing",
+        }
+
+        with pytest.raises(CheckpointMessageDecodeError):
+            decode_trace_event_data(db, task_id=int(task.id), data=data, strict=True)
+
+        fallback = decode_trace_event_data(
+            db,
+            task_id=int(task.id),
+            data=data,
+            strict=False,
+        )
+        assert MESSAGE_REFS_DECODE_ERROR_KEY in fallback
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_stores_checkpoint_messages_as_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "working"},
+        ]
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE,
+            task_id=str(task_id),
+            data=_checkpoint_data_with_large_fields("exec-handler", messages),
+            require_persisted=True,
+        )
+
+        handler._save_trace_event(db, event)
+
+        row = db.query(DatabaseTraceEvent).filter_by(task_id=task_id).one()
+        stored_messages = row.data["snapshot"]["context"]["messages"]
+        stored_tool_ledger = row.data["snapshot"]["pattern_state"]["tool_ledger"]
+        assert stored_messages["__encoding"] == MESSAGE_REFS_ENCODING
+        assert stored_tool_ledger["__encoding"] == LEDGER_REFS_ENCODING
+        assert db.query(TraceMessageBlob).count() == 2
+        assert db.query(TraceCheckpointBlob).count() == 2
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        loaded = handler._sync_load_latest_checkpoint("exec-handler")
+        assert loaded is not None
+        assert loaded["context"]["messages"] == messages
+        assert loaded["pattern_state"]["tool_ledger"] == {
+            "tool-1": {"result": "large tool output"}
+        }
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("storage_version", [1, 2])
+@pytest.mark.parametrize(
+    "action", [TraceAction.START, TraceAction.END, TraceAction.ERROR]
+)
+def test_database_trace_handler_redacts_runtime_secrets_in_tool_events(
+    storage_version, action
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task.conversation_storage_version = storage_version
+        db.commit()
+        task_id = int(task.id)
+        if storage_version == 2:
+            from xagent.web.tracing import ExecutionEventTraceAdapter
+
+            handler = ExecutionEventTraceAdapter(task_id)
+        else:
+            handler = DatabaseTraceHandler(task_id)
+        event = TraceEvent(
+            TraceEventType(TraceScope.ACTION, action, TraceCategory.TOOL),
+            task_id=str(task_id),
+            step_id="step-1",
+            data={
+                "tool_name": "shiftcare",
+                "tool_args": {
+                    "headers": {
+                        "Authorization": "Bearer raw-runtime-token",
+                        "X-Account": "6185",
+                    },
+                    "connector_runtime": {
+                        "secrets": {"authorization": "Bearer raw-runtime-token"},
+                        "auth_selector": {"resource_owner_key": "xagent:user:1"},
+                    },
+                },
+            },
+        )
+
+        handler._save_trace_event(db, event)
+
+        row = db.query(DatabaseTraceEvent).filter_by(task_id=task_id).one()
+        if storage_version == 2:
+            from xagent.web.models.task_execution_event import TaskExecutionEvent
+
+            fact = db.query(TaskExecutionEvent).filter_by(task_id=task_id).one()
+            assert fact.payload["data"] == row.data
+            assert "raw-runtime-token" not in str(fact.payload)
+            assert "xagent:user:1" not in str(fact.payload)
+        assert "raw-runtime-token" not in str(row.data)
+        assert "xagent:user:1" not in str(row.data)
+        tool_args = row.data["tool_args"]
+        assert tool_args["headers"]["Authorization"] == REDACTED_RUNTIME_SECRET
+        assert tool_args["headers"]["X-Account"] == "6185"
+        assert (
+            tool_args["connector_runtime"]["secrets"]["authorization"]
+            == REDACTED_RUNTIME_SECRET
+        )
+        assert (
+            tool_args["connector_runtime"]["auth_selector"]["resource_owner_key"]
+            == REDACTED_RUNTIME_SECRET
+        )
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_shares_blobs_across_checkpoints() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        first = [{"role": "user", "content": "task"}]
+        second = [*first, {"role": "assistant", "content": "done"}]
+        shared_tool_ledger = {"tool-1": {"result": "same"}}
+        shared_metadata = {"retrieved_memories": {"react_memory": "same"}}
+
+        handler._save_trace_event(
+            db,
+            TraceEvent(
+                CHECKPOINT_EVENT_TYPE,
+                task_id=str(task_id),
+                data=_checkpoint_data_with_large_fields(
+                    "exec-shared",
+                    first,
+                    tool_ledger=shared_tool_ledger,
+                    metadata=shared_metadata,
+                ),
+            ),
+        )
+        handler._save_trace_event(
+            db,
+            TraceEvent(
+                CHECKPOINT_EVENT_TYPE,
+                task_id=str(task_id),
+                data=_checkpoint_data_with_large_fields(
+                    "exec-shared",
+                    second,
+                    tool_ledger=shared_tool_ledger,
+                    metadata=shared_metadata,
+                ),
+            ),
+        )
+
+        assert db.query(DatabaseTraceEvent).count() == 2
+        assert db.query(TraceMessageBlob).count() == 2
+        assert db.query(TraceCheckpointBlob).count() == 2
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_dedupes_concurrent_checkpoint_blobs(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'concurrent-checkpoints.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+    apply_sqlite_concurrency_pragmas(engine)
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    messages = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"message-{index}-" + ("x" * 2000),
+        }
+        for index in range(24)
+    ]
+    checkpoint = _checkpoint_data_with_large_fields(
+        str(task_id),
+        messages,
+        tool_ledger={"tool-1": {"result": "r" * 4000}},
+        metadata={"memory": "m" * 4000},
+    )
+    checkpoint["snapshot"]["context"]["system_prompt"] = "system" * 1000
+    start = Barrier(4)
+
+    def save_checkpoint(worker: int) -> None:
+        event = TraceEvent(
+            CHECKPOINT_EVENT_TYPE,
+            task_id=str(task_id),
+            data={**copy.deepcopy(checkpoint), "worker": worker},
+            require_persisted=True,
+        )
+        worker_db = SessionLocal()
+        try:
+            start.wait(timeout=5)
+            DatabaseTraceHandler(task_id)._save_trace_event(worker_db, event)
+        finally:
+            worker_db.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(save_checkpoint, worker) for worker in range(4)]
+            for future in futures:
+                future.result(timeout=15)
+
+        db = SessionLocal()
+        try:
+            assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 4
+            assert db.query(TraceMessageBlob).filter_by(task_id=task_id).count() == 24
+            assert db.query(TraceCheckpointBlob).filter_by(task_id=task_id).count() == 3
+        finally:
+            db.close()
+    finally:
+        engine.dispose()
+
+
+def test_database_trace_handler_reads_old_inline_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [{"role": "user", "content": "old"}]
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="old-inline",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=_checkpoint_data("exec-old-inline", messages),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-old-inline"
+        )
+
+        assert loaded is not None
+        assert loaded["context"]["messages"] == messages
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_falls_back_when_latest_refs_are_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        old_messages = [{"role": "user", "content": "old"}]
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="old-readable",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data("exec-fallback", old_messages),
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="new-unreadable",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=1),
+                data=_checkpoint_data(
+                    "exec-fallback",
+                    {
+                        "__encoding": MESSAGE_REFS_ENCODING,
+                        "count": 1,
+                        "hash": canonical_json_hash(["sha256:missing"]),
+                        "refs": ["sha256:missing"],
+                    },
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-fallback"
+        )
+
+        assert loaded is not None
+        assert loaded["context"]["messages"] == old_messages
+    finally:
+        db.close()
+
+
+def _context_payload(
+    execution_id: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str,
+) -> dict[str, Any]:
+    return {
+        "execution_id": execution_id,
+        "messages": messages,
+        "system_prompt": system_prompt,
+        "metadata": {},
+    }
+
+
+def _dag_checkpoint_data(
+    execution_id: str,
+    messages: list[dict[str, Any]],
+    system_prompt: str,
+    tool_ledger: dict[str, Any],
+) -> dict[str, Any]:
+    root_context = _context_payload(execution_id, messages, system_prompt)
+    child_context = _context_payload(f"{execution_id}_child", messages, system_prompt)
+    return {
+        "checkpoint_type": CHECKPOINT_TYPE,
+        "root_execution_id": execution_id,
+        "execution_id": execution_id,
+        "label": "dag_step_completed",
+        "snapshot": {
+            "type": "checkpoint",
+            "label": "dag_step_completed",
+            "execution_id": execution_id,
+            "context": root_context,
+            "pattern": "DAGPlanExecutePattern",
+            "pattern_state": {
+                "status": "running",
+                "active_step_contexts": {"step-1": dict(child_context)},
+                "active_step_pattern_states": {"step-1": {"tool_ledger": tool_ledger}},
+                "step_results": {},
+            },
+            "execution_snapshot": {
+                "root_execution_id": execution_id,
+                "frames": {
+                    "root:dag": {
+                        "frame_id": "root:dag",
+                        "pattern_type": "dag",
+                        "context": dict(root_context),
+                        "pattern_state": {},
+                    },
+                    "child:react": {
+                        "frame_id": "child:react",
+                        "pattern_type": "react",
+                        "context": dict(child_context),
+                        "pattern_state": {"tool_ledger": tool_ledger},
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_v2_ledger_records_dedupe_across_growing_checkpoints() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        record_one = {
+            "tool_call_id": "call-1",
+            "tool_name": "web_search",
+            "args": {"query": "growth"},
+            "status": "completed",
+            "result": "large tool output " * 10,
+        }
+        record_two = {
+            "tool_call_id": "call-2",
+            "tool_name": "calculator",
+            "args": {"expression": "1+1"},
+            "status": "completed",
+            "result": "2",
+        }
+        first = _checkpoint_data_with_large_fields(
+            "exec-ledger",
+            [{"role": "user", "content": "task"}],
+            tool_ledger={"call-1": record_one},
+        )
+        second = _checkpoint_data_with_large_fields(
+            "exec-ledger",
+            [{"role": "user", "content": "task"}],
+            tool_ledger={"call-1": record_one, "call-2": record_two},
+        )
+
+        encoded_first = encode_checkpoint_data_for_storage(
+            db, task_id=task_id, data=first
+        )
+        encoded_second = encode_checkpoint_data_for_storage(
+            db, task_id=task_id, data=second
+        )
+        db.flush()
+
+        # The unchanged record is shared: two checkpoints with a growing
+        # ledger store 2 record blobs, not 3.
+        record_blobs = (
+            db.query(TraceCheckpointBlob)
+            .filter(TraceCheckpointBlob.blob_kind == TOOL_LEDGER_RECORD_KIND)
+            .all()
+        )
+        assert len(record_blobs) == 2
+
+        decoded_second = decode_trace_event_data(
+            db, task_id=task_id, data=encoded_second, strict=True
+        )
+        assert decoded_second["snapshot"]["pattern_state"]["tool_ledger"] == {
+            "call-1": record_one,
+            "call-2": record_two,
+        }
+        assert list(decoded_second["snapshot"]["pattern_state"]["tool_ledger"]) == [
+            "call-1",
+            "call-2",
+        ]
+
+        decoded_first = decode_trace_event_data(
+            db, task_id=task_id, data=encoded_first, strict=True
+        )
+        assert decoded_first["snapshot"]["pattern_state"]["tool_ledger"] == {
+            "call-1": record_one
+        }
+    finally:
+        db.close()
+
+
+def test_v2_encodes_nested_contexts_system_prompt_and_frame_ledgers() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [
+            {"role": "user", "content": "build a report"},
+            {"role": "assistant", "content": "planning"},
+        ]
+        system_prompt = "You are a meticulous data analyst. " * 20
+        tool_ledger = {"call-1": {"tool_call_id": "call-1", "result": "step output"}}
+        data = _dag_checkpoint_data("exec-dag", messages, system_prompt, tool_ledger)
+        original = copy.deepcopy(data)
+
+        encoded = encode_checkpoint_data_for_storage(db, task_id=task_id, data=data)
+        db.flush()
+
+        snapshot = encoded["snapshot"]
+        # Root context, both frames, and the active step context all encode
+        # their messages as refs against the same shared blobs.
+        assert snapshot["context"]["messages"]["__encoding"] == MESSAGE_REFS_ENCODING
+        for frame in snapshot["execution_snapshot"]["frames"].values():
+            assert frame["context"]["messages"]["__encoding"] == MESSAGE_REFS_ENCODING
+        step_context = snapshot["pattern_state"]["active_step_contexts"]["step-1"]
+        assert step_context["messages"]["__encoding"] == MESSAGE_REFS_ENCODING
+        assert db.query(TraceMessageBlob).count() == len(messages)
+
+        # The large system prompt is stored once and referenced everywhere.
+        assert (
+            snapshot["context"]["system_prompt"]["__encoding"]
+            == CHECKPOINT_BLOB_REF_ENCODING
+        )
+        prompt_blobs = (
+            db.query(TraceCheckpointBlob)
+            .filter(TraceCheckpointBlob.blob_kind == "context.system_prompt")
+            .all()
+        )
+        assert len(prompt_blobs) == 1
+        assert prompt_blobs[0].blob_data == system_prompt
+
+        # Nested ledgers (active step pattern state + react frame) encode
+        # per record and share the same record blob.
+        assert (
+            snapshot["pattern_state"]["active_step_pattern_states"]["step-1"][
+                "tool_ledger"
+            ]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+        assert (
+            snapshot["execution_snapshot"]["frames"]["child:react"]["pattern_state"][
+                "tool_ledger"
+            ]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+        record_blobs = (
+            db.query(TraceCheckpointBlob)
+            .filter(TraceCheckpointBlob.blob_kind == TOOL_LEDGER_RECORD_KIND)
+            .all()
+        )
+        assert len(record_blobs) == 1
+
+        decoded = decode_trace_event_data(
+            db, task_id=task_id, data=encoded, strict=True
+        )
+        assert decoded == original
+    finally:
+        db.close()
+
+
+def test_v2_small_system_prompt_and_empty_metadata_stay_inline() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        data = _checkpoint_data("exec-small", [{"role": "user", "content": "hi"}])
+        data["snapshot"]["context"]["execution_id"] = "exec-small"
+        data["snapshot"]["context"]["system_prompt"] = "short prompt"
+        data["snapshot"]["context"]["metadata"] = {}
+
+        encoded = encode_checkpoint_data_for_storage(db, task_id=task_id, data=data)
+        db.flush()
+
+        assert encoded["snapshot"]["context"]["system_prompt"] == "short prompt"
+        assert encoded["snapshot"]["context"]["metadata"] == {}
+        assert db.query(TraceCheckpointBlob).count() == 0
+    finally:
+        db.close()
+
+
+def test_v1_flag_still_writes_whole_ledger_blob_and_v2_decodes_it() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        tool_ledger = {"call-1": {"result": "legacy output"}}
+        data = _checkpoint_data_with_large_fields(
+            "exec-v1",
+            [{"role": "user", "content": "hello"}],
+            tool_ledger=tool_ledger,
+        )
+
+        encoded = encode_checkpoint_data_for_storage(
+            db, task_id=task_id, data=data, use_v2=False
+        )
+        db.flush()
+
+        assert encoded["snapshot"]["pattern_state"]["tool_ledger"] == {
+            "__encoding": CHECKPOINT_BLOB_REF_ENCODING,
+            "kind": "pattern_state.tool_ledger",
+            "hash": canonical_json_hash(tool_ledger),
+        }
+
+        decoded = decode_trace_event_data(
+            db, task_id=task_id, data=encoded, strict=True
+        )
+        assert decoded["snapshot"]["pattern_state"]["tool_ledger"] == tool_ledger
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_prunes_checkpoint_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
+            lambda: 3,
+        )
+        # Force the batched-delete loop to run multiple chunks.
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.SQL_IN_CLAUSE_CHUNK_SIZE",
+            1,
+        )
+
+        # A non-checkpoint system event and another execution's checkpoint
+        # must both survive pruning.
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="other-system",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={"note": "not a checkpoint"},
+            )
+        )
+        db.commit()
+        handler._save_trace_event(
+            db,
+            TraceEvent(
+                CHECKPOINT_EVENT_TYPE,
+                task_id=str(task_id),
+                data=_checkpoint_data(
+                    "exec-other", [{"role": "user", "content": "other"}]
+                ),
+            ),
+        )
+
+        for index in range(5):
+            handler._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data=_checkpoint_data(
+                        "exec-prune",
+                        [{"role": "user", "content": f"turn-{index}"}],
+                    ),
+                ),
+            )
+
+        rows = (
+            db.query(DatabaseTraceEvent)
+            .filter(DatabaseTraceEvent.task_id == task_id)
+            .order_by(DatabaseTraceEvent.id)
+            .all()
+        )
+        prune_rows = [
+            row for row in rows if row.data.get("execution_id") == "exec-prune"
+        ]
+        assert len(prune_rows) == 3
+        # The most recent checkpoints are the ones kept.
+        latest = decode_trace_event_data(
+            db, task_id=task_id, data=prune_rows[-1].data, strict=True
+        )
+        assert latest["snapshot"]["context"]["messages"] == [
+            {"role": "user", "content": "turn-4"}
+        ]
+        assert any(row.event_id == "other-system" for row in rows)
+        assert any(row.data.get("execution_id") == "exec-other" for row in rows)
+    finally:
+        db.close()
+
+
+def test_loader_falls_back_to_older_row_when_prefetch_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient blob-prefetch failure must not abort checkpoint loading."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        old_messages = [{"role": "user", "content": "older inline"}]
+        now = datetime.now(timezone.utc)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="older-inline",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data("exec-prefetch", old_messages),
+            )
+        )
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-prefetch", [{"role": "user", "content": "newest refs"}]
+            ),
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="newest-refs",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=1),
+                data=encoded,
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # The newest row needs the prefetch (it has refs) and fails; the
+        # older inline row has no markers, never touches the prefetch, and
+        # must be returned as the fallback.
+        with patch.object(
+            tms,
+            "_load_trace_blob_lookup",
+            side_effect=RuntimeError("transient db error"),
+        ):
+            loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-prefetch"
+            )
+
+        assert loaded is not None
+        assert loaded["context"]["messages"] == old_messages
+    finally:
+        db.close()
+
+
+def test_prune_matches_legacy_execution_id_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows keyed only by root/nested execution ids must still be pruned."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
+            lambda: 2,
+        )
+        now = datetime.now(timezone.utc)
+
+        # Legacy row: only root_execution_id set (no flat execution_id).
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="legacy-root-only",
+                event_type="system_update_general",
+                timestamp=now - timedelta(seconds=2),
+                data={
+                    "checkpoint_type": "agent_v2_execution_checkpoint",
+                    "root_execution_id": "exec-legacy",
+                    "snapshot": {"context": {"messages": []}},
+                },
+            )
+        )
+        # Legacy row: only the nested snapshot execution_id set.
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="legacy-nested-only",
+                event_type="system_update_general",
+                timestamp=now - timedelta(seconds=1),
+                data={
+                    "checkpoint_type": "agent_v2_execution_checkpoint",
+                    "snapshot": {
+                        "execution_id": "exec-legacy",
+                        "context": {"messages": []},
+                    },
+                },
+            )
+        )
+        db.commit()
+
+        for index in range(2):
+            handler._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data=_checkpoint_data(
+                        "exec-legacy",
+                        [{"role": "user", "content": f"turn-{index}"}],
+                    ),
+                ),
+            )
+
+        remaining = [
+            row.event_id
+            for row in db.query(DatabaseTraceEvent)
+            .filter(DatabaseTraceEvent.task_id == task_id)
+            .order_by(DatabaseTraceEvent.id)
+            .all()
+        ]
+        # Both legacy-shaped rows are older than the 2 new checkpoints and
+        # must have been pruned by the coalesce predicate.
+        assert "legacy-root-only" not in remaining
+        assert "legacy-nested-only" not in remaining
+        assert len(remaining) == 2
+    finally:
+        db.close()
+
+
+def test_checkpoint_execution_id_predicate_matches_the_python_helper() -> None:
+    """The read query and history pruning share one SQL predicate; it must
+    agree with ``checkpoint_execution_id()`` (the Python SSOT the storage
+    encoder also follows) on every shape a stored row can take, not just the
+    common one. A row with no execution-id information anywhere never
+    matches a real, non-empty id -- absence and the empty string are the
+    same SQL fact."""
+    from xagent.core.agent.checkpoint import checkpoint_execution_id
+    from xagent.web.services.trace_handlers import _checkpoint_execution_id_predicate
+
+    real_execution_id = "exec-parity-real"
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        rows = {
+            "absent-fields": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"context": {"messages": []}},
+            },
+            "present-but-empty": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": "",
+                "execution_id": "",
+                "snapshot": {"context": {"messages": []}},
+            },
+            "snapshot-only": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {
+                    "execution_id": real_execution_id,
+                    "context": {"messages": []},
+                },
+            },
+            "tagged-only": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": real_execution_id,
+                "snapshot": {"context": {"messages": []}},
+            },
+        }
+        for event_id, data in rows.items():
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_type="system_update_general",
+                    timestamp=datetime.now(timezone.utc),
+                    data=data,
+                )
+            )
+        db.commit()
+
+        # The Python SSOT: only the two id-bearing shapes resolve to the
+        # real execution id, regardless of whether it came from the root
+        # tag or the nested snapshot.
+        expected_matches = {"snapshot-only", "tagged-only"}
+        for event_id, data in rows.items():
+            resolved = checkpoint_execution_id(data)
+            if event_id in expected_matches:
+                assert resolved == real_execution_id, event_id
+            else:
+                assert resolved == "", event_id
+
+        # The SQL predicate must select exactly the same matching set.
+        matched_ids = {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                _checkpoint_execution_id_predicate(real_execution_id),
+            )
+            .all()
+        }
+        assert matched_ids == expected_matches
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
+            lambda: 0,
+        )
+
+        for index in range(4):
+            handler._save_trace_event(
+                db,
+                TraceEvent(
+                    CHECKPOINT_EVENT_TYPE,
+                    task_id=str(task_id),
+                    data=_checkpoint_data(
+                        "exec-keep",
+                        [{"role": "user", "content": f"turn-{index}"}],
+                    ),
+                ),
+            )
+
+        assert (
+            db.query(DatabaseTraceEvent)
+            .filter(DatabaseTraceEvent.task_id == task_id)
+            .count()
+            == 4
+        )
+    finally:
+        db.close()
+
+
+def test_convert_trace_checkpoint_messages_script_dry_run_and_execute() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        inline_messages = [{"role": "user", "content": "convert me"}]
+        already_encoded = encode_checkpoint_messages_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data("exec-convert", inline_messages),
+        )
+        mixed_encoded = encode_checkpoint_messages_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data_with_large_fields("exec-convert", inline_messages),
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="inline",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=_checkpoint_data("exec-convert", inline_messages),
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="refs",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=already_encoded,
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="mixed",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=mixed_encoded,
+            )
+        )
+        db.commit()
+
+        dry_run_stats = convert_trace_checkpoint_messages(
+            db,
+            dry_run=True,
+            batch_size=1,
+        )
+        assert dry_run_stats.converted_rows == 2
+        assert dry_run_stats.already_refs_rows == 1
+        inline_row = db.query(DatabaseTraceEvent).filter_by(event_id="inline").one()
+        assert isinstance(inline_row.data["snapshot"]["context"]["messages"], list)
+        mixed_row = db.query(DatabaseTraceEvent).filter_by(event_id="mixed").one()
+        assert isinstance(
+            mixed_row.data["snapshot"]["pattern_state"]["tool_ledger"], dict
+        )
+        assert (
+            mixed_row.data["snapshot"]["pattern_state"]["tool_ledger"].get("__encoding")
+            != CHECKPOINT_BLOB_REF_ENCODING
+        )
+
+        execute_stats = convert_trace_checkpoint_messages(
+            db,
+            dry_run=False,
+            batch_size=1,
+        )
+        assert execute_stats.converted_rows == 2
+        assert execute_stats.already_refs_rows == 1
+
+        converted_row = db.query(DatabaseTraceEvent).filter_by(event_id="inline").one()
+        stored_messages = converted_row.data["snapshot"]["context"]["messages"]
+        assert stored_messages["__encoding"] == MESSAGE_REFS_ENCODING
+        mixed_row = db.query(DatabaseTraceEvent).filter_by(event_id="mixed").one()
+        assert (
+            mixed_row.data["snapshot"]["pattern_state"]["tool_ledger"]["__encoding"]
+            == LEDGER_REFS_ENCODING
+        )
+        assert db.query(TraceMessageBlob).count() == 1
+        assert db.query(TraceCheckpointBlob).count() == 2
+
+        repeat_stats = convert_trace_checkpoint_messages(db, dry_run=False)
+        assert repeat_stats.converted_rows == 0
+        assert repeat_stats.already_refs_rows == 3
+    finally:
+        db.close()
+
+
+def test_convert_trace_checkpoint_messages_continues_after_row_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        messages = [{"role": "user", "content": "convert me"}]
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="bad",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=_checkpoint_data("exec-bad", messages),
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="good",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=_checkpoint_data("exec-good", messages),
+            )
+        )
+        db.commit()
+
+        from xagent.web.services import trace_message_storage
+
+        original_encode = trace_message_storage.encode_checkpoint_data_for_storage
+
+        def flaky_encode(db: Session, *, task_id: int, data: Any) -> Any:
+            if data.get("execution_id") == "exec-bad":
+                raise RuntimeError("synthetic conversion failure")
+            return original_encode(db, task_id=task_id, data=data)
+
+        monkeypatch.setattr(
+            trace_message_storage,
+            "encode_checkpoint_data_for_storage",
+            flaky_encode,
+        )
+
+        stats = convert_trace_checkpoint_messages(
+            db,
+            dry_run=False,
+            batch_size=10,
+        )
+
+        assert stats.error_rows == 1
+        assert stats.converted_rows == 1
+        bad_row = db.query(DatabaseTraceEvent).filter_by(event_id="bad").one()
+        assert isinstance(bad_row.data["snapshot"]["context"]["messages"], list)
+        good_row = db.query(DatabaseTraceEvent).filter_by(event_id="good").one()
+        assert (
+            good_row.data["snapshot"]["context"]["messages"]["__encoding"]
+            == MESSAGE_REFS_ENCODING
+        )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_query_failure_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    def broken_get_db() -> Iterator[Session]:
+        raise RuntimeError("pool checkout failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", broken_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError):
+            handler._sync_load_latest_checkpoint("exec-query-failure")
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+@pytest.mark.asyncio
+async def test_load_checkpoint_async_wrapper_propagates_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async wrapper must not collapse a read failure back to ``None``."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    def broken_get_db() -> Iterator[Session]:
+        raise RuntimeError("pool checkout failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", broken_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError):
+            await handler.load_latest_checkpoint("exec-query-failure-async")
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+def test_load_checkpoint_zero_rows_returns_none_and_clears_stale_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # A prior transient failure left the signal active; a query that
+        # completes successfully -- even with zero matching rows -- must
+        # clear it, not just a query that finds a checkpoint.
+        register_degradation(CHECKPOINT_LOAD_UNAVAILABLE, "stale from a prior failure")
+        try:
+            loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-empty"
+            )
+            assert loaded is None
+            assert CHECKPOINT_LOAD_UNAVAILABLE not in active_degradations()
+        finally:
+            clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_all_rows_undecodable_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every matching row permanently undecodable, set exhausted -> corrupt."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for offset, event_id in enumerate(["corrupt-old", "corrupt-new"]):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=offset),
+                    data=_checkpoint_data(
+                        "exec-corrupt",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{event_id}"]),
+                            "refs": [f"sha256:missing-{event_id}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint("exec-corrupt")
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_generic_decode_failure_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure on every row must not be reported as corrupt."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-transient", [{"role": "user", "content": "needs prefetch"}]
+            ),
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="needs-prefetch",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=encoded,
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with patch.object(
+            tms,
+            "_load_trace_blob_lookup",
+            side_effect=RuntimeError("transient db error"),
+        ):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "exec-transient"
+                )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_undecodable_full_batch_is_exhausted_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first batch exactly at the page size is not ambiguous: the scan
+    pages past it, finds nothing more, and that proves the matching set was
+    exhausted -- exclusively permanent decode failures is corrupt, not a
+    conservative unavailable."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+    from xagent.web.services.trace_handlers import CHECKPOINT_ROW_SCAN_LIMIT
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for i in range(CHECKPOINT_ROW_SCAN_LIMIT):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"full-batch-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-full-batch",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-full-batch"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_continues_past_a_batch_of_undecodable_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A readable row in a later batch is still found -- the scan does not
+    give up after the first page, it pages until the set is exhausted or a
+    readable row turns up."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # Newest four rows (scanned first, in two pages of two) are
+        # undecodable; the oldest row (third page) is readable.
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"multi-batch-bad-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=10 - i),
+                    data=_checkpoint_data(
+                        "exec-multi-batch",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="multi-batch-readable",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data(
+                    "exec-multi-batch", [{"role": "user", "content": "hello"}]
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-multi-batch"
+        )
+        assert loaded is not None
+        assert loaded["context"]["messages"] == [{"role": "user", "content": "hello"}]
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_exhausts_multiple_batches_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every row across every batch is permanently undecodable, and the
+    scan proves the set exhausted (a page shorter than the batch size) --
+    corrupt, not unavailable."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"multi-batch-corrupt-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-multi-batch-corrupt",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-multi-batch-corrupt"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_stops_at_max_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With history pruning disabled, a backlog large enough to keep paging
+    past the cap must stop and fail unavailable instead of scanning the
+    matching set to exhaustion query by query."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # 4 undecodable rows with a page size of 2 and a page cap of 2 means
+        # both pages come back full (no short page to prove exhaustion), so
+        # the loop must hit the cap on the 3rd iteration instead of issuing
+        # a 3rd query.
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"max-page-cap-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-max-page-cap",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_SCAN_MAX_PAGES", 2
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        with pytest.raises(CheckpointUnavailableError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-max-page-cap"
+            )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_load_checkpoint_generic_failure_mid_scan_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic (transient) failure on one row anywhere in a multi-batch
+    scan is conservatively unavailable, even if every other row in the scan
+    is a confirmed permanent decode failure. The final raise must also
+    register the degradation signal -- the intervening successful page
+    fetches clear it, so nothing else re-raises it before this raise site
+    does."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # Newest row is marked to fail the blob prefetch generically; it is
+        # otherwise perfectly readable (encoded so decode actually needs the
+        # blob lookup this test makes fail).
+        flaky_data = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-mid-scan-failure",
+                [{"role": "user", "content": "needs prefetch"}],
+            ),
+        )
+        flaky_data["__test_trigger_generic_failure"] = True
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="mid-scan-flaky",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=10),
+                data=flaky_data,
+            )
+        )
+        # Older rows are permanently undecodable, spanning a second batch.
+        for i in range(3):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"mid-scan-corrupt-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-mid-scan-failure",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        original_lookup = tms._load_trace_blob_lookup
+
+        def _flaky_lookup(db: Session, *, task_id: int, data_items: list[Any]) -> Any:
+            if any(
+                isinstance(item, dict) and item.get("__test_trigger_generic_failure")
+                for item in data_items
+            ):
+                raise RuntimeError("transient db error")
+            return original_lookup(db, task_id=task_id, data_items=data_items)
+
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=_flaky_lookup):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "exec-mid-scan-failure"
+                )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_load_checkpoint_readable_type_without_snapshot_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that claims to be a checkpoint but carries no payload is corrupt,
+    not absent -- it must not be silently treated as "no checkpoint"."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="no-snapshot",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "exec-no-snapshot",
+                },
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-no-snapshot"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_snapshotless_newest_row_does_not_shadow_older_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newest row with a readable checkpoint_type but no snapshot is a
+    per-row permanent failure, not a verdict on the matching set: the scan
+    falls through to the older valid row and returns its snapshot."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="shadowing-no-snapshot",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=10),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "exec-shadowed",
+                },
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="shadowing-valid-older",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data(
+                    "exec-shadowed", [{"role": "user", "content": "hello"}]
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-shadowed"
+        )
+        assert loaded is not None
+        assert loaded["context"]["messages"] == [{"role": "user", "content": "hello"}]
+    finally:
+        db.close()
+
+
+def test_checkpoint_read_failure_preserves_pool_timeout_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Translating a read failure must chain the original exception.
+
+    Resume consumers discriminate pool exhaustion before they act on an
+    unavailable checkpoint, and ``is_database_pool_timeout`` finds that
+    fact by walking ``__cause__``/``__context__``. A translation that drops
+    the chain would make an exhausted-pool read look like an ordinary
+    unavailable one, and the recovery path would answer it by issuing more
+    database writes against the same exhausted pool.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    def timing_out_get_db() -> Iterator[Session]:
+        raise SQLAlchemyTimeoutError("QueuePool limit reached")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", timing_out_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError) as checkout_failure:
+            handler._sync_load_latest_checkpoint("exec-checkout-timeout")
+        assert is_database_pool_timeout(checkout_failure.value)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+def test_checkpoint_query_failure_preserves_pool_timeout_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row-scan translation carries the same obligation as checkout."""
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+    from sqlalchemy.orm import Query
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+
+        def failing_all(self: Query) -> Any:
+            del self
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # Only the row scan uses ``.all()``; partition resolution reads
+        # through ``one_or_none``/``first`` and still completes, so this
+        # lands on the row-scan translation rather than the partition one.
+        monkeypatch.setattr(Query, "all", failing_all)
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(task_id)
+        with pytest.raises(CheckpointUnavailableError) as query_failure:
+            handler._sync_load_latest_checkpoint("exec-query-timeout")
+        assert "checkpoint query failed" in str(query_failure.value)
+        assert is_database_pool_timeout(query_failure.value)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_checkpoint_partition_read_failure_is_translated_and_chained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partition resolution is part of the read, not a step outside it.
+
+    A database failure while resolving which run partition this reader may
+    observe leaves the partition unknown, so the read could not be
+    completed. It must surface as ``CheckpointUnavailableError`` like any
+    other query failure -- a raw driver exception here would bypass every
+    consumer that catches the checkpoint read contract.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+
+        def failing_partition(self: DatabaseTraceHandler, _db: Session) -> Any:
+            del self
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            DatabaseTraceHandler,
+            "_root_checkpoint_read_partition",
+            failing_partition,
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(task_id)
+        with pytest.raises(CheckpointUnavailableError) as partition_failure:
+            handler._sync_load_latest_checkpoint("exec-partition-failure")
+        assert is_database_pool_timeout(partition_failure.value)
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_checkpoint_read_for_missing_task_row_is_unavailable_not_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished task row is an exceptional condition, not a policy one.
+
+    Refusal means "a checkpoint may exist but this reader is not the one
+    allowed to observe it", which callers answer by leaving the task
+    alone. A task row that is simply gone tells the reader nothing about
+    the partition, so it belongs with the read failures instead -- the two
+    verdicts are decided on adjacent branches and must not collapse.
+    """
+    from xagent.core.agent.checkpoint import (
+        CheckpointAccessRefusedError,
+        CheckpointUnavailableError,
+    )
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError) as missing_row:
+            handler._sync_load_latest_checkpoint("exec-missing-task")
+        assert not isinstance(missing_row.value, CheckpointAccessRefusedError)
+        assert CHECKPOINT_LOAD_UNAVAILABLE not in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()

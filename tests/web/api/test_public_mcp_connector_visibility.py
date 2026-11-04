@@ -1,0 +1,2553 @@
+import os
+import re
+import tempfile
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+import xagent.web.api.mcp as mcp_api
+from tests.shared.auth_database import auth_db_override
+from xagent.web.api.admin_mcp import (
+    PublicMCPAppCreate,
+    PublicMCPAppUpdate,
+    _commit_public_mcp_app_write,
+    admin_mcp_router,
+)
+from xagent.web.api.auth import (
+    AppNotOAuthError,
+    _ensure_user_mcp_server,
+    auth_router,
+)
+from xagent.web.api.mcp import mcp_router
+from xagent.web.models.auth_database import get_auth_db
+from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.public_mcp import PublicMCPApp, PublicMCPAppAudit
+from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
+
+
+def override_get_db():
+    db = None
+    try:
+        db = next(get_db())
+        yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
+app_for_tests = FastAPI()
+app_for_tests.include_router(auth_router)
+app_for_tests.include_router(mcp_router)
+app_for_tests.include_router(admin_mcp_router)
+app_for_tests.dependency_overrides[get_db] = override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
+client = TestClient(app_for_tests)
+
+
+def test_admin_catalog_openapi_documents_launch_config_and_update_semantics() -> None:
+    create_launch_config = PublicMCPAppCreate.model_json_schema()["properties"][
+        "launch_config"
+    ]
+    update_launch_config = PublicMCPAppUpdate.model_json_schema()["properties"][
+        "launch_config"
+    ]
+
+    for field_schema in (create_launch_config, update_launch_config):
+        description = field_schema.get("description", "").lower()
+        assert "credentials or secret values" in description
+        assert "connector credential flow" in description
+
+    operations = app_for_tests.openapi()["paths"]["/api/admin/mcp/apps/{app_id}"]
+    assert "full replacement" in operations["put"]["description"].lower()
+    assert "use patch" in operations["put"]["description"].lower()
+    assert "partial update" in operations["patch"]["description"].lower()
+    assert "presentation fields" in operations["patch"]["description"].lower()
+
+
+def _setup_test_db() -> str:
+    from xagent.web.models.database import init_db
+
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    db_url = f"sqlite:///{temp_db_path}"
+    init_db(db_url=db_url)
+    return temp_dir
+
+
+def _setup_admin() -> None:
+    status_response = client.get("/api/auth/setup-status")
+    assert status_response.status_code == 200
+    if status_response.json().get("needs_setup", True):
+        setup_response = client.post(
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
+        )
+        assert setup_response.status_code == 200
+
+
+def _login(username: str, password: str) -> dict[str, str]:
+    response = client.post(
+        "/api/auth/login", json={"username": username, "password": password}
+    )
+    assert response.status_code == 200
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def test_public_mcp_write_commit_rolls_back_and_preserves_failure() -> None:
+    db = Mock()
+    failure = RuntimeError("commit failed")
+    db.commit.side_effect = failure
+
+    with pytest.raises(RuntimeError) as caught:
+        _commit_public_mcp_app_write(db)
+
+    assert caught.value is failure
+    db.rollback.assert_called_once_with()
+
+
+def test_public_mcp_create_commit_maps_integrity_error_after_rollback() -> None:
+    db = Mock()
+    db.commit.side_effect = IntegrityError(
+        "INSERT INTO public_mcp_apps ...",
+        {},
+        RuntimeError("duplicate app_id"),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        _commit_public_mcp_app_write(db, integrity_error_detail="App already exists")
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == "App already exists"
+    db.rollback.assert_called_once_with()
+
+
+def _create_public_app(
+    headers: dict[str, str],
+    app_id: str,
+    name: str,
+    is_visible_in_connector: bool,
+    transport: str = "oauth",
+) -> None:
+    response = client.post(
+        "/api/admin/mcp/apps",
+        headers=headers,
+        json={
+            "app_id": app_id,
+            "name": name,
+            "description": f"{name} description",
+            "icon": "",
+            "transport": transport,
+            "provider_name": None,
+            "category": "Communication",
+            "oauth_scopes": [],
+            "is_visible_in_connector": is_visible_in_connector,
+            "launch_config": {},
+        },
+    )
+    assert response.status_code == 200
+
+
+def _connect_app_for_user(username: str, server_name: str) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        server = MCPServer(
+            name=server_name,
+            description="connected hidden app",
+            managed="external",
+            transport="oauth",
+        )
+        db.add(server)
+        db.flush()
+
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        server = MCPServer(
+            name=server_name,
+            description="custom stdio connector",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@floriscornel/teams-mcp@latest"],
+        )
+        db.add(server)
+        db.flush()
+
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _connect_oauth_account_for_user(
+    username: str, provider: str, *, resource_owner_key: str | None = None
+) -> None:
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        assert user is not None
+
+        db.add(
+            UserOAuth(
+                user_id=user.id,
+                provider=provider,
+                resource_owner_key=resource_owner_key,
+                access_token="access-token",
+                provider_user_id=f"{provider}-user",
+                email=f"{provider}@example.com",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_connected_non_oauth_public_app_is_marked_connected() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(
+            admin_headers,
+            "public-stdio",
+            "Public Stdio",
+            True,
+            transport="stdio",
+        )
+        _connect_custom_stdio_mcp_for_user("regular", "Public Stdio")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=public",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        public_app = next(app for app in response.json() if app["id"] == "public-stdio")
+        assert public_app["is_connected"] is True
+        assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_local_custom_mcp_app_is_a_self_contained_actor_scoped_edit_reference() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_custom_stdio_mcp_for_user("regular", "Private Local MCP")
+
+        response = client.get(
+            "/api/mcp/apps?location=local&search=private",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200, response.text
+        local_app = next(
+            app for app in response.json() if app["id"] == "Private Local MCP"
+        )
+        assert isinstance(local_app["server_id"], int)
+        assert local_app["transport"] == "stdio"
+        assert local_app["is_custom"] is True
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_non_oauth_public_app_matches_space_hyphen_name_variant() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(
+            admin_headers,
+            "space-hyphen",
+            "Different Display Name",
+            True,
+            transport="stdio",
+        )
+        _connect_custom_stdio_mcp_for_user("regular", "Space Hyphen")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=different",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        public_app = next(app for app in response.json() if app["id"] == "space-hyphen")
+        assert public_app["is_connected"] is True
+        assert isinstance(public_app["server_id"], int)
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_remote_connector_builds_oauth_connectability_once_per_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_oauth_account_for_user("regular", "microsoft")
+
+        checked_providers: list[str] = []
+
+        def count_connectability_check(oauth_account: object) -> bool:
+            checked_providers.append(str(getattr(oauth_account, "provider")))
+            return True
+
+        monkeypatch.setattr(
+            mcp_api, "_oauth_account_can_connect", count_connectability_check
+        )
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+
+        assert checked_providers == ["microsoft"]
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_remote_connector_ignores_actor_owned_oauth_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_oauth_account_for_user(
+            "regular",
+            "microsoft",
+            resource_owner_key="toby:slack:41:UALICE",
+        )
+
+        checked_providers: list[str] = []
+
+        def count_connectability_check(oauth_account: object) -> bool:
+            checked_providers.append(str(getattr(oauth_account, "provider")))
+            return True
+
+        monkeypatch.setattr(
+            mcp_api, "_oauth_account_can_connect", count_connectability_check
+        )
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+
+        assert response.status_code == 200
+        assert checked_providers == []
+        microsoft_apps = [
+            app for app in response.json() if app.get("provider") == "microsoft"
+        ]
+        assert microsoft_apps
+        for app in microsoft_apps:
+            assert app["is_connected"] is False
+            assert "connected_account" not in app
+            assert "server_id" not in app
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is timezone.utc:
+                return cls(2026, 1, 1, 8, 0, tzinfo=timezone.utc)
+            return cls(2026, 1, 1, 16, 0)
+
+    monkeypatch.setattr(mcp_api, "datetime", FixedDateTime)
+
+    oauth_account = SimpleNamespace(
+        access_token="access-token",
+        refresh_token=None,
+        expires_at=FixedDateTime(2026, 1, 1, 9, 0),
+    )
+
+    assert mcp_api._oauth_account_can_connect(oauth_account) is True
+
+
+def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(admin_headers, "visible-app", "Visible App", True)
+        _create_public_app(admin_headers, "hidden-app", "Hidden App", False)
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+
+        app_ids = {app["id"] for app in response.json()}
+        assert "visible-app" in app_ids
+        assert "hidden-app" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_real_shipped_chrome_row_is_excluded_from_the_connector_list() -> None:
+    """Round-7/8 open nit: the synthetic hidden-app test above pins the
+    listing filter's mechanics, and the connect-endpoint 404 is pinned
+    elsewhere against the real app id — but nothing asserted the listing
+    filter on the row this PR actually ships. init_db seeds the real
+    registry rows (chrome-devtools included, hidden), so this drives the
+    exact shipped state end to end: the row exists in the DB (asserted, so
+    the listing check can't pass vacuously) yet never reaches the catalog
+    listing. A registry visibility flip cannot ship silently with the suite
+    green."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        # Guard against a vacuous pass: the row really is in the DB (seeded
+        # by init_db from the registry), and really is hidden.
+        db = next(get_db())
+        try:
+            seeded = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "chrome-devtools")
+                .one()
+            )
+            assert seeded.is_visible_in_connector is False, (
+                "chrome-devtools must ship hidden -- if this flips to True, "
+                "update this test's premise together with the unhide checklist"
+            )
+        finally:
+            db.close()
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+        app_ids = {app["id"] for app in response.json()}
+        assert "chrome-devtools" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_custom_stdio_mcp_with_same_name_does_not_mark_builtin_oauth_app_connected() -> (
+    None
+):
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _connect_custom_stdio_mcp_for_user("regular", "Teams")
+
+        response = client.get(
+            "/api/mcp/apps?location=remote&search=teams",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+        teams_app = next(app for app in response.json() if app["id"] == "teams")
+        assert teams_app["is_connected"] is False
+        assert "server_id" not in teams_app
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        _connect_custom_stdio_mcp_for_user("regular", "Teams")
+
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == "regular").first()
+            assert user is not None
+
+            with pytest.raises(
+                ValueError, match="conflicts with an existing MCP server"
+            ) as exc:
+                _ensure_user_mcp_server(
+                    db,
+                    int(user.id),
+                    {
+                        "id": "teams",
+                        "name": "Teams",
+                        "description": "Connect to Microsoft Teams.",
+                        "provider": "microsoft",
+                        "auth_type": "builtin_oauth",
+                    },
+                )
+            # A genuine metadata conflict on a real OAuth app is a plain
+            # ValueError, NOT AppNotOAuthError — so the batch loop's narrowed
+            # except surfaces it instead of misreporting it as "non-oauth".
+            assert not isinstance(exc.value, AppNotOAuthError)
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_builtin_oauth_server_records_catalog_provenance() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    provenance = {"registry": "xagent", "app_id": "excel", "version": 1}
+    with Session(engine) as db:
+        _ensure_user_mcp_server(
+            db,
+            1,
+            {
+                "id": "excel",
+                "name": "Excel",
+                "description": "Connect to Excel.",
+                "provider": "microsoft",
+                "auth_type": "builtin_oauth",
+                "launch_config": {"builtin_provenance": provenance},
+            },
+        )
+        db.commit()
+
+        server = db.query(MCPServer).filter(MCPServer.name == "Excel").one()
+        assert server.auth == {
+            "app_id": "excel",
+            "provider": "microsoft",
+            "builtin_provenance": provenance,
+        }
+    engine.dispose()
+
+
+def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        provider_names = {row.provider_name for row in db.query(OAuthProvider).all()}
+        assert {"google", "linkedin", "microsoft", "meta"}.issubset(provider_names)
+        assert "hubspot" not in provider_names
+
+        microsoft_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "microsoft")
+            .first()
+        )
+        assert microsoft_provider is not None
+        assert microsoft_provider.default_scopes == ["User.Read"]
+        meta_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "meta")
+            .first()
+        )
+        assert meta_provider is not None
+        assert meta_provider.default_scopes == ["public_profile"]
+
+        app_ids = {row.app_id for row in db.query(PublicMCPApp).all()}
+        assert {
+            "linkedin",
+            "gmail",
+            "google-drive",
+            "google-calendar",
+            "teams",
+            "outlook",
+            "onedrive",
+            "facebook",
+            "instagram",
+        }.issubset(app_ids)
+
+        teams_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "teams").first()
+        )
+        outlook_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "outlook").first()
+        )
+        onedrive_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "onedrive").first()
+        )
+        facebook_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "facebook").first()
+        )
+        instagram_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "instagram").first()
+        )
+
+        assert teams_app is not None
+        assert teams_app.provider_name == "microsoft"
+        assert teams_app.oauth_scopes == [
+            "Team.ReadBasic.All",
+            "Channel.ReadBasic.All",
+            "TeamMember.Read.All",
+            "ChannelMessage.Read.All",
+            "ChannelMessage.Send",
+            "Chat.ReadWrite",
+            "offline_access",
+        ]
+        assert teams_app.launch_config == {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.teams"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+
+        assert outlook_app is not None
+        assert outlook_app.provider_name == "microsoft"
+        assert outlook_app.oauth_scopes == [
+            "Mail.Read",
+            "Mail.Send",
+            "Calendars.ReadWrite",
+            "Contacts.Read",
+            "offline_access",
+        ]
+        assert outlook_app.launch_config == {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.outlook"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+
+        assert onedrive_app is not None
+        assert onedrive_app.provider_name == "microsoft"
+        assert onedrive_app.oauth_scopes == ["Files.ReadWrite", "offline_access"]
+        assert onedrive_app.launch_config == {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.onedrive"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+
+        assert facebook_app is not None
+        assert facebook_app.provider_name == "meta"
+        assert facebook_app.category == "Marketing"
+        assert facebook_app.oauth_scopes == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+            "pages_read_user_content",
+        ]
+        assert facebook_app.launch_config == {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.facebook"],
+            "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        }
+
+        assert instagram_app is not None
+        assert instagram_app.provider_name == "meta"
+        assert instagram_app.category == "Marketing"
+        assert instagram_app.oauth_scopes == [
+            "pages_show_list",
+            "pages_read_engagement",
+            "instagram_basic",
+            "instagram_content_publish",
+        ]
+        assert instagram_app.launch_config == {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.instagram"],
+            "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        }
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    expected_python_apps = {
+        "linkedin": (
+            "xagent.web.tools.mcp.linkedin",
+            {"LINKEDIN_ACCESS_TOKEN": "access_token"},
+        ),
+        "gmail": (
+            "xagent.web.tools.mcp.gmail",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-drive": (
+            "xagent.web.tools.mcp.google_drive",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-calendar": (
+            "xagent.web.tools.mcp.calendar",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-docs": (
+            "xagent.web.tools.mcp.google_docs",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-slides": (
+            "xagent.web.tools.mcp.google_slides",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-analytics": (
+            "xagent.web.tools.mcp.google_analytics",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-search-console": (
+            "xagent.web.tools.mcp.google_search_console",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "teams": (
+            "xagent.web.tools.mcp.teams",
+            {"AUTH_TOKEN": "access_token"},
+        ),
+        "outlook": (
+            "xagent.web.tools.mcp.outlook",
+            {"AUTH_TOKEN": "access_token"},
+        ),
+        "onedrive": (
+            "xagent.web.tools.mcp.onedrive",
+            {"AUTH_TOKEN": "access_token"},
+        ),
+        "facebook": (
+            "xagent.web.tools.mcp.facebook",
+            {"META_ACCESS_TOKEN": "access_token"},
+        ),
+        "instagram": (
+            "xagent.web.tools.mcp.instagram",
+            {"META_ACCESS_TOKEN": "access_token"},
+        ),
+        "slack": (
+            "xagent.web.tools.mcp.slack",
+            {"SLACK_ACCESS_TOKEN": "access_token"},
+        ),
+    }
+    rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
+
+    for app_id, (module_name, env_mapping) in expected_python_apps.items():
+        assert rows_by_app_id[app_id]["launch_config"] == {
+            "command": "python",
+            "args": ["-m", module_name],
+            "env_mapping": env_mapping,
+        }
+
+    assert rows_by_app_id["google-maps"]["launch_config"] == {
+        "command": "npx",
+        "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
+        "required_env": ["GOOGLE_MAPS_API_KEY"],
+    }
+
+    assert rows_by_app_id["aws"]["launch_config"] == {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.aws"],
+        "required_env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+    }
+
+
+def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
+    """Granola, Notion, Atlassian, Miro, Fireflies and Rocketlane have no local
+    launch command at all — they host their own MCP server and are reached over
+    streamable_http. This is intentionally split out of
+    test_builtin_registry_uses_runtime_available_launch_commands, whose name
+    is about local launch *commands* and would misdescribe these
+    remote-only entries."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
+
+    assert rows_by_app_id["granola"]["transport"] == "streamable_http"
+    assert rows_by_app_id["granola"]["launch_config"] == {
+        "url": "https://mcp.granola.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+    assert rows_by_app_id["notion"]["transport"] == "streamable_http"
+    assert rows_by_app_id["notion"]["launch_config"] == {
+        "url": "https://mcp.notion.com/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+    assert rows_by_app_id["hubspot"]["transport"] == "streamable_http"
+    assert rows_by_app_id["hubspot"]["launch_config"] == {
+        "url": "https://mcp.hubspot.com",
+        "auth": {
+            "type": "mcp_oauth",
+            "credential_provider": "hubspot",
+            "token_endpoint_auth_method": "client_secret_post",
+        },
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "hubspot",
+            "version": 2,
+        },
+    }
+
+    # Atlassian's current endpoint is /v2/mcp; the legacy /v1/sse endpoint is
+    # unsupported after 2026-06-30 and must not be what the catalog points at.
+    assert rows_by_app_id["atlassian"]["transport"] == "streamable_http"
+    # Its metadata advertises more scopes than one request can carry, so the
+    # catalog pins a subset. It is the permission set users consent to, so it
+    # is pinned literally here like every other row; changing it after release
+    # also needs a new migration (see 20261013_atlassian_mcp_scope). Atlassian
+    # grants only the scopes of the products a site has, so a grant must
+    # include just the basic identity scopes (required_scope).
+    assert rows_by_app_id["atlassian"]["launch_config"] == {
+        "url": "https://mcp.atlassian.com/v2/mcp",
+        "auth": {
+            "type": "mcp_oauth",
+            "scope": (
+                "email offline_access read:account "
+                "read:bitbucket:agent-interface read:confluence:agent-interface "
+                "read:jira:agent-interface read:me "
+                "search:confluence:agent-interface search:jira:agent-interface "
+                "search:rovo:agent-interface write:bitbucket:agent-interface "
+                "write:confluence:agent-interface write:jira:agent-interface"
+            ),
+            "required_scope": "email offline_access read:account read:me",
+        },
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "atlassian",
+            "version": 1,
+        },
+    }
+
+    # Miro serves MCP at the host root (its protected-resource metadata
+    # names "https://mcp.miro.com/" as the resource), not under /mcp.
+    assert rows_by_app_id["miro"]["transport"] == "streamable_http"
+    assert rows_by_app_id["miro"]["launch_config"] == {
+        "url": "https://mcp.miro.com/",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {"registry": "xagent", "app_id": "miro", "version": 1},
+    }
+
+    # Fireflies serves MCP under /mcp; its protected-resource metadata names
+    # "https://api.fireflies.ai/mcp" as the resource and "https://api.fireflies.ai/"
+    # as the authorization server. Per-user OAuth 2.1 + PKCE with DCR; the
+    # docs' static API-key header is a Claude Desktop alternative the catalog
+    # deliberately does not model.
+    assert rows_by_app_id["fireflies"]["transport"] == "streamable_http"
+    assert rows_by_app_id["fireflies"]["launch_config"] == {
+        "url": "https://api.fireflies.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "fireflies",
+            "version": 1,
+        },
+    }
+
+    # Rocketlane serves MCP under /mcp on a dedicated host; its
+    # protected-resource metadata is published at the path-suffixed
+    # /.well-known/oauth-protected-resource/mcp, so the endpoint path is
+    # load-bearing for discovery and must stay exactly as verified.
+    assert rows_by_app_id["rocketlane"]["transport"] == "streamable_http"
+    assert rows_by_app_id["rocketlane"]["launch_config"] == {
+        "url": "https://rocket-mcp.rl-platforms.rocketlane.com/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "rocketlane",
+            "version": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "app_id",
+    [
+        "granola",
+        "notion",
+        "hubspot",
+        "atlassian",
+        "miro",
+        "fireflies",
+        "rocketlane",
+    ],
+)
+def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
+    """The registry shape must classify as mcp_oauth — anything else means the
+    catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
+    and generic_oauth_login rejects non-"oauth" transports)."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+    from xagent.web.mcp_apps import classify_app_auth
+
+    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == app_id)
+    assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
+
+
+def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields,
+        get_builtin_public_mcp_app,
+        is_builtin_public_mcp_app,
+    )
+
+    expected_execution_fields = {
+        "name": "Gmail",
+        "transport": "oauth",
+        "provider_name": "google",
+        "oauth_scopes": [],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.gmail"],
+            "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        },
+    }
+
+    app = get_builtin_public_mcp_app("gmail")
+    execution_fields = get_builtin_execution_fields("gmail")
+
+    assert app is not None
+    assert app["app_id"] == "gmail"
+    assert execution_fields == expected_execution_fields
+    assert is_builtin_public_mcp_app("gmail") is True
+    assert get_builtin_public_mcp_app("Gmail") is None
+    assert get_builtin_public_mcp_app("gmail ") is None
+    assert get_builtin_public_mcp_app("unknown-app") is None
+    assert get_builtin_execution_fields("unknown-app") is None
+    assert is_builtin_public_mcp_app("unknown-app") is False
+
+    app["name"] = "Mutated Gmail"
+    app["oauth_scopes"].append("mutated-scope")
+    app["launch_config"]["args"].append("mutated-arg")
+    assert execution_fields is not None
+    execution_fields["oauth_scopes"].append("another-mutated-scope")
+    execution_fields["launch_config"]["env_mapping"]["MUTATED"] = "token"
+
+    fresh_app = get_builtin_public_mcp_app("gmail")
+    assert fresh_app is not None
+    assert fresh_app["name"] == "Gmail"
+    assert fresh_app["oauth_scopes"] == expected_execution_fields["oauth_scopes"]
+    assert fresh_app["launch_config"] == expected_execution_fields["launch_config"]
+    assert get_builtin_execution_fields("gmail") == expected_execution_fields
+
+
+def test_get_builtin_execution_fields_and_optional_scopes() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields,
+        get_builtin_execution_fields_and_optional_scopes,
+    )
+
+    execution_fields, optional_scopes = (
+        get_builtin_execution_fields_and_optional_scopes("hubspot")
+    )
+    assert execution_fields == get_builtin_execution_fields("hubspot")
+    assert optional_scopes == []
+
+    # Most builtin apps have no optional_oauth_scopes key at all.
+    gmail_fields, gmail_optional = get_builtin_execution_fields_and_optional_scopes(
+        "gmail"
+    )
+    assert gmail_fields == get_builtin_execution_fields("gmail")
+    assert gmail_optional == []
+
+    assert get_builtin_execution_fields_and_optional_scopes("unknown-app") == (
+        None,
+        [],
+    )
+
+
+def test_app_to_dict_defaults_optional_oauth_scopes_for_apps() -> None:
+    from xagent.web.mcp_apps import _app_to_dict
+    from xagent.web.models.public_mcp import PublicMCPApp
+
+    hubspot_app = PublicMCPApp(
+        app_id="hubspot",
+        name="HubSpot",
+        transport="oauth",
+        provider_name="hubspot",
+        oauth_scopes=["crm.objects.contacts.read"],
+        launch_config={},
+    )
+    assert _app_to_dict(hubspot_app)["optional_oauth_scopes"] == []
+
+    custom_app = PublicMCPApp(
+        app_id="some-custom-app",
+        name="Custom",
+        transport="oauth",
+        provider_name="custom",
+        oauth_scopes=["custom.scope"],
+        launch_config={},
+    )
+    assert _app_to_dict(custom_app)["optional_oauth_scopes"] == []
+
+
+def test_builtin_registry_drift_validation_reports_safe_read_only_summaries() -> None:
+    from xagent.web.builtin_mcp_registry import validate_builtin_public_mcp_apps
+
+    secret_marker = "secret-value-must-not-appear"
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        gmail_app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        gmail_app.name = "Stale Gmail"
+        gmail_app.launch_config = {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+        deleted_builtin_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "google-drive").one()
+        )
+        db.delete(deleted_builtin_app)
+        custom_app = PublicMCPApp(
+            app_id="Gmail",
+            name="Custom Gmail Lookalike",
+            transport="stdio",
+            launch_config={"command": "custom-command"},
+        )
+        db.add(custom_app)
+        db.commit()
+
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        assert len(mismatches) == 1
+        mismatch = mismatches[0]
+        assert mismatch["app_id"] == "gmail"
+        assert mismatch["mismatched_fields"] == ["name", "launch_config"]
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", mismatch["canonical_hash"])
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", mismatch["persisted_hash"])
+        assert mismatch["canonical_hash"] != mismatch["persisted_hash"]
+        assert secret_marker not in repr(mismatches)
+        assert "Gmail" not in repr(mismatches)
+        assert "google-drive" not in repr(mismatches)
+
+        db.expire_all()
+        persisted_gmail = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        )
+        persisted_custom = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "Gmail").one()
+        )
+        assert persisted_gmail.name == "Stale Gmail"
+        assert persisted_gmail.launch_config == {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+        assert persisted_custom.launch_config == {"command": "custom-command"}
+        assert (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "google-drive").first()
+            is None
+        )
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_builtin_registry_drift_validation_accepts_canonical_rows() -> None:
+    from xagent.web.builtin_mcp_registry import validate_builtin_public_mcp_apps
+
+    temp_dir = _setup_test_db()
+    try:
+        with get_engine().begin() as connection:
+            assert validate_builtin_public_mcp_apps(connection) == []
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_provenance_version_drift_keeps_ownership_and_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        is_builtin_public_mcp_app,
+        validate_builtin_public_mcp_apps,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["version"] = 999
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is True
+        assert is_builtin_public_mcp_app("shopify") is True
+        assert (
+            _app_to_dict(shopify_app)["launch_config"]["builtin_provenance"]["version"]
+            == 1
+        )
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["launch_config"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_foreign_provenance_is_not_owned_but_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        validate_builtin_public_mcp_apps,
+    )
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["registry"] = "custom"
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is False
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["builtin_provenance"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_unmarked_planner_catalog_collision_keeps_custom_execution_fields() -> None:
+    """An operator-owned app_id collision must not receive builtin execution."""
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    custom_launch = {
+        "command": "custom-planner",
+        "args": ["--serve"],
+        "required_env": ["CUSTOM_TOKEN"],
+    }
+    custom = PublicMCPApp(
+        app_id="planner",
+        name="Internal Planning",
+        description="Operator-owned planning connector",
+        transport="stdio",
+        provider_name=None,
+        category="Custom",
+        oauth_scopes=None,
+        is_visible_in_connector=True,
+        launch_config=custom_launch,
+    )
+
+    assert _persisted_builtin_provenance_matches("planner", custom_launch) is False
+    projected = _app_to_dict(custom)
+    assert projected["name"] == "Internal Planning"
+    assert projected["transport"] == "stdio"
+    assert projected["provider"] is None
+    assert projected["launch_config"] == custom_launch
+
+
+def test_init_db_logs_safe_builtin_registry_drift_without_repairing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from xagent.web.models.database import init_db
+
+    secret_marker = "secret-value-must-not-be-logged"
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    db_url = f"sqlite:///{temp_db_path}"
+    init_db(db_url=db_url)
+
+    db = next(get_db())
+    try:
+        gmail_app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        gmail_app.launch_config = {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="xagent.web.models.database"):
+        init_db(db_url=db_url)
+
+    drift_records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.web.models.database"
+        and "Built-in MCP catalog drift detected" in record.getMessage()
+    ]
+    assert len(drift_records) == 1
+    drift_message = drift_records[0].getMessage()
+    assert "app_id=gmail" in drift_message
+    assert "mismatched_fields=launch_config" in drift_message
+    assert "canonical_hash=sha256:" in drift_message
+    assert "persisted_hash=sha256:" in drift_message
+    assert secret_marker not in drift_message
+
+    db = next(get_db())
+    try:
+        persisted_gmail = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        )
+        assert persisted_gmail.launch_config == {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_init_db_does_not_warn_when_builtin_registry_is_canonical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="xagent.web.models.database"):
+        temp_dir = _setup_test_db()
+    try:
+        assert not any(
+            record.name == "xagent.web.models.database"
+            and "Built-in MCP catalog drift detected" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_init_db_does_not_reseed_deleted_builtin_app_on_existing_database() -> None:
+    from xagent.web.models.database import init_db
+
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    db_url = f"sqlite:///{temp_db_path}"
+
+    init_db(db_url=db_url)
+
+    db = next(get_db())
+    try:
+        gmail_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+        )
+        assert gmail_app is not None
+        db.delete(gmail_app)
+        db.commit()
+    finally:
+        db.close()
+
+    init_db(db_url=db_url)
+
+    db = next(get_db())
+    try:
+        recreated_gmail_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+        )
+        assert recreated_gmail_app is None
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_connected_hidden_public_mcp_app_is_excluded_in_strong_hide_mode() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        _create_public_app(admin_headers, "hidden-app", "Hidden App", False)
+        _connect_app_for_user("regular", "Hidden App")
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+
+        app_ids = {app["id"] for app in response.json()}
+        assert "hidden-app" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_mixed_case_oauth_transport_app_is_marked_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the mixed-case transport fix: list_mcp_apps now routes on
+    auth_type (which lowercases), so a "OAuth"-cased catalog entry is treated as
+    builtin_oauth. Before, the exact-case `transport == "oauth"` branch stranded
+    it in the non-oauth path, leaving is_connected always False."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        # Admin API accepts arbitrary transport casing.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "mixed-oauth",
+                "name": "MixedOauth",
+                "description": "",
+                "icon": "",
+                "transport": "OAuth",
+                "provider_name": "microsoft",
+                "category": "Communication",
+                "oauth_scopes": [],
+                "is_visible_in_connector": True,
+                "launch_config": {},
+            },
+        )
+        assert resp.status_code == 200
+
+        _connect_oauth_account_for_user("regular", "microsoft")
+        monkeypatch.setattr(mcp_api, "_oauth_account_can_connect", lambda _a: True)
+
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == "regular").first()
+            assert user is not None
+            server = MCPServer(
+                name="MixedOauth",
+                description="",
+                managed="external",
+                transport="oauth",
+                auth={"app_id": "mixed-oauth"},
+            )
+            db.add(server)
+            db.flush()
+            db.add(
+                UserMCPServer(
+                    user_id=user.id,
+                    mcpserver_id=server.id,
+                    is_owner=True,
+                    can_edit=True,
+                    can_delete=True,
+                    is_active=True,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+        app = next(a for a in response.json() if a["id"] == "mixed-oauth")
+        assert app["is_connected"] is True
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_accepts_keyless_and_rejects_partial_key_shapes() -> None:
+    """Write-time constraint (#764), updated for the keyless class: a stdio
+    entry with a launch command and no required_env classifies as "keyless"
+    (e.g. Chrome) and is accepted; the genuinely partial shapes — required_env
+    without a command, or a command on a remote transport — still classify as
+    "unconnectable" and are rejected."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        # A stdio command without required_env is a valid keyless app.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "ok-keyless",
+                "name": "OkKeyless",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "args": ["-y", "x"]},
+            },
+        )
+        assert resp.status_code == 200
+
+        # required_env without command stays rejected.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-nocommand",
+                "name": "BadNoCommand",
+                "transport": "stdio",
+                "launch_config": {"required_env": ["KEY"]},
+            },
+        )
+        assert resp.status_code == 422
+
+        # A command on a remote transport is not keyless — still rejected.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-remote-command",
+                "name": "BadRemoteCommand",
+                "transport": "streamable_http",
+                "launch_config": {"command": "npx", "args": ["-y", "x"]},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_rejects_partial_remote_oauth_entry() -> None:
+    """Same write-time constraint (#764), for the remote-MCP-OAuth shape: a
+    streamable_http/sse/websocket entry needs BOTH launch_config.url and
+    launch_config.auth.type == "mcp_oauth", or it classifies as
+    "unconnectable" and must be rejected rather than silently persisted."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        # Shape 1: url without auth.type=mcp_oauth.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-auth-type",
+                "name": "BadNoAuthType",
+                "transport": "streamable_http",
+                "launch_config": {"url": "https://mcp.example.com/mcp"},
+            },
+        )
+        assert resp.status_code == 422
+
+        # Shape 2 (the reverse asymmetric shape): auth.type=mcp_oauth without url.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-url",
+                "name": "BadNoUrl",
+                "transport": "streamable_http",
+                "launch_config": {"auth": {"type": "mcp_oauth"}},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_accepts_full_remote_oauth_entry() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "good-remote-oauth",
+                "name": "GoodRemoteOAuth",
+                "transport": "streamable_http",
+                "launch_config": {
+                    "url": "https://mcp.example.com/mcp",
+                    "auth": {"type": "mcp_oauth"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["launch_config"]["url"] == "https://mcp.example.com/mcp"
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_update_app_enforces_auth_classification() -> None:
+    """The write-time constraint fires on PUT too, not just POST (both use the
+    same PublicMCPAppCreate model)."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "good-keyed",
+                "name": "GoodKeyed",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "required_env": ["KEY"]},
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        # Dropping the command (keeping required_env) is a genuinely partial
+        # shape and must be rejected. (Dropping required_env instead would be a
+        # legitimate api_key -> keyless transition, not a violation.)
+        updated = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "app_id": "good-keyed",
+                "name": "GoodKeyed",
+                "transport": "stdio",
+                "launch_config": {"required_env": ["KEY"]},
+            },
+        )
+        assert updated.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_put_removing_required_env_transitions_api_key_row_to_connectable_keyless() -> (
+    None
+):
+    """Round-4 MINOR-7b / round-5 m4: this loosening is real and previously
+    untested via PUT (only the CREATE/POST acceptance of a fresh keyless
+    shape was covered). An admin-created stdio row with required_env
+    classifies api_key; removing required_env via PUT is a legitimate
+    transition to keyless (not the genuinely partial shape rejected in
+    test_admin_update_app_enforces_auth_classification above, which drops
+    command instead) -- the write-time validator must accept it (200, not
+    422), and the resulting row must actually be connectable through the
+    real user-facing endpoint afterward, not just pass admin validation.
+    """
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "required_env": ["KEY"]},
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        from xagent.web.mcp_apps import classify_app_auth
+
+        assert (
+            classify_app_auth("stdio", {"command": "npx", "required_env": ["KEY"]})
+            == "api_key"
+        )
+
+        updated = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx"},
+            },
+        )
+        assert updated.status_code == 200
+        assert classify_app_auth("stdio", {"command": "npx"}) == "keyless"
+
+        # Connectable through the real endpoint post-transition, with no env
+        # at all -- the keyless shape's defining behavior.
+        connected = client.post(
+            "/api/mcp/apps/transitioning-app/connect",
+            headers=admin_headers,
+            json={"is_active": True},
+        )
+        assert connected.status_code == 200
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_update_grandfathers_a_preexisting_bad_shape_row_for_unrelated_edits() -> (
+    None
+):
+    """F4: a row already in an "unconnectable" partial shape (created directly,
+    simulating one that predates a shape rule tightening) must stay editable
+    for fields the shape check doesn't read — otherwise the write-time
+    constraint permanently locks out even an icon change on that row. A PUT
+    that also touches transport/launch_config must still be rejected."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-partial-oauth",
+                    name="LegacyPartialOAuth",
+                    icon="old-icon",
+                    transport="streamable_http",
+                    launch_config={"url": "https://mcp.example.com/mcp"},
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "legacy-partial-oauth")
+                .one()
+                .id
+            )
+        finally:
+            db.close()
+
+        unrelated_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"icon": "new-icon"},
+        )
+        assert unrelated_edit.status_code == 200
+        assert unrelated_edit.json()["icon"] == "new-icon"
+
+        shape_touching_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"launch_config": {"url": "https://mcp.example.com/mcp"}},
+        )
+        assert shape_touching_edit.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
+    """The write-time validator lives on the create model only, so listing must
+    not re-validate on response serialization. A legacy/direct-DB row with a
+    partial launch_config (classifies "unconnectable") must be returned, not turn
+    the whole admin list into a 500."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-bad",
+                    name="LegacyBad",
+                    transport="stdio",
+                    # required_env without a command: still a genuinely partial
+                    # shape (command-only now classifies "keyless", not partial).
+                    launch_config={"required_env": ["KEY"]},
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        resp = client.get("/api/admin/mcp/apps", headers=admin_headers)
+        assert resp.status_code == 200
+        assert any(a["app_id"] == "legacy-bad" for a in resp.json())
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_app_responses_derive_builtin_ownership() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "custom-owned",
+                "name": "Custom Owned",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "custom-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["is_builtin"] is False
+
+        listed = client.get("/api/admin/mcp/apps", headers=admin_headers)
+        assert listed.status_code == 200
+        apps = {app["app_id"]: app for app in listed.json()}
+        assert apps["gmail"]["is_builtin"] is True
+        assert apps["custom-owned"]["is_builtin"] is False
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_app_responses_overlay_builtin_execution_fields_without_persisting() -> (
+    None
+):
+    from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        stale_launch_config = {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+        }
+        db = next(get_db())
+        try:
+            gmail_app = (
+                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            )
+            gmail_app.name = "Stale Gmail"
+            gmail_app.oauth_scopes = ["stale-scope"]
+            gmail_app.launch_config = stale_launch_config
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get("/api/admin/mcp/apps", headers=admin_headers)
+
+        assert response.status_code == 200
+        apps = {app["app_id"]: app for app in response.json()}
+        execution_fields = get_builtin_execution_fields("gmail")
+        assert execution_fields is not None
+        assert {
+            field: apps["gmail"][field] for field in execution_fields
+        } == execution_fields
+        assert apps["gmail"]["is_builtin"] is True
+
+        db = next(get_db())
+        try:
+            persisted_gmail = (
+                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            )
+            assert persisted_gmail.name == "Stale Gmail"
+            assert persisted_gmail.oauth_scopes == ["stale-scope"]
+            assert persisted_gmail.launch_config == stale_launch_config
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("app_id", "renamed-gmail"),
+        ("name", "Renamed Gmail"),
+        ("transport", "stdio"),
+        ("provider_name", "wrong-provider"),
+        ("oauth_scopes", ["wrong-scope"]),
+        (
+            "launch_config",
+            {
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        ),
+    ],
+)
+def test_admin_patch_rejects_builtin_execution_field_changes(
+    field: str, replacement: object
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app_pk = app.id
+            before = {
+                column.name: getattr(app, column.name)
+                for column in PublicMCPApp.__table__.columns
+            }
+        finally:
+            db.close()
+
+        response = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={field: replacement},
+        )
+
+        assert response.status_code == 409
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            after = {
+                column.name: getattr(app, column.name)
+                for column in PublicMCPApp.__table__.columns
+            }
+            assert after == before
+            assert db.query(PublicMCPAppAudit).count() == 0
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_put_rejects_changed_builtin_execution_field_without_audit() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app_pk = app.id
+            persisted_name = app.name
+        finally:
+            db.close()
+
+        canonical = get_builtin_public_mcp_app("gmail")
+        assert canonical is not None
+        canonical["name"] = "Renamed Gmail"
+
+        response = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json=canonical,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "Built-in MCP app field 'name' is managed by code"
+        )
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            assert app.name == persisted_name
+            assert db.query(PublicMCPAppAudit).count() == 0
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_patch_allows_builtin_presentation_fields() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app_pk = app.id
+            original_launch_config = app.launch_config
+            original_description = app.description
+            admin_user_id = db.query(User.id).filter(User.username == "admin").scalar()
+        finally:
+            db.close()
+
+        response = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "builtin-patch"},
+            json={
+                "description": "Managed Gmail description",
+                "icon": "https://example.com/managed-gmail.png",
+                "category": "Managed Communication",
+                "is_visible_in_connector": False,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["is_builtin"] is True
+        assert body["description"] == "Managed Gmail description"
+        assert body["icon"] == "https://example.com/managed-gmail.png"
+        assert body["category"] == "Managed Communication"
+        assert body["is_visible_in_connector"] is False
+        assert body["launch_config"] == original_launch_config
+
+        db = next(get_db())
+        try:
+            audit = db.query(PublicMCPAppAudit).one()
+            assert audit.action == "update"
+            assert audit.app_id == "gmail"
+            assert audit.actor_user_id == admin_user_id
+            assert audit.request_id == "builtin-patch"
+            assert audit.before_values["description"] == original_description
+            assert audit.after_values["description"] == "Managed Gmail description"
+            assert audit.after_values["launch_config"] == original_launch_config
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_legacy_put_accepts_canonical_builtin_execution_fields() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp.id)
+                .filter(PublicMCPApp.app_id == "gmail")
+                .scalar()
+            )
+        finally:
+            db.close()
+        canonical = get_builtin_public_mcp_app("gmail")
+        assert canonical is not None
+        canonical["description"] = "Legacy client presentation update"
+
+        response = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "builtin-put"},
+            json=canonical,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["is_builtin"] is True
+        assert response.json()["description"] == "Legacy client presentation update"
+        db = next(get_db())
+        try:
+            audit = db.query(PublicMCPAppAudit).one()
+            assert audit.action == "update"
+            assert audit.app_id == "gmail"
+            assert audit.request_id == "builtin-put"
+            assert (
+                audit.before_values["description"] != audit.after_values["description"]
+            )
+            assert (
+                audit.after_values["description"] == "Legacy client presentation update"
+            )
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "custom-patch",
+                "name": "Custom Patch",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "old-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        updated = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "launch_config": {
+                    "command": "new-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                }
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["launch_config"]["command"] == "new-command"
+        assert updated.json()["is_builtin"] is False
+
+        # required_env without a command is still a partial shape on the merged
+        # state. (command without required_env would now merge into a valid
+        # keyless app instead.)
+        invalid = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"launch_config": {"required_env": ["CUSTOM_TOKEN"]}},
+        )
+        assert invalid.status_code == 422
+
+        renamed = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"app_id": "custom-patch-renamed"},
+        )
+        assert renamed.status_code == 409
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize(
+    ("builtin_id", "attempted_id"),
+    [("gmail", "gmail"), ("planner", "PLANNER"), ("planner", " planner ")],
+)
+def test_admin_create_rejects_reserved_builtin_id_after_deletion(
+    builtin_id: str, attempted_id: str
+) -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == builtin_id).one()
+            db.delete(app)
+            db.commit()
+        finally:
+            db.close()
+        canonical = get_builtin_public_mcp_app(builtin_id)
+        assert canonical is not None
+        canonical["app_id"] = attempted_id
+
+        response = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json=canonical,
+        )
+
+        assert response.status_code == 409
+        db = next(get_db())
+        try:
+            assert (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id.in_([builtin_id, attempted_id]))
+                .first()
+                is None
+            )
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_delete_rejects_builtin_catalog_app() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp.id)
+                .filter(PublicMCPApp.app_id == "gmail")
+                .scalar()
+            )
+        finally:
+            db.close()
+
+        response = client.delete(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 409
+        db = next(get_db())
+        try:
+            assert db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            assert db.query(PublicMCPAppAudit).count() == 0
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_failed_custom_create_rolls_back_staged_audit() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        def fail_commit_after_flush(session: Session) -> None:
+            session.flush()
+            raise RuntimeError("commit failed after flush")
+
+        with patch.object(Session, "commit", fail_commit_after_flush):
+            with pytest.raises(RuntimeError, match="commit failed after flush"):
+                client.post(
+                    "/api/admin/mcp/apps",
+                    headers=admin_headers,
+                    json={
+                        "app_id": "custom-failed-audit",
+                        "name": "Custom Failed Audit",
+                        "transport": "stdio",
+                        "launch_config": {
+                            "command": "custom-command",
+                            "required_env": ["CUSTOM_TOKEN"],
+                        },
+                    },
+                )
+
+        db = next(get_db())
+        try:
+            assert (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "custom-failed-audit")
+                .first()
+                is None
+            )
+            assert (
+                db.query(PublicMCPAppAudit)
+                .filter(PublicMCPAppAudit.app_id == "custom-failed-audit")
+                .count()
+                == 0
+            )
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            admin_user_id = db.query(User.id).filter(User.username == "admin").scalar()
+        finally:
+            db.close()
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers={**admin_headers, "X-Request-ID": "catalog-create"},
+            json={
+                "app_id": "custom-audited",
+                "name": "Custom Audited",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "old-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        replaced = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "catalog-put"},
+            json={
+                "app_id": "custom-audited",
+                "name": "Custom Audited Put",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "put-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert replaced.status_code == 200
+
+        updated = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "catalog-update"},
+            json={
+                "launch_config": {
+                    "command": "new-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                }
+            },
+        )
+        assert updated.status_code == 200
+
+        deleted = client.delete(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "catalog-delete"},
+        )
+        assert deleted.status_code == 200
+
+        db = next(get_db())
+        try:
+            audits = (
+                db.query(PublicMCPAppAudit)
+                .filter(PublicMCPAppAudit.app_id == "custom-audited")
+                .order_by(PublicMCPAppAudit.id)
+                .all()
+            )
+            assert [audit.action for audit in audits] == [
+                "create",
+                "update",
+                "update",
+                "delete",
+            ]
+            assert [audit.request_id for audit in audits] == [
+                "catalog-create",
+                "catalog-put",
+                "catalog-update",
+                "catalog-delete",
+            ]
+            assert {audit.actor_user_id for audit in audits} == {admin_user_id}
+            assert audits[0].before_values is None
+            assert audits[0].after_values["launch_config"]["command"] == "old-command"
+            assert audits[1].before_values["launch_config"]["command"] == "old-command"
+            assert audits[1].after_values["launch_config"]["command"] == "put-command"
+            assert audits[2].before_values["launch_config"]["command"] == "put-command"
+            assert audits[2].after_values["launch_config"]["command"] == "new-command"
+            assert audits[3].before_values["launch_config"]["command"] == "new-command"
+            assert audits[3].after_values is None
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass

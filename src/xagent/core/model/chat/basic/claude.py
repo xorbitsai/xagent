@@ -1,0 +1,1412 @@
+import asyncio
+import json
+import logging
+import os
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Union
+
+from json_repair import loads as repair_loads
+
+if TYPE_CHECKING:
+    from anthropic import Anthropic, AsyncAnthropic
+else:
+    try:
+        from anthropic import Anthropic, AsyncAnthropic  # type: ignore
+    except ImportError:
+        Anthropic = None  # type: ignore
+        AsyncAnthropic = None  # type: ignore
+
+from ...public_http import (
+    create_owned_async_sdk_client,
+    create_public_model_async_client,
+)
+from ..error import is_retryable_http_status
+from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..stream_deadline import await_before_deadline
+from ..timeout_config import TimeoutConfig
+from ..token_context import add_token_usage
+from ..types import ChunkType, StreamChunk
+from .base import BaseLLM
+from .tool_choice import supports_forced_tool_choice
+
+logger = logging.getLogger(__name__)
+
+
+class ModelCatalogUnavailableError(RuntimeError):
+    """Raised when a compatible endpoint does not implement model listing."""
+
+
+class AnthropicAuthenticationError(ValueError):
+    """Raised when Anthropic rejects a catalog request's credentials."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
+    """Normalize Anthropic usage to (input_tokens, cache_read, cache_write).
+
+    Anthropic's ``usage.input_tokens`` excludes tokens read from or written to
+    the prompt cache. The normalized total re-adds both so input counts stay
+    comparable across providers, where cached tokens are a subset of the
+    reported input tokens.
+    """
+
+    def _count(name: str) -> int:
+        # Missing/None/non-numeric values are normal (older SDKs, cache
+        # disabled, message_delta usage) — treat them as 0; token accounting
+        # must never raise out of an LLM call.
+        if isinstance(usage, dict):
+            value = usage.get(name, 0)
+        else:
+            value = getattr(usage, name, 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    cache_read = _count("cache_read_input_tokens")
+    cache_write = _count("cache_creation_input_tokens")
+    return _count("input_tokens") + cache_read + cache_write, cache_read, cache_write
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after a deadline expired, best effort."""
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing aborted Claude stream failed (%s)", type(exc).__name__)
+
+
+def _anthropic_stream_tool_calls(
+    accumulated_tool_calls: Dict[str, Dict],
+) -> List[Dict[str, Any]]:
+    tool_calls_list: List[Dict[str, Any]] = []
+    for tool_call in accumulated_tool_calls.values():
+        arguments = tool_call.get("arguments") or "{}"
+        tool_calls_list.append(
+            {
+                "id": tool_call.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": tool_call.get("name", ""),
+                    "arguments": arguments,
+                },
+            }
+        )
+    return tool_calls_list
+
+
+def _handle_union_type(schema: Dict[str, Any], union_key: str) -> Dict[str, Any]:
+    """Simplify anyOf/oneOf for Claude API compatibility.
+
+    Claude doesn't support anyOf/oneOf, so we resolve to a single concrete type:
+    - Optional[T] → T
+    - Union[str, List[str]] → array of strings
+    - Otherwise → first option
+    """
+    options = schema[union_key]
+    if not isinstance(options, list) or not options:
+        schema = {"type": "string"}
+        schema.pop(union_key, None)
+        return schema
+
+    has_null = any(
+        opt.get("type") == "null" or opt is None
+        for opt in options
+        if isinstance(opt, dict)
+    )
+    if has_null and len(options) == 2:
+        # Optional[T] — use the non-null type
+        for opt in options:
+            if isinstance(opt, dict) and opt.get("type") != "null":
+                result = _fix_claude_schema(opt)
+                schema = (
+                    result.copy() if isinstance(result, dict) else {"type": "string"}
+                )
+                break
+    elif len(options) == 2:
+        types = [opt.get("type") for opt in options if isinstance(opt, dict)]
+        if set(types) == {"string", "array"}:
+            schema = {"type": "array", "items": {"type": "string"}}
+        else:
+            first_option = options[0] if isinstance(options[0], dict) else {}
+            schema = _fix_claude_schema(first_option)
+    else:
+        first_option = options[0] if isinstance(options[0], dict) else {}
+        schema = _fix_claude_schema(first_option)
+
+    schema.pop(union_key, None)
+    return schema
+
+
+def _fix_pydantic_schema_for_claude(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fix Pydantic-generated schema for Claude API compatibility.
+
+    Claude requires:
+    1. All object types must have additionalProperties: false (not true or omitted)
+    2. Number/integer types cannot have: minimum, maximum, exclusiveMinimum, exclusiveMaximum
+    3. Empty schemas {} are not supported - must specify a concrete type
+    4. anyOf/oneOf are not supported - must choose a concrete type
+
+    Pydantic's model_json_schema() may add these unsupported properties, so we remove them.
+
+    Args:
+        schema: The schema dictionary to fix
+
+    Returns:
+        The fixed schema dictionary
+    """
+    if not isinstance(schema, dict):
+        return schema
+    return _fix_claude_schema(deepcopy(schema))
+
+
+def _fix_claude_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(schema, dict):
+        return schema
+
+    # Handle empty schema - convert to a concrete type
+    if not schema or len(schema) == 0:
+        # Default to object type with no properties
+        return {"type": "object", "properties": {}, "additionalProperties": False}
+
+    # Handle anyOf/oneOf - Claude doesn't support these
+    # We need to simplify to a single type
+    for union_key in ("anyOf", "oneOf"):
+        if union_key in schema:
+            schema = _handle_union_type(schema, union_key)
+            break  # Only process the first match
+
+    # If this is an object type, add additionalProperties: false
+    if schema.get("type") == "object":
+        # Always set to false (Claude doesn't support additionalProperties: true)
+        schema["additionalProperties"] = False
+
+    # For number type, remove unsupported properties
+    # Claude doesn't support: minimum, maximum, exclusiveMinimum, exclusiveMaximum
+    if schema.get("type") in ("number", "integer"):
+        unsupported_props = [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+        ]
+        for prop in unsupported_props:
+            schema.pop(prop, None)
+
+    # Recursively process nested structures. JSON Schema keywords such as
+    # "properties" and "$defs" contain a map of subschemas, not a schema object
+    # themselves. Treating that map as a schema corrupts fields named "type".
+    for key, value in list(schema.items()):
+        if key in {"properties", "$defs", "definitions", "patternProperties"}:
+            if isinstance(value, dict):
+                schema[key] = {
+                    str(prop_name): _fix_claude_schema(prop_schema)
+                    for prop_name, prop_schema in value.items()
+                }
+            continue
+        if key == "additionalProperties":
+            if isinstance(value, dict):
+                schema[key] = _fix_claude_schema(value)
+            continue
+        if isinstance(value, dict):
+            schema[key] = _fix_claude_schema(value)
+        elif isinstance(value, list):
+            schema[key] = [
+                _fix_claude_schema(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+
+    return schema
+
+
+class ClaudeLLM(BaseLLM):
+    """
+    Anthropic Claude LLM client using the official Anthropic SDK.
+    Supports Claude models with tool calling and vision capabilities.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "claude-3-5-sonnet-20241022",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        default_temperature: Optional[float] = None,
+        default_max_tokens: Optional[int] = None,
+        timeout: float = 180.0,
+        abilities: Optional[List[str]] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
+    ):
+        self._model_name = model_name
+        self.api_key = (
+            api_key or os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+        )
+        self.base_url = base_url
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.timeout = timeout
+        self.timeout_config = timeout_config or TimeoutConfig()
+
+        # Determine abilities based on model name or explicit configuration
+        if abilities:
+            self._abilities = abilities
+        else:
+            # Auto-detect abilities based on model name
+            self._abilities = ["chat", "tool_calling"]
+            if any(
+                vision_keyword in model_name.lower()
+                for vision_keyword in ["claude-3", "sonnet", "haiku", "opus"]
+            ):
+                self._abilities.append("vision")
+
+        # Initialize the Anthropic client
+        self._client: Optional[AsyncAnthropic] = None
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name/identifier."""
+        return self._model_name
+
+    @property
+    def abilities(self) -> List[str]:
+        """Get the list of abilities supported by this Claude LLM implementation."""
+        return self._abilities
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        return supports_forced_tool_choice(self._abilities, self._model_name)
+
+    def _ensure_client(self) -> None:
+        """Ensure the Anthropic client is initialized."""
+        if self._client is None:
+            if AsyncAnthropic is None:
+                raise RuntimeError(
+                    "anthropic SDK is not installed. Please install it with: pip install anthropic"
+                )
+
+            if not self.api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY or CLAUDE_API_KEY must be set")
+
+            # Build client kwargs with proper type annotations
+            client_kwargs: Dict[str, Any] = {
+                "api_key": self.api_key,
+                "timeout": self.timeout,
+                # Retry policy lives in the shared RetryWrapper only; the
+                # anthropic SDK defaults to two retries of its own, which
+                # would nest inside every attempt we make. See
+                # ``OpenAICompatibleLLM._ensure_client``.
+                "max_retries": 0,
+            }
+
+            if self.base_url:
+                # Remove trailing /v1 if present to avoid duplication
+                # The Anthropic SDK automatically appends /v1/ to the base_url
+                clean_base_url = self.base_url.rstrip("/")
+                if clean_base_url.endswith("/v1"):
+                    clean_base_url = clean_base_url[:-3]
+                client_kwargs["base_url"] = clean_base_url
+
+            self._client = create_owned_async_sdk_client(
+                AsyncAnthropic, **client_kwargs
+            )
+
+    def _convert_messages_to_anthropic_format(
+        self, messages: List[Dict[str, Any]]
+    ) -> tuple[Optional[str], List[Dict[str, Any]]]:
+        """
+        Convert OpenAI format messages to Anthropic format.
+
+        Args:
+            messages: List of messages in OpenAI format
+
+        Returns:
+            Tuple of (system_message, list of messages in Anthropic format)
+        """
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field (role/content/
+        # tool_use blocks), never a ``dict(msg)`` copy, so an internal
+        # marker like ``_xagent_provider_state`` on the input is never read
+        # and cannot leak into the Anthropic request. Switching any branch
+        # here to copy ``msg`` wholesale would reopen that leak.
+        anthropic_messages: List[Dict[str, Any]] = []
+        system_message = None
+
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            # Handle system message - Anthropic separates it
+            if role == "system":
+                if isinstance(content, str):
+                    system_message = content
+                elif isinstance(content, list):
+                    # Extract text from content list
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                    system_message = "\n".join(text_parts)
+                continue
+
+            if role == "tool":
+                tool_result: Dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": str(msg.get("tool_call_id") or ""),
+                    "content": str(content or ""),
+                }
+                if not tool_result["tool_use_id"]:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": str(content or ""),
+                        }
+                    )
+                else:
+                    anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": [tool_result],
+                        }
+                    )
+                continue
+
+            # Convert roles (Anthropic uses "user" and "assistant")
+            anthropic_role = "user" if role == "user" else "assistant"
+
+            tool_use_blocks = self._convert_openai_tool_calls_to_anthropic_blocks(
+                msg.get("tool_calls") or []
+            )
+
+            # Handle content
+            if isinstance(content, str):
+                if tool_use_blocks:
+                    anthropic_content: List[Dict[str, Any]] = []
+                    if content:
+                        anthropic_content.append({"type": "text", "text": content})
+                    anthropic_content.extend(tool_use_blocks)
+                    anthropic_messages.append(
+                        {"role": anthropic_role, "content": anthropic_content}
+                    )
+                else:
+                    anthropic_messages.append(
+                        {"role": anthropic_role, "content": content}
+                    )
+            elif isinstance(content, list):
+                # Multimodal content
+                anthropic_content = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            anthropic_content.append(
+                                {"type": "text", "text": item.get("text", "")}
+                            )
+                        elif item.get("type") == "image_url":
+                            # Handle image
+                            image_url = item.get("image_url", {})
+                            if isinstance(image_url, dict):
+                                url = image_url.get("url", "")
+                            else:
+                                url = image_url
+
+                            # For base64 data URLs
+                            if url.startswith("data:image"):
+                                # Parse the data URL
+                                # Format: data:image/jpeg;base64,<base64_string>
+                                try:
+                                    mime_type = url.split(":")[1].split(";")[0]
+                                    base64_data = url.split(",", 1)[1]
+                                    anthropic_content.append(
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": mime_type,
+                                                "data": base64_data,
+                                            },
+                                        }
+                                    )
+                                except (IndexError, ValueError):
+                                    logger.warning(
+                                        f"Invalid data URL format: {url[:50]}..."
+                                    )
+                            else:
+                                # For regular URLs, we'd need to fetch the image
+                                # For now, log a warning
+                                logger.warning(
+                                    f"Direct image URLs not yet supported: {url[:50]}..."
+                                )
+
+                anthropic_content.extend(tool_use_blocks)
+                anthropic_messages.append(
+                    {
+                        "role": anthropic_role,
+                        "content": anthropic_content if anthropic_content else [],
+                    }
+                )
+
+        return system_message, anthropic_messages
+
+    def _convert_openai_tool_calls_to_anthropic_blocks(
+        self,
+        tool_calls: List[Any],
+    ) -> List[Dict[str, Any]]:
+        blocks: List[Dict[str, Any]] = []
+        for index, tool_call in enumerate(tool_calls):
+            if not isinstance(tool_call, dict):
+                continue
+            function_payload = tool_call.get("function")
+            if isinstance(function_payload, dict):
+                name = function_payload.get("name")
+                arguments = function_payload.get("arguments", {})
+            else:
+                name = tool_call.get("name")
+                arguments = tool_call.get("args", tool_call.get("arguments", {}))
+            if not name:
+                continue
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(tool_call.get("id") or f"toolu_{index}"),
+                    "name": str(name),
+                    "input": self._coerce_tool_input(arguments),
+                }
+            )
+        return blocks
+
+    def _coerce_tool_input(self, arguments: Any) -> Dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            try:
+                payload = json.loads(arguments)
+            except json.JSONDecodeError:
+                return {"input": arguments}
+            return payload if isinstance(payload, dict) else {"input": payload}
+        return {}
+
+    def _convert_tools_to_anthropic_format(
+        self, tools: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert OpenAI format tools to Anthropic format.
+
+        Args:
+            tools: List of tools in OpenAI format
+
+        Returns:
+            List of tools in Anthropic format
+        """
+        anthropic_tools = []
+
+        for tool in tools:
+            function = tool.get("function", {})
+            name = function.get("name", "")
+            description = function.get("description", "")
+            parameters = function.get("parameters", {})
+            strict = tool.get("strict", False)
+
+            # Debug: log before fixing
+            logger.debug(
+                f"[Claude] Converting tool: {name}, original parameters: {str(parameters)[:200]}"
+            )
+
+            # Fix Pydantic-generated schema for Claude API compatibility
+            # This handles anyOf, oneOf, etc. which Claude doesn't support
+            fixed_parameters = _fix_pydantic_schema_for_claude(parameters.copy())
+
+            # Debug: log after fixing
+            logger.debug(
+                f"[Claude] Fixed tool: {name}, fixed parameters: {str(fixed_parameters)[:200]}"
+            )
+
+            # Convert to Anthropic tool format
+            anthropic_tool = {
+                "name": name,
+                "description": description,
+                "input_schema": fixed_parameters,
+            }
+
+            # Add strict mode if specified
+            if strict:
+                anthropic_tool["strict"] = True
+
+            anthropic_tools.append(anthropic_tool)
+
+        # Debug: log final anthropic tools
+        logger.debug(
+            f"[Claude] Final Anthropic tools being sent to API: {json.dumps(anthropic_tools, ensure_ascii=False)[:1000]}"
+        )
+
+        return anthropic_tools
+
+    async def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Perform a chat completion or trigger tool call.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy ("auto", "any", "none", or tool name)
+            response_format: Response format specification (e.g., {"type": "json_object"})
+            thinking: Thinking mode configuration (enables extended thinking for supported models)
+            output_config: Output configuration for structured outputs (e.g., {"format": {"type": "json_schema", "schema": {...}}})
+            **kwargs: Additional parameters to pass to the Anthropic API
+
+        Returns:
+            - If normal text reply: return string
+            - If tool call triggered: return dict with type "tool_call" and tool_calls list
+
+        Raises:
+            RuntimeError: If the API call fails
+        """
+        self._ensure_client()
+        assert self._client is not None
+
+        try:
+            # Convert messages to Anthropic format
+            system_message, anthropic_messages = (
+                self._convert_messages_to_anthropic_format(messages)
+            )
+
+            # Prepare the completion parameters
+            completion_params: Dict[str, Any] = {
+                "model": self._model_name,
+                "messages": self._sanitize_unicode_content(anthropic_messages),
+                **kwargs,
+            }
+
+            # Set temperature
+            if temperature is not None:
+                completion_params["temperature"] = temperature
+            elif self.default_temperature is not None:
+                completion_params["temperature"] = self.default_temperature
+
+            # Set max_tokens (required by Anthropic API)
+            if max_tokens is not None:
+                completion_params["max_tokens"] = max_tokens
+            elif self.default_max_tokens is not None:
+                completion_params["max_tokens"] = self.default_max_tokens
+            else:
+                # Anthropic requires max_tokens, use a reasonable default
+                # Claude 3.5 Sonnet supports up to 8K output, 4K is a safe default
+                completion_params["max_tokens"] = 4096
+
+            # Set system message
+            if system_message:
+                completion_params["system"] = system_message
+
+            tool_choice = self.compatible_tool_choice(tool_choice)
+
+            # Handle tools
+            if tools:
+                completion_params["tools"] = self._convert_tools_to_anthropic_format(
+                    tools
+                )
+
+                # Handle tool_choice
+                if tool_choice:
+                    if isinstance(tool_choice, str):
+                        if tool_choice == "auto":
+                            completion_params["tool_choice"] = {"type": "auto"}
+                        elif tool_choice == "any" or tool_choice == "required":
+                            completion_params["tool_choice"] = {"type": "any"}
+                        elif tool_choice == "none":
+                            # Don't include tools in the request
+                            del completion_params["tools"]
+                        else:
+                            # Specific tool name
+                            completion_params["tool_choice"] = {
+                                "type": "tool",
+                                "name": tool_choice,
+                            }
+                    elif isinstance(tool_choice, dict):
+                        # Pass through the dict format
+                        completion_params["tool_choice"] = tool_choice
+            elif tool_choice and tool_choice != "none":
+                # tool_choice specified but no tools - this is an error condition
+                logger.warning(
+                    f"tool_choice specified as {tool_choice} but no tools provided"
+                )
+
+            # Handle thinking mode (extended thinking)
+            if thinking is not None:
+                if thinking.get("type") == "enabled" or thinking.get("enable", False):
+                    completion_params["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking.get("budget_tokens", 10240),
+                    }
+                elif thinking.get("type") == "disabled":
+                    completion_params["thinking"] = {"type": "disabled"}
+
+            # Handle output_config for structured outputs
+            # In newer anthropic versions (>= 0.84.0), output_config is a direct parameter
+            # In older versions, it needs to be passed via extra_body
+            if output_config is not None:
+                # Fix Pydantic-generated schemas for Claude API compatibility
+                format_config = output_config.get("format", {})
+                if (
+                    format_config.get("type") == "json_schema"
+                    and "schema" in format_config
+                ):
+                    # Apply schema fixes recursively
+                    fixed_schema = _fix_pydantic_schema_for_claude(
+                        format_config["schema"]
+                    )
+                    output_config = {
+                        "format": {
+                            "type": "json_schema",
+                            "schema": fixed_schema,
+                        }
+                    }
+                # Try to pass output_config directly first (for newer SDK versions)
+                completion_params["output_config"] = output_config
+
+            # Handle response_format for JSON mode
+            # Anthropic doesn't have a response_format parameter, so we add instructions to system message
+            # Note: When tools are present, response_format is ignored as tools already require structured output
+            if (
+                response_format is not None
+                and response_format.get("type") == "json_object"
+                and not tools
+            ):
+                json_instruction = "You must respond with valid JSON only. Do not include any text outside the JSON structure."
+                if system_message:
+                    completion_params["system"] = (
+                        f"{system_message}\n\n{json_instruction}"
+                    )
+                else:
+                    completion_params["system"] = json_instruction
+
+            # Make the API call
+            response = await self._client.messages.create(**completion_params)
+
+            # Record token usage
+            if hasattr(response, "usage"):
+                usage = response.usage
+                input_tokens, cache_read, cache_write = _anthropic_input_usage(usage)
+                output_tokens = getattr(usage, "output_tokens", 0)
+                add_token_usage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    model=self._model_name,
+                    model_id=self.model_id,
+                    call_type="chat",
+                    cached_input_tokens=cache_read,
+                    cache_write_input_tokens=cache_write,
+                )
+
+            # Check for tool use in response
+            if hasattr(response, "stop_reason") and response.stop_reason == "tool_use":
+                # Extract tool calls
+                tool_calls = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_calls.append(
+                            {
+                                "id": block.id,
+                                "type": "function",
+                                "function": {
+                                    "name": block.name,
+                                    "arguments": json.dumps(block.input)
+                                    if hasattr(block, "input")
+                                    else "{}",
+                                },
+                            }
+                        )
+
+                if tool_calls:
+                    return {
+                        "type": "tool_call",
+                        "tool_calls": tool_calls,
+                        "raw": response.model_dump()
+                        if hasattr(response, "model_dump")
+                        else str(response),
+                    }
+
+            # Extract text content
+            text_content = []
+            for block in response.content:
+                if block.type == "text":
+                    text_content.append(block.text)
+
+            content = "".join(text_content).strip()
+
+            if not content:
+                # Empty response should trigger retry
+                raise LLMRetryableError("LLM returned empty content and no tool calls")
+
+            # If JSON format was requested, try to repair and validate JSON
+            if response_format and response_format.get("type") == "json_object":
+                try:
+                    # Try to repair the JSON first
+                    repaired_content = repair_loads(content, logging=False)
+                    # If repair succeeded, return the repaired JSON as string
+                    # to maintain consistency with normal text response
+                    logger.info("JSON repair succeeded, returning repaired content")
+                    return json.dumps(repaired_content, ensure_ascii=False)
+                except Exception as repair_error:
+                    # JSON repair failed - raise retryable error to trigger retry
+                    logger.warning(
+                        f"JSON repair failed, retrying LLM call: {repair_error}"
+                    )
+                    raise LLMRetryableError(
+                        "LLM returned unrepairable JSON when response_format=json_object was requested"
+                    )
+
+            # Handle output_config with json_schema - content should already be valid JSON
+            if output_config is not None:
+                format_config = output_config.get("format", {})
+                if format_config.get("type") == "json_schema":
+                    # When using json_schema, the response is already validated JSON
+                    # Return as-is since it's guaranteed to be valid
+                    logger.info("Returning JSON schema validated response")
+                    return content
+
+            return content
+
+        except Exception as e:
+            logger.error(f"Claude API error: {str(e)}")
+            # Re-raise LLMRetryableError as-is (will be caught by retry wrapper)
+            # Wrap other errors in RuntimeError
+            if isinstance(e, LLMRetryableError):
+                raise
+
+            if self._client:
+                # We can safely import these as _client exists implies SDK is installed
+                from anthropic import (
+                    APIConnectionError,
+                    APIStatusError,
+                    APITimeoutError,
+                    RateLimitError,
+                )
+
+                if isinstance(e, (APITimeoutError, APIConnectionError, RateLimitError)):
+                    raise LLMRetryableError(str(e)) from e
+
+                if isinstance(e, APIStatusError):
+                    raise LLMRetryableError(str(e)) from e
+
+            raise RuntimeError(f"Claude API error: {str(e)}") from e
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """
+        Stream chat completion with timeout controls and token tracking.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification (not used in streaming)
+            thinking: Thinking mode configuration
+            output_config: Output configuration for structured outputs
+            **kwargs: Additional parameters to pass to the Claude API
+
+        Yields:
+            StreamChunk objects with streaming response data
+
+        Raises:
+            RuntimeError: If the API call fails
+            LLMTimeoutError: First token or token interval deadline expired
+        """
+        self._ensure_client()
+        assert self._client is not None
+
+        # Tool call accumulation
+        accumulated_tool_calls: Dict[str, Dict] = {}
+        tool_id_by_content_block_index: Dict[int, str] = {}
+        current_content = ""
+
+        # Input-side usage arrives on message_start; the final usage chunk is
+        # yielded at message_delta, so carry the values across events.
+        stream_input_tokens = 0
+        stream_cache_read = 0
+        stream_cache_write = 0
+
+        try:
+            # Convert messages to Anthropic format
+            system_message, anthropic_messages = (
+                self._convert_messages_to_anthropic_format(messages)
+            )
+
+            # Prepare the completion parameters
+            completion_params: Dict[str, Any] = {
+                "model": self._model_name,
+                "messages": self._sanitize_unicode_content(anthropic_messages),
+                **kwargs,
+            }
+
+            # Set temperature
+            if temperature is not None:
+                completion_params["temperature"] = temperature
+            elif self.default_temperature is not None:
+                completion_params["temperature"] = self.default_temperature
+
+            # Set max_tokens (required by Anthropic API)
+            if max_tokens is not None:
+                completion_params["max_tokens"] = max_tokens
+            elif self.default_max_tokens is not None:
+                completion_params["max_tokens"] = self.default_max_tokens
+            else:
+                completion_params["max_tokens"] = 4096
+
+            # Set system message
+            if system_message:
+                completion_params["system"] = system_message
+
+            tool_choice = self.compatible_tool_choice(tool_choice)
+
+            # Handle tools
+            if tools:
+                completion_params["tools"] = self._convert_tools_to_anthropic_format(
+                    tools
+                )
+
+                # Handle tool_choice
+                if tool_choice:
+                    if isinstance(tool_choice, str):
+                        if tool_choice == "auto":
+                            completion_params["tool_choice"] = {"type": "auto"}
+                        elif tool_choice == "any" or tool_choice == "required":
+                            completion_params["tool_choice"] = {"type": "any"}
+                        elif tool_choice == "none":
+                            del completion_params["tools"]
+                        else:
+                            completion_params["tool_choice"] = {
+                                "type": "tool",
+                                "name": tool_choice,
+                            }
+                    elif isinstance(tool_choice, dict):
+                        completion_params["tool_choice"] = tool_choice
+            elif tool_choice and tool_choice != "none":
+                logger.warning(
+                    f"tool_choice specified as {tool_choice} but no tools provided"
+                )
+
+            # Handle thinking mode (extended thinking)
+            if thinking is not None:
+                if thinking.get("type") == "enabled" or thinking.get("enable", False):
+                    completion_params["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": thinking.get("budget_tokens", 10240),
+                    }
+                elif thinking.get("type") == "disabled":
+                    completion_params["thinking"] = {"type": "disabled"}
+
+            # Handle output_config for structured outputs
+            # In newer anthropic versions (>= 0.84.0), output_config is a direct parameter
+            # In older versions, it needs to be passed via extra_body
+            if output_config is not None:
+                # Fix Pydantic-generated schemas for API compatibility
+                format_config = output_config.get("format", {})
+                if (
+                    format_config.get("type") == "json_schema"
+                    and "schema" in format_config
+                ):
+                    # Apply schema fixes recursively
+                    fixed_schema = _fix_pydantic_schema_for_claude(
+                        format_config["schema"]
+                    )
+                    output_config = {
+                        "format": {
+                            "type": "json_schema",
+                            "schema": fixed_schema,
+                        }
+                    }
+                # Try to pass output_config directly (for newer SDK versions)
+                completion_params["output_config"] = output_config
+
+            # Handle response_format for JSON mode
+            # Anthropic doesn't have a response_format parameter, so we add instructions to system message
+            # Note: When tools are present, response_format is ignored as tools already require structured output
+            if (
+                response_format is not None
+                and response_format.get("type") == "json_object"
+                and not tools
+            ):
+                json_instruction = "You must respond with valid JSON only. Do not include any text outside the JSON structure."
+                if system_message:
+                    completion_params["system"] = (
+                        f"{system_message}\n\n{json_instruction}"
+                    )
+                else:
+                    completion_params["system"] = json_instruction
+
+            # Both limits are deadlines on the wait itself, not checks made
+            # when an event arrives: a check on arrival never runs for a
+            # stream that stays silent, and the SDK drops Anthropic's ``ping``
+            # keepalives, so the transport read timeout does not bound it
+            # either (#3058). The first-token deadline also covers opening
+            # the stream.
+            loop = asyncio.get_running_loop()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            # Make the streaming API call
+            stream = await await_before_deadline(
+                self._client.messages.create(**completion_params, stream=True),
+                deadline=first_token_deadline,
+                timeout_message=first_token_message,
+            )
+
+            # Process streaming response
+            # Note: We manually parse events instead of using SDK's tool parsing because:
+            # 1. We need real-time streaming with per-event processing
+            # 2. We need custom timeout controls during streaming
+            # 3. We need unified StreamChunk format across different LLM providers
+            # 4. We need to handle tool calls incrementally as they stream in
+            events = aiter(stream)
+            first_event = True
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_event:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                try:
+                    event = await await_before_deadline(
+                        anext(events),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(stream)
+                    raise
+                first_event = False
+
+                # Parse event based on type
+                if event.type == "content_block_start":
+                    # Start of a new content block (text or tool_use)
+                    if hasattr(event, "content_block"):
+                        block = event.content_block
+                        if block.type == "tool_use":
+                            # Initialize tool call
+                            tool_id = block.id if hasattr(block, "id") else ""
+                            tool_name = block.name if hasattr(block, "name") else ""
+                            block_index = getattr(event, "index", None)
+                            accumulated_tool_calls[tool_id] = {
+                                "id": tool_id,
+                                "name": tool_name,
+                                "arguments": "",
+                            }
+                            if isinstance(block_index, int):
+                                tool_id_by_content_block_index[block_index] = tool_id
+
+                elif event.type == "content_block_delta":
+                    # Incremental content update
+                    if hasattr(event, "delta"):
+                        delta = event.delta
+                        if delta.type == "text_delta":
+                            # Text token
+                            text = delta.text if hasattr(delta, "text") else ""
+                            current_content += text
+                            yield StreamChunk(
+                                type=ChunkType.TOKEN,
+                                content=current_content,
+                                delta=text,
+                                raw=event,
+                            )
+                        elif delta.type == "input_json_delta":
+                            # Tool arguments update
+                            # IMPORTANT: event.index is an INTEGER (content block position 0, 1, 2, ...)
+                            # NOT the tool_id string (like "toolu_01GK595WLP7ewvoLiMRV6sG4")
+                            # We must use event.index to look up the correct tool_id
+                            event_index = getattr(event, "index", None)
+                            if (
+                                isinstance(event_index, int)
+                                and event_index in tool_id_by_content_block_index
+                            ):
+                                tool_id = tool_id_by_content_block_index[event_index]
+                            elif (
+                                isinstance(event_index, int) and accumulated_tool_calls
+                            ):
+                                # Get tool_id by index (event.index is the position in content blocks)
+                                tool_ids = list(accumulated_tool_calls.keys())
+                                if 0 <= event_index < len(tool_ids):
+                                    tool_id = tool_ids[event_index]
+                                else:
+                                    # Fallback to first tool if index is out of range
+                                    logger.warning(
+                                        f"event.index {event.index} out of range [0, {len(tool_ids)}), using first tool"
+                                    )
+                                    tool_id = tool_ids[0]
+                            else:
+                                # Fallback to first tool if no index
+                                if accumulated_tool_calls:
+                                    logger.warning("No event.index, using first tool")
+                                    tool_id = list(accumulated_tool_calls.keys())[0]
+                                else:
+                                    logger.warning(
+                                        "No event.index and accumulated_tool_calls is empty, skipping chunk"
+                                    )
+                                    continue
+
+                            if tool_id in accumulated_tool_calls:
+                                args = (
+                                    delta.partial_json
+                                    if hasattr(delta, "partial_json")
+                                    else ""
+                                )
+                                accumulated_tool_calls[tool_id]["arguments"] += args
+                                if args:
+                                    yield StreamChunk(
+                                        type=ChunkType.TOOL_CALL,
+                                        tool_calls=_anthropic_stream_tool_calls(
+                                            accumulated_tool_calls
+                                        ),
+                                        raw=event,
+                                    )
+                            else:
+                                logger.warning(
+                                    f"tool_id {tool_id} not found in accumulated_tool_calls"
+                                )
+
+                elif event.type == "content_block_stop":
+                    # End of content block
+                    pass
+
+                elif event.type == "message_start":
+                    # Message start (contains usage info)
+                    if hasattr(event, "message") and hasattr(event.message, "usage"):
+                        usage = event.message.usage
+                        # Record input tokens (cache reads/writes are excluded
+                        # from Anthropic's input_tokens; re-add them)
+                        input_tokens, cache_read, cache_write = _anthropic_input_usage(
+                            usage
+                        )
+                        stream_input_tokens = input_tokens
+                        stream_cache_read = cache_read
+                        stream_cache_write = cache_write
+                        if input_tokens:
+                            add_token_usage(
+                                input_tokens=input_tokens,
+                                model=self._model_name,
+                                model_id=self.model_id,
+                                call_type="stream_chat",
+                                cached_input_tokens=cache_read,
+                                cache_write_input_tokens=cache_write,
+                            )
+
+                elif event.type == "message_delta":
+                    # Message end (contains usage info)
+                    if hasattr(event, "usage"):
+                        usage = event.usage
+                        # Record output tokens
+                        if hasattr(usage, "output_tokens"):
+                            add_token_usage(
+                                output_tokens=usage.output_tokens,
+                                model=self._model_name,
+                                model_id=self.model_id,
+                                call_type="stream_chat",
+                            )
+
+                        # Yield usage chunk. Input-side counts come from
+                        # message_start; message_delta usually only carries
+                        # output tokens.
+                        input_total = stream_input_tokens or (
+                            getattr(usage, "input_tokens", 0) or 0
+                        )
+                        output_total = getattr(usage, "output_tokens", 0) or 0
+                        usage_dict = {
+                            "input_tokens": input_total,
+                            "output_tokens": output_total,
+                            "total_tokens": input_total + output_total,
+                        }
+                        if stream_cache_read:
+                            usage_dict["cached_input_tokens"] = stream_cache_read
+                        if stream_cache_write:
+                            usage_dict["cache_write_input_tokens"] = stream_cache_write
+                        yield StreamChunk(
+                            type=ChunkType.USAGE,
+                            usage=usage_dict,
+                            raw=event,
+                        )
+
+                    # Check for stop reason
+                    if hasattr(event, "delta"):
+                        delta = event.delta
+                        stop_reason = (
+                            delta.stop_reason if hasattr(delta, "stop_reason") else None
+                        )
+                        if stop_reason:
+                            # Yield tool calls if accumulated
+                            if accumulated_tool_calls:
+                                yield StreamChunk(
+                                    type=ChunkType.TOOL_CALL,
+                                    tool_calls=_anthropic_stream_tool_calls(
+                                        accumulated_tool_calls
+                                    ),
+                                    finish_reason=stop_reason,
+                                    raw=event,
+                                )
+                            else:
+                                yield StreamChunk(
+                                    type=ChunkType.END,
+                                    finish_reason=stop_reason,
+                                    raw=event,
+                                )
+
+        except LLMTimeoutError:
+            # Already logged where the deadline expired.
+            raise
+        except Exception as e:
+            logger.error(f"Claude streaming API error: {str(e)}")
+            # Re-raise LLMRetryableError for retry
+            if isinstance(e, LLMRetryableError):
+                raise
+
+            # Check for retryable errors from anthropic
+            if self._client:
+                from anthropic import (
+                    APIConnectionError,
+                    APIStatusError,
+                    APITimeoutError,
+                    RateLimitError,
+                )
+
+                if isinstance(e, (APITimeoutError, APIConnectionError, RateLimitError)):
+                    error_msg = f"Claude API retryable error: {str(e)}"
+                    raise LLMRetryableError(error_msg) from e
+
+                if isinstance(e, APIStatusError):
+                    # ``chat`` turns every APIStatusError into
+                    # LLMRetryableError; streaming swallowed them into an
+                    # ERROR chunk instead, so the shared RetryWrapper never
+                    # saw one and the anthropic SDK's own budget was the only
+                    # cover a streaming call had. That budget is now zero
+                    # (see ``_ensure_client``), so transient statuses have to
+                    # raise -- a 529 Overloaded is exactly the capacity shape
+                    # this policy exists for. Permanent statuses keep the
+                    # ERROR chunk: replaying them cannot help, and ``chat``'s
+                    # blanket retry of 4xx is a separate defect, not one to
+                    # copy here.
+                    status = getattr(e, "status_code", None)
+                    # Same status set the shared predicate uses, so the
+                    # streaming guard and ``retry_on`` cannot drift apart.
+                    if isinstance(status, int) and is_retryable_http_status(status):
+                        raise LLMRetryableError(
+                            f"Claude API status error: {str(e)}"
+                        ) from e
+
+                    error_msg = f"Claude API status error: {str(e)}"
+                    yield StreamChunk(type=ChunkType.ERROR, content=error_msg, raw=e)
+                    return
+
+            # Wrap other errors
+            error_msg = f"Claude API error: {str(e)}"
+            yield StreamChunk(type=ChunkType.ERROR, content=error_msg, raw=e)
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        """
+        Check if this Claude LLM supports thinking mode.
+
+        Returns:
+            bool: True - Claude supports extended thinking mode
+        """
+        return True
+
+    async def vision_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Perform a vision-aware chat completion for Claude models that support vision.
+        This method handles multimodal messages with image content.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+                      Content can be a string or list of multimodal content items
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification
+            thinking: Thinking mode configuration (enables extended thinking)
+            output_config: Output configuration for structured outputs
+            **kwargs: Additional parameters to pass to the Claude API
+
+        Returns:
+            - If normal text reply: return string
+            - If tool call triggered: return dict with type "tool_call" and tool_calls list
+
+        Raises:
+            RuntimeError: If the model doesn't support vision or the API call fails
+        """
+        if not self.has_ability("vision"):
+            raise RuntimeError(
+                f"Model {self._model_name} does not support vision capabilities"
+            )
+
+        # Claude's chat method handles vision automatically
+        return await self.chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            **kwargs,
+        )
+
+    async def close(self) -> None:
+        """Close the Anthropic client and cleanup resources."""
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
+
+    async def __aenter__(self) -> "ClaudeLLM":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    @staticmethod
+    async def list_available_models(
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Fetch available models from Anthropic Claude API.
+
+        Args:
+            api_key: Anthropic API key
+            base_url: Base URL for Claude API (optional). If not provided,
+                     uses the official Anthropic API.
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
+
+        Returns:
+            List of available models with their information
+
+        Example:
+            >>> # Using official API
+            >>> models = await ClaudeLLM.list_available_models("sk-ant-...")
+            >>> # Using custom endpoint
+            >>> models = await ClaudeLLM.list_available_models(
+            ...     "sk-ant-...",
+            ...     base_url="https://custom-proxy.com"
+            ... )
+        """
+        import httpx
+
+        # Use official API if no custom base_url provided. Only custom compatible
+        # endpoints may legitimately omit Anthropic's model catalog endpoint.
+        if base_url is None:
+            base_url = "https://api.anthropic.com"
+
+        # Remove trailing /v1 if present to avoid duplication
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+        is_custom_endpoint = httpx.URL(base_url) != httpx.URL(
+            "https://api.anthropic.com"
+        )
+
+        url = base_url + "/v1/models"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        try:
+            async with create_public_model_async_client(timeout=30.0) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+
+                models = []
+                for model in data.get("data", []):
+                    models.append(
+                        {
+                            "id": model.get("id"),
+                            "display_name": model.get("display_name"),
+                            "created": model.get("created"),
+                            "type": model.get("type"),
+                        }
+                    )
+
+                # Sort by created date (newest first)
+                models.sort(
+                    key=lambda x: (
+                        (x.get("created") or 0) if x.get("created") is not None else 0
+                    ),
+                    reverse=True,
+                )
+                return models
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error fetching Claude models: {e.response.status_code}")
+            if e.response.status_code == 401:
+                raise AnthropicAuthenticationError(
+                    "Invalid Anthropic API key", status_code=401
+                ) from e
+            if e.response.status_code == 403:
+                raise AnthropicAuthenticationError(
+                    "Anthropic API key is not authorized", status_code=403
+                ) from e
+            if e.response.status_code == 404 and is_custom_endpoint:
+                raise ModelCatalogUnavailableError(
+                    "This Anthropic-compatible endpoint does not provide a model catalog"
+                ) from e
+            raise
+        except Exception as e:
+            logger.error(f"Failed to fetch Claude models: {e}")
+            if raise_on_error:
+                raise
+            return []

@@ -1,0 +1,165 @@
+name: Real RAG Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'src/xagent/core/tools/core/RAG_tools/**'
+      - 'src/xagent/core/model/embedding/**'
+      - 'src/xagent/core/model/rerank/**'
+      - 'src/xagent/web/api/kb*.py'
+      - 'src/xagent/web/services/**'
+      - 'tests/conftest.py'
+      - 'tests/web_integration/**'
+      - 'tests/core/tools/core/RAG_tools/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/ci-real-rag.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/xagent/core/tools/core/RAG_tools/**'
+      - 'src/xagent/core/model/embedding/**'
+      - 'src/xagent/core/model/rerank/**'
+      - 'src/xagent/web/api/kb*.py'
+      - 'src/xagent/web/services/**'
+      - 'tests/conftest.py'
+      - 'tests/web_integration/**'
+      - 'tests/core/tools/core/RAG_tools/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/ci-real-rag.yml'
+  workflow_dispatch:  # Allow manual triggering
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real_rag_tests:
+    name: Real RAG E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check workflow eligibility
+        id: eligibility
+        shell: bash
+        run: |
+          set -e
+
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.draft }}" = "true" ]; then
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            echo "Draft pull request; skipping real_rag test execution."
+          else
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"
+            echo "Workflow is eligible to run real_rag tests."
+          fi
+
+      - name: Check real embedding provider config
+        id: provider
+        if: steps.eligibility.outputs.run_tests == 'true'
+        shell: bash
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DASHSCOPE_EMBEDDING_API_KEY: ${{ secrets.DASHSCOPE_EMBEDDING_API_KEY }}
+          DASHSCOPE_EMBEDDING_MODEL: ${{ vars.DASHSCOPE_EMBEDDING_MODEL }}
+        run: |
+          set -e
+
+          if { [ -n "$DASHSCOPE_API_KEY" ] || [ -n "$DASHSCOPE_EMBEDDING_API_KEY" ]; } && [ -n "$DASHSCOPE_EMBEDDING_MODEL" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "DashScope embedding provider is configured."
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Real embedding provider is not configured; skipping real_rag test execution."
+          fi
+
+      - name: Checkout code
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        uses: actions/checkout@v7
+
+      - name: Ensure uv is available
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -e
+          if ! command -v uv >/dev/null 2>&1; then
+            echo "uv not found, installing..."
+            python3 -m pip install --user uv
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
+          python3 -m uv --version || uv --version
+
+      - name: Create virtual environment
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -e
+          _UV="python3 -m uv"
+          $_UV --version
+          $_UV venv --python 3.12
+
+      - name: Install dependencies
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv sync --all-extras
+
+      - name: Download Deepdoc models
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -e
+          python3 -m uv run deepdoc-download-models
+
+      - name: Setup Node.js
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install pptxgenjs globally
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        run: |
+          set -e
+          npm install -g pptxgenjs@4.0.1
+
+      - name: Run real_rag tests (serial, requires embedding API)
+        if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          if [ -n "$DASHSCOPE_API_KEY" ] || [ -n "$DASHSCOPE_EMBEDDING_API_KEY" ]; then
+            echo "DashScope embedding config configured"
+          else
+            echo "DashScope embedding key is not configured; real_rag tests may be skipped by pytest."
+          fi
+
+          python3 -m uv run python -m pytest -m "real_rag" -v -n 0
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DASHSCOPE_EMBEDDING_API_KEY: ${{ secrets.DASHSCOPE_EMBEDDING_API_KEY }}
+          DASHSCOPE_EMBEDDING_MODEL: ${{ vars.DASHSCOPE_EMBEDDING_MODEL }}
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "## Real RAG Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.eligibility.outputs.run_tests }}" != "true" ]; then
+            echo "Draft pull request; real_rag test execution was skipped." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.provider.outputs.configured }}" = "true" ]; then
+            echo "Real embedding provider was configured, so the real_rag tests were executed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No real embedding provider was configured, so the expensive real_rag test setup was skipped." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Required CI config:" >> $GITHUB_STEP_SUMMARY
+          echo "- DASHSCOPE_API_KEY or DASHSCOPE_EMBEDDING_API_KEY (secret)" >> $GITHUB_STEP_SUMMARY
+          echo "- DASHSCOPE_EMBEDDING_MODEL (repo variable)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "If no real embedding provider is configured, pytest marks real_rag tests as skipped." >> $GITHUB_STEP_SUMMARY

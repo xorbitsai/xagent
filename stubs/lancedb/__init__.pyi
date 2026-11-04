@@ -1,0 +1,3 @@
+from .db import DBConnection
+
+def connect(path: str) -> DBConnection: ...

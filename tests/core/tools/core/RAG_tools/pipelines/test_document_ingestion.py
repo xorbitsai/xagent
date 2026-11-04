@@ -1,0 +1,1733 @@
+"""Unit tests for the document ingestion pipeline."""
+
+from __future__ import annotations
+
+from typing import Dict, List, Union
+
+import pytest
+
+from xagent.core.model.embedding.base import BaseEmbedding
+from xagent.core.model.model import EmbeddingModelConfig
+from xagent.core.tools.core.RAG_tools.core.exceptions import (
+    DocumentValidationError,
+    EmbeddingAdapterError,
+)
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    ChunkEmbeddingData,
+    ChunkForEmbedding,
+    ChunkStrategy,
+    CollectionInfo,
+    DocumentProcessingStatus,
+    EmbeddingReadResponse,
+    EmbeddingWriteResponse,
+    IngestionConfig,
+    IngestionResult,
+    ParseDocumentResponse,
+    ParsedParagraph,
+    ParseMethod,
+)
+from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+from xagent.core.tools.core.RAG_tools.progress.manager import ProgressManager
+from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
+
+
+class _StubEmbeddingAdapter(BaseEmbedding):
+    """Deterministic embedding adapter for tests."""
+
+    def __init__(self, prefix: str = "vec") -> None:
+        self.prefix = prefix
+
+    def encode(  # type: ignore[override]
+        self,
+        text: Union[str, List[str]],
+        dimension: int | None = None,
+        instruct: str | None = None,
+    ) -> Union[List[float], List[List[float]]]:
+        if isinstance(text, str):
+            return [float(len(text)), 0.0]
+        return [[float(len(item)), float(index)] for index, item in enumerate(text)]
+
+    def get_dimension(self) -> int:
+        return 2
+
+    @property
+    def abilities(self) -> List[str]:
+        return ["embedding"]
+
+
+STATUS_EVENTS: List[Dict[str, str]] = []
+
+
+def _capture_status_record(
+    collection: str,
+    doc_id: str,
+    *,
+    status: str,
+    message: str,
+    parse_hash: str,
+) -> None:
+    STATUS_EVENTS.append(
+        {
+            "collection": collection,
+            "doc_id": doc_id,
+            "status": status,
+            "message": message,
+            "parse_hash": parse_hash,
+        }
+    )
+
+
+def _capture_record_ingestion_status(
+    collection: str,
+    doc_id: str | None,
+    *,
+    status: DocumentProcessingStatus,
+    message: str,
+    parse_hash: str | None,
+    user_id: int | None = None,
+) -> None:
+    """Wrapper to capture _record_ingestion_status calls."""
+    if doc_id:
+        _capture_status_record(
+            collection=collection,
+            doc_id=doc_id,
+            status=status.value,
+            message=message,
+            parse_hash=parse_hash or "",
+        )
+
+
+def _patch_embedding_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub embedding adapter resolution to avoid touching model hub."""
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, stub_adapter),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid real sleep calls in retry loops."""
+
+    monkeypatch.setattr(document_ingestion.time, "sleep", lambda _seconds: None)
+    # Mock asyncio.sleep for async retry loops
+    import asyncio
+
+    async def _no_async_sleep(seconds: float) -> None:
+        """Mock async sleep to avoid delays in tests."""
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _no_async_sleep)
+
+
+@pytest.fixture(autouse=True)
+def _clear_status_events() -> None:
+    """Ensure captured status events are reset between tests."""
+
+    STATUS_EVENTS.clear()
+
+
+def _patch_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install happy-path doubles for all pipeline dependencies."""
+
+    _patch_embedding_adapter(monkeypatch)
+
+    # Mock collection to exist
+    from unittest.mock import AsyncMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(
+        name="demo",
+        embedding_model_id="embedding-default",
+        embedding_dimension=2,
+    )
+    # Mock the async method that validate_document_processing_sync calls
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.get_collection",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    # Mock initialize_collection_embedding to return the initialized collection
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.initialize_collection_embedding",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "register_document",
+        lambda **_: {"doc_id": "doc-1", "created": True, "user_id": 1},
+    )
+
+    parse_response = ParseDocumentResponse(
+        doc_id="doc-1",
+        parse_hash="hash-1",
+        paragraphs=[ParsedParagraph(text="para", metadata={})],
+        written=True,
+    ).model_dump()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "parse_document",
+        lambda **_: parse_response,
+    )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "chunk_document",
+        lambda **_: {"chunk_count": 2, "created": True},
+    )
+
+    chunks = [
+        ChunkForEmbedding(
+            doc_id="doc-1",
+            chunk_id="chunk-1",
+            parse_hash="hash-1",
+            text="text-1",
+            chunk_hash="chunk-hash-1",
+            index=0,
+        ),
+        ChunkForEmbedding(
+            doc_id="doc-1",
+            chunk_id="chunk-2",
+            parse_hash="hash-1",
+            text="text-2",
+            chunk_hash="chunk-hash-2",
+            index=1,
+        ),
+    ]
+    read_response = EmbeddingReadResponse(
+        chunks=chunks,
+        total_count=2,
+        pending_count=2,
+    ).model_dump()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "read_chunks_for_embedding",
+        lambda **_: read_response,
+    )
+
+    def _mock_write_vectors(**kwargs: object) -> dict:
+        """Mock write_vectors_to_db that supports multiple calls for batch processing."""
+        embeddings = kwargs.get("embeddings", [])
+        return EmbeddingWriteResponse(
+            upsert_count=len(embeddings),
+            deleted_stale_count=0,
+            index_status="created" if kwargs.get("create_index", False) else "skipped",
+        ).model_dump()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        _mock_write_vectors,
+    )
+
+    # Mock status recording to avoid database operations in tests
+    monkeypatch.setattr(
+        document_ingestion,
+        "_record_ingestion_status",
+        _capture_record_ingestion_status,
+    )
+
+    # Mock collection manager functions
+    monkeypatch.setattr(
+        document_ingestion,
+        "validate_document_processing_sync",
+        lambda **_: None,  # No-op for tests
+    )
+
+
+def test_process_document_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pipeline returns success status with deterministic provider."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert isinstance(result, IngestionResult)
+    assert result.status == "success"
+    assert result.embedding_count == 2
+    assert result.vector_count == 2
+
+
+def test_process_document_initializes_with_canonical_embedding_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alias/default embedding IDs are canonicalized before collection init."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+    initialized_model_ids: List[str] = []
+
+    stub_config = EmbeddingModelConfig(
+        id=canonical_model_id,
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    def _resolve_effective_embedding_model_sync(
+        collection_name: str, config_model_id: str | None = None
+    ) -> str:
+        raise ValueError("collection not found")
+
+    def _resolve_adapter(
+        config: IngestionConfig,
+    ) -> tuple[EmbeddingModelConfig, BaseEmbedding]:
+        assert config.embedding_model_id == "text-embedding-v4"
+        return stub_config, stub_adapter
+
+    def _initialize_collection_embedding_sync(
+        *, collection_name: str, embedding_model_id: str
+    ) -> CollectionInfo:
+        initialized_model_ids.append(embedding_model_id)
+        return CollectionInfo(
+            name=collection_name,
+            embedding_model_id=embedding_model_id,
+            embedding_dimension=2,
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        _resolve_effective_embedding_model_sync,
+    )
+    monkeypatch.setattr(
+        document_ingestion, "_resolve_embedding_adapter", _resolve_adapter
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "initialize_collection_embedding_sync",
+        _initialize_collection_embedding_sync,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_model_id="text-embedding-v4"),
+    )
+
+    assert result.status == "success"
+    assert initialized_model_ids == [canonical_model_id]
+    assert result.completed_steps[0].metadata["model_id"] == canonical_model_id
+
+
+def test_process_document_reuses_existing_collection_embedding_model_before_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing collection model wins over a caller-provided alias."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+    initialized_model_ids: List[str] = []
+    resolved_config_model_ids: List[str | None] = []
+
+    stub_config = EmbeddingModelConfig(
+        id=canonical_model_id,
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    def _resolve_effective_embedding_model_sync(
+        collection_name: str, config_model_id: str | None = None
+    ) -> str:
+        resolved_config_model_ids.append(config_model_id)
+        return canonical_model_id
+
+    def _resolve_adapter(
+        config: IngestionConfig,
+    ) -> tuple[EmbeddingModelConfig, BaseEmbedding]:
+        assert config.embedding_model_id == canonical_model_id
+        return stub_config, stub_adapter
+
+    def _initialize_collection_embedding_sync(
+        *, collection_name: str, embedding_model_id: str
+    ) -> CollectionInfo:
+        initialized_model_ids.append(embedding_model_id)
+        return CollectionInfo(
+            name=collection_name,
+            embedding_model_id=embedding_model_id,
+            embedding_dimension=2,
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        _resolve_effective_embedding_model_sync,
+    )
+    monkeypatch.setattr(
+        document_ingestion, "_resolve_embedding_adapter", _resolve_adapter
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "initialize_collection_embedding_sync",
+        _initialize_collection_embedding_sync,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_model_id="text-embedding-v4"),
+    )
+
+    assert result.status == "success"
+    assert resolved_config_model_ids == ["text-embedding-v4"]
+    assert initialized_model_ids == [canonical_model_id]
+
+
+def test_process_document_init_failure_after_resolve_is_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preflight model resolution should not make init failures partial."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+    stub_config = EmbeddingModelConfig(
+        id=canonical_model_id,
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        lambda _collection, _model_id=None: canonical_model_id,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, stub_adapter),
+    )
+
+    def _raise_init_error(*, collection_name: str, embedding_model_id: str) -> None:
+        raise ValueError("collection already initialized with another model")
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "initialize_collection_embedding_sync",
+        _raise_init_error,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_model_id="text-embedding-v4"),
+    )
+
+    assert result.status == "error"
+    assert result.failed_step == "initialize_collection"
+    assert result.completed_steps == []
+    assert result.doc_id is None
+    assert STATUS_EVENTS == []
+
+
+def test_process_document_applies_spreadsheet_safeguards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet ingestion should force safer token-based chunking and batching."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    captured_chunk_kwargs: Dict[str, object] = {}
+    encode_batch_sizes: List[int] = []
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+
+    class _RecordingEmbeddingAdapter(_StubEmbeddingAdapter):
+        def encode(  # type: ignore[override]
+            self,
+            text: Union[str, List[str]],
+            dimension: int | None = None,
+            instruct: str | None = None,
+        ) -> Union[List[float], List[List[float]]]:
+            encode_batch_sizes.append(1 if isinstance(text, str) else len(text))
+            return super().encode(text, dimension, instruct)
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _RecordingEmbeddingAdapter()),
+    )
+
+    def _capture_chunk_document(**kwargs: object) -> dict:
+        captured_chunk_kwargs.update(kwargs)
+        return {"chunk_count": 2, "created": True}
+
+    monkeypatch.setattr(document_ingestion, "chunk_document", _capture_chunk_document)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(
+            parse_method=ParseMethod.DEFAULT,
+            chunk_strategy=ChunkStrategy.FIXED_SIZE,
+            chunk_size=1600,
+            chunk_overlap=200,
+            use_token_count=False,
+            embedding_batch_size=10,
+        ),
+    )
+
+    assert result.status == "success"
+    assert captured_chunk_kwargs["chunk_strategy"] == ChunkStrategy.RECURSIVE
+    assert captured_chunk_kwargs["chunk_size"] == 512
+    assert captured_chunk_kwargs["chunk_overlap"] == 64
+    assert captured_chunk_kwargs["use_token_count"] is True
+    compute_step = next(
+        step for step in result.completed_steps if step.name == "compute_embeddings"
+    )
+    assert compute_step.metadata.get("use_async") is True
+    assert encode_batch_sizes == [1, 1]
+
+
+def test_process_document_preserves_stricter_spreadsheet_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet safeguards should not enlarge already strict caller limits."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    captured_chunk_kwargs: Dict[str, object] = {}
+    captured_parse_method: Dict[str, object] = {}
+
+    def _capture_parse_document(**kwargs: object) -> dict:
+        captured_parse_method["parse_method"] = kwargs["parse_method"]
+        return ParseDocumentResponse(
+            doc_id="doc-1",
+            parse_hash="hash-1",
+            paragraphs=[ParsedParagraph(text="para", metadata={})],
+            written=True,
+        ).model_dump()
+
+    def _capture_chunk_document(**kwargs: object) -> dict:
+        captured_chunk_kwargs.update(kwargs)
+        return {"chunk_count": 2, "created": True}
+
+    monkeypatch.setattr(document_ingestion, "parse_document", _capture_parse_document)
+    monkeypatch.setattr(document_ingestion, "chunk_document", _capture_chunk_document)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/small.csv",
+        config=IngestionConfig(
+            chunk_strategy=ChunkStrategy.RECURSIVE,
+            chunk_size=128,
+            chunk_overlap=16,
+            use_token_count=False,
+            embedding_batch_size=1,
+        ),
+    )
+
+    assert result.status == "success"
+    assert captured_parse_method["parse_method"] == ParseMethod.DEFAULT
+    assert captured_chunk_kwargs["chunk_size"] == 128
+    assert captured_chunk_kwargs["chunk_overlap"] == 16
+    assert captured_chunk_kwargs["use_token_count"] is True
+
+
+def test_process_document_uses_async_writes_for_spreadsheets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet safeguards should keep provider calls single-row while allowing batched DB writes."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    write_calls: List[int] = []
+
+    def _record_write_vectors_to_db(**kwargs: object) -> EmbeddingWriteResponse:
+        embeddings = kwargs.get("embeddings", [])
+        write_calls.append(len(embeddings))
+        return EmbeddingWriteResponse(
+            upsert_count=len(embeddings),
+            deleted_stale_count=0,
+            index_status="created",
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        _record_write_vectors_to_db,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=8,
+            embedding_concurrent=3,
+        ),
+    )
+
+    assert result.status == "success"
+    compute_step = next(
+        step for step in result.completed_steps if step.name == "compute_embeddings"
+    )
+    assert compute_step.metadata.get("use_async") is True
+    assert compute_step.metadata.get("concurrent") == 3
+    assert write_calls == [2]
+
+
+def test_process_document_reports_embedding_progress_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Progress manager should expose completed/remaining counts for embedding and vector writes."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+    manager = ProgressManager()
+    manager._active_tasks.clear()
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=8,
+            embedding_concurrent=2,
+        ),
+        progress_manager=manager,
+        user_id=1,
+    )
+
+    assert result.status == "success"
+    task_id = "ingest_demo__tmp_table_xlsx"
+    task = manager.get_task_progress(task_id)
+    assert task is not None
+    assert task.metadata.get("steps") is not None
+
+    compute_step = task.metadata["steps"]["compute_embeddings"]
+    assert compute_step["current_count"] == 2
+    assert compute_step["total_count"] == 2
+    assert compute_step["message"] == "Completed"
+
+    write_step = task.metadata["steps"]["write_vectors_to_db"]
+    assert write_step["current_count"] == 2
+    assert write_step["total_count"] == 2
+    assert write_step["message"] == "Completed"
+
+
+def test_process_document_rejects_oversized_spreadsheet_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spreadsheet rows larger than the token budget should fail before embedding."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "read_chunks_for_embedding",
+        lambda **_: EmbeddingReadResponse(
+            chunks=[
+                ChunkForEmbedding(
+                    doc_id="doc-1",
+                    chunk_id="chunk-1",
+                    index=0,
+                    parse_hash="hash-1",
+                    text="x " * 2000,
+                    chunk_hash="chunk-hash-1",
+                    metadata={"file_type": "xlsx", "row_type": "data"},
+                )
+            ],
+            pending_count=1,
+            total_count=1,
+        ),
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/table.xlsx",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == "read_chunks_for_embedding"
+    assert "token budget" in result.message.lower()
+    assert {step.name for step in result.completed_steps} == {
+        "initialize_collection",
+        "resolve_embedding_adapter",
+        "register_document",
+        "parse_document",
+        "chunk_document",
+    }
+    assert STATUS_EVENTS == [
+        {
+            "collection": "demo",
+            "doc_id": "doc-1",
+            "status": DocumentProcessingStatus.RUNNING.value,
+            "message": "Document ingestion started.",
+            "parse_hash": "",
+        },
+        {
+            "collection": "demo",
+            "doc_id": "doc-1",
+            "status": DocumentProcessingStatus.FAILED.value,
+            "message": result.message,
+            "parse_hash": "hash-1",
+        },
+    ]
+
+
+def test_process_document_passes_file_id_to_register_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline should forward file_id to document registration."""
+    _patch_pipeline_dependencies(monkeypatch)
+    captured_kwargs: Dict[str, object] = {}
+
+    def _capture_register_document(**kwargs: object) -> dict[str, object]:
+        captured_kwargs.update(kwargs)
+        return {"doc_id": "doc-1", "created": True}
+
+    monkeypatch.setattr(
+        document_ingestion, "register_document", _capture_register_document
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+        file_id="file-123",
+    )
+
+    assert result.status == "success"
+    assert captured_kwargs["file_id"] == "file-123"
+
+
+def test_process_document_parses_physical_source_not_metadata_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parsing must read the physical source_path, not the canonical metadata path.
+
+    Staged uploads pass the staged file as ``source_path`` and the not-yet-published
+    canonical path as ``metadata_source_path``. The parse step must be handed the
+    physical staged path so it never depends on a file published only after success.
+    """
+    _patch_pipeline_dependencies(monkeypatch)
+    captured_kwargs: Dict[str, object] = {}
+
+    def _capture_parse_document(**kwargs: object) -> dict:
+        captured_kwargs.update(kwargs)
+        return ParseDocumentResponse(
+            doc_id="doc-1",
+            parse_hash="hash-1",
+            paragraphs=[ParsedParagraph(text="para", metadata={})],
+            written=True,
+        ).model_dump()
+
+    monkeypatch.setattr(document_ingestion, "parse_document", _capture_parse_document)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/staging/.background-ingest/abc/doc.pdf",
+        config=IngestionConfig(),
+        metadata_source_path="/uploads/user_1/kb/doc.pdf",
+    )
+
+    assert result.status == "success"
+    assert (
+        captured_kwargs["source_path_override"]
+        == "/staging/.background-ingest/abc/doc.pdf"
+    )
+
+
+def test_process_document_skips_embedding_when_no_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline exits early when there are no pending chunks to embed."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    empty_read = EmbeddingReadResponse(
+        chunks=[],
+        total_count=0,
+        pending_count=0,
+    ).model_dump()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "read_chunks_for_embedding",
+        lambda **_: empty_read,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "success"
+    assert result.embedding_count == 0
+    assert result.vector_count == 0
+    assert result.completed_steps[-1].name == "read_chunks_for_embedding"
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.SUCCESS.value
+    assert "no pending embeddings" in STATUS_EVENTS[-1]["message"].lower()
+
+
+def _record_commits(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, object]]:
+    commits: List[Dict[str, object]] = []
+
+    def _commit(**kwargs: object) -> None:
+        statuses = [event["status"] for event in STATUS_EVENTS]
+        commits.append({**kwargs, "statuses": statuses})
+
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
+    return commits
+
+
+def _nothing_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    empty = EmbeddingReadResponse(chunks=[], total_count=2, pending_count=0)
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: empty.model_dump()
+    )
+
+
+@pytest.mark.parametrize("nothing_pending", [False, True])
+def test_process_document_commits_vectors_before_recording_success(
+    monkeypatch: pytest.MonkeyPatch, nothing_pending: bool
+) -> None:
+    """Both the embedding path and the early-return path commit, gate included."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+    if nothing_pending:
+        _nothing_pending(monkeypatch)
+    commits = _record_commits(monkeypatch)
+
+    def gate() -> None:
+        return None
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+        user_id=7,
+        is_admin=True,
+        commit_gate=gate,
+    )
+
+    assert result.status == "success"
+    assert commits == [
+        {
+            "collection": "demo",
+            "doc_id": "doc-1",
+            "parse_hash": "hash-1",
+            "model": "embedding-default",
+            "commit_gate": gate,
+            "user_id": 7,
+            "is_admin": True,
+            "statuses": [DocumentProcessingStatus.RUNNING.value],
+        }
+    ]
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.SUCCESS.value
+
+
+@pytest.mark.parametrize("nothing_pending", [False, True])
+def test_process_document_fails_without_success_when_the_commit_fails(
+    monkeypatch: pytest.MonkeyPatch, nothing_pending: bool
+) -> None:
+    _patch_pipeline_dependencies(monkeypatch)
+    if nothing_pending:
+        _nothing_pending(monkeypatch)
+
+    def _commit(**_: object) -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == "write_vectors_to_db"
+    assert result.message == "commit failed"
+    assert [event["status"] for event in STATUS_EVENTS] == [
+        DocumentProcessingStatus.RUNNING.value,
+        DocumentProcessingStatus.FAILED.value,
+    ]
+
+
+def test_process_document_partial_on_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline reports partial status when write step fails."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    def _failing_write_vectors_to_db(**_: object) -> None:
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        _failing_write_vectors_to_db,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    # Writing is now integrated into the compute_embeddings step loop
+    assert result.failed_step in ("write_vectors_to_db", "compute_embeddings")
+    assert result.embedding_count == 2
+    assert result.vector_count == 0
+    assert result.message.startswith("Failed to write embedding batch")
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.FAILED.value
+
+
+def test_process_document_failed_before_register(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adapter resolution errors before registration should surface as errors."""
+
+    # Mock validate_document_processing_sync to pass validation
+    from unittest.mock import AsyncMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(name="demo")
+    # Mock the async method that validate_document_processing_sync calls
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.get_collection",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        _raise_adapter_error,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(parse_method="deepdoc"),
+    )
+
+    assert result.status == "error"
+    assert result.failed_step == "resolve_embedding_adapter"
+    assert "adapter missing" in result.message
+    assert STATUS_EVENTS == []
+
+
+def test_process_document_with_async_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pipeline works correctly with async concurrent embedding mode."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    # Test with async mode enabled
+    config = IngestionConfig(
+        parse_method="deepdoc",
+        embedding_model_id="embedding-default",  # Ensure embedding_model_id is set
+        embedding_use_async=True,
+        embedding_concurrent=5,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=config,
+    )
+
+    assert isinstance(result, IngestionResult)
+    assert result.status == "success"
+    assert result.embedding_count == 2
+    assert result.vector_count == 2
+    assert {step.name for step in result.completed_steps} == {
+        "initialize_collection",
+        "resolve_embedding_adapter",
+        "register_document",
+        "parse_document",
+        "chunk_document",
+        "read_chunks_for_embedding",
+        "compute_embeddings",
+        "write_vectors_to_db",
+    }
+
+    # Verify async mode metadata is recorded
+    compute_step = next(
+        step for step in result.completed_steps if step.name == "compute_embeddings"
+    )
+    assert compute_step.metadata.get("use_async") is True
+    assert compute_step.metadata.get("concurrent") == 5
+
+
+def test_process_document_with_batch_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pipeline works correctly with batch embedding mode (default)."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    # Test with batch mode (default, embedding_use_async=False)
+    config = IngestionConfig(
+        embedding_use_async=False,
+        embedding_batch_size=2,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=config,
+    )
+
+    assert isinstance(result, IngestionResult)
+    assert result.status == "success"
+    assert result.embedding_count == 2
+    assert result.vector_count == 2
+
+    # Verify batch mode metadata is recorded
+    compute_step = next(
+        step for step in result.completed_steps if step.name == "compute_embeddings"
+    )
+    assert compute_step.metadata.get("use_async") is False
+    assert compute_step.metadata.get("batch_size") == 2
+
+
+def test_process_document_streams_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Embeddings should be written batch-by-batch when batch size is small."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    calls: List[dict] = []
+
+    def _record_write_vectors_to_db(**kwargs: object) -> EmbeddingWriteResponse:
+        calls.append(
+            {
+                "create_index": kwargs.get("create_index", False),
+                "size": len(kwargs.get("embeddings", [])),
+            }
+        )
+        return EmbeddingWriteResponse(
+            upsert_count=len(kwargs.get("embeddings", [])),
+            deleted_stale_count=0,
+            index_status="created",
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        _record_write_vectors_to_db,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_batch_size=1),
+    )
+
+    assert result.embedding_count == 2
+    assert result.vector_count == 2
+    assert len(calls) == 2
+    assert calls[0]["create_index"] is False
+    assert calls[1]["create_index"] is True
+    assert sum(call["size"] for call in calls) == 2
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.SUCCESS.value
+
+
+def _raise_adapter_error(*_: object) -> None:
+    raise EmbeddingAdapterError("adapter missing")
+
+
+def test_process_document_rejects_path_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that process_document rejects path traversal attempts in source_path."""
+
+    _patch_embedding_adapter(monkeypatch)
+
+    # Mock collection manager functions to prevent LanceDB connection issues
+    from unittest.mock import AsyncMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(
+        name="demo",
+        embedding_model_id="embedding-default",
+        embedding_dimension=2,
+    )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.get_collection",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.initialize_collection_embedding",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "validate_document_processing_sync",
+        lambda **_: None,  # No-op for tests
+    )
+
+    # Test various path traversal attack patterns
+    malicious_paths = [
+        "../../../etc/passwd",  # Unix path traversal
+        "..\\..\\..\\windows\\system32\\config\\sam",  # Windows path traversal
+        "/etc/passwd",  # Absolute path (if should be restricted)
+        "..%2F..%2F..%2Fetc%2Fpasswd",  # URL-encoded path traversal
+        "....//....//....//etc/passwd",  # Double-dot encoding
+        "..%252F..%252F..%252Fetc%252Fpasswd",  # Double URL encoding
+    ]
+
+    for malicious_path in malicious_paths:
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path=malicious_path,
+            config=IngestionConfig(),
+        )
+
+        # Should fail early with validation error or file not found
+        assert result.status in ("error", "partial")
+        # The failed_step should indicate where it failed (likely register_document or initialize_collection)
+        assert result.failed_step in (
+            "register_document",
+            "initialize_collection",
+            "resolve_embedding_adapter",
+        )
+        # Should contain error message about invalid path, file not found, or unsupported file type
+        # Note: Some paths may pass existence check but fail file type validation
+        message_lower = result.message.lower()
+        assert (
+            "path" in message_lower
+            or "not found" in message_lower
+            or "invalid" in message_lower
+            or "does not exist" in message_lower
+            or "file type" in message_lower
+            or "unsupported" in message_lower
+        )
+
+
+def test_process_document_rejects_path_traversal_with_existing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Test that process_document should reject path traversal even if the target file exists.
+
+    This test mocks register_document to simulate path traversal detection.
+    In a properly secured system, paths containing '..' or absolute paths outside
+    allowed directories should be rejected even if the file exists.
+    """
+
+    _patch_embedding_adapter(monkeypatch)
+
+    # Mock collection to exist
+    from unittest.mock import AsyncMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(
+        name="demo",
+        embedding_model_id="embedding-default",
+        embedding_dimension=2,
+    )
+    # Mock the async method that validate_document_processing_sync calls
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.get_collection",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    # Mock initialize_collection_embedding to return the initialized collection
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.initialize_collection_embedding",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "validate_document_processing_sync",
+        lambda **_: None,  # No-op for tests
+    )
+
+    # Create a temporary file outside the allowed directory
+    outside_file = tmp_path.parent / "sensitive_file.txt"
+    outside_file.write_text("sensitive content")
+
+    # Try to access it using path traversal
+    malicious_path = f"../{outside_file.name}"
+
+    # Mock register_document to simulate path traversal detection
+    # This represents the expected behavior: reject paths with traversal patterns
+    def _mock_register_with_traversal(**kwargs: object) -> dict:
+        source_path = kwargs.get("source_path", "")
+        # Check for path traversal patterns
+        if ".." in source_path or (
+            source_path.startswith("/") and source_path != str(outside_file)
+        ):
+            raise DocumentValidationError(
+                f"Path traversal detected or path outside allowed directory: {source_path}"
+            )
+        return {"doc_id": "doc-1", "created": True}
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "register_document",
+        _mock_register_with_traversal,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path=malicious_path,
+        config=IngestionConfig(parse_method="default"),
+    )
+
+    # Should fail with validation error
+    assert result.status == "partial"
+    assert result.failed_step == "register_document"
+    assert (
+        "traversal" in result.message.lower()
+        or "invalid" in result.message.lower()
+        or "outside" in result.message.lower()
+    )
+
+
+def test_process_document_rejects_absolute_paths_outside_allowed_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that process_document rejects absolute paths to sensitive system files.
+
+    Absolute paths to system files should be rejected even if they exist,
+    as they represent a security risk.
+    """
+
+    _patch_embedding_adapter(monkeypatch)
+
+    # Mock collection to exist
+    from unittest.mock import AsyncMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(name="demo")
+    # Mock the async method that validate_document_processing_sync calls
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.collection_manager.get_collection",
+        AsyncMock(return_value=mock_collection),
+    )
+
+    # Test absolute paths that should be restricted
+    # These files typically don't exist in test environments, so they'll fail with "not found"
+    # But if they did exist, they should still be rejected
+    absolute_paths = [
+        "/etc/passwd",
+        "/etc/shadow",
+        "/root/.ssh/id_rsa",
+        "C:\\Windows\\System32\\config\\SAM",  # Windows absolute path
+    ]
+
+    for abs_path in absolute_paths:
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path=abs_path,
+            config=IngestionConfig(),
+        )
+
+        # Should fail with validation error (file not found, path validation, or file type)
+        assert result.status in ("error", "partial")
+        assert result.failed_step in (
+            "register_document",
+            "initialize_collection",
+            "resolve_embedding_adapter",
+        )
+        # Should contain error message about path, file not found, permission, or unsupported file type
+        # Note: Absolute paths to system files may exist but fail file type validation
+        # In CI environments with sandboxing, permission denied errors are also valid rejections
+        message_lower = result.message.lower()
+        assert (
+            "path" in message_lower
+            or "not found" in message_lower
+            or "does not exist" in message_lower
+            or "file type" in message_lower
+            or "unsupported" in message_lower
+            or "permission" in message_lower
+            or "denied" in message_lower
+        ), f"Unexpected error message for {abs_path}: {result.message}"
+
+
+def _make_chunks(n: int) -> List[ChunkForEmbedding]:
+    """n chunks with distinct text lengths (1..n) so a batch's vectors can be
+    traced back to their chunks and cross-batch scrambling is detectable."""
+    return [
+        ChunkForEmbedding(
+            doc_id="doc-1",
+            chunk_id=f"chunk-{i}",
+            parse_hash="hash-1",
+            text="x" * (i + 1),
+            chunk_hash=f"chunk-hash-{i}",
+            index=i,
+        )
+        for i in range(n)
+    ]
+
+
+def _run_batch_embedding(
+    monkeypatch: pytest.MonkeyPatch, *, concurrent: int
+) -> tuple[IngestionResult, int, List[ChunkEmbeddingData]]:
+    """Drive the sync/batch embedding path with a latency-injecting adapter that
+    records peak concurrency. Returns (result, max_inflight, written_embeddings)."""
+    import threading
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    chunks = _make_chunks(6)
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=6, pending_count=6
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    lock = threading.Lock()
+    state = {"inflight": 0, "max": 0}
+
+    class _ConcurrencyProbeAdapter(_StubEmbeddingAdapter):
+        def encode(  # type: ignore[override]
+            self, text, dimension=None, instruct=None
+        ):
+            with lock:
+                state["inflight"] += 1
+                state["max"] = max(state["max"], state["inflight"])
+            try:
+                # Event.wait (unlike time.sleep, which the autouse _no_sleep
+                # fixture stubs out) really blocks, forcing an overlap window.
+                threading.Event().wait(0.05)
+                # vector[0] == len(text) lets the caller verify batch alignment
+                return [[float(len(item)), 0.0] for item in text]
+            finally:
+                with lock:
+                    state["inflight"] -= 1
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _ConcurrencyProbeAdapter()),
+    )
+
+    written: List[ChunkEmbeddingData] = []
+
+    def _capture_write(**kwargs: object) -> dict:
+        written.extend(kwargs.get("embeddings", []))  # type: ignore[arg-type]
+        return EmbeddingWriteResponse(
+            upsert_count=len(kwargs.get("embeddings", [])),  # type: ignore[arg-type]
+            deleted_stale_count=0,
+            index_status="created" if kwargs.get("create_index") else "skipped",
+        ).model_dump()
+
+    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _capture_write)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.md",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=2,
+            embedding_concurrent=concurrent,
+        ),
+    )
+    return result, state["max"], written
+
+
+def test_batch_embedding_runs_concurrently_and_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """6 chunks / batch_size=2 => 3 batches. With embedding_concurrent=3 the encode
+    round-trips overlap, and vectors must still line up with their chunks in order."""
+    result, max_inflight, written = _run_batch_embedding(monkeypatch, concurrent=3)
+
+    assert result.status == "success"
+    assert max_inflight >= 2, "batch encodes did not overlap"
+    # All 6 embedded, in order, each vector aligned to its own chunk (no scrambling).
+    assert [e.chunk_id for e in written] == [f"chunk-{i}" for i in range(6)]
+    assert [int(e.vector[0]) for e in written] == [len(e.text) for e in written]
+
+
+def test_batch_embedding_concurrency_one_stays_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """embedding_concurrent=1 must preserve the legacy fully-serial behavior."""
+    result, max_inflight, written = _run_batch_embedding(monkeypatch, concurrent=1)
+
+    assert result.status == "success"
+    assert max_inflight == 1
+    assert [e.chunk_id for e in written] == [f"chunk-{i}" for i in range(6)]
+
+
+def test_batch_embedding_retries_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient encode() failure in the sync batch path must be retried
+    (parity with the async path) instead of failing the whole document."""
+    _patch_pipeline_dependencies(monkeypatch)
+
+    chunks = _make_chunks(2)  # one batch of 2 at batch_size=2
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=2, pending_count=2
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    calls = {"n": 0}
+
+    class _FlakyAdapter(_StubEmbeddingAdapter):
+        def encode(self, text, dimension=None, instruct=None):  # type: ignore[override]
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient 429")
+            return super().encode(text, dimension, instruct)
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _FlakyAdapter()),
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.md",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=2,
+            embedding_concurrent=1,
+            max_retries=3,
+        ),
+    )
+
+    assert result.status == "success"
+    assert calls["n"] == 2  # first attempt raised, retry succeeded
+
+
+def test_process_document_compacts_storage_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful ingestion must actually trigger LanceDB compaction.
+
+    Guards the wiring itself (xorbitsai/xagent#1140): without this, deleting the
+    ``_compact_storage_if_needed`` call leaves the whole suite green while
+    fragmentation silently comes back.
+    """
+    from unittest.mock import Mock, patch
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    store = Mock()
+    store.iter_batches.return_value = []
+    store.compact_tables.return_value = ["documents"]
+
+    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path="/tmp/doc.pdf",
+            config=IngestionConfig(),
+        )
+
+    assert result.status == "success"
+    store.compact_tables.assert_called_once()
+    tables = store.compact_tables.call_args.args[0]
+    # Exact names, not a prefix match: a wrongly-derived embeddings table name
+    # silently resolves to nothing and skips the table this fix exists for.
+    assert set(tables) == {
+        "documents",
+        "parses",
+        "chunks",
+        "collection_config",
+        "collection_metadata",
+        "ingestion_runs",
+        "embeddings_embedding_default",
+    }
+
+
+def test_process_document_succeeds_when_compaction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compaction is maintenance: its failure must not fail the ingestion."""
+    from unittest.mock import Mock, patch
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    store = Mock()
+    store.iter_batches.return_value = []
+    store.compact_tables.side_effect = RuntimeError("optimize exploded")
+
+    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path="/tmp/doc.pdf",
+            config=IngestionConfig(),
+        )
+
+    assert result.status == "success"
+    store.compact_tables.assert_called_once()
+
+
+def test_process_document_compacts_storage_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ingestion must still compact: it fragmented the tables too.
+
+    Failed runs write ingestion_runs (delete+add) and whatever steps completed,
+    so a deployment with a high failure rate is exactly the one that must not
+    stop compacting (xorbitsai/xagent#1140 lists failed uploads as a symptom).
+    """
+    from unittest.mock import Mock, patch
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    def _boom(**_: object) -> dict:
+        raise RuntimeError("chunking exploded")
+
+    monkeypatch.setattr(document_ingestion, "chunk_document", _boom)
+
+    store = Mock()
+    store.iter_batches.return_value = []
+    store.compact_tables.return_value = []
+
+    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path="/tmp/doc.pdf",
+            config=IngestionConfig(),
+        )
+
+    assert result.status != "success"
+    store.compact_tables.assert_called_once()
+    assert "ingestion_runs" in store.compact_tables.call_args.args[0]
+
+
+def test_process_document_compaction_covers_vendor_prefixed_model_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline level: a slashed model id must reach the table writes create.
+
+    The other pipeline tests use ``embedding-default``, which is idempotent
+    under ``to_model_tag`` -- one application and two produce the same string,
+    so their assertions cannot tell a single probe from a double one. A vendor
+    prefixed id can, because ``to_model_tag`` lowercases the vendor segment on
+    the second pass.
+    """
+    from unittest.mock import Mock, patch
+
+    _patch_pipeline_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (
+            EmbeddingModelConfig(
+                id="BAAI/bge-large-zh-v1.5",
+                model_name="bge-large-zh-v1.5",
+                model_provider="huggingface",
+                dimension=2,
+            ),
+            _StubEmbeddingAdapter(),
+        ),
+    )
+
+    store = Mock()
+    store.iter_batches.return_value = []
+    store.compact_tables.return_value = []
+
+    with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path="/tmp/doc.pdf",
+            config=IngestionConfig(),
+        )
+
+    assert result.status == "success"
+    assert set(store.compact_tables.call_args.args[0]) == {
+        "documents",
+        "parses",
+        "chunks",
+        "collection_config",
+        "collection_metadata",
+        "ingestion_runs",
+        "embeddings_BAAI_bge_large_zh_v1_5",  # single-applied (legacy spelling)
+        "embeddings_baai_bge_large_zh_v1_5",  # double-applied (what writes make)
+    }
+
+
+def test_ingest_tables_are_real_schema_manager_tables() -> None:
+    """_INGEST_TABLES is pinned exactly, and so is everything left out of it.
+
+    Equality rather than a subset check: a subset assertion catches a typo'd
+    name but is structurally blind to an *omitted* one, which is how
+    ``collection_config`` stayed uncovered. Pinning the leftovers means a new
+    ``ensure_*_table`` forces a deliberate in-or-out decision here rather than
+    silently defaulting to never compacted.
+    """
+    from xagent.core.tools.core.RAG_tools.LanceDB import schema_manager
+
+    ensured = {
+        name[len("ensure_") : -len("_table")]
+        for name in dir(schema_manager)
+        if name.startswith("ensure_") and name.endswith("_table")
+    }
+    assert set(document_ingestion._INGEST_TABLES) == {
+        "documents",
+        "parses",
+        "chunks",
+        "collection_config",
+        "collection_metadata",
+        "ingestion_runs",
+    }
+    assert ensured - set(document_ingestion._INGEST_TABLES) == {
+        "embeddings",  # named per model tag; the caller appends it
+        "main_pointers",  # grows with collection count, not ingest count
+        "prompt_templates",  # same
+        "kb_ids",  # same
+    }
+
+
+def _run_metered_batch_embedding(
+    monkeypatch: pytest.MonkeyPatch, *, fail_batch: int | None = None
+) -> tuple[IngestionResult | None, BaseException | None, list[dict]]:
+    """Drive the concurrent batch path with a real DashScope provider.
+
+    The provider records its own usage, as in production, from inside the
+    encode pool's worker threads. Returns the usage rows that reached the
+    caller's context.
+    """
+    import json
+    import threading
+    from types import SimpleNamespace
+
+    import requests
+
+    from xagent.core.model.chat.token_context import TokenContextManager
+    from xagent.core.model.embedding.dashscope import DashScopeEmbedding
+
+    _patch_pipeline_dependencies(monkeypatch)
+    chunks = _make_chunks(6)
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=6, pending_count=6
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    batch_started = threading.Barrier(3, timeout=5)
+
+    def post(url: str, **kwargs: object) -> requests.Response:
+        texts = kwargs["json"]["input"]["texts"]  # type: ignore[index]
+        batch_started.wait()  # all three batches really run side by side
+        response = requests.Response()
+        response.status_code = 200
+        body: dict = {"usage": {"total_tokens": 10 * len(texts)}}
+        if len(texts[0]) != fail_batch:
+            body["output"] = {
+                "embeddings": [{"embedding": [float(len(t)), 0.0]} for t in texts]
+            }
+        # The failing batch is billed (200) but unusable: no embeddings.
+        response._content = json.dumps(body).encode()
+        return response
+
+    provider = DashScopeEmbedding(api_key="k", dimension=2, model_id="kb-emb")
+    provider._session = SimpleNamespace(post=post)  # type: ignore[assignment]
+    config = EmbeddingModelConfig(
+        id="kb-emb",
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (config, provider),
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        lambda **kwargs: EmbeddingWriteResponse(
+            upsert_count=len(kwargs["embeddings"]),
+            deleted_stale_count=0,
+            index_status="skipped",
+        ).model_dump(),
+    )
+
+    result: IngestionResult | None = None
+    error: BaseException | None = None
+    with TokenContextManager() as manager:
+        try:
+            result = document_ingestion.process_document(
+                collection="demo",
+                source_path="/tmp/doc.md",
+                config=IngestionConfig(
+                    embedding_use_async=False,
+                    embedding_batch_size=2,
+                    embedding_concurrent=3,
+                    max_retries=1,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+    rows = [d for d in manager.get_usage().details if d.get("type") == "media"]
+    return result, error, rows
+
+
+def test_batch_embedding_usage_from_pool_threads_reaches_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pool threads do not carry the caller's context; before the per-worker
+    usage merge every concurrent batch's usage was silently dropped."""
+    result, error, rows = _run_metered_batch_embedding(monkeypatch)
+
+    assert error is None and result is not None and result.status == "success"
+    assert sorted(row["quantity"] for row in rows) == [2.0, 2.0, 2.0]
+    assert {row["model_id"] for row in rows} == {"kb-emb"}
+    assert sum(row["provider_input_tokens"] for row in rows) == 60
+
+
+def test_batch_embedding_failed_batch_still_merges_billed_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch the provider billed but returned unusable fails the document;
+    the usage of every batch billed so far must still reach the caller."""
+    # chunk texts are 1..6 chars long; batch 2 holds texts of length 3 and 4.
+    result, error, rows = _run_metered_batch_embedding(monkeypatch, fail_batch=3)
+
+    assert error is not None or (result is not None and result.status != "success")
+    assert sorted(row["quantity"] for row in rows) == [2.0, 2.0, 2.0]

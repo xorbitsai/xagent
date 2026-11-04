@@ -1,0 +1,159 @@
+# Xagent Source License
+
+**Effective Date:** February 15, 2026
+
+Copyright © 2026 Xorbits Inc.
+
+---
+
+## 1. Overview
+
+The Xagent software, source code, and associated materials (the **“Software”**) are provided under this Xagent Source License (the **“License”**).
+
+This License provides source-available rights for use, modification, and internal commercial deployment, while restricting certain hosted/service and competitive uses.
+
+> **Note:** This License is **not** an OSI-approved open source license.
+
+---
+
+## 2. Acceptance
+
+By using, copying, modifying, distributing, or making available the Software, you agree to be bound by this License.
+
+---
+
+## 3. Grant of Rights
+
+Subject to the terms and conditions of this License, the licensor (**“Licensor”**) grants you a non-exclusive, worldwide, royalty-free, non-transferable, non-sublicensable license to:
+
+1. **Use** the Software;
+2. **Copy** the Software;
+3. **Modify** the Software and create derivative works;
+4. **Distribute** the Software (including derivative works) in source and/or object form; and
+5. **Deploy** the Software for internal business purposes.
+
+All rights not expressly granted are reserved.
+
+---
+
+## 4. Restrictions
+
+### 4.1 Hosted / Managed Service Restriction
+
+Except as expressly permitted below, you may not provide the Software, or any **Restricted Functionality** of the Software, to any **Third Party** as a hosted service, managed service, or otherwise make it available for use over a network.
+
+This prohibition includes (without limitation):
+
+* offering the Software as “Xagent-as-a-Service” or a shared agent execution platform for multiple Third Parties;
+* providing multiple Third Parties access to a shared runtime, orchestration, execution, scheduling, workflow, or UI environment powered by the Software; or
+* operating a multi-tenant service in which Third Parties can create, run, manage, or monitor agents or workflows using the Software.
+
+### Permitted Single-Tenant Deployment
+
+You may deploy and operate the Software on behalf of a single Third Party customer, provided that:
+
+1. the deployment is dedicated to that customer (single-tenant);
+2. the customer does not share access with other Third Parties;
+3. the Software is not offered as a generalized or reusable platform service to multiple customers;
+4. such deployment is limited to that specific customer’s internal use; and
+5. all Xagent trademarks, product names, copyright notices, and branding elements remain visible and unaltered within the Software and related user interfaces.
+
+Removal, replacement, white-labeling, or obscuring of Xagent branding in a single-tenant deployment is prohibited unless you have obtained a separate commercial license or written authorization from the Licensor.
+
+For clarity, internal deployment within your own organization and your Affiliated Entities is permitted.
+
+### 4.2 Competitive Use Restriction
+
+You may not use the Software to develop, offer, or operate a product or service whose primary purpose is to provide an agent orchestration runtime or agent execution platform that competes directly with the Licensor’s commercial Xagent offering.
+
+### 4.3 License Protection / Technical Restrictions
+
+You may not remove, disable, circumvent, or materially alter any license verification, usage limitation, feature gating, entitlement checking, or similar functionality included in the Software that is intended to enforce this License or commercial terms.
+
+### 4.4 Notice and Attribution
+
+You may not alter, remove, or obscure any licensing, copyright, attribution, or other notices included in the Software.
+
+If you distribute a modified version of the Software, you must include prominent notices stating that you have modified the Software.
+
+---
+
+## 5. Trademarks
+
+This License does not grant you any rights to use the Licensor’s trademarks, service marks, trade names, logos, or product names (including **“Xagent”**), except as required for reasonable and customary use in describing the origin of the Software.
+
+---
+
+## 6. Patents
+
+The Licensor grants you a license under any patent claims the Licensor can license, or becomes able to license, to make, have made, use, sell, offer for sale, import, and have imported the Software, subject to the restrictions in this License.
+
+This patent license does not apply to any patent claims infringed by your modifications or additions.
+
+If you or your company make any written claim (including in a lawsuit or administrative proceeding) that the Software infringes or contributes to infringement of any patent, then your patent license under this License terminates immediately.
+
+---
+
+## 7. Distribution Conditions
+
+If you distribute any copy of the Software (modified or unmodified), you must ensure that recipients receive a copy of this License.
+
+---
+
+## 8. Termination and Reinstatement
+
+If you violate this License, your rights under this License terminate automatically.
+
+If the Licensor provides notice of the violation and you cure the violation within **30 days** of receiving notice, your rights will be reinstated retroactively.
+
+If you violate this License after reinstatement, your rights terminate automatically and permanently.
+
+---
+
+## 9. Disclaimer of Warranty
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE SOFTWARE IS PROVIDED **“AS IS”**, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+---
+
+## 10. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT WILL THE LICENSOR BE LIABLE FOR ANY DAMAGES ARISING OUT OF OR RELATING TO THIS LICENSE OR THE SOFTWARE, WHETHER IN CONTRACT, TORT, OR OTHERWISE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+---
+
+## 11. Definitions
+
+**“Affiliated Entities”** means any entity that controls, is controlled by, or is under common control with you.
+
+**“Control”** means ownership of more than 50% of the voting power or equity interests, or the power to direct management or policies.
+
+**“Restricted Functionality”** means the core runtime and orchestration capabilities of the Software, including (without limitation):
+
+* agent orchestration and task execution runtime;
+* multi-agent coordination and scheduling;
+* workflow execution and planning engine;
+* tool integration runtime and connectors;
+* management UI used to create, run, manage, or monitor agents/workflows.
+
+**“Third Party”** means any person or entity other than you and your Affiliated Entities.
+
+**“You”** means the individual or entity exercising rights under this License.
+
+---
+
+## 12. Commercial Licensing
+
+If you wish to use the Software in a way not permitted under this License (including offering a hosted or managed service), you may obtain a commercial license from the Licensor.
+
+---
+
+## 13. Miscellaneous
+
+If any provision of this License is held unenforceable, the remaining provisions will remain in effect.
+
+This License is the entire agreement regarding the Software and supersedes any prior or contemporaneous agreements relating to the Software.
+
+---
+
+**Version 1.0 — Effective February 15, 2026**

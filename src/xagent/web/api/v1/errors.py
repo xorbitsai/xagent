@@ -1,0 +1,322 @@
+"""Stable error schema for the ``/v1/*`` SDK surface.
+
+Every error response on the SDK surface is shaped like:
+
+    {
+        "error": {
+            "code": "<stable enum>",
+            "message": "<human-readable, may change>"
+        }
+    }
+
+The ``code`` is the contract SDK clients pin against; ``message`` is
+free text that may be updated for clarity without breaking clients.
+
+Why a separate error envelope from ``/api/*``:
+    ``/api/*`` uses FastAPI's default ``{"detail": "..."}`` shape, which
+    is fine for an in-house web UI but a poor SDK surface -- clients
+    would have to string-match against ``detail`` to distinguish "wrong
+    key" from "no such task" from "rate-limited". Coding the cause in a
+    stable enum lets each SDK language map server errors to typed
+    exceptions deterministically.
+"""
+
+from enum import Enum
+from typing import Any, NoReturn
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+
+
+class V1ErrorCode(str, Enum):
+    """Stable error codes for ``/v1/*`` responses.
+
+    Values are the on-the-wire strings; SDK clients pin against these.
+    Adding new codes is allowed; renaming or removing existing ones is
+    a breaking change.
+    """
+
+    # Authentication failures (401). One opaque code covers
+    # "missing header", "format wrong", "prefix not found", "secret
+    # wrong", and "key revoked" so attackers cannot distinguish them
+    # by error code (we already keep the timing constant via
+    # verify_dummy).
+    INVALID_API_KEY = "invalid_api_key"
+
+    # Caller is authenticated but the agent_id they asked for is not
+    # bound to their key. Returned as 404 (not 403) so the existence
+    # of other tenants' agents is not leaked.
+    AGENT_NOT_FOUND = "agent_not_found"
+
+    # Caller is authenticated but the workforce_id they asked for is
+    # not bound to their key. Returned as 404 (not 403) for the same
+    # leak-prevention reason as AGENT_NOT_FOUND.
+    WORKFORCE_NOT_FOUND = "workforce_not_found"
+
+    # The key-bound workforce has been archived; run creation and new
+    # turns are permanently rejected (409 -- retrying cannot succeed).
+    WORKFORCE_ARCHIVED = "workforce_archived"
+
+    # The workforce exists but is not in the ``active`` status runs
+    # require (e.g. still a draft). 409.
+    WORKFORCE_NOT_ACTIVE = "workforce_not_active"
+
+    # The workforce configuration changed since this conversation
+    # started; the pinned run snapshot no longer matches, so appends
+    # are permanently rejected (409). Client should create a new run.
+    WORKFORCE_CONFIG_CHANGED = "workforce_config_changed"
+
+    # An idempotency key was already used by a run whose task no longer
+    # exists -- the original result can't be replayed and the key can't
+    # be reused. 409.
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+
+    # A file id passed in ``message.files`` on run creation isn't
+    # accessible to the caller. 404 -- distinct from workforce_not_found
+    # so SDK clients can tell "bad file" from "bad workforce".
+    FILE_NOT_FOUND = "file_not_found"
+
+    # Caller is authenticated and agent_id is right, but the task_id
+    # they asked for doesn't exist or doesn't belong to their agent.
+    # Also 404 for the same leak-prevention reason.
+    TASK_NOT_FOUND = "task_not_found"
+
+    # The task_id named a task the retention policy expired, and the key
+    # could have seen that task while it existed. 410 Gone, not retryable:
+    # the conversation was removed and will not come back. ``details``
+    # carries ``task_id`` and ``expired_at``. A key that could not have
+    # seen the task gets ``task_not_found`` instead, and so does a task its
+    # owner deleted -- only the retention purge leaves the record this
+    # code is answered from.
+    TASK_EXPIRED = "task_expired"
+
+    # Template id is unknown or unavailable to the caller.
+    TEMPLATE_NOT_FOUND = "template_not_found"
+
+    # No skill the key holder can see has this name (GET), or the name does
+    # not address a personal skill the holder owns (PUT / DELETE). 404.
+    SKILL_NOT_FOUND = "skill_not_found"
+
+    # The key holder already has a personal skill with this name and the
+    # request is not a repeat of the write that created it. 409.
+    SKILL_ALREADY_EXISTS = "skill_already_exists"
+
+    # The task is currently running and cannot accept new input.
+    # 409 Conflict. Client should retry after polling task status.
+    TASK_BUSY = "task_busy"
+
+    # Request body failed Pydantic validation (empty content, wrong role,
+    # missing required field, etc.). 422. The default ``{"detail": [...]}``
+    # FastAPI shape is rewritten to this enum on the /v1/* path so SDK
+    # clients always switch on ``body.error.code``.
+    INVALID_INPUT = "invalid_input"
+
+    # Emitted when a caller exceeds the v1 SSE stream concurrency caps
+    # (per-task or per-principal).
+    RATE_LIMITED = "rate_limited"
+
+    # Monthly execution quota exhausted. 402 Payment Required. Two distinct
+    # codes so a client application can tell "my own sub-quota is spent" apart
+    # from "the whole team's ceiling is spent" — the team ceiling always wins,
+    # so QUOTA_EXCEEDED means there is no headroom at all, while
+    # CLIENT_QUOTA_EXCEEDED means the team still has room but this application's
+    # slice is used up.
+    QUOTA_EXCEEDED = "quota_exceeded"
+    CLIENT_QUOTA_EXCEEDED = "client_quota_exceeded"
+
+    # Server-side bug. Detail is sanitized; the raw exception stays in
+    # the server log.
+    INTERNAL_ERROR = "internal_error"
+    AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
+
+    CONNECTOR_NOT_FOUND = "connector_not_found"
+    INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
+    MISSING_RUNTIME_CONTEXT = "missing_runtime_context"
+    RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
+    RUNTIME_SECRET_NOT_ALLOWED = "runtime_secret_not_allowed"
+    RUNTIME_SECRET_UNAVAILABLE = "runtime_secret_unavailable"
+    SCHEDULED_SECRET_UNAVAILABLE = "scheduled_secret_unavailable"
+    CONNECTOR_RUNTIME_UNAVAILABLE = "connector_runtime_unavailable"
+    MCP_OAUTH_AUTHORIZATION_FAILED = "mcp_oauth_authorization_failed"
+    DELEGATED_AUTHORIZATION_FAILED = "delegated_authorization_failed"
+
+    # The task is waiting on an answer to a pending agent question and
+    # cannot accept a plain append. 409. Client should call
+    # ``POST /v1/chat/tasks/{id}/reply`` instead of retrying the append.
+    INTERACTION_RESPONSE_REQUIRED = "interaction_response_required"
+
+    # The task is waiting_for_user, but its saved execution progress
+    # cannot be resumed (no run-fenced checkpoint, or the checkpoint is
+    # unreadable/superseded). 409, not retryable -- the task stays in
+    # waiting_for_user and the caller must start a new task.
+    INTERACTION_NOT_RESUMABLE = "interaction_not_resumable"
+
+    # ``POST /v1/chat/tasks/{id}/reply`` was called on a task that is not
+    # currently waiting on a question (pending / paused / completed /
+    # failed). 409. Not retryable as-is; use ``append`` to start a new
+    # turn, or wait for the task to reach waiting_for_user.
+    NO_PENDING_INTERACTION = "no_pending_interaction"
+
+    # ``POST /v1/chat/tasks/{id}/cancel-question`` was called on a task that
+    # is not waiting_for_user and carries no cancelled-question marker for its
+    # current run (pending / paused / completed normally / failed). 409.
+    TASK_NOT_WAITING = "task_not_waiting"
+
+    # A reply's saved progress could not be read due to a transient
+    # infrastructure failure. 503, retryable -- distinct from
+    # ``interaction_not_resumable`` (which means resuming can never
+    # succeed) so clients know whether to retry or give up.
+    REPLY_OUTCOME_UNKNOWN = "reply_outcome_unknown"
+
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+
+
+# Default human-readable text per code. Endpoints may override the
+# message when more specific context is available (e.g. surfacing
+# ``"task is running"`` vs the default ``"task is busy"``).
+_DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
+    V1ErrorCode.INVALID_API_KEY: "Invalid or revoked API key.",
+    V1ErrorCode.AGENT_NOT_FOUND: "Agent not found or not accessible with this key.",
+    V1ErrorCode.WORKFORCE_NOT_FOUND: (
+        "Workforce not found or not accessible with this key."
+    ),
+    V1ErrorCode.WORKFORCE_ARCHIVED: (
+        "This workforce has been archived; it can no longer accept new "
+        "runs or messages."
+    ),
+    V1ErrorCode.WORKFORCE_NOT_ACTIVE: "Workforce must be active to run.",
+    V1ErrorCode.WORKFORCE_CONFIG_CHANGED: (
+        "The workforce configuration has changed since this conversation "
+        "started; please create a new run."
+    ),
+    V1ErrorCode.IDEMPOTENCY_CONFLICT: (
+        "This idempotency key was already used by a run that can no longer be replayed."
+    ),
+    V1ErrorCode.FILE_NOT_FOUND: "One or more file ids are not accessible.",
+    V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
+    V1ErrorCode.TASK_EXPIRED: (
+        "This task's conversation was removed under the retention policy."
+    ),
+    V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
+    V1ErrorCode.SKILL_NOT_FOUND: "Skill not found.",
+    V1ErrorCode.SKILL_ALREADY_EXISTS: "A skill with this name already exists.",
+    V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
+    V1ErrorCode.INVALID_INPUT: "Request body failed validation.",
+    V1ErrorCode.RATE_LIMITED: "Rate limit exceeded; retry later.",
+    V1ErrorCode.QUOTA_EXCEEDED: "Monthly execution quota exceeded for this team.",
+    V1ErrorCode.CLIENT_QUOTA_EXCEEDED: (
+        "Monthly execution quota exceeded for this client application."
+    ),
+    V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
+    V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+    V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
+    V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",
+    V1ErrorCode.RUNTIME_CONTEXT_IMMUTABLE: "Connector runtime context cannot change after task creation.",
+    V1ErrorCode.RUNTIME_SECRET_NOT_ALLOWED: "Runtime secret is not allowed for this entrypoint.",
+    V1ErrorCode.RUNTIME_SECRET_UNAVAILABLE: "Required runtime secret is unavailable.",
+    V1ErrorCode.SCHEDULED_SECRET_UNAVAILABLE: "Required scheduled runtime secret is unavailable.",
+    V1ErrorCode.CONNECTOR_RUNTIME_UNAVAILABLE: "Connector runtime context is unavailable.",
+    V1ErrorCode.MCP_OAUTH_AUTHORIZATION_FAILED: "MCP OAuth authorization is unavailable.",
+    V1ErrorCode.DELEGATED_AUTHORIZATION_FAILED: "Delegated authorization failed.",
+    V1ErrorCode.INTERACTION_RESPONSE_REQUIRED: (
+        "This task is waiting for an answer to a pending question; use "
+        "the task reply endpoint (POST .../reply) instead."
+    ),
+    V1ErrorCode.INTERACTION_NOT_RESUMABLE: (
+        "This task's saved progress cannot be resumed; it remains in "
+        "waiting_for_user. Start a new task instead of retrying."
+    ),
+    V1ErrorCode.NO_PENDING_INTERACTION: (
+        "This task has no pending question to answer."
+    ),
+    V1ErrorCode.TASK_NOT_WAITING: (
+        "This task is not waiting for an answer to a question."
+    ),
+    V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
+        "Reply was accepted but its outcome is not yet known. "
+        "Repeat the same command_id to check its outcome; do not send a new reply."
+    ),
+    V1ErrorCode.TEMPORARILY_UNAVAILABLE: (
+        "The task's saved progress could not be read. Please retry."
+    ),
+}
+
+
+class V1ApiError(Exception):
+    """Raise from any ``/v1/*`` handler to return a stable error response.
+
+    Use this instead of ``HTTPException`` so the response envelope is
+    consistent across the SDK surface. The exception handler in
+    ``web/app.py`` translates this to:
+
+        HTTP <http_status>
+        {"error": {"code": <code>, "message": <message>}}
+
+    Args:
+        code: One of the :class:`V1ErrorCode` enum values.
+        http_status: HTTP status code to send (401 / 404 / 409 / 429 / 500
+            per code, but the endpoint chooses, not the code).
+        message: Optional override of the default human-readable text.
+    """
+
+    def __init__(
+        self,
+        code: V1ErrorCode,
+        http_status: int,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message or _DEFAULT_MESSAGES[code])
+        self.code = code
+        self.http_status = http_status
+        self.message = message or _DEFAULT_MESSAGES[code]
+        self.details = details
+
+
+# Turn-rejection reasons (``TaskTurnError.reason``) that are NOT the
+# transient "busy" case. The default TASK_BUSY message tells the client
+# to retry, which is actively misleading for workforce rejections where
+# retrying can never succeed -- mirror of the WebSocket layer's
+# ``_TURN_REJECTION_MESSAGES`` map, expressed as stable v1 error codes.
+_TURN_REJECTION_CODES: dict[str, tuple[V1ErrorCode, int]] = {
+    "workforce_archived": (V1ErrorCode.WORKFORCE_ARCHIVED, 409),
+    "workforce_config_changed": (V1ErrorCode.WORKFORCE_CONFIG_CHANGED, 409),
+    # The run row backing this conversation is gone; from the SDK's
+    # perspective the task is simply no longer available.
+    "workforce_run_not_found": (V1ErrorCode.TASK_NOT_FOUND, 404),
+    # The run itself was cancelled (archive path or the stale-preview-run
+    # reaper) -- same "conversation no longer available" outcome as
+    # workforce_run_not_found from the SDK's perspective.
+    "workforce_run_not_active": (V1ErrorCode.TASK_NOT_FOUND, 404),
+    # The task is waiting on an answer to a pending question; append is
+    # not the right entrypoint for that -- POST .../reply is.
+    "interaction_response_required": (
+        V1ErrorCode.INTERACTION_RESPONSE_REQUIRED,
+        409,
+    ),
+}
+
+
+def raise_for_turn_rejection(reason: str) -> NoReturn:
+    """Translate a ``TaskTurnError.reason`` into the v1 error envelope.
+
+    Workforce-specific rejections get their own stable codes; anything
+    else (``busy``, ``bg_inflight``, future reasons) stays the generic
+    retryable ``task_busy`` 409.
+    """
+    code_status = _TURN_REJECTION_CODES.get(reason)
+    if code_status is not None:
+        code, http_status = code_status
+        raise V1ApiError(code, http_status)
+    raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
+
+
+async def v1_api_error_handler(_request: Request, exc: V1ApiError) -> JSONResponse:
+    """FastAPI exception handler -- mount via ``app.add_exception_handler``."""
+    error: dict[str, Any] = {"code": exc.code.value, "message": exc.message}
+    if exc.details is not None:
+        error["details"] = exc.details
+    return JSONResponse(status_code=exc.http_status, content={"error": error})

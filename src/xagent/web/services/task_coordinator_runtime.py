@@ -1,0 +1,1063 @@
+"""Single ownership lifecycle for shared task commands and their executions.
+
+The durable dispatcher selects commands; one coordinator serializes their
+application and owns every registered execution through callback cleanup.
+Run-scoped execution fences never acquire, renew or release task ownership.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import logging
+from contextvars import ContextVar
+from enum import Enum
+from typing import Any, Awaitable, Callable, TypeVar
+
+from sqlalchemy import and_, func, select
+from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.orm import Session
+
+from ...config import get_task_lease_heartbeat_seconds, get_task_lease_ttl_seconds
+from ..models.database import get_session_local
+from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
+from .db_runtime import (
+    await_task_settlement,
+    caller_is_cancelling,
+    cancel_and_drain_async_task,
+    drain_async_task_cancellation_safe,
+    is_database_pool_timeout,
+    propagate_deferred_cancellation,
+    run_db_io_cancellation_safe,
+)
+from .release_hold import release_hold
+from .task_coordinator_service import (
+    TaskExecutionContext,
+    TaskLease,
+    TaskLeaseRenewalState,
+    acquire_task_lease_no_commit,
+    lock_task_execution_no_commit,
+    lock_task_lease_no_commit,
+    recover_expired_idle_task_lease_no_commit,
+    release_task_lease_no_commit,
+    renew_task_leases_no_commit,
+)
+from .task_dispatch_cap import (
+    DISPATCH_CLASS_BATCH,
+    EXECUTION_OPENING_KINDS,
+    DispatchCapSnapshot,
+    build_dispatch_cap_snapshot,
+)
+from .task_lease_service import TaskLease as ExecutionLease
+from .task_lease_service import TaskLeaseHeartbeatOutcome, get_runner_id
+
+logger = logging.getLogger(__name__)
+
+Admission = Callable[[Session, TaskLease], TaskExecutionContext | None]
+Execution = Callable[[TaskExecutionContext], Awaitable[None]]
+Settlement = Callable[[Session, TaskExecutionContext, BaseException | None], None]
+
+
+class CoordinatorState(str, Enum):
+    ACQUIRING = "acquiring"
+    ACTIVE = "active"
+    QUIESCING = "quiescing"
+    LOST = "lost"
+    CLOSED = "closed"
+
+
+class TaskCoordinatorRegistry:
+    """Share acquisition, batch renewals, and one running handle per task."""
+
+    def __init__(self, session_factory: Callable[[], Session] | None = None):
+        self.session_factory = session_factory or get_session_local()
+        self.loop = asyncio.get_running_loop()
+        self.runner_id = get_runner_id()
+        self._coordinators: dict[int, TaskCoordinator] = {}
+        self._close_task: asyncio.Task[None] | None = None
+        self._heartbeats: dict[TaskLease, TaskCoordinator] = {}
+        self._heartbeat_wake = asyncio.Event()
+        self._heartbeat_runner: asyncio.Task[None] | None = None
+
+    def _register_heartbeat(self, coordinator: TaskCoordinator) -> None:
+        assert coordinator.lease is not None
+        coordinator._heartbeat_done = self.loop.create_future()
+        self._heartbeats[coordinator.lease] = coordinator
+        if self._heartbeat_runner is None or self._heartbeat_runner.done():
+            self._heartbeat_runner = self.loop.create_task(self._run_heartbeats())
+        self._heartbeat_wake.set()
+
+    async def _unregister_heartbeat(self, coordinator: TaskCoordinator) -> None:
+        assert coordinator.lease is not None
+        self._heartbeats.pop(coordinator.lease, None)
+        self._heartbeat_wake.set()
+        # A released owner must never have an unfinished renewal transaction.
+        if coordinator._renewal_waiter is not None:
+            await asyncio.shield(coordinator._renewal_waiter)
+        done = coordinator._heartbeat_done
+        if done is not None and not done.done():
+            done.set_result(None)
+
+    def _renew(
+        self, leases: tuple[TaskLease, ...]
+    ) -> dict[TaskLease, TaskLeaseRenewalState]:
+        with self.session_factory() as db, db.begin():
+            states = renew_task_leases_no_commit(db, leases)
+        return states
+
+    def _finish_heartbeat(
+        self, coordinator: TaskCoordinator, error: BaseException | None = None
+    ) -> None:
+        assert coordinator.lease is not None
+        assert coordinator._heartbeat_done is not None
+        self._heartbeats.pop(coordinator.lease, None)
+        if error is None:
+            coordinator._heartbeat_done.set_result(None)
+        else:
+            coordinator._healthy = False
+            coordinator._heartbeat_error = error
+            coordinator._recovery_required = True
+            coordinator._heartbeat_done.set_exception(error)
+        coordinator._request_close()
+
+    async def _run_heartbeats(self) -> None:
+        next_refresh_at = self.loop.time() + get_task_lease_heartbeat_seconds()
+        try:
+            while self._heartbeats:
+                next_attempt_at = min(
+                    [next_refresh_at]
+                    + [
+                        c._retry_at
+                        for c in self._heartbeats.values()
+                        if c._retry_at is not None
+                    ]
+                )
+                delay = max(0.0, next_attempt_at - self.loop.time())
+                if delay:
+                    self._heartbeat_wake.clear()
+                    try:
+                        await asyncio.wait_for(self._heartbeat_wake.wait(), delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    if self.loop.time() < next_attempt_at:
+                        continue
+                now = self.loop.time()
+                regular_refresh = now >= next_refresh_at
+                snapshot = tuple(
+                    (lease, c)
+                    for lease, c in self._heartbeats.items()
+                    if regular_refresh
+                    or (c._retry_at is not None and c._retry_at <= now)
+                )
+                if not snapshot:
+                    continue
+                waiter: asyncio.Future[None] = self.loop.create_future()
+                for _, c in snapshot:
+                    c._renewal_waiter = waiter
+                    c._retry_at = None
+                try:
+                    try:
+                        states = await run_db_io_cancellation_safe(
+                            lambda: self._renew(tuple(lease for lease, _ in snapshot))
+                        )
+                    except Exception as error:
+                        sqlstate = (
+                            (
+                                getattr(error.orig, "sqlstate", None)
+                                or getattr(error.orig, "pgcode", None)
+                            )
+                            if isinstance(error, DBAPIError)
+                            else None
+                        )
+                        # A renewal only extends the exact existing owner.
+                        # Rollback or connection loss gives no new lease time,
+                        # but does not invalidate the last acknowledged lease.
+                        rolled_back = sqlstate in (
+                            "55P03",
+                            "57014",
+                            "40P01",
+                            "40001",
+                        )
+                        connection_error = isinstance(error, DBAPIError) and (
+                            error.connection_invalidated
+                            or (
+                                isinstance(error, OperationalError)
+                                and sqlstate is None
+                                and (
+                                    hasattr(error.orig, "pgcode")
+                                    or hasattr(error.orig, "sqlstate")
+                                )
+                            )
+                        )
+                        retryable = (
+                            rolled_back
+                            or connection_error
+                            or is_database_pool_timeout(error)
+                        )
+                        for _, c in snapshot:
+                            # Preserve prior health/errors while there is margin;
+                            # only an acknowledged renewal can restore health.
+                            if (
+                                rolled_back or connection_error
+                            ) and c._has_renewal_margin():
+                                continue
+                            c._healthy = False
+                            c._heartbeat_error = error
+                            if not retryable or connection_error:
+                                self._finish_heartbeat(c, error)
+                        logger.warning(
+                            "Coordinator heartbeat batch failed: tasks=%s count=%s "
+                            "error=%s sqlstate=%s retryable=%s",
+                            [lease.task_id for lease, _ in snapshot[:10]],
+                            len(snapshot),
+                            type(error).__name__,
+                            sqlstate,
+                            retryable,
+                            exc_info=True,
+                        )
+                        if retryable:
+                            # A shared database failure must not be retried by
+                            # either an imminent regular tick or a row's timer.
+                            next_refresh_at = (
+                                self.loop.time() + get_task_lease_heartbeat_seconds()
+                            )
+                            for c in self._heartbeats.values():
+                                c._retry_at = None
+                    else:
+                        for lease, c in snapshot:
+                            state = states[lease]
+                            if state == TaskLeaseRenewalState.DEFERRED:
+                                # A skipped lock does not invalidate the last
+                                # committed renewal. Reserve one heartbeat of
+                                # margin, and never restore health from a skip.
+                                if c._healthy and not c._has_renewal_margin():
+                                    c._healthy = False
+                                    logger.warning(
+                                        "Task %s heartbeat remains deferred; "
+                                        "last renewal %.3fs ago",
+                                        c.task_id,
+                                        self.loop.time() - c._last_renewed_at,
+                                    )
+                                c._retry_at = self.loop.time() + min(
+                                    1.0, get_task_lease_heartbeat_seconds() / 4
+                                )
+                            elif state == TaskLeaseRenewalState.LOST:
+                                c.state = CoordinatorState.LOST
+                                self._finish_heartbeat(c)
+                            else:
+                                # Use dispatch time, not commit acknowledgement:
+                                # database time spent cannot extend our margin.
+                                c._last_renewed_at = now
+                                c._healthy = True
+                                c._heartbeat_error = None
+                finally:
+                    for _, c in snapshot:
+                        c._renewal_waiter = None
+                    waiter.set_result(None)
+                if regular_refresh:
+                    interval = get_task_lease_heartbeat_seconds()
+                    while next_refresh_at <= self.loop.time():
+                        next_refresh_at += interval
+        except BaseException as error:
+            for c in tuple(self._heartbeats.values()):
+                self._finish_heartbeat(c, error)
+            raise
+        finally:
+            self._heartbeat_runner = None
+
+    def busy_command_tasks(self) -> tuple[int, ...]:
+        """Let queue scans serve other tasks while this owner applies a command."""
+        return tuple(
+            task_id
+            for task_id, coordinator in self._coordinators.items()
+            if coordinator._command_tasks
+            or not coordinator._healthy
+            or coordinator.state
+            not in (CoordinatorState.ACQUIRING, CoordinatorState.ACTIVE)
+        )
+
+    async def ensure(self, task_id: int) -> TaskCoordinator | None:
+        while True:
+            if self._close_task is not None:
+                return None
+            coordinator = self._coordinators.get(task_id)
+            if coordinator is None:
+                coordinator = TaskCoordinator(self, task_id)
+                self._coordinators[task_id] = coordinator
+                break
+            if coordinator.state in (
+                CoordinatorState.ACQUIRING,
+                CoordinatorState.ACTIVE,
+            ):
+                break
+            # Preserve this wake without replacing an owner that is still
+            # draining. Cancellation of the waiter must not abort cleanup.
+            assert coordinator._close_task is not None
+            await asyncio.shield(coordinator._close_task)
+        coordinator._waiters += 1
+        try:
+            await asyncio.shield(coordinator._startup)
+            if (
+                self._close_task is not None
+                or coordinator.state != CoordinatorState.ACTIVE
+            ):
+                return None
+            coordinator._delivered = True
+            coordinator.wake()
+            return coordinator
+        finally:
+            coordinator._waiters -= 1
+            # Cancellation of one waiter must not cancel another's acquisition.
+            # If nobody received it, drain even a late commit before releasing.
+            if coordinator._waiters == 0 and not coordinator._delivered:
+                await coordinator.close()
+
+    def _remove(self, coordinator: TaskCoordinator) -> None:
+        if self._coordinators.get(coordinator.task_id) is coordinator:
+            del self._coordinators[coordinator.task_id]
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_all())
+        await drain_async_task_cancellation_safe(self._close_task)
+
+    async def _close_all(self) -> None:
+        await asyncio.gather(*(c.close() for c in list(self._coordinators.values())))
+        if self._heartbeat_runner is not None:
+            await drain_async_task_cancellation_safe(self._heartbeat_runner)
+
+
+class TaskCoordinator:
+    """Own acquisition, heartbeat, admission, execution and drained shutdown."""
+
+    def __init__(self, registry: TaskCoordinatorRegistry, task_id: int):
+        self.task_id = task_id
+        self.state = CoordinatorState.ACQUIRING
+        self.lease: TaskLease | None = None
+        self.wakeup = asyncio.Event()
+        self._registry = registry
+        self._waiters = 0
+        self._delivered = False
+        self._healthy = True
+        self._last_renewed_at = registry.loop.time()
+        self._heartbeat_error: BaseException | None = None
+        self._recovery_required = False
+        self._released = False
+        self._heartbeat_done: asyncio.Future[None] | None = None
+        self._renewal_waiter: asyncio.Future[None] | None = None
+        self._retry_at: float | None = None
+        self._execution_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._command_lock = asyncio.Lock()
+        self._command_tasks: set[asyncio.Task[Any]] = set()
+        self._children: set[asyncio.Task[Any]] = set()
+        # The governed command ids whose tickets each tracked handle's
+        # execution holds; released once every handle of that execution has
+        # finished (#2777). A joined guidance continuation inherits the
+        # ticket(s) of the execution it continues, rather than its own
+        # unstamped one. ``_continuation_pins`` holds the ids for a
+        # continuation that has been confirmed (via ``allow_injected_guidance``)
+        # but not yet registered through ``track_execution``, keyed by the
+        # joining command's id, so draining the original handle first does
+        # not lose them.
+        self._child_admissions: dict[asyncio.Task[Any], frozenset[int]] = {}
+        self._continuation_pins: dict[int, frozenset[int]] = {}
+        # Ticket ids a failed release attempt could not drop. Retried on the
+        # next drained handle: the settled/idle backstops only apply once the
+        # task is no longer RUNNING, i.e. after the successor ends.
+        self._unreleased_admissions: set[int] = set()
+        self._admission_releases: set[asyncio.Task[None]] = set()
+        self._idle_task: asyncio.Task[None] | None = None
+        self._startup = asyncio.create_task(self._start())
+
+    def _has_renewal_margin(self) -> bool:
+        return self._registry.loop.time() < (
+            self._last_renewed_at
+            + get_task_lease_ttl_seconds()
+            - get_task_lease_heartbeat_seconds()
+        )
+
+    def wake(self) -> None:
+        self.wakeup.set()
+
+    def _acquire(self) -> TaskLease | None:
+        with self._registry.session_factory() as db, db.begin():
+            recover_expired_idle_task_lease_no_commit(db, self.task_id)
+            return acquire_task_lease_no_commit(
+                db, self.task_id, runner_id=self._registry.runner_id
+            )
+
+    def _release(self) -> bool:
+        assert self.lease is not None
+        with self._registry.session_factory() as db, db.begin():
+            return release_task_lease_no_commit(db, self.lease)
+
+    async def _start(self) -> None:
+        self.lease = await run_db_io_cancellation_safe(self._acquire)
+        if self.lease is None:
+            return
+        # Shutdown may have begun while the acquisition transaction was blocked.
+        if self._close_task is None and self._registry._close_task is None:
+            self._registry._register_heartbeat(self)
+            self.state = CoordinatorState.ACTIVE
+
+    def require_recovery(self) -> None:
+        self._recovery_required = True
+
+    def owns_execution(self, execution: ExecutionLease) -> bool:
+        """Check a fixed execution fence against the actual in-process owner."""
+        return self.lease is not None and (
+            execution.task_id == self.task_id
+            and execution.runner_id == self.lease.runner_id
+            and execution.attempt_id == self.lease.attempt_id
+        )
+
+    async def observe_ownership(self, stop: asyncio.Event) -> TaskLeaseHeartbeatOutcome:
+        """Observe the owner's heartbeat without creating another renewal loop."""
+        from .task_lease_service import TaskLeaseHeartbeatOutcome
+
+        assert self._heartbeat_done is not None
+        waiter = asyncio.create_task(stop.wait())
+        try:
+            await asyncio.wait(
+                (waiter, self._heartbeat_done), return_when=asyncio.FIRST_COMPLETED
+            )
+            if self._heartbeat_done.done():
+                # Propagate a failed renewal rather than declaring it healthy.
+                self._heartbeat_done.result()
+            return TaskLeaseHeartbeatOutcome(
+                lease_lost=self.state == CoordinatorState.LOST,
+                pool_timeout=self._heartbeat_error,
+            )
+        finally:
+            await cancel_and_drain_async_task(waiter)
+
+    def pin_continuation(self, command_id: int) -> None:
+        """Pin the ticket ids a confirmed continuation must inherit.
+
+        Called from ``allow_injected_guidance`` at join confirmation time,
+        before the continuation handle is created. Captures every ticket id
+        any tracked handle currently holds -- not filtered to live handles,
+        because a handle whose done callback has not run yet still holds its
+        ids in ``_child_admissions`` -- so the continuation's own later
+        ``track_execution`` call inherits them even if the original handle
+        has since fully drained.
+        """
+        pinned: frozenset[int] = frozenset()
+        for owned in self._child_admissions.values():
+            pinned |= owned
+        self._continuation_pins[command_id] = pinned
+
+    def _discard_continuation_pin(self, command_id: int | None) -> None:
+        """Release an unclaimed pin once its joining command has finished.
+
+        A pin nobody's ``track_execution`` ever claimed (the joined guidance
+        never registered a continuation handle) must not hold its ticket(s)
+        forever.
+        """
+        if command_id is None:
+            return
+        owned = self._continuation_pins.pop(command_id, None)
+        if owned:
+            self._release_unheld(owned)
+
+    def track_execution(self, handle: asyncio.Task[Any]) -> None:
+        """Retain ownership until the actual outer execution handle finishes."""
+        if self.state != CoordinatorState.ACTIVE:
+            handle.cancel()
+            raise RuntimeError("Task coordinator is closing")
+        if handle in self._children:
+            return
+        from .task_admission_execution import current_admission_execution
+
+        context = current_admission_execution(self.task_id)
+        if context is not None:
+            if context.command_id in self._continuation_pins:
+                # A continuation confirmed by allow_injected_guidance takes
+                # over the ids pinned for it then, even if the execution it
+                # continues has since fully drained.
+                owned = self._continuation_pins.pop(context.command_id)
+                self._child_admissions[handle] = owned or frozenset(
+                    {context.command_id}
+                )
+            else:
+                live_owned: frozenset[int] = frozenset()
+                for child, owned in self._child_admissions.items():
+                    if child in self._children and not child.done():
+                        live_owned |= owned
+                if context.injected_run_id is not None and live_owned:
+                    # A joined continuation rides on the execution it
+                    # continues, not on its own (unstamped) ticket.
+                    self._child_admissions[handle] = live_owned
+                else:
+                    self._child_admissions[handle] = frozenset({context.command_id})
+        self._children.add(handle)
+        handle.add_done_callback(self._child_done)
+
+    def _child_done(self, handle: asyncio.Task[Any]) -> None:
+        self._children.discard(handle)
+        owned = self._child_admissions.pop(handle, None) or frozenset()
+        self._release_unheld(owned)
+        self._ensure_idle_check()
+
+    def _release_unheld(self, owned: frozenset[int]) -> None:
+        """Release whichever of ``owned`` no other live handle or pin still holds.
+
+        A closing owner drains its handles and either releases every ticket
+        with the lease or leaves them for recovery; only a live owner frees a
+        finished execution's slot on its own.
+        """
+        if self.state != CoordinatorState.ACTIVE:
+            return
+        still_held: frozenset[int] = frozenset()
+        for remaining in self._child_admissions.values():
+            still_held |= remaining
+        for remaining in self._continuation_pins.values():
+            still_held |= remaining
+        to_release = owned - still_held
+        if self._unreleased_admissions:
+            # A previously failed release is retried alongside this one; a
+            # fresh failure re-stashes it below.
+            to_release |= self._unreleased_admissions
+            self._unreleased_admissions.clear()
+        if not to_release:
+            return
+        release = asyncio.create_task(
+            self._release_drained_admission(frozenset(to_release))
+        )
+        self._admission_releases.add(release)
+        release.add_done_callback(self._admission_releases.discard)
+
+    async def _release_drained_admission(self, command_ids: frozenset[int]) -> None:
+        """Free the finished execution's slot even while a successor runs.
+
+        A handle that ended before settling its row leaves the task RUNNING
+        with no execution; its slot is freed here all the same, and the idle
+        check then hands that row to lease recovery as before.
+        """
+        from .task_execution_admission import release_command_admission
+
+        assert self.lease is not None
+        lease = self.lease
+
+        def release() -> None:
+            with self._registry.session_factory() as db, db.begin():
+                if lock_task_lease_no_commit(db, lease):
+                    for command_id in command_ids:
+                        release_command_admission(db, lease, command_id)
+
+        try:
+            await run_db_io_cancellation_safe(release)
+        except Exception:
+            # Stashed for retry on the next drained handle: the settled and
+            # idle releases only cover these tickets once the task is no
+            # longer RUNNING, i.e. after the successor ends.
+            self._unreleased_admissions |= command_ids
+            logger.exception(
+                "Task %s could not release admission for commands %s",
+                self.task_id,
+                command_ids,
+            )
+
+    async def execute_command(
+        self, command: Any, execute: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Serialize command application without blocking controls on a long run."""
+
+        async def apply() -> _T:
+            async with self._command_lock:
+                if self.state != CoordinatorState.ACTIVE:
+                    raise _CoordinatorClosed
+                # New executions may queue while a previous result is visible,
+                # but cannot change its run or inputs before its finalizers exit.
+                if command.kind.value in ("start", "resume_input"):
+                    await asyncio.gather(
+                        *(asyncio.shield(child) for child in tuple(self._children)),
+                        return_exceptions=True,
+                    )
+                    if self.state != CoordinatorState.ACTIVE:
+                        raise _CoordinatorClosed
+                # Control commands must not wait for admission cleanup's row lock.
+                if (
+                    command.kind.value in ("start", "resume", "resume_input", "message")
+                    and not self._children
+                    and self._execution_task is None
+                ):
+                    await run_db_io_cancellation_safe(self._release_settled_admissions)
+                if not self._healthy:
+                    from .task_command_transport import TaskCommandDeferred
+
+                    raise TaskCommandDeferred(
+                        "Task owner is awaiting a healthy renewal"
+                    )
+                token = _current_coordinator.set(self)
+                try:
+                    return await execute()
+                finally:
+                    _current_coordinator.reset(token)
+
+        handle = asyncio.create_task(apply())
+        self._command_tasks.add(handle)
+        try:
+            return await asyncio.shield(handle)
+        except asyncio.CancelledError as cancellation:
+            await cancel_and_drain_async_task(handle)
+            if caller_is_cancelling():
+                raise
+            # Command application was cancelled by something other than this
+            # caller: an owner close (heartbeat loss, shutdown drain) or a
+            # cancellation inside the command itself. The caller is still
+            # running and must not inherit that cancel.
+            raise _CoordinatorInterrupted from cancellation
+        finally:
+            self._command_tasks.discard(handle)
+            self._discard_continuation_pin(getattr(command, "id", None))
+            if self._recovery_required:
+                self._request_close()
+            else:
+                self._ensure_idle_check()
+
+    def _ensure_idle_check(self) -> None:
+        self.wake()
+        if self.state == CoordinatorState.ACTIVE and (
+            self._idle_task is None or self._idle_task.done()
+        ):
+            self._idle_task = asyncio.create_task(self._check_idle())
+
+    def _release_settled_admissions(self) -> None:
+        from .task_execution_admission import release_task_admissions
+
+        assert self.lease is not None
+        with self._registry.session_factory() as db, db.begin():
+            if lock_task_lease_no_commit(db, self.lease):
+                task = db.get(Task, self.task_id)
+                if task is not None and task.status != TaskStatus.RUNNING:
+                    release_task_admissions(db, self.lease)
+
+    def _queued_executions_held(
+        self, db: Session, cap: DispatchCapSnapshot | None
+    ) -> bool:
+        """Whether this process will not start the task's queued executions now.
+
+        ``cap`` is the snapshot of a process that starts no new execution for
+        this task as for a batch command, or None. At its dispatch cap the
+        process starts none. At its batch line it still starts interactive
+        commands, and the commands of a task run in order, so the task's
+        earliest unfinished command decides: only a pending batch command that
+        would open an execution holds the commands queued behind it. A cancel
+        or pause behind it is not an execution, so it is not excluded and
+        keeps the task busy.
+        """
+        if cap is None:
+            return False
+        if cap.closed:
+            return True
+        earliest = db.execute(
+            select(
+                TaskExecutionCommand.kind,
+                TaskExecutionCommand.status,
+                TaskExecutionCommand.dispatch_class,
+            )
+            .where(
+                TaskExecutionCommand.task_id == self.task_id,
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            .order_by(TaskExecutionCommand.id.asc())
+            .limit(1)
+        ).first()
+        return (
+            earliest is not None
+            and earliest.status == "pending"
+            and earliest.kind in EXECUTION_OPENING_KINDS
+            and earliest.dispatch_class == DISPATCH_CLASS_BATCH
+        )
+
+    def _release_if_idle(
+        self,
+        *,
+        held_by_cap: DispatchCapSnapshot | None = None,
+        sealed: bool = False,
+    ) -> str:
+        """Release the lease unless the task still has work for this owner.
+
+        ``held_by_cap`` is the snapshot of a process that will not start a new
+        execution for this task as for a batch command: at its dispatch cap, or
+        at its batch line. When ``_queued_executions_held`` says this process
+        will not start the task's queued executions now, its pending
+        execution-opening commands do not keep the lease and any process with
+        room may claim them.
+
+        ``sealed`` says this process starts no command attempt at all
+        (``release_hold.seal``), so no pending command -- a queued pause or
+        cancel included -- keeps the lease: it stays pending in the database
+        for whichever process claims it next, as at shutdown. Claimed
+        (``processing``) commands still keep it.
+
+        Neither exclusion applies to a RUNNING task, whose orphaned row keeps
+        the busy/recover handling.
+        """
+        assert self.lease is not None
+        with self._registry.session_factory() as db, db.begin():
+            if not lock_task_lease_no_commit(db, self.lease):
+                return "released"
+            task = db.get(Task, self.task_id)
+            if task is not None and task.status != TaskStatus.RUNNING:
+                from .task_execution_admission import release_task_admissions
+
+                release_task_admissions(db, self.lease)
+            unfinished = select(TaskExecutionCommand.id).where(
+                TaskExecutionCommand.task_id == self.task_id,
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            held_execution = and_(
+                TaskExecutionCommand.status == "pending",
+                TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+            )
+            resting = task is not None and task.status != TaskStatus.RUNNING
+            exclude_held = resting and self._queued_executions_held(db, held_by_cap)
+            if resting and sealed:
+                unfinished = unfinished.where(TaskExecutionCommand.status != "pending")
+            elif exclude_held:
+                unfinished = unfinished.where(~held_execution)
+            pending = db.execute(unfinished.limit(1)).first()
+            if pending is not None:
+                return "busy"
+            held = (
+                db.scalar(
+                    select(func.count())
+                    .select_from(TaskExecutionCommand)
+                    .where(TaskExecutionCommand.task_id == self.task_id, held_execution)
+                )
+                if exclude_held
+                else 0
+            )
+            task = db.get(Task, self.task_id)
+            assert task is not None
+            if task.status == TaskStatus.RUNNING:
+                # Admission may have committed before the process could register
+                # an execution. Stop renewal and preserve the token for recovery.
+                return "recover"
+            if not release_task_lease_no_commit(db, self.lease):
+                return "recover"
+        if held and held_by_cap is not None:
+            logger.info(
+                "Task %s lease released by runner %s at its dispatch cap or batch "
+                "line (limit=%s, active=%s); %s queued execution command(s) left "
+                "for a process with a free slot",
+                self.task_id,
+                self.lease.runner_id,
+                held_by_cap.limit,
+                len(held_by_cap.active_ids),
+                held,
+            )
+        return "released"
+
+    async def _check_idle(self) -> None:
+        try:
+            while self.state == CoordinatorState.ACTIVE:
+                self.wakeup.clear()
+                async with self._command_lock:
+                    if (
+                        self._healthy
+                        and not self._children
+                        and not self._command_tasks
+                        and self._execution_task is None
+                    ):
+                        # Built on the loop: the snapshot reads the execution
+                        # registry and records the cap state for gate_held_s.
+                        cap = build_dispatch_cap_snapshot()
+                        held_by_cap = (
+                            None if cap.admits(self.task_id, interactive=False) else cap
+                        )
+                        outcome = await run_db_io_cancellation_safe(
+                            functools.partial(
+                                self._release_if_idle,
+                                held_by_cap=held_by_cap,
+                                sealed=release_hold.sealed,
+                            )
+                        )
+                        if outcome != "busy":
+                            self._recovery_required = outcome == "recover"
+                            self._released = outcome == "released"
+                            self._request_close()
+                            return
+                # Handler completion precedes the transport's receipt commit.
+                # Polling that durable queue also covers a lost wakeup.
+                try:
+                    await asyncio.wait_for(self.wakeup.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+        except Exception:
+            self._recovery_required = True
+            self._request_close()
+            logger.exception("Task %s idle release failed", self.task_id)
+
+    def submit_execution(
+        self, *, admit: Admission, execute: Execution, settle: Settlement
+    ) -> asyncio.Task[None] | None:
+        """Reserve one handle before yielding, or retain the caller's defer path.
+
+        Admission and settlement run under task fences in short transactions.
+        Admission must return the context it created in that transaction (or
+        None to roll back). Settlement records the business outcome, including
+        cancellation before execution starts; it never releases ownership.
+        Await the returned handle through shield if only observing completion.
+        """
+        if (
+            self.state != CoordinatorState.ACTIVE
+            or self._registry._close_task is not None
+            or not self._healthy
+            or self._execution_task is not None
+        ):
+            return None
+        self._execution_task = asyncio.create_task(
+            self._run_execution(admit, execute, settle)
+        )
+        self._execution_task.add_done_callback(self._execution_done)
+        return self._execution_task
+
+    def _admit(self, admit: Admission) -> TaskExecutionContext | None:
+        assert self.lease is not None
+        with self._registry.session_factory() as db, db.begin():
+            if not lock_task_lease_no_commit(db, self.lease):
+                return None
+            context = admit(db, self.lease)
+            if context is None:
+                db.rollback()
+            elif context.lease != self.lease or not lock_task_execution_no_commit(
+                db, context
+            ):
+                raise ValueError("Admission returned an execution outside this lease")
+            return context
+
+    def _settle(
+        self,
+        settle: Settlement,
+        context: TaskExecutionContext,
+        error: BaseException | None,
+    ) -> None:
+        with self._registry.session_factory() as db, db.begin():
+            if lock_task_execution_no_commit(db, context):
+                settle(db, context, error)
+
+    async def _run_execution(
+        self, admit: Admission, execute: Execution, settle: Settlement
+    ) -> None:
+        worker = asyncio.create_task(asyncio.to_thread(self._admit, admit))
+        try:
+            context, cancellation = await await_task_settlement(worker)
+        except BaseException:
+            # A failed commit can have an unknown durable outcome. Stop this
+            # owner instead of leaving a RUNNING row on an idle heartbeat.
+            self._recovery_required = True
+            self._request_close()
+            raise
+        with propagate_deferred_cancellation(cancellation):
+            if context is None:
+                return
+            error: BaseException | None = cancellation
+            try:
+                if cancellation is not None:
+                    raise cancellation
+                await execute(context)
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                settlement = asyncio.create_task(
+                    asyncio.to_thread(self._settle, settle, context, error)
+                )
+                try:
+                    _, settlement_cancellation = await await_task_settlement(settlement)
+                except BaseException:
+                    self._recovery_required = True
+                    self._request_close()
+                    raise
+                # The transaction succeeded; deferred cancellation must not
+                # turn a known commit into an uncertain recovery outcome.
+                if settlement_cancellation is not None:
+                    raise settlement_cancellation
+
+    def _execution_done(self, task: asyncio.Task[None]) -> None:
+        if self._execution_task is task:
+            self._execution_task = None
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "Task %s coordinated execution failed",
+                self.task_id,
+                exc_info=task.exception(),
+            )
+        self.wake()
+
+    def _request_close(self) -> asyncio.Task[None]:
+        if self._close_task is None:
+            if self.state != CoordinatorState.LOST:
+                self.state = CoordinatorState.QUIESCING
+            self._close_task = asyncio.create_task(self._close())
+        return self._close_task
+
+    async def close(self) -> None:
+        """Stop admission immediately and drain cleanup despite repeated cancel.
+
+        Normal idle release checks the durable queue under the task lock.
+        Shutdown drains all registered work and lets another owner take queued commands.
+        """
+        await drain_async_task_cancellation_safe(self._request_close())
+
+    async def _close(self) -> None:
+        """Drain everything this owner started, then release its lease if safe.
+
+        Settlement evidence: the lease counts as released only when the idle
+        check released it (``_released``) or ``_release()`` here returned
+        True. Every other way out -- skipped release (unhealthy, recovery
+        required, LOST), a release that returned False or raised, or a close
+        cancelled before it got there -- leaves the lease to TTL recovery
+        and is recorded as unsettled. The coordinator still leaves the
+        registry either way, so coordinator counts alone prove nothing.
+        """
+        # Set only by a confirmed ``_release()`` below; ``_released`` is read
+        # where it is used, since the idle check may set it before this runs.
+        released = False
+        unsettled_reason = "close ended before the lease release"
+        try:
+            await asyncio.gather(self._startup, return_exceptions=True)
+            if self._idle_task is not None:
+                await cancel_and_drain_async_task(self._idle_task)
+            await asyncio.gather(
+                *(cancel_and_drain_async_task(t) for t in tuple(self._command_tasks)),
+                return_exceptions=True,
+            )
+            await asyncio.gather(
+                *(cancel_and_drain_async_task(t) for t in tuple(self._children)),
+                return_exceptions=True,
+            )
+            # Drained handles may still be freeing their slots; let those
+            # commits land before this owner's lease is released.
+            await asyncio.gather(
+                *(
+                    drain_async_task_cancellation_safe(t)
+                    for t in tuple(self._admission_releases)
+                ),
+                return_exceptions=True,
+            )
+            if self._execution_task is not None:
+                await cancel_and_drain_async_task(self._execution_task)
+            # Keep renewing while execution and its settlement are being drained.
+            if self._heartbeat_done is not None:
+                await self._registry._unregister_heartbeat(self)
+                await asyncio.gather(self._heartbeat_done, return_exceptions=True)
+            if self.lease is not None and not self._released:
+                if self.state == CoordinatorState.LOST:
+                    unsettled_reason = "lease lost"
+                elif self._recovery_required:
+                    unsettled_reason = "recovery required"
+                elif not self._healthy:
+                    unsettled_reason = "heartbeat unhealthy"
+                else:
+                    released = await run_db_io_cancellation_safe(self._release)
+                    unsettled_reason = "lease release not confirmed"
+        except Exception:
+            # Leave the exact token for TTL recovery if cleanup cannot commit.
+            logger.exception("Task %s coordinator cleanup failed", self.task_id)
+            unsettled_reason = "coordinator cleanup failed"
+        finally:
+            if self.lease is not None and not (self._released or released):
+                release_hold.record_unsettled(
+                    "task_lease", f"task:{self.task_id}", unsettled_reason
+                )
+            self.state = CoordinatorState.CLOSED
+            self._registry._remove(self)
+
+
+_T = TypeVar("_T")
+_current_coordinator: ContextVar[TaskCoordinator | None] = ContextVar(
+    "task_coordinator", default=None
+)
+_registry: TaskCoordinatorRegistry | None = None
+
+
+class _CoordinatorClosed(Exception):
+    """An idle owner retired before this command entered its application gate."""
+
+
+class _CoordinatorInterrupted(Exception):
+    """Command application was cancelled by something other than its caller.
+
+    Raised for an owner close (heartbeat loss, shutdown drain) or a
+    cancellation inside the command itself. It must not subclass
+    ``_CoordinatorClosed``: that one is retried, and an interrupted command
+    may already be partly applied.
+    """
+
+
+def current_task_coordinator(task_id: int) -> TaskCoordinator | None:
+    coordinator = _current_coordinator.get()
+    return (
+        coordinator
+        if coordinator is not None and coordinator.task_id == task_id
+        else None
+    )
+
+
+def get_task_coordinator_registry() -> TaskCoordinatorRegistry:
+    global _registry
+    if _registry is None or _registry.loop is not asyncio.get_running_loop():
+        _registry = TaskCoordinatorRegistry()
+    return _registry
+
+
+async def execute_coordinated_command(
+    command: Any, execute: Callable[[], Awaitable[_T]]
+) -> _T:
+    from .task_command_transport import TaskCommandDeferred
+
+    registry = get_task_coordinator_registry()
+    while True:
+        coordinator = await registry.ensure(command.task_id)
+        if coordinator is None:
+            raise TaskCommandDeferred("Waiting for the task execution owner")
+        try:
+            return await coordinator.execute_command(command, execute)
+        except _CoordinatorClosed:
+            # The transport still owns this exact claim. Re-enter through the
+            # registry after the old owner has drained, without redelivering it.
+            continue
+
+
+def live_coordinator_count() -> int:
+    """Coordinators registered on this loop, including ones still closing.
+
+    A coordinator leaves the registry only when its close has finished, so a
+    non-zero count is ownership this process still holds or is giving up.
+    Zero in combined mode, which never creates the registry.
+    """
+
+    registry = _registry
+    if registry is None or registry.loop is not asyncio.get_running_loop():
+        return 0
+    return len(registry._coordinators)
+
+
+def task_coordinators_closing() -> bool:
+    """Whether this loop's coordinators are being closed for host shutdown.
+
+    Host shutdown closes the registry before the background task manager, and
+    closing a coordinator cancels its executions, so a run cancelled that way
+    sees this, not the manager's shutdown flag. A single coordinator closing
+    on its own (idle release, lost renewal) does not count.
+    """
+
+    registry = _registry
+    return (
+        registry is not None
+        and registry._close_task is not None
+        and registry.loop is asyncio.get_running_loop()
+    )
+
+
+async def close_task_coordinators() -> None:
+    global _registry
+    if _registry is not None and _registry.loop is asyncio.get_running_loop():
+        await _registry.close()
+        _registry = None

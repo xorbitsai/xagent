@@ -1,0 +1,348 @@
+"use client"
+
+import React, { Suspense, useCallback, useEffect, useRef, useState } from "react"
+import { Loader2, PanelRight } from "lucide-react"
+import { useParams } from "next/navigation"
+import { Button } from "@/components/ui/button"
+import { AgentChatHeader } from "@/components/chat/agent-chat-header"
+import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { TaskAgentExecutionDrawer } from "@/components/task/task-agent-execution-drawer"
+import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
+import { ProgressPanel, type ProgressStepView } from "@/components/task/progress-panel"
+import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
+import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
+import { useI18n } from "@/contexts/i18n-context"
+import { cn } from "@/lib/utils"
+
+export interface SessionCheckWatch {
+  viewed: number | null // the task this view checks; null while no view is on
+  reconnects: number // the app's sameTaskReconnects as last seen
+}
+
+export const INITIAL_SESSION_CHECK_WATCH: SessionCheckWatch = { viewed: null, reconnects: 0 }
+
+// When this page asks the connector-runtime dialog to check the viewed task.
+// A view starts when the URL and the app state first agree on a task and
+// lasts while the app state stays on it, so the URL disagreeing for a moment
+// neither ends it nor starts a new one. A view is checked once when it
+// starts, and again each time the app reports that the socket reopened for
+// the task it was already connected to (sameTaskReconnects, counted in
+// onConnect). The first connect for a task is not counted there, so the page
+// coming up is not taken for a reconnect.
+export function nextSessionCheck(
+  prev: SessionCheckWatch,
+  now: { urlTaskId: number; stateTaskId: number | null; reconnects: number },
+): { next: SessionCheckWatch; check: { taskId: number; cause: SessionCheckCause } | null } {
+  if (prev.viewed !== null && now.stateTaskId === prev.viewed) {
+    if (now.reconnects === prev.reconnects) return { next: prev, check: null }
+    return { next: { ...prev, reconnects: now.reconnects }, check: { taskId: prev.viewed, cause: "reconnected" } }
+  }
+  const { stateTaskId } = now
+  if (stateTaskId === null || stateTaskId <= 0 || stateTaskId !== now.urlTaskId) {
+    return { next: { viewed: null, reconnects: now.reconnects }, check: null }
+  }
+  return { next: { viewed: stateTaskId, reconnects: now.reconnects }, check: { taskId: stateTaskId, cause: "opened" } }
+}
+
+function TaskDetailContent() {
+  const { state, setTaskId, closeFilePreview, sameTaskReconnects } = useApp()
+  const { openSessionCheck } = useConnectorRuntimeDialogActions()
+  const { t } = useI18n()
+  const params = useParams()
+  const taskIdFromUrl = params.id
+  const [progressPanelOpen, setProgressPanelOpen] = useState(false)
+  const [agentExecution, setAgentExecution] = useState<{ taskId: number; selection: AgentExecutionSummary } | null>(null)
+  const dismissedProgressRunKeyRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (taskIdFromUrl && typeof taskIdFromUrl === "string") {
+      const taskIdNum = parseInt(taskIdFromUrl, 10)
+      if (!Number.isNaN(taskIdNum) && taskIdNum !== state.taskId) {
+        setTaskId(taskIdNum)
+      }
+    }
+  }, [taskIdFromUrl, setTaskId, state.taskId])
+
+  useEffect(() => {
+    return () => {
+      closeFilePreview()
+    }
+  }, [closeFilePreview])
+
+  // Asks the connector-runtime dialog to check the viewed task (see
+  // nextSessionCheck); the dialog's provider decides whether that opens anything.
+  const urlTaskId = typeof taskIdFromUrl === "string" ? parseInt(taskIdFromUrl, 10) : NaN
+  const sessionCheckRef = useRef(INITIAL_SESSION_CHECK_WATCH)
+  useEffect(() => {
+    const { next, check } = nextSessionCheck(sessionCheckRef.current, {
+      urlTaskId, stateTaskId: state.taskId, reconnects: sameTaskReconnects,
+    })
+    sessionCheckRef.current = next
+    if (check !== null) openSessionCheck(check.taskId, check.cause)
+  }, [urlTaskId, state.taskId, sameTaskReconnects, openSessionCheck])
+
+  // progressPanelOpen/dismissedProgressRunKeyRef are mount-local state, not
+  // scoped to the viewed task - a soft A-to-B navigation (setTaskId without a
+  // remount) would otherwise carry task A's open/dismissed state straight
+  // into task B. Task A's dagExecution/steps are already cleared on a task
+  // switch (see app-context-chat.tsx's SET_TASK_ID taskChanged branch), but
+  // the moment task B's OWN history/live data repopulates a dagExecution,
+  // `progressPanelVisible` only checks `progressPanelOpen && Boolean(dagExecution)`
+  // - if it was left true from viewing A, B's panel would appear without any
+  // new user action, bypassing the auto-open effect's own gating below
+  // entirely (that effect decides whether to OPEN it, not whether it's
+  // already open). Resetting on every taskId change (including the very
+  // first one) is harmless: both start already at their default values.
+  useEffect(() => {
+    setProgressPanelOpen(false)
+    setAgentExecution(null)
+    dismissedProgressRunKeyRef.current = null
+  }, [state.taskId])
+
+  // Prefer turn_id (a stable per-turn identity - see DAGExecution's own
+  // comment) over created_at for identifying "this run" - created_at can get
+  // rebuilt with a fresh value on a replan re-arrival while still being the
+  // SAME run, which would incorrectly reopen a panel the user just dismissed
+  // and restart its elapsed timer. Falls back to created_at only when
+  // turn_id is absent (an older backend, or some other pattern that doesn't
+  // set it).
+  const progressRunKey = state.dagExecution?.turn_id ?? state.dagExecution?.created_at
+
+  const handleCollapseProgressPanel = useCallback(() => {
+    dismissedProgressRunKeyRef.current = progressRunKey !== undefined && progressRunKey !== null ? String(progressRunKey) : null
+    setProgressPanelOpen(false)
+  }, [progressRunKey])
+
+  const handleProgressStepClick = useCallback((stepId: string) => {
+    window.dispatchEvent(new CustomEvent("scrollToTraceStep", { detail: { stepId } }))
+  }, [])
+
+  // Auto-open the panel the moment this turn enters DAG/plan_execute mode -
+  // the plan's step list is known as soon as planning starts, so there is no
+  // reason to wait for the user to click the header toggle. A manual
+  // collapse only suppresses re-opening for *this* run (tracked by
+  // progressRunKey); the next DAG run gets a fresh key and opens again.
+  //
+  // Gated to LIVE runs only: history replay (reconnect, or simply opening an
+  // already-finished task's page) populates dagExecution/progressRunKey too,
+  // via the exact same state this effect watches - without these guards,
+  // just viewing a finished task's history would pop the panel open
+  // unprompted. isHistoryLoading/isReplaying skip the population that
+  // happens WHILE replay is in flight; the terminal-status check catches the
+  // case where replay has already finished (or the page was opened directly
+  // on an already-finished task) and progressRunKey is simply sitting there
+  // populated from history, no live transition ever having occurred.
+  useEffect(() => {
+    if (progressRunKey === undefined || progressRunKey === null) return
+    if (state.isHistoryLoading || state.isReplaying) return
+    if (isTerminalTaskStatus(state.currentTask?.status)) return
+    const key = String(progressRunKey)
+    if (dismissedProgressRunKeyRef.current === key) return
+    setProgressPanelOpen(true)
+  }, [progressRunKey, state.isHistoryLoading, state.isReplaying, state.currentTask?.status])
+
+  // Scrolls the chat's trace log to a step when a Progress panel row is
+  // clicked (TraceEventRenderer.tsx tags each DAG step group with
+  // `data-step-id`).
+  useEffect(() => {
+    const handleScrollToTraceStep = (event: Event) => {
+      const stepId = (event as CustomEvent<{ stepId?: string }>).detail?.stepId
+      if (!stepId) return
+      // Step ids are LLM-generated plan identifiers with no schema constraint
+      // on their content (see plan_generator.py's tool schema), so they can
+      // legitimately contain characters that aren't safe to interpolate into
+      // a CSS attribute selector (quotes, backslashes, control characters
+      // including NUL). Matching by actual attribute value instead of
+      // building a selector string sidesteps escaping entirely - there's
+      // nothing here for a pathological id to break. A replan reuses the same
+      // step ids, and a multi-turn task's history can render more than one
+      // trace group tagged with the same data-step-id - take the LAST match
+      // (the current/most recent one) rather than the first.
+      const matches = Array.from(document.querySelectorAll("[data-step-id]")).filter(
+        (el) => el.getAttribute("data-step-id") === stepId
+      )
+      matches[matches.length - 1]?.scrollIntoView({ behavior: "smooth", block: "center" })
+    }
+    window.addEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
+    return () => window.removeEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
+  }, [])
+
+  // Between `md` and `xl` the panel renders as a dismissible overlay (see the
+  // render below) rather than a static column - Escape should close it the
+  // same way clicking the backdrop does. Harmless above `xl`, where the panel
+  // is a static sibling and there's no backdrop to match: closing it there
+  // via Escape is just the same action the header toggle already offers.
+  useEffect(() => {
+    if (!progressPanelOpen) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") handleCollapseProgressPanel()
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [progressPanelOpen, handleCollapseProgressPanel])
+
+  // Deliberately keyed off the TASK's own status, not dagExecution.phase:
+  // a single step failing (dag_step_failed) sets the whole dagExecution.phase
+  // to "failed" even when the DAG goes on to replan and keep running, and the
+  // raw backend dag_execution payload never carries phase "completed"/"failed"
+  // at all (only planning/replanning/executing/completion_assessment) nor an
+  // updated_at - so freezing off dagExecution would freeze early on a
+  // recoverable step failure, or never freeze, or un-freeze on a later
+  // in-flight dag_execution event. The task's own status is the one signal
+  // that's actually authoritative for "this run is truly over."
+  const isDagFinished = isTerminalTaskStatus(state.currentTask?.status)
+  // During a mid-run replan the old plan's steps are superseded but still
+  // sitting in state.steps (a replanning event carries no replacement list,
+  // and it's the SAME run, so nothing resets them) - the graph view already
+  // hides the old plan for this phase (task-conversation-panel.tsx's
+  // isPlanning), and the panel must apply the same policy rather than keep
+  // presenting superseded rows as if they were current. An empty list
+  // renders the panel's own planning/empty state; the rows come back with
+  // the replacement plan's first executing event. completion_assessment is
+  // deliberately NOT gated the same way: at that point the just-executed
+  // plan is still the current one (assessment may well conclude
+  // "completed"), so hiding it would blank the panel after every normal
+  // execution round.
+  //
+  // Excludes an already-finished task (isDagFinished): the backend's phase
+  // never advances out of "replanning" on its own once the task ends (a
+  // task can go terminal via a path - e.g. an assistant message settling the
+  // turn - that never syncs dagExecution.phase; a dropped/malformed
+  // executing-transition event leaves it stuck too), and ProgressPanel
+  // itself renders nothing at all for zero steps once endedAt is set (no
+  // spinner, no rows - see its own runEnded comment). Hiding here would then
+  // blank the whole panel body permanently instead of showing the run's last
+  // known steps, which is strictly worse than a rare stale-superseded-plan
+  // flash mid-replan.
+  const progressSteps: ProgressStepView[] = (state.dagExecution?.phase === "replanning" && !isDagFinished)
+    ? []
+    : state.steps.map((step) => ({
+      id: step.id,
+      title: step.name,
+      description: step.description,
+      status: step.status,
+      startedAt: step.started_at,
+      completedAt: step.completed_at,
+    }))
+  const progressPanelVisible = progressPanelOpen && Boolean(state.dagExecution)
+  // dagTerminatedAt, not updatedAt: the latter is general task metadata that
+  // keeps changing after this run ends for unrelated reasons (a title edit,
+  // another field update via a later task_info refresh), which would make
+  // the frozen elapsed time silently drift on revisit. dagTerminatedAt is
+  // stamped once by UPDATE_TASK_STATUS specifically for this and preserved
+  // across those unrelated refreshes.
+  const progressEndedAt = isDagFinished ? state.currentTask?.dagTerminatedAt : undefined
+
+  return (
+    <div className="h-full flex flex-col md:flex-row bg-background">
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+        {state.currentTask?.agentId ? (
+          <AgentChatHeader
+            agentId={state.currentTask.agentId}
+            name={state.currentTask.agentName}
+            logoUrl={state.currentTask.agentLogoUrl}
+            showBack
+            rightSlot={state.dagExecution ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn("rounded-full flex-shrink-0", progressPanelOpen ? "bg-muted text-primary" : "hover:bg-muted")}
+                onClick={() => (progressPanelOpen ? handleCollapseProgressPanel() : setProgressPanelOpen(true))}
+                title={progressPanelOpen ? t("chatPage.progressPanel.collapse") : t("chatPage.progressPanel.toggleTooltip")}
+                aria-pressed={progressPanelOpen}
+              >
+                <PanelRight className="w-5 h-5" />
+              </Button>
+            ) : null}
+          />
+        ) : state.dagExecution ? (
+          <div className="flex h-[62px] shrink-0 items-center justify-end border-b border-border px-4">
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn("rounded-full flex-shrink-0", progressPanelOpen ? "bg-muted text-primary" : "hover:bg-muted")}
+              onClick={() => (progressPanelOpen ? handleCollapseProgressPanel() : setProgressPanelOpen(true))}
+              title={progressPanelOpen ? t("chatPage.progressPanel.collapse") : t("chatPage.progressPanel.toggleTooltip")}
+              aria-pressed={progressPanelOpen}
+            >
+              <PanelRight className="w-5 h-5" />
+            </Button>
+          </div>
+        ) : null}
+        <div className="flex-1 min-h-0 relative">
+          <TaskConversationPanel mode="page" voiceConversationEnabled onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
+            if (state.taskId) {
+              closeFilePreview()
+              setAgentExecution({ taskId: state.taskId, selection })
+            }
+          } : undefined} />
+          {agentExecution && agentExecution.taskId === state.taskId && (
+            <TaskAgentExecutionDrawer
+              key={`${agentExecution.taskId}:${agentExecution.selection.workerTaskId}`}
+              taskId={agentExecution.taskId}
+              selection={agentExecution.selection}
+              onClose={() => setAgentExecution(null)}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Three responsive treatments, since a fixed side column has nowhere
+          good to go at every width once TaskConversationPanel's own
+          chat/PreviewSheet split is also in play:
+          - Below `md`: no room for a side-by-side column at all, so it
+            stacks below the chat instead, capped to a fraction of the
+            viewport height (shrink-0 so that cap holds) - unchanged from
+            before.
+          - `md` to below `xl` (tablet/narrow desktop): a fixed overlay
+            sliding in from the right edge, with a dismissible backdrop -
+            this is the "overlay/collapse mode at constrained widths" the PR
+            review asked for, specifically because this is the range where
+            TaskConversationPanel's own PreviewSheet split (when a file/graph
+            preview is also open) leaves too little room for a permanent
+            side-by-side rail; an overlay draws on top instead of taking flex
+            space from that split, so the two no longer compete for width.
+          - `xl` and up: reverts to a normal static sibling column (siblings
+            the header+chat column above, not nested under it, so it visually
+            pops out from the right edge of the entire page) - there's
+            finally enough width for both panels to coexist without either
+            being squeezed. */}
+      {progressPanelVisible && (
+        <>
+          {/* z-[110]/z-[120], above every other fixed/high-z-index element on
+              this page: the header sits at z-50, TaskConversationPanel's own
+              PreviewSheet column-resize handle at z-[100] (its wide invisible
+              hit area would otherwise still capture drag clicks meant for
+              this panel), and the floating voice-input mic button at z-[70]
+              (which would otherwise float visibly on top of the dimmed
+              backdrop) - all need to render underneath this overlay, not just
+              the header. */}
+          <div
+            className="hidden md:block xl:hidden fixed inset-0 z-[110] bg-black/20"
+            onClick={handleCollapseProgressPanel}
+            aria-hidden="true"
+          />
+          <div
+            className="w-full shrink-0 h-[45vh] border-t border-border md:fixed md:inset-y-0 md:right-0 md:z-[120] md:h-full md:w-[360px] md:border-t-0 md:border-l md:shadow-2xl xl:static xl:z-auto xl:shadow-none"
+          >
+            <ProgressPanel
+              steps={progressSteps}
+              startedAt={state.dagExecution?.created_at}
+              endedAt={progressEndedAt}
+              onCollapse={handleCollapseProgressPanel}
+              onStepClick={handleProgressStepClick}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+export default function TaskDetailPage() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center h-full"><Loader2 className="w-8 h-8 animate-spin" /></div>}>
+      <TaskDetailContent />
+    </Suspense>
+  )
+}

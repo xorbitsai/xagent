@@ -1,0 +1,87 @@
+"""Streaming data types for LLM chat responses."""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List
+
+# Message-dict key under which a provider-owned, opaque round-trip payload
+# (e.g. DeepSeek's mandatory ``reasoning_content`` replay) is stashed between
+# an LLM response and the next request that carries that message back. Lives
+# here rather than in a transport module so protocol-rule modules (e.g.
+# ``basic.deepseek_tool_protocol``) can depend on it without reaching into a
+# transport implementation module.
+PROVIDER_STATE_METADATA_KEY = "_xagent_provider_state"
+
+# Response-dict key marking that ``content`` was not produced as content.
+# A reasoning model whose output budget runs out while it is still thinking
+# returns an empty ``content`` alongside a ``reasoning_content`` trace; the
+# OpenAI-compatible client surfaces that trace as ``content`` so a caller
+# does not read a truncated-but-healthy response as an empty one. That is a
+# reasonable default for, say, a connection test, and wrong for any caller
+# that treats content as an answer -- so the substitution is declared rather
+# than left to be inferred from the response's shape. Lives here, next to
+# PROVIDER_STATE_METADATA_KEY and for the same reason: consumers can honour
+# it without importing a transport module.
+CONTENT_SOURCE_KEY = "content_source"
+CONTENT_SOURCE_REASONING_FALLBACK = "reasoning_fallback"
+
+
+class ChunkType(Enum):
+    """Streaming response chunk types"""
+
+    TOKEN = "token"  # Regular token
+    TOOL_CALL = "tool_call"  # Tool call
+    USAGE = "usage"  # Token usage statistics
+    ERROR = "error"  # Error
+    PROTOCOL_ERROR = "protocol_error"  # Provider tool-protocol violation
+    END = "end"  # End
+
+
+@dataclass
+class StreamChunk:
+    """Streaming response chunk
+
+    Attributes:
+        type: Chunk type
+        content: Accumulated complete content
+        delta: Incremental content (new content added by current chunk)
+        tool_calls: Tool call list (only for TOOL_CALL type)
+        usage: Token usage statistics (only for USAGE type)
+        finish_reason: Provider finish reason, set on the chunk that ends the
+            generation (END, or the final TOKEN / TOOL_CALL chunk when the
+            provider reports it alongside the last delta)
+        raw: Original response object
+    """
+
+    type: ChunkType
+    content: str = ""
+    delta: str = ""
+    tool_calls: List[Dict] = field(default_factory=list)
+    usage: Dict[str, int] = field(default_factory=dict)
+    finish_reason: str = ""
+    raw: Any = None
+    protocol_error: Dict[str, Any] = field(default_factory=dict)
+
+    def is_token(self) -> bool:
+        """Check if this is a token type"""
+        return self.type == ChunkType.TOKEN
+
+    def is_tool_call(self) -> bool:
+        """Check if this is a tool call type"""
+        return self.type == ChunkType.TOOL_CALL
+
+    def is_usage(self) -> bool:
+        """Check if this is a usage type"""
+        return self.type == ChunkType.USAGE
+
+    def is_error(self) -> bool:
+        """Check if this is an error type"""
+        return self.type == ChunkType.ERROR
+
+    def is_protocol_error(self) -> bool:
+        """Check if this is a provider tool-protocol error."""
+        return self.type == ChunkType.PROTOCOL_ERROR
+
+    def is_end(self) -> bool:
+        """Check if this is an end type"""
+        return self.type == ChunkType.END

@@ -1,0 +1,9 @@
+name = "xagent-get"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# Serve the installer at https://get.xagent.co (the zone must be on this
+# Cloudflare account; adjust if the domain moves).
+routes = [
+  { pattern = "get.xagent.co", custom_domain = true },
+]

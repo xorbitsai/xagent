@@ -1,0 +1,2886 @@
+import React, { Suspense, startTransition } from "react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { createRoot } from "react-dom/client"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+const apiRequestMock = vi.hoisted(() => vi.fn())
+const openFilePreviewMock = vi.hoisted(() => vi.fn())
+const routerPushMock = vi.hoisted(() => vi.fn())
+const resetMentionMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
+const authUserMock = vi.hoisted(() => ({
+  current: { id: "1", is_admin: true } as { id: string; is_admin: boolean },
+}))
+
+vi.mock("@/lib/api-wrapper", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
+    "@/lib/api-wrapper"
+  )
+  return {
+    ...actual,
+    apiRequest: apiRequestMock,
+  }
+})
+
+vi.mock("@/lib/utils", () => ({
+  cn: (...classes: Array<string | false | null | undefined>) =>
+    classes.filter(Boolean).join(" "),
+  generateClientMessageId: vi.fn(),
+  getApiUrl: () => "http://api.local",
+  getUploadApiUrl: () => "http://upload.local",
+}))
+
+vi.mock("@/contexts/i18n-context", () => ({
+  useI18n: () => ({
+    t: (key: string) => key,
+  }),
+}))
+
+vi.mock("@/contexts/app-context-chat", () => ({
+  useApp: () => ({
+    openFilePreview: openFilePreviewMock,
+  }),
+}))
+
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ user: authUserMock.current, token: "test-token" }),
+}))
+
+vi.mock("@/components/config-dialog", () => ({
+  ConfigDialog: ({ trigger }: { trigger: unknown }) => trigger,
+}))
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    push: routerPushMock,
+  }),
+}))
+
+const useFileMentionCalls = vi.hoisted(() => [] as unknown[][])
+
+vi.mock("@/hooks/use-file-mention", () => ({
+  useFileMention: (...args: unknown[]) => {
+    useFileMentionCalls.push(args)
+    return {
+      checkTrigger: vi.fn(),
+      dropdownPosition: null,
+      fileList: [],
+      filteredFiles: [],
+      handleKeyDown: vi.fn(() => false),
+      insertFile: vi.fn(),
+      isLoadingFiles: false,
+      resetMention: resetMentionMock,
+      selectedFileIndex: 0,
+      showFilePicker: false,
+    }
+  },
+}))
+
+vi.mock("sonner", () => ({
+  toast: {
+    error: toastErrorMock,
+    success: vi.fn(),
+  },
+}))
+
+import { generateClientMessageId } from "@/lib/utils"
+import { ChatInput } from "./ChatInput"
+
+const emptyJsonResponse = () =>
+  new Response(JSON.stringify([]), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  })
+
+describe("ChatInput", () => {
+  it("highlights text without modifying matching file metadata attributes", () => {
+    const { container } = render(<ChatInput onSend={vi.fn()} inputValue="[A&B <Q>.txt](file:secret-id) secret-id"
+      onInputChange={vi.fn()} promptHighlightTerms={["secret-id"]} hideConfig />)
+    const editor = container.querySelector("[contenteditable]")!
+    const chip = editor.querySelector("[data-file-path]")!
+    expect(chip.getAttribute("data-file-path")).toBe("secret-id")
+    expect(chip.getAttribute("data-filename")).toBe("A&B <Q>.txt")
+    const highlight = editor.querySelector("[data-prompt-highlight]")!
+    expect(highlight.textContent).toBe("secret-id")
+    expect(chip.contains(highlight)).toBe(false)
+  })
+
+  it("keeps hostile file names and highlight terms inert in restored drafts", () => {
+    const payload = '<img src=x onerror="alert">'
+    const { container } = render(<ChatInput onSend={vi.fn()} inputValue={`[${payload}](file:id) ${payload}`}
+      onInputChange={vi.fn()} promptHighlightTerms={[payload]} hideConfig />)
+    const editor = container.querySelector("[contenteditable]")!
+    expect(editor.querySelector("img,script,iframe")).toBeNull()
+    expect(editor.querySelector("[data-file-path]")?.getAttribute("data-filename")).toBe(payload)
+    expect(editor.querySelector("[data-prompt-highlight]")?.textContent).toBe(payload)
+    for (const element of editor.querySelectorAll("*")) {
+      expect([...element.attributes].filter((attribute) => /^on/i.test(attribute.name))).toEqual([])
+    }
+  })
+
+  beforeEach(() => {
+    let generatedClientMessageId = 0
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementation(() => `client-message-${++generatedClientMessageId}`)
+    authUserMock.current = { id: "1", is_admin: true }
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
+    openFilePreviewMock.mockReset()
+    routerPushMock.mockReset()
+    resetMentionMock.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+    Reflect.deleteProperty(document, "execCommand")
+    vi.unstubAllGlobals()
+  })
+
+  it("opens voice mode beside the composer without sending or clearing its draft", async () => {
+    apiRequestMock.mockImplementation(async () => new Response(JSON.stringify([
+      { id: 1, model_id: "live", model_name: "scribe_v2_realtime", abilities: ["asr"] },
+      { id: 2, model_id: "tts", model_name: "eleven_v3", abilities: ["tts"] },
+    ].map(model => ({ category: "speech", model_provider: "elevenlabs", base_url: null, temperature: null,
+      context_window: null, dimension: null, description: null, created_at: null, updated_at: null,
+      is_active: true, is_owner: true, can_edit: true, can_delete: true, is_shared: false, ...model }))), { status: 200 }))
+    const openVoice = vi.fn()
+    const onSend = vi.fn()
+    const onInputChange = vi.fn()
+    const { container, rerender } = render(<ChatInput onSend={onSend}
+      onVoiceConversation={openVoice} inputValue="Keep my draft" onInputChange={onInputChange}
+      readOnlyConfig taskConfig={{ model: "selected-model", executionMode: "flash" }} />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    expect(openVoice).toHaveBeenCalledWith(expect.objectContaining({ model: "selected-model", executionMode: { mode: "flash" } }))
+    expect(container.querySelector("[contenteditable]")).toHaveTextContent("Keep my draft")
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onInputChange).not.toHaveBeenCalled()
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceConversationDisabled
+      readOnlyConfig taskConfig={{ model: "selected-model" }} />)
+    expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    expect(openVoice).toHaveBeenCalledOnce()
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceInputEnabled={false} />)
+    expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
+  })
+
+  it("requires a model when submitting generic chat", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="hello"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.input.noModelAlert")).toBeInTheDocument()
+    })
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("binds a new task to a selected local browser window", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/computer/local-browser/readiness") {
+        return Promise.resolve(
+          new Response(JSON.stringify({
+            ready: true,
+            connected: true,
+            attached: true,
+            application: "Google Chrome",
+            title: "GitHub",
+            windows: [
+              {
+                pid: 100,
+                window_id: 20,
+                application: "Google Chrome",
+                title: "GitHub",
+              },
+            ],
+            permissions: {},
+            issues: [],
+            message: "",
+          }), { status: 200, headers: { "Content-Type": "application/json" } })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="inspect this page"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        taskConfig={{ model: "model-1" }}
+      />
+    )
+
+    fireEvent.click(screen.getByLabelText("chatPage.input.actions.add"))
+    fireEvent.click(screen.getByText("chatPage.input.localBrowser.label"))
+    fireEvent.click(await screen.findByText("GitHub"))
+
+    expect(screen.queryByText("chatPage.input.localBrowser.chipLabel")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("Google Chrome · GitHub")).toBeInTheDocument()
+    const form = container.querySelector("form") as HTMLFormElement
+    expect(form).toHaveClass("rounded-2xl")
+    expect(form).not.toHaveClass("rounded-tl-none")
+    fireEvent.submit(form)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "inspect this page",
+        expect.objectContaining({
+          runtimeExtensions: {
+            local_browser: {
+              pid: 100,
+              window_id: 20,
+              application: "Google Chrome",
+              title: "GitHub",
+            },
+          },
+        }),
+      )
+    })
+  })
+
+  it("does not submit a stale local browser target after the feature is hidden", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/computer/local-browser/readiness") {
+        return Promise.resolve(
+          new Response(JSON.stringify({
+            ready: true,
+            application: "Google Chrome",
+            windows: [{
+              pid: 100,
+              window_id: 20,
+              application: "Google Chrome",
+              title: "GitHub",
+            }],
+            issues: [],
+            message: "",
+          }), { status: 200, headers: { "Content-Type": "application/json" } }),
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "inspect this page",
+      onInputChange: vi.fn(),
+      onSend,
+      taskConfig: { model: "model-1" },
+    }
+    const { container, rerender } = render(<ChatInput {...commonProps} />)
+
+    fireEvent.click(screen.getByLabelText("chatPage.input.actions.add"))
+    fireEvent.click(screen.getByText("chatPage.input.localBrowser.label"))
+    fireEvent.click(await screen.findByText("GitHub"))
+    expect(screen.getByLabelText("Google Chrome · GitHub")).toBeInTheDocument()
+
+    rerender(<ChatInput {...commonProps} readOnlyConfig />)
+    expect(screen.queryByLabelText("Google Chrome · GitHub")).not.toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][1]).not.toHaveProperty("runtimeExtensions")
+  })
+
+  it("clears a selected target that disappears from refreshed readiness", async () => {
+    let readinessCalls = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/computer/local-browser/readiness") {
+        readinessCalls += 1
+        return Promise.resolve(
+          new Response(JSON.stringify({
+            ready: true,
+            application: "Google Chrome",
+            windows: readinessCalls === 1 ? [{
+              pid: 100,
+              window_id: 20,
+              application: "Google Chrome",
+              title: "GitHub",
+            }] : [{
+              pid: 100,
+              window_id: 21,
+              application: "Google Chrome",
+              title: "Xagent",
+            }],
+            issues: [],
+            message: "",
+          }), { status: 200, headers: { "Content-Type": "application/json" } }),
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue="inspect this page"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskConfig={{ model: "model-1" }}
+      />,
+    )
+
+    fireEvent.click(screen.getByLabelText("chatPage.input.actions.add"))
+    fireEvent.click(screen.getByText("chatPage.input.localBrowser.label"))
+    fireEvent.click(await screen.findByText("GitHub"))
+    expect(screen.getByLabelText("Google Chrome · GitHub")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText("chatPage.input.actions.add"))
+    fireEvent.click(
+      screen.getAllByText("chatPage.input.localBrowser.label").at(-1) as HTMLElement,
+    )
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Google Chrome · GitHub")).not.toBeInTheDocument()
+    })
+  })
+
+  it("disambiguates browser windows with the same application and title", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/computer/local-browser/readiness") {
+        return Promise.resolve(
+          new Response(JSON.stringify({
+            ready: true,
+            application: "Google Chrome",
+            windows: [
+              {
+                pid: 100,
+                window_id: 20,
+                application: "Google Chrome",
+                title: "GitHub",
+              },
+              {
+                pid: 100,
+                window_id: 21,
+                application: "Google Chrome",
+                title: "GitHub",
+              },
+            ],
+            issues: [],
+            message: "",
+          }), { status: 200, headers: { "Content-Type": "application/json" } }),
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue="inspect"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskConfig={{ model: "model-1" }}
+      />,
+    )
+
+    fireEvent.click(screen.getByLabelText("chatPage.input.actions.add"))
+    fireEvent.click(screen.getByText("chatPage.input.localBrowser.label"))
+
+    expect(await screen.findAllByText("GitHub")).toHaveLength(2)
+    expect(
+      screen.getAllByText("chatPage.input.localBrowser.windowIdentifier"),
+    ).toHaveLength(2)
+  })
+
+  it("does not advertise local browser to a non-admin", () => {
+    authUserMock.current = { id: "2", is_admin: false }
+
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue="hello"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskConfig={{ model: "model-1" }}
+      />
+    )
+
+    expect(screen.queryByLabelText("chatPage.input.actions.add")).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      "http://api.local/api/computer/local-browser/readiness",
+      expect.anything(),
+    )
+  })
+
+  it("aborts an in-flight readiness request when the picker unmounts", async () => {
+    let readinessSignal: AbortSignal | undefined
+    apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === "http://api.local/api/computer/local-browser/readiness") {
+        readinessSignal = init?.signal ?? undefined
+        return new Promise<Response>(() => {})
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+    const { unmount } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="inspect"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskConfig={{ model: "model-1" }}
+      />
+    )
+
+    fireEvent.click(screen.getByLabelText("chatPage.input.actions.add"))
+    fireEvent.click(screen.getByText("chatPage.input.localBrowser.label"))
+    await waitFor(() => expect(readinessSignal).toBeDefined())
+
+    unmount()
+
+    expect(readinessSignal?.aborted).toBe(true)
+  })
+
+  it("suppresses preseeded files and restored file previews when files are disabled", () => {
+    const onSend = vi.fn()
+    const onFilesChange = vi.fn()
+    const uploadFile = vi.fn()
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn(),
+    })
+    const { container } = render(
+      <ChatInput
+        files={[file]}
+        filesDisabled
+        hideConfig
+        inputValue="[secret.txt](file:file-secret)"
+        onFilesChange={onFilesChange}
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        uploadFile={uploadFile}
+      />
+    )
+
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    expect(container.querySelector(".file-chip-preview")).toBeNull()
+    const editor = screen.getByRole("textbox")
+    expect(editor).toHaveTextContent("secret.txt")
+    expect(editor).not.toHaveTextContent("file-secret")
+    expect(editor.innerHTML).not.toContain("file-secret")
+
+    editor.innerHTML = '<span class="file-chip-preview" data-file-path="file-secret">secret</span>'
+    fireEvent.click(editor.querySelector(".file-chip-preview") as HTMLElement)
+
+    fireEvent.drop(container.querySelector("form") as HTMLFormElement, {
+      dataTransfer: { types: ["Files"] },
+    })
+    fireEvent.paste(editor, {
+      clipboardData: {
+        items: [{
+          kind: "file",
+          type: "text/plain",
+          getAsFile: () => file,
+        }],
+        getData: () => "",
+      },
+    })
+
+    expect(openFilePreviewMock).not.toHaveBeenCalled()
+    expect(onFilesChange).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/files/"),
+      )
+    ).toBe(false)
+  })
+
+  it("keeps restored file preview semantics when only upload UI is hidden", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="[report.txt](file:file-report)"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        readOnlyConfig
+      />
+    )
+
+    const chip = container.querySelector(".file-chip-preview")
+    expect(chip).not.toBeNull()
+    fireEvent.click(chip as HTMLElement)
+    expect(openFilePreviewMock).toHaveBeenCalledWith(
+      "file-report",
+      "file-report",
+      [{ fileName: "file-report", fileId: "file-report" }],
+    )
+  })
+
+  it("classifies a coded unsuccessful 2xx upload response", async () => {
+    apiRequestMock.mockImplementation((url: string) => Promise.resolve(
+      url === "http://upload.local/api/files/upload"
+        ? new Response(JSON.stringify({
+            success: false,
+            error_code: "upload_too_large",
+            detail: "private storage detail",
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        : emptyJsonResponse(),
+    ))
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={files}
+          hideConfig
+          inputValue=""
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    fireEvent.change(container.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["data"], "data.txt")] },
+    })
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.uploadTooLarge",
+        { duration: 8000 },
+      )
+    })
+    expect(screen.queryByText("data.txt")).not.toBeInTheDocument()
+  })
+
+  it("rejects duplicate custom upload identifiers before mutating files", async () => {
+    const uploadFile = vi.fn().mockResolvedValue({ file_id: "duplicate-id" })
+    const files = [
+      new File(["first"], "first.txt"),
+      new File(["second"], "second.txt"),
+    ]
+
+    function Harness() {
+      const [selectedFiles, setSelectedFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={selectedFiles}
+          hideConfig
+          inputValue=""
+          onFilesChange={setSelectedFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    fireEvent.change(container.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files },
+    })
+
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(2))
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.uploadFailed",
+        { duration: 8000 },
+      )
+    })
+    expect(files.every(file => !("file_id" in file))).toBe(true)
+  })
+
+  it("restores a draft file chip without displaying its canonical id and preserves that id on send", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="[report.txt](file:canonical-file-id)"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    expect(screen.getByText("report.txt")).toBeInTheDocument()
+    expect(screen.queryByText("canonical-file-id")).not.toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "[report.txt](file:canonical-file-id)",
+        expect.any(Object),
+      )
+    })
+  })
+
+  it("keeps a controlled first-message draft after an async send rejection", async () => {
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("delivery failed"))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="retry this"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />,
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalled())
+    expect(onInputChange).not.toHaveBeenCalledWith("")
+  })
+
+  it("allows selected agent submissions without a local model", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="hello"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        selectedAgents={[{ id: 42, name: "Shared Agent" }]}
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ model: "" })
+      )
+    })
+    expect(resetMentionMock).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
+    // selectedAgents no longer renders a "Using @name" chip (that
+    // mechanism was removed as unreachable dead code) - only drives the
+    // no-model guard above. A regression reintroducing it would leave
+    // this test green without an explicit check.
+    expect(screen.queryByText("@Shared Agent")).not.toBeInTheDocument()
+  })
+
+  it("clears the read-only model display instead of showing a stale lead's model while a new one's config is still loading", () => {
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      readOnlyConfig: true,
+    }
+    const { rerender } = render(<ChatInput {...commonProps} taskConfig={{ model: "agent-a-model" }} />)
+
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout).
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+  })
+
+  it("submits the live taskConfig model, not a stale value inherited by the internal mirror", async () => {
+    // The internal `agentConfig` mirror inherits the previous model when a
+    // new taskConfig doesn't specify one (`taskConfig.model || prev.model`
+    // in the syncing effect) - correct for genuine partial updates to the
+    // SAME lead, but submission (and the read-only model badge, which reads
+    // the same live-`taskConfig` value) must still prefer the live prop over
+    // that mirror once a config is meant to be authoritative (readOnlyConfig),
+    // so a real timing gap between a lead switch and its own effect catching
+    // up can't submit - or display - an unrelated previous lead's model.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // New lead's taskConfig arrives without its own model yet (e.g. only
+    // executionMode resolved so far) - the internal mirror would inherit the
+    // previous lead's model rather than clearing it, but the live-read badge
+    // must not show that stale value either.
+    rerender(<ChatInput {...commonProps} taskConfig={{ executionMode: "flash" }} />)
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ model: "" })
+      )
+    })
+  })
+
+  it("submits the live taskConfig executionMode, not a stale value inherited by the internal mirror", async () => {
+    // Same root cause as the model test above, but for executionMode: the
+    // internal `agentConfig` mirror only clears its stale executionMode
+    // asynchronously (a separate effect, once taskConfig goes away), and
+    // the submit path used to spread that live-computed value only when
+    // truthy - so a falsy live value (taskConfig gone entirely, e.g. the
+    // new lead's own config fetch is still in flight) silently fell
+    // through to whatever executionMode the mirror still held from the
+    // PREVIOUS lead, instead of clearing it the same way `model` does.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout), same as the page-level race this whole family of
+    // fixes targets.
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ executionMode: undefined })
+      )
+    })
+  })
+
+  it("does not show pause for uppercase terminal task status", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="next request"
+        isLoading
+        onInputChange={vi.fn()}
+        onPause={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="FAILED"
+      />
+    )
+
+    expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+  })
+
+  it("renders voice input as an inline toolbar action when ASR is configured", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(await screen.findByLabelText("voiceInput.start")).toBeInTheDocument()
+  })
+
+  it("does not load or render voice controls when voice input is disabled", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+
+    await Promise.resolve()
+
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
+  })
+
+  it("stops active recording without transcribing when voice input is disabled", async () => {
+    const trackStop = vi.fn()
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: trackStop }],
+    })
+    const recorders: Array<{
+      state: "inactive" | "recording"
+      stop: ReturnType<typeof vi.fn>
+    }> = []
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+      ondataavailable: ((event: { data: Blob }) => void) | null = null
+      onstop: (() => void) | null = null
+      onerror: (() => void) | null = null
+      stop = vi.fn(() => {
+        this.state = "inactive"
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: this.mimeType }) })
+        this.onstop?.()
+      })
+
+      constructor() {
+        recorders.push(this)
+      }
+
+      start() {
+        this.state = "recording"
+      }
+    }
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+    expect(recorders).toHaveLength(1)
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+
+    await waitFor(() => expect(recorders[0].stop).toHaveBeenCalledTimes(1))
+    expect(trackStop).toHaveBeenCalledTimes(1)
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/models/speech/transcribe"),
+      ),
+    ).toBe(false)
+  })
+
+  it("does not invalidate a committed recorder for an abandoned disabled render", async () => {
+    const trackStop = vi.fn()
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: trackStop }],
+    })
+    const recorders: Array<{
+      state: "inactive" | "recording"
+      stop: ReturnType<typeof vi.fn>
+    }> = []
+    let suspendedRenderStarted = false
+    const neverResolves = new Promise<never>(() => undefined)
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+      ondataavailable: ((event: { data: Blob }) => void) | null = null
+      onstop: (() => void) | null = null
+      onerror: (() => void) | null = null
+      stop = vi.fn(() => {
+        this.state = "inactive"
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: this.mimeType }) })
+        this.onstop?.()
+      })
+
+      constructor() {
+        recorders.push(this)
+      }
+
+      start() {
+        this.state = "recording"
+      }
+    }
+
+    const NeverSettles = () => {
+      suspendedRenderStarted = true
+      throw neverResolves
+    }
+    const VoiceInputHarness = ({
+      enabled,
+      suspend,
+    }: {
+      enabled: boolean
+      suspend: boolean
+    }) => (
+      <Suspense fallback={null}>
+        <ChatInput
+          hideConfig
+          hideFileUpload
+          inputValue=""
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          voiceInputEnabled={enabled}
+        />
+        {suspend && <NeverSettles />}
+      </Suspense>
+    )
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const container = document.createElement("div")
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    try {
+      await act(async () => {
+        root.render(<VoiceInputHarness enabled suspend={false} />)
+      })
+
+      fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+      await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+      expect(recorders).toHaveLength(1)
+
+      await act(async () => {
+        startTransition(() => {
+          root.render(<VoiceInputHarness enabled={false} suspend />)
+        })
+        await Promise.resolve()
+      })
+      expect(suspendedRenderStarted).toBe(true)
+
+      await act(async () => {
+        root.render(<VoiceInputHarness enabled suspend={false} />)
+      })
+
+      expect(
+        apiRequestMock.mock.calls.some(
+          ([url]) => typeof url === "string" && url.includes("/api/models/speech/transcribe"),
+        ),
+      ).toBe(false)
+      fireEvent.click(screen.getByLabelText("voiceInput.stop"))
+
+      await waitFor(() => expect(trackStop).toHaveBeenCalledTimes(1))
+    } finally {
+      await act(async () => {
+        root.unmount()
+      })
+      container.remove()
+    }
+  })
+
+  it("stops a stale media stream when voice capability is restored before getUserMedia resolves", async () => {
+    let resolveStream!: (stream: typeof staleStream) => void
+    const staleTrackStop = vi.fn()
+    const staleStream = {
+      getTracks: () => [{ stop: staleTrackStop }],
+    }
+    const getUserMedia = vi.fn(() => new Promise<typeof staleStream>((resolve) => {
+      resolveStream = resolve
+    }))
+    const recorders: unknown[] = []
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+
+      constructor() {
+        recorders.push(this)
+      }
+
+      start() {
+        this.state = "recording"
+      }
+
+      stop() {
+        this.state = "inactive"
+      }
+    }
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    resolveStream(staleStream)
+
+    await waitFor(() => expect(staleTrackStop).toHaveBeenCalledTimes(1))
+    expect(recorders).toHaveLength(0)
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/models/speech/transcribe"),
+      ),
+    ).toBe(false)
+  })
+
+  it("does not apply a stale transcription after voice capability is restored", async () => {
+    let resolveTranscription!: (response: Response) => void
+    const transcription = new Promise<Response>((resolve) => {
+      resolveTranscription = resolve
+    })
+    const getUserMedia = vi.fn().mockResolvedValue({
+      getTracks: () => [{ stop: vi.fn() }],
+    })
+    const onInputChange = vi.fn()
+
+    class FakeMediaRecorder {
+      static isTypeSupported = vi.fn(() => true)
+      mimeType = "audio/webm"
+      state: "inactive" | "recording" = "inactive"
+      ondataavailable: ((event: { data: Blob }) => void) | null = null
+      onstop: (() => void) | null = null
+      onerror: (() => void) | null = null
+
+      start() {
+        this.state = "recording"
+      }
+
+      stop() {
+        this.state = "inactive"
+        this.ondataavailable?.({ data: new Blob(["audio"], { type: this.mimeType }) })
+        this.onstop?.()
+      }
+    }
+
+    vi.stubGlobal("MediaRecorder", FakeMediaRecorder)
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      mediaDevices: { getUserMedia },
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ abilities: ["asr"] }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      if (url === "http://upload.local/api/models/speech/transcribe") {
+        return transcription
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+    const editor = screen.getByRole("textbox")
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn((_command: string, _showUi: boolean, value: string) => {
+        editor.appendChild(document.createTextNode(value))
+        return true
+      }),
+    })
+
+    fireEvent.click(await screen.findByLabelText("voiceInput.start"))
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledWith({ audio: true }))
+    fireEvent.click(screen.getByLabelText("voiceInput.stop"))
+    await waitFor(() => {
+      expect(
+        apiRequestMock.mock.calls.some(
+          ([url]) => url === "http://upload.local/api/models/speech/transcribe",
+        ),
+      ).toBe(true)
+    })
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    resolveTranscription(
+      new Response(JSON.stringify({ text: "stale transcription" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(editor).not.toHaveTextContent("stale transcription")
+    expect(onInputChange).not.toHaveBeenCalledWith("stale transcription")
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("does not restore stale ASR availability after voice input is disabled", async () => {
+    let resolveInitialModels!: (models: Array<{ abilities: string[] }>) => void
+    const initialModels = new Promise<Array<{ abilities: string[] }>>((resolve) => {
+      resolveInitialModels = resolve
+    })
+    let availabilityRequests = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url !== "http://api.local/api/models/?category=speech&limit=1000") {
+        return Promise.resolve(emptyJsonResponse())
+      }
+      availabilityRequests += 1
+      return availabilityRequests === 1
+        ? { ok: true, json: () => initialModels }
+        : new Promise<Response>(() => undefined)
+    })
+
+    const { rerender } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+    await waitFor(() => expect(availabilityRequests).toBe(1))
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled={false}
+      />
+    )
+    resolveInitialModels([{ abilities: ["asr"] }])
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+    rerender(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        voiceInputEnabled
+      />
+    )
+
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
+  })
+
+  it("allows live guidance while a task is running", async () => {
+    const onSend = vi.fn()
+    const onPause = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="please focus on the API contract"
+        isLoading
+        onInputChange={vi.fn()}
+        onPause={onPause}
+        onSend={onSend}
+        taskStatus="running"
+      />
+    )
+
+    expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "please focus on the API contract",
+        expect.objectContaining({ model: "" })
+      )
+    })
+  })
+
+  it.each([false, true])("keeps a rejected draft without duplicating a handled notification (%s)", async notificationHandled => {
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(Object.assign(new Error("Message was rejected"), { notificationHandled }))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    await waitFor(() => {
+      expect(onInputChange).not.toHaveBeenCalledWith("")
+    })
+    expect(onSend.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ clientMessageId: expect.any(String) })
+    )
+    expect(toastErrorMock).toHaveBeenCalledTimes(notificationHandled ? 0 : 1)
+  })
+
+  it.each([
+    [false, false, 1],
+    [false, true, 1],
+    [true, false, 1],
+    [true, true, 0],
+  ])("notifies a late failure unless the input is gone and the connection was lost (unmounted: %s, connectionLost: %s)", async (unmounted, connectionLost, toasts) => {
+    let fail!: (error: Error) => void
+    const onSend = vi.fn(() => new Promise<void>((_resolve, reject) => { fail = reject }))
+    const { container, unmount } = render(
+      <ChatInput hideConfig hideFileUpload inputValue="late failure" onInputChange={vi.fn()} onSend={onSend} readOnlyConfig />
+    )
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    if (unmounted) unmount()
+
+    await act(async () => { fail(Object.assign(new Error("late failure"), { connectionLost })) })
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(toasts)
+  })
+
+  it.each([
+    ["clears the sent draft", "sent draft", true],
+    ["keeps a draft typed while the send was pending", "typed meanwhile", false],
+  ])("%s once the send succeeds", async (_name, draftAtSuccess, cleared) => {
+    let succeed!: () => void
+    const onSend = vi.fn(() => new Promise<void>(resolve => { succeed = resolve }))
+    const onInputChange = vi.fn()
+    const input = (value: string) => (
+      <ChatInput hideConfig hideFileUpload inputValue={value} onInputChange={onInputChange} onSend={onSend} readOnlyConfig />
+    )
+    const { container, rerender } = render(input("sent draft"))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    rerender(input(draftAtSuccess))
+
+    await act(async () => { succeed() })
+
+    expect(onInputChange.mock.calls.some(([value]) => value === "")).toBe(cleared)
+  })
+
+  it.each([
+    ["clears the sent draft", "sent draft", ""],
+    ["keeps a draft typed while the send was pending", "typed meanwhile", "typed meanwhile"],
+  ])("%s once the send succeeds on an uncontrolled input", async (_name, draftAtSuccess, expected) => {
+    let succeed!: () => void
+    const onSend = vi.fn(() => new Promise<void>(resolve => { succeed = resolve }))
+    const { container } = render(<ChatInput hideConfig hideFileUpload onSend={onSend} readOnlyConfig />)
+    const editor = container.querySelector("[contenteditable]") as HTMLDivElement
+    const type = (text: string) => { editor.textContent = text; fireEvent.input(editor) }
+    type("sent draft")
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    type(draftAtSuccess)
+
+    await act(async () => { succeed() })
+
+    expect(editor.textContent).toBe(expected)
+  })
+
+  it("localizes coded send failures without displaying their raw message", async () => {
+    const onSend = vi.fn().mockRejectedValue(Object.assign(
+      new Error("provider token=secret"),
+      {
+        errorCode: "task_checkpoint_unreadable",
+        userFacing: true,
+      },
+    ))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="send safely"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.taskCheckpointUnreadable",
+        { duration: 8000 },
+      )
+    })
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("token=secret"),
+    )
+  })
+
+  it("sends a free-text draft with the interaction request active when the draft begins", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        currentInteractionRequestId="inputreq_r1"
+        hideConfig
+        hideFileUpload
+        inputValue="Answer R1"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        taskConfig={{
+          model: "model-1",
+          metadata: { source: "existing" },
+        }}
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1]).toEqual(expect.objectContaining({
+      metadata: {
+        source: "existing",
+        request_id: "inputreq_r1",
+      },
+    }))
+  })
+
+  it("keeps a draft bound to its original request when the active request rotates", async () => {
+    const onSend = vi.fn()
+    const props = {
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "Answer begun for R1",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...props} currentInteractionRequestId="inputreq_r1" />
+    )
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("binds the next draft to the request active after a successful clear", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const commonProps = {
+      hideConfig: true,
+      hideFileUpload: true,
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r1"
+        inputValue="Answer R1"
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue=""
+      />
+    )
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue="Answer R2"
+      />
+    )
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][1].metadata).toEqual({
+      request_id: "inputreq_r2",
+    })
+  })
+
+  it("keeps a draft id-less when it began before request identities were available", async () => {
+    const onSend = vi.fn()
+    const props = {
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "Legacy answer",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(<ChatInput {...props} />)
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1]).not.toHaveProperty("metadata.request_id")
+  })
+
+  it("starts a new delivery identity after an abandoned failed draft is retyped", async () => {
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementationOnce(() => "abandoned-r1-delivery")
+      .mockImplementationOnce(() => "fresh-r2-delivery")
+      .mockReturnValue("later-delivery")
+    const onSend = vi.fn().mockRejectedValue(new Error("Delivery outcome unknown"))
+    const commonProps = {
+      hideConfig: true,
+      hideFileUpload: true,
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r1"
+        inputValue="Same answer"
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][1]).toEqual(expect.objectContaining({
+      clientMessageId: "abandoned-r1-delivery",
+      metadata: { request_id: "inputreq_r1" },
+    }))
+
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue=""
+      />
+    )
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue="Same answer"
+      />
+    )
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][1]).toEqual(expect.objectContaining({
+      clientMessageId: "fresh-r2-delivery",
+      metadata: { request_id: "inputreq_r2" },
+    }))
+  })
+
+  it("binds a file-only draft before a later request rotation", async () => {
+    const onSend = vi.fn()
+    const file = new File(["answer"], "answer.txt", { type: "text/plain" })
+    const props = {
+      files: [file],
+      hideConfig: true,
+      inputValue: "",
+      onFilesChange: vi.fn(),
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...props} currentInteractionRequestId="inputreq_r1" />
+    )
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("reuses the same clientMessageId when retrying unchanged content after an outcome-unknown failure", async () => {
+    // Server-side dedup safety net: a failure that doesn't carry
+    // `retryWithNewId` means the send's outcome is unknown (it may have
+    // actually landed), so a retry with byte-identical content must reuse
+    // the same id instead of minting a new one - otherwise the server can't
+    // tell the retry apart from a genuine second message.
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const { container } = render(
+      <ChatInput
+        currentInteractionRequestId="inputreq_r1"
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+
+    // isSubmittingRef only releases 500ms after a submit settles.
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).toBe(firstId)
+    expect(onSend.mock.calls[1][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("generates a new clientMessageId when retrying after a retryWithNewId failure", async () => {
+    // The opposite case: a failure the caller marks `retryWithNewId` means
+    // the send is confirmed to have never landed, so a retry - even with
+    // identical content - should get its own fresh id rather than being
+    // conflated with the failed attempt.
+    // Keep this scenario's two delivery identities explicit.
+    vi.mocked(generateClientMessageId)
+      .mockImplementationOnce(() => "retry-with-new-id-1")
+      .mockImplementationOnce(() => "retry-with-new-id-2")
+    const onInputChange = vi.fn()
+    const retryableError = Object.assign(new Error("Message was rejected"), {
+      retryWithNewId: true,
+    })
+    const onSend = vi.fn().mockRejectedValue(retryableError)
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).not.toBe(firstId)
+  })
+
+  const mockDefaultModel = () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=llm") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ model_id: "model-1", is_default: true }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+  }
+
+  const executionModeLabel = (mode: string) =>
+    `builds.configForm.executionMode.${mode}.title`
+  const UNSET_MODE_LABEL = "builds.configForm.executionMode.unset"
+
+  it("sends the picked execution mode for a new standalone task", async () => {
+    mockDefaultModel()
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="plan a trip"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    const trigger = await screen.findByText(UNSET_MODE_LABEL)
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByText(executionModeLabel("think")))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "plan a trip",
+        expect.objectContaining({ executionMode: { mode: "think" } })
+      )
+    })
+  })
+
+  it("sends an explicitly picked auto mode", async () => {
+    mockDefaultModel()
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="plan a trip"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    fireEvent.click(await screen.findByText(UNSET_MODE_LABEL))
+    fireEvent.click(screen.getByText(executionModeLabel("auto")))
+    expect(screen.getByText(executionModeLabel("auto"))).toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "plan a trip",
+        expect.objectContaining({ executionMode: { mode: "auto" } })
+      )
+    })
+  })
+
+  it("omits the execution mode when the picker was never touched", async () => {
+    mockDefaultModel()
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="plan a trip"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    await screen.findByText(UNSET_MODE_LABEL)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].executionMode).toBeUndefined()
+  })
+
+  it("hides the execution mode picker for a read-only (agent-resolved) task", async () => {
+    mockDefaultModel()
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue="summarize this doc"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        readOnlyConfig
+      />
+    )
+
+    expect(screen.queryByText(UNSET_MODE_LABEL)).not.toBeInTheDocument()
+  })
+
+  it("drops a pick made before the picker was hidden", async () => {
+    mockDefaultModel()
+    const onSend = vi.fn()
+    const props = {
+      hideFileUpload: true,
+      inputValue: "plan a trip",
+      onInputChange: vi.fn(),
+      onSend,
+    }
+    const { container, rerender } = render(<ChatInput {...props} />)
+
+    fireEvent.click(await screen.findByText(UNSET_MODE_LABEL))
+    fireEvent.click(screen.getByText(executionModeLabel("think")))
+    expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
+
+    rerender(<ChatInput {...props} readOnlyConfig />)
+    rerender(<ChatInput {...props} />)
+
+    expect(screen.getByText(UNSET_MODE_LABEL)).toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].executionMode).toBeUndefined()
+  })
+
+  it("closes the execution mode menu after a send", async () => {
+    mockDefaultModel()
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="plan a trip"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    fireEvent.click(await screen.findByText(UNSET_MODE_LABEL))
+    expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    await waitFor(() => {
+      expect(screen.queryByText(executionModeLabel("think"))).not.toBeInTheDocument()
+    })
+  })
+
+  it("hides the execution mode picker when the composer config is read-only", async () => {
+    mockDefaultModel()
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue="hello"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        readOnlyConfig
+      />
+    )
+
+    expect(screen.queryByText(UNSET_MODE_LABEL)).not.toBeInTheDocument()
+  })
+
+  it("hides the execution mode picker when composer config is hidden", async () => {
+    mockDefaultModel()
+    render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="hello"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.queryByText(UNSET_MODE_LABEL)).not.toBeInTheDocument()
+  })
+
+  it("hides the execution mode picker for an existing task and keeps its mode", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="continue"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        taskConfig={{ model: "model-1", executionMode: "flash" }}
+      />
+    )
+
+    expect(
+      screen.queryByText("builds.configForm.executionMode.auto.title")
+    ).not.toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "continue",
+        expect.objectContaining({ executionMode: { mode: "flash" } })
+      )
+    })
+  })
+
+  it("keeps generic loading input disabled without a live task status", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="wait"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(container.querySelector('button[type="submit"]')).toBeDisabled()
+  })
+
+  it("shows pause for a running task when there is no draft to send", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onPause={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+
+    expect(screen.getByTitle("agent.input.actions.pauseTask")).toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).toBeDisabled()
+  })
+
+  it("keeps pause hidden while running draft files are still uploading", async () => {
+    const onPause = vi.fn()
+    const uploadFile = vi.fn(() => new Promise<{ file_id: string }>(() => {}))
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+
+      return (
+        <ChatInput
+          hideConfig
+          inputValue=""
+          files={files}
+          isLoading
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onPause={onPause}
+          onSend={vi.fn()}
+          taskStatus="running"
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(["draft"], "draft.txt", { type: "text/plain" })
+
+    fireEvent.change(fileInput, { target: { files: [file] } })
+
+    await waitFor(() => {
+      expect(uploadFile).toHaveBeenCalledWith(
+        file,
+        expect.objectContaining({ taskType: "task" })
+      )
+    })
+    await waitFor(() => {
+      expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
+    })
+    expect(container.querySelector('button[type="submit"]')).toBeDisabled()
+  })
+
+  it("keeps the stop square focusable but inert while a stop is in flight", () => {
+    const onStop = vi.fn()
+    const stopProps = {
+      compact: true,
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "",
+      isLoading: true,
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      onStop,
+      taskStatus: "running",
+    }
+    const { rerender, unmount } = render(<ChatInput {...stopProps} stopState="idle" />)
+    const button = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(button).not.toHaveAttribute("aria-disabled")
+
+    rerender(<ChatInput {...stopProps} stopState="stopping" />)
+    const pending = screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    expect(pending).toBe(button)
+    expect(pending).not.toBeDisabled()
+    expect(pending).toHaveAttribute("aria-disabled", "true")
+    // classList, not a substring match: Button's base classes already contain
+    // "disabled:pointer-events-none", which a substring check would find.
+    expect(pending.classList.contains("pointer-events-none")).toBe(true)
+    expect(pending.classList.contains("opacity-50")).toBe(true)
+
+    // jsdom refuses focus() on a natively disabled button, so this fails if
+    // the stop square goes back to `disabled`.
+    pending.blur()
+    pending.focus()
+    expect(document.activeElement).toBe(pending)
+
+    fireEvent.click(pending)
+    expect(onStop).not.toHaveBeenCalled()
+    unmount()
+
+    const secondRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    const stopButton = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(stopButton).not.toBeDisabled()
+    expect(stopButton).toHaveAttribute("type", "button")
+    const hint = screen.getByText("widgetSession.stopTimedOut")
+    expect(hint).toBeInTheDocument()
+    expect(stopButton).toHaveAttribute("aria-describedby", hint.id)
+    expect(screen.getByRole("textbox")).not.toHaveAttribute("aria-describedby")
+    fireEvent.click(stopButton)
+    expect(onStop).toHaveBeenCalledTimes(1)
+    secondRender.unmount()
+
+    const thirdRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="not_sent"
+        taskStatus="running"
+      />
+    )
+    // A refusal and a timeout are different outcomes, so they get different
+    // sentences; the timed-out copy must not leak through for a refusal.
+    expect(screen.getByText("widgetSession.stopNotSent")).toBeInTheDocument()
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeDisabled()
+    thirdRender.unmount()
+
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="draft"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+  })
+
+  it("keeps the stop hint region mounted and changes only its text", () => {
+    const commonProps = {
+      compact: true,
+      hideConfig: true,
+      hideFileUpload: true,
+      isLoading: true,
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      onStop: vi.fn(),
+      taskStatus: "running",
+    }
+    const { rerender, unmount } = render(
+      <ChatInput {...commonProps} inputValue="" stopState="stopping" />
+    )
+    const region = screen.getByRole("status")
+    expect(region.textContent).toBe("")
+    expect(region.className).not.toContain("mb-3")
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toHaveAttribute("aria-describedby")
+
+    rerender(<ChatInput {...commonProps} inputValue="" stopState="timed_out" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("widgetSession.stopTimedOut")
+    expect(region.className).toContain("mb-3")
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).toHaveAttribute("aria-describedby", region.id)
+
+    rerender(<ChatInput {...commonProps} inputValue="draft" stopState="timed_out" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("")
+
+    rerender(<ChatInput {...commonProps} inputValue="" stopState="not_sent" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("widgetSession.stopNotSent")
+    unmount()
+
+    const wide = render(
+      <ChatInput
+        {...commonProps}
+        compact={false}
+        inputValue=""
+        stopState="timed_out"
+      />
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+    wide.unmount()
+
+    render(
+      <ChatInput
+        {...commonProps}
+        onStop={undefined}
+        inputValue=""
+        stopState="timed_out"
+      />
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+  })
+
+  it("swaps the compact submit control for a stop square", () => {
+    const cases: Array<[string, string]> = [
+      ["", "widgetSession.stopResponse"],
+      ["draft", "common.send"],
+    ]
+    const renderedClassNames: string[] = []
+
+    for (const [inputValue, expectedName] of cases) {
+      const otherName = expectedName === "common.send"
+        ? "widgetSession.stopResponse"
+        : "common.send"
+      const { unmount } = render(
+        <ChatInput
+          compact
+          hideConfig
+          hideFileUpload
+          inputValue={inputValue}
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+          stopState="idle"
+          taskStatus="running"
+        />
+      )
+      const control = screen.getByRole("button", { name: expectedName })
+      expect(control).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: otherName })).not.toBeInTheDocument()
+      renderedClassNames.push(control.className)
+      unmount()
+    }
+
+    // Neither render dims its control here, so the two class strings differ
+    // only if the controls stopped taking their size and box styling from the
+    // same expression -- which is what would let the slot change shape when
+    // the stop square takes the send button's place.
+    const [stopClassName, submitClassName] = renderedClassNames
+    expect(stopClassName).toContain("h-8 w-8")
+    expect(submitClassName).toBe(stopClassName)
+  })
+
+  it("renders no stop control without an onStop callback", () => {
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "common.send" })).toBeInTheDocument()
+  })
+
+  it("blocks sending while a stop request is still pending", () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="please also do X"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="stopping"
+        taskStatus="running"
+      />
+    )
+
+    // The draft keeps the send control in the slot, as it always has; what
+    // changes while a stop is outstanding is that the control cannot act, and
+    // that it says why: it carries the stop control's "Stopping..." name.
+    const submitButton = container.querySelector('button[type="submit"]') as HTMLButtonElement
+    expect(submitButton).toBeDisabled()
+    expect(submitButton.className).toContain("bg-muted text-muted-foreground/50")
+    expect(submitButton).toHaveAccessibleName("widgetSession.stoppingResponse")
+    expect(submitButton).toHaveAttribute("title", "widgetSession.stoppingResponse")
+    expect(screen.getAllByRole("button", { name: "widgetSession.stoppingResponse" })).toEqual([submitButton])
+
+    fireEvent.click(submitButton)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" })
+
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("still sends when no stop request is pending", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="please also do X"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="idle"
+        taskStatus="running"
+      />
+    )
+
+    const submitButton = screen.getByRole("button", { name: "common.send" })
+    expect(submitButton).not.toBeDisabled()
+    expect(submitButton.className).not.toContain("bg-muted")
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][0]).toBe("please also do X")
+  })
+
+  it("renders no stop control outside the compact toolbar", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="idle"
+        taskStatus="running"
+      />
+    )
+
+    // The wider toolbar has no stop control by design; it carries the pause
+    // control instead, and passing onStop here changes nothing.
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).toBeInTheDocument()
+  })
+
+  it.each([
+    ["a wide composer with onStop", { compact: false, onStop: vi.fn() }],
+    ["a compact composer without onStop", { compact: true, onStop: undefined }],
+  ])(
+    "does not hold sending for a pending stop in %s",
+    async (_label, stopControlProps) => {
+      const onSend = vi.fn()
+      const { container } = render(
+        <ChatInput
+          {...stopControlProps}
+          hideConfig
+          hideFileUpload
+          inputValue="please also do X"
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={onSend}
+          readOnlyConfig
+          stopState="stopping"
+          taskStatus="running"
+        />
+      )
+
+      expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+      expect(
+        screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+      ).toBeNull()
+
+      fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    }
+  )
+
+  it("uses the provided placeholder and keeps the default without one", () => {
+    const onSend = vi.fn()
+    const { rerender } = render(<ChatInput hideConfig hideFileUpload onSend={onSend} />)
+
+    expect(screen.getByText("chatPage.input.placeholder")).toBeInTheDocument()
+
+    rerender(<ChatInput hideConfig hideFileUpload onSend={onSend} placeholder="custom.placeholder" />)
+
+    expect(screen.getByText("custom.placeholder")).toBeInTheDocument()
+    expect(screen.queryByText("chatPage.input.placeholder")).not.toBeInTheDocument()
+  })
+})
+
+describe("ChatInput upload-only attachments", () => {
+  const attachments = { accept: ".pdf,.png", maxFiles: 2, maxFileBytes: 100 }
+  const pdf = (name = "report.pdf", size = 10) => {
+    const file = new File(["x".repeat(size)], name, { type: "application/pdf" })
+    return file
+  }
+  let fetchSpy: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    useFileMentionCalls.length = 0
+    toastErrorMock.mockReset()
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
+    fetchSpy = vi.fn(() => Promise.resolve(emptyJsonResponse()))
+    vi.stubGlobal("fetch", fetchSpy)
+    localStorage.setItem("token", "main-site-token")
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  type HarnessProps = Partial<React.ComponentProps<typeof ChatInput>> & {
+    initialFiles?: File[]
+    onFilesSeen?: (files: File[]) => void
+  }
+  function Harness({ initialFiles = [], onFilesSeen, ...props }: HarnessProps) {
+    const [files, setFiles] = React.useState<File[]>(initialFiles)
+    return (
+      <ChatInput
+        files={files}
+        filesDisabled
+        hideConfig
+        inputValue=""
+        onFilesChange={(next) => {
+          onFilesSeen?.(next)
+          setFiles(next)
+        }}
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        {...props}
+      />
+    )
+  }
+
+  const fileInput = (container: HTMLElement) =>
+    container.querySelector('input[type="file"]') as HTMLInputElement | null
+
+  it("keeps the upload control hidden when files are disabled and no attachments are offered", () => {
+    const { container } = render(<Harness />)
+    expect(fileInput(container)).toBeNull()
+  })
+
+  it("shows the upload control with the advertised accept list while files stay disabled", () => {
+    const { container } = render(<Harness attachments={attachments} />)
+
+    expect(fileInput(container)?.getAttribute("accept")).toBe(".pdf,.png")
+    expect(fileInput(container)?.multiple).toBe(true)
+  })
+
+  it("shows the upload control in the compact toolbar too", () => {
+    const { container } = render(<Harness attachments={attachments} compact />)
+
+    expect(fileInput(container)?.getAttribute("accept")).toBe(".pdf,.png")
+  })
+
+  it("collects files without uploading them and still hides file previews", () => {
+    const onFilesSeen = vi.fn()
+    const { container } = render(
+      <Harness attachments={attachments} onFilesSeen={onFilesSeen} />,
+    )
+    const file = pdf()
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, { target: { files: [file] } })
+
+    expect(onFilesSeen).toHaveBeenCalledWith([file])
+    expect(screen.getByText("report.pdf")).toBeInTheDocument()
+    expect(container.querySelector(".file-chip-preview")).toBeNull()
+  })
+
+  it("refuses an extension that is not advertised, case-insensitively accepting the advertised ones", () => {
+    const { container } = render(<Harness attachments={attachments} />)
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [pdf("script.exe"), pdf("noextension"), pdf("SHOUT.PDF")] },
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.typeNotSupported", expect.anything())
+    expect(screen.queryByText("script.exe")).not.toBeInTheDocument()
+    expect(screen.queryByText("noextension")).not.toBeInTheDocument()
+    expect(screen.getByText("SHOUT.PDF")).toBeInTheDocument()
+  })
+
+  it("refuses a file larger than the advertised limit", () => {
+    const { container } = render(<Harness attachments={attachments} />)
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [pdf("big.pdf", 101), pdf("fits.pdf", 100)] },
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("clientErrors.uploadTooLarge", expect.anything())
+    expect(screen.queryByText("big.pdf")).not.toBeInTheDocument()
+    expect(screen.getByText("fits.pdf")).toBeInTheDocument()
+  })
+
+  it("refuses files beyond the per-message count, counting files already collected", () => {
+    const { container } = render(
+      <Harness attachments={attachments} initialFiles={[pdf("one.pdf")]} />,
+    )
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [pdf("two.pdf"), pdf("three.pdf")] },
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.tooManyFiles", expect.anything())
+    expect(screen.getByText("one.pdf")).toBeInTheDocument()
+    expect(screen.getByText("two.pdf")).toBeInTheDocument()
+    expect(screen.queryByText("three.pdf")).not.toBeInTheDocument()
+  })
+
+  it("shows uploading and failed cards and retries only the failed file", () => {
+    const uploading = pdf("busy.pdf")
+    const failed = pdf("broken.pdf")
+    const done = pdf("done.pdf")
+    const onRetryAttachment = vi.fn()
+    render(
+      <Harness
+        attachments={attachments}
+        initialFiles={[uploading, failed, done]}
+        attachmentStatuses={new Map([
+          [uploading, "uploading"],
+          [failed, "failed"],
+          [done, "uploaded"],
+        ])}
+        onRetryAttachment={onRetryAttachment}
+      />,
+    )
+
+    expect(screen.getAllByText("widgetSession.attachments.uploading")).toHaveLength(1)
+    fireEvent.click(screen.getByText("widgetSession.attachments.uploadFailedRetry"))
+
+    expect(onRetryAttachment).toHaveBeenCalledTimes(1)
+    expect(onRetryAttachment).toHaveBeenCalledWith(failed)
+  })
+
+  it("disables the retry button of a failed file while attachments are busy and enables it again afterwards", () => {
+    const failed = pdf("broken.pdf")
+    const onRetryAttachment = vi.fn()
+    const props = {
+      attachments,
+      initialFiles: [failed],
+      attachmentStatuses: new Map([[failed, "failed" as const]]),
+      onRetryAttachment,
+    }
+    const { rerender } = render(<Harness {...props} attachmentsBusy />)
+    const retryButton = screen.getByRole("button", { name: "widgetSession.attachments.uploadFailedRetry" })
+
+    expect(retryButton).toBeDisabled()
+    fireEvent.click(retryButton)
+    expect(onRetryAttachment).not.toHaveBeenCalled()
+
+    rerender(<Harness {...props} attachmentsBusy={false} />)
+    const enabledButton = screen.getByRole("button", { name: "widgetSession.attachments.uploadFailedRetry" })
+    expect(enabledButton).toBeEnabled()
+    fireEvent.click(enabledButton)
+    expect(onRetryAttachment).toHaveBeenCalledTimes(1)
+    expect(onRetryAttachment).toHaveBeenCalledWith(failed)
+  })
+
+  it("does not let a draft with a file still uploading be submitted", () => {
+    const uploading = pdf("busy.pdf")
+    const onSend = vi.fn()
+    const { rerender } = render(
+      <Harness
+        attachments={attachments}
+        initialFiles={[uploading]}
+        attachmentStatuses={new Map([[uploading, "uploading"]])}
+        onSend={onSend}
+      />,
+    )
+    const editor = screen.getByRole("textbox")
+
+    fireEvent.keyDown(editor, { key: "Enter" })
+    expect(onSend).not.toHaveBeenCalled()
+
+    rerender(
+      <Harness
+        attachments={attachments}
+        initialFiles={[uploading]}
+        attachmentStatuses={new Map([[uploading, "uploaded"]])}
+        onSend={onSend}
+      />,
+    )
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" })
+    expect(onSend).toHaveBeenCalledTimes(1)
+  })
+
+  it("disables the upload button and refuses added files while answering a request", () => {
+    const onFilesSeen = vi.fn()
+    const { container } = render(
+      <Harness
+        attachments={attachments}
+        compact
+        currentInteractionRequestId="request-1"
+        onFilesSeen={onFilesSeen}
+      />,
+    )
+
+    expect(screen.getByTitle("chatPage.input.actions.upload")).toBeDisabled()
+    fireEvent.change(fileInput(container) as HTMLInputElement, { target: { files: [pdf()] } })
+
+    expect(onFilesSeen).not.toHaveBeenCalled()
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.noFilesOnAnswer", expect.anything())
+  })
+
+  it("collects pasted and dropped files through the same limits", () => {
+    const onFilesSeen = vi.fn()
+    const { container } = render(
+      <Harness attachments={attachments} onFilesSeen={onFilesSeen} />,
+    )
+    const good = pdf("pasted.pdf")
+    const bad = pdf("pasted.exe")
+    const editor = screen.getByRole("textbox")
+
+    fireEvent.paste(editor, {
+      clipboardData: { items: [{ kind: "file", type: "application/pdf", getAsFile: () => good }] },
+    })
+    expect(onFilesSeen).toHaveBeenLastCalledWith([good])
+
+    const form = container.querySelector("form") as HTMLFormElement
+    fireEvent.drop(form, {
+      dataTransfer: { types: ["Files"], items: [{ kind: "file", getAsFile: () => bad }], files: [bad] },
+    })
+    expect(onFilesSeen).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.typeNotSupported", expect.anything())
+  })
+
+  describe.each([[true], [false]])("with deferFileUpload=%s", (deferFileUpload) => {
+    it("never reads or uploads a file on its own and keeps file mentions closed", () => {
+      const uploadFile = vi.fn()
+      const { container } = render(
+        <Harness
+          attachments={attachments}
+          deferFileUpload={deferFileUpload}
+          uploadFile={uploadFile}
+          voiceInputEnabled={false}
+        />,
+      )
+
+      fireEvent.change(fileInput(container) as HTMLInputElement, { target: { files: [pdf()] } })
+      const editor = screen.getByRole("textbox")
+      editor.textContent = "@"
+      fireEvent.input(editor)
+
+      expect(uploadFile).not.toHaveBeenCalled()
+      expect(apiRequestMock).not.toHaveBeenCalled()
+      const urls = fetchSpy.mock.calls.map((call) => String(call[0]))
+      expect(urls.filter((url) => url.includes("/api/files/"))).toEqual([])
+      const headers = JSON.stringify(fetchSpy.mock.calls.map((call) => call[1]?.headers ?? null))
+      expect(headers).not.toContain("main-site-token")
+      expect(useFileMentionCalls.length).toBeGreaterThan(0)
+      for (const call of useFileMentionCalls) expect(call[4]).toBe(true)
+    })
+  })
+
+  it("keeps the previous behaviour when no attachments option is passed", async () => {
+    const uploadFile = vi.fn().mockResolvedValue({ file_id: "file-1" })
+
+    function Plain() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={files}
+          hideConfig
+          inputValue=""
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+    const { container } = render(<Plain />)
+    expect(fileInput(container)?.getAttribute("accept")).toContain(".docx")
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [new File(["x"], "plain.txt")] },
+    })
+
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(1))
+  })
+})
+
+describe("ChatInput autoSendRequest", () => {
+  const editorOf = (container: HTMLElement) =>
+    container.querySelector("[contenteditable]") as HTMLElement
+  // Lets the timers that type the message run, then the send they trigger.
+  const advance = async (ms: number) => {
+    await act(async () => {
+      vi.advanceTimersByTime(ms)
+    })
+  }
+  const composer = (props: Partial<React.ComponentProps<typeof ChatInput>>) => (
+    <ChatInput
+      hideConfig
+      hideFileUpload
+      onSend={vi.fn()}
+      readOnlyConfig
+      {...props}
+    />
+  )
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    let generatedClientMessageId = 0
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementation(() => `client-message-${++generatedClientMessageId}`)
+    toastErrorMock.mockReset()
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it("types the requested message in step by step, then sends it once and clears the composer", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    expect(editorOf(container)).toHaveTextContent(/^S$/)
+    await advance(100)
+    expect(editorOf(container)).toHaveTextContent(/^Show m$/)
+    expect(onSend).not.toHaveBeenCalled()
+
+    // The whole text is in after 15 more steps, and it is sent after a pause.
+    await advance(200)
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    expect(onSend).not.toHaveBeenCalled()
+    await advance(200)
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend).toHaveBeenCalledWith(
+      "Show my schedule",
+      expect.objectContaining({ clientMessageId: "client-message-1" }),
+    )
+    expect(editorOf(container)).toBeEmptyDOMElement()
+  })
+
+  it("types into the editor while it has focus", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container, rerender } = render(composer({ onSend, isLoading: true }))
+    editorOf(container).focus()
+    expect(document.activeElement).toBe(editorOf(container))
+
+    rerender(composer({
+      onSend,
+      isLoading: true,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    // The caret stays after the typed text.
+    const selection = window.getSelection()
+    expect(selection?.isCollapsed).toBe(true)
+    expect(selection?.anchorNode).toBe(editorOf(container))
+    expect(selection?.anchorOffset).toBe(editorOf(container).childNodes.length)
+  })
+
+  it("sends nothing on Enter while the message is being typed, then sends the whole message", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(100)
+
+    fireEvent.keyDown(editorOf(container), { key: "Enter" })
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    expect(onSend).not.toHaveBeenCalled()
+
+    await advance(1000)
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend).toHaveBeenCalledWith("Show my schedule", expect.anything())
+  })
+
+  it("never shows part of an emoji or an accented letter while typing", async () => {
+    const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"
+    const accented = "e\u0301"
+    const { container } = render(composer({
+      isLoading: true,
+      autoSendRequest: { id: 1, text: `${family}${accented}` },
+    }))
+
+    expect(editorOf(container).textContent).toBe(family)
+    await advance(20)
+    expect(editorOf(container).textContent).toBe(`${family}${accented}`)
+  })
+
+  it("leaves the typed message in a composer whose files are still uploading", async () => {
+    const onSend = vi.fn()
+    const file = new File(["x"], "a.pdf", { type: "application/pdf" })
+    const { container } = render(composer({
+      onSend,
+      files: [file],
+      onFilesChange: vi.fn(),
+      attachmentStatuses: new Map([[file, "uploading" as const]]),
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("leaves the typed message in a composer that cannot send", async () => {
+    const onSend = vi.fn()
+    const { container } = render(composer({
+      onSend,
+      isLoading: true,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("stops typing without sending when the visitor edits the composer", async () => {
+    const onSend = vi.fn()
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(100)
+
+    fireEvent.input(editorOf(container))
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show m$/)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("drops a request that arrives while another one is being typed", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(100)
+
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text: "Cancel my shift" } }))
+    await advance(1000)
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend).toHaveBeenCalledWith("Show my schedule", expect.anything())
+  })
+
+  it("keeps a failed message, shows the failure toast and reuses its message id on the next request", async () => {
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(new Error("Message was rejected"))
+      .mockResolvedValueOnce(undefined)
+    const { container, rerender } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(1000)
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+
+    // As with the send button, a new send waits until 500ms after the last one settled.
+    await advance(600)
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text: "Show my schedule" } }))
+    await advance(1000)
+
+    expect(onSend).toHaveBeenCalledTimes(2)
+    expect(onSend.mock.calls[1][1].clientMessageId).toBe(
+      onSend.mock.calls[0][1].clientMessageId,
+    )
+    expect(editorOf(container)).toBeEmptyDOMElement()
+  })
+
+  it("reuses the message id when a prompt starting with whitespace is retried after an unknown outcome", async () => {
+    // One character per step, so typing the text as given would first leave
+    // only the leading space in the composer.
+    const text = " Show my schedule"
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(new Error("Message delivery was not acknowledged"))
+      .mockResolvedValueOnce(undefined)
+    const { rerender } = render(composer({ onSend, autoSendRequest: { id: 1, text } }))
+    await advance(1000)
+    expect(onSend).toHaveBeenCalledTimes(1)
+
+    await advance(600)
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text } }))
+    await advance(1000)
+
+    expect(onSend.mock.calls.map(([message, config]) => [message, config.clientMessageId])).toEqual([
+      ["Show my schedule", "client-message-1"],
+      ["Show my schedule", "client-message-1"],
+    ])
+  })
+
+  it("puts the whole message in at once when reduced motion is preferred", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)",
+    }))
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    await advance(200)
+    expect(onSend).toHaveBeenCalledWith("Show my schedule", expect.anything())
+  })
+})

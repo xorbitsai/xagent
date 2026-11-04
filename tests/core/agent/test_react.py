@@ -1,0 +1,14701 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import re
+import threading
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import ANY
+
+import pytest
+from langchain_core.tools import tool as langchain_tool
+from pydantic import BaseModel
+
+from xagent.core.agent import (
+    ExecutionContext,
+    PatternRuntime,
+    ReActPattern,
+    ReActReasoningMode,
+    ToolCallInterrupted,
+    ToolCallRecord,
+)
+from xagent.core.agent.checkpoint import CheckpointPersistenceError
+from xagent.core.agent.context import execution as execution_module
+from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
+from xagent.core.agent.pattern.react.react import (
+    _INTERACTION_TRIM_CHARS,
+    FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT,
+    FORCED_ANSWER_READ_UNLISTED_PATH_TEXT,
+    FORCED_ANSWER_READS_USED_UP_TEXT,
+    _normalize_ask_user_interactions,
+)
+from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
+from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
+from xagent.core.model.chat.basic.router import RouterLLM
+from xagent.core.model.chat.exceptions import LLMToolProtocolError
+from xagent.core.model.chat.tool_protocol import (
+    ToolProtocolViolation,
+    tool_protocol_error_response,
+)
+from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+    GatedCall,
+    GateDecision,
+    _gated_interaction_source,
+    current_tool_call_execution_context,
+    gate_mcp_tools,
+    register_mcp_approval_gate,
+    unregister_mcp_approval_gate,
+)
+from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
+from xagent.core.tools.user_interaction import ToolInteractionSettlement
+
+
+class CalculatorArgs(BaseModel):
+    expression: str
+
+
+class WriteFileArgs(BaseModel):
+    file_path: str
+    content: str
+
+
+class SearchArgs(BaseModel):
+    query: str
+    count: int = 10
+
+
+class EmptyArgs(BaseModel):
+    pass
+
+
+def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
+    previous = SimpleNamespace(
+        role="tool",
+        metadata={
+            "raw_result": {"success": False, "failure_code": "excel_site_not_found"}
+        },
+    )
+    user = SimpleNamespace(role="user", metadata={})
+    current = SimpleNamespace(
+        role="tool",
+        metadata={
+            "raw_result": {
+                "success": False,
+                "failure_code": "excel_workbook_access_denied",
+            }
+        },
+    )
+    context = SimpleNamespace(messages=[previous, user, current])
+
+    assert (
+        ReActPattern._latest_tool_failure_code(context)
+        == "excel_workbook_access_denied"
+    )
+
+
+def test_latest_tool_failure_code_rejects_unallowlisted_code() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_rejects_non_string_code() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": 123},
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_stops_at_a_later_non_dict_result() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="tool", metadata={"raw_result": "completed"}),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_cross_a_failed_current_turn() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_drops_stale_failure_after_success() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"status": "success"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_reuse_older_code_after_uncoded_failure() -> (
+    None
+):
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"success": False, "error": "other failure"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+class FakeTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "calculator"
+            description = "Evaluate math expressions."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return CalculatorArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        expression = args["expression"]
+        return {"result": eval(expression), "expression": expression}  # noqa: S307
+
+
+class FakeWorkspaceOutputTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = WORKSPACE_OUTPUT_FILES_TOOL_NAME
+            description = "List output files from the current workspace."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+
+@pytest.mark.asyncio
+async def test_react_binds_exact_execution_identity_for_mcp_gate() -> None:
+    seen: list[GatedCall] = []
+
+    async def gate(call: GatedCall) -> GateDecision:
+        seen.append(call)
+        return GateDecision.deny()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    registration = register_mcp_approval_gate(
+        task_source="slack", gate=gate, resume=resume
+    )
+    try:
+        target = FakeTool()
+        target.name = "calculator"
+        (gated,) = gate_mcp_tools([target], connection={"id": 41})
+        context = ExecutionContext(
+            execution_id="task-248032",
+            metadata={"task_source": "slack", "run_id": "run-1"},
+        )
+        context.add_user_message("Publish.", metadata={"turn_id": "turn-1"})
+
+        result = await ReActPattern(max_iterations=2).run(
+            context=context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "calculator",
+                                    "arguments": '{"expression":"2+2"}',
+                                },
+                            }
+                        ]
+                    },
+                    {"content": "The connector call was denied.", "done": True},
+                ]
+            ),
+        )
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+    assert result["success"] is True
+    assert target.calls == []
+    assert len(seen) == 1
+    execution = seen[0].execution_context
+    assert execution.task_source == "slack"
+    assert execution.task_id == "task-248032"
+    assert execution.run_id == "run-1"
+    assert execution.turn_id == "turn-1"
+    assert execution.tool_call_id == "call-1"
+    assert execution.pattern == "react"
+    assert execution.react_step_id
+
+
+class FakeReadToolResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = SPILL_READ_TOOL_NAME
+            description = "Read one engine-stored large tool result."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+
+class FakeWriteFileTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "write_file"
+            description = "Write file content in workspace."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return WriteFileArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        path = args["file_path"]
+        return {
+            "success": True,
+            "filename": path.split("/")[-1],
+            "relative_path": f"output/{path.split('/')[-1]}",
+            "file_path": f"/workspace/output/{path.split('/')[-1]}",
+        }
+
+
+class FakeSearchTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "zhipu_web_search"
+            description = "Search the web."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return SearchArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {
+            "results": [
+                {
+                    "title": "用不了NotebookLM,试试这个国产知识库工具",
+                    "link": "https://example.com/a",
+                },
+                {
+                    "title": "AnyGen真能取代NotebookLM?",
+                    "link": "https://example.com/b",
+                },
+                {
+                    "title": "Open NotebookLM",
+                    "link": "https://example.com/c",
+                },
+            ]
+        }
+
+
+class FakeTraceSanitizingTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "custom_api"
+            description = "Call a custom API."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    def sanitize_tool_args_for_trace(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in args.items() if key != "headers"}
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"success": True, "args": args}
+
+
+class FakeInPlaceTraceSanitizingTool(FakeTraceSanitizingTool):
+    def sanitize_tool_args_for_trace(self, args: dict[str, Any]) -> dict[str, Any]:
+        args.pop("headers", None)
+        if isinstance(args.get("body"), dict):
+            args["body"].pop("secret", None)
+        return args
+
+
+class FakeGroupedTool:
+    def __init__(self, name: str, category: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            description = "Run grouped work."
+
+        self.metadata = Metadata()
+        self.metadata.name = name
+        self.metadata.category = category
+
+    def args_type(self) -> type[BaseModel]:
+        return SearchArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {
+            "results": [{"title": self.metadata.name, "link": "https://example.com"}]
+        }
+
+
+class FakeBrowserNavigateTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "browser_navigate"
+            description = "Navigate a browser page."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {
+            "success": True,
+            "session_id": args.get("session_id", ""),
+            "url": args["url"],
+            "title": "",
+            "message": "ok",
+        }
+
+
+class BrokenTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "broken"
+            description = "Always fails."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        raise RuntimeError(f"broken with {args}")
+
+
+class FailingResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "failing_result"
+            description = "Returns a failed tool result."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {"success": False, "output": "", "error": f"failed with {args}"}
+
+
+class StatusErrorResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "status_error_result"
+            description = "Returns a status=error tool result."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {"status": "error", "message": f"failed with {args}"}
+
+
+class IsErrorResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "is_error_result"
+            description = "Returns an MCP-style is_error result."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {
+            "is_error": True,
+            "content": [{"text": f"failed with {args}"}],
+        }
+
+
+class ClassifiedFailureResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "classified_failure_result"
+            description = "Returns a classified delegated-agent failure."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {
+            "success": False,
+            "is_error": True,
+            "status": "error",
+            "failure_code": "unsupported_nested_interaction",
+            "error": "Nested agent calls cannot forward interactive prompts.",
+            "output": "Nested agent calls cannot forward interactive prompts.",
+            "response": "Nested agent calls cannot forward interactive prompts.",
+        }
+
+
+class FakeAskUserTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "ask_user_question"
+            description = "Legacy ask user tool."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return args
+
+
+class LegacySchemaArgs:
+    @classmethod
+    def schema(cls) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+        }
+
+
+class LegacySchemaTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "legacy_schema"
+            description = "Legacy schema tool."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[LegacySchemaArgs]:
+        return LegacySchemaArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {"value": args["value"]}
+
+
+class FakeLLM:
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def final_answer_response(
+    answer: str, response_language: str = "English"
+) -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_final",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": json.dumps(
+                        {
+                            "response_language": response_language,
+                            "answer": answer,
+                        }
+                    ),
+                },
+            }
+        ],
+    }
+
+
+class FakeNamedLLM(FakeLLM):
+    """FakeLLM carrying a ``model_name``, for tests that assert on it in logs."""
+
+    model_name = "fake-model"
+
+
+class StreamingFinalAnswerLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming ReAct path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        tool_names = [
+            tool["function"]["name"] for tool in list(kwargs.get("tools") or [])
+        ]
+        if tool_names == ["final_answer"]:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The result is 4."}'
+                            ),
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        if tool_names:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        yield StreamChunk(type=ChunkType.TOKEN, delta="The result")
+        yield StreamChunk(type=ChunkType.TOKEN, delta=" is 4.")
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingInvalidToolProtocolFinalAnswerLLM:
+    def __init__(
+        self,
+        *,
+        structured_work_tool: bool = False,
+        partial_final_before_work_tool: bool = False,
+        invalid_retry: bool = False,
+    ) -> None:
+        self.structured_work_tool = structured_work_tool
+        self.partial_final_before_work_tool = partial_final_before_work_tool
+        self.invalid_retry = invalid_retry
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("invalid tool protocol path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+        elif call_index == 1:
+            if self.partial_final_before_work_tool:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_partial_final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"Draft answer"}'
+                                ),
+                            },
+                        }
+                    ],
+                )
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 1,
+                            "id": "call_unavailable_work_tool",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": '{"expression":"3+3"}',
+                            },
+                        }
+                    ],
+                )
+            elif self.structured_work_tool:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "id": "call_unavailable_work_tool",
+                            "function": {
+                                "name": "calculator",
+                                "arguments": '{"expression":"3+3"}',
+                            },
+                        }
+                    ],
+                )
+            else:
+                yield StreamChunk(
+                    type=ChunkType.PROTOCOL_ERROR,
+                    protocol_error={
+                        "provider": "deepseek",
+                        "code": "serialized_tool_call_content",
+                        "message": "Invalid provider tool protocol.",
+                    },
+                )
+        elif self.invalid_retry:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_retry_partial_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English","answer":"Retry draft"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 1,
+                        "id": "call_retry_unavailable_work_tool",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"4+4"}',
+                        },
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "Simplified Chinese",
+                                    "answer": "目前没有找到可直接下载的音频片段。",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingUnavailableToolRecoveryLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("unavailable-tool recovery path should stay streaming")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            tool_name = "calculator"
+            arguments = '{"expression":"2+2"}'
+            tool_call_id = "call_first_work"
+        elif call_index == 1:
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code="unavailable_tool_call",
+                message="DeepSeek returned unavailable tool call 'calculator'.",
+            )
+        elif call_index == 2:
+            tool_name = "calculator"
+            arguments = '{"expression":"3+3"}'
+            tool_call_id = "call_recovered_work"
+        else:
+            tool_name = "final_answer"
+            arguments = json.dumps(
+                {
+                    "response_language": "English",
+                    "answer": "The results are 4 and 6.",
+                }
+            )
+            tool_call_id = "call_final"
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": tool_call_id,
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments,
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingMalformedFinalAnswerRecoveryLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("malformed-tool recovery path should stay streaming")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_transcribe",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        if call_index == 1:
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code="malformed_tool_arguments",
+                message="DeepSeek returned malformed arguments for 'final_answer'.",
+                details={
+                    "original_arguments_preview": '{"answer":',
+                    "original_arguments_length": 10,
+                    "repair_status": "skipped_incomplete",
+                },
+            )
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final_repaired",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps(
+                            {
+                                "response_language": "Simplified Chinese",
+                                "answer": "音频主要讲运动如何缓解精神疲劳。",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingPlainTextFinalAnswerLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming ReAct final answer should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        yield StreamChunk(type=ChunkType.TOKEN, delta="Plain")
+        yield StreamChunk(type=ChunkType.TOKEN, delta=" final.")
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingPreambleToolCallLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming ReAct preamble path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        yield StreamChunk(type=ChunkType.TOKEN, delta="I will use a tool first.")
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"2+2"}',
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingFinalAnswerToolLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming ReAct final_answer tool should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        prefix = '{"answer":"'
+        for arguments in [
+            prefix + "Hi",
+            prefix + "Hi there",
+            prefix + 'Hi there."}',
+        ]:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingMixedFinalAnswerAndToolLLM:
+    """First call bundles final_answer with a work tool; the retry answers for real."""
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming mixed tool path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Candidate"}',
+                        },
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final_2",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": '{"answer":"4"}',
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingAnswerThenWorkToolLLM:
+    """Streams a final_answer candidate before the batch also names a work tool.
+
+    Exercises the case where the answer streamer has already emitted content
+    by the time the work tool's name shows up in a later chunk of the same
+    response, so the strip point is the only place left to close the stream.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming answer-then-tool path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            prefix = '{"answer":"'
+            for arguments in [
+                prefix + "Looking",
+                prefix + "Looking that up now.",
+                prefix + 'Looking that up now."}',
+            ]:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                )
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 1,
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final_2",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": '{"answer":"4"}',
+                    },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingRepeatedGuardFinalAnswerLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming repeated guard path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        if call_index == 0:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news","count":10}',
+                        },
+                    }
+                ],
+            )
+        elif call_index == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news latest","count":5}',
+                        },
+                    }
+                ],
+            )
+        elif call_index == 2:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"已有搜索结果足够回答。"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"Fallback answer."}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class ScriptedStreamLLM:
+    """Streams one scripted tool-call batch per ``stream_chat`` call.
+
+    Each batch is a list of ``(tool_name, args_dict)`` pairs. Every call's
+    arguments are streamed in two fragments (a truncated prefix, then the
+    full JSON) so the answer streamer sees a partial candidate before the
+    complete one, matching the production streaming shape. This is the one
+    general-purpose fake model for the #486 batch-shape matrix - covering a
+    new shape means adding a batch here, not a new fake model class.
+    """
+
+    def __init__(self, batches: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        self.batches = batches
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("ScriptedStreamLLM should not fall back to chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        index = min(len(self.stream_calls) - 1, len(self.batches) - 1)
+        for position, (name, args) in enumerate(self.batches[index]):
+            serialized = json.dumps(args)
+            cut = max(1, len(serialized) // 2)
+            for fragment in (serialized[:cut], serialized):
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": position,
+                            "id": f"call_{position}",
+                            "function": {"name": name, "arguments": fragment},
+                        }
+                    ],
+                )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class OutboundCollector:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def __call__(self, payload: dict[str, Any]) -> None:
+        self.events.append(payload)
+
+
+class BlockingLLM:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def chat(self, **kwargs: Any) -> Any:
+        del kwargs
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class BlockingProtocolRetryLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.retry_started = asyncio.Event()
+        self.cancelled = False
+
+    async def chat(self, **kwargs: Any) -> Any:
+        del kwargs
+        self.calls += 1
+        if self.calls == 1:
+            return tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="serialized_tool_call_content",
+                    message="Invalid provider tool protocol.",
+                )
+            )
+        self.retry_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class FakeTracer:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    async def start_trace(self, **kwargs: Any) -> None:
+        self.events.append(("start_trace", kwargs))
+
+    async def finish_trace(self, **kwargs: Any) -> None:
+        self.events.append(("finish_trace", kwargs))
+
+    async def start_span(self, **kwargs: Any) -> None:
+        self.events.append(("start_span", kwargs))
+
+    async def finish_span(self, **kwargs: Any) -> None:
+        self.events.append(("finish_span", kwargs))
+
+
+class TraceEventRecorder:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        **_: Any,
+    ) -> str:
+        self.events.append(
+            {
+                "event_type": getattr(event_type, "value", str(event_type)),
+                "task_id": task_id,
+                "step_id": step_id,
+                "data": data or {},
+            }
+        )
+        return str(len(self.events))
+
+
+class MemoryNote:
+    content = "Use the stored project preference."
+    keywords = ["project", "preference"]
+    metadata = {"source": "test"}
+    category = "react_memory"
+
+
+class FakeMemoryStore:
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+
+    def search(self, **kwargs: Any) -> list[MemoryNote]:
+        self.searches.append(kwargs)
+        return [MemoryNote()]
+
+
+class FakeSkillManager:
+    def __init__(self) -> None:
+        self.loaded: list[str] = []
+
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "test-skill",
+                "description": "A test skill",
+                "when_to_use": "Testing",
+            }
+        ]
+
+    async def get_skill(self, name: str) -> dict[str, Any] | None:
+        if name != "test-skill":
+            return None
+        self.loaded.append(name)
+        return {
+            "name": "test-skill",
+            "description": "A test skill",
+            "content": "Follow the selected skill instructions.",
+        }
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "I should calculate this first.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "The result is 4.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == [{"expression": "2+2"}]
+    assert [message.role for message in context.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert context.messages[1].tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "arguments": json.dumps({"expression": "2+2"}),
+            },
+        }
+    ]
+    assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
+    system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "latest user message" in system_prompt
+    assert re.search(r"Turn-start date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
+    assert "use this date when forming search queries" in system_prompt
+    assert "not supported by the conversation" in system_prompt
+    assert "available context is insufficient" in system_prompt
+    assert "quantitative data" in system_prompt
+    assert "Do not write assistant text in the same response as a work tool call" in (
+        system_prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_carries_opaque_provider_state() -> None:
+    provider_state = {"provider": {"field": ""}}
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "_xagent_provider_state": provider_state,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "The result is 4.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assistant_messages = [
+        message
+        for message in llm.calls[1]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert assistant_messages[0]["_xagent_provider_state"] == provider_state
+    assert "reasoning_content" not in assistant_messages[0]
+    stored_assistant = next(
+        message
+        for message in context.messages
+        if message.role == "assistant" and message.tool_calls
+    )
+    assert stored_assistant.metadata["_xagent_provider_state"] == provider_state
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_does_not_persist_invalid_raw_tool_calls() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": (
+                                '{"query": "Germany vs Ivory Coast live score"'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {
+                            "arguments": (
+                                '}{"query":"德国 科特迪瓦 世界杯 比分 2026 6月"}'
+                            ),
+                        },
+                    },
+                ],
+            },
+            {"content": "No live score found.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("搜索啊")
+
+    result = await pattern.run(context=context, tools=[FakeSearchTool()], llm=llm)
+
+    assert result["success"] is True
+    assistant_tool_calls = context.messages[1].tool_calls
+    assert assistant_tool_calls == [
+        {
+            "id": "call_search",
+            "type": "function",
+            "function": {
+                "name": "zhipu_web_search",
+                "arguments": json.dumps(
+                    {"input": ('{"query": "Germany vs Ivory Coast live score"')},
+                    ensure_ascii=False,
+                ),
+            },
+        }
+    ]
+    second_prompt_tool_calls = [
+        message["tool_calls"]
+        for message in llm.calls[1]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    assert second_prompt_tool_calls == [assistant_tool_calls]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_streams_only_final_answer_after_tool_call() -> None:
+    llm = StreamingFinalAnswerLLM()
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 0
+    assert len(llm.stream_calls) == 2
+    assert llm.stream_calls[0]["tools"][0]["function"]["name"] == "calculator"
+    assert [tool["function"]["name"] for tool in llm.stream_calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    forced_answer_description = llm.stream_calls[1]["tools"][0]["function"][
+        "parameters"
+    ]["properties"]["answer"]["description"]
+    assert "get_workspace_output_files" not in forced_answer_description
+    assert llm.stream_calls[1]["tool_choice"] == "required"
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_recovers_unavailable_forced_final_with_full_tool_set() -> None:
+    llm = StreamingUnavailableToolRecoveryLLM()
+    pattern = ReActPattern(max_iterations=4, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2 and 3+3")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="task-1", tracer=tracer)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "The results are 4 and 6."
+    assert tool.calls == [{"expression": "2+2"}, {"expression": "3+3"}]
+    assert len(llm.stream_calls) == 4
+    assert [schema["function"]["name"] for schema in llm.stream_calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    recovery_tool_names = [
+        schema["function"]["name"] for schema in llm.stream_calls[2]["tools"]
+    ]
+    assert "calculator" in recovery_tool_names
+    assert "final_answer" in recovery_tool_names
+    assert (
+        "Re-decide this turn using the complete current tool set"
+        in llm.stream_calls[2]["messages"][0]["content"]
+    )
+    # stream_calls[1] is the forced final-answer turn. Assert the no-tools
+    # grounding variant specifically: both branches carry the rule, so only the
+    # can_call_tools=False wording proves run() reached the forced branch.
+    forced_final_prompt = llm.stream_calls[1]["messages"][0]["content"]
+    assert "quantitative data" in forced_final_prompt
+    assert "invented values" in forced_final_prompt
+    assert "use an appropriate tool" not in forced_final_prompt
+    recovery_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "unavailable_tool_call_recovery"
+    ]
+    assert len(recovery_starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_repairs_malformed_forced_final_answer_arguments() -> None:
+    llm = StreamingMalformedFinalAnswerRecoveryLLM()
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="780")
+    context.add_user_message("这个音频讲了什么？")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="780", tracer=tracer)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "音频主要讲运动如何缓解精神疲劳。"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.stream_calls) == 3
+    assert [schema["function"]["name"] for schema in llm.stream_calls[2]["tools"]] == [
+        "final_answer"
+    ]
+    retry_prompt = llm.stream_calls[2]["messages"][0]["content"]
+    assert "malformed JSON arguments" in retry_prompt
+    assert "one complete JSON object" in retry_prompt
+    recovery_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "malformed_tool_arguments_recovery"
+    ]
+    assert len(recovery_starts) == 1
+    protocol_errors = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_error_llm"
+        and event["data"].get("protocol_code") == "malformed_tool_arguments"
+    ]
+    assert len(protocol_errors) == 1
+    assert protocol_errors[0]["data"]["protocol_details"] == {
+        "original_arguments_preview": '{"answer":',
+        "original_arguments_length": 10,
+        "repair_status": "skipped_incomplete",
+    }
+
+
+@pytest.mark.parametrize("structured_work_tool", [False, True])
+@pytest.mark.asyncio
+async def test_react_retries_invalid_forced_final_as_final_answer_tool(
+    structured_work_tool: bool,
+) -> None:
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=structured_work_tool
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "目前没有找到可直接下载的音频片段。"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.stream_calls) == 3
+    assert [tool["function"]["name"] for tool in llm.stream_calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.stream_calls[1]["tool_choice"] == "required"
+    retry_tools = llm.stream_calls[2]["tools"]
+    retry_tool_names = [tool["function"]["name"] for tool in retry_tools]
+    if structured_work_tool:
+        assert "calculator" in retry_tool_names
+        assert "final_answer" in retry_tool_names
+    else:
+        assert retry_tool_names == ["final_answer"]
+    assert llm.stream_calls[2]["tool_choice"] == "required"
+    retry_prompt = llm.stream_calls[2]["messages"][0]["content"]
+    if structured_work_tool:
+        assert "complete current tool set" in retry_prompt
+    else:
+        assert "calling the final_answer control tool exactly once" in retry_prompt
+    outbound_text = "".join(
+        str(event.get("delta", "")) + str(event.get("content", ""))
+        for event in outbound.events
+    )
+    assert "DSML" not in outbound_text
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_retries_provider_tool_protocol_error_with_work_tools() -> None:
+    llm = FakeLLM(
+        responses=[
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="nested_serialized_tool_call",
+                    message="Invalid provider tool protocol.",
+                )
+            ),
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_write",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": json.dumps(
+                                {
+                                    "file_path": "podcast.md",
+                                    "content": "# Podcast script\nComplete script body.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "The podcast script is ready.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    tool = FakeWriteFileTool()
+    context = ExecutionContext()
+    context.add_user_message("Create a podcast script and synthesize it.")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "The podcast script is ready."
+    assert tool.calls == [
+        {
+            "file_path": "podcast.md",
+            "content": "# Podcast script\nComplete script body.",
+        }
+    ]
+    assert len(llm.calls) == 3
+    retry_tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
+    assert "write_file" in retry_tool_names
+    assert "final_answer" in retry_tool_names
+    assert (
+        "If work remains, call the appropriate available work tool directly"
+        in llm.calls[1]["messages"][0]["content"]
+    )
+    assert all(
+        message.content != "Invalid provider tool protocol."
+        for message in context.messages
+        if isinstance(message.content, str)
+    )
+    llm_end_events = [
+        event for event in tracer.events if event["event_type"] == "action_end_llm"
+    ]
+    assert llm_end_events[0]["data"]["success"] is False
+    assert llm_end_events[0]["data"]["phase"] == ("discarded_invalid_tool_protocol")
+    assert llm_end_events[1]["data"]["success"] is True
+
+
+def test_react_rejects_null_tool_calls_in_forced_final_response() -> None:
+    pattern = ReActPattern()
+
+    assert pattern._response_requires_tool_protocol_retry(
+        {"content": "Done.", "tool_calls": None},
+        force_final_answer=True,
+    )
+
+
+def test_react_grounding_rule_present_in_both_answer_paths() -> None:
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Build a KPI report")
+
+    tool_prompt = pattern._messages_for_llm(
+        context, has_tools=True, tool_names=["calculator"]
+    )[0]["content"]
+    lookup_tool_prompt = pattern._messages_for_llm(
+        context,
+        has_tools=True,
+        tool_names=[WORKSPACE_OUTPUT_FILES_TOOL_NAME, "final_answer"],
+    )[0]["content"]
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    for prompt in (tool_prompt, lookup_tool_prompt, forced_prompt):
+        assert "quantitative data" in prompt
+        assert "A citation or search snippet is not evidence" in prompt
+        assert (
+            "a current user request that explicitly asks you to write a template"
+            in prompt
+        )
+        assert "This does not restrict the wording you compose" in prompt
+    assert "use an appropriate tool to verify" in tool_prompt
+    assert "use an appropriate tool" not in forced_prompt
+    for prompt in (tool_prompt, lookup_tool_prompt):
+        assert "tool-call arguments that assert facts" in prompt
+        assert "never guess one" in prompt
+    assert "tool-call arguments that assert facts" not in forced_prompt
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in tool_prompt
+    assert "exact markdown_link" in tool_prompt
+    assert "lookup is unavailable" in tool_prompt
+    assert "call get_workspace_output_files once before finalizing" not in tool_prompt
+    assert (
+        "call get_workspace_output_files once before finalizing" in lookup_tool_prompt
+    )
+    assert forced_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
+    assert "call get_workspace_output_files once before finalizing" not in forced_prompt
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_defaults_presentation_without_guessing_required_information(
+    user_interaction_enabled: bool,
+) -> None:
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    user_request = "Analyze the available evidence. Ask me PDF or DOCX first."
+    context.add_user_message(user_request)
+
+    tool_names = [
+        schema["function"]["name"] for schema in pattern._builtin_tool_schemas()
+    ]
+    messages = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)
+    prompt = messages[0]["content"]
+
+    assert messages[-1]["content"] == user_request
+    assert "including an unspecified output format" in prompt
+    assert (
+        "deliver the supported work without pausing unless "
+        "the user explicitly asked to choose" in prompt
+    )
+    assert "does not permit guessing facts, action targets, or authorization" in prompt
+    # Presentation defaults must not weaken the existing missing-fact policy.
+    assert "fact-carrying argument value" in prompt
+    if user_interaction_enabled:
+        assert "ask_user_question" in tool_names
+        assert "Request clarification only when missing information" in prompt
+        assert "or the user explicitly asked to be consulted" in prompt
+        assert "call ask_user_question" in prompt
+        assert "user choice cannot be obtained in this run" not in prompt
+        assert "User interaction is disabled" not in prompt
+    else:
+        assert "ask_user_question" not in tool_names
+        assert "Request clarification only" not in prompt
+        assert "call ask_user_question" not in prompt
+        assert "User interaction is disabled" in prompt
+        assert (
+            "If the user explicitly asked to choose and that choice is still "
+            "pending, do not select for them; finish with outcome=blocked" in prompt
+        )
+        assert "user choice cannot be obtained in this run" in prompt
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_authorization_guidance_preserves_interaction_policy(
+    user_interaction_enabled: bool,
+) -> None:
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Summarize the records for my account.")
+    tool_names = [
+        schema["function"]["name"] for schema in pattern._builtin_tool_schemas()
+    ]
+    prompt = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)[
+        0
+    ]["content"]
+
+    assert "If a tool reports missing or expired authorization" in prompt
+    assert "generic HTTP tool does not restore access" in prompt
+    assert "retry only after a relevant authorization or configuration change" in prompt
+    assert "Never ask the user to paste passwords, API keys, or access tokens" in prompt
+    if user_interaction_enabled:
+        assert "call ask_user_question" in prompt
+    else:
+        assert "ask_user_question" not in tool_names
+        assert "call ask_user_question" not in prompt
+        assert "finish with outcome=blocked and explain what is missing" in prompt
+
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+    assert "If a tool reports missing or expired authorization" not in forced_prompt
+    assert "retry only after" not in forced_prompt
+
+
+def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:
+    """A selected subset must stay the scope at the moment the model writes
+    the user-visible answer, not just while it can still call tools.
+
+    Without this, a sweep that already ran before the user narrowed the
+    request (list every conversation, then ask which to review) leaves data
+    about the unselected ones sitting in tool results — and nothing stopped
+    the forced final-answer turn from reporting on it anyway (PR #2099
+    review, F4)."""
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("check my channels for action items")
+
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    assert "narrowed the request to a selected" in forced_prompt
+    assert (
+        "leave out anything outside it even if an earlier tool call already "
+        "returned data about it" in forced_prompt
+    )
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_missing_argument_value_instruction_matches_interaction_policy(
+    user_interaction_enabled: bool,
+) -> None:
+    """A missing argument value routes to whichever remedy the run allows.
+
+    The grounding rule tells the model to classify an unsourced fact-carrying
+    argument as missing information; this instruction is what turns that
+    classification into an action, and the two branches must never both be
+    present.
+    """
+    ask_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, call ask_user_question"
+    )
+    blocked_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, do not ask the user"
+    )
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("update Jane Doe")
+
+    # tool_names is derived per branch only to keep the input shaped like
+    # production, where the interaction control tools are filtered out of the
+    # schema when interaction is disabled. It drives nothing here:
+    # missing_information_instruction never reads tool_names, so every
+    # assertion below is driven solely by user_interaction_enabled.
+    tool_names = ["update_record"]
+    if user_interaction_enabled:
+        tool_names.append("ask_user_question")
+    prompt = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)[
+        0
+    ]["content"]
+
+    # The subset-selection rule describes how to read an ask_user_question
+    # answer, so it travels with the branch where that tool exists; a run that
+    # cannot ask must not be told how to interpret an answer it can't receive.
+    # It's scoped to questions about which items/resources to act on (not
+    # every ask_user_question, e.g. a format pick) — see PR #2099 review.
+    subset_instruction = (
+        "that asked which items or resources to act on by selecting a "
+        "subset of the offered options, that selection is the complete "
+        "scope for that work"
+    )
+
+    if user_interaction_enabled:
+        assert ask_instruction in prompt
+        assert blocked_instruction not in prompt
+        assert "do not fill the value in yourself" in prompt
+        assert subset_instruction in prompt
+        assert "even ones that are already accessible" in prompt
+        assert "or that fit the original request" in prompt
+    else:
+        assert blocked_instruction in prompt
+        assert ask_instruction not in prompt
+        assert "finish with outcome=blocked and explain what is missing" in prompt
+        assert subset_instruction not in prompt
+
+
+@pytest.mark.asyncio
+async def test_react_tool_argument_rule_tracks_ask_user_question_availability() -> None:
+    """The prohibition and its remedy must reach the model on the same call.
+
+    The grounding rule tells the model to treat an unsourceable fact-carrying
+    argument as missing information; ask_user_question is the tool that acts on
+    that classification. Telling the model not to invent a value on a turn
+    where it cannot ask for one would leave it with no legal move. Both are
+    gated by ``force_final_answer`` today, so the coupling holds only
+    incidentally; this pins both directions of it against a later change that
+    narrows one gate without the other.
+    """
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need calculation.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The result is 4."}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[FakeTool()], llm=llm)
+
+    assert result["success"] is True
+    coupling = [
+        (
+            "ask_user_question"
+            in [schema["function"]["name"] for schema in call["tools"]],
+            "tool-call arguments that assert facts" in call["messages"][0]["content"],
+        )
+        for call in llm.calls
+    ]
+    # One run covers both cells: the open turn offers ask_user_question and
+    # carries the rule, the forced final turn offers neither.
+    assert coupling == [(True, True), (False, False)]
+
+
+@pytest.mark.asyncio
+async def test_react_closes_invalid_initial_final_answer_stream_before_retry() -> None:
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        partial_final_before_work_tool=True
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "目前没有找到可直接下载的音频片段。"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[2]["error"] == "invalid tool protocol, retrying"
+
+
+@pytest.mark.asyncio
+async def test_react_reuses_resolved_route_for_tool_protocol_retry() -> None:
+    downstream = StreamingInvalidToolProtocolFinalAnswerLLM(
+        partial_final_before_work_tool=True
+    )
+    selected_models: list[str] = []
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = 1_048_576
+
+    async def select_model(_prompt: str) -> str:
+        selected = f"test/model-{len(selected_models) + 1}"
+        selected_models.append(selected)
+        return selected
+
+    router._select_model = select_model  # type: ignore[assignment]
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="task-1", tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=router,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert selected_models == ["test/model-1", "test/model-2"]
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "unavailable_tool_call_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert retry_starts[0]["data"]["selected_model"] == "test/model-2"
+    assert retry_starts[0]["data"]["context_window"] == 1_048_576
+
+
+@pytest.mark.asyncio
+async def test_react_closes_invalid_retry_final_answer_stream_before_failure() -> None:
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=True,
+        invalid_retry=True,
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    outbound = OutboundCollector()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(
+        execution_id="task-1",
+        tracer=tracer,
+        outbound_message_handler=outbound,
+    )
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert outbound.events[2]["error"] == "invalid tool protocol after retry"
+    invalid_end_events = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_end_llm"
+        and event["data"].get("success") is False
+    ]
+    assert [event["data"]["phase"] for event in invalid_end_events] == [
+        "discarded_invalid_tool_protocol",
+        "discarded_invalid_tool_protocol_retry",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_does_not_stream_plain_text_when_tool_protocol_is_ignored() -> (
+    None
+):
+    llm = StreamingPlainTextFinalAnswerLLM()
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Answer directly")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Plain final."
+    assert llm.stream_calls[0]["tools"] is not None
+    assert llm.stream_calls[0]["tool_choice"] == "required"
+    assert outbound.events == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_does_not_stream_tool_call_preamble() -> None:
+    llm = StreamingPreambleToolCallLLM()
+    pattern = ReActPattern(max_iterations=1)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    outbound = OutboundCollector()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(
+        execution_id="task-1",
+        tracer=tracer,
+        outbound_message_handler=outbound,
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is False
+    assert tool.calls == [{"expression": "2+2"}]
+    assert llm.stream_calls[0]["tools"][0]["function"]["name"] == "calculator"
+    assert outbound.events == []
+    tool_start_event = next(
+        event for event in tracer.events if event["event_type"] == "action_start_tool"
+    )
+    assert tool_start_event["data"]["assistant_content"] == ("I will use a tool first.")
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_streams_final_answer_control_tool() -> None:
+    llm = StreamingFinalAnswerToolLLM()
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Answer directly")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Hi there."
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert [event["delta"] for event in outbound.events[1:-1]] == [
+        "Hi",
+        " there",
+        ".",
+    ]
+    assert outbound.events[-1]["content"] == "Hi there."
+
+
+@pytest.mark.asyncio
+async def test_react_strips_final_answer_bundled_before_work_tool() -> None:
+    """I-2: a final_answer bundled before a work tool is stripped too - the
+    work tool is no longer silently discarded, and the candidate answer text
+    is never streamed to the frontend."""
+
+    llm = StreamingMixedFinalAnswerAndToolLLM()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert not any(
+        event.get("content") == "Candidate" or event.get("delta") == "Candidate"
+        for event in outbound.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_strips_final_answer_bundled_after_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-1/I-3/I-5: a final_answer bundled after a work tool is stripped, the
+    work tool executes and its result reaches the next turn, and the strip is
+    logged once with the model name and the pre-strip tool list, bounded and
+    escaped."""
+
+    llm = FakeNamedLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+
+    # I-3: the stripped final_answer leaves no trace in the assistant
+    # message, the tool-result messages, or the ledger.
+    assistant_messages = context.get_messages_by_role("assistant")
+    first_turn_tool_names = [
+        call["function"]["name"] for call in (assistant_messages[0].tool_calls or [])
+    ]
+    assert first_turn_tool_names == ["calculator"]
+    tool_result_ids = {
+        message.tool_call_id for message in context.get_messages_by_role("tool")
+    }
+    assert "call_final" not in tool_result_ids
+    assert "call_final" not in pattern.tool_call_id_index
+
+    # Regression-only guard, not a mutation-effective assertion on its own:
+    # no orphaned tool_call may ever appear in history.
+    assistant_tool_call_ids = {
+        call["id"]
+        for message in assistant_messages
+        for call in (message.tool_calls or [])
+    }
+    assert assistant_tool_call_ids == tool_result_ids
+
+    all_content = json.dumps(
+        [message.content for message in context.messages], default=str
+    )
+    assert "Looking that up now." not in all_content
+
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["messages"][-1]["role"] == "tool"
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert "final_answer" in messages[0]
+    assert "calculator" in messages[0]
+    assert "fake-model" in messages[0]
+
+    # I-5 (bound): the tool-name list in the warning is capped, escaped, and
+    # never exposes an unbounded or unescaped model-controlled string.
+    caplog.clear()
+    long_name = "x" * 200 + "\n" + "y"
+    overflow_tool_calls = [
+        {"id": "call_long", "function": {"name": long_name, "arguments": "{}"}},
+        *(
+            {
+                "id": f"call_work_{index}",
+                "function": {"name": f"work_tool_{index}", "arguments": "{}"},
+            }
+            for index in range(10)
+        ),
+        {
+            "id": "call_overflow_final",
+            "function": {
+                "name": "final_answer",
+                "arguments": '{"answer":"Looking that up now."}',
+            },
+        },
+    ]
+    overflow_llm = FakeNamedLLM(responses=[{"tool_calls": overflow_tool_calls}])
+    overflow_pattern = ReActPattern(max_iterations=1)
+    overflow_context = ExecutionContext(
+        system_prompt="You are helpful.", execution_id="task-2"
+    )
+    overflow_context.add_user_message("Run many tools")
+    overflow_runtime = PatternRuntime(execution_id="task-2")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        await overflow_pattern.run(
+            context=overflow_context,
+            tools=[],
+            llm=overflow_llm,
+            runtime=overflow_runtime,
+        )
+
+    overflow_messages = [record.getMessage() for record in caplog.records]
+    assert len(overflow_messages) == 1
+    overflow_message = overflow_messages[0]
+    assert "(+4 more)" in overflow_message
+    assert "\n" not in overflow_message
+    assert ("x" * 64) in overflow_message
+    assert ("x" * 65) not in overflow_message
+
+
+def test_tool_names_for_log_tolerates_non_mapping_entries() -> None:
+    """Matches the isinstance(dict) defense in _batch_carries_work_tool and
+    _strip_final_answer_bundled_with_work_tools: a non-mapping batch entry
+    must render a placeholder instead of crashing the log line it appears
+    in."""
+
+    pattern = ReActPattern()
+
+    rendered = pattern._tool_names_for_log(
+        [
+            {"id": "call_1", "name": "calculator"},
+            "not-a-tool-call",
+            None,
+        ]
+    )
+
+    assert "calculator" in rendered
+    assert "non-mapping tool_call: str" in rendered
+    assert "non-mapping tool_call: NoneType" in rendered
+
+
+@pytest.mark.asyncio
+async def test_react_strips_every_final_answer_in_a_mixed_batch() -> None:
+    """I-4: every final_answer in a batch is stripped, not only the first."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_a",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"A"}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_b",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"B"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["response"] not in {"A", "B"}
+    assert result["response"] == "4"
+    assistant_messages = context.get_messages_by_role("assistant")
+    first_turn_tool_calls = assistant_messages[0].tool_calls or []
+    assert len(first_turn_tool_calls) == 1
+    assert first_turn_tool_calls[0]["function"]["name"] == "calculator"
+
+
+@pytest.mark.asyncio
+async def test_react_closes_open_answer_stream_when_bundled_final_answer_is_stripped() -> (
+    None
+):
+    """I-6: an answer stream already open when the batch turns out to bundle
+    a work tool is closed explicitly instead of left open forever, and it is
+    never closed as though the candidate text were the real final answer."""
+
+    llm = StreamingAnswerThenWorkToolLLM()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+
+    started_id = next(
+        event["message_id"]
+        for event in outbound.events
+        if event["type"] == "final_answer_start"
+    )
+    first_stream_events = []
+    for event in outbound.events:
+        if event.get("message_id") != started_id:
+            continue
+        first_stream_events.append(event)
+        if event["type"] == "final_answer_error":
+            break
+
+    assert [event["type"] for event in first_stream_events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert not any(
+        event["type"] == "final_answer_end"
+        and event.get("content") == "Looking that up now."
+        for event in outbound.events
+    )
+    assert outbound.events[-1]["type"] == "final_answer_end"
+    assert outbound.events[-1]["content"] == "4"
+
+
+@pytest.mark.asyncio
+async def test_react_keeps_send_message_bundled_with_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Guards against a future change that widens the strip from final_answer
+    to every control tool. This test stays green if the strip is removed
+    entirely - it pins behavior that must not change, not behavior this fix
+    introduces."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(runtime.outbound_messages) == 1
+    assert runtime.outbound_messages[0]["message"] == "Still working"
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_keeps_control_only_final_answer_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same guard shape as the send_message case: a batch of control tools
+    only has no result the answer could be missing, so the strip must not
+    touch it. Green with or without the strip."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Do the thing")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "Done."
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_forced_final_answer_recovers_full_tool_set_after_mixed_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-9a: guards the forced-final-answer turn's existing recovery path.
+    This test stays green if the strip is removed entirely - it pins
+    behavior that must not change, not behavior this fix introduces."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_2",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    second_call_tool_names = {
+        schema["function"]["name"] for schema in llm.calls[1]["tools"]
+    }
+    assert "calculator" in second_call_tool_names
+    assert pattern.force_final_answer_next is False
+    assert tool.calls == [{"expression": "2+2"}]
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_forced_final_answer_fails_when_recovery_retry_bundles_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-9b: anchor test - pins the strip's position, not its existence.
+    Deleting the strip helper entirely leaves this green. Moving the strip
+    call to run ahead of either tool-protocol-retry guard check instead of
+    after both turns it red: on the first guard, because the strip fires and
+    logs before that response is discarded wholesale for an unrelated reason,
+    leaving a stray "discarding" warning behind; on the second (retry) guard,
+    because stripping the retried batch's final_answer erases the very
+    mixed-call shape that guard exists to reject, so the run no longer fails
+    at all - it runs the retried calculator and needs a third response the
+    fixture never provides."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_2",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tool.calls == []
+    # The run fails through the existing invalid-protocol path, which logs
+    # its own unrelated warning; only the strip's warning must be absent.
+    assert not any("discarding" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_from_a_retried_batch_when_not_reforcing() -> (
+    None
+):
+    """Guards the retry recheck's accepted behavior change: a retried batch
+    that is neither a forced turn nor itself rejecting mixed control calls
+    (reject_mixed_control_calls=False from a provider protocol error on the
+    first response, force_final_answer=False because this was never a forced
+    turn) now lets a bundled empty final_answer strip and the work tool run,
+    instead of hard-failing as "invalid tool protocol after retry". The
+    first response's provider-level protocol error is what puts the run on
+    the retry path at all; the retried response is the one carrying the
+    mixed batch this test is pinning."""
+
+    llm = FakeLLM(
+        responses=[
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="serialized_tool_call_content",
+                    message="Invalid provider tool protocol.",
+                )
+            ),
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_work",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":""}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_bundled_with_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-11: an empty-answer final_answer bundled with a work tool is
+    stripped like any other bundled final_answer, instead of discarding the
+    whole response the way a control-only empty answer does."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":""}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 2
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("carried no answer text" in message for message in messages)
+    assert any(
+        "final_answer" in message and "calculator" in message for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pauses_for_user_after_stripping_bundled_final_answer() -> None:
+    """I-12: a batch that turns out to need user input after the bundled
+    final_answer is stripped still pauses cleanly, with the unexecuted work
+    tool cancelled rather than silently dropped."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                    {
+                        "id": "call_ask",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": '{"message":"Which one?"}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2 then ask me something")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert tool.calls == []
+    assert "call_final" not in pattern.tool_call_id_index
+    assert pattern._record_for_tool_call_id("call_calc").status == "cancelled"
+    assert pattern._record_for_tool_call_id("call_ask").status == "completed"
+
+    assistant_messages = context.get_messages_by_role("assistant")
+    assistant_tool_call_ids = {
+        call["id"]
+        for message in assistant_messages
+        for call in (message.tool_calls or [])
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in context.get_messages_by_role("tool")
+    }
+    assert assistant_tool_call_ids == {"call_ask", "call_calc"}
+    assert assistant_tool_call_ids <= tool_result_ids
+
+
+@pytest.mark.asyncio
+async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "render_english_poster"
+    tool = FakeBrowserNavigateTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-browser",
+            "name": "browser_navigate",
+            "args": {"url": "poster_en.html"},
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [
+        {
+            "url": "poster_en.html",
+            "_xagent_step_id": "render_english_poster",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_passes_runtime_step_to_computer_tool_call() -> None:
+    class FakeComputerTool:
+        name = "computer"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(args)
+            return {"success": True}
+
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "inspect_browser"
+    tool = FakeComputerTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-computer",
+            "name": "computer",
+            "args": {"actions": [{"type": "screenshot"}]},
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [
+        {
+            "actions": [{"type": "screenshot"}],
+            "_xagent_step_id": "inspect_browser",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_interrupt_cancels_in_flight_tool() -> None:
+    class SlowVisionTool:
+        name = "understand_images"
+        description = "Analyze an image."
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def ainvoke(self, _args: dict[str, Any]) -> Any:
+            self.started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return {"success": True, "answer": "never"}
+
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = SlowVisionTool()
+    tool_call = {
+        "id": "call-vision",
+        "name": "understand_images",
+        "args": {"images": "file-id", "question": "What is shown?"},
+    }
+    task = asyncio.create_task(pattern._execute_tool_safely(tool_call, [tool], runtime))
+    await tool.started.wait()
+
+    runtime.request_interrupt("paused by websocket")
+
+    with pytest.raises(ToolCallInterrupted, match="paused by websocket"):
+        await task
+    assert tool.cancelled.is_set()
+    assert pattern._record_for_tool_call_id("call-vision").status == "interrupted"
+    assert (
+        pattern._record_for_tool_call_id("call-vision").error == "paused by websocket"
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_tool_interrupt_checkpoint_uses_tool_safe_point() -> None:
+    class SlowVisionTool:
+        name = "understand_images"
+        description = "Analyze an image."
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def ainvoke(self, _args: dict[str, Any]) -> Any:
+            self.started.set()
+            await asyncio.sleep(60)
+            return {"success": True, "answer": "never"}
+
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="react-tool-safe-point")
+    context = ExecutionContext(execution_id="react-tool-safe-point")
+    context.add_user_message("Inspect this image.")
+    tool = SlowVisionTool()
+    llm = FakeLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "vision-1",
+                        "function": {
+                            "name": "understand_images",
+                            "arguments": json.dumps(
+                                {
+                                    "images": "file-id",
+                                    "question": "What is shown?",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    task = asyncio.create_task(
+        pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+    )
+    await tool.started.wait()
+    runtime.request_interrupt("paused by websocket")
+    result = await task
+
+    assert result["status"] == "interrupted"
+    checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(runtime.checkpoints)
+        if checkpoint["label"] == "interrupted"
+    )
+    assert checkpoint["metadata"] == {
+        "safe_point": "during_tool",
+        "reason": "paused by websocket",
+    }
+
+
+@pytest.mark.asyncio
+async def test_react_sanitizes_tool_args_before_trace_and_execution() -> None:
+    class CapturingRuntime(PatternRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started_args: dict[str, Any] | None = None
+
+        async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+            self.started_args = dict(tool_call.get("args") or {})
+
+    pattern = ReActPattern()
+    runtime = CapturingRuntime()
+    tool = FakeTraceSanitizingTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-custom-api",
+            "name": "custom_api",
+            "args": {
+                "headers": {"Authorization": "Bearer caller-token"},
+                "params": {"q": "client"},
+            },
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert runtime.started_args == {"params": {"q": "client"}}
+    assert tool.calls == [{"params": {"q": "client"}}]
+    record = pattern._record_for_tool_call_id("call-custom-api")
+    assert record.args == {"params": {"q": "client"}}
+    assert "caller-token" not in repr(record.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_react_trace_safe_tool_args_handles_null_args() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = FakeTraceSanitizingTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-custom-api",
+            "name": "custom_api",
+            "args": None,
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [{}]
+
+
+def test_react_trace_safe_tool_args_ignores_non_mapping_args() -> None:
+    pattern = ReActPattern()
+    tool = FakeTraceSanitizingTool()
+    tool_call = {
+        "id": "call-custom-api",
+        "name": "custom_api",
+        "args": ["not", "a", "mapping"],
+    }
+
+    result = pattern._with_trace_safe_tool_args(tool_call, [tool])
+
+    assert result is tool_call
+
+
+@pytest.mark.parametrize("raw_args", [["not", "a", "mapping"], "not-a-mapping"])
+@pytest.mark.asyncio
+async def test_react_rejects_non_mapping_tool_args_without_crashing_ledger(
+    raw_args: Any,
+) -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = FakeTraceSanitizingTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-custom-api",
+            "name": "custom_api",
+            "args": raw_args,
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "Tool call args must be a JSON object."
+    assert tool.calls == []
+    record = pattern._record_for_tool_call_id("call-custom-api")
+    assert record.status == "failed"
+    assert record.args == {}
+    assert record.error == "Tool call args must be a JSON object."
+
+
+def test_react_trace_safe_tool_args_detects_in_place_sanitizer() -> None:
+    pattern = ReActPattern()
+    tool = FakeInPlaceTraceSanitizingTool()
+    tool_call = {
+        "id": "call-custom-api",
+        "name": "custom_api",
+        "args": {
+            "headers": {"Authorization": "Bearer caller-token"},
+            "body": {"secret": "body-secret", "safe": "value"},
+        },
+    }
+
+    result = pattern._with_trace_safe_tool_args(tool_call, [tool])
+
+    assert result is not tool_call
+    assert result["args"] == {"body": {"safe": "value"}}
+    assert tool_call["args"] == {
+        "headers": {"Authorization": "Bearer caller-token"},
+        "body": {"secret": "body-secret", "safe": "value"},
+    }
+    assert "caller-token" not in repr(result)
+    assert "body-secret" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_unwraps_textual_final_answer_json() -> None:
+    llm = FakeLLM(
+        responses=[
+            '```json\n{"action":"final_answer","action_input":"Done cleanly."}\n```'
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Finish")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Done cleanly."
+    assert context.messages[-1].content == "Done cleanly."
+    assert "action_input" not in context.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_finalizes_with_completion_evidence() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_write",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"file_path":"en_poster.html","content":"<html></html>"}'
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            final_answer_response("Created output/en_poster.html."),
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    tool = FakeWriteFileTool()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message(
+        "Create the English poster HTML.",
+        metadata={
+            "dag_completion_evidence": (
+                "The writer returned success=true for the requested output path."
+            )
+        },
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Created output/en_poster.html."
+    assert tool.calls == [{"file_path": "en_poster.html", "content": "<html></html>"}]
+    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    assert llm.calls[1]["tool_choice"] == "required"
+    assert (
+        "Step completion evidence: The writer returned success=true"
+        in (llm.calls[1]["messages"][0]["content"])
+    )
+    assert "Do not repeat the same work" in llm.calls[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"已有结果足够回答。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=3,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    tool = FakeSearchTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "可以基于已有搜索结果回答。"
+    assert len(llm.calls) == 4
+    assert len(tool.calls) == 2
+    tool_names = [schema["function"]["name"] for schema in llm.calls[2]["tools"]]
+    assert tool_names == ["react_decision"]
+    decision_prompt = llm.calls[2]["messages"][-1]["content"]
+    assert "Latest user request text" in decision_prompt
+    assert "最近 AI 新闻" in decision_prompt
+    assert "Do not put user-facing final answer text in this decision" in (
+        decision_prompt
+    )
+    assert "private observations are evidence for reasoning" in decision_prompt
+    assert "requested computer screenshot" in decision_prompt
+    assert "artifact, file_ref, or markdown_link" in decision_prompt
+    assert "future tool action" in decision_prompt
+    assert "response_language" not in decision_prompt
+    decision_schema = llm.calls[2]["tools"][0]["function"]["parameters"]
+    assert "response_language" not in decision_schema["properties"]
+    assert "response_language" not in decision_schema["required"]
+    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
+        "final_answer"
+    ]
+    final_prompt = "\n".join(
+        str(message.get("content") or "") for message in llm.calls[3]["messages"]
+    )
+    assert "Completion assessment JSON" not in final_prompt
+    assert pattern.pending_tool_calls == []
+
+
+def test_react_repeated_decision_anchors_latest_user_text_not_cached_task() -> None:
+    pattern = ReActPattern()
+    pattern.task_text = "search AI news"
+    context = ExecutionContext()
+    context.add_user_message("search AI news")
+    tail = "TAIL_SHOULD_NOT_BE_IN_LANGUAGE_ANCHOR"
+    context.add_user_message(f"请用简体中文回答 {'x' * 430}{tail}")
+
+    messages = pattern._messages_for_repeated_tool_decision(
+        context,
+        {
+            "tool_name": "zhipu_web_search",
+            "latest_tool_name": "zhipu_web_search",
+            "consecutive_tool_calls": 2,
+        },
+    )
+
+    prompt = messages[-1]["content"]
+    anchor_start = prompt.index("Latest user request text")
+    anchor_end = prompt.index("Use this as the controlling request", anchor_start)
+    anchor = prompt[anchor_start:anchor_end]
+    assert "请用简体中文回答" in anchor
+    assert "search AI news" not in anchor
+    assert "... [truncated]" in anchor
+    assert tail not in anchor
+    assert "response_language" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    },
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"OpenAI news May 2026","count":5}',
+                        },
+                    },
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"The current batch is enough.",'
+                                '"supported_findings":["Both searches completed."],'
+                                '"missing_verification":""}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            final_answer_response("Both pending searches were executed."),
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=3,
+        repeated_tool_decision_after_consecutive_tool_calls=1,
+    )
+    tool = FakeSearchTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Both pending searches were executed."
+    assert len(tool.calls) == 2
+    assert len(llm.calls) == 3
+    tool_result_ids = [
+        message.tool_call_id
+        for message in context.messages
+        if message.role == "tool"
+        and (message.metadata or {}).get("tool_name") == "zhipu_web_search"
+    ]
+    assert tool_result_ids[-2:] == ["search_1", "search_2"]
+    tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
+    assert tool_names == ["react_decision"]
+    assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
+        "final_answer"
+    ]
+    final_prompt = "\n".join(
+        str(message.get("content") or "") for message in llm.calls[2]["messages"]
+    )
+    assert "Both searches completed." in final_prompt
+    assert "constrain only interpretive or causal claims" in final_prompt
+    assert "not an exhaustive list of source facts or requested records" in final_prompt
+    assert "report every requested item" in final_prompt
+    assert "answer-scope ceiling" not in final_prompt
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "failed_1",
+                        "function": {
+                            "name": "failing_result",
+                            "arguments": '{"input":"bad image ref"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"Vadim Nicolai xinference","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "browser_1",
+                        "function": {
+                            "name": "browser_navigate",
+                            "arguments": '{"url":"https://example.com/profile"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"Enough cross-tool attempts."}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            final_answer_response("已有跨工具结果，直接回答。", "Simplified Chinese"),
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=4,
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    search_tool = FakeSearchTool()
+    browser_tool = FakeBrowserNavigateTool()
+    context = ExecutionContext()
+    context.add_user_message("判断这封邮件是不是广撒网")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FailingResultTool(), search_tool, browser_tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "已有跨工具结果，直接回答。"
+    assert len(llm.calls) == 5
+    assert len(search_tool.calls) == 1
+    assert len(browser_tool.calls) == 1
+    tool_names = [schema["function"]["name"] for schema in llm.calls[3]["tools"]]
+    assert tool_names == ["react_decision"]
+    decision_prompt = llm.calls[3]["messages"][-1]["content"]
+    assert "3 consecutive work-tool calls without a final answer" in decision_prompt
+    assert "latest work tool was browser_navigate" in decision_prompt
+    assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
+        "final_answer"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "search_source",
+                            "arguments": '{"query":"AirPods 4 charging port"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fetch_1",
+                        "function": {
+                            "name": "fetch_source",
+                            "arguments": '{"query":"Apple AirPods 4 page"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "search_source",
+                            "arguments": '{"query":"AirPods 4 USB-C"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"Enough web research."}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            final_answer_response("AirPods 4 uses USB-C."),
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=4,
+        repeated_tool_decision_after_consecutive_tool_calls=3,
+        repeated_tool_decision_after_consecutive_work_tool_calls=10,
+    )
+    search_tool = FakeGroupedTool("search_source", "research")
+    fetch_tool = FakeGroupedTool("fetch_source", "research")
+    context = ExecutionContext()
+    context.add_user_message("airpods 4 是什么接口")
+
+    result = await pattern.run(
+        context=context,
+        tools=[search_tool, fetch_tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "AirPods 4 uses USB-C."
+    assert len(llm.calls) == 5
+    assert len(search_tool.calls) == 2
+    assert len(fetch_tool.calls) == 1
+    tool_names = [schema["function"]["name"] for schema in llm.calls[3]["tools"]]
+    assert tool_names == ["react_decision"]
+    decision_prompt = llm.calls[3]["messages"][-1]["content"]
+    assert (
+        "3 consecutive successful calls in the research tool group" in decision_prompt
+    )
+    assert "latest tool was search_source" in decision_prompt
+    assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
+        "final_answer"
+    ]
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"已有结果足够回答。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=3,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    tool = FakeSearchTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        allow_auto_reroute=True,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "可以基于已有搜索结果回答。"
+    assert len(llm.calls) == 4
+    assert len(tool.calls) == 2
+    next_tool_names = [
+        tool_schema["function"]["name"] for tool_schema in llm.calls[2]["tools"]
+    ]
+    assert next_tool_names == ["react_decision"]
+    assert (
+        "action must be final_answer or tool_call"
+        in (llm.calls[2]["messages"][-1]["content"])
+    )
+    assert llm.calls[2]["tool_choice"] == "required"
+    assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
+        "final_answer"
+    ]
+    assert pattern.repeated_tool_decision is None
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_repeated_guard_can_switch_to_non_repeated_tool() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"Google AI news May 2026","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"tool_call",'
+                                '"reason":"Need to write the output file.",'
+                                '"missing_verification":"write summarized search results"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "write_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"file_path":"ai_news.md",'
+                                '"content":"summarized search results"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"Simplified Chinese",'
+                                '"answer":"搜索后已写入文件。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    search_tool = FakeSearchTool()
+    write_tool = FakeWriteFileTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(
+        context=context,
+        tools=[search_tool, write_tool],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "搜索后已写入文件。"
+    assert len(search_tool.calls) == 2
+    assert len(write_tool.calls) == 1
+    assert len(llm.calls) == 5
+    decision_tool_names = [
+        schema["function"]["name"] for schema in llm.calls[2]["tools"]
+    ]
+    assert decision_tool_names == ["react_decision"]
+    normal_tool_names = [schema["function"]["name"] for schema in llm.calls[3]["tools"]]
+    assert "zhipu_web_search" in normal_tool_names
+    assert "write_file" in normal_tool_names
+    assert "write summarized search results" in "\n".join(
+        str(message.get("content") or "") for message in llm.calls[3]["messages"]
+    )
+    final_tool_names = [schema["function"]["name"] for schema in llm.calls[4]["tools"]]
+    assert "final_answer" in final_tool_names
+    assert "react_decision" not in final_tool_names
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_repeated_guard_can_fire_twice_in_single_run() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"AI news May 2026","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"Google AI news May 2026","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"tool_call",'
+                                '"reason":"Need one more source.",'
+                                '"missing_verification":"official source"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_3",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": (
+                                '{"query":"OpenAI news May 2026 official","count":3}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_2",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"final_answer",'
+                                '"reason":"Now enough sources."}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            final_answer_response("第三次搜索后信息足够。", "Simplified Chinese"),
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    tool = FakeSearchTool()
+    context = ExecutionContext()
+    context.add_user_message("最近 AI 新闻")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "第三次搜索后信息足够。"
+    assert len(tool.calls) == 3
+    assert len(llm.calls) == 6
+    assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
+        "react_decision"
+    ]
+    assert "official source" in "\n".join(
+        str(message.get("content") or "") for message in llm.calls[3]["messages"]
+    )
+    assert [schema["function"]["name"] for schema in llm.calls[4]["tools"]] == [
+        "react_decision"
+    ]
+    assert [schema["function"]["name"] for schema in llm.calls[5]["tools"]] == [
+        "final_answer"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_defers_repeated_final_decision_to_normal_loop() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"locate source file","count":10}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "search_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"find pptx input path","count":5}',
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "decision_1",
+                        "function": {
+                            "name": "react_decision",
+                            "arguments": (
+                                '{"action":"tool_call",'
+                                '"reason":"Need to perform the actual file edit.",'
+                                '"missing_verification":"remove the NotebookLM watermark from the PPTX"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "write_1",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": (
+                                '{"file_path":"MegaCube_Infinite_AI2.pptx",'
+                                '"content":"watermark removed"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"Simplified Chinese",'
+                                '"answer":"已完成处理。"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    search_tool = FakeSearchTool()
+    write_tool = FakeWriteFileTool()
+    context = ExecutionContext()
+    context.add_user_message("去除右下角 notebooklm 水印")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[search_tool, write_tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "已完成处理。"
+    assert len(search_tool.calls) == 2
+    assert len(write_tool.calls) == 1
+    assistant_messages = [
+        message.content for message in context.messages if message.role == "assistant"
+    ]
+    assert "已找到源文件路径。正在处理去除水印，请稍候..." not in assistant_messages
+    assert assistant_messages[-1] == "已完成处理。"
+    continue_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "repeated_tool_decision_continue"
+    ]
+    assert len(continue_checkpoints) == 1
+    assert any(
+        message.role == "system"
+        and "Repeated tool decision continuation guidance" in message.content
+        and "remove the NotebookLM watermark from the PPTX" in message.content
+        for message in context.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_streams_final_answer_after_repeated_guard() -> None:
+    llm = StreamingRepeatedGuardFinalAnswerLLM()
+    pattern = ReActPattern(
+        max_iterations=4,
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+    tool = FakeSearchTool()
+    context = ExecutionContext(execution_id="task-1")
+    context.add_user_message("Search AI news")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "Fallback answer."
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "Fallback answer."
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_supports_plain_function_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    to_thread_calls: list[dict[str, Any]] = []
+
+    async def fake_to_thread(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        to_thread_calls.append({"fn": fn, "args": args, "kwargs": kwargs})
+        return fn(*args, **kwargs)
+
+    def double_number(value: int) -> dict[str, Any]:
+        """Double a numeric input."""
+        return {"result": value * 2}
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use the plain function.",
+                "tool_calls": [
+                    {
+                        "id": "call_plain",
+                        "function": {
+                            "name": "double_number",
+                            "arguments": '{"value":4}',
+                        },
+                    }
+                ],
+            },
+            {"content": "The result is 8.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Double 4")
+
+    result = await pattern.run(context=context, tools=[double_number], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 8."
+    assert to_thread_calls
+    assert to_thread_calls[0]["kwargs"] == {"value": 4}
+    tool_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "double_number"
+    )
+    assert tool_schema["function"]["description"] == "Double a numeric input."
+    parameters = tool_schema["function"]["parameters"]
+    assert parameters["properties"]["value"]["type"] == "integer"
+    assert parameters["required"] == ["value"]
+    assert context.messages[2].content == "Tool double_number returned: {'result': 8}"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_uses_langchain_tool_schema() -> None:
+    @langchain_tool
+    def add_numbers(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_add",
+                        "function": {
+                            "name": "add_numbers",
+                            "arguments": '{"a":2,"b":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "The result is 5.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Add 2 and 3")
+
+    result = await pattern.run(context=context, tools=[add_numbers], llm=llm)
+
+    assert result["success"] is True
+    tool_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "add_numbers"
+    )
+    parameters = tool_schema["function"]["parameters"]
+    assert parameters["properties"]["a"]["type"] == "integer"
+    assert parameters["properties"]["b"]["type"] == "integer"
+    assert parameters["required"] == ["a", "b"]
+    assert context.get_messages_by_role("tool")[-1].content == (
+        "Tool add_numbers returned: 5"
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_supports_legacy_args_type_schema() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Inspect schema")
+
+    result = await pattern.run(context=context, tools=[LegacySchemaTool()], llm=llm)
+
+    assert result["success"] is True
+    tool_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "legacy_schema"
+    )
+    parameters = tool_schema["function"]["parameters"]
+    assert parameters["properties"]["value"]["type"] == "integer"
+    assert parameters["required"] == ["value"]
+
+
+def test_react_compacts_provider_tool_schema_without_losing_named_fields() -> None:
+    class CompactSchemaArgs:
+        @staticmethod
+        def model_json_schema() -> dict[str, Any]:
+            return {
+                "title": "CompactSchemaArgs",
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "title": "Title",
+                        "type": "string",
+                        "description": "First line.\n\n  Second line.",
+                        "default": "draft",
+                    },
+                    "properties": {
+                        "title": "Properties",
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "title": "Value",
+                                "type": "integer",
+                            }
+                        },
+                    },
+                },
+                "required": ["title", "properties"],
+            }
+
+    class CompactSchemaTool:
+        def __init__(self) -> None:
+            class Metadata:
+                name = "compact_schema"
+                description = "Compact\n\n  - first   step\n  - second step."
+
+            self.metadata = Metadata()
+
+        def args_type(self) -> type[CompactSchemaArgs]:
+            return CompactSchemaArgs
+
+    schema = ReActPattern()._build_tool_schema(CompactSchemaTool())
+
+    assert schema["function"]["description"] == (
+        "Compact\n\n- first step\n- second step."
+    )
+    parameters = schema["function"]["parameters"]
+    assert "title" not in parameters
+    assert parameters["properties"]["title"] == {
+        "type": "string",
+        "description": "First line.\n\nSecond line.",
+        "default": "draft",
+    }
+    assert parameters["properties"]["properties"] == {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+    }
+    assert parameters["required"] == ["title", "properties"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Loading the skill first.",
+                "tool_calls": [
+                    {
+                        "id": "call_skill",
+                        "function": {
+                            "name": "load_skill",
+                            "arguments": '{"skill_name":"test-skill"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    memory_store = FakeMemoryStore()
+    skill_manager = FakeSkillManager()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message(
+        "Do the thing\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Do the thing"},
+    )
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+        skill_manager=skill_manager,
+        allowed_skills=["test-skill"],
+    )
+
+    assert result["success"] is True
+    assert [search["filters"]["category"] for search in memory_store.searches] == [
+        "react_memory",
+        "general",
+    ]
+    assert [search["query"] for search in memory_store.searches] == [
+        "Do the thing",
+        "Do the thing",
+    ]
+    first_system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "Use the stored project preference." in first_system_prompt
+    assert "Available skills:" in first_system_prompt
+    assert "- test-skill: A test skill" in first_system_prompt
+    tool_names = [
+        tool["function"]["name"] for tool in list(llm.calls[0].get("tools") or [])
+    ]
+    assert "load_skill" in tool_names
+    # After load_skill, the full guidance appears in the next system prompt.
+    assert skill_manager.loaded == ["test-skill"]
+    second_system_prompt = llm.calls[1]["messages"][0]["content"]
+    assert "Available Skill: test-skill" in second_system_prompt
+    assert "Follow the selected skill instructions." in second_system_prompt
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_emits_memory_retrieve_trace_events() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    memory_store = FakeMemoryStore()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-memory-trace")
+    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    context = ExecutionContext(execution_id="task-memory-trace")
+    context.add_user_message("Use memory")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    memory_events = [
+        event for event in tracer.events if "memory_retrieve" in event["event_type"]
+    ]
+    assert [event["event_type"] for event in memory_events] == [
+        "task_start_memory_retrieve",
+        "task_end_memory_retrieve",
+    ]
+    assert all(event["task_id"] == "task-memory-trace" for event in memory_events)
+    store_events = [
+        event for event in tracer.events if "memory_store" in event["event_type"]
+    ]
+    # store_memory is model-driven now; no tool call means no store events.
+    assert store_events == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_keeps_tools_available_after_successful_tool() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need calculation.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The result is 4."}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == [{"expression": "2+2"}]
+    assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
+    second_call_tool_names = [
+        schema["function"]["name"] for schema in llm.calls[1]["tools"]
+    ]
+    assert "calculator" in second_call_tool_names
+    assert "final_answer" in second_call_tool_names
+    assert "Do not call tools again" not in llm.calls[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
+    llm = FakeLLM(responses=[{"content": "No tools needed."}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeAskUserTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    tool_names = [schema["function"]["name"] for schema in llm.calls[0]["tools"]]
+    assert tool_names.count("ask_user_question") == 1
+    assert "final_answer" in tool_names
+    assert "send_message" in tool_names
+    assert "complete_task" not in tool_names
+    ask_user_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "ask_user_question"
+    )
+    ask_user_description = ask_user_schema["function"]["description"]
+    assert "cannot continue without missing user-provided information" in (
+        ask_user_description
+    )
+    assert (
+        "Use this when the user explicitly asks to be consulted, or when "
+        "execution cannot continue" in ask_user_description
+    )
+    assert (
+        "Unless the user explicitly asks to be consulted, do not use it to "
+        "confirm execution strategy" in ask_user_description
+    )
+    assert "whether to use memory" in ask_user_description
+    assert (
+        "Do not request passwords, API keys, or access tokens" in ask_user_description
+    )
+    assert "offer uploaded or pasted data where suitable" in ask_user_description
+    assert "credentials belong in the application's connection settings" in (
+        ask_user_description
+    )
+    assert (
+        "a fact-carrying value (one that asserts a real-world fact) for a tool "
+        "argument that the user has not provided" in ask_user_description
+    )
+    # The qualifier must match the grounding rule's scope: without it the
+    # description would invite pausing for a search query the model composes.
+    assert "require inventing a fact-carrying argument value" in ask_user_description
+    system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "Only call tools that are present in the current tool schema" in (
+        system_prompt
+    )
+    assert "tool names mentioned in memory" in system_prompt
+    assert "call the final_answer tool exactly once" in system_prompt
+    assert (
+        "Never put final_answer in the same response as any other tool call"
+        in system_prompt
+    )
+    final_answer_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "final_answer"
+    )["function"]
+    assert (
+        "canonical language contract provided by the system context"
+        in final_answer_schema["description"]
+    )
+    assert (
+        "Call this tool alone: never place it in the same response as any "
+        "other tool call" in final_answer_schema["description"]
+    )
+    assert "response_language" in final_answer_schema["parameters"]["required"]
+    assert "outcome" in final_answer_schema["parameters"]["required"]
+    assert final_answer_schema["parameters"]["properties"]["outcome"]["enum"] == [
+        "completed",
+        "partial",
+        "blocked",
+    ]
+    response_language_schema = final_answer_schema["parameters"]["properties"][
+        "response_language"
+    ]
+    assert "Simplified Chinese" in response_language_schema["description"]
+    assert "Traditional Chinese" in response_language_schema["description"]
+    assert "generic Chinese" in response_language_schema["description"]
+    answer_schema = final_answer_schema["parameters"]["properties"]["answer"]
+    assert "response_language" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
+    assert "exact markdown_link" in answer_schema["description"]
+    assert "get_workspace_output_files" not in answer_schema["description"]
+
+
+def test_interaction_type_list_has_one_source() -> None:
+    from xagent.core.tools.adapters.vibe.ask_user_tool import InteractionArg
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+    from xagent.web.services.task_interaction_service import _V1_INTERACTION_TYPES
+
+    assert INTERACTION_TYPES == (
+        "select_one",
+        "select_multiple",
+        "text_input",
+        "file_upload",
+        "confirm",
+        "number_input",
+        "action_cards",
+    )
+    assert InteractionArg.model_fields["type"].description == (
+        "Type of interaction: select_one, select_multiple, text_input, "
+        "file_upload, confirm, number_input, action_cards"
+    )
+    assert frozenset(INTERACTION_TYPES) == _V1_INTERACTION_TYPES
+
+
+async def test_react_pattern_ask_user_question_schema_derives_its_type_enum_from_one_source() -> (
+    None
+):
+    """The ask_user_question tool's ``interactions[].type`` enum is built
+    from ``interaction_types.INTERACTION_TYPES`` rather than a copy written
+    out in this schema; a name added or reordered there must show up here
+    unchanged."""
+
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+
+    llm = FakeLLM(responses=[{"content": "No tools needed."}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeAskUserTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    ask_user_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "ask_user_question"
+    )["function"]
+    type_enum = ask_user_schema["parameters"]["properties"]["interactions"]["items"][
+        "properties"
+    ]["type"]["enum"]
+    assert type_enum == list(INTERACTION_TYPES)
+
+
+def test_react_module_pulls_in_no_web_modules() -> None:
+    """react.py must not depend on xagent.web. The interaction type list it
+    reads lives in an import-free module for exactly this reason -- putting
+    it beside InteractionArg in ask_user_tool pulls the tool-registration
+    chain and 61 xagent.web modules into every import of this pattern."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import xagent.core.agent.pattern.react.react; "
+        "print(len([m for m in sys.modules if m.startswith('xagent.web')]))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "0"
+
+
+def test_react_final_answer_lookup_instruction_tracks_active_workspace_tool() -> None:
+    pattern = ReActPattern()
+
+    assert not inspect.signature(pattern._final_answer_tool_schema).parameters
+    schemas = pattern._tool_schemas_with_builtin_controls([FakeWorkspaceOutputTool()])
+    final_answer_schema = next(
+        schema for schema in schemas if schema["function"]["name"] == "final_answer"
+    )
+    answer_description = final_answer_schema["function"]["parameters"]["properties"][
+        "answer"
+    ]["description"]
+
+    assert "get_workspace_output_files" in answer_description
+
+
+def _context_with_spill_records(*relative_paths: str) -> ExecutionContext:
+    from xagent.core.agent.context.components import SpillRegistryComponent
+
+    context = ExecutionContext()
+    records = [
+        {
+            "relative_path": path,
+            "kind": "array",
+            "item_count": 1,
+            "original_chars": 10,
+            "value_path": "output",
+            "record_fields": None,
+            "truncated_after_items": None,
+        }
+        for path in relative_paths
+    ]
+    context.set_component("spilled_results", SpillRegistryComponent(records=records))
+    return context
+
+
+# --- read_tool_result schema gate -------------------------------------------
+
+
+def test_read_tool_result_excluded_from_base_tool_schemas_unconditionally() -> None:
+    pattern = ReActPattern()
+    schemas = pattern._tool_schemas_with_builtin_controls(
+        [FakeWorkspaceOutputTool(), FakeReadToolResultTool()]
+    )
+    names = [schema["function"]["name"] for schema in schemas]
+    assert SPILL_READ_TOOL_NAME not in names
+
+
+def test_spilled_paths_empty_registry() -> None:
+    pattern = ReActPattern()
+    assert pattern._spilled_paths(ExecutionContext()) == frozenset()
+
+
+def test_spilled_paths_does_not_create_a_registry_component() -> None:
+    """Reading the registry must not add an empty component to the context.
+
+    The context's spilled_results property creates one on first read, and
+    the schema gate reads the registry on every iteration, so going through
+    that property would put an empty spilled_results entry into every
+    checkpoint of a run that never stored anything.
+    """
+    pattern = ReActPattern()
+    context = ExecutionContext()
+
+    assert pattern._spilled_paths(context) == frozenset()
+    assert context.get_component("spilled_results") is None
+    assert "spilled_results" not in context.to_dict()["components"]
+
+
+def test_spilled_paths_reflects_registry_contents() -> None:
+    pattern = ReActPattern()
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    assert pattern._spilled_paths(context) == frozenset(
+        {"tool-results/a-000000000000.json"}
+    )
+
+
+@pytest.mark.parametrize(
+    "record_count, has_reader",
+    [(0, True), (1, True), (64, True), (0, False), (1, False)],
+)
+def test_schema_gate_offers_the_reader_only_with_a_record_and_a_reader_tool(
+    record_count: int, has_reader: bool
+) -> None:
+    """The gate appends the reader's schema only when the run's registry
+    holds a record and the run has a reader to offer; otherwise it returns
+    the base list object itself. The base list never names the reader, and
+    the tool object never leaves the tools list, so a call to it can always
+    be dispatched whatever the model was shown."""
+    pattern = ReActPattern()
+    read_tool = FakeReadToolResultTool()
+    tools: list[Any] = [FakeWorkspaceOutputTool()]
+    if has_reader:
+        tools.append(read_tool)
+    base = pattern._tool_schemas_with_builtin_controls(tools)
+    reader_schema = pattern._build_tool_schema(read_tool) if has_reader else None
+    context = _context_with_spill_records(
+        *(f"tool-results/r{i:02d}-000000000000.json" for i in range(record_count))
+    )
+
+    result = pattern._tool_schemas_with_spill_read(base, reader_schema, context)
+
+    assert SPILL_READ_TOOL_NAME not in [s["function"]["name"] for s in base]
+    if record_count and has_reader:
+        assert result == [*base, reader_schema]
+    else:
+        assert result is base
+    if has_reader:
+        assert pattern._find_tool(SPILL_READ_TOOL_NAME, tools) is read_tool
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_none_run_sends_no_tools_with_a_non_empty_registry() -> None:
+    """A run with tool_choice="none" sends the model no tools at all, and a
+    registry that already holds a record does not bring the reader back."""
+    llm = FakeLLM(responses=["Direct answer"])
+    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert llm.calls[0]["tools"] is None
+    assert llm.calls[0]["tool_choice"] is None
+
+
+def _tool_call_response(call_id: str, name: str, arguments: str) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {"id": call_id, "function": {"name": name, "arguments": arguments}}
+        ],
+    }
+
+
+def _schema_names(llm_call: dict[str, Any]) -> list[str]:
+    return [schema["function"]["name"] for schema in llm_call["tools"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "forced_turn_tools"),
+    [
+        (True, ["final_answer", SPILL_READ_TOOL_NAME]),
+        (False, ["final_answer"]),
+    ],
+    ids=["non_empty_registry", "empty_registry"],
+)
+async def test_forced_answer_turn_offers_the_reader_only_with_a_non_empty_registry(
+    stored: bool, forced_turn_tools: list[str]
+) -> None:
+    """The forced-answer turn that follows a successful tool result sends
+    final_answer plus the reader while the registry holds a record, and
+    final_answer alone when it is empty -- asserted on the tools the model
+    call actually received."""
+    run = await _run_pattern(
+        _react(max_iterations=4, finalize_after_tool_result=True),
+        [_calculator_call(), _final_call("2")],
+        stored=stored,
+    )
+
+    assert run.result["success"] is True
+    assert len(run.llm.calls) == 2
+    assert (SPILL_READ_TOOL_NAME in run.names(0)) is stored
+    assert run.names(1) == forced_turn_tools
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_turn_sends_only_final_answer_with_a_non_empty_registry() -> (
+    None
+):
+    """The settlement-fence turn keeps final_answer alone even while the
+    registry holds a record and the reads are still open."""
+    pattern = _forced_turn_pattern(fence=True)
+
+    run = await _run_pattern(pattern, [_final_call("no")])
+
+    assert run.result["success"] is True
+    assert run.tools(0) == [pattern._final_answer_tool_schema()]
+    assert run.states("before_llm")[0]["forced_answer_read_open"] is False
+
+
+@pytest.mark.asyncio
+async def test_reader_is_offered_on_the_turn_after_a_mid_run_spill(tmp_path) -> None:
+    """The registry fills up during the run: the first tool call returns a
+    result whose oversized value was really spilled under the run's
+    workspace, and add_tool_result registers it. The model call before that
+    result must not offer the reader, and the very next one must -- the gate
+    runs on every iteration, not once before the loop."""
+    from xagent.core.tools.tool_result_spill import (
+        SPILL_RESERVED_RESULT_KEY,
+        SpillTarget,
+        spill_dir_for_workspace,
+        spill_oversized_values,
+    )
+
+    target = SpillTarget(spill_dir=spill_dir_for_workspace(tmp_path), max_chars=100)
+
+    class SpillingTool(FakeTool):
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            spilled, records = spill_oversized_values(
+                {"output": "x" * 300},
+                target,
+                tool_name="calculator",
+                max_recursion=20,
+            )
+            return {**spilled, SPILL_RESERVED_RESULT_KEY: records}
+
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("call_calc", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("call_final", "final_answer", '{"answer": "done"}'),
+        ]
+    )
+    context = ExecutionContext()
+    context.attach_workspace("ws-mid-run", str(tmp_path))
+    context.add_user_message("q")
+    tool = SpillingTool()
+
+    result = await ReActPattern(max_iterations=4).run(
+        context=context, tools=[tool, FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(tool.calls) == 1
+    assert context.get_component("spilled_results") is not None
+    assert len(context.get_component("spilled_results").records) == 1
+    assert len(llm.calls) == 2
+    assert SPILL_READ_TOOL_NAME not in _schema_names(llm.calls[0])
+    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_a_record_without_a_relative_path_is_ignored_by_the_gate() -> None:
+    """A registry record of the wrong shape -- here one with no
+    relative_path, as a hand-edited or older checkpoint could carry -- is
+    skipped rather than crashing the gate, and the well-formed record next
+    to it still opens it."""
+    from xagent.core.agent.context.components import SpillRegistryComponent
+
+    good_path = "tool-results/a-000000000000.json"
+    context = ExecutionContext()
+    context.set_component(
+        "spilled_results",
+        SpillRegistryComponent(
+            records=[
+                {"kind": "array", "item_count": 1},
+                {"relative_path": good_path, "kind": "array", "item_count": 1},
+            ]
+        ),
+    )
+    context.add_user_message("hi")
+    pattern = ReActPattern(max_iterations=3)
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("call_final", "final_answer", '{"answer": "done"}')
+        ]
+    )
+
+    assert pattern._spilled_paths(context) == frozenset({good_path})
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert SPILL_READ_TOOL_NAME in _schema_names(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_normal_turn_protocol_retry_schema_includes_read_tool_result() -> None:
+    """The protocol-repair call sites (react.py's two
+    _retry_tool_protocol_response call sites) must offer the same dynamic
+    tool face as the turn they are repairing, not the static
+    base_tool_schemas computed once before the loop starts. Triggers the
+    empty-final-answer repair -- a retry path that runs on an ordinary
+    (non-forced) turn -- and inspects the tools list the retry call itself
+    received.
+    """
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_empty",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": ""}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "done"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) == 2
+    retry_tool_names = [schema["function"]["name"] for schema in llm.calls[1]["tools"]]
+    assert SPILL_READ_TOOL_NAME in retry_tool_names
+    assert llm.calls[1]["tools"] == llm.calls[0]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_protocol_error_retry_schema_includes_read_tool_result() -> None:
+    """The other protocol-repair call site: an LLMToolProtocolError raised by
+    the model call itself on an ordinary turn. Its retry must be offered the
+    same tool list as the call that failed, reader included."""
+
+    class ProtocolErrorLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise LLMToolProtocolError(
+                    provider="deepseek",
+                    code="malformed_tool_arguments",
+                    message="The model returned malformed tool arguments.",
+                )
+            return {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "done"}',
+                        },
+                    }
+                ],
+            }
+
+    llm = ProtocolErrorLLM()
+    pattern = ReActPattern(max_iterations=3)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert len(llm.calls) == 2
+    first_tool_names = [schema["function"]["name"] for schema in llm.calls[0]["tools"]]
+    assert SPILL_READ_TOOL_NAME in first_tool_names
+    assert llm.calls[1]["tools"] == llm.calls[0]["tools"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_spilled_offers_no_reader_and_adds_no_component() -> (
+    None
+):
+    """A run whose registry stays empty sees the baseline tool list on every
+    call, and finishes with no spilled_results component in its checkpoint
+    payload -- the gate that runs on every iteration only reads the
+    registry, it never creates one."""
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression": "2+2"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("What is 2+2?")
+    calculator = FakeTool()
+
+    result = await pattern.run(
+        context=context, tools=[calculator, FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert calculator.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 2
+    for call in llm.calls:
+        names = [schema["function"]["name"] for schema in call["tools"]]
+        assert "calculator" in names
+        assert SPILL_READ_TOOL_NAME not in names
+    assert context.get_component("spilled_results") is None
+    assert "spilled_results" not in context.to_dict()["components"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_a_registered_spill_offers_the_reader_on_ordinary_turns() -> (
+    None
+):
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer": "done"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = _context_with_spill_records("tool-results/a-000000000000.json")
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[FakeTool(), FakeReadToolResultTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    names = [schema["function"]["name"] for schema in llm.calls[0]["tools"]]
+    assert names.count(SPILL_READ_TOOL_NAME) == 1
+    assert "calculator" in names
+
+
+# --- forced-answer turn: shared run setup ------------------------------------
+
+_STORED_PATH = "tool-results/a-000000000000.json"
+_FORCED_READ_STATE_KEYS = (
+    "forced_answer_reads_used",
+    "forced_answer_reads_rejected",
+    "forced_answer_read_open",
+    "forced_answer_extra_iterations",
+)
+_RETRY_LABELS = frozenset(
+    {
+        "tool_protocol_retry",
+        "unavailable_tool_call_recovery",
+        "empty_final_answer_recovery",
+        "settlement_final_answer_recovery",
+        "malformed_tool_arguments_recovery",
+    }
+)
+
+
+class ReadToolResultArgs(BaseModel):
+    path: str | None = None
+    start: int | None = None
+    end: int | None = None
+    offset: int = 0
+
+
+class RecordingReadToolResultTool:
+    """A read_tool_result that records what it was asked to read."""
+
+    def __init__(self, *, concurrency_safe: bool = False) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = SimpleNamespace(
+            name=SPILL_READ_TOOL_NAME,
+            description="Read one engine-stored large tool result.",
+            concurrency_safe=concurrency_safe,
+        )
+
+    def args_type(self) -> type[BaseModel]:
+        return ReadToolResultArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"relative_path": args.get("path"), "items": ["stored item"]}
+
+
+class NamedTool:
+    """A work tool with a given name that records its calls."""
+
+    def __init__(self, name: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.metadata = SimpleNamespace(name=name, description=f"Run {name}.")
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"success": True}
+
+
+class _RespondingLLM:
+    """A fake model that answers each call from the tools it received."""
+
+    def __init__(self, respond: Any) -> None:
+        self.respond = respond
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.respond(kwargs, len(self.calls))
+
+
+def _forced_read_state(state: dict[str, Any]) -> tuple[Any, ...]:
+    """The four forced-read keys of one checkpoint state, in a fixed order."""
+    return tuple(state[key] for key in _FORCED_READ_STATE_KEYS)
+
+
+def _calculator_call(call_id: str = "call_calc") -> dict[str, Any]:
+    """A model response that calls the calculator once with 1+1."""
+    return _tool_call_response(call_id, "calculator", '{"expression": "1+1"}')
+
+
+def _final_call(answer: str = "done") -> dict[str, Any]:
+    """A model response that calls final_answer with the given answer."""
+    return _tool_call_response(
+        "call_final", "final_answer", json.dumps({"answer": answer})
+    )
+
+
+def _empty_answer() -> dict[str, Any]:
+    """A model response that calls final_answer with an empty answer."""
+    return _tool_call_response("call_empty", "final_answer", '{"answer": ""}')
+
+
+def _decision_response(action: str) -> dict[str, Any]:
+    """A repeated-tool decision response choosing the given action."""
+    return _tool_call_response(
+        "call_decision",
+        "react_decision",
+        json.dumps({"action": action, "reason": "more"}),
+    )
+
+
+def _read_call(call_id: str, path: str | None = _STORED_PATH, **extra: Any) -> Any:
+    """A model response with one read_tool_result call; path=None omits it."""
+    args: dict[str, Any] = dict(extra)
+    if path is not None:
+        args["path"] = path
+    return _tool_call_response(call_id, SPILL_READ_TOOL_NAME, json.dumps(args))
+
+
+def _batch_response(*calls: tuple[str, str, dict[str, Any]]) -> dict[str, Any]:
+    """One model response carrying every (id, name, args) call given."""
+    return {
+        "tool_calls": [
+            {"id": call_id, "function": {"name": name, "arguments": json.dumps(args)}}
+            for call_id, name, args in calls
+        ]
+    }
+
+
+def _read_batch(arguments: Any, prefix: str = "call_read") -> dict[str, Any]:
+    """One model response with a read_tool_result call per args mapping,
+    numbered in order."""
+    return _batch_response(
+        *(
+            (f"{prefix}_{index}", SPILL_READ_TOOL_NAME, args)
+            for index, args in enumerate(arguments)
+        )
+    )
+
+
+def _refused(text: str) -> dict[str, Any]:
+    """The result a refused forced-turn read gets, carrying that refusal."""
+    return {"success": False, "status": "refused", "error": text}
+
+
+def _always_calculator() -> _RespondingLLM:
+    """A fake model that calls the calculator on every call."""
+    return _RespondingLLM(lambda kwargs, n: _calculator_call(f"call_{n}"))
+
+
+def _react(**kwargs: Any) -> ReActPattern:
+    """A ReActPattern with the given settings and a task text already set."""
+    pattern = ReActPattern(**kwargs)
+    pattern.task_text = "t"
+    return pattern
+
+
+def _forced_turn_pattern(
+    *, used: int = 0, rejected: int = 0, fence: bool = False, **kwargs: Any
+) -> ReActPattern:
+    """A pattern whose next turn is forced, with the two per-run read
+    counters preset and, with fence=True, the settlement fence raised."""
+    kwargs.setdefault("max_iterations", 4)
+    pattern = _react(**kwargs)
+    pattern.force_final_answer_next = True
+    pattern.forced_answer_reads_used = used
+    pattern.forced_answer_reads_rejected = rejected
+    if fence:
+        pattern.settlement_final_answer_fence = True
+    return pattern
+
+
+def _forced_turn_context(
+    stored: bool = True, *paths: str, message: str = "What is in the stored result?"
+) -> ExecutionContext:
+    """A context with one user message and, when stored, a registry holding
+    the given paths (_STORED_PATH when none are given)."""
+    context = (
+        _context_with_spill_records(*(paths or (_STORED_PATH,)))
+        if stored
+        else ExecutionContext()
+    )
+    context.add_user_message(message)
+    return context
+
+
+@dataclass
+class _ForcedRun:
+    """One finished run: the pattern, the context, the fake model with every
+    call it received, the runtime with every checkpoint, and the result."""
+
+    pattern: ReActPattern
+    context: ExecutionContext
+    llm: Any
+    runtime: PatternRuntime
+    result: dict[str, Any]
+
+    def tools(self, call: int) -> Any:
+        """The tool schemas the model received on that call."""
+        return self.llm.calls[call]["tools"]
+
+    def names(self, call: int) -> list[str]:
+        """The tool names the model received on that call."""
+        return _schema_names(self.llm.calls[call])
+
+    def prompt(self, call: int) -> str:
+        """The system prompt the model received on that call."""
+        return str(self.llm.calls[call]["messages"][0]["content"])
+
+    def labels(self) -> list[str]:
+        return [payload["label"] for payload in self.runtime.checkpoints]
+
+    def states(self, label: str) -> list[dict[str, Any]]:
+        """The pattern state of every checkpoint with that label, in order."""
+        return [
+            payload["pattern_state"]
+            for payload in self.runtime.checkpoints
+            if payload["label"] == label
+        ]
+
+    def retry_labels(self) -> list[str]:
+        """The labels of the protocol-repair checkpoints the run wrote."""
+        return [label for label in self.labels() if label in _RETRY_LABELS]
+
+    def tool_outputs(self, name: str) -> list[Any]:
+        """The raw results recorded in the context for calls to that tool."""
+        return [
+            message.metadata.get("raw_result")
+            for message in self.context.messages
+            if message.role == "tool" and message.metadata.get("tool_name") == name
+        ]
+
+
+async def _run_pattern(
+    pattern: ReActPattern,
+    llm: Any,
+    *,
+    stored: bool = True,
+    context: ExecutionContext | None = None,
+    tools: list[Any] | None = None,
+) -> _ForcedRun:
+    """Run the pattern once and keep everything the run left behind.
+
+    llm is a list of scripted responses (wrapped in FakeLLM) or a fake model.
+    The context defaults to _forced_turn_context(stored); the tools default
+    to a calculator and a reader that is offered but never executed.
+    """
+    fake_llm = FakeLLM(list(llm)) if isinstance(llm, list) else llm
+    run_context = context if context is not None else _forced_turn_context(stored)
+    runtime = PatternRuntime(execution_id="forced-answer")
+    result = await pattern.run(
+        context=run_context,
+        tools=tools if tools is not None else [FakeTool(), FakeReadToolResultTool()],
+        llm=fake_llm,
+        runtime=runtime,
+    )
+    return _ForcedRun(pattern, run_context, fake_llm, runtime, result)
+
+
+# --- forced-answer turn: read state ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (0, 0),
+        (1, 1),
+        (3, 3),
+        (5, 5),
+        (None, 0),
+        (-2, 0),
+        ("missing", 0),
+    ],
+)
+@pytest.mark.parametrize(
+    ("key", "attribute"),
+    [
+        ("forced_answer_reads_used", "forced_answer_reads_used"),
+        ("forced_answer_reads_rejected", "forced_answer_reads_rejected"),
+        ("forced_answer_extra_iterations", "forced_answer_extra_iterations"),
+    ],
+)
+def test_read_policy_fields_round_trip_through_checkpoint(
+    key: str, attribute: str, stored: Any, expected: int
+) -> None:
+    source = ReActPattern()
+    _preset_forced_turn(source)
+    state = source.get_state()
+    assert _forced_read_state(state) == (2, 1, True, 3)
+    restored = ReActPattern()
+    restored.load_state(state)
+    assert _forced_read_state(restored.get_state()) == (2, 1, True, 3)
+
+    if stored == "missing":
+        del state[key]
+    else:
+        state[key] = stored
+    restored = ReActPattern()
+    setattr(restored, attribute, 7)
+    restored.load_state(state)
+    assert getattr(restored, attribute) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("missing", False),
+        (None, False),
+        (-1, False),
+        ("yes", False),
+        (0, False),
+        (1, False),
+    ],
+)
+def test_read_open_flag_round_trips_through_checkpoint(
+    stored: Any, expected: bool
+) -> None:
+    """The read-open flag resumes True only from a stored True; a missing,
+    None, negative or otherwise non-boolean value resumes as False."""
+    state = ReActPattern().get_state()
+    if stored == "missing":
+        del state["forced_answer_read_open"]
+    else:
+        state["forced_answer_read_open"] = stored
+    restored = ReActPattern()
+    restored._forced_answer_read_open = not expected
+    restored.load_state(state)
+    assert restored._forced_answer_read_open is expected
+
+
+class _ProtocolErrorThenScriptLLM(FakeLLM):
+    """Raises one LLMToolProtocolError, then replays scripted responses."""
+
+    def __init__(self, code: str, responses: list[Any]) -> None:
+        super().__init__(responses)
+        self.code = code
+
+    async def chat(self, **kwargs: Any) -> Any:
+        if not self.calls:
+            self.calls.append(kwargs)
+            raise LLMToolProtocolError(
+                provider="deepseek",
+                code=self.code,
+                message="The model called a tool that is not available.",
+            )
+        return await super().chat(**kwargs)
+
+
+def _preset_forced_turn(pattern: ReActPattern) -> ReActPattern:
+    """Put the pattern mid forced turn: flag set, reads open, counters at
+    2 reads, 1 reject and 3 extra iterations."""
+    pattern.force_final_answer_next = True
+    pattern._forced_answer_read_open = True
+    pattern.forced_answer_reads_used = 2
+    pattern.forced_answer_reads_rejected = 1
+    pattern.forced_answer_extra_iterations = 3
+    return pattern
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_point",
+    ["protocol_exception_recovery", "protocol_retry_recovery", "pause", "finalize"],
+)
+async def test_releasing_forced_answer_resets_the_forced_turn_state(
+    exit_point: str,
+) -> None:
+    """The four places that leave the forced turn clear the force flag and
+    the read-open flag, and leave the per-run counters and the extra
+    iterations alone."""
+    pattern = _preset_forced_turn(_react(max_iterations=4))
+    tools = [FakeTool(), FakeReadToolResultTool()]
+
+    if exit_point == "pause":
+        pattern._discard_pending_tool_plan_after_pause(_forced_turn_context())
+        state = pattern.get_state()
+    else:
+        if exit_point == "protocol_exception_recovery":
+            llm: Any = _ProtocolErrorThenScriptLLM(
+                "unavailable_tool_call", [_calculator_call(), _final_call("2")]
+            )
+        elif exit_point == "protocol_retry_recovery":
+            llm = FakeLLM([_calculator_call(), _calculator_call(), _final_call("2")])
+        else:
+            llm = FakeLLM([_final_call("2")])
+        run = await _run_pattern(pattern, llm, tools=tools)
+        assert run.result["success"] is True
+        state = run.states("final" if exit_point == "finalize" else "after_llm")[0]
+        if exit_point != "finalize":
+            # The retry ran on the full tool set, so the call it returned ran.
+            assert "calculator" in run.names(1)
+            assert tools[0].calls == [{"expression": "1+1"}]
+
+    assert state["force_final_answer_next"] is False
+    assert _forced_read_state(state) == (2, 1, False, 3)
+
+
+@pytest.mark.asyncio
+async def test_invalid_protocol_exit_only_closes_the_forced_turn_reads() -> None:
+    """Ending the run on an invalid tool protocol closes the reads offered
+    to the forced turn and leaves the force flag, the per-run counters and
+    the extra iterations as they were."""
+    run = await _run_pattern(
+        _preset_forced_turn(_react(max_iterations=4)),
+        [_empty_answer(), _empty_answer()],
+    )
+
+    assert run.result["success"] is False
+    assert run.result["status"] == "invalid_tool_protocol"
+    (state,) = run.states("invalid_tool_protocol")
+    assert state["force_final_answer_next"] is True
+    assert _forced_read_state(state) == (2, 1, False, 3)
+
+
+# Recorded on the parent commit with the same scripts: the checkpoint labels
+# with force_final_answer_next at each, and the tool names each model call
+# received. A run whose registry stays empty must reproduce both exactly.
+_ORDINARY_TOOLS = ["calculator", "final_answer", "send_message", "ask_user_question"]
+# The checkpoints of a first turn that calls the calculator once.
+_FIRST_TOOL_TURN = [
+    ("before_llm", False),
+    ("after_llm", False),
+    ("before_tool", False),
+    ("after_tool", False),
+]
+_EMPTY_REGISTRY_BASELINES: dict[str, dict[str, Any]] = {
+    "derived_forced_turn": {
+        "pattern": {
+            "max_iterations": 2,
+            "finalize_after_tool_result": True,
+            "repeated_tool_decision_after_consecutive_tool_calls": 1,
+        },
+        "responses": [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _decision_response("tool_call"),
+            _tool_call_response("f1", "final_answer", '{"answer": "2"}'),
+        ],
+        "checkpoints": [
+            *_FIRST_TOOL_TURN,
+            ("repeated_tool_decision_requested", False),
+            ("repeated_tool_decision_continue", False),
+            ("before_llm", False),
+            ("after_llm", False),
+            ("final", False),
+            ("completed", False),
+        ],
+        "tools": [_ORDINARY_TOOLS, ["react_decision"], ["final_answer"]],
+        "status": "completed",
+    },
+    "invalid_protocol": {
+        "pattern": {"max_iterations": 2, "finalize_after_tool_result": True},
+        "responses": [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("f1", "final_answer", '{"answer": ""}'),
+            _tool_call_response("f2", "final_answer", '{"answer": ""}'),
+        ],
+        "checkpoints": [
+            *_FIRST_TOOL_TURN,
+            ("before_llm", True),
+            ("empty_final_answer_recovery", True),
+            ("invalid_tool_protocol", True),
+        ],
+        "tools": [_ORDINARY_TOOLS, ["final_answer"], ["final_answer"]],
+        "status": "invalid_tool_protocol",
+    },
+    "reader_call_recovers": {
+        "pattern": {"max_iterations": 2, "finalize_after_tool_result": True},
+        "responses": [
+            _tool_call_response("c1", "calculator", '{"expression": "1+1"}'),
+            _tool_call_response("r1", SPILL_READ_TOOL_NAME, "{}"),
+            _tool_call_response("c2", "calculator", '{"expression": "2+2"}'),
+            _tool_call_response("f1", "final_answer", '{"answer": "4"}'),
+        ],
+        "checkpoints": [
+            *_FIRST_TOOL_TURN,
+            ("before_llm", True),
+            ("unavailable_tool_call_recovery", True),
+            ("after_llm", False),
+            ("before_tool", False),
+            ("after_tool", False),
+            ("before_iteration_limit_delivery", True),
+            ("max_iterations", True),
+        ],
+        "tools": [_ORDINARY_TOOLS, ["final_answer"], _ORDINARY_TOOLS, ["final_answer"]],
+        "status": "max_iterations",
+    },
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", sorted(_EMPTY_REGISTRY_BASELINES))
+async def test_empty_registry_flash_run_matches_the_baseline(scenario: str) -> None:
+    """With the reader tool present but nothing stored, a flash run sends the
+    model the same tools, walks the same checkpoints with the same force
+    flag, and every checkpoint carries the new read keys at their defaults."""
+    baseline = _EMPTY_REGISTRY_BASELINES[scenario]
+
+    run = await _run_pattern(
+        _react(**baseline["pattern"]),
+        [dict(response) for response in baseline["responses"]],
+        context=_forced_turn_context(False, message="What is 1+1?"),
+    )
+
+    assert run.result["status"] == baseline["status"]
+    assert [
+        (payload["label"], payload["pattern_state"]["force_final_answer_next"])
+        for payload in run.runtime.checkpoints
+    ] == baseline["checkpoints"]
+    assert [_schema_names(call) for call in run.llm.calls] == baseline["tools"]
+    for payload in run.runtime.checkpoints:
+        assert _forced_read_state(payload["pattern_state"]) == (0, 0, False, 0)
+    assert run.context.get_component("spilled_results") is None
+
+
+# --- forced-answer turn: tool surface and protocol ---------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cell",
+    ["reader_offered", "allowance_used_up", "empty_registry", "tool_choice_none"],
+)
+async def test_forced_turn_schema_has_exactly_one_final_answer(cell: str) -> None:
+    """Whatever the forced turn offers, it names final_answer exactly once
+    and offers at most one other tool, even for an agent carrying many."""
+    pattern = _forced_turn_pattern(
+        used=3 if cell == "allowance_used_up" else 0,
+        tool_choice="none" if cell == "tool_choice_none" else "required",
+    )
+    many_tools: list[Any] = [NamedTool(f"work_tool_{index}") for index in range(12)]
+
+    run = await _run_pattern(
+        pattern,
+        [_final_call()],
+        stored=cell != "empty_registry",
+        tools=[*many_tools, NamedTool("read_file"), FakeReadToolResultTool()],
+    )
+
+    assert run.result["success"] is True
+    names = run.names(0)
+    assert names.count("final_answer") == 1
+    assert len(names) <= 2
+    assert (SPILL_READ_TOOL_NAME in names) is (cell == "reader_offered")
+
+
+def _set_point_run(set_point: str) -> tuple[ReActPattern, list[Any], int]:
+    """A pattern and a script that reach a forced turn through one set-point
+    of the flag, with the index of the model call that is the forced turn."""
+    if set_point == "disabled_control_tool":
+        pattern = _react(max_iterations=4, user_interaction_enabled=False)
+        ask = _tool_call_response(
+            "call_ask", "ask_user_question", '{"message": "which one?"}'
+        )
+        return pattern, [ask, _final_call()], 1
+    if set_point == "empty_final_answer":
+        pattern = _react(max_iterations=4)
+        pattern.pending_tool_calls = [
+            {"id": "call_empty", "name": "final_answer", "args": {"answer": ""}}
+        ]
+        return pattern, [_final_call()], 0
+    if set_point == "finalize_after_tool_result":
+        pattern = _react(max_iterations=4, finalize_after_tool_result=True)
+        return pattern, [_calculator_call(), _final_call()], 1
+    pattern = _react(
+        max_iterations=4, repeated_tool_decision_after_consecutive_tool_calls=1
+    )
+    script = [_calculator_call(), _decision_response("final_answer"), _final_call()]
+    return pattern, script, 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "set_point",
+    [
+        "disabled_control_tool",
+        "empty_final_answer",
+        "finalize_after_tool_result",
+        "repeated_tool_decision",
+    ],
+)
+async def test_forced_turn_exposes_read_tool_result(set_point: str) -> None:
+    """Each way into the forced turn, other than the settlement fence, offers
+    final_answer and read_tool_result -- never read_file -- while the
+    registry holds a record."""
+    pattern, script, forced_index = _set_point_run(set_point)
+
+    run = await _run_pattern(
+        pattern,
+        script,
+        tools=[FakeTool(), NamedTool("read_file"), RecordingReadToolResultTool()],
+    )
+
+    assert run.result["success"] is True
+    assert len(run.llm.calls) == forced_index + 1
+    names = run.names(forced_index)
+    assert set(names) == {"final_answer", SPILL_READ_TOOL_NAME}
+    assert "read_file" not in names
+    assert run.llm.calls[forced_index]["tool_choice"] == "required"
+
+
+_FROZEN_TURN_START = datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+
+
+class _FrozenDatetime(datetime):
+    @classmethod
+    def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+        if tz is None:
+            return _FROZEN_TURN_START.replace(tzinfo=None)
+        return _FROZEN_TURN_START.astimezone(tz)
+
+
+@pytest.fixture
+def frozen_turn_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze the clock the context stamps as its turn start, so prompts
+    from separate runs render the same "Turn started at" line."""
+    monkeypatch.setattr(execution_module, "datetime", _FrozenDatetime)
+
+
+async def _forced_turn_call(
+    *, stored: bool, reader: bool, **counters: Any
+) -> tuple[ReActPattern, dict[str, Any]]:
+    """The first model call of a forced turn that answers at once."""
+    tools: list[Any] = [FakeTool(), NamedTool("read_file")]
+    if reader:
+        tools.append(FakeReadToolResultTool())
+    run = await _run_pattern(
+        _forced_turn_pattern(**counters), [_final_call()], stored=stored, tools=tools
+    )
+    assert run.result["success"] is True
+    return run.pattern, run.llm.calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "overrides"),
+    [
+        ("empty_registry", {"stored": False}),
+        ("no_reader_tool", {"reader": False}),
+        ("reads_used_up", {"used": 3}),
+        ("rejects_used_up", {"rejected": 3}),
+        ("settlement_fence", {"fence": True}),
+        ("settlement_fence_reads_used_up", {"fence": True, "used": 3, "rejected": 3}),
+    ],
+)
+async def test_forced_turn_stays_single_tool(
+    cell: str, overrides: dict[str, Any], frozen_turn_start: None
+) -> None:
+    """When any condition for offering reads fails, the forced turn sends
+    exactly the baseline final_answer schema. Where no allowance is used up,
+    and on the settlement-fence turn whatever the counters say, the prompt is
+    byte-identical to a run that stored nothing and has no reader."""
+    options: dict[str, Any] = {"stored": True, "reader": True, **overrides}
+    pattern, call = await _forced_turn_call(**options)
+
+    assert call["tools"] == [pattern._final_answer_tool_schema()]
+    if cell not in {"reads_used_up", "rejects_used_up"}:
+        _, reference = await _forced_turn_call(
+            stored=False, reader=False, fence=options.get("fence", False)
+        )
+        assert call["messages"] == reference["messages"]
+
+
+def _final_answer_entry(tools: list[dict[str, Any]]) -> dict[str, Any]:
+    """The final_answer schema in a tool list."""
+    return next(s for s in tools if s["function"]["name"] == "final_answer")
+
+
+def _answer_description(schema: dict[str, Any]) -> str:
+    return schema["function"]["parameters"]["properties"]["answer"]["description"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", [True, False])
+@pytest.mark.parametrize("workspace_tool", [True, False])
+async def test_forced_turn_final_answer_schema_is_the_baseline_one(
+    stored: bool, workspace_tool: bool
+) -> None:
+    """The forced turn's final_answer is the baseline schema, never the
+    ordinary-turn variant that asks for get_workspace_output_files."""
+    tools: list[Any] = [FakeTool(), FakeReadToolResultTool()]
+    if workspace_tool:
+        tools.append(FakeWorkspaceOutputTool())
+
+    run = await _run_pattern(
+        _react(max_iterations=4, finalize_after_tool_result=True),
+        [_calculator_call(), _final_call("2")],
+        stored=stored,
+        tools=tools,
+    )
+
+    assert run.result["success"] is True
+    forced = _final_answer_entry(run.tools(1))
+    assert forced == run.pattern._final_answer_tool_schema()
+    assert "get_workspace_output_files" not in _answer_description(forced)
+    ordinary = _answer_description(_final_answer_entry(run.tools(0)))
+    assert ("get_workspace_output_files" in ordinary) is workspace_tool
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_final_answer_schema_with_tool_choice_none() -> None:
+    pattern = _forced_turn_pattern(tool_choice="none")
+
+    run = await _run_pattern(
+        pattern,
+        [_final_call()],
+        tools=[FakeWorkspaceOutputTool(), FakeReadToolResultTool()],
+    )
+
+    assert run.tools(0) == [pattern._final_answer_tool_schema()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stored", "latched"), [(True, True), (False, False)])
+async def test_forced_answer_latch_only_when_reads_are_open(
+    stored: bool, latched: bool
+) -> None:
+    """A forced turn reached only through the flash-mode derived condition
+    (the flag itself is False) latches the flag when it offers reads, and
+    leaves it as it was when the registry is empty."""
+    run = await _run_pattern(
+        _react(
+            max_iterations=2,
+            finalize_after_tool_result=True,
+            repeated_tool_decision_after_consecutive_tool_calls=1,
+        ),
+        [_calculator_call("c1"), _decision_response("tool_call"), _final_call("2")],
+        stored=stored,
+    )
+
+    assert run.result["success"] is True
+    before_llm = run.states("before_llm")
+    assert len(before_llm) == 2
+    assert before_llm[0]["force_final_answer_next"] is False
+    assert before_llm[1]["force_final_answer_next"] is latched
+    assert before_llm[1]["forced_answer_read_open"] is latched
+    assert (SPILL_READ_TOOL_NAME in run.names(2)) is stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("used", "called", "accepted"),
+    [
+        (0, SPILL_READ_TOOL_NAME, True),
+        (0, "final_answer", True),
+        (0, "read_file", False),
+        (0, "write_file", False),
+        (3, SPILL_READ_TOOL_NAME, False),
+        (3, "final_answer", True),
+        (3, "read_file", False),
+        (3, "write_file", False),
+    ],
+)
+async def test_forced_turn_protocol_accepts_exactly_the_offered_tools(
+    used: int, called: str, accepted: bool
+) -> None:
+    """A forced turn's response is accepted exactly when every call names a
+    tool the turn sent: final_answer and read_tool_result while reads are
+    open, final_answer alone once an allowance is used up."""
+    reader = RecordingReadToolResultTool()
+    if called == "final_answer":
+        first = _final_call()
+    elif called == SPILL_READ_TOOL_NAME:
+        first = _read_call("call_read")
+    else:
+        first = _tool_call_response("call_other", called, "{}")
+
+    run = await _run_pattern(
+        _forced_turn_pattern(used=used),
+        [first, _final_call(), _final_call()],
+        tools=[NamedTool("read_file"), NamedTool("write_file"), reader],
+    )
+
+    assert run.result["success"] is True
+    assert (run.retry_labels() == []) is accepted
+    assert (len(reader.calls) == 1) is (accepted and called == SPILL_READ_TOOL_NAME)
+
+
+def test_protocol_check_without_allowed_names_accepts_only_final_answer() -> None:
+    pattern = ReActPattern()
+    read_call = {"tool_calls": [{"id": "r", "name": SPILL_READ_TOOL_NAME, "args": {}}]}
+    final = {
+        "tool_calls": [{"id": "f", "name": "final_answer", "args": {"answer": "a"}}]
+    }
+
+    assert pattern._response_requires_tool_protocol_retry(
+        read_call, force_final_answer=True
+    )
+    assert not pattern._response_requires_tool_protocol_retry(
+        final, force_final_answer=True
+    )
+    assert not pattern._response_requires_tool_protocol_retry(
+        read_call,
+        force_final_answer=True,
+        allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
+    )
+
+
+def _provider_rejected_call(pattern: ReActPattern, name: str) -> dict[str, Any]:
+    """The response DeepSeek's codec produces when the model calls a tool the
+    forced turn did not send."""
+    from xagent.core.model.chat.basic.deepseek_tool_protocol import (
+        normalize_deepseek_response,
+    )
+
+    response = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "id": "call_x",
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ],
+        },
+        tools=[pattern._final_answer_tool_schema()],
+    )
+    assert response["tool_calls"] == []
+    return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["plain_call", "provider_violation"])
+@pytest.mark.parametrize(
+    ("called", "recovers"),
+    [
+        (SPILL_READ_TOOL_NAME, False),
+        ("read_file", True),
+        (WORKSPACE_OUTPUT_FILES_TOOL_NAME, True),
+        ("calculator", True),
+    ],
+)
+async def test_exhausted_read_allowance_does_not_recover_tool_set(
+    entry: str, called: str, recovers: bool
+) -> None:
+    """Once the read allowance is used up, another read_tool_result call is
+    retried on final_answer alone: the flag stays set, the counters do not
+    move. Any other tool the turn did not offer still gets the full tool set
+    back, as before."""
+    pattern = _forced_turn_pattern(used=3)
+    reader = RecordingReadToolResultTool()
+    first = (
+        _tool_call_response("call_x", called, "{}")
+        if entry == "plain_call"
+        else _provider_rejected_call(pattern, called)
+    )
+
+    run = await _run_pattern(
+        pattern,
+        [first, _final_call()],
+        tools=[FakeTool(), NamedTool("read_file"), FakeWorkspaceOutputTool(), reader],
+    )
+
+    assert run.result["success"] is True
+    assert reader.calls == []
+    assert run.tools(0) == [pattern._final_answer_tool_schema()]
+    (retry_label,) = run.retry_labels()
+    (retry_state,) = run.states(retry_label)
+    assert retry_state["forced_answer_reads_used"] == 3
+    assert retry_state["forced_answer_reads_rejected"] == 0
+    if recovers:
+        assert retry_label == "unavailable_tool_call_recovery"
+        assert "calculator" in run.names(1)
+    else:
+        assert retry_label == "tool_protocol_retry"
+        assert retry_state["force_final_answer_next"] is True
+        assert run.tools(1) == [pattern._final_answer_tool_schema()]
+
+
+@pytest.mark.parametrize(
+    ("forced", "details"),
+    [
+        (True, "missing"),
+        (True, "without_tool_name"),
+        (False, "named"),
+        (False, "missing"),
+    ],
+)
+def test_unnamed_or_unforced_unavailable_tool_call_still_recovers(
+    forced: bool, details: str
+) -> None:
+    """A violation that does not name the refused call restores the full
+    tool set, as before, rather than keep a narrowed set; outside a forced
+    turn every unavailable_tool_call restores it, named or not."""
+    pattern = ReActPattern()
+    response = _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
+    error = response["_xagent_tool_protocol_error"]
+    if details == "missing":
+        del error["details"]
+    elif details == "without_tool_name":
+        error["details"] = {"original_arguments_preview": "{}"}
+    normalized = pattern._normalize_llm_response(response)
+
+    assert pattern._requires_full_tool_set_recovery(
+        normalized,
+        force_final_answer=forced,
+        allowed_tool_names=frozenset({"final_answer", SPILL_READ_TOOL_NAME}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["plain_call", "provider_violation"])
+async def test_empty_registry_forced_turn_reader_call_still_recovers(
+    entry: str,
+) -> None:
+    """With nothing stored, a forced turn that calls read_tool_result anyway
+    gets the full tool set back and the flag cleared, exactly as before."""
+    pattern = _forced_turn_pattern()
+    first = (
+        _read_call("call_read")
+        if entry == "plain_call"
+        else _provider_rejected_call(pattern, SPILL_READ_TOOL_NAME)
+    )
+
+    run = await _run_pattern(pattern, [first, _final_call()], stored=False)
+
+    assert run.result["success"] is True
+    assert run.retry_labels() == ["unavailable_tool_call_recovery"]
+    assert run.names(1) == _ORDINARY_TOOLS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "overrides"),
+    [
+        ("reads_open", {}),
+        ("reads_used_up", {"used": 3}),
+        ("settlement_fence", {"fence": True}),
+    ],
+)
+async def test_forced_turn_protocol_retry_sends_the_turn_tools(
+    cell: str, overrides: dict[str, Any]
+) -> None:
+    """Within one forced turn, the protocol-repair retry sends exactly the
+    tools the turn itself sent."""
+    run = await _run_pattern(
+        _forced_turn_pattern(**overrides), [_empty_answer(), _final_call()]
+    )
+
+    assert run.result["success"] is True
+    assert len(run.llm.calls) == 2
+    assert run.tools(1) == run.tools(0)
+    assert (SPILL_READ_TOOL_NAME in run.names(0)) is (cell == "reads_open")
+
+
+# --- forced-answer turn: read policy -----------------------------------------
+
+_SPILL_NAME = "calculator-0123456789abcdef0123456789abcdef.json"
+_SPILL_PATH = f"tool-results/{_SPILL_NAME}"
+
+
+async def _run_forced_reads(
+    responses: list[Any], **pattern_kwargs: Any
+) -> tuple[_ForcedRun, RecordingReadToolResultTool]:
+    """A forced turn over a registry holding _SPILL_PATH that replays the
+    given responses, then answers; returns the run and its recording reader."""
+    reader = RecordingReadToolResultTool()
+    run = await _run_pattern(
+        _forced_turn_pattern(max_iterations=8, **pattern_kwargs),
+        [*responses, _final_call()],
+        context=_forced_turn_context(True, _SPILL_PATH),
+        tools=[FakeTool(), reader],
+    )
+    return run, reader
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "admitted"),
+    [
+        (_SPILL_PATH, True),
+        (f"output/{_SPILL_PATH}", True),
+        (f"./{_SPILL_PATH}", True),
+        (f"input/{_SPILL_PATH}", False),
+        ("../../x", False),
+        (f"/workspace/output/{_SPILL_PATH}", False),
+        (12345, False),
+        (_SPILL_PATH.replace("0123", "1123", 1), False),
+        (f"{_SPILL_PATH}l", False),
+    ],
+)
+async def test_forced_turn_path_matching_and_counters(
+    path: Any, admitted: bool
+) -> None:
+    """A path that normalizes to a stored result runs and counts as a read;
+    any other path does not run and counts as a reject."""
+    run, reader = await _run_forced_reads([_read_batch([{"path": path}])])
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == (1 if admitted else 0)
+    assert run.pattern.forced_answer_reads_used == (1 if admitted else 0)
+    assert run.pattern.forced_answer_reads_rejected == (0 if admitted else 1)
+    assert run.pattern.forced_answer_extra_iterations == 1
+    if admitted:
+        assert reader.calls[0]["path"] == path
+    else:
+        assert run.tool_outputs(SPILL_READ_TOOL_NAME) == [
+            _refused(FORCED_ANSWER_READ_UNLISTED_PATH_TEXT)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_offset_continuation_counts_as_one_read() -> None:
+    """Reading on through one stored result with a larger offset is one read
+    per call; the fourth call finds the allowance used up and does not run."""
+    offsets = [0, 12_000, 24_000, 36_000]
+    run, reader = await _run_forced_reads(
+        [
+            _read_batch(
+                {"path": _SPILL_PATH, "start": 1, "end": 2, "offset": offset}
+                for offset in offsets
+            )
+        ]
+    )
+
+    assert run.result["success"] is True
+    assert [call["offset"] for call in reader.calls] == offsets[:3]
+    assert run.pattern.forced_answer_reads_used == 3
+    assert run.pattern.forced_answer_extra_iterations == 3
+    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[-1] == _refused(
+        FORCED_ANSWER_READS_USED_UP_TEXT
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [{}, {"path": None}, {"path": ""}, {"path": "   "}],
+    ids=["no_key", "null", "empty", "whitespace"],
+)
+async def test_forced_turn_listing_call_disposition(args: dict[str, Any]) -> None:
+    """A forced-turn read_tool_result call without a path -- the key missing,
+    null, or blank, exactly as the tool itself reads it -- lists the stored
+    results: it runs and counts as one read, not as a reject."""
+    run, reader = await _run_forced_reads([_read_batch([args])])
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == 1
+    assert reader.calls[0].get("path") == args.get("path")
+    assert run.pattern.forced_answer_reads_used == 1
+    assert run.pattern.forced_answer_reads_rejected == 0
+    assert run.pattern.forced_answer_extra_iterations == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+async def test_forced_turn_read_keeps_relative_path_in_checkpoint(
+    tmp_path, parallel: bool
+) -> None:
+    """The admitted read runs with the path the model wrote; nothing on the
+    way rewrites it into the workspace's absolute path."""
+    reader = RecordingReadToolResultTool(concurrency_safe=True)
+    context = _forced_turn_context(True, _SPILL_PATH)
+    context.attach_workspace("ws-forced-read", str(tmp_path))
+
+    run = await _run_pattern(
+        _forced_turn_pattern(tool_parallel_enabled=parallel),
+        [_read_batch([{"path": _SPILL_PATH}] * 2), _final_call()],
+        context=context,
+        tools=[FakeTool(), reader],
+    )
+
+    assert run.result["success"] is True
+    assert [call["path"] for call in reader.calls] == [_SPILL_PATH, _SPILL_PATH]
+    label = "before_tool_batch" if parallel else "before_tool"
+    payloads = [p for p in run.runtime.checkpoints if p["label"] == label]
+    assert payloads
+    for payload in payloads:
+        serialized = json.dumps(
+            {"metadata": payload["metadata"], "state": payload["pattern_state"]},
+            default=str,
+        )
+        assert _SPILL_PATH in serialized
+        assert str(tmp_path) not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("used", "rejected", "paths", "outputs", "reads_run"),
+    [
+        (2, 0, [_SPILL_PATH, _SPILL_PATH], [FORCED_ANSWER_READS_USED_UP_TEXT], 1),
+        (
+            0,
+            2,
+            ["tool-results/x.json", _SPILL_PATH],
+            [
+                FORCED_ANSWER_READ_UNLISTED_PATH_TEXT,
+                FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT,
+            ],
+            0,
+        ),
+    ],
+    ids=["reads_used_up", "rejects_used_up"],
+)
+async def test_forced_turn_refusals_once_an_allowance_is_used_up(
+    used: int,
+    rejected: int,
+    paths: list[str],
+    outputs: list[str],
+    reads_run: int,
+) -> None:
+    """The observation a refused read gets names which allowance ran out;
+    once either is used up, even a stored path is refused and nothing more
+    is counted."""
+    run, reader = await _run_forced_reads(
+        [_read_batch({"path": path} for path in paths)], used=used, rejected=rejected
+    )
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == reads_run
+    assert run.tool_outputs(SPILL_READ_TOOL_NAME)[reads_run:] == [
+        _refused(text) for text in outputs
+    ]
+    counters = (
+        run.pattern.forced_answer_reads_used,
+        run.pattern.forced_answer_reads_rejected,
+    )
+    assert counters == ((3, 0) if used else (0, 3))
+    assert run.pattern.forced_answer_extra_iterations == 1
+
+
+class _ToolEventRecordingRuntime(PatternRuntime):
+    """A PatternRuntime that records the tool call ids it was told about."""
+
+    def __init__(self) -> None:
+        super().__init__(execution_id="refused-read")
+        self.tool_events: list[tuple[str, Any]] = []
+
+    async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+        self.tool_events.append(("start", tool_call.get("id")))
+        await super().on_tool_start(tool_call=tool_call)
+
+    async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
+        self.tool_events.append(("end", tool_call.get("id")))
+        await super().on_tool_end(tool_call=tool_call, result=result)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_read_is_closed_like_a_cancelled_call() -> None:
+    """A refused read gets a failed result carrying the refusal text, which
+    the model reads in its observation, and a ledger record with status
+    "refused". Like a cancelled call it sends no tool start or end event:
+    the read never ran, and the start event is where a run is metered."""
+    reader = RecordingReadToolResultTool()
+    context = _forced_turn_context(True, _SPILL_PATH)
+    runtime = _ToolEventRecordingRuntime()
+    reads = [
+        ("call_good", SPILL_READ_TOOL_NAME, {"path": _SPILL_PATH}),
+        ("call_bad", SPILL_READ_TOOL_NAME, {"path": "tool-results/x.json"}),
+    ]
+
+    result = await _forced_turn_pattern(max_iterations=8).run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([_batch_response(*reads), _final_call()]),
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    pattern_state = runtime.checkpoints[-1]["pattern_state"]
+    pattern_ledger = {
+        tool_call_id: pattern_state["tool_ledger"][key]
+        for tool_call_id, key in pattern_state["tool_call_id_index"].items()
+    }
+    refused = pattern_ledger["call_bad"]
+    assert refused["status"] == "refused"
+    assert refused["result"] == _refused(FORCED_ANSWER_READ_UNLISTED_PATH_TEXT)
+    assert not tool_result_succeeded(refused["result"])
+    assert pattern_ledger["call_good"]["status"] == "completed"
+    observation = next(
+        message.content
+        for message in context.messages
+        if message.role == "tool" and message.tool_call_id == "call_bad"
+    )
+    assert FORCED_ANSWER_READ_UNLISTED_PATH_TEXT in str(observation)
+    assert ("start", "call_good") in runtime.tool_events
+    assert all(call_id != "call_bad" for _, call_id in runtime.tool_events)
+
+
+class _InterruptingReader(RecordingReadToolResultTool):
+    """A read_tool_result whose first run asks the runtime to stop and then
+    waits, so the stop lands while the read is running."""
+
+    def __init__(self) -> None:
+        super().__init__(concurrency_safe=True)
+        self.runtime: PatternRuntime | None = None
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        result = await super().run_json_async(args)
+        if len(self.calls) == 1 and self.runtime is not None:
+            self.runtime.request_interrupt("stop while reading")
+            await asyncio.sleep(5)
+        return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parallel", "with_id"),
+    [(False, True), (True, True), (False, False)],
+    ids=["serial", "concurrent", "serial_without_id"],
+)
+async def test_a_read_interrupted_while_running_is_counted_once(
+    parallel: bool, with_id: bool
+) -> None:
+    """A forced-turn read stopped while it runs was admitted and counted
+    before it started. Resuming from the interrupted checkpoint runs the same
+    read again without counting it a second time -- also for a call the
+    model sent without an id, which gets its ledger key before it runs."""
+    reads = 2 if parallel else 1
+    reader = _InterruptingReader()
+    pattern = _forced_turn_pattern(tool_parallel_enabled=parallel)
+    context = _forced_turn_context(True, _SPILL_PATH)
+    runtime = PatternRuntime(execution_id="interrupted-read")
+    reader.runtime = runtime
+    response = _read_batch([{"path": _SPILL_PATH}] * reads)
+    if not with_id:
+        for call in response["tool_calls"]:
+            del call["id"]
+
+    first = await pattern.run(
+        context=context,
+        tools=[FakeTool(), reader],
+        llm=FakeLLM([response]),
+        runtime=runtime,
+    )
+
+    assert first["status"] == "interrupted"
+    state = runtime.checkpoints[-1]["pattern_state"]
+    assert _forced_read_state(state) == (reads, 0, True, reads)
+    # Every admitted read of the batch was cut off, the one still waiting
+    # to start included; each stays pending and is recorded as interrupted.
+    assert len(state["pending_tool_calls"]) == reads
+    assert len(reader.calls) == 1
+
+    resumed = _react(max_iterations=4, tool_parallel_enabled=parallel)
+    resumed.load_state(state)
+    reader.runtime = None
+    run = await _run_pattern(
+        resumed, [_final_call()], context=context, tools=[FakeTool(), reader]
+    )
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == 1 + reads
+    assert resumed.forced_answer_reads_used == reads
+    assert resumed.forced_answer_extra_iterations == reads
+
+
+def _successful_reads_ledger(pattern: ReActPattern, count: int) -> dict[str, Any]:
+    """Record count completed reads in the ledger; return the last call."""
+    call: dict[str, Any] = {}
+    for index in range(count):
+        call = {
+            "id": f"call_read_{index}",
+            "name": SPILL_READ_TOOL_NAME,
+            "args": {"path": _SPILL_PATH},
+        }
+        pattern._record_tool_call(call, status="completed", result={"items": []})
+    return call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "read_open", "force_flag", "fires"),
+    [
+        ("flash_after_a_forced_turn_with_nothing_stored", False, True, True),
+        ("forced_turn_offering_reads", True, True, False),
+        ("forced_turn_with_the_allowance_used_up", False, True, True),
+    ],
+)
+async def test_repeated_tool_decision_still_fires_after_a_forced_turn(
+    cell: str, read_open: bool, force_flag: bool, fires: bool
+) -> None:
+    """Only the turn that actually offers reads skips the repeated-tool
+    decision; the force flag alone does not."""
+    pattern = ReActPattern(finalize_after_tool_result=True)
+    pattern.force_final_answer_next = force_flag
+    pattern._forced_answer_read_open = read_open
+    last_call = _successful_reads_ledger(pattern, 4)
+    stored = cell != "flash_after_a_forced_turn_with_nothing_stored"
+
+    requested = await pattern._request_repeated_tool_decision_if_needed(
+        tool_call=last_call,
+        context=_forced_turn_context(stored=stored),
+        runtime=PatternRuntime(execution_id="decision"),
+    )
+
+    assert requested is fires
+
+
+@pytest.mark.asyncio
+async def test_repeated_reads_on_ordinary_turns_still_ask_for_a_decision() -> None:
+    """With stored results, four reads in a row on ordinary turns still ask
+    the repeated-tool decision."""
+    reader = RecordingReadToolResultTool()
+    reads = [
+        _read_call(f"call_read_{index}", _SPILL_PATH, start=index + 1)
+        for index in range(4)
+    ]
+
+    run = await _run_pattern(
+        _react(max_iterations=8),
+        [*reads, _decision_response("final_answer"), _final_call()],
+        context=_forced_turn_context(True, _SPILL_PATH),
+        tools=[FakeTool(), reader],
+    )
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == 4
+    assert run.names(4) == ["react_decision"]
+    assert run.pattern.forced_answer_reads_used == 0
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_reads_do_not_ask_for_a_decision() -> None:
+    """Reads admitted on a forced turn do not trigger the repeated-tool
+    decision, even past its threshold."""
+    run, reader = await _run_forced_reads(
+        [_read_batch([{"path": _SPILL_PATH}] * 3)],
+        repeated_tool_decision_after_consecutive_tool_calls=2,
+    )
+
+    assert run.result["success"] is True
+    assert len(reader.calls) == 3
+    assert "repeated_tool_decision_requested" not in run.labels()
+
+
+# --- forced-answer turn: prompt tiers ----------------------------------------
+
+_UNREAD_ITEMS_SENTENCE = "State in your answer which items you did not read."
+_BASELINE_TOOL_RULE = (
+    "Do not call any other tool and do not output tool-call markup as plain text."
+)
+_READ_TOOL_RULE = (
+    "Do not call any tool other than final_answer and read_tool_result, and do "
+    "not output tool-call markup as plain text."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("used", [0, 1, 2])
+@pytest.mark.parametrize("path", ["main_loop", "protocol_retry"])
+async def test_forced_turn_tier_a_prompt_states_unread_items(
+    used: int, path: str
+) -> None:
+    """A forced turn that offers reads tells the model how many reads remain
+    before the final answer, lists the stored results, and asks it to say
+    which items it did not read -- on the turn itself and on its repair."""
+    script = [_final_call()]
+    if path == "protocol_retry":
+        script.insert(0, _empty_answer())
+
+    run = await _run_pattern(
+        _forced_turn_pattern(used=used),
+        script,
+        tools=[FakeTool(), NamedTool("read_file"), FakeReadToolResultTool()],
+    )
+
+    prompt = run.prompt(-1)
+    assert (
+        "You may call read_tool_result to read the stored results listed below "
+        f"before answering, at most {3 - used} more time(s) before the final "
+        "answer."
+    ) in prompt
+    assert _UNREAD_ITEMS_SENTENCE in prompt
+    assert _READ_TOOL_RULE in prompt
+    assert _BASELINE_TOOL_RULE not in prompt
+    assert _STORED_PATH in prompt
+    assert "Stored results:" in prompt
+    assert "read_file" not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cell", "overrides", "sentence"),
+    [
+        ("reads_used_up", {"used": 3}, FORCED_ANSWER_READS_USED_UP_TEXT),
+        ("rejects_used_up", {"rejected": 3}, FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT),
+        ("both_used_up", {"used": 3, "rejected": 3}, FORCED_ANSWER_READS_USED_UP_TEXT),
+        ("empty_registry", {"stored": False}, None),
+        ("settlement_fence", {"fence": True}, None),
+        ("settlement_fence_reads_used_up", {"fence": True, "used": 3}, None),
+    ],
+)
+async def test_forced_turn_prompt_tier_follows_tool_names(
+    cell: str, overrides: dict[str, Any], sentence: str | None
+) -> None:
+    """A forced turn that does not offer reads names the allowance that ran
+    out -- the read allowance when it did, the reject allowance when only
+    that one did, the same order a refused call is judged in -- and
+    otherwise gets the prompt a run with nothing stored gets: no read
+    sentence and the baseline tool rule."""
+    options = dict(overrides)
+    stored = options.pop("stored", True)
+
+    run = await _run_pattern(
+        _forced_turn_pattern(**options), [_final_call()], stored=stored
+    )
+
+    prompt = run.prompt(0)
+    for text in (
+        FORCED_ANSWER_READS_USED_UP_TEXT,
+        FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT,
+    ):
+        assert (text in prompt) is (text == sentence)
+    assert _BASELINE_TOOL_RULE in prompt
+    assert _UNREAD_ITEMS_SENTENCE not in prompt
+    assert SPILL_READ_TOOL_NAME not in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("used", "expected", "absent"),
+    [
+        (
+            0,
+            "Call final_answer again with the complete user-facing response in "
+            "its answer field, in a turn of its own.",
+            "final_answer is the only tool available on this turn",
+        ),
+        (
+            3,
+            "final_answer is the only tool available on this turn: call it again "
+            "with the complete user-facing response in its answer field.",
+            "in a turn of its own",
+        ),
+    ],
+    ids=["reads_offered", "final_answer_alone"],
+)
+async def test_forced_turn_empty_answer_retry_text_follows_the_offered_tools(
+    used: int, expected: str, absent: str
+) -> None:
+    run = await _run_pattern(
+        _forced_turn_pattern(used=used), [_empty_answer(), _final_call()]
+    )
+
+    retry_prompt = run.prompt(1)
+    assert expected in retry_prompt
+    assert absent not in retry_prompt
+
+
+@pytest.mark.asyncio
+async def test_forced_turn_tier_a_lists_registry_records() -> None:
+    """The stored-result list on the forced turn is the compaction notice:
+    at most twelve entries, then a line that says how to list the rest."""
+    paths = [f"tool-results/r{index:02d}-000000000000.json" for index in range(13)]
+
+    run = await _run_pattern(
+        _forced_turn_pattern(),
+        [_final_call()],
+        context=_forced_turn_context(True, *paths),
+    )
+
+    prompt = run.prompt(0)
+    listed = [path for path in paths if f"- {path}: " in prompt]
+    assert listed == paths[:12]
+    assert (
+        "- ... 1 more stored file(s); call read_tool_result with no path to list them"
+    ) in prompt
+
+
+# --- forced-answer turn: iteration bound -------------------------------------
+
+
+class _SpillingCalculator(FakeTool):
+    """A calculator whose result is large enough to be stored by the engine."""
+
+    def __init__(self, target: Any) -> None:
+        super().__init__()
+        self.target = target
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        from xagent.core.tools.tool_result_spill import (
+            SPILL_RESERVED_RESULT_KEY,
+            spill_oversized_values,
+        )
+
+        self.calls.append(args)
+        spilled, records = spill_oversized_values(
+            {"output": "x" * 300},
+            self.target,
+            tool_name="calculator",
+            max_recursion=20,
+        )
+        return {**spilled, SPILL_RESERVED_RESULT_KEY: records}
+
+
+def _stored_path(context: ExecutionContext) -> str:
+    component = context.get_component("spilled_results")
+    assert component is not None
+    return str(component.records[0]["relative_path"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "concurrent"])
+@pytest.mark.parametrize("reads", [1, 2, 3])
+async def test_single_call_forced_turn_reads_then_answers(
+    tmp_path, parallel: bool, reads: int
+) -> None:
+    """single_call keeps max_iterations=2, stores a large result, reads it on
+    the forced turn and still answers inside the loop -- not through the
+    iteration-limit delivery turn."""
+    from xagent.core.tools.tool_result_spill import (
+        SpillTarget,
+        spill_dir_for_workspace,
+    )
+
+    context = _forced_turn_context(False, message="What is 1+1?")
+    context.attach_workspace("ws-single-call", str(tmp_path))
+    tool = _SpillingCalculator(
+        SpillTarget(spill_dir=spill_dir_for_workspace(tmp_path), max_chars=100)
+    )
+    reader = RecordingReadToolResultTool()
+
+    def respond(kwargs: dict[str, Any], call_number: int) -> Any:
+        if call_number == 1:
+            return _calculator_call()
+        if call_number <= reads + 1:
+            return _read_call(f"call_read_{call_number}", _stored_path(context))
+        return _final_call("2")
+
+    run = await _run_pattern(
+        ReActPattern(
+            max_iterations=2,
+            finalize_after_tool_result=True,
+            tool_parallel_enabled=parallel,
+        ),
+        _RespondingLLM(respond),
+        context=context,
+        tools=[tool, reader],
+    )
+
+    assert run.result["success"] is True
+    assert "termination_reason" not in run.result
+    assert run.result["response"] == "2"
+    assert run.pattern.max_iterations == 2
+    assert run.pattern.forced_answer_extra_iterations == reads
+    assert len(reader.calls) == reads
+    assert len(run.llm.calls) == reads + 2
+    assert SPILL_READ_TOOL_NAME in run.names(1)
+    assert (SPILL_READ_TOOL_NAME in run.names(-1)) is (reads < 3)
+
+
+_NO_REPEATED_TOOL_DECISION = {
+    "repeated_tool_decision_after_consecutive_tool_calls": None,
+    "repeated_tool_decision_after_consecutive_work_tool_calls": None,
+}
+
+
+def _visited_iterations(run: _ForcedRun) -> list[int]:
+    """current_iteration at every before_llm checkpoint, in order."""
+    return [state["current_iteration"] for state in run.states("before_llm")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("max_iterations", "start", "extra", "visited"),
+    [
+        (3, 0, 0, [0, 1, 2]),
+        (3, 2, 0, [2]),
+        (3, 3, 0, []),
+        (3, 4, 0, []),
+        (2, 0, 2, [0, 1]),
+    ],
+    ids=["from_0", "from_max_minus_1", "from_max", "from_max_plus_1", "extra_2"],
+)
+async def test_iterations_match_the_fixed_range_without_forced_reads(
+    max_iterations: int, start: int, extra: int, visited: list[int]
+) -> None:
+    """With no forced answer turn the loop visits exactly
+    range(current_iteration, max_iterations): extra iterations that reads
+    earned do not extend it for ordinary turns. The iteration-limit failure
+    reports them next to max_iterations."""
+    pattern = _react(max_iterations=max_iterations, **_NO_REPEATED_TOOL_DECISION)
+    pattern.current_iteration = start
+    pattern.forced_answer_extra_iterations = extra
+
+    run = await _run_pattern(
+        pattern, _always_calculator(), stored=False, tools=[FakeTool()]
+    )
+
+    assert run.result["success"] is False
+    assert _visited_iterations(run) == visited
+    assert run.result["iterations"] == max_iterations
+    assert run.result["forced_answer_extra_iterations"] == extra
+
+
+@pytest.mark.asyncio
+async def test_extra_iterations_are_bounded_per_run() -> None:
+    """A model that alternates a six-read batch on every forced turn that
+    offers reads with a work-tool call on every other turn cannot keep
+    raising the loop bound: the read allowances are per run, so the extra
+    iterations stay at most six and the run ends after a bounded number of
+    model calls. Nor can it spend those iterations on work: past
+    max_iterations only a forced answer turn runs, and the one that would be
+    handed the full tool set stops instead, so the work tool runs only on
+    the first turn. The same model on the base commit runs it twice there,
+    because its forced turn at the last counted iteration recovers the full
+    tool set; here that turn is spent on reads. The repeated-tool decision
+    is switched off, because it is not a hard stop."""
+    extra_cap = 6
+    calls_cap = 2 * (2 + extra_cap) + 1
+    safety_stop = 200
+    bad_path = "tool-results/unlisted-000000000000.json"
+    batch = [_STORED_PATH, _STORED_PATH, bad_path, bad_path, bad_path, _STORED_PATH]
+
+    def respond(kwargs: dict[str, Any], call_number: int) -> Any:
+        if call_number > safety_stop:
+            return _final_call("stop")
+        names = _schema_names(kwargs) if kwargs.get("tools") else []
+        if names == ["final_answer", SPILL_READ_TOOL_NAME]:
+            return _read_batch(
+                ({"path": path} for path in batch), prefix=f"call_read_{call_number}"
+            )
+        return _calculator_call(f"call_calc_{call_number}")
+
+    calculator = FakeTool()
+    run = await _run_pattern(
+        _react(
+            max_iterations=2,
+            finalize_after_tool_result=True,
+            **_NO_REPEATED_TOOL_DECISION,
+        ),
+        _RespondingLLM(respond),
+        tools=[calculator, RecordingReadToolResultTool()],
+    )
+
+    observed_extra = [
+        payload["pattern_state"]["forced_answer_extra_iterations"]
+        for payload in run.runtime.checkpoints
+    ]
+    assert max(observed_extra) <= extra_cap
+    assert run.pattern.forced_answer_extra_iterations <= extra_cap
+    assert len(run.llm.calls) <= calls_cap
+    assert run.result["success"] is False
+    assert run.result["status"] == "max_iterations"
+    assert len(calculator.calls) == 1
+    assert _visited_iterations(run) == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_after_a_recovery_stops_at_max_iterations() -> None:
+    """Reads on a forced turn earn extra iterations, and a later call to a
+    tool the forced turn did not offer gets the full tool set back. The
+    ordinary turn that follows is past max_iterations, so it does not run:
+    the work tool ran once, on the recovered turn, and the loop stops at its
+    bound as it would without the reads."""
+    calculator = FakeTool()
+
+    def respond(kwargs: dict[str, Any], call_number: int) -> Any:
+        if call_number == 1:
+            return _read_batch([{"path": _STORED_PATH}] * 2)
+        return _calculator_call(f"call_calc_{call_number}")
+
+    run = await _run_pattern(
+        _forced_turn_pattern(max_iterations=2, **_NO_REPEATED_TOOL_DECISION),
+        _RespondingLLM(respond),
+        tools=[calculator, RecordingReadToolResultTool()],
+    )
+
+    assert run.pattern.forced_answer_extra_iterations == 2
+    assert run.retry_labels() == ["unavailable_tool_call_recovery"]
+    assert len(calculator.calls) == 1
+    assert _visited_iterations(run) == [0, 1]
+    assert run.result["status"] == "max_iterations"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The result is 4."}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == [{"expression": "2+2"}]
+    assert context.messages[-2].role == "tool"
+    assert context.messages[-2].tool_call_id == "call_final"
+    assert context.messages[-2].metadata["tool_name"] == "final_answer"
+    assert context.messages[-1].role == "assistant"
+    assert context.messages[-1].content == "The result is 4."
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpoint() -> (
+    None
+):
+    # The trailing call is another control tool (send_message), not a work
+    # tool: a work tool here would instead be stripped from the batch before
+    # final_answer ever reaches this point (see the strip tests above), which
+    # would defeat what this test is pinning - that a control result of
+    # "completed" clears whatever is still queued behind it.
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime()
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Finish and do not continue")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "Done."
+    assert tool.calls == []
+    assert pattern.pending_tool_calls == []
+    final_checkpoint = next(
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "final"
+    )
+    assert final_checkpoint["pattern_state"]["status"] == "completed"
+    assert final_checkpoint["pattern_state"]["pending_tool_calls"] == []
+
+
+def test_react_decision_schema_assesses_work_before_choosing_action() -> None:
+    schema = ReActPattern()._react_decision_tool_schema()
+    parameters = schema["function"]["parameters"]
+
+    assert list(parameters["properties"]) == [
+        "reason",
+        "supported_findings",
+        "missing_verification",
+        "action",
+    ]
+    assert parameters["required"] == [
+        "reason",
+        "missing_verification",
+        "action",
+    ]
+    assert parameters["additionalProperties"] is False
+
+
+def test_react_decision_does_not_finalize_with_missing_work() -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_contradictory",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "One more audio clip must be synthesized.",
+                            "missing_verification": "Synthesize the final audio clip.",
+                            "action": "final_answer",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision == {
+        "action": "tool_call",
+        "reason": "One more audio clip must be synthesized.",
+        "supported_findings": [],
+        "missing_verification": "Synthesize the final audio clip.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw_findings", "expected"),
+    [
+        ("not-a-list", []),
+        ([None, 7, {}, "", "  ", "\n", "  verified finding  "], ["verified finding"]),
+    ],
+)
+def test_react_decision_normalizes_supported_findings(
+    raw_findings: object,
+    expected: list[str],
+) -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_findings",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "Enough evidence is available.",
+                            "supported_findings": raw_findings,
+                            "missing_verification": "",
+                            "action": "final_answer",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision is not None
+    assert decision["supported_findings"] == expected
+
+
+def test_react_decision_bounds_supported_findings_during_parsing() -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_many_findings",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "Enough evidence is available.",
+                            "supported_findings": [
+                                " ",
+                                "x" * 600,
+                                *[f" finding {index} " for index in range(12)],
+                            ],
+                            "missing_verification": "",
+                            "action": "final_answer",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision is not None
+    assert len(decision["supported_findings"]) == 12
+    assert decision["supported_findings"][0].endswith("... [truncated]")
+    assert decision["supported_findings"][-1] == "finding 10"
+
+
+def test_react_decision_discards_supported_findings_when_continuing() -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_continue",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "One more source is required.",
+                            "supported_findings": ["Do not carry this forward."],
+                            "missing_verification": "Fetch the next source.",
+                            "action": "tool_call",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision is not None
+    assert decision["action"] == "tool_call"
+    assert decision["supported_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_accepts_plain_text_response() -> None:
+    llm = FakeLLM(responses=["Direct answer"])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result == {
+        "success": True,
+        "output": "Direct answer",
+        "response": "Direct answer",
+        "status": "completed",
+        "completion_outcome": "completed",
+    }
+    assert context.messages[-1].content == "Direct answer"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_can_run_as_strict_single_call() -> None:
+    llm = FakeLLM(responses=["Direct answer"])
+    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(context=context, tools=[FakeTool()], llm=llm)
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert llm.calls[0]["tools"] is None
+    assert llm.calls[0]["tool_choice"] is None
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_errors_without_llm() -> None:
+    pattern = ReActPattern()
+    context = ExecutionContext()
+    context.add_user_message("Hello")
+
+    result = await pattern.run(context=context, tools=[], llm=None)
+
+    assert result["success"] is False
+    assert "requires an llm" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_send_message_without_response_continues() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Sending progress.",
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Still working","message_type":"progress","expect_response":false}',
+                        },
+                    }
+                ],
+            },
+            {"content": "All done."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    runtime = PatternRuntime()
+    context = ExecutionContext()
+    context.add_user_message("Work")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "All done."
+    assert len(runtime.outbound_messages) == 1
+    outbound_message = runtime.outbound_messages[0]
+    assert outbound_message["type"] == "agent_message"
+    assert outbound_message["execution_id"] == context.execution_id
+    assert outbound_message["message"] == "Still working"
+    assert outbound_message["message_type"] == "progress"
+    assert outbound_message["expect_response"] is False
+    assert outbound_message["visible"] is True
+    assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
+    tool_messages = context.get_messages_by_role("tool")
+    assert len(tool_messages) == 1
+    assert tool_messages[0].metadata["tool_name"] == "send_message"
+    next_call_messages = llm.calls[1]["messages"]
+    assert next_call_messages[-1]["role"] == "tool"
+    assert all(
+        message.get("content") != "Still working" for message in next_call_messages
+    )
+    assert pattern._record_for_tool_call_id("call_message").status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_send_message_with_response_waits() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need input.",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    sent_messages: list[dict[str, Any]] = []
+    runtime = PatternRuntime(outbound_message_handler=sent_messages.append)
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is False
+    assert result["status"] == "waiting_for_user"
+    assert result["message"] == "Choose A or B"
+    assert sent_messages == runtime.outbound_messages
+    assert sent_messages[0]["message"] == "Choose A or B"
+    assert sent_messages[0]["expect_response"] is True
+    assert pattern.status == "waiting_for_user"
+    tool_messages = context.get_messages_by_role("tool")
+    assert tool_messages[0].tool_call_id == "call_question"
+    assert tool_messages[0].metadata["raw_result"]["status"] == "waiting_for_user"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_ask_user_question_pauses_with_structured_payload() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need structured input.",
+                "tool_calls": [
+                    {
+                        "id": "call_question_form",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": (
+                                '{"message":"Pick one","interactions":'
+                                '[{"type":"select_one","field":"choice","label":"Choice",'
+                                '"options":[{"label":"A","value":"a"}]}]}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is False
+    assert result["status"] == "waiting_for_user"
+    assert result["message"] == "Pick one"
+    assert len(runtime.outbound_messages) == 1
+    outbound_message = runtime.outbound_messages[0]
+    assert outbound_message["type"] == "agent_message"
+    assert outbound_message["execution_id"] == "exec-1"
+    assert outbound_message["message"] == "Pick one"
+    assert outbound_message["message_type"] == "question"
+    assert outbound_message["expect_response"] is True
+    assert outbound_message["visible"] is True
+    assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
+    # Carries real options: a picker with nothing to select gets the engine's
+    # free-text field appended, which would make this a test of that instead.
+    assert outbound_message["metadata"]["interactions"] == [
+        {
+            "type": "select_one",
+            "field": "choice",
+            "label": "Choice",
+            "options": [{"label": "A", "value": "a"}],
+        }
+    ]
+    assert pattern._record_for_tool_call_id("call_question_form").status == "completed"
+    tool_messages = context.get_messages_by_role("tool")
+    assert tool_messages[0].tool_call_id == "call_question_form"
+    assert tool_messages[0].metadata["raw_result"]["status"] == "waiting_for_user"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_ask_user_question_drops_invalid_options() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need structured input.",
+                "tool_calls": [
+                    {
+                        "id": "call_question_form",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": (
+                                '{"message":"Pick one","interactions":'
+                                '[{"type":"select_one","field":"choice",'
+                                '"label":"Choice","options":['
+                                '{"label":"A","value":"a"},'
+                                '{"label":"","value":"empty-label"},'
+                                '{"value":"missing-label"},'
+                                '{"label":"Missing value"},'
+                                '{"label":"B","value":"b","description":"Bee"}'
+                                "]}]}"
+                            ),
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["status"] == "waiting_for_user"
+    assert result["interactions"][0]["options"] == [
+        {"label": "A", "value": "a"},
+        {"label": "B", "value": "b", "description": "Bee"},
+    ]
+
+
+# Independent reference for JavaScript's String.prototype.trim() semantics,
+# derived from unicodedata rather than the production _INTERACTION_TRIM_CHARS
+# constant -- reusing that constant here would make every assertion below
+# self-proving instead of an independent check. Built once at module scope
+# and reused, instead of being rebuilt inline in each function that needs it.
+_JS_TRIM = {chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"}
+_JS_TRIM |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+
+
+def _js_trim_equivalent(value: str) -> str:
+    """Reference JavaScript String.prototype.trim(), via the independent
+    _JS_TRIM set above."""
+    return value.strip("".join(_JS_TRIM))
+
+
+def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
+    """Coverage check, superset half: _INTERACTION_TRIM_CHARS must contain
+    every code point JavaScript's trim() removes, or writing the normalized
+    field back into item["field"] and relying on the frontend's own trim()
+    being a no-op on it stops holding."""
+    assert _JS_TRIM <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None:
+    """Coverage check, differential half: pins the five Python-only code
+    points exactly. The superset check above alone would still pass if one
+    of these five were mistyped (e.g. U+001C typoed into U+001B), since a
+    typo like that only shrinks the Python-only difference by one member and
+    stays within a superset of the JavaScript table."""
+    assert set(_INTERACTION_TRIM_CHARS) - _JS_TRIM == {
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x1f",
+        "\x85",
+    }
+
+
+def test_python_whitespace_set_is_a_subset_of_the_frozen_trim_table() -> None:
+    """task_interaction_service.py's write-side field/option checks use
+    plain str.strip() rather than importing _INTERACTION_TRIM_CHARS -- that
+    is only safe to reason about at all if every code point Python's own
+    str.isspace() treats as whitespace is already inside the frozen table.
+    Computed independently (via isspace(), not by re-deriving from
+    _INTERACTION_TRIM_CHARS or from _JS_TRIM), so a typo that dropped one of
+    the five Python-only code points from the frozen table would be caught
+    here even if it happened to still pass the two JS-side checks above."""
+    python_whitespace = {chr(c) for c in range(0x110000) if chr(c).isspace()}
+    assert python_whitespace <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_normalize_keeps_well_formed_options_and_fields() -> None:
+    """A normal option and a normal field pass through unchanged."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+    assert normalized[0]["field"] == "choice"
+
+
+def test_normalize_returns_empty_list_for_non_list_interactions() -> None:
+    """A top-level interactions value that is not a list -- the model
+    sending a dict or a string instead of an array, say -- is rejected
+    outright rather than partially processed."""
+    assert _normalize_ask_user_interactions("not-a-list") == []
+    assert _normalize_ask_user_interactions({"field": "choice"}) == []
+    assert _normalize_ask_user_interactions(None) == []
+
+
+def test_normalize_skips_non_dict_elements_within_the_list() -> None:
+    """A non-dict element inside an otherwise well-formed interactions list
+    is dropped, and the well-formed interactions around it are still
+    normalized -- one malformed element does not fail the whole batch."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            "not-a-dict",
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            },
+            42,
+            None,
+        ]
+    )
+    assert len(normalized) == 1
+    assert normalized[0]["field"] == "choice"
+
+
+_BLANK_TEXT_CASES = [
+    ("v1_empty", ""),
+    ("v2_ascii_spaces", "   "),
+    ("v3_mixed_whitespace", "\t\n "),
+    ("v4_fullwidth_space", "\u3000"),
+    ("v5_bom_only", "\ufeff"),
+    ("v8_python_only_control", "\x1c"),
+    ("v9_js_line_separator", "\u2028"),
+    ("v10_nbsp", "\xa0"),
+]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_drops_blank_options(case_id: str, value: str) -> None:
+    """An option whose label or value is blank under
+    _INTERACTION_TRIM_CHARS is dropped -- the same treatment the existing
+    empty-string-label case already gets (see the regression test above
+    for missing/empty label or value), widened from "the empty string" to
+    "blank under the trim table"."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [
+                    {"label": value, "value": "kept-value"},
+                    {"label": "kept-label", "value": value},
+                    {"label": "A", "value": "a"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_substitutes_blank_field(case_id: str, value: str) -> None:
+    """A field name blank under _INTERACTION_TRIM_CHARS falls back to
+    response_{index}."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == "response_0"
+
+
+def test_normalize_substitutes_blank_field_using_its_own_index() -> None:
+    """The fallback is f"response_{index}" for the interaction's own
+    position, not a fixed "response_0" -- a well-formed interaction ahead
+    of the blank one must not shift what the blank one falls back to."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {"type": "select_one", "field": "choice", "label": "Choice"},
+            {"type": "select_one", "field": "   ", "label": "Other"},
+        ]
+    )
+    assert normalized[0]["field"] == "choice"
+    assert normalized[1]["field"] == "response_1"
+
+
+@pytest.mark.parametrize(
+    "case_id,value,expected",
+    [
+        ("v6_bom_prefix", "\ufeffabc", "abc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff", "abc"),
+    ],
+)
+def test_normalize_field_bom_normalizes_to_frontend_equivalent(
+    case_id: str, value: str, expected: str
+) -> None:
+    """A field wrapped in a BOM (with or without interior spacing)
+    normalizes to the same string the frontend's own trim() produces. The
+    same normalization applies when the value arrives through the field/id/
+    name alias chain rather than "field" directly."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == expected
+
+    normalized_via_alias = _normalize_ask_user_interactions(
+        [{"type": "select_one", "id": value, "label": "Choice"}]
+    )
+    assert normalized_via_alias[0]["field"] == expected
+
+
+@pytest.mark.parametrize(
+    "case_id,value",
+    [
+        ("v1_empty", ""),
+        ("v2_ascii_spaces", "   "),
+        ("v3_mixed_whitespace", "\t\n "),
+        ("v4_fullwidth_space", "\u3000"),
+        ("v5_bom_only", "\ufeff"),
+        ("v6_bom_prefix", "\ufeffabc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff"),
+        ("v8_python_only_control", "\x1c"),
+        ("v9_js_line_separator", "\u2028"),
+    ],
+)
+def test_normalized_field_is_stable_under_javascript_trim(
+    case_id: str, value: str
+) -> None:
+    """Whatever field the normalizer produces must already be a fixed
+    point of the frontend's own trim(). If it were not, writing the result
+    back into item["field"] and trusting the frontend to leave it alone
+    would silently stop being true for that input."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    field = normalized[0]["field"]
+    assert _js_trim_equivalent(field) == field
+
+
+def test_normalize_logs_when_all_options_are_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interaction whose options are all blank keeps the
+    interaction (the question still goes out) and logs exactly one warning.
+    The warning's extra keys are exactly {dropped, total, interaction_index},
+    all ints, and its message format args are also all ints -- no
+    model-controlled string (the field name, a label, a value) is allowed
+    into either half of this log line."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {
+                    "type": "select_one",
+                    "field": "choice",
+                    "options": [
+                        {"label": "   ", "value": "   "},
+                        {"label": "\ufeff", "value": "\ufeff"},
+                    ],
+                }
+            ]
+        )
+
+    assert len(normalized) == 1
+    assert normalized[0]["options"] == []
+
+    dropped_records = [r for r in caplog.records if "dropped all" in r.getMessage()]
+    assert len(dropped_records) == 1
+    record = dropped_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"dropped", "total", "interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+    # Both options in this interaction were blank, so dropped == total == 2,
+    # not just "some int" -- pins the actual count, not merely its type.
+    assert record.__dict__["dropped"] == 2
+    assert record.__dict__["total"] == 2
+    assert record.__dict__["interaction_index"] == 0
+
+
+def test_normalize_keeps_surviving_option_text_verbatim() -> None:
+    """An option that survives the blank filter keeps its label and
+    value exactly as given -- normalization only judges blankness, it never
+    rewrites content. A BOM-wrapped value is the only kind of input that can
+    tell "judge blank" apart from "judge blank and also rewrite": a purely
+    blank value would be dropped under either implementation, so it would
+    not catch a rewrite regression."""
+    raw = {"label": "\ufeffImport", "value": "\ufeffimport"}
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "choice", "options": [raw]}]
+    )
+    assert normalized[0]["options"] == [raw]
+
+
+def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Within one ask_user_question call, a BOM-wrapped field name and
+    its plain counterpart now normalize to the same field. This function
+    does not deduplicate -- both interactions are kept unchanged. Both
+    call sites deduplicate afterward: the multi-tool one is covered
+    below in this file, the single-tool one in
+    test_react_ask_user_question_dedup.py. One warning is logged, with
+    an integer-only extra/message-args payload."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {"type": "select_one", "field": "\ufeffchoice"},
+                {"type": "select_one", "field": "choice"},
+            ]
+        )
+
+    assert [item["field"] for item in normalized] == ["choice", "choice"]
+
+    collision_records = [
+        r for r in caplog.records if "colliding field name" in r.getMessage()
+    ]
+    assert len(collision_records) == 1
+    record = collision_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"colliding_field_count", "total"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
+    """The field/id/name alias chain keeps its raw truthiness
+    check on purpose. A BOM-only field is truthy before normalization, so it
+    wins the alias chain and is only normalized away to blank afterward --
+    id="ok" is never reached. Widening the blankness judgment to include BOM
+    does not create a new alias-chain outcome, it only adds a new way to
+    reach the one a plain whitespace field already produced (the second
+    case below, pinned as a regression)."""
+    normalized_bom = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "\ufeff", "id": "ok"}]
+    )
+    assert normalized_bom[0]["field"] == "response_0"
+
+    normalized_whitespace = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "   ", "id": "ok"}]
+    )
+    assert normalized_whitespace[0]["field"] == "response_0"
+
+
+@pytest.mark.parametrize(
+    "case_id,raw",
+    [
+        (
+            "case1_alias_only",
+            {
+                "type": "select_one",
+                "field": "f",
+                "actions": [{"label": "A", "value": "a"}],
+            },
+        ),
+        (
+            "case2_options_and_unrelated_actions",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": [{"label": "A", "value": "a"}],
+                "actions": [{"label": "X", "value": "x"}],
+            },
+        ),
+        (
+            "case3_options_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [{"label": "B", "value": "b"}],
+            },
+        ),
+        (
+            "case4_actions_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": "bad",
+            },
+        ),
+    ],
+)
+def test_normalize_strips_actions_alias_from_output(case_id: str, raw: dict) -> None:
+    """The output never carries an actions key, unconditionally --
+    whether options was missing, a well-formed list, or a malformed
+    non-list value, and whether actions itself was a list or not. Case 1
+    additionally asserts the alias survived into options: without that
+    second assertion, moving the pop above the alias branch would still
+    pass this case (actions is gone either way, just for the wrong reason)
+    while silently losing the alias's only copy of the data -- a gap only
+    test_normalize_aliases_actions_when_options_is_not_a_list below would
+    otherwise catch alone."""
+    normalized = _normalize_ask_user_interactions([raw])
+    assert "actions" not in normalized[0]
+    if case_id == "case1_alias_only":
+        assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+def test_normalize_aliases_actions_when_options_is_not_a_list() -> None:
+    """When options is present but not a list, the alias branch --
+    widened from "options" not in item to "options is not a list" -- still
+    rescues actions into options, and the usual blank-option filter still
+    runs on what it rescued. This is the test that would catch the pop
+    running before the alias branch: with the pop moved earlier, actions
+    would already be gone by the time the alias branch runs, options would
+    stay "auto", and this assertion would fail even though every case in
+    test_normalize_strips_actions_alias_from_output would still pass (that
+    test only checks that actions is gone, not that its data went
+    anywhere)."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [
+                    {"label": "   ", "value": "   "},
+                    {"label": "B", "value": "b"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "B", "value": "b"}]
+    assert "actions" not in normalized[0]
+
+
+def test_normalize_logs_when_options_is_not_a_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """options present but neither a list nor rescued by an actions alias
+    is a malformed shape the model produced; today it silently renders as
+    no available options (the renderer falls back to interaction.options ||
+    []), and this warning is the only signal that it happened. Same
+    integer-only payload discipline as the other two warnings in this
+    same function (the all-options-blank warning and the colliding-field-
+    name warning)."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [{"type": "select_one", "field": "choice", "options": "auto"}]
+        )
+
+    assert normalized[0]["options"] == "auto"
+    assert "actions" not in normalized[0]
+
+    records = [r for r in caplog.records if "non-list options" in r.getMessage()]
+    assert len(records) == 1
+    record = records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # Same three attributes excluded for the same reasons as the other two
+    # warning tests in this module: "taskName" (3.12+ LogRecord attribute),
+    # "message" and "asctime" (added by a Formatter.format() pass, not by
+    # this call's own extra= payload).
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+@pytest.mark.asyncio
+async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
+    """_pause_for_tool_results runs its own field-name dedup after
+    calling the normalizer for each tool. Two tools whose fields now
+    normalize (via the BOM fix) to the same string still end up with
+    distinct field names in the published interactions -- narrowing the
+    normalizer's output domain does not break the existing dedup loop."""
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    tool_call_a = {"id": "call_a", "name": "tool_a"}
+    tool_call_b = {"id": "call_b", "name": "tool_b"}
+    result_a = {
+        "status": "waiting_for_user",
+        "message": "Pick one",
+        "message_type": "question",
+        # Options are what keep these answerable, so the published list is the
+        # deduplicated one with no free-text field appended.
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "\ufeffchoice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ],
+    }
+    result_b = {
+        "status": "waiting_for_user",
+        "message": "Pick another",
+        "message_type": "question",
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "B", "value": "b"}],
+            }
+        ],
+    }
+
+    outcome = await pattern._pause_for_tool_results(
+        waiting_pairs=[(tool_call_a, result_a), (tool_call_b, result_b)],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert outcome["status"] == "waiting_for_user"
+    assert [item["field"] for item in outcome["interactions"]] == [
+        "choice",
+        "choice_2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_resume_waiting_without_user_response_stays_waiting() -> (
+    None
+):
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need input.",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    first = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert first["status"] == "waiting_for_user"
+
+    resumed_pattern = ReActPattern(max_iterations=2)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed_llm = FakeLLM([{"content": "Should not run"}])
+
+    resumed = await resumed_pattern.run(context=context, tools=[], llm=resumed_llm)
+
+    assert resumed["status"] == "waiting_for_user"
+    assert resumed["message"] == "Choose A or B"
+    assert resumed_llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_resume_waiting_after_user_response_continues() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need input.",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    first = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert first["status"] == "waiting_for_user"
+    context.add_user_message("B", metadata={"response_to_waiting_for_user": "legacy"})
+
+    resumed_pattern = ReActPattern(max_iterations=2)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed_llm = FakeLLM([{"content": "Continuing with B."}])
+
+    resumed = await resumed_pattern.run(context=context, tools=[], llm=resumed_llm)
+
+    assert resumed["success"] is True
+    assert resumed["output"] == "Continuing with B."
+    assert len(resumed_llm.calls) == 1
+    assert context.messages[-2].content == "B"
+    resumed_messages = resumed_llm.calls[0]["messages"]
+    assert resumed_messages[-1]["role"] == "user"
+    assert "answer to a pending agent question" in resumed_messages[-1]["content"]
+    assert resumed_messages[-1]["content"].endswith("B")
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_replans_after_waiting_control_tool() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need input, then calculate.",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"5+5"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=4)
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Ask, then calculate")
+
+    first = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert first["status"] == "waiting_for_user"
+    assert pattern.pending_tool_calls == []
+    assert pattern._record_for_tool_call_id("call_calc").status == "cancelled"
+    assert tool.calls == []
+
+    context.add_user_message("B")
+    resumed_pattern = ReActPattern(max_iterations=4)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_replanned",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"5+5"}',
+                        },
+                    }
+                ]
+            },
+            {"content": "The result is 10.", "done": True},
+        ]
+    )
+
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[tool],
+        llm=resumed_llm,
+    )
+
+    assert resumed["success"] is True
+    assert tool.calls == [{"expression": "5+5"}]
+    assert context.get_messages_by_role("tool")[-1].tool_call_id == (
+        "call_calc_replanned"
+    )
+    resumed_messages = resumed_llm.calls[0]["messages"]
+    cancelled_tool_result = next(
+        message
+        for message in resumed_messages
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call_calc"
+    )
+    assert "cancelled" in cancelled_tool_result["content"]
+
+
+def _ask_then_stale_final_answer_llm() -> FakeLLM:
+    """One response bundling ask_user_question with a stale final_answer."""
+
+    return FakeLLM(
+        responses=[
+            {
+                "content": "Choose A or B",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": (
+                                '{"message":"Choose A or B","interactions":[]}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_stale_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Choose A or B"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+
+def _send_message_then_stale_final_answer_llm() -> FakeLLM:
+    """One response bundling send_message(expect_response) with a stale
+    final_answer."""
+
+    return FakeLLM(
+        responses=[
+            {
+                "content": "Choose A or B",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Choose A or B",'
+                                '"message_type":"question",'
+                                '"expect_response":true}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_stale_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Choose A or B"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+
+async def _park_on_question_with_stale_sibling(
+    llm: FakeLLM | None = None,
+) -> dict[str, Any]:
+    """Run one turn that parks on a control tool with a bundled sibling.
+
+    Returns the ``waiting_for_user`` checkpoint payload the runtime persisted
+    at pause time -- the exact state a production resume restores.
+    """
+
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Ask, then answer")
+    runtime = PatternRuntime()
+
+    first = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm or _ask_then_stale_final_answer_llm(),
+        runtime=runtime,
+    )
+
+    assert first["status"] == "waiting_for_user"
+    waiting_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "waiting_for_user"
+    ]
+    assert waiting_checkpoints
+    return waiting_checkpoints[-1]
+
+
+@pytest.mark.asyncio
+async def test_react_waiting_checkpoint_persists_discarded_pending_plan() -> None:
+    """#2216: the checkpoint written when a control tool parks the run must
+    already reflect the discarded tool plan. Persisting the batch's unexecuted
+    siblings made a resume replay them instead of replanning."""
+
+    checkpoint = await _park_on_question_with_stale_sibling()
+
+    assert checkpoint["pattern_state"]["pending_tool_calls"] == []
+    persisted_context = ExecutionContext.from_dict(checkpoint["context"])
+    cancelled = [
+        message
+        for message in persisted_context.messages
+        if message.role == "tool" and message.tool_call_id == "call_stale_final"
+    ]
+    assert len(cancelled) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_resume_from_waiting_checkpoint_without_answer_stays_parked() -> (
+    None
+):
+    """The pause-time cancellation results in the persisted context must not
+    make a resume without a new user message look like an answered question."""
+
+    checkpoint = await _park_on_question_with_stale_sibling()
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "Should not run"}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["status"] == "waiting_for_user"
+    assert resumed["message"] == "Choose A or B"
+    assert resumed_llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_resume_from_waiting_checkpoint_replans_instead_of_replaying() -> (
+    None
+):
+    """#2216 production signature: resuming the parked run with the user's
+    answer must reason over it, never finalize off a stale sibling call."""
+
+    checkpoint = await _park_on_question_with_stale_sibling()
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("B")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["success"] is True
+    assert len(resumed_llm.calls) == 1
+    assert resumed["response"] == "You chose B."
+
+
+@pytest.mark.asyncio
+async def test_react_send_message_waiting_checkpoint_resume_replans() -> None:
+    """send_message(expect_response=True) parks through the same control
+    branch as ask_user_question; its persisted waiting checkpoint must carry
+    an empty plan and resume by replanning, not by replaying the stale
+    sibling (#2216)."""
+
+    checkpoint = await _park_on_question_with_stale_sibling(
+        llm=_send_message_then_stale_final_answer_llm()
+    )
+
+    assert checkpoint["pattern_state"]["pending_tool_calls"] == []
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("B")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["success"] is True
+    assert len(resumed_llm.calls) == 1
+    assert resumed["response"] == "You chose B."
+
+
+def _legacy_waiting_state_and_context(
+    *stale_pendings: dict[str, Any],
+) -> tuple[dict[str, Any], ExecutionContext]:
+    """Build the state a pre-fix waiting_for_user checkpoint persisted: the
+    parked question plus the batch's unexecuted siblings still pending."""
+
+    context = ExecutionContext()
+    context.add_user_message("Ask, then answer")
+    context.add_assistant_message(
+        "Choose A or B",
+        tool_calls=[
+            {
+                "id": "call_question",
+                "type": "function",
+                "function": {
+                    "name": "ask_user_question",
+                    "arguments": '{"message": "Choose A or B", "interactions": []}',
+                },
+            },
+            *(
+                {
+                    "id": stale_pending["id"],
+                    "type": "function",
+                    "function": {
+                        "name": stale_pending["name"],
+                        "arguments": json.dumps(stale_pending["args"]),
+                    },
+                }
+                for stale_pending in stale_pendings
+            ),
+        ],
+    )
+    context.add_tool_result(
+        tool_name="ask_user_question",
+        result={
+            "status": "waiting_for_user",
+            "message": "Choose A or B",
+            "message_type": "question",
+            "interactions": [],
+        },
+        tool_call_id="call_question",
+    )
+    state = {
+        "status": "waiting_for_user",
+        "waiting_for_user_request": {
+            "event_id": "evt_legacy",
+            "tool_call_id": "call_question",
+            "tool_name": "ask_user_question",
+            "message": "Choose A or B",
+            "message_type": "question",
+            "interactions": [],
+            "task_text": "Ask, then answer",
+            "message_count": len(context.messages),
+        },
+        "pending_tool_calls": list(stale_pendings),
+    }
+    return state, context
+
+
+_STALE_FINAL_ANSWER = {
+    "id": "call_stale_final",
+    "name": "final_answer",
+    "args": {"answer": "Choose A or B"},
+}
+_STALE_WORK_TOOL = {
+    "id": "call_stale_calc",
+    "name": "calculator",
+    "args": {"expression": "5+5"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_pendings",
+    [
+        pytest.param([_STALE_FINAL_ANSWER], id="stale-final-answer"),
+        pytest.param([_STALE_WORK_TOOL], id="stale-work-tool"),
+        pytest.param(
+            [_STALE_FINAL_ANSWER, _STALE_WORK_TOOL],
+            id="stale-final-answer-and-work-tool",
+        ),
+    ],
+)
+async def test_react_resume_waiting_cancels_stale_pending_from_legacy_checkpoint(
+    stale_pendings: list[dict[str, Any]],
+) -> None:
+    """Checkpoints written before the discard-order fix still carry the parked
+    batch's siblings; the waiting-resume path must cancel them all -- never
+    finalize off a stale final_answer, never execute a stale work tool -- and
+    the healed state must re-persist with an empty plan."""
+
+    state, context = _legacy_waiting_state_and_context(*stale_pendings)
+    context.add_user_message("B")
+    pattern = ReActPattern(max_iterations=3)
+    pattern.load_state(state)
+    tool = FakeTool()
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+    runtime = PatternRuntime()
+
+    resumed = await pattern.run(
+        context=context, tools=[tool], llm=resumed_llm, runtime=runtime
+    )
+
+    assert resumed["success"] is True
+    assert resumed["response"] == "You chose B."
+    assert len(resumed_llm.calls) == 1
+    assert tool.calls == []
+    for stale_pending in stale_pendings:
+        assert (
+            pattern._record_for_tool_call_id(stale_pending["id"]).status == "cancelled"
+        )
+    resume_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "tool_interaction_response_received"
+    ]
+    assert resume_checkpoints
+    assert resume_checkpoints[-1]["pattern_state"]["pending_tool_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_resume_keeps_original_memory_input() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": '{"message":"Choose A or B","message_type":"question","expect_response":true}',
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message(
+        "Ask, then calculate\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Ask, then calculate"},
+    )
+
+    first = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert first["status"] == "waiting_for_user"
+    rebuilt_context = ExecutionContext.from_dict(context.to_dict())
+    rebuilt_context.add_user_message("B")
+    resumed_pattern = ReActPattern(max_iterations=3)
+    legacy_state = pattern.get_state()
+    legacy_state.pop("memory_input_text")
+    resumed_pattern.load_state(legacy_state)
+    resumed_llm = FakeLLM(
+        responses=[
+            {
+                "content": "Storing the preference.",
+                "tool_calls": [
+                    {
+                        "id": "call_mem",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": (
+                                '{"content":"User chose option B.",'
+                                '"kind":"user_preference"}'
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Continuing with B.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
+
+    resumed = await resumed_pattern.run(
+        context=rebuilt_context,
+        tools=[],
+        llm=resumed_llm,
+        memory_store=memory_store,
+    )
+
+    assert resumed["success"] is True
+    assert len(memory_store.added) == 1
+    # Legacy state without memory_input_text re-derives it from the original
+    # request, not the resume turn.
+    assert resumed_pattern.memory_input_text == "Ask, then calculate"
+    assert "task" not in memory_store.added[0].metadata
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_tool_errors_are_written_as_observations() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use missing tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_missing",
+                        "function": {
+                            "name": "missing",
+                            "arguments": '{"value":1}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after missing tool."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Recover")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Recovered after missing tool."
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert "Tool missing returned" in tool_message.content
+    assert tool_message.metadata["raw_result"]["success"] is False
+    assert "Tool not found" in tool_message.metadata["raw_result"]["error"]
+    assert pattern._record_for_tool_call_id("call_missing").status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_tool_exception_is_written_as_observation() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use broken tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_broken",
+                        "function": {
+                            "name": "broken",
+                            "arguments": '{"value":2}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after broken tool."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Recover")
+
+    result = await pattern.run(context=context, tools=[BrokenTool()], llm=llm)
+
+    assert result["success"] is True
+    assert result["response"] == "Recovered after broken tool."
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert tool_message.metadata["raw_result"]["success"] is False
+    assert "broken with" in tool_message.metadata["raw_result"]["error"]
+    assert pattern._record_for_tool_call_id("call_broken").status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_failed_tool_result_emits_tool_error_trace() -> None:
+    tracer = TraceEventRecorder()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use failing tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_failed_result",
+                        "function": {
+                            "name": "failing_result",
+                            "arguments": '{"value":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after failed tool result."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(execution_id="failed-result")
+    context.add_user_message("Recover")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[FailingResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert tool_message.metadata["raw_result"]["success"] is False
+    assert pattern._record_for_tool_call_id("call_failed_result").status == "failed"
+    event_types = {event["event_type"] for event in tracer.events}
+    assert "action_error_tool" in event_types
+    assert "task_start_react" in event_types
+    step_ids = {
+        event["step_id"]
+        for event in tracer.events
+        if event["event_type"] in {"task_start_react", "action_start_tool"}
+    }
+    assert len(step_ids) == 1
+    react_step_id = step_ids.pop()
+    assert react_step_id is not None
+    assert react_step_id.startswith("react_")
+    assert react_step_id != "failed-result"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_status_error_tool_result_is_failed() -> None:
+    tracer = TraceEventRecorder()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use failing tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_status_error_result",
+                        "function": {
+                            "name": "status_error_result",
+                            "arguments": '{"value":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after status error tool result."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(execution_id="status-error-result")
+    context.add_user_message("Recover")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[StatusErrorResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert tool_message.metadata["raw_result"]["status"] == "error"
+    assert (
+        pattern._record_for_tool_call_id("call_status_error_result").status == "failed"
+    )
+    event_types = {event["event_type"] for event in tracer.events}
+    assert "action_error_tool" in event_types
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_mcp_is_error_result_is_failed_without_failure_code() -> (
+    None
+):
+    tracer = TraceEventRecorder()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use failing MCP tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_is_error_result",
+                        "function": {
+                            "name": "is_error_result",
+                            "arguments": '{"value":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after MCP tool failure."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(execution_id="is-error-result")
+    context.add_user_message("Recover")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[IsErrorResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert tool_message.metadata["raw_result"]["is_error"] is True
+    assert pattern._record_for_tool_call_id("call_is_error_result").status == "failed"
+    assert llm.calls[1]["tools"] is not None
+    failure_events = [
+        event for event in tracer.events if event["event_type"] == "action_error_tool"
+    ]
+    assert len(failure_events) == 1
+    assert "failure_code" not in failure_events[0]["data"]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_classified_failure_preserves_failure_code() -> None:
+    """A classified delegated failure's ``failure_code`` survives end to end.
+
+    ``AgentTool`` returns a classified failure dict (see
+    ``_classified_failure`` in agent_tool.py) carrying a ``failure_code``.
+    A real ``ReActPattern`` run must preserve it on all three parent-level
+    surfaces: the tool ledger record, the tool message's ``raw_result``
+    metadata, and the ``action_error_tool`` trace event's data.
+    """
+    tracer = TraceEventRecorder()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use classified failure tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_classified",
+                        "function": {
+                            "name": "classified_failure_result",
+                            "arguments": '{"value":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after classified failure."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(execution_id="classified-failure-result")
+    context.add_user_message("Recover")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[ClassifiedFailureResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert pattern._record_for_tool_call_id("call_classified").status == "failed"
+    assert (
+        pattern._record_for_tool_call_id("call_classified").result["failure_code"]
+        == "unsupported_nested_interaction"
+    )
+
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert (
+        tool_message.metadata["raw_result"]["failure_code"]
+        == "unsupported_nested_interaction"
+    )
+
+    failure_events = [
+        event for event in tracer.events if event["event_type"] == "action_error_tool"
+    ]
+    assert len(failure_events) == 1
+    assert failure_events[0]["data"]["failure_code"] == "unsupported_nested_interaction"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_generates_new_step_id_per_run() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="multi-react")
+    context.add_user_message("First")
+
+    first = ReActPattern(max_iterations=1)
+    first_result = await first.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([{"content": "First done."}]),
+        runtime=runtime,
+    )
+
+    context.add_user_message("Second")
+    second = ReActPattern(max_iterations=1)
+    second_result = await second.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([{"content": "Second done."}]),
+        runtime=runtime,
+    )
+
+    assert first_result["success"] is True
+    assert second_result["success"] is True
+    react_start_step_ids = [
+        event["step_id"]
+        for event in tracer.events
+        if event["event_type"] == "task_start_react"
+    ]
+    assert len(react_start_step_ids) == 2
+    assert all(step_id.startswith("react_") for step_id in react_start_step_ids)
+    assert react_start_step_ids[0] != react_start_step_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_traces_context_compaction() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="compact-react")
+    context.compact_config.threshold = 1
+    for index in range(3):
+        context.add_user_message(f"message {index}")
+    llm = FakeLLM([{"content": "summary"}, {"content": "done"}])
+    llm.context_window = 32_000
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        # Two responses: compaction now summarizes with the main model when no
+        # compact model is configured, so it consumes one before the turn's
+        # own call.
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    compact_events = [
+        event for event in tracer.events if event["event_type"].endswith("_compact")
+    ]
+    assert [event["event_type"] for event in compact_events] == [
+        "action_start_compact",
+        "action_end_compact",
+    ]
+    assert compact_events[0]["step_id"].startswith("react_")
+    assert compact_events[1]["data"]["success"] is True
+    assert compact_events[1]["data"]["compact_type"] == "execution_context"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_uses_compact_llm_for_context_compaction() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="compact-react-llm")
+    context.compact_config.threshold = 1
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+    llm = FakeLLM([{"content": "done"}])
+    compact_llm = FakeLLM(
+        [
+            {
+                "content": "summarized tool result",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ]
+    )
+    compact_llm.context_window = 32_000
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=llm,
+        compact_llm=compact_llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert len(compact_llm.calls) == 1
+    assert compact_llm.calls[0]["max_tokens"] == 256
+    assert "Preserve the language" in compact_llm.calls[0]["messages"][0]["content"]
+    assert len(llm.calls) == 1
+    assert any(
+        "summarized tool result" in message["content"]
+        for message in llm.calls[0]["messages"]
+    )
+    compact_end = next(
+        event for event in tracer.events if event["event_type"] == "action_end_compact"
+    )
+    assert compact_end["data"]["strategy"] == "llm_summary"
+    compact_llm_events = [
+        event
+        for event in tracer.events
+        if event["event_type"] in {"action_start_llm", "action_end_llm"}
+        and event["data"].get("purpose") == "context_compaction"
+    ]
+    assert [event["event_type"] for event in compact_llm_events] == [
+        "action_start_llm",
+        "action_end_llm",
+    ]
+    assert compact_llm_events[1]["data"]["input_tokens"] == 10
+    assert context.get_total_token_usage()["total"] == 15
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_emits_runtime_checkpoints() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "I should calculate this first.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"3+3"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "The result is 6.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Calculate 3+3")
+    runtime = PatternRuntime()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert [checkpoint["label"] for checkpoint in runtime.checkpoints] == [
+        "before_llm",
+        "after_llm",
+        "before_tool",
+        "after_tool",
+        "before_llm",
+        "after_llm",
+        "final",
+    ]
+    after_llm = runtime.checkpoints[1]
+    [checkpointed_call] = after_llm["pattern_state"]["pending_tool_calls"]
+    assert checkpointed_call == {
+        "id": "call_1",
+        "invocation_id": ANY,
+        "issued_at": ANY,
+        "name": "calculator",
+        "args": {"expression": "3+3"},
+    }
+    context_call = after_llm["context"]["messages"][1]["tool_calls"][0]
+    assert context_call["id"] == "call_1"
+    assert "invocation_id" not in context_call
+    assert "issued_at" not in context_call
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_runtime_emits_tracer_task_and_tool_events() -> None:
+    tracer = FakeTracer()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need a tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_trace",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"3*3"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "The result is 9.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Calculate 3*3")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert [event for event, _ in tracer.events] == [
+        "start_trace",
+        "start_span",
+        "finish_span",
+        "finish_trace",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_pause_cancels_active_llm_call() -> None:
+    llm = BlockingLLM()
+    runtime = PatternRuntime()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Wait on model")
+
+    task = asyncio.create_task(
+        pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=runtime,
+        )
+    )
+    await asyncio.wait_for(llm.started.wait(), timeout=1)
+
+    runtime.request_interrupt("paused by test")
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert llm.cancelled is True
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["interrupt_reason"] == "paused by test"
+    assert runtime.last_checkpoint["label"] == "interrupted"
+    assert runtime.last_checkpoint["metadata"] == {
+        "safe_point": "during_llm",
+        "reason": "paused by test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_pause_during_tool_protocol_retry_is_during_llm() -> None:
+    llm = BlockingProtocolRetryLLM()
+    runtime = PatternRuntime()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Retry the model")
+
+    task = asyncio.create_task(
+        pattern.run(
+            context=context,
+            tools=[FakeTool()],
+            llm=llm,
+            runtime=runtime,
+        )
+    )
+    await asyncio.wait_for(llm.retry_started.wait(), timeout=1)
+
+    runtime.request_interrupt("paused during retry")
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert llm.cancelled is True
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["interrupt_reason"] == "paused during retry"
+    assert runtime.last_checkpoint["label"] == "interrupted"
+    assert runtime.last_checkpoint["metadata"] == {
+        "safe_point": "during_llm",
+        "reason": "paused during retry",
+    }
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_interrupts_at_tool_boundary() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "I should calculate this first.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"4+4"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    runtime = PatternRuntime()
+    runtime.interrupt_checker = lambda: len(runtime.checkpoints) >= 2
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext()
+    context.add_user_message("Calculate 4+4")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert tool.calls == []
+    assert runtime.last_checkpoint["label"] == "interrupted"
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call == {
+        "id": "call_1",
+        "invocation_id": ANY,
+        "issued_at": ANY,
+        "name": "calculator",
+        "args": {"expression": "4+4"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_resumes_pending_tool_call_from_checkpoint() -> None:
+    first_llm = FakeLLM(
+        responses=[
+            {
+                "content": "I should calculate this first.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"4+4"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    first_runtime = PatternRuntime()
+    first_runtime.interrupt_checker = lambda: len(first_runtime.checkpoints) >= 2
+    first_pattern = ReActPattern(max_iterations=3)
+    first_context = ExecutionContext()
+    first_context.add_user_message("Calculate 4+4")
+
+    interrupted = await first_pattern.run(
+        context=first_context,
+        tools=[FakeTool()],
+        llm=first_llm,
+        runtime=first_runtime,
+    )
+    checkpoint = first_runtime.last_checkpoint
+
+    assert interrupted["status"] == "interrupted"
+    assert checkpoint is not None
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    restored_tool = FakeTool()
+    restored_runtime = PatternRuntime()
+
+    result = await restored_pattern.run(
+        context=restored_context,
+        tools=[restored_tool],
+        llm=FakeLLM([{"content": "The result is 8.", "done": True}]),
+        runtime=restored_runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 8."
+    assert restored_tool.calls == [{"expression": "4+4"}]
+    assert [message.role for message in restored_context.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+
+def test_react_pattern_state_roundtrip() -> None:
+    pattern = ReActPattern(
+        max_iterations=5,
+        repeated_tool_decision_after_consecutive_work_tool_calls=7,
+    )
+    pattern.status = "acting"
+    pattern.current_iteration = 2
+    pattern.task_text = "Original task"
+    pattern.memory_input_text = "Clean original task"
+    pattern.pending_tool_calls = [{"id": "call_1", "name": "calculator", "args": {}}]
+    pattern._record_tool_call(
+        {"id": "call_1", "name": "calculator", "args": {"expression": "1+1"}},
+        status="completed",
+        result={"result": 2},
+    )
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+
+    assert restored.status == "acting"
+    assert restored.current_iteration == 2
+    assert restored.max_iterations == 5
+    assert restored.repeated_tool_decision_after_consecutive_work_tool_calls == 7
+    assert restored.task_text == "Original task"
+    assert restored.memory_input_text == "Clean original task"
+    assert restored.reasoning_mode == ReActReasoningMode.TOOL_CALLING
+    assert restored._record_for_tool_call_id("call_1").result == {"result": 2}
+
+
+def test_react_pattern_loads_legacy_state_without_overwriting_memory_input() -> None:
+    restored = ReActPattern()
+    restored.memory_input_text = "Clean task from the rebuilt root context"
+
+    restored.load_state({"task_text": "Augmented execution task"})
+
+    assert restored.task_text == "Augmented execution task"
+    assert restored.memory_input_text == "Clean task from the rebuilt root context"
+
+
+def test_react_pattern_state_roundtrip_preserves_disabled_decision_thresholds() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=None,
+        repeated_tool_decision_after_consecutive_work_tool_calls=None,
+    )
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+
+    assert restored.repeated_tool_decision_after_consecutive_tool_calls is None
+    assert restored.repeated_tool_decision_after_consecutive_work_tool_calls is None
+
+
+def test_tool_call_record_from_dict_handles_null_args() -> None:
+    record = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "call_1",
+            "tool_name": "calculator",
+            "args": None,
+        }
+    )
+
+    assert record.args == {}
+    assert record.args_hash == ""
+    assert record.status == "pending"
+
+
+def test_args_hash_is_stable_sha256_digest() -> None:
+    pattern = ReActPattern()
+
+    digest = pattern._args_hash({"b": 2, "a": 1})
+
+    assert len(digest) == 64
+    assert all(char in "0123456789abcdef" for char in digest)
+    # Key order must not affect the digest.
+    assert digest == pattern._args_hash({"a": 1, "b": 2})
+    assert digest != pattern._args_hash({"a": 1, "b": 3})
+
+
+def test_args_hash_survives_circular_reference_args() -> None:
+    pattern = ReActPattern()
+    circular: dict = {"query": "x"}
+    circular["self"] = circular
+
+    digest = pattern._args_hash(circular)
+
+    assert len(digest) == 64
+    assert all(char in "0123456789abcdef" for char in digest)
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_reasoning_action_mode_is_explicit_placeholder() -> None:
+    pattern = ReActPattern(reasoning_mode=ReActReasoningMode.REASONING_ACTION)
+    context = ExecutionContext()
+    context.add_user_message("Think")
+
+    result = await pattern.run(context=context, tools=[], llm=FakeLLM([]))
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert "reserved for a future implementation" in result["error"]
+    assert result["reasoning_mode"] == ReActReasoningMode.REASONING_ACTION.value
+    assert result["error_type"] == "not_implemented"
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_runtime_injected_from_runner_style_traces_events() -> None:
+    tracer = FakeTracer()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need a tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_trace",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"3*3"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "The result is 9.", "done": True},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Calculate 3*3")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert [event for event, _ in tracer.events] == [
+        "start_trace",
+        "start_span",
+        "finish_span",
+        "finish_trace",
+    ]
+
+
+class MemoryToolStore:
+    """Fake memory store with both search (retrieval/dedup) and add (store)."""
+
+    def __init__(self) -> None:
+        self.searches: list[dict[str, Any]] = []
+        self.added: list[Any] = []
+        self.notes: dict[str, Any] = {}
+        self.updated: list[Any] = []
+
+    def search(self, **kwargs: Any) -> list[Any]:
+        self.searches.append(kwargs)
+        return []
+
+    def add(self, note: Any) -> Any:
+        self.added.append(note)
+        return SimpleNamespace(success=True, memory_id=f"mem-{len(self.added)}")
+
+    def get(self, memory_id: str) -> Any:
+        note = self.notes.get(memory_id)
+        if note is None:
+            return SimpleNamespace(success=False, content=None)
+        return SimpleNamespace(success=True, content=note)
+
+    def update(self, note: Any) -> Any:
+        self.updated.append(note)
+        self.notes[note.id] = note
+        return SimpleNamespace(success=True, memory_id=note.id)
+
+
+def _tool_names_from_llm_call(call: dict[str, Any]) -> list[str]:
+    return [tool["function"]["name"] for tool in list(call.get("tools") or [])]
+
+
+def test_find_tool_accepts_a_compatible_historical_name() -> None:
+    class RenamedTool:
+        name = "agent_research_assistant__a42"
+
+        @staticmethod
+        def matches_name(name: str) -> bool:
+            return name in {"agent_42", "agent_old_name__a42"}
+
+    tool = RenamedTool()
+    pattern = ReActPattern()
+
+    assert pattern._find_tool("agent_42", [tool]) is tool
+    assert pattern._find_tool("agent_old_name__a42", [tool]) is tool
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Worth remembering.",
+                "tool_calls": [
+                    {
+                        "id": "call_mem",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": (
+                                '{"content":"User prefers reports in Chinese.",'
+                                '"kind":"user_preference"}'
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Write the weekly report")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    tool_names = _tool_names_from_llm_call(llm.calls[0])
+    assert "store_memory" in tool_names
+    assert "search_memory" in tool_names
+    assert "update_memory" in tool_names
+    assert "delete_memory" in tool_names
+    assert len(memory_store.added) == 1
+    assert memory_store.added[0].content == "User prefers reports in Chinese."
+    # No end-of-run memory-evaluation LLM call: both fake responses are
+    # consumed by the ReAct loop itself.
+    assert llm.responses == []
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_update_memory_keeps_request_text_out_of_metadata() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Correcting stale memory.",
+                "tool_calls": [
+                    {
+                        "id": "call_update_memory",
+                        "function": {
+                            "name": "update_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "memory_id": "mem-existing",
+                                    "content": "Use the current release channel.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
+    memory_store.notes["mem-existing"] = SimpleNamespace(
+        id="mem-existing",
+        content="Use the legacy release channel.",
+        metadata={"source": "test"},
+    )
+    pattern = ReActPattern(max_iterations=3)
+    typed = "Update the release notes"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext()
+    context.add_user_message(augmented, metadata={"display_message": typed})
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    assert len(memory_store.updated) == 1
+    assert memory_store.updated[0].metadata == {"source": "test"}
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_without_memory_store_has_no_store_memory_tool() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    pattern = ReActPattern(max_iterations=1, tool_choice="none")
+    context = ExecutionContext()
+    context.add_user_message("Do the thing")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert "store_memory" not in _tool_names_from_llm_call(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_react_pattern_skips_store_memory_tool_in_single_call_mode() -> None:
+    llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
+    memory_store = MemoryToolStore()
+    pattern = ReActPattern(max_iterations=2, finalize_after_tool_result=True)
+    context = ExecutionContext()
+    context.add_user_message("Quick question")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    assert "store_memory" not in _tool_names_from_llm_call(llm.calls[0])
+    assert memory_store.added == []
+
+
+@pytest.mark.asyncio
+async def test_tool_result_user_interaction_fails_closed_when_disabled() -> None:
+    class WaitingTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Request approval.",
+        )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "Approve this action?",
+            }
+
+    pattern = ReActPattern(max_iterations=2, user_interaction_enabled=False)
+    runtime = PatternRuntime(execution_id="unattended-task")
+    context = ExecutionContext(execution_id="unattended-task")
+    context.add_user_message("Run unattended.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[WaitingTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert "interaction is disabled" in result["error"]
+    assert runtime.outbound_messages == []
+    assert pattern.status == "failed"
+    assert pattern.waiting_for_user_request is None
+
+
+@pytest.mark.asyncio
+async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
+    class ResumableTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="approval_gate",
+                description="Run an action after the user responds.",
+            )
+            self.resume_calls: list[dict[str, str]] = []
+            self.resume_context = None
+            self.user_response: str | None = None
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        def resume_user_interaction(
+            self,
+            *,
+            interaction_id: str,
+            response: str,
+        ) -> None:
+            self.resume_context = current_tool_call_execution_context()
+            self.resume_calls.append(
+                {"interaction_id": interaction_id, "response": response}
+            )
+            self.user_response = response
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            if self.user_response is None:
+                return {
+                    "success": False,
+                    "status": "waiting_for_user",
+                    "interaction_id": "interaction-1",
+                    "message": "Should the action continue?",
+                    "message_type": "confirmation",
+                    "interactions": [
+                        {
+                            "type": "select_one",
+                            "field": "decision",
+                            "label": "Decision",
+                            "options": [
+                                {"label": "Continue", "value": "continue"},
+                                {"label": "Stop", "value": "stop"},
+                            ],
+                        }
+                    ],
+                }
+            response = self.user_response
+            self.user_response = None
+            return {
+                "success": True,
+                "expression": args["expression"],
+                "user_response": response,
+            }
+
+    class MutationTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="mutation",
+                description="Mutate state.",
+            )
+            self.calls: list[dict[str, Any]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"success": True}
+
+    first_tool = ResumableTool()
+    first_mutation = MutationTool()
+    context = ExecutionContext(execution_id="interaction-task")
+    context.add_user_message("Run the gated action.")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="interaction-task", tracer=tracer)
+    pattern = ReActPattern(max_iterations=4)
+    waiting = await pattern.run(
+        context=context,
+        tools=[first_tool, first_mutation],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        },
+                        {
+                            "id": "stale-mutation",
+                            "function": {
+                                "name": "mutation",
+                                "arguments": '{"expression":"99"}',
+                            },
+                        },
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+    assert waiting["message"] == "Should the action continue?"
+    assert pattern._record_for_tool_call_id("wait-call").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("stale-mutation").status == "cancelled"
+    assert pattern.pending_tool_calls == []
+    assert first_mutation.calls == []
+    assert runtime.outbound_messages[0]["expect_response"] is True
+    assert any(
+        event["event_type"] == "action_end_tool"
+        and event["data"]["status"] == "waiting_for_user"
+        for event in tracer.events
+    )
+    assert not any(
+        event["event_type"] == "action_error_tool" for event in tracer.events
+    )
+
+    context.add_user_message("Continue")
+    resumed_tool = ResumableTool()
+    resumed_mutation = MutationTool()
+    resumed_pattern = ReActPattern(max_iterations=4)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[resumed_tool, resumed_mutation],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "resume-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                },
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-call",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"The action completed.",'
+                                    '"outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                },
+            ]
+        ),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["completion_outcome"] == "completed"
+    assert resumed_tool.resume_calls == [
+        {"interaction_id": "interaction-1", "response": "Continue"}
+    ]
+    assert resumed_tool.resume_context.react_step_id == (
+        pattern._record_for_tool_call_id("wait-call").step_id
+    )
+    assert resumed_mutation.calls == []
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    response_metadata = next(
+        message.metadata
+        for message in context.messages
+        if message.role == "user" and message.content == "Continue"
+    )
+    assert response_metadata["response_to_waiting_for_user"]["question"] == (
+        "Should the action continue?"
+    )
+
+
+@pytest.mark.parametrize("waiting_request", [None, [], "malformed"])
+def test_tool_interaction_response_queue_ignores_malformed_requests(
+    waiting_request: Any,
+) -> None:
+    pattern = ReActPattern()
+
+    pattern._queue_tool_interaction_responses(
+        waiting_request=waiting_request,
+        response="Continue",
+        tools=[],
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
+    class CallbackLessTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="clarification_gate",
+                description="Ask for clarification without retaining server state.",
+            )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": "interaction-1",
+                "message": "Which value should be used?",
+                "message_type": "question",
+                "interactions": [
+                    {
+                        "type": "text_input",
+                        "field": "value",
+                        "label": "Value",
+                    }
+                ],
+            }
+
+    tool = CallbackLessTool()
+    context = ExecutionContext(execution_id="callback-less-interaction")
+    context.add_user_message("Use the requested value.")
+    pattern = ReActPattern(max_iterations=2)
+    waiting = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "clarification_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+
+    context.add_user_message("Use 42")
+    resumed_pattern = ReActPattern(max_iterations=2)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-call",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"Using 42.",'
+                                    '"outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["completion_outcome"] == "completed"
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    response_message = next(
+        message
+        for message in context.messages
+        if message.role == "user" and message.content == "Use 42"
+    )
+    waiting_metadata = response_message.metadata["response_to_waiting_for_user"]
+    assert waiting_metadata == {
+        "question": "Which value should be used?",
+        "message_type": "question",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ungated_mcp_tool_pause_and_resume_takes_the_legacy_path() -> None:
+    """The gate wrapper is inert for an interaction it never gated.
+
+    ``MCPApprovalGateTool`` exposes ``resume_user_interaction`` for every MCP
+    tool, so every wrapped tool now looks resumable to
+    ``_queue_tool_interaction_responses``. That is only safe because the gate
+    returns ``None`` for an interaction it did not issue, and ReAct reads
+    ``None`` as "legacy replan": nothing is projected onto the ledger row and
+    the model replans from the user's reply, exactly as before the wrapper.
+    """
+
+    class WaitingMCPTool(FakeTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.name = "mcp_notion_search"
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(args)
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": "host-owned-interaction",
+                "message": "Which page?",
+                "message_type": "question",
+                "interactions": [
+                    {"type": "text_input", "field": "page", "label": "Page"}
+                ],
+            }
+
+    target = WaitingMCPTool()
+    (gated,) = gate_mcp_tools([target], connection={"id": 41})
+    # A gate is registered for a DIFFERENT source; this execution carries none.
+    registration = register_mcp_approval_gate(
+        task_source="slack",
+        gate=_never_called_gate,
+        resume=_never_called_gate,
+    )
+    try:
+        context = ExecutionContext(execution_id="ungated-mcp-interaction")
+        context.add_user_message("Find the page.")
+        pattern = ReActPattern(max_iterations=2)
+        waiting = await pattern.run(
+            context=context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "wait-call",
+                                "function": {
+                                    "name": "mcp_notion_search",
+                                    "arguments": '{"expression":"roadmap"}',
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+        assert waiting["status"] == "waiting_for_user"
+        # The gate did not stamp this id: the tool, not the gate, issued it.
+        assert pattern._record_for_tool_call_id("wait-call").result[
+            "interaction_id"
+        ] == ("host-owned-interaction")
+
+        context.add_user_message("The roadmap page")
+        resumed_pattern = ReActPattern(max_iterations=2)
+        resumed_pattern.load_state(pattern.get_state())
+        resumed = await resumed_pattern.run(
+            context=context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "final-call",
+                                "function": {
+                                    "name": "final_answer",
+                                    "arguments": (
+                                        '{"response_language":"English",'
+                                        '"answer":"Found it.",'
+                                        '"outcome":"completed"}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+    assert resumed["success"] is True
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    # Legacy path: no settlement was projected onto the original row, and the
+    # gate never re-dispatched the call.
+    record = resumed_pattern._record_for_tool_call_id("wait-call")
+    assert record.status == "waiting_for_user"
+    assert record.settlement_status is None
+    assert target.calls == [{"expression": "roadmap"}]
+
+
+async def _never_called_gate(*_: Any, **__: Any) -> None:
+    raise AssertionError("an ungated execution must not reach the gate hooks")
+
+
+@pytest.mark.asyncio
+async def test_gated_call_survives_a_real_checkpoint_rebuild_and_resumes() -> None:
+    """The PR's core scenario, end to end, across a full runtime rebuild.
+
+    gated call -> require_approval -> real checkpoint -> rebuild every
+    runtime-owned object from that checkpoint -> resume, with the gate
+    recognizing the ``xgate:`` id *it* issued and settling the original call.
+
+    The pieces were covered in isolation; what this pins is that they compose
+    across the serialization boundary - the stamped interaction id and the
+    issuing step id both survive by value, which is the whole reason the id
+    carries the source instead of process memory.
+    """
+
+    target = FakeTool()
+    target.name = "mcp_LinkedIn_create_post"
+    (gated,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def gate(call: GatedCall) -> GateDecision:
+        return GateDecision.require_approval("host-1", message="Publish this?")
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(
+            await executor({"expression": "2+2"})
+        )
+
+    registration = register_mcp_approval_gate(
+        task_source="slack", gate=gate, resume=resume, timeout_seconds=30
+    )
+    try:
+        first_context = ExecutionContext(
+            execution_id="gated-rebuild-task",
+            metadata={"task_source": "slack", "run_id": "run-1"},
+        )
+        first_context.add_user_message("Publish it.", metadata={"turn_id": "turn-1"})
+        first_pattern = ReActPattern(max_iterations=3)
+        first_runtime = PatternRuntime(execution_id="gated-rebuild-task")
+        waiting = await first_pattern.run(
+            context=first_context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "gated-call-1",
+                                "function": {
+                                    "name": "mcp_LinkedIn_create_post",
+                                    "arguments": '{"expression":"2+2"}',
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+            runtime=first_runtime,
+        )
+
+        assert waiting["status"] == "waiting_for_user"
+        assert target.calls == []
+        paused_record = first_pattern._record_for_tool_call_id("gated-call-1")
+        stamped_id = paused_record.result["interaction_id"]
+        # The gate stamped its own source into the id the host will see back.
+        assert _gated_interaction_source(stamped_id) == ("slack", "host-1")
+
+        checkpoint = next(
+            checkpoint
+            for checkpoint in reversed(first_runtime.checkpoints)
+            if checkpoint["label"] == "waiting_for_user"
+        )
+
+        # Rebuild every runtime-owned object from the durable checkpoint.
+        restored_context = ExecutionContext.from_dict(checkpoint["context"])
+        restored_context.add_user_message("approve")
+        restored_pattern = ReActPattern(max_iterations=3)
+        restored_pattern.load_state(checkpoint["pattern_state"])
+
+        # The stamped id and the issuing step survived serialization by value.
+        restored_record = restored_pattern._record_for_tool_call_id("gated-call-1")
+        assert restored_record.result["interaction_id"] == stamped_id
+        assert restored_record.step_id == paused_record.step_id
+
+        resumed = await restored_pattern.run(
+            context=restored_context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "final-call",
+                                "function": {
+                                    "name": "final_answer",
+                                    "arguments": (
+                                        '{"response_language":"English",'
+                                        '"answer":"Published.",'
+                                        '"outcome":"completed"}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+            runtime=PatternRuntime(execution_id="gated-rebuild-task"),
+        )
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+    assert resumed["success"] is True
+    # The approved write ran exactly once, on the rebuilt runtime.
+    assert target.calls == [{"expression": "2+2"}]
+    settled = restored_pattern._record_for_tool_call_id("gated-call-1")
+    assert settled.status == "completed"
+    assert settled.settlement_status == "succeeded"
+    assert restored_pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
+    class ResumableTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="approval_gate",
+                description="Resume exact interactions.",
+            )
+            self.calls: list[dict[str, str]] = []
+            self.fail_interaction_id = "interaction-2"
+
+        def resume_user_interaction(
+            self,
+            *,
+            interaction_id: str,
+            response: str,
+        ) -> None:
+            self.calls.append({"interaction_id": interaction_id, "response": response})
+            if interaction_id == self.fail_interaction_id:
+                raise RuntimeError("delivery failed")
+
+    pending = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Approve first",
+        },
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-2",
+            "interaction_id": "interaction-2",
+            "response": "Reject second",
+        },
+    ]
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = list(pending)
+    for index in (1, 2):
+        pattern._store_tool_record(
+            ToolCallRecord(
+                tool_call_id=f"call-{index}",
+                tool_name="approval_gate",
+                args={},
+                args_hash="stored-hash",
+                status="waiting_for_user",
+            )
+        )
+    tool = ResumableTool()
+    context = ExecutionContext(execution_id="interaction-delivery")
+    for index in (1, 2):
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            f"call-{index}",
+        )
+    runtime = PatternRuntime(execution_id="interaction-delivery")
+
+    with pytest.raises(RuntimeError, match="delivery failed"):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=runtime,
+        )
+
+    assert tool.calls == [
+        {"interaction_id": "interaction-1", "response": "Approve first"},
+        {"interaction_id": "interaction-2", "response": "Reject second"},
+    ]
+    assert pattern.pending_tool_interaction_responses == [pending[1]]
+
+    tool.fail_interaction_id = ""
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert tool.calls[-1] == {
+        "interaction_id": "interaction-2",
+        "response": "Reject second",
+    }
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_without_resume_callback_is_skipped() -> None:
+    class CallbackLessTool:
+        metadata = SimpleNamespace(
+            name="clarification_gate",
+            description="No resume callback.",
+        )
+
+    pending = {
+        "tool_name": "clarification_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Use 42",
+    }
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [pending]
+    context = ExecutionContext(execution_id="callback-less-delivery")
+    runtime = PatternRuntime(execution_id="callback-less-delivery")
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[CallbackLessTool()],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+
+
+class SettlementApprovalTool:
+    """Resumable tool whose pause/resume outcome is scripted per interaction."""
+
+    non_idempotent = True
+
+    def __init__(
+        self,
+        *,
+        name: str = "approval_gate",
+        resume_result: Any = None,
+        resume_results: dict[str, Any] | None = None,
+        interaction_id: str = "publish-interaction-1",
+    ) -> None:
+        self.metadata = SimpleNamespace(
+            name=name,
+            description="Publish after explicit approval.",
+        )
+        self.resume_result = resume_result
+        self.resume_results = resume_results
+        self.interaction_id = interaction_id
+        self.run_calls: list[dict[str, Any]] = []
+        self.resume_calls: list[dict[str, str]] = []
+
+    def args_type(self) -> type[BaseModel]:
+        return CalculatorArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.run_calls.append(args)
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "interaction_id": self.interaction_id,
+            "message": "Publish this exact post?",
+            "message_type": "confirmation",
+            "interactions": [],
+        }
+
+    async def resume_user_interaction(
+        self,
+        *,
+        interaction_id: str,
+        response: str,
+    ) -> Any:
+        self.resume_calls.append(
+            {"interaction_id": interaction_id, "response": response}
+        )
+        if self.resume_results is not None:
+            return self.resume_results[interaction_id]
+        return self.resume_result
+
+
+def _waiting_ledger_record(tool_call_id: str, **overrides: Any) -> ToolCallRecord:
+    fields: dict[str, Any] = {
+        "tool_call_id": tool_call_id,
+        "tool_name": "approval_gate",
+        "args": {},
+        "args_hash": "stored-hash",
+        "status": "waiting_for_user",
+    }
+    fields.update(overrides)
+    return ToolCallRecord(**fields)
+
+
+def _settlement_trace_events(
+    tracer: TraceEventRecorder, tool_call_id: str
+) -> list[str]:
+    return [
+        event["event_type"]
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == tool_call_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() -> None:
+    first_context = ExecutionContext(execution_id="durable-interaction-task")
+    first_context.add_user_message("Publish the approved post.")
+    first_pattern = ReActPattern(max_iterations=3)
+    first_runtime = PatternRuntime(execution_id="durable-interaction-task")
+    waiting = await first_pattern.run(
+        context=first_context,
+        tools=[SettlementApprovalTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "original-publish-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"publish"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=first_runtime,
+    )
+    assert waiting["status"] == "waiting_for_user"
+    checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(first_runtime.checkpoints)
+        if checkpoint["label"] == "waiting_for_user"
+    )
+    # Rebuild every runtime-owned object from the durable checkpoint.
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("Approve")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_tool = SettlementApprovalTool(
+        resume_result=ToolInteractionSettlement.succeeded(
+            {"success": True, "post_urn": "urn:li:share:123"}
+        )
+    )
+    resumed_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"Published.",'
+                                '"outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    tracer = TraceEventRecorder()
+    resumed_runtime = PatternRuntime(
+        execution_id="durable-interaction-task",
+        tracer=tracer,
+    )
+    resumed_runtime.active_turn_id = "approval-turn"
+    resumed = await restored_pattern.run(
+        context=restored_context,
+        tools=[resumed_tool],
+        llm=resumed_llm,
+        runtime=resumed_runtime,
+    )
+    assert resumed["success"] is True
+    assert resumed_tool.run_calls == []
+    assert resumed_tool.resume_calls == [
+        {"interaction_id": "publish-interaction-1", "response": "Approve"}
+    ]
+    record = restored_pattern._record_for_tool_call_id("original-publish-call")
+    assert record.status == "completed"
+    assert record.settlement_status == "succeeded"
+    assert record.invocation_id is not None
+    assert record.settlement_turn_id == resumed_runtime.active_turn_id
+    # The issuing ReAct step survives the checkpoint round-trip BY VALUE, so a
+    # resumed gated call rebuilds the exact execution identity it paused with.
+    # A truthy-only assertion here would pass on any regenerated step id.
+    assert (
+        record.step_id
+        == first_pattern._record_for_tool_call_id("original-publish-call").step_id
+    )
+    assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
+    assert (
+        len(
+            restored_pattern._consecutive_successful_tool_group_records("approval_gate")
+        )
+        == 1
+    )
+    assert restored_pattern._consecutive_work_tool_call_count() == 1
+    projected_messages = [
+        message
+        for message in restored_context.messages
+        if message.role == "tool" and message.tool_call_id == "original-publish-call"
+    ]
+    assert len(projected_messages) == 1
+    assert projected_messages[0].metadata["raw_result"] == record.result
+    assert "urn:li:share:123" in str(resumed_llm.calls[0]["messages"])
+    assert restored_pattern.pending_tool_interaction_responses == []
+    assert _settlement_trace_events(tracer, "original-publish-call") == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "original-publish-call"
+    ]
+    assert {event["step_id"] for event in settlement_events} == {record.step_id}
+    assert {event["data"]["invocation_id"] for event in settlement_events} == {
+        record.invocation_id
+    }
+    assert {event["data"]["original_started_at"] for event in settlement_events} == {
+        record.issued_at
+    }
+
+
+@pytest.mark.asyncio
+async def test_settlement_lifecycle_does_not_rebill_the_tool_call(mocker: Any) -> None:
+    """One tracer and one runtime across pause and resume (#2283 round 3).
+
+    ``PatternRuntime.on_tool_start`` bills one tool call unconditionally, so a
+    settlement that reused it would durably charge the user twice for a resume
+    that runs no tool.
+    """
+
+    billed = mocker.patch("xagent.core.model.chat.token_context.add_tool_call_usage")
+    tracer = TraceEventRecorder()
+    first_context = ExecutionContext(execution_id="metered-interaction")
+    first_context.add_user_message("Publish the approved post.")
+    first_pattern = ReActPattern(max_iterations=3)
+    runtime = PatternRuntime(execution_id="metered-interaction", tracer=tracer)
+    waiting = await first_pattern.run(
+        context=first_context,
+        tools=[SettlementApprovalTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "original-publish-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"publish"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+    assert waiting["status"] == "waiting_for_user"
+    assert billed.call_count == 1
+
+    first_context.add_user_message("Approve")
+    resumed_tool = SettlementApprovalTool(
+        resume_result=ToolInteractionSettlement.succeeded(
+            {"success": True, "post_urn": "urn:li:share:123"}
+        )
+    )
+    resumed = await first_pattern.run(
+        context=first_context,
+        tools=[resumed_tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-call",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"Published.",'
+                                    '"outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert resumed["success"] is True
+    assert resumed_tool.run_calls == []
+    # The resume executed no tool, so the single pause-time invocation is the
+    # only billable action in the whole flow.
+    assert billed.call_count == 1
+    tool_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "original-publish-call"
+    ]
+    # Pause pair, then exactly one settlement pair that closes the call.
+    assert [event["event_type"] for event in tool_events] == [
+        "action_start_tool",
+        "action_end_tool",
+        "action_start_tool",
+        "action_end_tool",
+    ]
+    assert tool_events[1]["data"]["status"] == "waiting_for_user"
+    assert tool_events[2]["data"]["settlement_delivery"] is True
+    assert tool_events[3]["data"]["settlement_delivery"] is True
+    assert tool_events[3]["data"]["success"] is True
+    assert tool_events[3]["data"]["settlement_status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_same_step_reused_provider_id_settles_the_exact_invocation() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    for call in (first, second):
+        call.update(step_id="react_same", turn_id="original-turn")
+    pattern._record_tool_call(first, status="completed", result={"value": "first"})
+    pattern._record_tool_call(
+        second,
+        status="waiting_for_user",
+        result={"success": False, "status": "waiting_for_user"},
+    )
+    first_before = pattern._tool_record_for_call(first)
+    second_before = pattern._tool_record_for_call(second)
+
+    context = ExecutionContext(execution_id="same-step-reuse")
+    context.add_tool_result(
+        "approval_gate",
+        first_before.result,
+        first["id"],
+        invocation_id=first["invocation_id"],
+    )
+    context.add_tool_result(
+        "approval_gate",
+        second_before.result,
+        second["id"],
+        invocation_id=second["invocation_id"],
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": second["id"],
+            "invocation_id": second["invocation_id"],
+            "interaction_id": "approval-2",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="same-step-reuse", tracer=tracer)
+    runtime.active_turn_id = "settlement-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded(
+                    {"success": True, "value": "settled"}
+                )
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert pattern._tool_record_for_call(first).result == {"value": "first"}
+    settled = pattern._tool_record_for_call(second)
+    assert settled.result == {"success": True, "value": "settled"}
+    assert settled.settlement_turn_id == "settlement-turn"
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("settlement_delivery") is True
+    ]
+    assert {event["data"]["invocation_id"] for event in settlement_events} == {
+        second["invocation_id"]
+    }
+    assert {event["data"]["original_started_at"] for event in settlement_events} == {
+        second_before.issued_at
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_replays_pending_settlement_traces_at_entry(mocker: Any) -> None:
+    pattern = ReActPattern(max_iterations=1)
+    replay = mocker.patch.object(
+        pattern,
+        "_replay_unemitted_settlement_traces",
+        new=mocker.AsyncMock(),
+    )
+    context = ExecutionContext(execution_id="run-replay-entry")
+    context.add_user_message("Finish")
+
+    await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([{"content": "Done", "done": True}]),
+        runtime=PatternRuntime(execution_id="run-replay-entry"),
+    )
+
+    replay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_settlement_tracer_failure_keeps_the_trace_owed_and_the_run_going(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tracer failure that is not a fact commit is logged, not raised.
+
+    A failed fact commit raises instead; see
+    test_resumed_settlement_fact_failure_remains_replayable.
+    """
+
+    class FailingTracer:
+        async def trace_event(self, *_: Any, **__: Any) -> None:
+            raise RuntimeError("tracer failed")
+
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    pattern._record_tool_call(
+        call,
+        status="completed",
+        result={"success": True},
+        settlement_status="succeeded",
+        settlement_trace_pending=True,
+    )
+    record = pattern._tool_record_for_call(call)
+    settle = pattern._trace_tool_interaction_settlement(
+        record=record,
+        status="succeeded",
+        result={"success": True},
+        error=None,
+        runtime=PatternRuntime(execution_id="settle", tracer=FailingTracer()),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await settle
+    assert "settlement trace event failed" in caplog.text
+    assert pattern._tool_record_for_call(call).settlement_trace_pending
+
+
+@pytest.mark.asyncio
+async def test_legacy_settlement_keeps_original_time_unknown() -> None:
+    pattern = ReActPattern()
+    pattern._store_tool_record(
+        _waiting_ledger_record("legacy-call", step_id="react-original", issued_at=None)
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "legacy-call",
+            "interaction_id": "legacy-interaction",
+            "response": "Approve",
+        }
+    ]
+    context = ExecutionContext(execution_id="legacy-settlement")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "legacy-call",
+    )
+    tracer = TraceEventRecorder()
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(execution_id="legacy-settlement", tracer=tracer),
+    )
+
+    record = pattern._record_for_tool_call_id("legacy-call")
+    assert record is not None and record.issued_at is None
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("settlement_delivery") is True
+    ]
+    assert settlement_events
+    assert all(
+        "original_started_at" not in event["data"] for event in settlement_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds() -> (
+    None
+):
+    settlement = ToolInteractionSettlement.succeeded(
+        {"success": True, "post_urn": "urn:li:share:123"}
+    )
+
+    class FailingCheckpointTracer:
+        async def checkpoint(self, **_: Any) -> None:
+            raise RuntimeError("checkpoint unavailable")
+
+    pending = {
+        "tool_name": "approval_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Approve",
+    }
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [pending]
+    pattern._store_tool_record(
+        _waiting_ledger_record(
+            "call-1",
+            args={"expression": "publish"},
+            result={"status": "waiting_for_user"},
+        )
+    )
+    context = ExecutionContext(execution_id="interaction-retry")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    tool = SettlementApprovalTool(resume_result=settlement)
+    # ``PatternRuntime._emit_checkpoint`` normalizes a raw writer failure to
+    # ``CheckpointPersistenceError``. The rollback catches ``BaseException``,
+    # so it holds for the normalized durability error exactly as it does for
+    # the raw one; the original writer error survives as the cause.
+    with pytest.raises(CheckpointPersistenceError) as raised:
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=PatternRuntime(tracer=FailingCheckpointTracer()),
+        )
+    assert "checkpoint unavailable" in str(raised.value.__cause__)
+    assert pattern.pending_tool_interaction_responses == [pending]
+    assert pattern._record_for_tool_call_id("call-1").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("call-1").settlement_status is None
+    assert context.messages[0].metadata["raw_result"]["status"] == "waiting_for_user"
+    assert (
+        len(
+            [
+                message
+                for message in context.messages
+                if message.tool_call_id == "call-1"
+            ]
+        )
+        == 1
+    )
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=PatternRuntime(),
+    )
+    assert len(tool.resume_calls) == 2
+    assert pattern.pending_tool_interaction_responses == []
+    assert pattern._record_for_tool_call_id("call-1").result == settlement.result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
+async def test_non_successful_settlement_fails_the_original_tool_call(
+    status: str,
+) -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Reject",
+        }
+    ]
+    pattern._store_tool_record(_waiting_ledger_record("call-1"))
+    context = ExecutionContext(execution_id="terminal-interaction")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    runtime.active_turn_id = "approval-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement(status=status)  # type: ignore[arg-type]
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+    record = pattern._record_for_tool_call_id("call-1")
+    assert record.status == "failed"
+    assert record.settlement_status == status
+    assert record.settlement_turn_id == "approval-turn"
+    assert record.result["success"] is False
+    assert record.result["settlement_status"] == status
+    guarded = status in {"rejected", "dispatch_unknown"}
+    assert pattern.force_final_answer_next is guarded
+    assert pattern.settlement_final_answer_fence is guarded
+    assert pattern.settlement_fence_turn_id == ("approval-turn" if guarded else None)
+    assert len(pattern._consecutive_successful_tool_group_records("approval_gate")) == 0
+    assert pattern._consecutive_work_tool_call_count() == 1
+    assert _settlement_trace_events(tracer, "call-1") == [
+        "action_start_tool",
+        "action_error_tool",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("missing_ledger", "invalid_settlement_target"),
+        ("wrong_tool", "invalid_settlement_target"),
+        ("not_waiting", "already_settled"),
+        ("missing_result", "invalid_settlement_target"),
+        ("duplicate_result", "invalid_settlement_target"),
+    ],
+)
+async def test_invalid_resume_target_is_skipped_before_callback(
+    case: str, reason: str
+) -> None:
+    pattern = ReActPattern()
+    pending = {
+        "tool_name": "approval_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Approve",
+    }
+    pattern.pending_tool_interaction_responses = [pending]
+    if case != "missing_ledger":
+        pattern._store_tool_record(
+            _waiting_ledger_record(
+                "call-1",
+                tool_name="different_tool" if case == "wrong_tool" else "approval_gate",
+                status="completed" if case == "not_waiting" else "waiting_for_user",
+                result={"success": True} if case == "not_waiting" else None,
+            )
+        )
+    context = ExecutionContext(execution_id="invalid-resume-target")
+    if case != "missing_result":
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            "call-1",
+        )
+    if case == "duplicate_result":
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            "call-1",
+        )
+    messages_before = list(context.messages)
+    tool = SettlementApprovalTool(
+        resume_result=ToolInteractionSettlement.succeeded({"success": True})
+    )
+    runtime = PatternRuntime()
+    runtime.active_turn_id = "approval-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+    # The external callback must never run for a target we cannot resolve.
+    assert tool.resume_calls == []
+    assert pattern.pending_tool_interaction_responses == []
+    assert runtime.last_checkpoint["metadata"]["reason"] == reason
+    # The transcript is never rewritten on this path: the slot is exactly what
+    # failed to validate.
+    assert context.messages == messages_before
+
+    record = pattern._record_for_tool_call_id("call-1")
+    if case == "missing_ledger":
+        # Nothing to settle and nothing to guard; the entry is simply dropped.
+        assert record is None
+        return
+    if case == "wrong_tool":
+        # The record belongs to another call, so it stays exactly as it was.
+        assert record is not None
+        assert record.status == "waiting_for_user"
+        assert record.settlement_status is None
+        return
+    if case == "not_waiting":
+        # Idempotent replay: the earlier terminal outcome is left untouched.
+        assert record is not None
+        assert record.status == "completed"
+        assert record.settlement_status is None
+        return
+    # missing_result / duplicate_result: the row would otherwise stay
+    # waiting_for_user forever and be invisible to the duplicate-write guard.
+    assert record is not None
+    assert record.status == "failed"
+    assert record.settlement_status == "dispatch_unknown"
+    assert record.settlement_turn_id == "approval-turn"
+    assert record.result["success"] is False
+    assert "automatic retry is disabled" in record.result["error"].lower()
+    assert pattern.settlement_final_answer_fence is True
+    assert pattern.settlement_fence_turn_id == "approval-turn"
+    # And the model's retry of the same write is now suppressed, not executed.
+    suppressed = pattern._suppressed_duplicate_write_result(
+        {
+            "id": "retry-call",
+            "name": "approval_gate",
+            "args": {},
+            "turn_id": "approval-turn",
+        },
+        [tool],
+    )
+    assert suppressed is not None
+    assert suppressed["duplicate_write_suppressed"] is True
+    assert suppressed["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_resume_callback_result_fails_closed() -> None:
+    class BadReturnTool:
+        metadata = SimpleNamespace(name="approval_gate")
+
+        async def resume_user_interaction(self, **_: str) -> Any:
+            return {"unexpected": True}
+
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Approve",
+        }
+    ]
+    pattern._store_tool_record(_waiting_ledger_record("call-1"))
+    context = ExecutionContext(execution_id="invalid-resume-return")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    runtime = PatternRuntime()
+    runtime.active_turn_id = "approval-turn"
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[BadReturnTool()],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+    assert (
+        pattern._record_for_tool_call_id("call-1").settlement_status
+        == "dispatch_unknown"
+    )
+    assert pattern.settlement_final_answer_fence is True
+    assert pattern.settlement_fence_turn_id == "approval-turn"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["rejected", "dispatch_unknown"])
+@pytest.mark.parametrize("terminal_first", [True, False])
+async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
+    terminal_status: str,
+    terminal_first: bool,
+) -> None:
+    """The fence is a one-way latch inside the resumed turn (maintainer call).
+
+    A later success in the same batch settles normally on its own row but must
+    not reopen write authorization for the turn.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="settlement-batch")
+    interaction_ids = (
+        ["terminal", "succeeded"] if terminal_first else ["succeeded", "terminal"]
+    )
+    call_ids: dict[str, str] = {}
+    for index, interaction_id in enumerate(interaction_ids, 1):
+        call_id = f"call-{index}"
+        call_ids[interaction_id] = call_id
+        pattern.pending_tool_interaction_responses.append(
+            {
+                "tool_name": "approval_gate",
+                "tool_call_id": call_id,
+                "interaction_id": interaction_id,
+                "response": "Approve",
+            }
+        )
+        pattern._store_tool_record(_waiting_ledger_record(call_id))
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            call_id,
+        )
+    tool = SettlementApprovalTool(
+        resume_results={
+            "terminal": ToolInteractionSettlement(status=terminal_status),  # type: ignore[arg-type]
+            "succeeded": ToolInteractionSettlement.succeeded(
+                {"success": True, "post_urn": "urn:li:share:9"}
+            ),
+        }
+    )
+    runtime = PatternRuntime()
+    runtime.active_turn_id = "approval-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+    assert pattern.force_final_answer_next is True
+    assert pattern.settlement_final_answer_fence is True
+    assert pattern.settlement_fence_turn_id == "approval-turn"
+
+    # The successful sibling still settled correctly on its own row and in the
+    # transcript; the fence is turn-wide, not a per-row veto.
+    success_id = call_ids["succeeded"]
+    success_record = pattern._record_for_tool_call_id(success_id)
+    assert success_record.status == "completed"
+    assert success_record.settlement_status == "succeeded"
+    assert success_record.result == {"success": True, "post_urn": "urn:li:share:9"}
+    projected = [
+        message
+        for message in context.messages
+        if message.role == "tool" and message.tool_call_id == success_id
+    ]
+    assert len(projected) == 1
+    assert projected[0].metadata["raw_result"] == success_record.result
+
+    terminal_record = pattern._record_for_tool_call_id(call_ids["terminal"])
+    assert terminal_record.status == "failed"
+    assert terminal_record.settlement_status == terminal_status
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_survives_tool_protocol_recovery() -> None:
+    class DeniedWriteTool:
+        non_idempotent = True
+        metadata = SimpleNamespace(name="publish", description="Publish a post.")
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, _args: dict[str, Any]) -> Any:
+            self.calls += 1
+            return {"success": True}
+
+    pattern = ReActPattern(max_iterations=2)
+    pattern.settlement_final_answer_fence = True
+    context = ExecutionContext(execution_id="settlement-fence")
+    context.add_user_message("Do not publish it.")
+    tool = DeniedWriteTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "invalid-retry",
+                        "function": {
+                            "name": "publish",
+                            "arguments": '{"expression":"publish"}',
+                        },
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The write was not retried.",'
+                                '"outcome":"blocked"}'
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["completion_outcome"] == "blocked"
+    assert tool.calls == 0
+    assert [
+        [schema["function"]["name"] for schema in call["tools"]] for call in llm.calls
+    ] == [["final_answer"], ["final_answer"]]
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_survives_unavailable_tool_exception_recovery() -> None:
+    class RecoveryLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise LLMToolProtocolError(
+                    provider="deepseek",
+                    code="unavailable_tool_call",
+                    message="The narrowed schema rejected a work tool.",
+                )
+            return {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The write was not retried.",'
+                                '"outcome":"blocked"}'
+                            ),
+                        },
+                    }
+                ]
+            }
+
+    pattern = ReActPattern(max_iterations=1)
+    pattern.settlement_final_answer_fence = True
+    context = ExecutionContext(execution_id="settlement-exception-fence")
+    context.add_user_message("Do not publish it.")
+    llm = RecoveryLLM()
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["completion_outcome"] == "blocked"
+    assert [
+        [schema["function"]["name"] for schema in call["tools"]] for call in llm.calls
+    ] == [["final_answer"], ["final_answer"]]
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_binds_its_own_turn_during_protocol_retry() -> None:
+    """Within the fenced turn, protocol retry still cannot reach a work tool."""
+
+    class DeniedWriteTool:
+        non_idempotent = True
+        metadata = SimpleNamespace(name="publish", description="Publish a post.")
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, _args: dict[str, Any]) -> Any:
+            self.calls += 1
+            return {"success": True}
+
+    pattern = ReActPattern(max_iterations=2)
+    pattern.settlement_final_answer_fence = True
+    pattern.settlement_fence_turn_id = "approval-turn"
+    context = ExecutionContext(execution_id="settlement-fence-turn")
+    context.add_user_message(
+        "Do not publish it.", metadata={"turn_id": "approval-turn"}
+    )
+    tool = DeniedWriteTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "invalid-retry",
+                        "function": {
+                            "name": "publish",
+                            "arguments": '{"expression":"publish"}',
+                        },
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The write was not retried.",'
+                                '"outcome":"blocked"}'
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["completion_outcome"] == "blocked"
+    assert tool.calls == 0
+    assert [
+        [schema["function"]["name"] for schema in call["tools"]] for call in llm.calls
+    ] == [["final_answer"], ["final_answer"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ["max_iterations", "interrupted", "paused"])
+async def test_settlement_fence_does_not_outlive_its_turn(exit_kind: str) -> None:
+    """A fenced turn that never reaches _finalize_outcome must not lock later turns.
+
+    ``max_iterations``, an interrupt, and a second ``waiting_for_user`` pause
+    all leave ``settlement_final_answer_fence`` set, so honoring it beyond its
+    own turn would silently lock every later user message in the conversation
+    to final-answer-only.
+    """
+
+    class WorkTool:
+        metadata = SimpleNamespace(name="calculator", description="Do work.")
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, _args: dict[str, Any]) -> Any:
+            self.calls += 1
+            return {"success": True, "value": 4}
+
+    pattern = ReActPattern(max_iterations=1)
+    pattern.settlement_final_answer_fence = True
+    pattern.settlement_fence_turn_id = "approval-turn"
+    context = ExecutionContext(execution_id=f"fence-exit-{exit_kind}")
+    context.add_user_message("Approve", metadata={"turn_id": "approval-turn"})
+    fenced_tool = WorkTool()
+
+    if exit_kind == "max_iterations":
+        fenced_llm: Any = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "fenced-final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"","outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+            * 4
+        )
+        await pattern.run(context=context, tools=[fenced_tool], llm=fenced_llm)
+    elif exit_kind == "interrupted":
+
+        class InterruptingRuntime(PatternRuntime):
+            async def should_interrupt(self) -> bool:
+                return True
+
+        await pattern.run(
+            context=context,
+            tools=[fenced_tool],
+            llm=FakeLLM([{"content": "unused"}]),
+            runtime=InterruptingRuntime(execution_id=context.execution_id),
+        )
+    else:
+        pattern.status = "waiting_for_user"
+        pattern.waiting_for_user_request = {
+            "kind": "tool_waiting_for_user",
+            "message": "Which one?",
+            "message_type": "question",
+            "message_count": len(context.messages),
+            "requests": [],
+            "interactions": [],
+        }
+    # Whatever the exit route, the flag is still latched on the pattern.
+    assert pattern.settlement_final_answer_fence is True
+
+    # A brand-new user turn must get its tools back.
+    next_context = ExecutionContext(execution_id=f"fence-exit-{exit_kind}-next")
+    next_context.add_user_message("Now compute 2+2.", metadata={"turn_id": "next-turn"})
+    pattern.status = "idle"
+    pattern.waiting_for_user_request = None
+    pattern.force_final_answer_next = False
+    pattern.max_iterations = 3
+    next_tool = WorkTool()
+    next_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "work-call",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"It is 4.","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+
+    result = await pattern.run(context=next_context, tools=[next_tool], llm=next_llm)
+
+    assert result["success"] is True
+    assert next_tool.calls == 1
+    assert "calculator" in [
+        schema["function"]["name"] for schema in next_llm.calls[0]["tools"]
+    ]
+    assert pattern.settlement_final_answer_fence is False
+    assert pattern.settlement_fence_turn_id is None
+
+
+def test_checkpoint_state_copies_pending_interaction_responses() -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "publish",
+            "tool_call_id": "call-1",
+            "interaction_id": "approval-1",
+            "response": "Approve",
+        }
+    ]
+
+    state = pattern.get_state()
+    pattern.pending_tool_interaction_responses[0]["response"] = "Changed"
+
+    assert state["pending_tool_interaction_responses"][0]["response"] == "Approve"
+
+
+def test_settlement_fence_survives_a_state_round_trip() -> None:
+    pattern = ReActPattern()
+    pattern.settlement_final_answer_fence = True
+    pattern.settlement_fence_turn_id = "approval-turn"
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+
+    assert restored.settlement_final_answer_fence is True
+    assert restored.settlement_fence_turn_id == "approval-turn"
+
+
+def test_settlement_ledger_fields_survive_a_record_round_trip() -> None:
+    record = ToolCallRecord(
+        tool_call_id="call-1",
+        tool_name="publish",
+        args={"text": "hi"},
+        args_hash="hash",
+        status="completed",
+        result={"success": True},
+        settlement_status="succeeded",
+        turn_id="original-turn",
+        settlement_turn_id="approval-turn",
+        tool_attempt_id="attempt-1",
+        assistant_message_id="batch-1",
+    )
+
+    restored = ToolCallRecord.from_dict(record.to_dict())
+
+    assert restored == record
+
+
+def test_resumed_success_guards_only_its_settlement_turn() -> None:
+    pattern = ReActPattern()
+    args = {"text": "approved"}
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="original-call",
+            tool_name="publish",
+            args=args,
+            args_hash=pattern._args_hash(args),
+            status="completed",
+            result={"success": True},
+            settlement_status="succeeded",
+            turn_id="original-turn",
+            settlement_turn_id="approval-turn",
+        )
+    )
+    tool = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish"),
+    )
+    same_turn = pattern._suppressed_duplicate_write_result(
+        {"id": "new-call", "name": "publish", "args": args, "turn_id": "approval-turn"},
+        [tool],
+    )
+    original_turn = pattern._suppressed_duplicate_write_result(
+        {"id": "old-call", "name": "publish", "args": args, "turn_id": "original-turn"},
+        [tool],
+    )
+    later_turn = pattern._suppressed_duplicate_write_result(
+        {"id": "later-call", "name": "publish", "args": args, "turn_id": "later-turn"},
+        [tool],
+    )
+    assert same_turn["duplicate_write_suppressed"] is True
+    assert same_turn["success"] is True
+    # The settled row is keyed by its settlement turn, so the original
+    # execution turn is no longer the guard key.
+    assert original_turn is None
+    assert later_turn is None
+
+
+@pytest.mark.parametrize("settlement_status", ["rejected", "dispatch_unknown"])
+def test_denied_settlement_suppresses_the_same_write_in_its_turn(
+    settlement_status: str,
+) -> None:
+    pattern = ReActPattern()
+    args = {"text": "denied"}
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="original-call",
+            tool_name="publish",
+            args=args,
+            args_hash=pattern._args_hash(args),
+            status="failed",
+            result={"success": False, "settlement_status": settlement_status},
+            settlement_status=settlement_status,
+            settlement_turn_id="approval-turn",
+        )
+    )
+    tool = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish"),
+    )
+
+    suppressed = pattern._suppressed_duplicate_write_result(
+        {"id": "retry", "name": "publish", "args": args, "turn_id": "approval-turn"},
+        [tool],
+    )
+    later = pattern._suppressed_duplicate_write_result(
+        {"id": "retry", "name": "publish", "args": args, "turn_id": "later-turn"},
+        [tool],
+    )
+
+    assert suppressed["success"] is False
+    assert suppressed["duplicate_write_suppressed"] is True
+    assert "denied or is uncertain" in suppressed["message"]
+    assert later is None
+
+
+def test_plain_failed_settlement_is_not_duplicate_write_guarded() -> None:
+    """``failed`` means the write provably did not happen, so a retry is allowed."""
+
+    pattern = ReActPattern()
+    args = {"text": "not sent"}
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="original-call",
+            tool_name="publish",
+            args=args,
+            args_hash=pattern._args_hash(args),
+            status="failed",
+            result={"success": False, "settlement_status": "failed"},
+            settlement_status="failed",
+            settlement_turn_id="approval-turn",
+        )
+    )
+    tool = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish"),
+    )
+
+    assert (
+        pattern._suppressed_duplicate_write_result(
+            {
+                "id": "retry",
+                "name": "publish",
+                "args": args,
+                "turn_id": "approval-turn",
+            },
+            [tool],
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_reply_reaches_every_resumable_interaction_in_the_batch() -> None:
+    """Product decision: one free-text reply fans out to each resume callback.
+
+    Each callback interprets the shared answer and settles its own
+    interaction; callback-less waiting tools are untouched and keep the legacy
+    free-text replan path #2256 requires.
+    """
+
+    class ResumableWriteTool:
+        non_idempotent = True
+
+        def __init__(self, name: str) -> None:
+            self.metadata = SimpleNamespace(name=name)
+
+        def resume_user_interaction(self, **_: str) -> None:
+            return None
+
+    callback_less_write = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish_c"),
+    )
+    waiting_request = {
+        "kind": "tool_waiting_for_user",
+        "requests": [
+            {
+                "tool_name": "publish_a",
+                "tool_call_id": "call-a",
+                "interaction_id": "approval-a",
+            },
+            {
+                "tool_name": "publish_b",
+                "tool_call_id": "call-b",
+                "interaction_id": "approval-b",
+            },
+            {
+                "tool_name": "publish_c",
+                "tool_call_id": "call-c",
+                "interaction_id": "approval-c",
+            },
+        ],
+    }
+    pattern = ReActPattern()
+
+    pattern._queue_tool_interaction_responses(
+        waiting_request=waiting_request,
+        response="Approve the first one only",
+        tools=[
+            ResumableWriteTool("publish_a"),
+            ResumableWriteTool("publish_b"),
+            callback_less_write,
+        ],
+    )
+
+    assert pattern.pending_tool_interaction_responses == [
+        {
+            "tool_name": "publish_a",
+            "tool_call_id": "call-a",
+            "invocation_id": None,
+            "interaction_id": "approval-a",
+            "response": "Approve the first one only",
+        },
+        {
+            "tool_name": "publish_b",
+            "tool_call_id": "call-b",
+            "invocation_id": None,
+            "interaction_id": "approval-b",
+            "response": "Approve the first one only",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_free_text_reply_to_several_writes_is_delivered_not_re_asked() -> None:
+    """No disambiguation prompt: a plain reply resumes the run (#2283 round 3).
+
+    The rejected revision demanded a JSON interaction_id map here, so any
+    ordinary reply re-asked the same prompt forever with no escape hatch.
+    """
+
+    class ResumableWriteTool:
+        non_idempotent = True
+
+        def __init__(self, name: str) -> None:
+            self.metadata = SimpleNamespace(name=name)
+            self.calls: list[str] = []
+
+        def resume_user_interaction(self, *, interaction_id: str, **_: str) -> None:
+            self.calls.append(interaction_id)
+            return None
+
+    pattern = ReActPattern()
+    pattern.status = "waiting_for_user"
+    pattern.waiting_for_user_request = {
+        "kind": "tool_waiting_for_user",
+        "message": "Approve both writes?",
+        "message_type": "question",
+        "message_count": 0,
+        "requests": [
+            {
+                "tool_name": "publish_a",
+                "tool_call_id": "call-a",
+                "interaction_id": "approval-a",
+            },
+            {
+                "tool_name": "publish_b",
+                "tool_call_id": "call-b",
+                "interaction_id": "approval-b",
+            },
+        ],
+        "interactions": [],
+    }
+    context = ExecutionContext(execution_id="shared-authorization")
+    context.add_user_message("Approve")
+
+    result = await pattern._resume_waiting_for_user_if_needed(
+        context=context,
+        runtime=PatternRuntime(),
+        tools=[ResumableWriteTool("publish_a"), ResumableWriteTool("publish_b")],
+    )
+
+    assert result is None
+    assert pattern.status == "thinking"
+    assert pattern.waiting_for_user_request is None
+    assert [
+        pending["interaction_id"]
+        for pending in pattern.pending_tool_interaction_responses
+    ] == ["approval-a", "approval-b"]
+    assert {
+        pending["response"] for pending in pattern.pending_tool_interaction_responses
+    } == {"Approve"}
+
+
+@pytest.mark.asyncio
+async def test_react_run_reports_pattern_error_when_resume_checkpoint_fails() -> None:
+    """A durability failure while checkpointing the received user response
+    must still be reported as a terminal pattern error.
+
+    ``run()`` calls ``_resume_waiting_for_user_if_needed`` before its own
+    ``try``/``except Exception: on_pattern_error(); raise`` block starts.
+    Without a dedicated guard around that call, a
+    ``CheckpointPersistenceError`` raised while checkpointing
+    ``"tool_interaction_response_received"`` would propagate straight past
+    ``on_pattern_error`` -- no terminal ``trace_error`` would ever be
+    recorded, even though the run aborts.
+    """
+
+    class _FailingResumeCheckpointTracer(TraceEventRecorder):
+        async def checkpoint(self, **payload: Any) -> None:
+            if payload.get("label") == "tool_interaction_response_received":
+                raise CheckpointPersistenceError("transient checkpoint write failure")
+
+    tracer = _FailingResumeCheckpointTracer()
+    pattern = ReActPattern()
+    pattern.status = "waiting_for_user"
+    pattern.waiting_for_user_request = {
+        "kind": "tool_waiting_for_user",
+        "message": "Approve?",
+        "message_type": "question",
+        "message_count": 0,
+        "requests": [],
+        "interactions": [],
+    }
+    context = ExecutionContext(execution_id="resume-checkpoint-failure")
+    context.add_user_message("Approve")
+    runtime = PatternRuntime(tracer=tracer, execution_id="resume-checkpoint-failure")
+
+    with pytest.raises(CheckpointPersistenceError):
+        await pattern.run(context=context, tools=[], llm=FakeLLM([]), runtime=runtime)
+
+    error_events = [
+        event for event in tracer.events if event["event_type"] == "task_error_general"
+    ]
+    assert error_events
+    assert error_events[-1]["data"]["error_type"] == "agent_pattern_error"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tool_interactions_pause_in_one_deterministic_message() -> (
+    None
+):
+    class ConcurrentWaitingTool:
+        def __init__(self, name: str, message: str) -> None:
+            self.metadata = SimpleNamespace(
+                name=name,
+                description=f"Wait for {name} input.",
+                concurrency_safe=True,
+            )
+            self.message = message
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": f"{self.metadata.name}-interaction",
+                "message": self.message,
+                "interactions": [
+                    {
+                        "type": "text",
+                        "field": "decision",
+                        "label": self.metadata.name,
+                    }
+                ],
+            }
+
+    class MutationTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="mutation",
+                description="Mutate state.",
+                concurrency_safe=False,
+            )
+            self.calls: list[dict[str, Any]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"success": True}
+
+    mutation_tool = MutationTool()
+    tools = [
+        ConcurrentWaitingTool("first_gate", "Answer the first question."),
+        ConcurrentWaitingTool("second_gate", "Answer the second question."),
+        mutation_tool,
+    ]
+    pattern = ReActPattern(
+        max_iterations=2,
+        tool_parallel_enabled=True,
+        tool_max_concurrency=2,
+    )
+    runtime = PatternRuntime(execution_id="concurrent-interactions")
+    context = ExecutionContext(execution_id="concurrent-interactions")
+    context.add_user_message("Run both checks.")
+
+    result = await pattern.run(
+        context=context,
+        tools=tools,
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "first-call",
+                            "function": {
+                                "name": "first_gate",
+                                "arguments": '{"expression":"1"}',
+                            },
+                        },
+                        {
+                            "id": "second-call",
+                            "function": {
+                                "name": "second_gate",
+                                "arguments": '{"expression":"2"}',
+                            },
+                        },
+                        {
+                            "id": "stale-mutation",
+                            "function": {
+                                "name": "mutation",
+                                "arguments": '{"expression":"3"}',
+                            },
+                        },
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert result["message"].startswith("Multiple tools need your input")
+    assert [item["field"] for item in result["interactions"]] == [
+        "decision",
+        "decision_2",
+    ]
+    assert [
+        request["interactions"][0]["field"]
+        for request in pattern.waiting_for_user_request["requests"]
+    ] == ["decision", "decision_2"]
+    assert len(runtime.outbound_messages) == 1
+    assert pattern._record_for_tool_call_id("first-call").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("second-call").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("stale-mutation").status == "cancelled"
+    assert pattern.pending_tool_calls == []
+    assert mutation_tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_final_answer_preserves_semantic_completion_outcome() -> None:
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Complete everything if possible.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-partial",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"One item remains.",'
+                                    '"outcome":"partial"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["completion_outcome"] == "partial"
+
+
+class StreamingEmptyFinalAnswerLLM:
+    """Calls ``final_answer`` with an unusable answer, then optionally recovers.
+
+    Models the two observed shapes of xorbitsai/xagent#1312: an arguments object
+    that omits ``answer`` entirely (truncated output), and an arguments payload
+    that fails JSON parsing.
+    """
+
+    RECOVERED_ARGUMENTS = (
+        '{"response_language":"English","answer":"The result is 4.",'
+        '"outcome":"completed"}'
+    )
+
+    def __init__(
+        self,
+        *,
+        recover: bool = True,
+        broken_arguments: str = '{"response_language":"English","outcome":"completed"}',
+        preamble: str = "",
+        trailing_work_tool: bool = False,
+    ) -> None:
+        self.recover = recover
+        self.broken_arguments = broken_arguments
+        self.preamble = preamble
+        self.trailing_work_tool = trailing_work_tool
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("empty final answer path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        arguments = (
+            self.RECOVERED_ARGUMENTS
+            if call_index > 0 and self.recover
+            else self.broken_arguments
+        )
+        if self.preamble:
+            yield StreamChunk(type=ChunkType.TOKEN, delta=self.preamble)
+        tool_calls = [
+            {
+                "id": f"call_final_{call_index}",
+                "function": {"name": "final_answer", "arguments": arguments},
+            }
+        ]
+        if call_index == 0 and self.trailing_work_tool:
+            tool_calls.append(
+                {
+                    "id": "call_work_0",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"2+2"}',
+                    },
+                }
+            )
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=tool_calls,
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _react_empty_final_answer_fixture() -> tuple[
+    ReActPattern,
+    ExecutionContext,
+    PatternRuntime,
+    OutboundCollector,
+    TraceEventRecorder,
+]:
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    outbound = OutboundCollector()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(
+        execution_id="task-1",
+        tracer=tracer,
+        outbound_message_handler=outbound,
+    )
+    return pattern, context, runtime, outbound, tracer
+
+
+@pytest.mark.asyncio
+async def test_react_retries_final_answer_that_omits_the_answer_field() -> None:
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "empty_final_answer_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert retry_starts[0]["data"]["recovery_reason"] == "empty_final_answer"
+
+    # The discarded turn must not leak a partial stream to the user.
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_with_trailing_work_call() -> None:
+    """An empty-answer final_answer bundled with a work tool is stripped like
+    any other bundled final_answer: the work tool executes instead of being
+    discarded along with the empty answer (I-11, streaming path)."""
+
+    llm = StreamingEmptyFinalAnswerLLM(trailing_work_tool=True)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.stream_calls) == 2
+
+    assistant_tool_call_ids = {
+        tool_call["id"]
+        for message in context.messages
+        for tool_call in (message.tool_calls or [])
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in context.messages if message.role == "tool"
+    }
+    assert "call_final_0" not in assistant_tool_call_ids
+    assert "call_final_0" not in pattern.tool_call_id_index
+    assert assistant_tool_call_ids <= tool_result_ids
+
+
+@pytest.mark.asyncio
+async def test_react_fails_when_final_answer_stays_empty_after_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[FakeTool()],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    # The core regression: an empty answer must never finalize as success with
+    # the "No output provided" placeholder.
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert "output" not in result
+    assert len(llm.stream_calls) == 2
+    assert outbound.events == []
+
+    discarded = [
+        event["data"]["phase"]
+        for event in tracer.events
+        if event["event_type"] == "action_end_llm"
+        and event["data"].get("success") is False
+    ]
+    assert discarded == [
+        "discarded_invalid_tool_protocol",
+        "discarded_invalid_tool_protocol_retry",
+    ]
+
+    # Neither condition was logged before this fix, leaving nothing to debug from.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("final_answer carried no answer text" in m for m in messages)
+    assert any(
+        "invalid tool protocol after retry" in m and "failing the run" in m
+        for m in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_retries_final_answer_with_malformed_arguments() -> None:
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":"The res',
+    )
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+    # Truncated arguments can stream a partial answer before the call is
+    # rejected. That partial is closed with an error and superseded by a fresh
+    # stream, matching how the pattern already handles a protocol retry - the
+    # point is that the run ends with a real answer instead of nothing.
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blank_answer",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"answer": ""}, id="empty-string"),
+        pytest.param({"answer": "   \n"}, id="whitespace"),
+        # ``str(None)`` is the literal "None", which would sail past a naive
+        # ``str(args.get("answer", "")).strip()`` check and be finalized as the
+        # user-facing answer.
+        pytest.param({"answer": None}, id="none"),
+    ],
+)
+async def test_react_re_requests_final_answer_for_resumed_empty_pending_call(
+    blank_answer: dict[str, Any],
+) -> None:
+    """A pending call restored from a checkpoint bypasses response normalization."""
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {
+                "response_language": "English",
+                "outcome": "completed",
+                **blank_answer,
+            },
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert pattern._record_for_tool_call_id("call_resumed").status == "failed"
+    assert pattern.pending_tool_calls == []
+    # The next turn is forced back to final_answer only.
+    assert [
+        tool["function"]["name"] for tool in llm.stream_calls[0].get("tools") or []
+    ] == ["final_answer"]
+
+
+def test_final_answer_text_treats_none_as_absent() -> None:
+    """One coercion for both the protocol check and finalization.
+
+    ``str(None)`` is the literal "None"; if the two sites coerce independently
+    they drift, and a null answer gets finalized as the string "None".
+    """
+
+    pattern = ReActPattern()
+
+    assert pattern._final_answer_text({"answer": None}) == ""
+    assert pattern._final_answer_text({}) == ""
+    assert pattern._final_answer_text(None) == ""
+    assert pattern._final_answer_text({"answer": ""}) == ""
+    assert pattern._final_answer_text({"answer": "  hi  "}) == "  hi  "
+    assert pattern._final_answer_text({"answer": 0}) == "0"
+
+
+def test_coerce_arguments_drops_unusable_control_tool_payloads() -> None:
+    pattern = ReActPattern()
+
+    # Work tools keep the opaque passthrough so existing behavior is unchanged.
+    assert pattern._coerce_arguments("not json", tool_name="calculator") == {
+        "input": "not json"
+    }
+    assert pattern._coerce_arguments("[1, 2]", tool_name="calculator") == {
+        "input": [1, 2]
+    }
+
+    # Blank payloads have nothing to preserve, whether the raw string is blank
+    # or the JSON literal of a blank string.
+    assert pattern._coerce_arguments("", tool_name="calculator") == {}
+    assert pattern._coerce_arguments('""', tool_name="calculator") == {}
+    assert pattern._coerce_arguments('"   "', tool_name="calculator") == {}
+
+    # Control tools must not smuggle a malformed payload through as ``input``,
+    # which would silently strip ``answer`` and finalize with nothing to show.
+    assert pattern._coerce_arguments("not json", tool_name="final_answer") == {}
+    assert pattern._coerce_arguments('"just a string"', tool_name="final_answer") == {}
+    assert pattern._coerce_arguments("not json", tool_name="send_message") == {}
+
+    # Well-formed payloads are untouched.
+    assert pattern._coerce_arguments('{"answer":"hi"}', tool_name="final_answer") == {
+        "answer": "hi"
+    }
+
+
+def test_empty_final_answer_call_detects_blank_answers() -> None:
+    pattern = ReActPattern()
+
+    def normalized(args: Any) -> dict[str, Any]:
+        return {"tool_calls": [{"id": "c1", "name": "final_answer", "args": args}]}
+
+    assert pattern._empty_final_answer_call(normalized({})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": ""})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": "  \n"})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": None})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": "done"})) is None
+    # Coercion must match ``_handle_control_tool``, which stringifies the value,
+    # so a scalar answer is not mistaken for a missing one.
+    assert pattern._empty_final_answer_call(normalized({"answer": 0})) is None
+    assert pattern._empty_final_answer_call({"tool_calls": []}) is None
+    assert (
+        pattern._empty_final_answer_call(
+            {"tool_calls": [{"id": "c1", "name": "calculator", "args": {}}]}
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_discards_rest_of_resumed_batch_after_empty_final_answer() -> None:
+    """A rejected resume batch cancels its still-pending sibling calls.
+
+    On resume the whole batch's assistant envelope is already recorded in
+    history before execution starts, so every queued call must end with a
+    result row; the only safe outcome for siblings behind a rejected empty
+    ``final_answer`` is cancellation. A fresh-turn ``[final_answer(""),
+    work_tool]`` batch instead strips the ``final_answer`` before anything
+    is recorded and runs the work tool, so the two paths diverge on purpose.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    # The side-effecting tool never ran.
+    assert tool.calls == []
+    # I2: the abandoned call still got exactly one result.
+    assert pattern._record_for_tool_call_id("call_work").status == "cancelled"
+    assert pattern._record_for_tool_call_id("call_resumed").status == "failed"
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_finalizes_a_scalar_zero_answer() -> None:
+    """``answer=0`` is an answer, not an absent one.
+
+    The empty check coerces before testing, so a falsy scalar must survive the
+    guard and reach the user rather than being rejected as blank.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":0,"outcome":"completed"}',
+    )
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "0"
+    # Accepted on the first turn: no repair retry was spent.
+    assert len(llm.stream_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_marks_the_abandoned_run_when_the_answer_stayed_empty() -> None:
+    """The abandoned result distinguishes "never answered" from other violations.
+
+    ``invalid_tool_protocol`` also covers provider protocol errors, mixed control
+    calls, and a non-``final_answer`` tool on a forced turn. Delegated-child
+    classification reads this marker so it does not collapse all of them into
+    "never produced an answer" and discard the child's own diagnostic.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert "final_answer without an answer" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_does_not_mark_other_tool_protocol_violations() -> None:
+    """A non-empty-answer violation keeps the generic error and no marker."""
+
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=True,
+        invalid_retry=True,
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is False
+    assert "invalid tool protocol response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_survives_a_state_roundtrip() -> None:
+    """The post-rejection state is recoverable through the real mechanism.
+
+    The guard exists for checkpoint resumes, so the rejection it performs has to
+    survive ``get_state``/``load_state`` rather than only an in-process mutation.
+    """
+
+    pattern = ReActPattern(max_iterations=3)
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    resumed = ReActPattern(max_iterations=3)
+    resumed.load_state(pattern.get_state())
+    assert resumed.pending_tool_calls == pattern.pending_tool_calls
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    result = await resumed.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=PatternRuntime(execution_id="task-1"),
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+
+    # The forcing the rejection installed is itself serializable, which is what a
+    # crash between the rejection and the next turn would depend on.
+    carried = ReActPattern()
+    carried.load_state(resumed.get_state())
+    assert carried.force_final_answer_next is False  # cleared once answered
+    assert carried._record_for_tool_call_id("call_resumed").status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_abandons_after_forced_retry() -> None:
+    """resume -> reject -> forced turn -> empty -> in-turn retry -> abandon."""
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert pattern.pending_tool_calls == []
+    # The forced turn plus its one in-turn repair attempt, and no more.
+    assert len(llm.stream_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_reverse_batch_order_cannot_undo_an_executed_tool() -> None:
+    """Pins the documented limit of the resume guard's batch discard.
+
+    In ``[work_tool, final_answer("")]`` restored onto ``pending_tool_calls``,
+    the work tool has already executed by the time the rejection runs, so
+    discarding the rest of the batch cannot reach back and undo it - the
+    resume guard can only cancel calls still queued, never ones already
+    committed.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    tool = FakeTool()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    # The work tool ran: the rejection cannot reach back past it.
+    assert tool.calls == [{"expression": "2+2"}]
+    assert pattern._record_for_tool_call_id("call_work").status == "completed"
+    assert pattern._record_for_tool_call_id("call_resumed").status == "failed"
+
+
+def test_rejected_empty_final_answer_is_recorded_as_a_failure() -> None:
+    """The rejection must not read back as a successful tool result."""
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {"id": "call_1", "name": "final_answer", "args": {"answer": ""}}
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    recorded = pattern._record_for_tool_call_id("call_1")
+    assert recorded.status == "failed"
+    # The recorded result carries the keys ``tool_result_succeeded`` reads, so a
+    # consumer cannot read this failure back as a success.
+    assert tool_result_succeeded(recorded.result) is False
+    # Same shape as the cancelled siblings, so the ledger is uniform.
+    assert recorded.result["status"] == "error"
+    tool_messages = [m for m in context.messages if getattr(m, "role", None) == "tool"]
+    assert "empty answer" in tool_messages[-1].content
+
+
+def test_reject_empty_final_answer_tolerates_non_string_arg_keys() -> None:
+    """Log formatting must not abort the run it is diagnosing.
+
+    ``sorted`` over mixed-type keys raises ``TypeError``, and ``run()`` re-raises
+    from its ``except``, so an unsortable payload would fail the run at exactly
+    the point this guard exists to recover from.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {
+        "id": "call_1",
+        "name": "final_answer",
+        "args": {"answer": "", 1: "numeric", None: "null"},
+    }
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    assert pattern.force_final_answer_next is True
+
+
+@pytest.mark.asyncio
+async def test_react_discards_the_preamble_with_the_rejected_response() -> None:
+    """Pins the documented cost of whole-response rejection.
+
+    The preamble arrived attached to a protocol violation, so it is not a vetted
+    answer and is dropped with the response rather than replayed into the retry.
+    A model that recovers supersedes it; one that repeats the pattern fails the
+    run and the preamble is never shown.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(preamble="Let me look into that.")
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert "Let me look into that." not in str(result["response"])
+    assert all(
+        "Let me look into that." not in str(event.get("content") or event.get("delta"))
+        for event in outbound.events
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_names", "unavailable"),
+    [
+        (["generate_image", "list_image_models"], True),
+        (["generate_image", "edit_image"], False),
+        (["list_image_models"], False),
+        (["web_search"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_flags_missing_image_editing_and_renders_the_correction(
+    tool_names: list[str], unavailable: bool
+) -> None:
+    from xagent.core.agent.context.enrichment import (
+        IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+        SKILL_CONTEXT_METADATA_KEY,
+    )
+
+    from .concurrency_harness import FakeTool as NamedFakeTool
+
+    llm = FakeLLM(responses=[{"content": "done", "done": True}])
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.metadata[SKILL_CONTEXT_METADATA_KEY] = "Use `edit_image` to refine."
+    context.add_user_message("make an ad")
+
+    await pattern.run(
+        context=context,
+        tools=[NamedFakeTool(name) for name in tool_names],
+        llm=llm,
+    )
+
+    assert context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] is unavailable
+    rendered = llm.calls[0]["messages"][0]["content"]
+    assert ("image editing is unavailable here" in rendered) is unavailable
+    assert ("attach a reference through images" in rendered) is unavailable
+
+
+class NoArgToolLLM:
+    """Calls a parameterless tool with `arguments: ""`, then finishes.
+
+    Reproduces the provider shape behind xorbitsai/xagent#1501 on the streaming
+    path: a blank argument string must reach the tool as an empty call, not kill
+    the run.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("this path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_list_0",
+                        "function": {"name": "list_models", "arguments": ""},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final_0",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"gpt-4o","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class NoArgTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "list_models"
+            description = "List available models."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"models": ["gpt-4o"]}
+
+
+@pytest.mark.asyncio
+async def test_react_runs_a_parameterless_tool_called_with_blank_arguments() -> None:
+    """#1501 (a): a no-arg tool sent `""` executes instead of failing the run."""
+
+    llm = NoArgToolLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = NoArgTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool, FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "gpt-4o"
+    assert tool.calls == [{}]
+
+
+@pytest.mark.asyncio
+async def test_react_repairs_final_answer_called_with_blank_arguments() -> None:
+    """Guards the `_empty_final_answer_call` repair retry, not `_fallback_arguments`.
+
+    `final_answer` is a control tool, so blank arguments are dropped by the
+    control-tool branch and never reach the blank-string branch this PR adds.
+    What is pinned here is that the resulting empty args still spend the one
+    repair retry instead of finalizing the run.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(broken_arguments="")
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "empty_final_answer_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+class BlankThenRecoverLLM:
+    """Calls a required-argument work tool with `""`, then recovers.
+
+    First turn: `calculator` with blank arguments. Second turn: a valid
+    `final_answer`. Pins what actually happens to a required-argument tool
+    handed `{}` — the tool fails internally and the error feeds back as a tool
+    result, not a dead run.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("this path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_calc_0",
+                        "function": {"name": "calculator", "arguments": ""},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final_0",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The result is 4.","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_react_survives_required_argument_tool_called_with_blank_arguments() -> (
+    None
+):
+    """#1501 (b): a required-argument work tool sent `""` receives `{}`, fails
+    inside the tool, and the error feeds back to the model instead of killing
+    the run."""
+
+    llm = BlankThenRecoverLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    # Discriminating assertion for react.py's blank-string fallback branch: the
+    # old code delivered {"input": ""} here, which would fail this equality.
+    assert tool.calls == [{}]
+
+    tool_results = [m for m in context.messages if m.role == "tool"]
+    assert len(tool_results) >= 1
+    first = tool_results[0]
+    assert first.tool_call_id == "call_calc_0"
+    assert "'success': False" in first.content
+
+
+@pytest.mark.asyncio
+async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) -> None:
+    """The seam: a real `OpenAICompatibleLLM` stream carrying `arguments: ""`
+    drives a real ReAct loop and the parameterless tool executes."""
+
+    def sdk_chunk(tool_calls=None, finish_reason=None):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+
+    def sdk_tool_call(name, arguments):
+        return SimpleNamespace(
+            index=0,
+            id=f"call_{name}",
+            type="function",
+            function=SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    async def first_stream():
+        yield sdk_chunk([sdk_tool_call("list_models", "")])
+        yield sdk_chunk(finish_reason="tool_calls")
+
+    async def second_stream():
+        yield sdk_chunk(
+            [
+                sdk_tool_call(
+                    "final_answer",
+                    '{"response_language":"English",'
+                    '"answer":"gpt-4o","outcome":"completed"}',
+                )
+            ]
+        )
+        yield sdk_chunk(finish_reason="tool_calls")
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first_stream(), second_stream()]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    from xagent.core.model.chat.basic.openai import OpenAILLM
+
+    llm = OpenAILLM(model_name="gpt-4o-mini", base_url=None, api_key="test-key")
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = NoArgTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool, FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "gpt-4o"
+    assert tool.calls == [{}]
+
+
+def _react_clock_prompt(timezone_name: str | None) -> str:
+    context = ExecutionContext(
+        created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+    )
+    if timezone_name is not None:
+        context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = timezone_name
+    context.add_user_message("how many shifts do we have on tomorrow?")
+
+    messages = ReActPattern()._messages_for_llm(context, has_tools=True)
+    return messages[0]["content"]
+
+
+# Covers the whole fallback instruction through the get_current_time pointer, so
+# reverting any part of it fails rather than only a change to the prefix.
+UTC_DATE_INSTRUCTION = (
+    "Turn-start date (UTC): 2026-08-24. "
+    "For recent, latest, current, or time-sensitive requests, use this "
+    "date when forming search queries and judging source relevance. If the "
+    "exact current time matters or the turn may have crossed midnight, call "
+    "the get_current_time tool if it is available."
+)
+
+
+def _date_instruction(prompt: str) -> str:
+    start = prompt.index("Turn-start date (")
+    end = prompt.index("if it is available.", start) + len("if it is available.")
+    return prompt[start:end]
+
+
+def test_tool_call_date_line_keeps_utc_wording_without_a_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt(None)) == UTC_DATE_INSTRUCTION
+
+
+def test_tool_call_date_line_uses_the_caller_timezone() -> None:
+    prompt = _react_clock_prompt("Australia/Melbourne")
+
+    assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
+        "Turn-start date (UTC): 2026-08-24. ",
+        "Turn-start date (Australia/Melbourne): 2026-08-25. ",
+    )
+    # The UTC date is what produced the wrong "tomorrow" in production.
+    assert "Turn-start date (UTC)" not in prompt
+
+
+def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
+
+
+# ---------------------------------------------------------------------------
+# xagent#486: every final_answer stream that gets opened must be closed with
+# exactly one terminal event, regardless of how the batch that opened it
+# resolves. See _close_streamed_answer's docstring in react.py for the R0-R3
+# contract these tests pin down.
+# ---------------------------------------------------------------------------
+
+
+def _fa(answer: str) -> tuple[str, dict[str, Any]]:
+    return ("final_answer", {"answer": answer})
+
+
+def _send_message_call(*, expect_response: bool) -> tuple[str, dict[str, Any]]:
+    return (
+        "send_message",
+        {
+            "message": "Side note",
+            "message_type": "question" if expect_response else "progress",
+            "expect_response": expect_response,
+        },
+    )
+
+
+def _ask_user_question_call() -> tuple[str, dict[str, Any]]:
+    return (
+        "ask_user_question",
+        {
+            "message": "Which one?",
+            "interactions": [
+                {"type": "select_one", "field": "choice", "label": "Choice"}
+            ],
+        },
+    )
+
+
+def _work_tool_call() -> tuple[str, dict[str, Any]]:
+    return ("calculator", {"expression": "2+2"})
+
+
+_FALLBACK_ANSWER = "Fallback answer."
+_FALLBACK_BATCH: list[tuple[str, dict[str, Any]]] = [_fa(_FALLBACK_ANSWER)]
+
+
+def _terminal_events_by_message_id(
+    events: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Group final_answer_start/end/error events by message_id.
+
+    Used to check that every started message_id gets exactly one terminal
+    event (end or error), never zero and never two.
+    """
+
+    by_id: dict[str, list[str]] = {}
+    for event in events:
+        event_type = event.get("type")
+        if event_type not in (
+            "final_answer_start",
+            "final_answer_end",
+            "final_answer_error",
+        ):
+            continue
+        by_id.setdefault(event["message_id"], []).append(event_type)
+    return by_id
+
+
+_I1_RUN_CASES: list[dict[str, Any]] = [
+    {
+        "label": "C1_single_final_answer",
+        "batches": [[_fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C2_identical_final_answers",
+        "batches": [[_fa("Same answer."), _fa("Same answer.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C3_distinct_final_answers",
+        "batches": [[_fa("First."), _fa("Second."), _fa("Third.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C4_final_answer_before_send_message",
+        "batches": [[_fa("Answer one."), _send_message_call(expect_response=False)]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C5_final_answer_before_ask_user_question",
+        "batches": [[_fa("Answer one."), _ask_user_question_call()]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C6_send_message_before_final_answer",
+        "batches": [[_send_message_call(expect_response=False), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C7_send_message_expect_response_before_final_answer",
+        "batches": [[_send_message_call(expect_response=True), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C8_ask_user_question_before_final_answer",
+        "batches": [[_ask_user_question_call(), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C9a_final_answer_before_work_tool",
+        "batches": [[_fa("Candidate."), _work_tool_call()], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C9b_work_tool_before_final_answer",
+        "batches": [[_work_tool_call(), _fa("Candidate.")], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately - only the fallback batch's
+        # stream ever opens.
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C10_empty_final_answer_in_control_only_batch",
+        "batches": [[_fa("Valid answer."), _fa("")], _FALLBACK_BATCH],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C14_disabled_control_tool_cancels_first_final_answer",
+        "batches": [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ],
+        "needs_tool": False,
+        "user_interaction_enabled": False,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", _I1_RUN_CASES, ids=[case["label"] for case in _I1_RUN_CASES]
+)
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event(
+    case: dict[str, Any],
+) -> None:
+    """I-1: for every batch shape that can occur through a real ReAct run,
+    each final_answer_start's message_id gets exactly one terminal event
+    (final_answer_end or final_answer_error) - never zero, never two. A
+    shape whose stream never opens (R0) produces no started ids at all."""
+
+    llm = ScriptedStreamLLM(case["batches"])
+    pattern = ReActPattern(
+        max_iterations=case["max_iterations"],
+        user_interaction_enabled=case["user_interaction_enabled"],
+    )
+    tools = [FakeTool()] if case["needs_tool"] else []
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=tools, llm=llm, runtime=runtime)
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    actual_sequences = list(by_id.values())
+    assert actual_sequences == case["expected_sequences"]
+    for sequence in actual_sequences:
+        assert sequence[0] == "final_answer_start"
+        assert len(sequence) == 2
+        assert sequence[1] in ("final_answer_end", "final_answer_error")
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_outbound_handler() -> (
+    None
+):
+    """I-1, front condition (no outbound handler): start_final_answer_stream
+    returns None with no handler to send to, so the answer streamer never
+    accumulates content and never starts - the run still delivers the
+    correct answer through the non-streaming path, and there is nothing to
+    close."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one.")]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=None)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_native_streaming() -> (
+    None
+):
+    """I-1, front condition (no native streaming): a model without
+    stream_chat falls back to the non-streaming call path, so on_chunk is
+    never invoked and the answer streamer never starts - zero final_answer_*
+    events, even though tool_schemas were offered and a final_answer call
+    was made."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Answer one."}',
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert outbound.events == []
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_c12_manual() -> (
+    None
+):
+    """I-1, C12 (no tool_calls, plain assistant content, stream already
+    open): there is no known way for a real model response to leave the
+    stream open while producing zero tool_calls - reaching R1 or R3 both
+    require at least one tool call, and the only way tool_calls empties out
+    after the stream opens (the bundled-final_answer strip) always keeps a
+    work-tool entry behind. This case drives the stream open through the
+    real streaming primitive directly, then calls the close function with a
+    tool_calls=[] batch, so the R2 branch is exercised the same way I-11
+    exercises R3's otherwise-untriggerable shapes."""
+
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    streamer = ReActFinalAnswerStreamer(runtime)
+    await streamer.handle_chunk(
+        StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": '{"answer":"Partial"}',
+                    },
+                }
+            ],
+        )
+    )
+    assert streamer.started
+    pattern = ReActPattern(max_iterations=1)
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content="Some plain content.",
+        tool_calls=[],
+    )
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 1
+    (sequence,) = by_id.values()
+    assert sequence == ["final_answer_start", "final_answer_end"]
+    end_event = next(e for e in outbound.events if e["type"] == "final_answer_end")
+    assert end_event["content"] == "Some plain content."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,batch,force_final_answer",
+    [
+        ("identical", [_fa("  Same answer.\n"), _fa("  Same answer.\n")], False),
+        (
+            "distinct_increasing",
+            [_fa("  First.\n"), _fa("  Second, longer.\n"), _fa("  Third, longest.\n")],
+            False,
+        ),
+        (
+            "distinct_decreasing",
+            [_fa("  First, longest.\n"), _fa("  Second.\n"), _fa("  Third.\n")],
+            False,
+        ),
+        (
+            "two_distinct_forced",
+            [_fa("  First.\n"), _fa("  Second, different.\n")],
+            True,
+        ),
+    ],
+)
+async def test_react_multi_final_answer_closes_stream_with_first_payload(
+    label: str,
+    batch: list[tuple[str, dict[str, Any]]],
+    force_final_answer: bool,
+) -> None:
+    """I-2: a batch with more than one final_answer call closes the stream on
+    the batch's first payload, verbatim (no stripping) - matching the text
+    _handle_control_tool actually delivers, whatever the later payloads say.
+
+    Every payload carries leading/trailing whitespace so this is only green
+    if the close path uses the raw text and never adds a ``.strip()``.
+    ``two_distinct_forced`` runs with ``force_final_answer_next`` set: when
+    the model is forced to answer through a single-tool ``final_answer``
+    schema, more than one call in the same batch is the shape that actually
+    reaches production, not an edge case.
+    """
+
+    llm = ScriptedStreamLLM([batch])
+    pattern = ReActPattern(max_iterations=1)
+    if force_final_answer:
+        pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    first_payload = batch[0][1]["answer"]
+    assert result["success"] is True
+    assert result["response"] == first_payload
+    end_events = [e for e in outbound.events if e["type"] == "final_answer_end"]
+    assert len(end_events) == 1
+    assert end_events[0]["content"] == first_payload
+    assert not any(e["type"] == "final_answer_error" for e in outbound.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "ask_user_question"],
+)
+async def test_react_final_answer_before_control_tool_ends_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-3: final_answer first in the batch always ends the stream with its
+    own answer, even when a control tool follows it in the same batch - that
+    trailing call never actually runs (_handle_control_tool's final_answer
+    branch finalizes the run before it is reached)."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one."), control_call]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert [e["type"] for e in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "Answer one."
+    # The trailing control tool never ran: it would have produced an
+    # agent_message event (send_message) or paused the run.
+    assert not any(e["type"] == "agent_message" for e in outbound.events)
+    assert result.get("status") != "waiting_for_user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _send_message_call(expect_response=True),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "send_message_expect_response", "ask_user_question"],
+)
+async def test_react_control_tool_before_final_answer_opens_no_answer_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-4: a control tool ahead of final_answer in the same batch disables
+    the answer streamer before any answer bytes are emitted (the streamer
+    self-disables on the first non-final_answer tool name it sees), so no
+    final_answer_* event of any kind is ever produced for that response.
+    The run's delivered outcome is pinned too: the later final_answer is
+    still executed and delivered unless a response-expecting control tool
+    pauses the run before reaching it."""
+
+    llm = ScriptedStreamLLM([[control_call, _fa("Answer one.")], _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert not any(e["type"].startswith("final_answer_") for e in outbound.events)
+    control_name, control_args = control_call
+    if control_name == "ask_user_question" or control_args.get("expect_response"):
+        assert result["status"] == "waiting_for_user"
+    else:
+        assert result["success"] is True
+        assert result["response"] == "Answer one."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordering", ["final_answer_first", "work_tool_first"])
+async def test_react_work_tool_batch_still_fails_stream_before_close(
+    ordering: str,
+) -> None:
+    """I-5: a final_answer bundled with a work tool keeps going through the
+    existing strip-and-fail path (the batch is stripped of its final_answer
+    call and the open stream is failed there), not through the close
+    function's own R3 fallback, and the stream this closes never ends as
+    though the stripped text were the delivered answer.
+
+    Streaming a work-tool name before any final_answer bytes disables the
+    answer streamer immediately (final_answer_stream.py's guard checks tool
+    names as soon as they appear, before reading any field), so
+    ``work_tool_first`` never opens a stream at all; ``final_answer_first``
+    is the only ordering that can leave a stream open for the strip point to
+    close.
+    """
+
+    if ordering == "final_answer_first":
+        batch = [_fa("Candidate."), _work_tool_call()]
+    else:
+        batch = [_work_tool_call(), _fa("Candidate.")]
+    llm = ScriptedStreamLLM([batch, _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    # Deltas may echo the discarded candidate while the model is still
+    # streaming - that is pre-existing emit_prefix behavior, unrelated to
+    # this invariant. What must never happen is the discarded text being
+    # delivered as a completed answer.
+    assert not any(
+        e["type"] == "final_answer_end" and e.get("content") == "Candidate."
+        for e in outbound.events
+    )
+
+    if ordering == "work_tool_first":
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately: no stream is ever opened for
+        # this batch, and only the fallback batch's stream produces events.
+        by_id = _terminal_events_by_message_id(outbound.events)
+        assert len(by_id) == 1
+        (only_sequence,) = by_id.values()
+        assert only_sequence == ["final_answer_start", "final_answer_end"]
+        return
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    first_stream_error = next(
+        e for e in outbound.events if e["type"] == "final_answer_error"
+    )
+    assert first_stream_error["error"] == (
+        "discarded an answer that arrived together with tool "
+        "calls; answering again once the tools have run"
+    )
+    second_stream_end = next(
+        e
+        for e in outbound.events
+        if e["type"] == "final_answer_end" and e["message_id"] == second_id
+    )
+    assert second_stream_end["content"] == _FALLBACK_ANSWER
+    assert runtime.last_final_answer_stream_message_id == second_id
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_fails_cancelled_answer_stream() -> None:
+    """I-6: when a disabled user-interaction control tool shares the batch
+    with the first final_answer, _disabled_control_tool_index means R1 does
+    not fire - the stream is failed, not ended, and the run recovers on the
+    next forced turn. The failed stream's id is never mistaken for the
+    delivered one."""
+
+    llm = ScriptedStreamLLM(
+        [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    assert runtime.last_final_answer_stream_message_id == second_id
+    assert runtime.last_final_answer_stream_message_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_react_close_streamed_answer_zero_side_effect_when_discarded_stream_is_last() -> (
+    None
+):
+    """A discarded stream's id must never leave itself behind in
+    runtime.last_final_answer_stream_message_id. max_iterations=1 forces the
+    discarded stream to be the run's only stream, which is the only
+    construction where this assertion has any discriminating power - with a
+    later round, start_final_answer_stream unconditionally clears the field
+    before a new id could be confused with the old one, so the assertion
+    would pass even if the close function wrongly called finish() instead of
+    fail() here."""
+
+    llm = ScriptedStreamLLM(
+        [[_fa("Answer one."), _send_message_call(expect_response=False)]]
+    )
+    pattern = ReActPattern(max_iterations=1, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_index_is_the_single_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-7: _close_streamed_answer and _execute_pending_tool_calls must share
+    one _disabled_control_tool_index implementation. Patching it to always
+    return None flips both call sites' observable behavior together: the
+    execution side stops canceling the first final_answer, and the streaming
+    side switches from failing to ending that same stream. A collusion where
+    the close function reimplemented the check inline would not move under
+    this patch."""
+
+    def make_pattern() -> tuple[
+        ReActPattern,
+        ScriptedStreamLLM,
+        OutboundCollector,
+        PatternRuntime,
+        ExecutionContext,
+    ]:
+        llm = ScriptedStreamLLM(
+            [
+                [_fa("Answer one."), _send_message_call(expect_response=False)],
+                _FALLBACK_BATCH,
+            ]
+        )
+        pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+        context = ExecutionContext(
+            system_prompt="You are helpful.", execution_id="task-1"
+        )
+        context.add_user_message("Question")
+        outbound = OutboundCollector()
+        runtime = PatternRuntime(
+            execution_id="task-1", outbound_message_handler=outbound
+        )
+        return pattern, llm, outbound, runtime, context
+
+    real_pattern, real_llm, real_outbound, real_runtime, real_context = make_pattern()
+    real_result = await real_pattern.run(
+        context=real_context, tools=[], llm=real_llm, runtime=real_runtime
+    )
+
+    assert real_result["response"] == _FALLBACK_ANSWER
+    assert any(e["type"] == "final_answer_error" for e in real_outbound.events)
+
+    (
+        mutant_pattern,
+        mutant_llm,
+        mutant_outbound,
+        mutant_runtime,
+        mutant_context,
+    ) = make_pattern()
+    monkeypatch.setattr(
+        mutant_pattern,
+        "_disabled_control_tool_index",
+        lambda tool_calls, *, user_interaction_enabled: None,
+    )
+    mutant_result = await mutant_pattern.run(
+        context=mutant_context, tools=[], llm=mutant_llm, runtime=mutant_runtime
+    )
+
+    assert mutant_result["response"] == "Answer one."
+    assert not any(e["type"] == "final_answer_error" for e in mutant_outbound.events)
+    assert any(
+        e["type"] == "final_answer_end" and e["content"] == "Answer one."
+        for e in mutant_outbound.events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,tool_calls,assistant_content",
+    [
+        (
+            "C11_work_tool_only",
+            [{"name": "calculator", "args": {"expression": "2+2"}}],
+            None,
+        ),
+        ("C13_no_calls_no_content", [], None),
+        (
+            "C15_final_answer_not_first",
+            [
+                {"name": "send_message", "args": {"message": "hi"}},
+                {"name": "final_answer", "args": {"answer": "x"}},
+            ],
+            None,
+        ),
+    ],
+)
+async def test_react_close_streamed_answer_fails_open_stream_without_deliverable_final_answer(
+    label: str,
+    tool_calls: list[dict[str, Any]],
+    assistant_content: Any,
+) -> None:
+    """I-11: these three tool_calls shapes have no known way to occur through
+    a real model response, so they are pinned at the function level instead
+    of being forced into an end-to-end fake-model shape that would not occur
+    in production. Whenever the stream is open and neither R1 nor R2 applies,
+    _close_streamed_answer
+    must fail it exactly once and must never call finish."""
+
+    class RecordingStreamer:
+        def __init__(self) -> None:
+            self.started = True
+            self.finish_calls: list[str] = []
+            self.fail_calls: list[str] = []
+
+        async def finish(self, content: str) -> None:
+            self.finish_calls.append(content)
+
+        async def fail(self, error: str) -> None:
+            self.fail_calls.append(error)
+
+    pattern = ReActPattern(max_iterations=1)
+    streamer = RecordingStreamer()
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content=assistant_content,
+        tool_calls=tool_calls,
+    )
+
+    assert streamer.finish_calls == []
+    assert streamer.fail_calls == [NO_DELIVERABLE_FINAL_ANSWER_REASON]
+
+
+class RoutedDownstreamLLM:
+    """Downstream selection behind a router.
+
+    It needs both entry points: compaction goes through ``run_llm_call`` ->
+    ``chat``, while the turn's own call streams (``_ResolvedRouterLLM``
+    defines ``stream_chat``, so the runtime takes the native streaming path).
+    Both record into one list so call ordering is assertable.
+    """
+
+    def __init__(self, chat_responses: list[Any], final_text: str) -> None:
+        self.chat_responses = chat_responses
+        self.final_text = final_text
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.chat_responses.pop(0)
+
+    async def stream_chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        yield StreamChunk(type=ChunkType.TOKEN, delta=self.final_text)
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _routing_router(
+    downstream: Any, route_prompts: list[str], *, context_window: int = 32_000
+) -> RouterLLM:
+    """A real ``RouterLLM`` whose selection is stubbed to record its prompt.
+
+    ``context_window`` is deliberately set, matching production: ``adapter.py``
+    always stamps it from the model row, and ``prepare_llm_for_context``
+    recomputes the compaction threshold from it. Leaving it unset would put the
+    fixture in a state a real router never reaches. The fixture uses a realistic
+    32k window and enough history below to trigger compaction.
+    """
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = context_window
+
+    async def select_model(prompt: str) -> str:
+        route_prompts.append(prompt)
+        return "test/model"
+
+    router._select_model = select_model  # type: ignore[assignment]
+    return router
+
+
+def _react_context_with_tool_history(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            },
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 120_000}, tool_call_id="call-1"
+    )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> None:
+    """An unset compact slot must not silently disable summary compaction.
+
+    ``PatternRuntime.compact_context_if_needed`` skips summarization entirely
+    without a compact LLM and drops all but the last few messages instead.
+    Agent preview and delegated sub-agents resolve that slot themselves and
+    validate only the default model, so an empty slot is ordinary -- and made
+    the same agent behave differently depending on how it was launched.
+    """
+    downstream = RoutedDownstreamLLM(
+        [{"content": "summarized tool result"}], final_text="done"
+    )
+    route_prompts: list[str] = []
+    router = _routing_router(downstream, route_prompts)
+    context = _react_context_with_tool_history("compact-inherits-main")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=router,
+        compact_llm=None,
+        runtime=PatternRuntime(tracer=TraceEventRecorder()),
+    )
+
+    assert result["success"] is True
+    # Two downstream calls: the summary, then the turn's own call -- and the
+    # summary reached that call, which is what proves compaction summarized
+    # rather than truncated.
+    assert len(downstream.calls) == 2
+    assert any(
+        "summarized tool result" in message.get("content", "")
+        for message in downstream.calls[1]["messages"]
+    )
+    # One routing decision for the whole turn, taken on the conversation.
+    assert len(route_prompts) == 1
+    assert "Conversation history to compact" not in route_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_nested_fact_failure_is_not_a_retryable_tool_error() -> None:
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+
+    class UncertainTool(FakeTool):
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            raise ExecutionEventPersistenceError("child event commit failed")
+
+    with pytest.raises(ExecutionEventPersistenceError):
+        await ReActPattern()._execute_tool_safely(
+            {"id": "child1", "name": "calculator", "args": {"expression": "2+2"}},
+            [UncertainTool()],
+            PatternRuntime(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("calculator", {"expression": "2+2"}),
+        ("send_message", {"message": "Working"}),
+        ("ask_user_question", {"message": "Which option?"}),
+        ("final_answer", {"answer": "Done"}),
+    ],
+)
+async def test_react_shared_lifecycle_preserves_tool_observers(
+    name: str, args: dict[str, Any], mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "call-1", "name": name, "args": args}]
+    )
+    original_call = dict(call)
+    pattern.pending_tool_calls = [call]
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "step-1"
+    runtime.active_turn_id = "turn-1"
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    started = mocker.spy(runtime, "on_tool_start")
+    ended = mocker.spy(runtime, "on_tool_end")
+    billed = mocker.patch("xagent.core.model.chat.token_context.add_tool_call_usage")
+
+    await pattern._execute_pending_tool_calls(
+        context=context, tools=[FakeTool()], llm=FakeLLM([]), runtime=runtime
+    )
+
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern._record_for_tool_call_id("call-1").status == "completed"
+    assert len(context.get_messages_by_role("tool")) == 1
+    ordinary_count = int(name == "calculator")
+    assert started.call_count == ended.call_count == billed.call_count == ordinary_count
+    # Execution preparation replaces the pending entry without mutating the
+    # caller-owned input retained for retries or diagnostics.
+    assert call == original_call
+    assert (
+        pattern._record_for_tool_call_id("call-1").invocation_id
+        == call["invocation_id"]
+    )
+    if name in {"send_message", "ask_user_question"}:
+        metadata = runtime.outbound_messages[0]["metadata"]
+        assert metadata["tool_call_id"] == "call-1"
+        assert metadata["tool_name"] == name
+        assert metadata["step_id"] == "step-1"
+        assert metadata["turn_id"] == "turn-1"
+        assert "args" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "status"),
+    [
+        (RuntimeError, "failed"),
+        (ToolCallInterrupted, "interrupted"),
+        (asyncio.CancelledError, "interrupted"),
+    ],
+)
+async def test_react_control_send_failure_settles_lifecycle_and_propagates(
+    failure_type: type[BaseException], status: str, mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [
+            {
+                "id": "send-1",
+                "name": "send_message",
+                "args": {"message": "Hi"},
+            }
+        ]
+    )
+    original_call = dict(call)
+    pattern.pending_tool_calls = [call]
+    failure = failure_type("send aborted")
+
+    async def send(payload: dict[str, Any]) -> None:
+        assert pattern._record_for_tool_call_id("send-1").status == "running"
+        assert payload["metadata"]["tool_call_id"] == "send-1"
+        raise failure
+
+    runtime = PatternRuntime(outbound_message_handler=send)
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    with pytest.raises(failure_type) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        status,
+    ]
+    assert pattern._record_for_tool_call_id("send-1").error == "send aborted"
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call == original_call
+    assert call == original_call
+    assert context.get_messages_by_role("tool") == []
+
+
+@pytest.mark.asyncio
+async def test_react_aggregated_question_preserves_ordered_call_sources() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "parent-step"
+    runtime.active_turn_id = "turn-1"
+    calls = [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+    await pattern._pause_for_tool_results(
+        waiting_pairs=[(call, {"message": call["name"]}) for call in calls],
+        context=ExecutionContext(),
+        runtime=runtime,
+    )
+    assert runtime.outbound_messages[0]["metadata"]["tool_calls"] == [
+        {
+            "tool_call_id": "a",
+            "tool_name": "first",
+            "step_id": "child-step",
+            "turn_id": "turn-1",
+        },
+        {
+            "tool_call_id": "b",
+            "tool_name": "second",
+            "step_id": "parent-step",
+            "dag_step_id": "parent-step",
+            "turn_id": "turn-1",
+        },
+    ]
+    assert calls == [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_final_checkpoint_failure_preserves_completed_call(
+    mocker: Any,
+) -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_calls = [
+        {"id": "final-1", "name": "final_answer", "args": {"answer": "Done"}}
+    ]
+    runtime = PatternRuntime()
+    failure = RuntimeError("checkpoint unavailable")
+    mocker.patch.object(runtime, "checkpoint", side_effect=failure)
+    records = mocker.spy(pattern, "_record_tool_call")
+    context = ExecutionContext()
+
+    with pytest.raises(RuntimeError) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern._record_for_tool_call_id("final-1").status == "completed"
+    assert pattern._record_for_tool_call_id("final-1").error is None
+    assert len(context.get_messages_by_role("tool")) == 1
+
+
+def _react_state_container_ids(obj: object, seen: set[int] | None = None) -> set[int]:
+    if seen is None:
+        seen = set()
+    if id(obj) in seen or not isinstance(obj, (dict, list, set)):
+        return seen
+    seen.add(id(obj))
+    values = obj.values() if isinstance(obj, dict) else obj
+    for value in values:
+        _react_state_container_ids(value, seen)
+    return seen
+
+
+def _react_live_container_ids(
+    obj: object,
+    seen: set[int] | None = None,
+    visited: set[int] | None = None,
+    depth: int = 0,
+) -> set[int]:
+    if seen is None:
+        seen = set()
+    if visited is None:
+        visited = set()
+    if depth > 8 or id(obj) in visited:
+        return seen
+    visited.add(id(obj))
+    if isinstance(obj, (dict, list, set)):
+        seen.add(id(obj))
+        values = obj.values() if isinstance(obj, dict) else obj
+        for value in values:
+            _react_live_container_ids(value, seen, visited, depth + 1)
+    elif hasattr(obj, "__dict__"):
+        for value in vars(obj).values():
+            _react_live_container_ids(value, seen, visited, depth + 1)
+    return seen
+
+
+def test_react_get_state_snapshots_in_place_mutated_containers() -> None:
+    """``get_state()`` must not hand back a container someone writes into.
+
+    The DAG checkpoint rollback restores a previously returned state to undo
+    a failed checkpoint, so any container a later code path mutates in place
+    has to be copied here.
+
+    The invariant is deliberately *not* "nothing is shared". Each exemption
+    below is write-once -- the value is replaced wholesale, never written
+    through -- so it cannot leak a later write into a snapshot, and copying
+    it would cost time on a path that runs ~20 times per step:
+
+    * ``tool_ledger`` entries' ``args`` / ``result`` -- ``_record_tool_call``
+      builds a new ``ToolCallRecord`` and replaces the entry. These also hold
+      whatever a custom or MCP tool returned, which may not be copyable at
+      all.
+    * ``last_response`` -- only ever reassigned.
+    * ``pending_tool_calls`` -- always rebound (``= list(...)``, slices).
+    * ``repeated_tool_decision`` / ``waiting_for_user_request`` -- rebound to
+      a fresh dict (see the "Rebind rather than mutate" comment in react.py).
+    """
+
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "response": {"deep": ["r1"]}}
+    ]
+    pattern.pending_tool_calls = [{"id": "tc1", "function": {"arguments": "{}"}}]
+    pattern.pending_tool_call_content = {"a": {"b": [1]}}
+    pattern.repeated_tool_decision = {"d": {"deep": 1}}
+    pattern.waiting_for_user_request = {"w": {"deep": 1}}
+    pattern.last_response = {"r": {"deep": 1}}
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="c1",
+            tool_name="t",
+            args={"nested": {"deep": [1]}},
+            args_hash="h",
+            status="completed",
+            result={"out": ["v"]},
+        )
+    )
+
+    state = pattern.get_state()
+
+    # The containers with in-place writers must be copied.
+    assert (
+        state["pending_tool_interaction_responses"]
+        is not pattern.pending_tool_interaction_responses
+    )
+    assert state["pending_tool_call_content"] is not pattern.pending_tool_call_content
+
+    # Anything else shared must be one of the documented write-once
+    # exemptions -- a new shared container fails this test.
+    exempt = _react_state_container_ids(
+        [
+            state["last_response"],
+            state["pending_tool_calls"],
+            state["repeated_tool_decision"],
+            state["waiting_for_user_request"],
+            [
+                [record.get("args"), record.get("result")]
+                for record in state["tool_ledger"].values()
+            ],
+        ]
+    )
+    shared = _react_state_container_ids(state) & _react_live_container_ids(pattern)
+
+    assert not (shared - exempt)
+
+
+def test_react_get_state_survives_a_non_copyable_tool_result() -> None:
+    """A tool result that cannot be copied must not break checkpointing.
+
+    ``ToolCallRecord.result`` is typed ``Any`` and holds whatever a custom or
+    MCP tool returned -- a lock, a file handle, a generator. The JSON layer
+    downstream degrades such values to a placeholder; the snapshot boundary
+    must not turn them into a hard failure first.
+    """
+
+    pattern = ReActPattern()
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="c1",
+            tool_name="t",
+            args={"a": 1},
+            args_hash="h",
+            status="completed",
+            result={"success": True, "handle": threading.Lock()},
+        )
+    )
+
+    state = pattern.get_state()
+
+    assert state["tool_ledger"]["c1"]["result"]["success"] is True
+
+
+def test_react_get_state_degrades_when_a_snapshotted_value_cannot_be_copied() -> None:
+    """A non-copyable value inside a snapshotted container degrades, not raises.
+
+    ``snapshot_container`` falls back to a shallow copy, which still defends
+    against the ``pop`` that the delivery loop performs on this list.
+    """
+
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "handle": threading.Lock()}
+    ]
+
+    state = pattern.get_state()
+    captured = state["pending_tool_interaction_responses"]
+
+    assert captured is not pattern.pending_tool_interaction_responses
+    pattern.pending_tool_interaction_responses.pop(0)
+    assert [entry["interaction_id"] for entry in captured] == ["i1"]
+
+
+def test_react_get_state_is_unaffected_by_later_pop() -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "response": "r1"},
+        {"tool_name": "t2", "interaction_id": "i2", "response": "r2"},
+    ]
+
+    state = pattern.get_state()
+
+    pattern.pending_tool_interaction_responses.pop(0)
+
+    assert [
+        entry["interaction_id"] for entry in state["pending_tool_interaction_responses"]
+    ] == ["i1", "i2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_action", ["start", "end", "error"])
+async def test_resumed_settlement_fact_failure_remains_replayable(
+    failed_action: str, mocker: Any
+) -> None:
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+    from xagent.core.agent.trace import Tracer
+
+    tracer = Tracer()
+    attempted: list[str] = []
+
+    async def write_fact(event: Any) -> None:
+        action = event.event_type.action.value
+        attempted.append(action)
+        if action == failed_action:
+            raise ExecutionEventPersistenceError("settlement fact commit uncertain")
+
+    tracer.event_writer = write_fact
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Approve",
+        }
+    ]
+    pattern._store_tool_record(_waiting_ledger_record("call-1"))
+    context = ExecutionContext(execution_id="settlement-fact-failure")
+    context.add_tool_result(
+        "approval_gate", {"success": False, "status": "waiting_for_user"}, "call-1"
+    )
+    settlement = ToolInteractionSettlement(
+        status="failed" if failed_action == "error" else "succeeded",
+        result={"success": failed_action != "error"},
+    )
+    runtime = PatternRuntime(tracer=tracer)
+    runtime.active_turn_id = "approval-turn"
+    mocker.patch.object(runtime, "checkpoint", new_callable=mocker.AsyncMock)
+    tool = SettlementApprovalTool(resume_result=settlement)
+    # The failed fact stops the run, after the settled ledger row was saved.
+    with pytest.raises(ExecutionEventPersistenceError):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=runtime,
+        )
+    runtime.checkpoint.assert_awaited_once()
+    assert runtime.checkpoint.await_args.args == (
+        "tool_interaction_response_delivered",
+    )
+    assert pattern.pending_tool_interaction_responses == []
+    assert failed_action in attempted
+    assert len(tool.resume_calls) == 1
+    record = pattern._record_for_tool_call_id("call-1")
+    assert record is not None and record.settlement_trace_pending is True
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    replay_tracer = TraceEventRecorder()
+    replay_runtime = PatternRuntime(
+        execution_id="settlement-fact-failure", tracer=replay_tracer
+    )
+    replay_runtime.active_turn_id = "repair-turn"
+    await restored._replay_unemitted_settlement_traces(runtime=replay_runtime)
+    assert _settlement_trace_events(replay_tracer, "call-1") == [
+        "action_start_tool",
+        "action_error_tool" if failed_action == "error" else "action_end_tool",
+    ]
+    assert {event["data"].get("turn_id") for event in replay_tracer.events} == {
+        "approval-turn"
+    }
+    restored_record = restored._record_for_tool_call_id("call-1")
+    assert restored_record is not None
+    assert restored_record.settlement_trace_pending is False
+
+
+def test_invocation_identity_is_fresh_per_normalized_provider_call() -> None:
+    pattern = ReActPattern()
+
+    [same_step_first] = pattern._normalize_tool_calls(
+        [{"function": {"name": "calculator", "arguments": "{}"}}]
+    )
+    [same_step_second] = pattern._normalize_tool_calls(
+        [{"function": {"name": "calculator", "arguments": "{}"}}]
+    )
+
+    assert same_step_first["id"] == same_step_second["id"] == "tool_call_0"
+    assert same_step_first["invocation_id"] != same_step_second["invocation_id"]
+    assert pattern._tool_call_for_context(same_step_first) == {
+        "id": "tool_call_0",
+        "type": "function",
+        "function": {"name": "calculator", "arguments": "{}"},
+    }
+
+
+def test_reused_provider_id_keeps_distinct_records_and_start_times() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {"value": 1}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {"value": 2}}]
+    )
+    first["step_id"] = "react_same"
+    second["step_id"] = "react_other"
+    first["issued_at"] = 100.0
+    second["issued_at"] = 200.0
+
+    pattern._record_tool_call(first, status="running")
+    pattern._record_tool_call(first, status="completed", result={"value": 1})
+    pattern._record_tool_call(second, status="running")
+
+    first_record = pattern._tool_record_for_call(first)
+    second_record = pattern._tool_record_for_call(second)
+    assert first_record is not second_record
+    assert first_record.step_id == "react_same"
+    assert second_record.step_id == "react_other"
+    assert first_record.issued_at == 100.0
+    assert second_record.issued_at == 200.0
+    assert len(pattern.tool_ledger) == 2
+
+
+def test_issued_at_is_stamped_at_normalization_and_survives_pre_execution_restore() -> (
+    None
+):
+    pattern = ReActPattern()
+    calls = pattern._normalize_tool_calls(
+        [
+            {"id": "first", "name": "calculator", "args": {}},
+            {"id": "second", "name": "calculator", "args": {}},
+        ]
+    )
+    assert calls[0]["issued_at"] == calls[1]["issued_at"]
+    assert calls[0]["issued_at"] is not None
+    pattern.pending_tool_calls = calls
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    restored_call = restored.pending_tool_calls[0]
+    restored._record_tool_call(restored_call, status="running")
+
+    assert restored_call["issued_at"] == calls[0]["issued_at"]
+    assert restored._record_for_tool_call_id("first").issued_at == calls[0]["issued_at"]
+
+
+def test_invocation_identity_survives_checkpoint_and_legacy_rows_stay_unknown() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {}}]
+    )
+    pattern._record_tool_call(call, status="running")
+    pattern.pending_tool_calls = [call]
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "calculator",
+            "tool_call_id": "provider-1",
+            "invocation_id": call["invocation_id"],
+            "interaction_id": "interaction-1",
+            "response": "continue",
+        }
+    ]
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    restored_call = restored.pending_tool_calls[0]
+    restored_record = restored._tool_record_for_call(restored_call)
+    issued_at = restored_record.issued_at
+    restored._record_tool_call(
+        restored_call, status="completed", result={"success": True}
+    )
+
+    assert (
+        restored._tool_record_for_call(restored_call).invocation_id
+        == (call["invocation_id"])
+    )
+    assert restored._tool_record_for_call(restored_call).issued_at == issued_at
+    assert (
+        restored.pending_tool_interaction_responses[0]["invocation_id"]
+        == (call["invocation_id"])
+    )
+
+    legacy = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "legacy-provider-id",
+            "tool_name": "calculator",
+            "args": {},
+            "status": "completed",
+        }
+    )
+    assert legacy.invocation_id is None
+    assert legacy.issued_at is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_serial_pause_delivers_reply_without_fabricated_identity() -> (
+    None
+):
+    pattern = ReActPattern()
+    caller_owned = {
+        "id": "legacy-provider-id",
+        "name": "approval_gate",
+        "args": {"expression": "1+1"},
+    }
+    pattern.pending_tool_calls = [caller_owned]
+    context = ExecutionContext(execution_id="legacy-serial-resume")
+    runtime = PatternRuntime(execution_id="legacy-serial-resume")
+    tool = SettlementApprovalTool(
+        resume_result=ToolInteractionSettlement.succeeded(
+            {"success": True, "value": "approved"}
+        )
+    )
+
+    waiting = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=[tool],
+        llm=None,
+        runtime=runtime,
+    )
+
+    assert waiting is not None and waiting["status"] == "waiting_for_user"
+    assert caller_owned == {
+        "id": "legacy-provider-id",
+        "name": "approval_gate",
+        "args": {"expression": "1+1"},
+    }
+    record = pattern._record_for_tool_call_id("legacy-provider-id")
+    assert record.invocation_id is None
+    assert record.issued_at is None
+    tool_message = next(
+        message for message in context.messages if message.role == "tool"
+    )
+    assert "invocation_id" not in tool_message.metadata
+    request = pattern.waiting_for_user_request["requests"][0]
+    assert request["invocation_id"] is None
+
+    pattern._queue_tool_interaction_responses(
+        waiting_request=pattern.waiting_for_user_request,
+        response="Approve",
+        tools=[tool],
+    )
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert tool.resume_calls == [
+        {
+            "interaction_id": "publish-interaction-1",
+            "response": "Approve",
+        }
+    ]
+    assert pattern.pending_tool_interaction_responses == []
+    assert pattern._record_for_tool_call_id("legacy-provider-id").result == {
+        "success": True,
+        "value": "approved",
+    }
+
+
+def test_provider_compatible_projection_matches_pre_identity_dict_semantics() -> None:
+    pattern = ReActPattern()
+    calls: list[dict[str, Any]] = []
+    for provider_id, name, success in (
+        ("provider-a", "alpha", True),
+        ("provider-b", "beta", True),
+        ("provider-a", "alpha-new", False),
+        ("provider-c", "final_answer", True),
+        ("provider-b", "beta-new", True),
+    ):
+        [call] = pattern._normalize_tool_calls(
+            [{"id": provider_id, "name": name, "args": {}}]
+        )
+        calls.append(call)
+        pattern._record_tool_call(
+            call,
+            status="completed" if success else "failed",
+            result={"success": success},
+        )
+
+    expected: dict[str, ToolCallRecord] = {}
+    for call in calls:
+        expected[str(call["id"])] = pattern._tool_record_for_call(call)
+
+    projected = pattern._provider_compatible_tool_records()
+    assert [record.tool_call_id for record in projected] == list(expected)
+    assert projected == list(expected.values())
+    assert (
+        pattern._record_for_tool_call_id("provider-a").invocation_id
+        == calls[2]["invocation_id"]
+    )
+    assert (
+        pattern._record_for_tool_call_id("provider-b").invocation_id
+        == calls[4]["invocation_id"]
+    )
+    assert pattern._tool_record_for_call(calls[0]).tool_name == "alpha"
+    assert pattern._tool_record_for_call(calls[1]).tool_name == "beta"
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    assert [
+        (record.tool_call_id, record.tool_name, record.status)
+        for record in restored._provider_compatible_tool_records()
+    ] == [
+        (record.tool_call_id, record.tool_name, record.status) for record in projected
+    ]
+    assert (
+        restored._find_tool_record(
+            tool_call_id="provider-a",
+            invocation_id=str(calls[0]["invocation_id"]),
+        ).tool_name
+        == "alpha"
+    )
+
+
+def test_provider_compatible_consumers_ignore_overwritten_invocations() -> None:
+    pattern = ReActPattern()
+    tool = SettlementApprovalTool()
+    calls: list[dict[str, Any]] = []
+    for expression in ("first", "second"):
+        [call] = pattern._normalize_tool_calls(
+            [
+                {
+                    "id": "provider-reused",
+                    "name": "approval_gate",
+                    "args": {"expression": expression},
+                }
+            ]
+        )
+        call["turn_id"] = "same-turn"
+        calls.append(call)
+        pattern._record_tool_call(
+            call,
+            status="completed",
+            result={"success": True, "value": expression},
+        )
+
+    [retry_of_overwritten] = pattern._normalize_tool_calls(
+        [
+            {
+                "id": "provider-reused",
+                "name": "approval_gate",
+                "args": {"expression": "first"},
+            }
+        ]
+    )
+    retry_of_overwritten["turn_id"] = "same-turn"
+
+    assert pattern._consecutive_work_tool_call_count() == 1
+    assert (
+        pattern._suppressed_duplicate_write_result(
+            retry_of_overwritten,
+            [tool],
+        )
+        is None
+    )
+
+
+def test_empty_invocation_id_restores_as_legacy_none() -> None:
+    record = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "legacy",
+            "tool_name": "calculator",
+            "args": {},
+            "status": "running",
+            "invocation_id": "",
+        }
+    )
+
+    assert record.invocation_id is None
+
+
+def test_record_tool_call_does_not_enrich_caller_owned_legacy_dict() -> None:
+    pattern = ReActPattern()
+    call = {"id": "legacy", "name": "calculator", "args": {}}
+
+    pattern._record_tool_call(call, status="running")
+
+    assert call == {"id": "legacy", "name": "calculator", "args": {}}
+    assert pattern._record_for_tool_call_id("legacy").invocation_id is None
+
+
+def test_cancelled_calls_keep_identity_in_message_and_ledger_without_mutation() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "cancelled", "name": "calculator", "args": {}}]
+    )
+    original = dict(call)
+    context = ExecutionContext(execution_id="cancelled-identity")
+
+    pattern._cancel_tool_calls([call], context, reason="cancelled by test")
+
+    [message] = context.get_messages_by_role("tool")
+    assert message.metadata["invocation_id"] == call["invocation_id"]
+    assert pattern._tool_record_for_call(call).invocation_id == call["invocation_id"]
+    assert call == original
+
+
+@pytest.mark.asyncio
+async def test_control_tool_result_keeps_additive_invocation_metadata() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [
+            {
+                "id": "final",
+                "name": "final_answer",
+                "args": {"answer": "Done", "outcome": "completed"},
+            }
+        ]
+    )
+    pattern.pending_tool_calls = [call]
+    context = ExecutionContext(execution_id="control-identity")
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=[],
+        llm=None,
+        runtime=PatternRuntime(execution_id="control-identity"),
+    )
+
+    assert result is not None and result["status"] == "completed"
+    [message] = context.get_messages_by_role("tool")
+    assert message.metadata["invocation_id"] == call["invocation_id"]
+    assert pattern._tool_record_for_call(call).invocation_id == call["invocation_id"]
+
+
+def test_settlement_consumer_selects_exact_reused_provider_invocation() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "approval_gate", "args": {}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "approval_gate", "args": {}}]
+    )
+    for call in (first, second):
+        call.update(step_id="react_same", turn_id="original-turn")
+    pattern._record_tool_call(first, status="completed", result={"value": "first"})
+    pattern._record_tool_call(
+        second,
+        status="waiting_for_user",
+        result={"success": False, "status": "waiting_for_user"},
+    )
+
+    context = ExecutionContext(execution_id="exact-resume")
+    context.add_tool_result(
+        "approval_gate",
+        {"value": "first"},
+        "provider-1",
+        invocation_id=first["invocation_id"],
+    )
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "provider-1",
+        invocation_id=second["invocation_id"],
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "provider-1",
+            "invocation_id": second["invocation_id"],
+            "interaction_id": "interaction-2",
+            "response": "Approve",
+        }
+    ]
+    record = pattern._validate_tool_interaction_settlement_target(
+        pending=pattern.pending_tool_interaction_responses[0],
+        context=context,
+    )
+
+    assert record.invocation_id == second["invocation_id"]
+    assert record.result == {"success": False, "status": "waiting_for_user"}
+
+
+@pytest.mark.asyncio
+async def test_every_runtime_tool_lifecycle_event_carries_invocation_identity() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="trace-identity", tracer=tracer)
+    cases = [
+        ("success", {"success": True}),
+        ("waiting", {"success": False, "status": "waiting_for_user"}),
+        ("error", {"success": False, "error": "failed"}),
+        ("cancelled", None),
+    ]
+
+    for label, result in cases:
+        tool_call = {
+            "id": "provider-reused",
+            "invocation_id": f"invocation-{label}",
+            "name": "calculator",
+            "args": {},
+            "step_id": "public-step",
+        }
+        await runtime.on_tool_start(tool_call=tool_call)
+        if label == "error":
+            await runtime.on_tool_error(
+                tool_call=tool_call,
+                error=RuntimeError("failed"),
+                result=result,
+            )
+        elif label == "cancelled":
+            await runtime.on_tool_cancelled(tool_call=tool_call, reason="stop")
+        else:
+            await runtime.on_tool_end(tool_call=tool_call, result=result)
+
+    tool_events = [event for event in tracer.events if "tool" in event["event_type"]]
+    assert len(tool_events) == 8
+    for (label, _), start, terminal in zip(cases, tool_events[::2], tool_events[1::2]):
+        assert start["data"]["invocation_id"] == f"invocation-{label}"
+        assert terminal["data"]["invocation_id"] == f"invocation-{label}"
+        assert start["step_id"] == terminal["step_id"] == "public-step"
+
+
+def test_find_tool_record_separates_legacy_and_identity_rows_sharing_provider_id() -> (
+    None
+):
+    pattern = ReActPattern()
+    # A pre-identity checkpoint: provider-keyed rows and no stored index.
+    pattern.load_state(
+        {
+            "tool_ledger": {
+                "shared": {
+                    "tool_call_id": "shared",
+                    "tool_name": "legacy_tool",
+                    "args": {},
+                    "status": "completed",
+                    "result": {"success": True},
+                },
+                "other": {
+                    "tool_call_id": "other",
+                    "tool_name": "other_tool",
+                    "args": {},
+                    "status": "completed",
+                    "result": {"success": True},
+                },
+            }
+        }
+    )
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "shared", "name": "new_tool", "args": {}}]
+    )
+    pattern._record_tool_call(call, status="failed", result={"success": False})
+
+    legacy = pattern._find_tool_record(tool_call_id="shared", invocation_id=None)
+    exact = pattern._find_tool_record(
+        tool_call_id="shared", invocation_id=call["invocation_id"]
+    )
+    assert legacy is not None and legacy.tool_name == "legacy_tool"
+    assert exact is not None and exact.tool_name == "new_tool"
+    assert (
+        pattern._find_tool_record(tool_call_id="shared", invocation_id="unknown")
+        is None
+    )
+    assert list(pattern.tool_ledger) == ["shared", "other", call["invocation_id"]]
+    # The provider view replaces the reused id in place, as the pre-identity
+    # ledger did, so the newer row keeps the legacy row's position.
+    assert pattern._record_for_tool_call_id("shared") is exact
+    assert [
+        record.tool_name for record in pattern._provider_compatible_tool_records()
+    ] == ["new_tool", "other_tool"]
+
+
+def test_provider_index_order_survives_checkpoint_restore() -> None:
+    # A concurrent batch reusing ids from an earlier step moves them to the
+    # tail of the provider index but not of the exact ledger, so the restored
+    # order must come from the persisted index rather than the ledger order.
+    pattern = ReActPattern()
+    for provider_id in ("tool_call_0", "tool_call_1", "tool_call_2"):
+        [call] = pattern._normalize_tool_calls(
+            [{"id": provider_id, "name": "web_search", "args": {}}]
+        )
+        pattern._record_tool_call(call, status="completed", result={"success": True})
+    batch = pattern._normalize_tool_calls(
+        [
+            {"id": "tool_call_0", "name": "web_search", "args": {}},
+            {"id": "tool_call_1", "name": "web_search", "args": {}},
+        ]
+    )
+    for call in batch:
+        pattern._record_tool_call(call, status="completed", result={"success": True})
+    pattern._reorder_ledger_for_batch(batch)
+
+    restored = ReActPattern()
+    restored.load_state(json.loads(json.dumps(pattern.get_state())))
+
+    expected = ["tool_call_2", "tool_call_0", "tool_call_1"]
+    assert list(pattern.tool_call_id_index) == expected
+    assert list(restored.tool_call_id_index) == expected
+    assert restored.tool_call_id_index == pattern.tool_call_id_index
+
+
+class _CheckpointRecorder(TraceEventRecorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.checkpoints: list[dict[str, Any]] = []
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.checkpoints.append(payload)
+
+
+def _checkpoint_metadata(tracer: _CheckpointRecorder, label: str) -> dict[str, Any]:
+    [metadata] = [
+        payload["metadata"]
+        for payload in tracer.checkpoints
+        if payload.get("label") == label
+    ]
+    return metadata
+
+
+@pytest.mark.asyncio
+async def test_delivered_and_invalid_target_checkpoints_report_the_row_identity() -> (
+    None
+):
+    pattern = ReActPattern()
+    [waiting, stale] = pattern._normalize_tool_calls(
+        [
+            {"id": "wait-call", "name": "approval_gate", "args": {}},
+            {"id": "stale-call", "name": "approval_gate", "args": {}},
+        ]
+    )
+    context = ExecutionContext(execution_id="settlement-identity")
+    for call in (waiting, stale):
+        pattern._record_tool_call(
+            call, status="waiting_for_user", result={"status": "waiting_for_user"}
+        )
+    # Only the first row has its single tool result; the second fails
+    # validation and is closed as an invalid settlement target.
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "wait-call",
+        invocation_id=waiting["invocation_id"],
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": call["id"],
+            "invocation_id": call["invocation_id"],
+            "interaction_id": "publish-interaction-1",
+            "response": "Approve",
+        }
+        for call in (waiting, stale)
+    ]
+    tracer = _CheckpointRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    runtime.active_turn_id = "approval-turn"
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    delivered = _checkpoint_metadata(tracer, "tool_interaction_response_delivered")
+    skipped = _checkpoint_metadata(tracer, "tool_interaction_response_skipped")
+    assert delivered["invocation_id"] == waiting["invocation_id"]
+    assert skipped["reason"] == "invalid_settlement_target"
+    assert skipped["invocation_id"] == stale["invocation_id"]
+
+
+@pytest.mark.asyncio
+async def test_skipped_checkpoint_reports_the_queued_request_identity() -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "removed_tool",
+            "tool_call_id": "removed-call",
+            "invocation_id": "queued-invocation",
+            "interaction_id": "interaction-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = _CheckpointRecorder()
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[],
+        context=ExecutionContext(execution_id="skipped-identity"),
+        runtime=PatternRuntime(tracer=tracer),
+    )
+
+    skipped = _checkpoint_metadata(tracer, "tool_interaction_response_skipped")
+    assert skipped["reason"] == "resume_callback_unavailable"
+    assert skipped["invocation_id"] == "queued-invocation"
+
+
+def _record_completed_calls(
+    pattern: ReActPattern, calls: list[tuple[str, dict[str, Any]]]
+) -> None:
+    for index, (tool_name, args) in enumerate(calls):
+        record = ToolCallRecord(
+            tool_call_id=f"call_{index}",
+            invocation_id=f"inv_{index}",
+            tool_name=tool_name,
+            args=args,
+            args_hash=f"hash_{index}",
+            status="completed",
+            result={"content": [{"text": "ok"}], "is_error": False},
+        )
+        pattern.tool_ledger[record.invocation_id] = record
+        pattern.tool_call_id_index[record.tool_call_id] = record.invocation_id
+
+
+def _react_mcp_tool_adapter(tool_name: str):
+    from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name=tool_name,
+            description=tool_name,
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        name_prefix="mcp_Xero_",
+        source_server="xero",
+    )
+
+
+def test_react_repeated_guard_counts_each_decision_group_separately() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    tools = [
+        _react_mcp_tool_adapter("list_invoices"),
+        _react_mcp_tool_adapter("list_aged_receivables"),
+    ]
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        tools
+    )
+    _record_completed_calls(
+        pattern,
+        [
+            ("mcp_Xero_list_invoices", {"page": 2}),
+            ("mcp_Xero_list_invoices", {"page": 3}),
+            ("mcp_Xero_list_invoices", {"page": 4}),
+            ("mcp_Xero_list_aged_receivables", {"contactId": "c1"}),
+        ],
+    )
+
+    assert (
+        pattern._repeated_tool_call_metadata(
+            {"name": "mcp_Xero_list_aged_receivables", "args": {}}
+        )
+        is None
+    )
+
+
+def test_react_repeated_guard_marks_paged_runs() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=3)
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": page}) for page in (1, 2, 3)],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+    messages = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )
+    prompt = messages[-1]["content"]
+    assert "paging through a list" in prompt
+    assert "more pages may exist" in prompt
+
+
+@pytest.mark.parametrize(
+    ("argument", "values"),
+    [
+        ("page", (1, 2, 3, 4)),
+        ("cursor", ("a", "b", "c", "d")),
+        ("offset", (0, 50, 100, 150)),
+        ("page_token", ("a", "b", "c", "d")),
+        ("skip", (0, 50, 100, 150)),
+        ("next_skip", (0, 50, 100, 150)),
+        ("starting_after", ("a", "b", "c", "d")),
+        ("page_index", (0, 1, 2, 3)),
+    ],
+)
+def test_react_repeated_guard_marks_advancing_paged_runs(
+    argument: str, values: tuple[Any, ...]
+) -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    _record_completed_calls(
+        pattern,
+        [("mcp_Xero_list_overdue_invoices", {argument: value}) for value in values],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata(
+        {"name": "mcp_Xero_list_overdue_invoices"}
+    )
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+    prompt = pattern._messages_for_repeated_tool_decision(ExecutionContext(), metadata)[
+        -1
+    ]["content"]
+    assert "offset, or skip" in prompt
+
+
+def test_react_repeated_guard_does_not_mark_identical_page_arguments() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": 1}) for _ in range(4)],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert "paginated" not in metadata
+
+
+def test_react_repeated_guard_marks_cursor_added_after_first_page() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
+    _record_completed_calls(
+        pattern,
+        [
+            ("list_invoices", {"status": "open"}),
+            ("list_invoices", {"status": "open", "cursor": "next-page"}),
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+
+
+def test_react_work_attempt_guard_marks_pagination_after_failed_page() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=4,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": 1}), ("list_invoices", {"page": 2})],
+    )
+    failed = ToolCallRecord(
+        tool_call_id="call_failed",
+        invocation_id="inv_failed",
+        tool_name="list_invoices",
+        args={"page": 3},
+        args_hash="hash_failed",
+        status="failed",
+        result={
+            "content": [{"text": "Error listing invoices: boom"}],
+            "is_error": True,
+        },
+    )
+    pattern.tool_ledger[failed.invocation_id] = failed
+    pattern.tool_call_id_index[failed.tool_call_id] = failed.invocation_id
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "work_tool_attempts"
+    assert metadata["paginated"] is True
+
+
+def test_react_work_attempt_guard_ignores_other_tools_pagination() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=4,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    _record_completed_calls(
+        pattern,
+        [
+            ("list_invoices", {"page": 1}),
+            ("list_invoices", {"page": 2}),
+            ("send_reminder", {"invoice_id": "inv-1"}),
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "send_reminder"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "work_tool_attempts"
+    assert "paginated" not in metadata
+
+
+def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
+    _record_completed_calls(
+        pattern,
+        [("web_search", {"query": "a"}), ("web_search", {"query": "b"})],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "web_search"})
+
+    assert metadata is not None
+    assert "paginated" not in metadata
+    messages = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )
+    prompt = messages[-1]["content"]
+    assert "paging through a list" not in prompt

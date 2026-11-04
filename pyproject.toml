@@ -1,0 +1,433 @@
+[project]
+authors = [
+  { name = "Jicheng Shi", email = "rogershijicheng@gmail.com" },
+  { name = "Xuye Qin", email = "qinxuye@gmail.com" },
+]
+name = "xagent-ai"
+dynamic = ["version"]
+description = "a powerful agent os with great compatibility"
+license = { text = "Xagent Source License" }
+readme = "README.md"
+requires-python = ">=3.11"
+
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+  "pydantic >= 2.11.7",
+  "langchain-openai >= 1.1.14, <2",
+  "langchain-core >= 1.6.12, <2",
+  "langchain-community >= 0.4.2, <0.5",
+  "openai >= 2.26.0, <3",  # retain the supported HTTPX 1.x SDK API
+  "anthropic >= 0.84.0",
+  "google-genai >= 1.65.0",
+  "elevenlabs >= 2.0.0",
+  "xinference-client >= 2.3.0, <3",  # retain the tested client/model session contract
+  "zai-sdk>=0.0.4",
+  "numexpr >= 2.11.0",
+  "aiohttp >= 3.14.5",
+  "yarl >= 1.22.0, < 2.0.0",  # Shared URL validation must match aiohttp normalization
+  "tqdm >= 4.66.0",
+  "beautifulsoup4 >= 4.12.3",
+  "html2text >= 2025.4.15",
+  "PyYAML >= 6.0.2",
+  "fastapi >= 0.143.3",
+  "starlette >= 1.8.0",  # FastAPI's own lower bound still permits vulnerable releases
+  "uvicorn >= 0.35.0",
+  "websockets>=15.0.1",
+  "httpx[socks] >= 0.27.2",
+  "rich >= 14.0.0",
+  "prompt_toolkit >= 3.0.0",
+  "langfuse >= 4.0.6, < 5.0.0",    # Tracing implementation targets the v4 SDK API
+  "opentelemetry-api >= 1.39.0, < 2.0.0",
+  "opentelemetry-sdk >= 1.39.0, < 2.0.0",
+  "opentelemetry-exporter-otlp-proto-http >= 1.39.0, < 2.0.0",
+  "python-dotenv >= 1.2.4",
+  "mcp>=1.30.0,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
+  "asyncssh>=2.24.1",  # SSH MCP runner (production runtime, not just tests)
+  "requests >= 2.34.2",  # required by the patched Docling Core dependency graph
+  "idna >= 3.20",  # magento.py's non-ASCII MAGENTO_BASE_URL handling
+  "python-dateutil >= 2.8.2",  # calendar.py's RRULE validation (utils.parse_rrule); currently only pulled in transitively
+  "boto3 >= 1.34.59",  # Converse/ConverseStream plus AWS built-in MCP connectors
+  "celery[redis]>=5.4.0,<6.0.0",
+  "redis>=5.0.0",
+  "pillow >= 12.3.0",
+  "defusedxml>=0.7.1",
+  "python-docx>=1.1.0",  # Built-in Word MCP connector runtime
+  "pypinyin>=0.53.0",
+  "cairosvg >= 2.9.1",
+  # Bounded: the memory admission primitives depend on LanceDB table, metadata
+  # and commit semantics that no major/minor bump is contracted to preserve.
+  # See "LanceDB memory compatibility" in docs/deployment.md.
+  "lancedb>=0.32.0,<0.38",
+  # Dictionary for lance FTS jieba tokenizer; only the macOS wheel embeds one.
+  "jieba>=0.42.1",
+  "pyarrow>=16.1.0",
+  # Basic document processing (keep pypdf for basic PDF support)
+  "pypdf>=6.21.1",
+  "tiktoken>=0.8.0",
+  # Database ORM and migrations (core for web interface)
+  "sqlalchemy>=2.0.0",
+  "aiosqlite>=0.20.0",
+  "greenlet>=3.0",
+  "alembic>=1.13.0",
+  "PyJWT[crypto]>=2.15.1,<3",
+  "cryptography>=50.0.2",
+  "bcrypt>=4.0.0",
+  # Rate limiting for public trigger callback and trigger CRUD endpoints
+  "limits>=3.13.0",
+  # Per-mailbox Gmail Pub/Sub provisioning for Gmail triggers
+  "google-cloud-pubsub>=2.21.0",
+  # Utilities
+  "docker>=7.2.0",
+  "json-repair==0.64.0",  # Preserve audited tool-argument repair behavior
+  "jsonschema>=4.25.1",
+  "beartype>=0.18.5",
+  "matplotlib>=3.5.0",
+  "google-auth-oauthlib>=1.2.0",
+  "google-api-python-client>=2.145.0",
+  # zoneinfo's IANA timezone database - stdlib zoneinfo relies on the OS's
+  # tz data, which minimal container images may not ship; this guarantees
+  # it's present regardless of platform (calendar/outlook conflict-check
+  # timezone math needs real zone offsets, not just zone names).
+  "tzdata>=2024.1",
+  "boxlite>=0.10.7,<0.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "boxlite>=0.10.7,<0.11; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "filelock>=3.32.7",
+  "fsspec>=2026.9.0",
+  "cloudpickle>=3.0.0",
+  "exa-py>=2.0.0",
+  # Data science libraries (core for RAG and analysis)
+  "pandas>=1.3.0",
+  # Special handling - AI-enhanced document processing
+  "deepdoc-lib==0.2.4",
+  "aiogram>=3.4.1",
+  "aiohttp-socks>=0.8.4",
+  "lark-oapi>=1.5.3",
+  "slack-sdk>=3.43.0",
+  "s3fs>=2026.2.0",
+  "authlib>=1.7.2",
+  "itsdangerous>=2.2.0",
+  "volcengine-python-sdk[ark]>=5.0.37",
+  "byteplus-python-sdk-v2>=3.0.52",
+]
+
+[project.optional-dependencies]
+command-path-guard = ["bashlex>=0.18"]
+
+# In-process LLM routing for OpenRouter's "auto" model. xrouter-llm currently
+# does not declare its bundled predictor runtime deps, so keep them explicit
+# here until upstream does.
+router = [
+  "xrouter-llm>=0.3.6",
+  "sentence-transformers>=3.0.0",
+  # xrouter-llm's embedding model is a Qwen3-architecture checkpoint; transformers
+  # only registered the `qwen3` model type in 4.51.
+  "transformers>=4.51",
+  "torch>=2.0.0",
+]
+# document processing libraries(Non-AI)
+document-processing = [
+  "pdfplumber>=0.10.0",
+  "unstructured>=0.27.28",
+  # Keep unstructured from resolving to legacy numba releases that cannot build
+  # on Python 3.12 after deepdoc-lib moved the environment to NumPy 2.x.
+  "numba>=0.64.0",
+  "typer>=0.9.0",            # Required by spacy CLI, used by unstructured
+  "pymupdf>=1.23.0,<1.27.0",
+  "python-docx>=1.1.0",
+  "openpyxl>=3.1.0",
+  "python-pptx>=0.6.0",
+  "pypdf2>=3.0.1",
+]
+
+# AI-related document processing
+ai-document = ["docling>=2.140.0"]
+
+# PostgreSQL driver (uses psycopg2-binary for convenience)
+# Note: For production, consider installing psycopg2 from source instead
+postgresql = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0"]
+postgresql-async = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0", "greenlet>=3.0"]
+
+duckdb = ["duckdb>=1.0.0,<2.0", "duckdb-engine>=0.10.0,<1.0"]
+
+# Browser automation
+browser = ["playwright>=1.40.0"]
+
+# Browser TLS fingerprint impersonation for WAF-sensitive web crawling
+waf-crawl = ["curl_cffi>=0.14.0"]
+
+# Alternative vector databases (optional alternatives to LanceDB)
+chromadb = ["chromadb"]
+milvus = ["pymilvus>=2.6.9,<3.0.0"]
+
+# All optional extras (for users who want everything)
+# Note: List packages directly since optional-dependencies doesn't support include-group
+all = [
+  "bashlex>=0.18",
+  "unstructured>=0.27.28",
+  "numba>=0.64.0",
+  "typer>=0.9.0",            # Required by spacy CLI, used by unstructured
+  "pymupdf>=1.23.0,<1.27.0",
+  "python-docx>=1.1.0",
+  "openpyxl>=3.1.0",
+  "python-pptx>=0.6.0",
+  "pypdf2>=3.0.1",
+  "docling>=2.140.0",
+  "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "greenlet>=3.0",
+  "playwright>=1.40.0",
+  "curl_cffi>=0.14.0",
+  "chromadb",
+  "pymilvus>=2.6.9,<3.0.0",
+  "xrouter-llm>=0.3.6",
+  "sentence-transformers>=3.0.0",
+]
+
+[dependency-groups]
+# Runtime dependencies available to untrusted code in the separately published
+# sandbox image. Dockerfile.sandbox exports only this group from uv.lock so the
+# Python dependency set stays reproducible without inheriting the backend's larger set.
+sandbox = [
+  "pydantic>=2.11.7",
+  "pydantic-settings>=2.16.0",
+  "cloudpickle>=3.0.0",
+  "mcp>=1.30.0,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
+  "pandas>=1.3.0",
+  "numpy>=1.21.0",
+  "matplotlib>=3.5.0",
+  "openpyxl>=3.1.0",
+  "python-docx>=1.1.0",
+  "fsspec>=2026.9.0",
+]
+
+backend-image = [
+  "unstructured>=0.27.28",
+  "numba>=0.64.0",
+  "typer>=0.9.0",
+  "pymupdf>=1.23.0,<1.27.0",
+  "python-docx>=1.1.0",
+  "openpyxl>=3.1.0",
+  "python-pptx>=0.6.0",
+  "pypdf2>=3.0.1",
+  "docling>=2.140.0",
+  "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "playwright>=1.40.0",
+  "curl_cffi>=0.14.0",
+  "chromadb",
+  "pymilvus>=2.6.9,<3.0.0",
+  "torch",
+  "torchvision",
+  "xrouter-llm>=0.3.6",
+  "sentence-transformers>=3.0.0",
+]
+
+# Development tools (linting, formatting)
+dev = [
+  "pre-commit>=4.2.0",
+  "ruff>=0.12.3",
+  "flake8>=7.3.0",
+  "mypy>=1.16.1",
+  { include-group = "test" },
+  { include-group = "static-type-check" },
+]
+
+# Testing dependencies
+test = [
+  "bashlex>=0.18",
+  "packaging>=25.0",
+  "pytest>=9.1.1",
+  "pytest-mock>=3.14.1",
+  "pytest-cov>=6.2.1",
+  "pytest-asyncio>=0.24.0",
+  "pytest-xdist>=3.0",
+  "pytest-dotenv>=0.5.2",
+  "pytest-timeout>=2.4.0",
+  "pytest-socket>=0.7.0",
+  "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "chromadb",
+  "pymilvus>=2.6.9,<3.0.0",
+  "openpyxl>=3.1.5",
+  "python-docx>=1.1.0",
+  "asyncssh>=2.24.1",
+]
+
+# Static type checking
+static-type-check = [
+  "types-PyYAML>=6.0",
+  "types-requests>=2.0.0",
+  "types-openpyxl>=3.1.5",
+  "types-setuptools>=69.0.0",
+  "types-docker>=7.1.0.20251009",
+  "types-python-dateutil>=2.8.19",
+]
+
+[project.scripts]
+xagent = "xagent.web.__main__:main"
+xagent-web = "xagent.web.__main__:main"
+
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# Require installable wheels for both development and Linux CI/deployment.
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.pytest.ini_options]
+
+
+addopts = "-ra -q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["tests/_stubs"]
+# Fail a hung test instead of blocking its CI job until the job timeout.
+# A test's own @pytest.mark.timeout(...) still takes precedence.
+timeout = 300
+markers = [
+  "integration: marks tests as integration tests",
+  "slow: marks tests as slow running tests",
+  "postgresql: marks tests that require PostgreSQL database",
+  "milvus: needs a Milvus server at MILVUS_URI; skipped when it is unset",
+  "real_rag: real embedding/provider/search KB integration; prefer serial CI (-n 0) under load",
+  "contract_stub: stable API contract tests using stub embedding or mocks",
+  "e2e: end-to-end style tests (may be slow)",
+  "requires_network: tests that need outbound network access",
+]
+
+[tool.mypy]
+mypy_path = "src:stubs"
+disallow_any_unimported = true
+no_implicit_optional = true
+check_untyped_defs = true
+exclude = ["src/xagent/web/uploads/", "src/xagent/migrations/"]
+warn_return_any = true
+show_error_codes = true
+warn_unused_ignores = true
+python_version = "3.11"
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+namespace_packages = true
+explicit_package_bases = true
+[[tool.mypy.overrides]]
+module = [
+  "asyncssh",
+  "bashlex",
+  "docx",
+  "docx.*",
+  "defusedxml",
+  "defusedxml.*",
+  "pptx",
+  "pptx.*",
+  "pdfplumber",
+  "pypdf",
+  "pypdf.*",
+  "unstructured.*",
+  "fitz",
+  "pandas",
+  "matplotlib",
+  "matplotlib.pyplot",
+  "deepdoc",
+  "deepdoc.*",
+  "jieba",
+  "json_repair",
+  "langchain_core.*",
+  "alembic",
+  "alembic.*",
+  "xinference",
+  "xinference.*",
+  "xinference_client",
+  "xinference_client.*",
+  "aiogram",
+  "aiogram.*",
+  "lark_oapi",
+  "lark_oapi.*",
+  "exa_py",
+  "exa_py.*",
+  "celery",
+  "celery.*",
+  "kombu",
+  "kombu.*",
+  "fsspec",
+  "fsspec.*",
+  "joblib",
+  "xrouter_llm",
+  "xrouter_llm.*",
+  "google.pubsub_v1",
+  "boto3",
+  "botocore.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["core.tools.file_tool"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["xagent.core.tools.core.vision_tool"]
+disable_error_code = ["assignment"]
+
+[[tool.mypy.overrides]]
+module = [
+  "xagent.core.model.chat.basic.xinference",
+  "xagent.core.model.embedding.xinference",
+  "xagent.core.model.image.xinference",
+  "xagent.core.model.asr.xinference",
+  "xagent.core.model.tts.xinference",
+  "xagent.web.channels.telegram.bot",
+  "xagent.web.channels.telegram.handler",
+  # asyncssh ships no type stubs; the runner annotates connection types that
+  # would otherwise trip disallow_any_unimported.
+  "xagent.core.ssh.runner",
+  # python-docx ships no type stubs; this module annotates its Document type
+  # (docx.document.Document) which would otherwise trip disallow_any_unimported.
+  "xagent.web.tools.mcp.word",
+]
+disallow_any_unimported = false
+warn_unused_ignores = false
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xagent"]
+# `packages` already includes the whole src/xagent tree (Python sources plus the
+# tracked skills/templates data files). Do NOT add an explicit `include` here:
+# in hatchling an `include` list becomes the authoritative allowlist and would
+# drop everything else (the entire Python package). The built frontend static
+# export is .gitignore'd as a build output, so it must be declared as an
+# artifact for the single-process (pip / uvx) deployment to serve the UI.
+artifacts = ["src/xagent/web/frontend_dist/**"]
+
+[tool.hatch.build.targets.sdist]
+artifacts = ["src/xagent/web/frontend_dist/**"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.isort]
+profile = "black"
+line_length = 88
+multi_line_output = 3
+include_trailing_comma = true
+
+[tool.ruff]
+target-version = "py311"

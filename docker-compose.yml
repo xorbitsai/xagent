@@ -1,0 +1,207 @@
+services:
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:latest
+    container_name: xagent_nginx
+    restart: unless-stopped
+    ports:
+      - "${PORT:-80}:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - xagent_data:/root/.xagent:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - xagent_network
+
+  # Xagent Frontend (Next.js)
+  frontend:
+    image: xprobe/xagent-frontend:0.8.5
+    container_name: xagent_frontend
+    restart: unless-stopped
+    networks:
+      - xagent_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Xagent Backend (FastAPI)
+  backend:
+    image: xprobe/xagent-backend:0.8.5
+    container_name: xagent_backend
+    restart: unless-stopped
+    # Don't expose ports, only accessible through nginx
+    environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
+      - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
+      - BACKEND_PORT=8000
+      - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      # The published image runs this service as root for its existing volume
+      # layout. Keep the compatibility opt-in explicit here; non-root
+      # deployments should set this to false and use Chromium's sandbox.
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
+      - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
+      - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
+      - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
+      - XAGENT_REDIS_URL=redis://redis:6379/0
+      - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
+      - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
+      - XAGENT_CELERY_BROKER_URL=redis://redis:6379/1
+      - XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS=${XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS:-3600}
+      # This backend sits behind the single nginx hop above, which sets
+      # X-Forwarded-For in append mode. Trust exactly that one hop so every
+      # per-IP rate limit (share/widget auth, task-create, run sub-quota,
+      # trigger callbacks) keys on the real client IP instead of nginx's
+      # container IP — otherwise all client traffic collapses onto one IP and
+      # per-IP caps become a single global cap. Raise only if you add more
+      # trusted proxies (CDN/LB) in front of nginx.
+      - XAGENT_TRUSTED_PROXY_HOPS=${XAGENT_TRUSTED_PROXY_HOPS:-1}
+    env_file:
+      - .env
+    volumes:
+      - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - xagent_network
+
+  # Celery worker for triggers and KB ingestion. Agent execution stays in backend.
+  worker:
+    image: xprobe/xagent-backend:0.8.5
+    container_name: xagent_worker
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "xagent.web.jobs.celery_app:celery_app",
+        "worker",
+        "-Q",
+        "kb,triggers,default",
+        "--loglevel=INFO",
+      ]
+    environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
+      - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
+      - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
+      - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
+      - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
+      - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
+      - XAGENT_REDIS_URL=redis://redis:6379/0
+      - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
+      - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
+      - XAGENT_CELERY_BROKER_URL=redis://redis:6379/1
+      - XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS=${XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS:-3600}
+    env_file:
+      - .env
+    volumes:
+      - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - xagent_network
+
+  # Celery beat schedules trigger scans. It never runs agent execution.
+  scheduler:
+    image: xprobe/xagent-backend:0.8.5
+    container_name: xagent_scheduler
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "xagent.web.jobs.celery_app:celery_app",
+        "beat",
+        "--loglevel=INFO",
+      ]
+    environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
+      - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
+      - XAGENT_REDIS_URL=redis://redis:6379/0
+      - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
+      - XAGENT_CELERY_BROKER_URL=redis://redis:6379/1
+      - XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS=${XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS:-3600}
+    env_file:
+      - .env
+    volumes:
+      - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - xagent_network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:${POSTGRES_IMAGE_TAG:-17-bookworm}
+    container_name: xagent_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=xagent
+      - POSTGRES_USER=xagent
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xagent -d xagent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - xagent_network
+
+  # Redis cache for hot-path API reads
+  redis:
+    image: redis:7-alpine
+    container_name: xagent_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - xagent_network
+
+volumes:
+  postgres_data:
+    driver: local
+  xagent_data:
+    driver: local
+  xagent_secrets:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  xagent_network:
+    driver: bridge

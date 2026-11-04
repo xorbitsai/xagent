@@ -1,0 +1,649 @@
+"""Read-only snapshot of the synchronous DB state required to bootstrap
+a task-bound ``AgentService``.
+
+Background:
+    ``AgentServiceManager.get_agent_for_task`` runs a contiguous block
+    of synchronous DB queries (Task row + per-task LLM resolution +
+    optional Agent Builder lookup with up to 4 ``DBModel`` queries and
+    4 user-aware LLM access checks) on the main asyncio event loop. On
+    a fully-configured Agent Builder task that adds up to 8-12 DB
+    round-trips. Under load the block measures 20+ seconds of asyncio
+    slow-callback time and blocks every other request on the same
+    worker (issue #427 — ``_schedule_bg._runner took 23.371s``
+    observed locally on 2026-05-20).
+
+    This module batches those reads into a single function intended to
+    be invoked through ``asyncio.to_thread``. The function opens its
+    own ``SessionLocal``, eagerly reads everything, closes the session,
+    and returns a frozen primitive snapshot. ORM rows MUST NOT escape
+    the loader -- a downstream caller that mistakenly held an ORM
+    reference past the close would hit ``DetachedInstanceError`` on
+    its next attribute access.
+
+Out of scope:
+    * ``UploadedFile`` selected-files binding -- contains writes and is
+      therefore handled by its own worker-owned Session during agent
+      bootstrap instead of being folded into this read-only snapshot.
+    * MCP server configs -- async + OAuth refresh path.
+"""
+
+from __future__ import annotations
+
+import logging
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+from sqlalchemy.orm import Session
+
+from ...core.agent.voice_policy import voice_from_preferences
+from ...core.model.chat.basic.base import BaseLLM
+from ..models.database import get_session_local
+from ..models.task import DAGExecution, Task, TraceEvent
+from ..models.user import User
+from .llm_utils import AgentRuntimeFields
+from .task_execution_context_service import (
+    TaskExecutionRecoverySnapshot,
+    load_task_execution_recovery_snapshot_sync,
+)
+
+if TYPE_CHECKING:
+    from .workforce_runtime import WorkforceTaskRuntime
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _TaskFields:
+    """Primitive subset of the ``Task`` row needed past the snapshot."""
+
+    id: int
+    user_id: int
+    status: Any  # ``TaskStatus`` enum value (frozen, not ORM).
+    agent_id: Optional[int]
+    agent_config: Any  # JSON column -- ``dict | None`` in practice.
+    model_name: Optional[str]
+    compact_model_name: Optional[str]
+    execution_mode: Optional[str]
+    agent_type: Optional[str]
+    source: str | None = None
+    run_id: str | None = None
+    state_version: int = 0
+    control_state: str | None = None
+    conversation_storage_version: int = 1
+
+
+@dataclass(frozen=True)
+class MemoryPolicyTaskFields:
+    """Small authoritative task projection used on warm-runtime cache hits."""
+
+    id: int
+    user_id: int
+    agent_id: int | None
+    source: str | None
+    agent_config: Any
+
+
+@dataclass(frozen=True)
+class RuntimeUserFields:
+    """Primitive runtime identity required while an agent is constructed."""
+
+    id: int
+    is_admin: bool
+    # Onboarding "Launch" step voice choice, verbatim from the raw
+    # preferences JSON (not validated against VALID_VOICES here - an
+    # unrecognized value is stored as-is and only becomes an inert no-op
+    # later, inside apply_output_voice's own isinstance/lookup guard in
+    # api/agents.py), or None if the key is unset.
+    voice: Optional[str] = None
+
+
+def detach_runtime_user_fields(user: User) -> RuntimeUserFields:
+    """Reduce a live ORM ``User`` row to the primitives ``RuntimeUserFields``
+    needs, read now while the row is still attached and unexpired.
+
+    A caller holding a live ``User`` past the point its Session's
+    connection gets released (``release_db_connection_if_clean``'s
+    rollback unconditionally expires every object that Session loaded)
+    would otherwise force an implicit reload on the next attribute
+    access - synchronously, on the event loop, in the same window this
+    whole snapshot mechanism exists to keep query-free. Call this as
+    soon as a live ``User`` is in hand instead of holding onto it."""
+    return RuntimeUserFields(
+        id=int(user.id),
+        is_admin=bool(user.is_admin),
+        voice=voice_from_preferences(user.preferences),
+    )
+
+
+@dataclass(frozen=True)
+class TaskReconstructionSnapshot:
+    """Detached historical state consumed by agent reconstruction."""
+
+    tracer_events: tuple[dict[str, Any], ...] = ()
+    plan_state: Optional[dict[str, Any]] = None
+    # Preserve the legacy retry pre-check: any runtime TraceEvent or
+    # DAGExecution row attempts reconstruction, even when current_plan is empty.
+    has_history: bool = False
+
+
+@dataclass(frozen=True)
+class TaskSetupSnapshot:
+    """All synchronous DB state that ``get_agent_for_task`` needs to
+    bootstrap a task-bound ``AgentService``.
+
+    Strict invariant: every field is a primitive, an enum, a frozen
+    dataclass, or a fully-constructed application-layer object
+    (``BaseLLM``) that is safe to read off the loop thread. ORM rows
+    must not leak.
+    """
+
+    task: _TaskFields
+    runtime_user: Optional[RuntimeUserFields]
+    has_reconstructable_history: bool
+    task_pattern: str
+    # Final resolved LLMs after the agent-builder override (if any).
+    task_llm: Optional[BaseLLM]
+    task_fast_llm: Optional[BaseLLM]
+    task_vision_llm: Optional[BaseLLM]
+    task_compact_llm: Optional[BaseLLM]
+    # Agent Builder configuration -- only populated when
+    # ``task.agent_id`` resolves to an existing ``Agent`` row. The
+    # frozen dataclass lives in ``llm_utils`` because the same shape
+    # is also produced by ``resolve_task_runtime_config_core`` for
+    # the main-loop reconstruct path; one definition, one home.
+    agent: Optional[AgentRuntimeFields]
+    agent_config: Optional[dict]
+    excluded_agent_id: Optional[int]
+    conversation_history: tuple[dict[str, Any], ...] = ()
+    # Largest stored transcript row id ``conversation_history`` covers. Handed
+    # to the agent so a compaction during this turn can record what its summary
+    # absorbed. ``None`` means there was nothing to cover, and a compaction
+    # will emit an unpositionable summary that the next turn ignores.
+    conversation_watermark: Optional[int] = None
+    execution_recovery: TaskExecutionRecoverySnapshot = TaskExecutionRecoverySnapshot()
+    reconstruction: TaskReconstructionSnapshot = TaskReconstructionSnapshot()
+    # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
+    # Kept as the service-layer frozen dataclass; no ORM row is retained.
+    workforce_runtime: WorkforceTaskRuntime | None = None
+    # Set by ``apply_task_model_override``: the caller-selected models this
+    # snapshot's slots hold. ``AgentServiceManager`` rebuilds a cached
+    # service that was not built from this same override.
+    model_override: Optional["TaskModelOverride"] = None
+    conversation_event_watermark: dict[str, Any] | None = None
+
+
+class TaskModelOverrideError(ValueError):
+    """A task model override cannot be applied as requested."""
+
+
+# ``ToolCategory.VISION``: the tools that read images with the vision model.
+_VISION_TOOL_CATEGORY = "vision"
+
+
+@dataclass(frozen=True)
+class TaskModelOverride:
+    """One caller-selected model for every conversational role of a task run.
+
+    Applied to a :class:`TaskSetupSnapshot` after the Agent Builder overlay
+    has resolved the task's models, so nothing built from the snapshot --
+    the ``AgentService`` model slots, and the tool models handed to
+    ``create_default_tools`` (a later tool rebuild reuses that tool config) --
+    can still reach the models the overlay chose.
+
+    ``vision_llm`` is the model vision tools use. ``None`` means vision is
+    deliberately unavailable for this run: an :class:`UnavailableVisionModel`
+    takes the slot, so nothing falls back to a default vision model and any
+    vision call is refused with ``vision_unavailable``, and an explicit tool
+    category list loses its ``vision`` category, so no vision tool is offered.
+    (An unrestricted selection has no list to remove it from; its vision tools
+    are built on the stand-in and refuse.) ``excluded_tool_categories``
+    removes tool categories from this run's selection; it requires an
+    explicit category list, since an unrestricted selection has no list to
+    remove from. Exclusions match *exact category names* only: excluding the
+    plain ``mcp`` category does not remove ``mcp:<server>`` entries from the
+    selection, and such an entry still loads that server. A caller that wants
+    no MCP tools at all must therefore list every ``mcp:<server>`` it selects,
+    not just ``mcp``. The applied override remains on the snapshot
+    (``model_override``), where the tool build reads this set to decide
+    whether an actor-marked task may re-add ``mcp``.
+
+    Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
+    applied to rebuilds a cached service for the task unless that service
+    was built from this same override object, so a later turn cannot run on
+    an earlier turn's models. A lookup without an override rebuilds a
+    service built from one too, unless its run is still in progress or
+    waiting, so pause, resume and replies keep reaching that run.
+    """
+
+    llm: BaseLLM
+    vision_llm: BaseLLM | None = None
+    excluded_tool_categories: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.llm, BaseLLM):
+            raise TypeError("llm must be a BaseLLM")
+        if self.vision_llm is not None and not isinstance(self.vision_llm, BaseLLM):
+            raise TypeError("vision_llm must be a BaseLLM or None")
+        categories: Any = self.excluded_tool_categories
+        # A bare string would be read character by character, or matched as
+        # a substring; neither is a category selection.
+        if isinstance(categories, (str, bytes)):
+            raise TypeError(
+                "excluded_tool_categories must be a collection of category "
+                "names, not a single string"
+            )
+        normalized = frozenset(categories)
+        if not all(isinstance(category, str) for category in normalized):
+            raise TypeError("excluded_tool_categories must hold category names")
+        object.__setattr__(self, "excluded_tool_categories", normalized)
+
+
+def apply_task_model_override(
+    snapshot: TaskSetupSnapshot, override: TaskModelOverride
+) -> TaskSetupSnapshot:
+    """Return ``snapshot`` with ``override`` in every model slot it resolved.
+
+    Raises :class:`TaskModelOverrideError` when categories are to be excluded
+    from a selection that is not an explicit list.
+
+    The returned snapshot also carries ``override`` as ``model_override``: the
+    requested exclusion set stays reachable there for the tool build, which
+    needs the intent (an old agent's list may never have listed ``mcp``, yet
+    this run still excludes it) to decide whether an actor-marked task may
+    re-add ``mcp``. See :class:`TaskModelOverride` for the exact-name /
+    scoped-``mcp:<server>`` semantics. The vision-category removal is
+    deliberately not part of that set: it already has its own stand-in
+    mechanism.
+    """
+    from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
+
+    agent_config = snapshot.agent_config
+    categories = agent_config.get("tool_categories") if agent_config else None
+    if override.excluded_tool_categories and not isinstance(categories, list):
+        raise TaskModelOverrideError(
+            "tool categories can only be excluded from an explicit selection"
+        )
+    removed = set(override.excluded_tool_categories)
+    if override.vision_llm is None:
+        # Vision tools on the stand-in could only refuse; offer none.
+        removed.add(_VISION_TOOL_CATEGORY)
+    if isinstance(categories, list) and removed & set(categories):
+        agent_config = {
+            **cast(dict[str, Any], agent_config),
+            "tool_categories": [
+                category for category in categories if category not in removed
+            ],
+        }
+    # Deliberately a truthy stand-in, never ``None``: the tool configuration
+    # falls back to the owner's configured vision model when its explicit one
+    # is missing or falsy.
+    vision_llm = (
+        override.vision_llm
+        if override.vision_llm is not None
+        else UnavailableVisionModel()
+    )
+    return replace(
+        snapshot,
+        task_llm=override.llm,
+        task_fast_llm=override.llm,
+        task_vision_llm=vision_llm,
+        task_compact_llm=override.llm,
+        agent_config=agent_config,
+        model_override=override,
+    )
+
+
+# NOTE: All LLM resolution + agent-builder merge + execution-mode →
+# pattern logic lives in ``llm_utils.resolve_task_runtime_config_core``.
+# This loader is the off-loop wrapper that:
+#   1. opens its own ``SessionLocal``,
+#   2. calls the shared core to do the actual resolution,
+#   3. wraps the resulting ORM ``Task`` row in a frozen
+#      ``_TaskFields`` so nothing escapes the loader's session
+#      (``Agent`` primitives are already provided by the core as an
+#      ``AgentRuntimeFields`` instance).
+# Reconstruction and normal creation both consume this detached snapshot;
+# neither path re-resolves runtime configuration from a request Session.
+
+
+class TaskOwnerMismatchError(Exception):
+    """The task row's owner does not match the expected ``task_owner_user_id``.
+
+    Distinct from "task missing" (which returns ``None``): a missing task is a
+    benign race (deleted before the bg run), whereas an owner mismatch is an
+    identity/authorization inconsistency. Raising keeps the runtime from
+    silently resolving models / tools as the wrong user.
+    """
+
+    def __init__(self, task_id: int, expected: int, actual: int):
+        super().__init__(f"task {task_id} owner {actual} != expected {expected}")
+        self.task_id = task_id
+        self.expected = expected
+        self.actual = actual
+
+
+def load_task_reconstruction_snapshot_sync(
+    session: Session,
+    task_id: int,
+) -> TaskReconstructionSnapshot:
+    """Load and decode reconstruction rows before the worker Session closes."""
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(session, task_id):
+        from sqlalchemy import select
+
+        from ...core.agent.checkpoint import CheckpointCorruptError
+        from ..models.task_execution_event import TaskExecutionEvent
+        from .task_execution_event_recovery import event_checkpoint_data
+
+        # AgentService.reconstruct_from_history currently only restores the task
+        # id. Keep its history-presence gate event-backed; actual execution state
+        # is selected under the runner's partition and lease by the reader.
+        # If reconstruction starts consuming history/plan again, first apply
+        # run/execution/horizon selection and adapt this pattern state to the
+        # legacy plan shape; these arguments are currently ignored by it.
+        event = session.scalar(
+            select(TaskExecutionEvent)
+            .where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.kind == "recovery_state",
+            )
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(1)
+        )
+        if event is None:
+            return TaskReconstructionSnapshot()
+        data = event_checkpoint_data(event)
+        protocol_event_id = event.payload.get("protocol_event_id")
+        if not isinstance(protocol_event_id, str) or not protocol_event_id:
+            raise CheckpointCorruptError(
+                "Recovery state has no valid protocol event ID"
+            )
+        state = data["snapshot"].get("pattern_state") or {}
+        return TaskReconstructionSnapshot(
+            tracer_events=(
+                {
+                    "id": protocol_event_id,
+                    "event_type": "system_update_general",
+                    "task_id": str(task_id),
+                    "step_id": event.payload.get("step_id"),
+                    "timestamp": event.occurred_at.timestamp(),
+                    "data": deepcopy(data),
+                    "parent_id": event.payload.get("parent_event_id"),
+                },
+            ),
+            plan_state=deepcopy(state.get("plan")),
+            has_history=True,
+        )
+
+    from .trace_message_storage import decode_trace_events_data
+
+    trace_rows = (
+        session.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+        )
+        .all()
+    )
+    decoded_data = decode_trace_events_data(
+        session,
+        task_id=task_id,
+        data_items=[row.data for row in trace_rows],
+        strict=False,
+    )
+    tracer_events = tuple(
+        {
+            "id": str(row.event_id),
+            "event_type": str(row.event_type),
+            "task_id": str(row.task_id),
+            "step_id": str(row.step_id) if row.step_id is not None else None,
+            "timestamp": row.timestamp.timestamp() if row.timestamp else None,
+            "data": deepcopy(data),
+            "parent_id": (
+                str(row.parent_event_id) if row.parent_event_id is not None else None
+            ),
+        }
+        for row, data in zip(trace_rows, decoded_data)
+    )
+
+    dag_row = (
+        session.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+    )
+    plan_state = (
+        deepcopy(cast(dict[str, Any], dag_row.current_plan))
+        if dag_row is not None and dag_row.current_plan
+        else None
+    )
+    return TaskReconstructionSnapshot(
+        tracer_events=tracer_events,
+        plan_state=plan_state,
+        has_history=bool(trace_rows) or dag_row is not None,
+    )
+
+
+def _resolve_inline_preview_excluded_agent_id(
+    session: Session,
+    task_row: Task,
+    agent_config: Optional[dict],
+) -> Optional[int]:
+    """Resolve the published preview agent with the legacy owner/team rule."""
+    if not agent_config or not agent_config.get("preview_agent_id"):
+        return None
+
+    from ..models.agent import AgentStatus
+    from .agent_team_scope import resolve_authorized_agent
+
+    owner_user_id = int(task_row.user_id)
+    preview_agent = resolve_authorized_agent(
+        session,
+        owner_user_id,
+        agent_config.get("preview_agent_id"),
+    )
+    if preview_agent is None or preview_agent.status != AgentStatus.PUBLISHED:
+        return None
+    return int(preview_agent.id)
+
+
+def load_task_setup_snapshot_sync(
+    task_id: int,
+    task_owner_user_id: Optional[int],
+    *,
+    before_message_id: Optional[int] = None,
+    before_turn_id: str | None = None,
+    actor_user_id: Optional[int] = None,
+    actor_is_admin: bool = False,
+) -> Optional[TaskSetupSnapshot]:
+    """Open a dedicated ``SessionLocal``, read every synchronous field
+    ``get_agent_for_task`` needs for normal (non-reconstruct) creation,
+    close the session, and return a primitive snapshot.
+
+    Designed to be called from the event loop via
+    ``await asyncio.to_thread(load_task_setup_snapshot_sync, ...)`` so
+    the main loop stays responsive during the read (issue #427).
+
+    ``task_owner_user_id`` is the runtime identity the task runs as. When
+    provided it MUST match the row's ``user_id``; a mismatch raises
+    :class:`TaskOwnerMismatchError` (never silently splits "snapshot owner"
+    from "resolution user"). Model / runtime resolution always uses the
+    row's owner, not the passed value.
+
+    Returns ``None`` when the task row is missing -- callers fall back
+    to whatever behaviour the legacy in-line code already implements
+    for that case (default LLM, no agent-builder override).
+    """
+    from .llm_utils import resolve_task_runtime_config_core
+
+    session_factory = get_session_local()
+    session: Session = session_factory()
+    try:
+        task_query = session.query(Task).filter(Task.id == task_id)
+        if actor_user_id is not None and not actor_is_admin:
+            task_query = task_query.filter(Task.user_id == actor_user_id)
+        task_row = task_query.first()
+        if task_row is None:
+            return None
+
+        owner_user_id = int(task_row.user_id)
+        if task_owner_user_id is not None and owner_user_id != task_owner_user_id:
+            raise TaskOwnerMismatchError(task_id, task_owner_user_id, owner_user_id)
+
+        runtime_user_row = (
+            session.query(User.id, User.is_admin, User.preferences)
+            .filter(User.id == owner_user_id)
+            .first()
+        )
+        runtime_user = (
+            RuntimeUserFields(
+                id=int(runtime_user_row[0]),
+                is_admin=bool(runtime_user_row[1]),
+                voice=voice_from_preferences(runtime_user_row[2]),
+            )
+            if runtime_user_row is not None
+            else None
+        )
+
+        task_fields = _TaskFields(
+            id=int(task_row.id),
+            conversation_storage_version=int(task_row.conversation_storage_version),
+            user_id=int(task_row.user_id),
+            status=task_row.status,
+            source=str(task_row.source) if task_row.source is not None else None,
+            agent_id=int(task_row.agent_id) if task_row.agent_id is not None else None,
+            agent_config=(
+                dict(task_row.agent_config)
+                if isinstance(task_row.agent_config, dict)
+                else task_row.agent_config
+            ),
+            model_name=(
+                str(task_row.model_name) if task_row.model_name is not None else None
+            ),
+            compact_model_name=(
+                str(task_row.compact_model_name)
+                if task_row.compact_model_name is not None
+                else None
+            ),
+            execution_mode=getattr(task_row, "execution_mode", None),
+            agent_type=(
+                str(task_row.agent_type) if task_row.agent_type is not None else None
+            ),
+            run_id=str(task_row.run_id) if task_row.run_id is not None else None,
+            state_version=int(task_row.state_version or 0),
+            control_state=(
+                str(task_row.control_state)
+                if task_row.control_state is not None
+                else None
+            ),
+        )
+
+        # Runtime resolution always uses the row's OWNER, never the passed
+        # value (which is validated to match above when provided).
+        core = resolve_task_runtime_config_core(
+            task_row, session, user_id=owner_user_id
+        )
+        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
+        excluded_agent_id = core.excluded_agent_id
+        if excluded_agent_id is None:
+            excluded_agent_id = _resolve_inline_preview_excluded_agent_id(
+                session,
+                task_row,
+                core.agent_config,
+            )
+
+        from .chat_history_service import load_task_transcript_window
+
+        event_watermark = None
+        if task_fields.conversation_storage_version == 2:
+            from .task_event_context_service import load_task_event_context
+
+            event_context = load_task_event_context(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+                before_turn_id=before_turn_id,
+            )
+            conversation_history = tuple(event_context.messages)
+            conversation_watermark = None
+            event_watermark = event_context.watermark
+            execution_recovery = TaskExecutionRecoverySnapshot(
+                selected_skill_name=event_context.selected_skill_name,
+            )
+        else:
+            transcript_window = load_task_transcript_window(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+            )
+            conversation_history = tuple(transcript_window.messages)
+            conversation_watermark = transcript_window.watermark
+            execution_recovery = load_task_execution_recovery_snapshot_sync(
+                session, task_id
+            )
+        reconstruction = load_task_reconstruction_snapshot_sync(session, task_id)
+
+        # ``core.agent_fields`` is already an ``AgentRuntimeFields``
+        # frozen dataclass; pass it through directly.
+        return TaskSetupSnapshot(
+            task=task_fields,
+            runtime_user=runtime_user,
+            has_reconstructable_history=reconstruction.has_history,
+            task_pattern=core.task_pattern,
+            task_llm=task_llm,
+            task_fast_llm=task_fast_llm,
+            task_vision_llm=task_vision_llm,
+            task_compact_llm=task_compact_llm,
+            agent=core.agent_fields,
+            agent_config=core.agent_config,
+            excluded_agent_id=excluded_agent_id,
+            conversation_history=conversation_history,
+            conversation_watermark=conversation_watermark,
+            conversation_event_watermark=event_watermark,
+            execution_recovery=execution_recovery,
+            reconstruction=reconstruction,
+            workforce_runtime=deepcopy(core.workforce),
+        )
+    finally:
+        session.close()
+
+
+def load_memory_policy_task_fields_sync(
+    task_id: int,
+    task_owner_user_id: int | None,
+) -> MemoryPolicyTaskFields | None:
+    """Read only fields that can change memory eligibility for a cache hit."""
+
+    session_factory = get_session_local()
+    session: Session = session_factory()
+    try:
+        row = (
+            session.query(
+                Task.id,
+                Task.user_id,
+                Task.agent_id,
+                Task.source,
+                Task.agent_config,
+            )
+            .filter(Task.id == task_id)
+            .first()
+        )
+        if row is None:
+            return None
+        owner_user_id = int(row[1])
+        if task_owner_user_id is not None and owner_user_id != task_owner_user_id:
+            raise TaskOwnerMismatchError(
+                task_id,
+                task_owner_user_id,
+                owner_user_id,
+            )
+        raw_config = row[4]
+        return MemoryPolicyTaskFields(
+            id=int(row[0]),
+            user_id=owner_user_id,
+            agent_id=int(row[2]) if row[2] is not None else None,
+            source=str(row[3]) if row[3] is not None else None,
+            agent_config=deepcopy(raw_config),
+        )
+    finally:
+        session.close()

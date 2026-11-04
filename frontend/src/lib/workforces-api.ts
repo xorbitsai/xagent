@@ -1,0 +1,500 @@
+"use client"
+
+import {
+  apiRequest,
+  getApiErrorMessage,
+  isJsonRecord,
+  parseApiResponse,
+} from "@/lib/api-wrapper"
+import { getApiUrl } from "@/lib/utils"
+import { resolveReportedTimezone } from "@/hooks/use-websocket"
+import type {
+  WorkforceAgentOption,
+  WorkforceAgentExecution,
+  WorkforceArchiveResponse,
+  WorkforceCanvasResponse,
+  WorkforceCreatePayload,
+  WorkforceDetail,
+  WorkforceListResponse,
+  WorkforcePreviewRunPayload,
+  WorkforcePromptCreatePayload,
+  WorkforceRunHistoryItem,
+  WorkforceRunHistoryResponse,
+  WorkforceRunPayload,
+  WorkforceRunResponse,
+  WorkforceShareLink,
+  WorkforceUpdatePayload,
+  WorkforceWidgetConfig,
+  WorkforceWorker,
+  WorkforceWorkerPayload,
+  WorkforceWorkerUpdatePayload,
+} from "@/types/workforce"
+
+export type WorkforceDiscardErrorCode =
+  | "workforce_not_discardable"
+  | "workforce_has_runs"
+
+export class WorkforceDiscardError extends Error {
+  readonly code: WorkforceDiscardErrorCode
+
+  constructor(code: WorkforceDiscardErrorCode, message: string) {
+    super(message)
+    this.name = "WorkforceDiscardError"
+    this.code = code
+  }
+}
+
+function isWorkforceDiscardErrorCode(
+  value: unknown,
+): value is WorkforceDiscardErrorCode {
+  return value === "workforce_not_discardable" || value === "workforce_has_runs"
+}
+
+function formatApiDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string" && detail.trim()) {
+    return detail
+  }
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (item && typeof item === "object" && "msg" in item) {
+          return String(item.msg)
+        }
+        return null
+      })
+      .filter(Boolean)
+    if (messages.length > 0) {
+      return messages.join("; ")
+    }
+  }
+  // Structured error shape used by delete/unarchive on this route:
+  // { detail: { code, message } }. Without this branch the object falls
+  // through to parseApiError's raw-JSON-text fallback, surfacing the whole
+  // response body as the error message instead of the intended one.
+  if (isJsonRecord(detail) && typeof detail.message === "string" && detail.message.trim()) {
+    return detail.message
+  }
+  return fallback
+}
+
+async function parseApiError(response: Response, fallback: string): Promise<Error> {
+  const parsed = await parseApiResponse(response)
+  if (isJsonRecord(parsed.data)) {
+    const detailMessage = formatApiDetail(parsed.data.detail, "")
+    if (detailMessage) {
+      return new Error(detailMessage)
+    }
+  }
+  return new Error(getApiErrorMessage(response, parsed, fallback))
+}
+
+function jsonHeaders(): HeadersInit {
+  return {
+    "Content-Type": "application/json",
+  }
+}
+
+export async function listWorkforces(params?: {
+  page?: number
+  size?: number
+  search?: string
+  status?: string
+}): Promise<WorkforceListResponse> {
+  const searchParams = new URLSearchParams()
+  if (params?.page) searchParams.set("page", String(params.page))
+  if (params?.size) searchParams.set("size", String(params.size))
+  if (params?.search) searchParams.set("search", params.search)
+  if (params?.status) searchParams.set("status", params.status)
+
+  const suffix = searchParams.toString() ? `?${searchParams.toString()}` : ""
+  const response = await apiRequest(`${getApiUrl()}/api/workforces${suffix}`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforces")
+  }
+  return response.json()
+}
+
+export async function getWorkforce(workforceId: number | string): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce")
+  }
+  return response.json()
+}
+
+export async function createWorkforce(payload: WorkforceCreatePayload): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to create workforce")
+  }
+  return response.json()
+}
+
+export async function createWorkforceFromPrompt(
+  payload: WorkforcePromptCreatePayload,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/from-prompt`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to create workforce")
+  }
+  return response.json()
+}
+
+export async function updateWorkforce(
+  workforceId: number | string,
+  payload: WorkforceUpdatePayload,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce")
+  }
+  return response.json()
+}
+
+export async function archiveWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceArchiveResponse> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}`, {
+    method: "DELETE",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to archive workforce")
+  }
+  return response.json()
+}
+
+export async function unarchiveWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/unarchive`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to unarchive workforce")
+  }
+  return response.json()
+}
+
+export async function deleteWorkforcePermanently(
+  workforceId: number | string,
+): Promise<void> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}?permanent=true`,
+    { method: "DELETE" },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to delete workforce")
+  }
+}
+
+export async function discardWorkforce(
+  workforceId: number | string,
+  fallbackErrorMessage: string,
+): Promise<void> {
+  let response: Response
+  try {
+    response = await apiRequest(
+      `${getApiUrl()}/api/workforces/${workforceId}/discard`,
+      { method: "POST" },
+    )
+  } catch {
+    throw new Error(fallbackErrorMessage)
+  }
+  if (!response.ok) {
+    let parsed: Awaited<ReturnType<typeof parseApiResponse>>
+    try {
+      parsed = await parseApiResponse(response)
+    } catch {
+      throw new Error(fallbackErrorMessage)
+    }
+    if (
+      isJsonRecord(parsed.data) &&
+      isJsonRecord(parsed.data.detail) &&
+      isWorkforceDiscardErrorCode(parsed.data.detail.code)
+    ) {
+      throw new WorkforceDiscardError(
+        parsed.data.detail.code,
+        fallbackErrorMessage,
+      )
+    }
+    throw new Error(fallbackErrorMessage)
+  }
+}
+
+export async function publishWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/publish`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to publish workforce")
+  }
+  return response.json()
+}
+
+export async function unpublishWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/unpublish`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to unpublish workforce")
+  }
+  return response.json()
+}
+
+export async function addWorkforceAgent(
+  workforceId: number | string,
+  payload: WorkforceWorkerPayload,
+): Promise<WorkforceWorker> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/agents`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to add workforce worker")
+  }
+  return response.json()
+}
+
+export async function updateWorkforceAgent(
+  workforceId: number | string,
+  memberId: number | string,
+  payload: WorkforceWorkerUpdatePayload,
+): Promise<WorkforceWorker> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/agents/${memberId}`,
+    {
+      method: "PATCH",
+      headers: jsonHeaders(),
+      body: JSON.stringify(payload),
+    },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce worker")
+  }
+  return response.json()
+}
+
+export async function removeWorkforceAgent(
+  workforceId: number | string,
+  memberId: number | string,
+): Promise<void> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/agents/${memberId}`,
+    {
+      method: "DELETE",
+    },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to remove workforce worker")
+  }
+}
+
+// The workforce opening turn starts inside this HTTP request and never reaches
+// the websocket send path, so the zone is attached here. An explicit value on
+// the payload wins; otherwise fall back to the browser/data-timezone resolution.
+function withReportedTimezone<T extends { timezone?: string }>(payload: T): T {
+  if (payload.timezone) return payload
+  const timezone = resolveReportedTimezone()
+  return timezone ? { ...payload, timezone } : payload
+}
+
+
+export async function runWorkforce(
+  workforceId: number | string,
+  payload: WorkforceRunPayload | string,
+): Promise<WorkforceRunResponse> {
+  const body = withReportedTimezone(
+    typeof payload === "string" ? { message: payload } : payload,
+  )
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/runs`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to run workforce")
+  }
+  return response.json()
+}
+
+export async function runWorkforcePreview(
+  payload: WorkforcePreviewRunPayload,
+): Promise<WorkforceRunResponse> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/preview/runs`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(withReportedTimezone(payload)),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to run workforce preview")
+  }
+  return response.json()
+}
+
+export async function getWorkforceAgentExecution(
+  workforceId: number | string,
+  taskId: number | string,
+  workerTaskId: string,
+  signal?: AbortSignal,
+): Promise<WorkforceAgentExecution> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/runs/${taskId}/agent-executions/${encodeURIComponent(workerTaskId)}`,
+    { signal },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load Agent execution")
+  }
+  return response.json()
+}
+
+export async function listWorkforceRuns(
+  workforceId: number | string,
+  params?: {
+    page?: number
+    size?: number
+  },
+): Promise<WorkforceRunHistoryResponse> {
+  const searchParams = new URLSearchParams()
+  if (params?.page) searchParams.set("page", String(params.page))
+  if (params?.size) searchParams.set("size", String(params.size))
+
+  const suffix = searchParams.toString() ? `?${searchParams.toString()}` : ""
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/runs${suffix}`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce runs")
+  }
+  return response.json()
+}
+
+export async function getWorkforceRun(
+  workforceId: number | string,
+  runId: number | string,
+): Promise<WorkforceRunHistoryItem> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}/runs/${runId}`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce run")
+  }
+  return response.json()
+}
+
+export async function getWorkforceCanvas(
+  workforceId: number | string,
+): Promise<WorkforceCanvasResponse> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/canvas`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce canvas")
+  }
+  return response.json()
+}
+
+export async function listAgentOptions(): Promise<WorkforceAgentOption[]> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/agent-options`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load agents")
+  }
+  return response.json()
+}
+
+export async function getWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce share link")
+  }
+  return response.json()
+}
+
+export async function enableWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to enable workforce share link")
+  }
+  return response.json()
+}
+
+export async function rotateWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link/rotate`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to rotate workforce share link")
+  }
+  return response.json()
+}
+
+export async function disableWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link`, {
+    method: "DELETE",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to disable workforce share link")
+  }
+  return response.json()
+}
+
+export async function getWorkforceWidgetConfig(
+  workforceId: number | string,
+): Promise<WorkforceWidgetConfig> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget-key`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce widget config")
+  }
+  return response.json()
+}
+
+export async function updateWorkforceWidgetConfig(
+  workforceId: number | string,
+  updates: { widget_enabled?: boolean; allowed_domains?: string[] },
+): Promise<WorkforceWidgetConfig> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(updates),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce widget config")
+  }
+  return response.json()
+}
+
+export async function rotateWorkforceWidgetKey(
+  workforceId: number | string,
+): Promise<WorkforceWidgetConfig> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget-key/rotate`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to rotate workforce widget key")
+  }
+  return response.json()
+}

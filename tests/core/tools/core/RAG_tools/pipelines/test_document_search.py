@@ -1,0 +1,652 @@
+"""Unit tests for the document search pipeline."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, List
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+from xagent.core.model.embedding.base import BaseEmbedding
+from xagent.core.storage import initialize_storage_manager
+from xagent.core.tools.core.RAG_tools.chunk.chunk_document import chunk_document
+from xagent.core.tools.core.RAG_tools.core.config import IndexPolicy
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    ChunkEmbeddingData,
+    FusionConfig,
+    HybridSearchResponse,
+    IndexStatus,
+    ParseMethod,
+    SearchConfig,
+    SearchPipelineResult,
+    SearchResult,
+    SearchType,
+)
+from xagent.core.tools.core.RAG_tools.file.register_document import register_document
+from xagent.core.tools.core.RAG_tools.parse.parse_document import parse_document
+from xagent.core.tools.core.RAG_tools.pipelines import document_search
+from xagent.core.tools.core.RAG_tools.pipelines.document_search import (
+    _apply_rerank_if_needed,
+    _resolve_unified_rerank,
+)
+from xagent.core.tools.core.RAG_tools.storage.factory import (
+    get_vector_index_store,
+)
+from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
+    read_chunks_for_embedding,
+    write_vectors_to_db,
+)
+
+
+class _FakeEmbeddingAdapter(BaseEmbedding):
+    """Local embedding adapter that deterministically encodes text length."""
+
+    def encode(
+        self, text: Any, dimension: int | None = None, instruct: str | None = None
+    ) -> Any:
+        if isinstance(text, str):
+            return [float(len(text))]
+        return [[float(len(item))] for item in text]
+
+    def get_dimension(self) -> int:
+        return 1
+
+    @property
+    def abilities(self) -> List[str]:
+        return ["embedding"]
+
+
+def _patch_embedding_adapter(
+    monkeypatch: pytest.MonkeyPatch, embedding_model_id: str
+) -> None:
+    """Force search pipeline to use local fake embedding adapter."""
+
+    fake_config = type(
+        "FakeConfig",
+        (),
+        {"id": embedding_model_id, "model_name": embedding_model_id},
+    )()
+
+    monkeypatch.setattr(
+        document_search,
+        "resolve_embedding_adapter",
+        lambda _model_id, api_key=None, base_url=None, timeout_sec=None: (
+            fake_config,
+            _FakeEmbeddingAdapter(),
+        ),
+    )
+
+
+@pytest.mark.integration
+def test_document_search_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run the full document pipeline on a real PDF and ensure sparse search works."""
+
+    # -------- Environment bootstrap --------
+    lancedb_dir = tmp_path / "lancedb"
+    lancedb_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("LANCEDB_DIR", str(lancedb_dir))
+
+    storage_root = tmp_path / "storage"
+    uploads_dir = storage_root / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    initialize_storage_manager(str(storage_root), str(uploads_dir))
+
+    embedding_model_id = "rag-test-embedding"
+    _patch_embedding_adapter(monkeypatch, embedding_model_id)
+
+    # Mock collection manager for embedding binding
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(
+        name="test_collection",
+        embedding_model_id=embedding_model_id,
+        embedding_dimension=384,  # Fake dimension
+    )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync",
+        lambda collection_name: (
+            mock_collection
+            if collection_name == "test_collection"
+            else CollectionInfo(name=collection_name)
+        ),
+    )
+    # Ensure FTS indices are created via storage abstraction layer
+    # Patch the IndexPolicy to enable FTS
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.IndexPolicy",
+        lambda **kwargs: IndexPolicy(fts_enabled=True),
+    )
+
+    # -------- Pipeline execution --------
+    tests_root = Path(__file__).resolve().parents[5]
+    test_pdf = tests_root / "resources" / "test_files" / "test.pdf"
+    collection = f"collection_{uuid.uuid4().hex[:8]}"
+    doc_id = uuid.uuid4().hex
+
+    register_document(
+        collection=collection,
+        source_path=str(test_pdf),
+        doc_id=doc_id,
+        user_id=1,
+    )
+
+    parse_result = parse_document(
+        collection=collection,
+        doc_id=doc_id,
+        parse_method=ParseMethod.PYPDF,
+        user_id=1,
+        is_admin=True,
+    )
+    parse_hash = parse_result["parse_hash"]
+
+    chunk_document(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        user_id=1,
+    )
+
+    embedding_read = read_chunks_for_embedding(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        model=embedding_model_id,
+        user_id=1,
+    )
+    assert embedding_read.chunks, "Expected parsed chunks for embedding"
+
+    embeddings: List[ChunkEmbeddingData] = []
+    for chunk in embedding_read.chunks:
+        text = chunk.text or ""
+        embeddings.append(
+            ChunkEmbeddingData(
+                doc_id=chunk.doc_id,
+                chunk_id=chunk.chunk_id,
+                parse_hash=chunk.parse_hash,
+                model=embedding_model_id,
+                vector=[float(len(text))],
+                text=text,
+                chunk_hash=chunk.chunk_hash,
+            )
+        )
+
+    write_vectors_to_db(
+        collection=collection,
+        embeddings=embeddings,
+        create_index=True,
+        user_id=1,
+    )
+
+    # -------- Execute sparse search --------
+    first_chunk_text = embedding_read.chunks[0].text.strip()
+    assert first_chunk_text, "First chunk should contain textual content"
+    query_text = first_chunk_text.split()[0]
+    search_result = document_search.search_documents(
+        collection=collection,
+        query_text=query_text,
+        config=SearchConfig(
+            search_type=SearchType.SPARSE,
+            top_k=3,
+            embedding_model_id=embedding_model_id,
+        ),
+        user_id=1,
+    )
+
+    assert isinstance(search_result, SearchPipelineResult)
+    assert search_result.status == "success"
+    assert search_result.result_count > 0
+    assert any(
+        query_text.lower() in result.text.lower() for result in search_result.results
+    )
+
+    # FTS index should have been created via storage abstraction layer
+    vector_store = get_vector_index_store()
+    index_result = vector_store.create_index(embedding_model_id, readonly=True)
+    assert index_result.fts_enabled is True
+
+
+@pytest.mark.integration
+def test_chinese_sparse_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test sparse search with Chinese text content and queries."""
+
+    # -------- Environment bootstrap --------
+    lancedb_dir = tmp_path / "lancedb_chinese"
+    lancedb_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("LANCEDB_DIR", str(lancedb_dir))
+
+    storage_root = tmp_path / "storage_chinese"
+    uploads_dir = storage_root / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    initialize_storage_manager(str(storage_root), str(uploads_dir))
+
+    embedding_model_id = "rag-test-embedding-chinese"
+    _patch_embedding_adapter(monkeypatch, embedding_model_id)
+
+    # Mock collection manager for embedding binding
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    mock_collection = CollectionInfo(
+        name="test_collection_chinese",
+        embedding_model_id=embedding_model_id,
+        embedding_dimension=384,
+    )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.get_collection_sync",
+        lambda collection_name: (
+            mock_collection
+            if collection_name == "test_collection_chinese"
+            else CollectionInfo(name=collection_name)
+        ),
+    )
+
+    # Ensure FTS indices are created via storage abstraction layer
+    # Patch the IndexPolicy to enable FTS
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.IndexPolicy",
+        lambda **kwargs: IndexPolicy(fts_enabled=True),
+    )
+
+    # -------- Create Chinese test document --------
+    tests_root = Path(__file__).resolve().parents[5]
+    test_txt = tests_root / "resources" / "test_files" / "test.txt"
+
+    # Check if test.txt exists and contains Chinese
+    if not test_txt.exists():
+        pytest.skip(f"Test file not found: {test_txt}")
+
+    # Create a temporary Chinese text file if needed
+    chinese_test_file = tmp_path / "chinese_test.txt"
+    chinese_content = """人工智能是计算机科学的一个分支。
+机器学习是人工智能的核心技术之一。
+自然语言处理用于理解和生成人类语言。
+深度学习使用神经网络进行学习。
+这些技术正在改变我们的世界。"""
+    chinese_test_file.write_text(chinese_content, encoding="utf-8")
+
+    collection = f"collection_chinese_{uuid.uuid4().hex[:8]}"
+    doc_id = uuid.uuid4().hex
+
+    # Use the Chinese test file
+    register_document(
+        collection=collection,
+        source_path=str(chinese_test_file),
+        doc_id=doc_id,
+        user_id=1,
+    )
+
+    parse_result = parse_document(
+        collection=collection,
+        doc_id=doc_id,
+        parse_method=ParseMethod.DEEPDOC,
+        user_id=1,
+        is_admin=True,
+    )
+    parse_hash = parse_result["parse_hash"]
+
+    chunk_document(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        user_id=1,
+    )
+
+    embedding_read = read_chunks_for_embedding(
+        collection=collection,
+        doc_id=doc_id,
+        parse_hash=parse_hash,
+        model=embedding_model_id,
+        user_id=1,
+    )
+    assert embedding_read.chunks, "Expected parsed chunks for embedding"
+
+    # Check if chunks contain Chinese text
+    has_chinese = any(
+        any("\u4e00" <= char <= "\u9fff" for char in chunk.text)
+        for chunk in embedding_read.chunks
+    )
+    if not has_chinese:
+        pytest.skip("No Chinese content found in parsed chunks")
+
+    embeddings: List[ChunkEmbeddingData] = []
+    for chunk in embedding_read.chunks:
+        text = chunk.text or ""
+        embeddings.append(
+            ChunkEmbeddingData(
+                doc_id=chunk.doc_id,
+                chunk_id=chunk.chunk_id,
+                parse_hash=chunk.parse_hash,
+                model=embedding_model_id,
+                vector=[float(len(text))],
+                text=text,
+                chunk_hash=chunk.chunk_hash,
+            )
+        )
+
+    write_vectors_to_db(
+        collection=collection,
+        embeddings=embeddings,
+        create_index=True,
+        user_id=1,
+    )
+
+    # -------- Test Chinese sparse search queries --------
+    chinese_queries = [
+        "人工智能",
+        "机器学习",
+        "自然语言处理",
+        "深度学习",
+    ]
+
+    for query_text in chinese_queries:
+        search_result = document_search.search_documents(
+            collection=collection,
+            query_text=query_text,
+            config=SearchConfig(
+                search_type=SearchType.SPARSE,
+                top_k=5,
+                embedding_model_id=embedding_model_id,
+            ),
+            user_id=1,
+        )
+
+        assert isinstance(search_result, SearchPipelineResult)
+        print(f"\n查询: {query_text}")
+        print(f"状态: {search_result.status}")
+        print(f"结果数量: {search_result.result_count}")
+        # SearchPipelineResult.warnings is List[str], not List[SearchWarning]
+        fts_warning_present = any("FTS" in w for w in search_result.warnings)
+        print(f"FTS 启用: {not fts_warning_present}")
+
+        if search_result.warnings:
+            for warning in search_result.warnings:
+                print(f"  警告: {warning}")
+
+        # Check if FTS worked or fell back to substring search
+        if search_result.result_count > 0:
+            print(f"  找到 {search_result.result_count} 个结果")
+            for i, result in enumerate(search_result.results[:3], 1):
+                print(f"    {i}. 分数: {result.score:.4f}, 文本: {result.text[:50]}...")
+            # Verify that query text appears in results (either via FTS or substring fallback)
+            assert any(query_text in result.text for result in search_result.results), (
+                f"Query '{query_text}' should appear in search results"
+            )
+        else:
+            print("  未找到结果（可能 FTS 不支持中文分词）")
+
+        # Check for FTS fallback warning
+        # SearchPipelineResult.warnings is List[str], not List[SearchWarning]
+        has_fallback_warning = any("FTS_FALLBACK" in w for w in search_result.warnings)
+        if has_fallback_warning:
+            print("  ⚠️  使用了子串匹配回退（FTS 可能不支持中文分词）")
+
+    # Verify FTS index status
+    vector_store = get_vector_index_store()
+    index_result = vector_store.create_index(embedding_model_id, readonly=True)
+    fts_enabled = index_result.fts_enabled
+    print(f"\nFTS 索引状态: {fts_enabled}")
+    print("=" * 60)
+
+
+def test_resolve_rerank_requires_model_id() -> None:
+    """Verify that rerank resolver returns None when no rerank_model_id is provided.
+
+    This ensures "no KB binding = no rerank" contract is respected.
+    """
+    # Without any config or with config missing rerank_model_id, should return None
+    result = _resolve_unified_rerank()
+    assert result is None
+
+    cfg_no_rerank = SearchConfig(embedding_model_id="test-embed")
+    result = _resolve_unified_rerank(cfg_no_rerank)
+    assert result is None
+
+
+def test_apply_rerank_dashscope_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test DashScope rerank succeeds."""
+    # Setup mock DashScope rerank
+    mock_rerank = MagicMock()
+    # New unified rerank path uses compress_with_scores returning (text, score) tuples
+    mock_rerank.compress_with_scores.return_value = [
+        ("doc3", 0.95),
+        ("doc1", 0.85),
+        ("doc2", 0.75),
+    ]
+
+    # Create test results
+    results = [
+        SearchResult(
+            doc_id="d1",
+            chunk_id="c1",
+            text="doc1",
+            score=0.8,
+            parse_hash="ph1",
+            model_tag="m1",
+            created_at=datetime.now(timezone.utc),
+            vector_score=0.8,
+            fts_score=0.7,
+            vector_rank=1,
+            fts_rank=2,
+        ),
+        SearchResult(
+            doc_id="d2",
+            chunk_id="c2",
+            text="doc2",
+            score=0.7,
+            parse_hash="ph2",
+            model_tag="m1",
+            created_at=datetime.now(timezone.utc),
+            vector_score=0.7,
+            fts_score=0.8,
+            vector_rank=2,
+            fts_rank=1,
+        ),
+        SearchResult(
+            doc_id="d3",
+            chunk_id="c3",
+            text="doc3",
+            score=0.6,
+            parse_hash="ph3",
+            model_tag="m1",
+            created_at=datetime.now(timezone.utc),
+            vector_score=0.6,
+            fts_score=0.6,
+            vector_rank=3,
+            fts_rank=3,
+        ),
+    ]
+
+    # Need rerank_model_id set for _resolve_unified_rerank to not short-circuit
+    cfg = SearchConfig(
+        embedding_model_id="test-embed", rerank_top_k=5, rerank_model_id="qwen3-rerank"
+    )
+
+    # Mock _resolve_unified_rerank to return our mock
+    with patch(
+        "xagent.core.tools.core.RAG_tools.pipelines.document_search._resolve_unified_rerank",
+        return_value=mock_rerank,
+    ):
+        reranked, used_rerank, warnings = _apply_rerank_if_needed(
+            results, "test query", cfg
+        )
+
+    assert used_rerank is True
+    assert len(reranked) == 3
+    assert reranked[0].text == "doc3"
+    assert reranked[1].text == "doc1"
+    assert reranked[2].text == "doc2"
+    # Score should be updated with rerank relevance scores (clamped to [0, 1])
+    assert reranked[0].score == pytest.approx(0.95)
+    assert reranked[1].score == pytest.approx(0.85)
+    assert reranked[2].score == pytest.approx(0.75)
+    assert len(warnings) == 0
+    mock_rerank.compress_with_scores.assert_called_once_with(
+        ["doc1", "doc2", "doc3"], "test query"
+    )
+
+
+def test_apply_rerank_dashscope_failure_keeps_fused_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test DashScope rerank failure returns the fused results untouched."""
+    # Setup mock DashScope rerank that raises exception
+    # Use RequestException to match actual DashScope API behavior
+    mock_rerank = MagicMock()
+    mock_rerank.compress_with_scores.side_effect = requests.exceptions.RequestException(
+        "DashScope API error"
+    )
+
+    # Create test results with original scores/ranks
+    results = [
+        SearchResult(
+            doc_id="d1",
+            chunk_id="c1",
+            text="doc1",
+            score=0.8,
+            parse_hash="ph1",
+            model_tag="m1",
+            created_at=datetime.now(timezone.utc),
+            vector_score=0.8,
+            fts_score=0.7,
+            vector_rank=1,
+            fts_rank=2,
+        ),
+        SearchResult(
+            doc_id="d2",
+            chunk_id="c2",
+            text="doc2",
+            score=0.7,
+            parse_hash="ph2",
+            model_tag="m1",
+            created_at=datetime.now(timezone.utc),
+            vector_score=0.7,
+            fts_score=0.8,
+            vector_rank=2,
+            fts_rank=1,
+        ),
+    ]
+
+    # Need rerank_model_id set for _resolve_unified_rerank to not short-circuit
+    cfg = SearchConfig(embedding_model_id="test-embed", rerank_model_id="qwen3-rerank")
+    monkeypatch.setenv("DASHSCOPE_RERANK_ENABLED", "false")
+
+    # Mock _resolve_unified_rerank to return our mock
+    with patch(
+        "xagent.core.tools.core.RAG_tools.pipelines.document_search._resolve_unified_rerank",
+        return_value=mock_rerank,
+    ):
+        reranked, used_rerank, warnings = _apply_rerank_if_needed(
+            results, "test query", cfg
+        )
+
+    assert used_rerank is False
+    assert [r.text for r in reranked] == ["doc1", "doc2"]
+    assert warnings == ["MagicMock rerank failed: DashScope API error"]
+
+
+def test_apply_rerank_no_rerank_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test rerank skipped when not configured."""
+    results = [
+        SearchResult(
+            doc_id="d1",
+            chunk_id="c1",
+            text="doc1",
+            score=0.8,
+            parse_hash="ph1",
+            model_tag="m1",
+            created_at=datetime.now(timezone.utc),
+        ),
+    ]
+
+    cfg = SearchConfig(embedding_model_id="test-embed", rerank_model_id=None)
+    monkeypatch.setenv("DASHSCOPE_RERANK_ENABLED", "false")
+
+    reranked, used_rerank, warnings = _apply_rerank_if_needed(
+        results, "test query", cfg
+    )
+
+    assert used_rerank is False
+    assert len(reranked) == 1
+    assert reranked[0].text == "doc1"
+    # No warnings expected when rerank is completely disabled
+    assert len(warnings) == 0
+
+
+def test_apply_rerank_hybrid_passthrough_without_rerank_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a rerank model, fused hybrid results are returned verbatim."""
+    now = datetime.now(timezone.utc)
+    results = [
+        SearchResult(
+            doc_id=f"d{i}",
+            chunk_id=f"c{i}",
+            text=f"doc{i}",
+            score=1.0 - i / 100,
+            parse_hash=f"ph{i}",
+            model_tag="m1",
+            created_at=now,
+            vector_score=0.9 - i / 100,
+            fts_score=0.8 - i / 100,
+            vector_rank=i + 1,
+            fts_rank=10 - i,
+        )
+        for i in range(10)
+    ]
+
+    cfg = SearchConfig(embedding_model_id="test-embed", rerank_model_id=None)
+    monkeypatch.setenv("DASHSCOPE_RERANK_ENABLED", "false")
+
+    reranked, used_rerank, warnings = _apply_rerank_if_needed(
+        results, "test query", cfg
+    )
+
+    assert used_rerank is False
+    assert reranked == results
+    assert warnings == []
+
+
+def test_hybrid_partial_success_uses_warning_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hybrid partial_success should not claim unconditional success."""
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_effective_embedding_model_sync",
+        lambda collection, model_id=None: "resolved-embed",
+    )
+    _patch_embedding_adapter(monkeypatch, "resolved-embed")
+    monkeypatch.setattr(
+        document_search,
+        "search_hybrid",
+        lambda **kwargs: HybridSearchResponse(
+            results=[],
+            total_count=0,
+            status="partial_success",
+            warnings=[],
+            fusion_config=kwargs["fusion_config"] or FusionConfig(),
+            dense_count=0,
+            sparse_count=0,
+            index_status=IndexStatus.INDEX_READY,
+            index_advice=None,
+        ),
+    )
+
+    result = document_search.search_documents(
+        collection="kb1",
+        query_text="test query",
+        config=SearchConfig(
+            search_type=SearchType.HYBRID,
+            top_k=5,
+            embedding_model_id="placeholder-model",
+        ),
+    )
+
+    assert result.status == "partial_success"
+    assert result.message == "Hybrid search completed with warnings"

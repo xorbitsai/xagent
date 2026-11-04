@@ -1,0 +1,2158 @@
+"""Test authentication API functionality"""
+
+import asyncio
+import os
+import tempfile
+import threading
+from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
+
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+from tests.shared.auth_database import auth_db_override
+from xagent.web.api import auth as auth_api
+from xagent.web.api.auth import (
+    RefreshTokenResponse,
+    auth_router,
+    hash_password,
+    verify_password,
+)
+from xagent.web.models import database as database_module
+from xagent.web.models.auth_database import get_auth_db
+from xagent.web.models.database import Base, configure_db, get_db, get_engine
+from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+
+# Create temporary directory for database
+temp_dir = tempfile.mkdtemp()
+temp_db_path = os.path.join(temp_dir, "test.db")
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{temp_db_path}"
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def override_get_db():
+    db = None
+    try:
+        db = TestingSessionLocal()
+        yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
+# Create test app without startup events
+test_app = FastAPI()
+test_app.include_router(auth_router)
+test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
+
+# Create test client
+client = TestClient(test_app)
+
+
+def setup_first_admin(
+    username: str = "administrator",
+    password: str = "admin123",
+    email: str = "administrator@example.com",
+) -> None:
+    response = client.post(
+        "/api/auth/setup-admin",
+        json={"username": username, "email": email, "password": password},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+
+
+def login_and_get_token(username: str, password: str) -> str:
+    response = client.post(
+        "/api/auth/login", json={"username": username, "password": password}
+    )
+    assert response.status_code == 200
+    return response.json()["access_token"]
+
+
+# Cleanup function
+def cleanup_test_db():
+    try:
+        import shutil
+
+        shutil.rmtree(temp_dir)
+    except OSError:
+        pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_global_test_db():
+    """Cleanup global test database after all tests"""
+    yield
+    cleanup_test_db()
+
+
+@pytest.fixture(scope="function")
+def test_db():
+    """Create test database"""
+    # Create unique database for each test
+    import uuid
+
+    test_db_path = os.path.join(temp_dir, f"test_{uuid.uuid4().hex}.db")
+    test_db_url = f"sqlite:///{test_db_path}"
+    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
+
+    # Create all tables
+    Base.metadata.create_all(bind=test_engine)
+
+    # Update the engine for this test
+    global engine, TestingSessionLocal
+    engine = test_engine
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    # Also point the app's global session factory at the same file:
+    # update_current_user_preferences opens its own Session via
+    # get_session_local() (see _merge_user_preferences_locked) rather
+    # than the request-scoped `db` from Depends(get_db)/TestingSessionLocal
+    # above, so without this it raises "Session Local is not initialized"
+    # instead of touching this test's own database. configure_db binds
+    # the engine/session factory without re-running migrations or
+    # create_all, which this fixture already did above. Save/restore the
+    # prior globals in finally, matching test_task_interaction_close.py's
+    # db_without_interaction_table fixture - otherwise this rebinding
+    # leaks into whichever test runs next in the same process (e.g. under
+    # pytest-xdist, an order-dependent flake: a later test file that
+    # expects its own database, or none configured yet, would instead
+    # silently see this now-deleted per-test sqlite file).
+    previous_engine = database_module._engine
+    previous_session_local = database_module._SessionLocal
+    configure_db(db_url=test_db_url)
+
+    try:
+        yield
+    finally:
+        database_module._engine = previous_engine
+        database_module._SessionLocal = previous_session_local
+
+        # Cleanup
+        Base.metadata.drop_all(bind=test_engine)
+        try:
+            os.unlink(test_db_path)
+        except OSError:
+            pass
+
+
+@pytest.fixture(scope="function")
+def test_user_data():
+    """Test user data"""
+    return {
+        "username": "testuser",
+        "email": "testuser@example.com",
+        "password": "testpassword123",
+    }
+
+
+@pytest.fixture(scope="function")
+def test_admin_data():
+    """Test admin user data"""
+    return {"username": "admin", "email": "admin@example.com", "password": "admin123"}
+
+
+class TestAuthAPI:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {
+                "success": False,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 60,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": " ",
+                "refresh_token": "refresh",
+                "expires_in": 60,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": " ",
+                "expires_in": 60,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 1.5,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": True,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": "60",
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 0,
+                "refresh_expires_in": 120,
+            },
+            {
+                "success": True,
+                "message": "no",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 60,
+                "refresh_expires_in": -1,
+            },
+        ],
+    )
+    def test_refresh_response_requires_complete_strict_rotation(self, payload):
+        with pytest.raises(Exception):
+            RefreshTokenResponse.model_validate(payload)
+
+    def test_refresh_response_serializes_literal_success(self):
+        response = RefreshTokenResponse(
+            success=True,
+            message="ok",
+            access_token=" access ",
+            refresh_token=" refresh ",
+            expires_in=60,
+            refresh_expires_in=120,
+        )
+        assert response.model_dump()["success"] is True
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "success",
+            "access_token",
+            "refresh_token",
+            "expires_in",
+            "refresh_expires_in",
+        ],
+    )
+    def test_refresh_response_rejects_each_missing_required_field(self, field):
+        payload = {
+            "success": True,
+            "message": "ok",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 60,
+            "refresh_expires_in": 120,
+        }
+        del payload[field]
+
+        with pytest.raises(Exception):
+            RefreshTokenResponse.model_validate(payload)
+
+    """Test authentication API endpoints"""
+
+    def test_login_success(self, test_db, test_user_data):
+        """Test successful user login"""
+        setup_first_admin()
+        # First register the user
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        # Then login
+        response = client.post("/api/auth/login", json=test_user_data)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["message"] == "Login successful"
+        assert data["user"]["username"] == test_user_data["username"]
+        assert data["user"]["email"] == test_user_data["email"]
+        assert "id" in data["user"]
+        assert "loginTime" in data["user"]
+
+    def test_login_success_with_email(self, test_db, test_user_data):
+        """Test successful user login with email"""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        response = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["email"],
+                "password": test_user_data["password"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["user"]["username"] == test_user_data["username"]
+        assert data["user"]["email"] == test_user_data["email"]
+
+    def test_refresh_rotates_token_and_rejects_stale_token(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        login_response = client.post("/api/auth/login", json=test_user_data)
+        old_refresh_token = login_response.json()["refresh_token"]
+        monkeypatch.setattr(
+            auth_api,
+            "create_refresh_token",
+            lambda data: "rotated-refresh-token",
+        )
+
+        refresh_response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": old_refresh_token},
+        )
+        assert refresh_response.status_code == 200
+        assert refresh_response.json()["success"] is True
+        assert refresh_response.json()["refresh_token"] == "rotated-refresh-token"
+
+        stale_response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": old_refresh_token},
+        )
+        assert stale_response.status_code == 401
+        assert stale_response.json()["detail"] == "Invalid refresh token"
+
+    def test_refresh_rejects_malformed_token(self, test_db):
+        response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": "not-a-jwt"},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid refresh token"
+
+    def test_refresh_reports_temporary_server_failure(self, test_db, monkeypatch):
+        def fail_verification(_token):
+            raise SQLAlchemyError("database unavailable")
+
+        monkeypatch.setattr(auth_api, "verify_refresh_token", fail_verification)
+
+        response = client.post(
+            "/api/auth/refresh",
+            json={"refresh_token": "temporarily-unverifiable"},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Token refresh is temporarily unavailable"
+
+    def test_refresh_does_not_mask_programming_errors(self, test_db, monkeypatch):
+        def fail_verification(_token):
+            raise RuntimeError("unexpected refresh bug")
+
+        monkeypatch.setattr(auth_api, "verify_refresh_token", fail_verification)
+
+        with pytest.raises(RuntimeError, match="unexpected refresh bug"):
+            client.post(
+                "/api/auth/refresh",
+                json={"refresh_token": "unexpectedly-broken"},
+            )
+
+    def test_get_current_user_profile(self, test_db, test_user_data):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        response = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["user"]["username"] == test_user_data["username"]
+        assert data["user"]["email"] == test_user_data["email"]
+        assert data["user"]["preferences"] == {}
+
+    def test_voice_conversation_preferences_round_trip_without_changing_writing_style(
+        self, test_db
+    ):
+        setup_first_admin()
+        token = login_and_get_token("administrator", "admin123")
+        headers = {"Authorization": f"Bearer {token}"}
+        assert (
+            client.patch(
+                "/api/auth/me/preferences",
+                json={"voice": "warm", "department": "Sales"},
+                headers=headers,
+            ).status_code
+            == 200
+        )
+        preferences = {
+            "asr_model_id": "live",
+            "tts_model_id": "speaker",
+            "voice": "selected-voice",
+        }
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice_conversation": preferences},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        stored = client.get("/api/auth/me", headers=headers).json()["user"][
+            "preferences"
+        ]
+        assert stored == {
+            "voice": "warm",
+            "department": "Sales",
+            "voice_conversation": preferences,
+        }
+        for invalid in (
+            {"voice": "../../v1/user"},
+            {"tts_model_id": "x" * 513},
+            {"unknown": True},
+        ):
+            assert (
+                client.patch(
+                    "/api/auth/me/preferences",
+                    json={"voice_conversation": invalid},
+                    headers=headers,
+                ).status_code
+                == 422
+            )
+        assert (
+            client.patch(
+                "/api/auth/me/preferences",
+                json={"voice_conversation": None},
+                headers=headers,
+            ).status_code
+            == 200
+        )
+        assert client.get("/api/auth/me", headers=headers).json()["user"][
+            "preferences"
+        ] == {"voice": "warm", "department": "Sales"}
+
+    def test_update_current_user_preferences_merges_across_calls(
+        self, test_db, test_user_data
+    ):
+        """Onboarding writes preferences incrementally, one step at a time
+        (About you, then Goals, then Launch) - a later PATCH must not erase
+        an earlier step's answer."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        first = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "Sales", "industry": "Real estate"},
+            headers=headers,
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["user"]["preferences"] == {
+            "department": "Sales",
+            "industry": "Real estate",
+        }
+
+        second = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice": "friendly", "goals": ["Reply to new leads fast"]},
+            headers=headers,
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["user"]["preferences"] == {
+            "department": "Sales",
+            "industry": "Real estate",
+            "voice": "friendly",
+            "goals": ["Reply to new leads fast"],
+        }
+
+        # A later PATCH can also overwrite one earlier field while leaving
+        # the others untouched.
+        third = client.patch(
+            "/api/auth/me/preferences",
+            json={"onboarded": True},
+            headers=headers,
+        )
+        assert third.status_code == 200, third.text
+        assert third.json()["user"]["preferences"] == {
+            "department": "Sales",
+            "industry": "Real estate",
+            "voice": "friendly",
+            "goals": ["Reply to new leads fast"],
+            "onboarded": True,
+        }
+
+    def test_update_current_user_preferences_from_a_null_row(
+        self, test_db, test_user_data
+    ):
+        """The model's ``default=dict`` only applies to new ORM inserts -
+        every user row that existed before this migration landed has a
+        genuine SQL NULL, not ``{}``, and nothing in this test file's own
+        registration flow exercises that state. Force it directly."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        db = TestingSessionLocal()
+        try:
+            db.query(User).filter(User.id == user_id).update({"preferences": None})
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice": "friendly"},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"] == {"voice": "friendly"}
+
+        # Persisted, not just echoed back - confirm a fresh /me sees it too.
+        me = client.get("/api/auth/me", headers=headers)
+        assert me.json()["user"]["preferences"] == {"voice": "friendly"}
+
+    def test_update_current_user_preferences_rejects_unknown_voice(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice": "sarcastic"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_an_unknown_field(
+        self, test_db, test_user_data
+    ):
+        """A typo'd key (e.g. "voce") must be a validation error, not a
+        silently-empty update that still reports success - extra="forbid"
+        is what makes model_dump(exclude_unset=True) fail loudly instead
+        of returning {} for a body with no recognized fields."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voce": "friendly"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_a_lax_boolean_for_onboarded(
+        self, test_db, test_user_data
+    ):
+        """StrictBool, matching this file's StrictInt/StrictStr convention
+        elsewhere - "true"/1/etc. must not silently coerce."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"onboarded": "true"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_accepts_fields_at_their_bounds(
+        self, test_db, test_user_data
+    ):
+        """The full preferences JSON is replayed through every login/`/me`/
+        email-update/token-validation/PATCH response, so these bounds
+        exist to cap that payload size, not to reject realistic input -
+        exactly-at-the-limit values must still succeed."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={
+                "department": "d" * auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH,
+                "industry": "i" * auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH,
+                "goals": ["g" * auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH]
+                * auth_api.PREFERENCES_GOALS_MAX_ITEMS,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+
+    def test_update_current_user_preferences_rejects_department_over_the_length_limit(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "d" * (auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH + 1)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_industry_over_the_length_limit(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"industry": "i" * (auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH + 1)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_a_goal_over_the_length_limit(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"goals": ["g" * (auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH + 1)]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_too_many_goals(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"goals": ["g"] * (auth_api.PREFERENCES_GOALS_MAX_ITEMS + 1)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_blank_department_and_industry(
+        self, test_db, test_user_data
+    ):
+        """A blank string is meaningless stored data, not a signal to
+        clear the field - null already does that for a merge-style PATCH
+        (see the no-op-body test above)."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "   "},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"industry": ""},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_a_blank_goal(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"goals": ["Ship the launch", "   "]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_strips_surrounding_whitespace(
+        self, test_db, test_user_data
+    ):
+        """The blank-rejection validators check `.strip()` but must also
+        persist the stripped value, not the original - otherwise a
+        non-blank-but-padded value like "  Sales  " passes validation
+        and is stored with its whitespace intact."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={
+                "department": "  Sales  ",
+                "industry": "  Retail  ",
+                "goals": ["  Ship the launch  "],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        preferences = response.json()["user"]["preferences"]
+        assert preferences["department"] == "Sales"
+        assert preferences["industry"] == "Retail"
+        assert preferences["goals"] == ["Ship the launch"]
+
+    def test_update_current_user_preferences_clears_a_field_with_null(
+        self, test_db, test_user_data
+    ):
+        """null is the merge-style PATCH's clear signal, distinct from
+        (and still allowed alongside) the blank-string rejection above.
+        Clearing deletes the key entirely rather than storing a literal
+        `{"department": null}` entry - otherwise every future read would
+        replay that stale explicit-null forever."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "Sales"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": None},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        preferences = response.json()["user"]["preferences"]
+        assert preferences.get("department") is None
+        assert "department" not in preferences
+
+    def test_update_current_user_preferences_with_empty_body_is_a_no_op(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        client.patch(
+            "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
+        )
+
+        response = client.patch("/api/auth/me/preferences", json={}, headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["user"]["preferences"] == {"department": "Sales"}
+
+    def test_update_current_user_preferences_invalidates_cache_only_for_voice(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """A voice change must evict any cached AgentService for this user
+        (see AgentServiceManager.invalidate_cached_agents_for_owner) so an
+        already-warm task rebuilds with the new voice on its next turn -
+        an unrelated field (e.g. department) must not trigger that."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        user_id = register_response.json()["user"]["id"]
+
+        mock_manager = MagicMock()
+        mock_manager.invalidate_cached_agents_for_owner = AsyncMock()
+        monkeypatch.setattr(
+            agent_runtime_service, "get_agent_manager", lambda: mock_manager
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        mock_manager.invalidate_cached_agents_for_owner.assert_not_called()
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
+
+    def test_update_current_user_preferences_survives_a_failed_cache_invalidation(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """The merge already committed by the time invalidation runs -
+        a raise here must not turn a successful write into a client-visible
+        500, mirroring _run_post_commit_oauth_side_effects's same guard for
+        the identical "committed, best-effort follow-up" shape."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        mock_manager = MagicMock()
+        mock_manager.invalidate_cached_agents_for_owner = AsyncMock(
+            side_effect=RuntimeError("cache backend unavailable")
+        )
+        monkeypatch.setattr(
+            agent_runtime_service, "get_agent_manager", lambda: mock_manager
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"]["voice"] == "warm"
+        mock_manager.invalidate_cached_agents_for_owner.assert_called_once()
+
+        # Persisted, not just echoed back despite the failed invalidation.
+        me = client.get("/api/auth/me", headers=headers)
+        assert me.json()["user"]["preferences"]["voice"] == "warm"
+
+    def test_serialize_auth_user_tolerates_malformed_non_dict_preferences(
+        self, test_db, test_user_data
+    ):
+        """`preferences` has no nested-type constraint, so a corrupted or
+        hand-edited row could hold a non-dict JSON value (e.g. a list).
+        Every endpoint that serializes the user (login, /me, this PATCH's
+        own response) must degrade to an empty dict instead of crashing on
+        `dict(value)`."""
+        import json
+
+        from sqlalchemy import text as sa_text
+
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        db = TestingSessionLocal()
+        try:
+            db.execute(
+                sa_text("UPDATE users SET preferences = :prefs WHERE id = :id"),
+                {"prefs": json.dumps(["not", "a", "dict"]), "id": user_id},
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get("/api/auth/me", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"] == {}
+
+        patch_response = client.patch(
+            "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
+        )
+        assert patch_response.status_code == 200, patch_response.text
+        assert patch_response.json()["user"]["preferences"] == {"department": "Sales"}
+
+    def test_update_current_user_preferences_returns_404_for_deleted_user(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """`_lock_user_row_for_preferences_update` returning False (row
+        deleted between get_current_user loading it and the lock attempt)
+        must surface as a clean 404, not an unhandled
+        ObjectDeletedError/500 from the subsequent db.refresh(user)."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        monkeypatch.setattr(
+            auth_api, "_lock_user_row_for_preferences_update", lambda db, user_id: False
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 404, response.text
+
+    def test_update_current_user_preferences_returns_503_when_release_fails(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """release_db_connection_if_clean returning False (mirroring
+        workforce_creator.py's own hard-error convention for this same
+        helper) must surface as a 503, not silently continue holding
+        the connection through the lock wait."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        monkeypatch.setattr(
+            auth_api, "release_db_connection_if_clean", lambda db: False
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 503, response.text
+        assert response.json()["detail"]["code"] == "preferences_update_unavailable"
+
+    def test_lock_user_row_exercises_the_real_sqlite_no_op_update_branch(
+        self, test_db, test_user_data
+    ):
+        """The 404 test above monkeypatches this function away entirely -
+        this one calls the real implementation directly against a real
+        SQLite session, so the no-op-UPDATE-then-existence-check branch
+        itself (not just its assumed contract) is exercised: it must
+        return True for a row that exists, and False for a user_id with
+        no matching row, without raising on either the UPDATE or the
+        follow-up SELECT."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+
+        db = TestingSessionLocal()
+        try:
+            assert auth_api._lock_user_row_for_preferences_update(db, user_id) is True
+            db.commit()
+
+            nonexistent_user_id = user_id + 999999
+            assert (
+                auth_api._lock_user_row_for_preferences_update(db, nonexistent_user_id)
+                is False
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def test_lock_user_row_actually_blocks_a_second_sqlite_writer(
+        self, test_db, test_user_data
+    ):
+        """The no-op UPDATE's write lock isn't just assumed to serialize
+        two concurrent merges - WAL mode plus apply_sqlite_concurrency_
+        pragmas' busy_timeout make it plausible by design, but that was
+        never itself exercised. Two real threads, two real connections
+        to the same on-disk file (get_engine(), not this file's own
+        TestingSessionLocal, since only get_engine() has the pragmas
+        applied): the second's call must not return until the first
+        releases its lock, proven with an Event, not a timing guess."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+
+        SessionForLock = sessionmaker(bind=get_engine())
+        holder_acquired = threading.Event()
+        release_holder = threading.Event()
+        second_acquired = threading.Event()
+        errors: list[BaseException] = []
+
+        def hold_the_lock() -> None:
+            db = SessionForLock()
+            try:
+                auth_api._lock_user_row_for_preferences_update(db, user_id)
+                holder_acquired.set()
+                assert release_holder.wait(timeout=DB_PROGRESS_TIMEOUT)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.commit()
+                db.close()
+
+        def acquire_second() -> None:
+            assert holder_acquired.wait(timeout=DB_PROGRESS_TIMEOUT)
+            db = SessionForLock()
+            try:
+                auth_api._lock_user_row_for_preferences_update(db, user_id)
+                second_acquired.set()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.commit()
+                db.close()
+
+        holder_thread = threading.Thread(target=hold_the_lock)
+        second_thread = threading.Thread(target=acquire_second)
+        holder_thread.start()
+        assert holder_acquired.wait(timeout=DB_PROGRESS_TIMEOUT)
+        second_thread.start()
+
+        try:
+            # The second thread is now blocked inside SQLite's busy-timeout
+            # wait for the row lock the first thread holds - it must not
+            # have finished yet.
+            assert not second_acquired.wait(timeout=0.2)
+        finally:
+            # Release and join even when the assertion above fails - a
+            # regression that actually breaks the lock (what this test
+            # exists to catch) would otherwise leave holder_thread running
+            # with an open write-lock transaction for its own 5s timeout,
+            # which can then make the test_db fixture's teardown
+            # (Base.metadata.drop_all, needing that same lock) race and
+            # raise its own confusing "database is locked" error on top
+            # of the real AssertionError.
+            release_holder.set()
+            holder_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+            second_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+        assert not errors, errors
+        assert second_acquired.is_set(), (
+            "the second writer never acquired the lock after the first released it"
+        )
+
+    def test_merge_user_preferences_locked_returns_none_when_user_vanishes_after_lock(
+        self, test_db, monkeypatch
+    ):
+        """A second, narrower race than the lock-helper-returns-False case
+        above: the lock helper can report success for a row that's since
+        been deleted (lock acquired, then a concurrent delete lands before
+        the fetch). worker_db.get(User, user_id) is None must be its own
+        clean None result, not an unhandled crash - exercised directly
+        since reaching it through the endpoint would need an actual
+        concurrent delete mid-request."""
+        monkeypatch.setattr(
+            auth_api, "_lock_user_row_for_preferences_update", lambda db, user_id: True
+        )
+
+        result = auth_api._merge_user_preferences_locked(999999, {"voice": "warm"})
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_keeps_all_sql_off_the_event_loop(
+        self, test_db, test_user_data
+    ):
+        """The row lock this endpoint takes is a real, potentially slow
+        blocking wait under contention - the whole reason its transaction
+        runs inside asyncio.to_thread. That protection is easy to
+        half-lose: Session.commit() defaults to expire_on_commit=True, so
+        any attribute access on `user` after the awaited call returns
+        (e.g. building the response, or reading user.id for cache
+        invalidation) would otherwise trigger an implicit reload - a
+        blocking SELECT landing back on the event loop instead of the
+        worker thread. This asserts no SQL for the request executes on
+        the calling (event-loop) thread at all, not just that the
+        response content is correct."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        event_loop_thread_id = threading.get_ident()
+        executed_thread_ids: list[int] = []
+
+        def _record_thread(*_args: object, **_kwargs: object) -> None:
+            executed_thread_ids.append(threading.get_ident())
+
+        # _merge_user_preferences_locked opens its own Session via
+        # get_session_local() (see its own docstring for why), which is
+        # bound to a different engine object than this file's own
+        # TestingSessionLocal/`engine` - the `configure_db` call the
+        # `test_db` fixture makes points both at the same underlying
+        # sqlite file, but they're separate SQLAlchemy Engine instances,
+        # so the listener has to attach to the one the endpoint's own
+        # worker session actually uses.
+        merge_engine = get_engine()
+        event.listen(merge_engine, "before_cursor_execute", _record_thread)
+        # `user` and `db` share one Session here, mirroring FastAPI's own
+        # per-request dependency caching (get_current_user's `user` and
+        # this endpoint's own `db` parameter resolve to the same cached
+        # instance in production) - giving them separate sessions, as an
+        # earlier version of this test did, can't reproduce a bug where
+        # release_db_connection_if_clean(db) expires `user` out from
+        # under the caller.
+        request_db = TestingSessionLocal()
+        try:
+            user = (
+                request_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
+            response = await auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        finally:
+            event.remove(merge_engine, "before_cursor_execute", _record_thread)
+            request_db.close()
+
+        assert response.success is True
+        assert response.user is not None
+        assert response.user["preferences"]["voice"] == "warm"
+        assert executed_thread_ids, "expected the merge to issue at least one query"
+        assert event_loop_thread_id not in executed_thread_ids, (
+            "a query ran on the event-loop thread instead of the "
+            "asyncio.to_thread worker - the lock/refresh/merge/commit "
+            "transaction (or the post-commit reload expire_on_commit "
+            "forces) leaked back onto the event loop"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_reads_user_id_before_releasing_db(
+        self, test_db, test_user_data
+    ):
+        """release_db_connection_if_clean(db) rolls back `db` when it is
+        clean, and Session.rollback() unconditionally expires every
+        object that session loaded - `user` included, since
+        get_current_user's `user` and this endpoint's own `db` resolve
+        to the same cached Session in production (FastAPI's per-request
+        dependency caching; see the SQL-off-the-event-loop test above
+        for why this test gives them the same Session too). Touching
+        `user.id` after that release would force an implicit reload
+        SELECT - reacquiring the very connection just released,
+        synchronously on this thread, defeating the point of releasing
+        it at all, and raising ObjectDeletedError outright had the row
+        been deleted meanwhile. Asserts no query at all runs on this
+        session's connection after its rollback."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        released = threading.Event()
+        queries_after_release: list[str] = []
+
+        def _on_rollback(_conn):
+            released.set()
+
+        def _on_cursor_execute(_conn, _cursor, statement, *_args, **_kwargs):
+            if released.is_set():
+                queries_after_release.append(statement)
+
+        event.listen(engine, "rollback", _on_rollback)
+        event.listen(engine, "before_cursor_execute", _on_cursor_execute)
+        request_db = TestingSessionLocal()
+        try:
+            user = (
+                request_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
+            response = await auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        finally:
+            event.remove(engine, "rollback", _on_rollback)
+            event.remove(engine, "before_cursor_execute", _on_cursor_execute)
+            request_db.close()
+
+        assert response.success is True
+        assert released.is_set(), (
+            "expected release_db_connection_if_clean to roll back this clean session"
+        )
+        assert not queries_after_release, (
+            "a query executed on the request session after it was "
+            "released - user_id must be read from `user` strictly "
+            "before releasing `db`, since the rollback expires it: "
+            f"{queries_after_release}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_builds_response_before_commit(
+        self, test_db, test_user_data
+    ):
+        """G16: Session.commit() defaults to expire_on_commit=True, so any
+        attribute access on `worker_user` after `worker_db.commit()`
+        returns would force an implicit reload SELECT - itself a race,
+        since the row lock is released the instant commit() returns and
+        a concurrent delete could land in that gap (see
+        _merge_user_preferences_locked's own docstring). The SQL-off-the-
+        event-loop test above can't catch a regression here: a reload
+        forced back onto the same worker thread would still pass that
+        assertion. This instead asserts no query at all executes on the
+        merge's connection after its COMMIT, proving the response
+        payload really is built from the ORM object beforehand."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        committed = threading.Event()
+        queries_after_commit: list[str] = []
+
+        def _on_commit(_conn):
+            committed.set()
+
+        def _on_cursor_execute(_conn, _cursor, statement, *_args, **_kwargs):
+            if committed.is_set():
+                queries_after_commit.append(statement)
+
+        merge_engine = get_engine()
+        event.listen(merge_engine, "commit", _on_commit)
+        event.listen(merge_engine, "before_cursor_execute", _on_cursor_execute)
+        # `user` and `db` share one Session, mirroring FastAPI's own
+        # per-request dependency caching - see the sibling SQL-off-the-
+        # event-loop test above for why.
+        request_db = TestingSessionLocal()
+        try:
+            user = (
+                request_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
+            response = await auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        finally:
+            event.remove(merge_engine, "commit", _on_commit)
+            event.remove(merge_engine, "before_cursor_execute", _on_cursor_execute)
+            request_db.close()
+
+        assert response.success is True
+        assert committed.is_set(), "expected the merge to actually commit"
+        assert not queries_after_commit, (
+            "a query executed after commit() - the response payload must "
+            "be built from the ORM object strictly before commit, since "
+            "expire_on_commit=True would otherwise force a reload here: "
+            f"{queries_after_commit}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_cancellation_drains_merge_worker(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """A cancelled/disconnected request must not abandon
+        _merge_user_preferences_locked's worker thread while it still
+        holds the row lock and an open Session on it -
+        run_db_io_cancellation_safe's whole contract (see its own and
+        _merge_user_preferences_locked's docstrings) is that the worker
+        is drained to completion before the caller's cancellation is
+        allowed to propagate. Mirrors
+        test_task_command_transport.py's
+        test_dispatch_cancellation_drains_inflight_completion_worker for
+        the same drain-before-cancel contract."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        merge_started = threading.Event()
+        allow_merge = threading.Event()
+        merge_completed = threading.Event()
+        original_normalize = auth_api._normalized_preferences
+
+        def blocking_normalize(worker_user):
+            merge_started.set()
+            assert allow_merge.wait(timeout=DB_PROGRESS_TIMEOUT)
+            result = original_normalize(worker_user)
+            merge_completed.set()
+            return result
+
+        monkeypatch.setattr(auth_api, "_normalized_preferences", blocking_normalize)
+
+        # `user` and `db` share one Session, mirroring FastAPI's own
+        # per-request dependency caching - see the SQL-off-the-event-loop
+        # test above for why.
+        request_db = TestingSessionLocal()
+        user = (
+            request_db.query(User)
+            .filter(User.username == test_user_data["username"])
+            .one()
+        )
+        # Read before release_db_connection_if_clean's rollback expires
+        # `user` (see update_current_user_preferences's own comment on
+        # this) and before request_db.close() below detaches it outright.
+        user_id = int(user.id)
+        request_task = asyncio.create_task(
+            auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(merge_started.wait, DB_PROGRESS_TIMEOUT),
+                timeout=DB_PROGRESS_TIMEOUT,
+            )
+            request_task.cancel()
+            await asyncio.sleep(0.02)
+            assert not request_task.done()
+        finally:
+            allow_merge.set()
+            request_db.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=DB_PROGRESS_TIMEOUT)
+        assert merge_completed.is_set()
+
+        # Drained, not abandoned: the merge that was already in flight
+        # when cancelled must still have committed.
+        verify_db = TestingSessionLocal()
+        try:
+            stored = verify_db.query(User).filter(User.id == user_id).one()
+            assert stored.preferences["voice"] == "warm"
+        finally:
+            verify_db.close()
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_invalidates_cache_after_committed_cancellation(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """run_db_io_cancellation_safe's own contract discards a settled
+        result in favor of re-raising the caller's cancellation - so a
+        request cancelled after the merge has already committed must
+        still invalidate the voice cache before that cancellation is
+        allowed to propagate, or an already-warm task keeps speaking in
+        the stale voice until incidental cache eviction. Delays the
+        worker's return (not its commit) after the merge has
+        genuinely committed, so cancelling here reproduces "committed,
+        but not yet observed by the caller" rather than "not committed
+        yet" (which the sibling drain test above already covers)."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        request_db = TestingSessionLocal()
+        user = (
+            request_db.query(User)
+            .filter(User.username == test_user_data["username"])
+            .one()
+        )
+        user_id = int(user.id)
+
+        committed = threading.Event()
+        allow_return = threading.Event()
+
+        def _on_commit(_conn):
+            committed.set()
+
+        original_merge = auth_api._merge_user_preferences_locked
+
+        def delayed_merge(merge_user_id, merge_updates):
+            result = original_merge(merge_user_id, merge_updates)
+            assert allow_return.wait(timeout=DB_PROGRESS_TIMEOUT)
+            return result
+
+        monkeypatch.setattr(auth_api, "_merge_user_preferences_locked", delayed_merge)
+
+        mock_manager = MagicMock()
+        mock_manager.invalidate_cached_agents_for_owner = AsyncMock()
+        monkeypatch.setattr(
+            agent_runtime_service, "get_agent_manager", lambda: mock_manager
+        )
+
+        merge_engine = get_engine()
+        event.listen(merge_engine, "commit", _on_commit)
+        try:
+            request_task = asyncio.create_task(
+                auth_api.update_current_user_preferences(
+                    request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                    db=request_db,
+                    user=user,
+                )
+            )
+            await asyncio.wait_for(
+                asyncio.to_thread(committed.wait, DB_PROGRESS_TIMEOUT),
+                timeout=DB_PROGRESS_TIMEOUT,
+            )
+            request_task.cancel()
+            await asyncio.sleep(0.02)
+            assert not request_task.done()
+        finally:
+            allow_return.set()
+            event.remove(merge_engine, "commit", _on_commit)
+            request_db.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=DB_PROGRESS_TIMEOUT)
+
+        mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
+
+    def test_update_current_user_email(self, test_db, test_user_data, monkeypatch):
+        monkeypatch.setenv("XAGENT_SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("XAGENT_SMTP_FROM_EMAIL", "no-reply@example.com")
+        monkeypatch.setattr(auth_api, "send_email_changed_notice", MagicMock())
+        sent = {}
+        monkeypatch.setattr(
+            auth_api,
+            "send_email_change_confirmation",
+            lambda email, token, app: sent.update(token=token),
+        )
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        response = client.patch(
+            "/api/auth/email",
+            json={
+                "email": "updated@example.com",
+                "current_password": test_user_data["password"],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["pending_confirmation"] is True
+        assert data["user"]["email"] == test_user_data["email"]
+        confirmed = client.post(
+            "/api/auth/email/confirm",
+            json={"token": sent["token"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert confirmed.json()["success"] is True
+        assert confirmed.json()["user"]["email"] == "updated@example.com"
+
+    def test_logout_revokes_the_refresh_token_supplied_by_the_client(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        assert client.post("/api/auth/register", json=test_user_data).status_code == 200
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["username"],
+                "password": test_user_data["password"],
+            },
+        )
+        assert login.status_code == 200
+        tokens = login.json()
+
+        response = client.post(
+            "/api/auth/logout",
+            json={"refresh_token": tokens["refresh_token"]},
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        refresh = client.post(
+            "/api/auth/refresh", json={"refresh_token": tokens["refresh_token"]}
+        )
+        assert refresh.status_code == 401
+
+    @pytest.mark.parametrize("email", [None, "oidc@example.com"])
+    def test_oidc_user_email_update_is_disabled_without_local_password(
+        self, test_db, email
+    ):
+        db = TestingSessionLocal()
+        try:
+            user = User(
+                username="oidc-user",
+                email=email,
+                password_hash="!oidc-google",
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            result = asyncio.run(
+                auth_api.update_current_user_email(
+                    request=auth_api.UpdateEmailRequest(email="new@example.com"),
+                    http_request=Request({"type": "http", "headers": []}),
+                    db=db,
+                    user=user,
+                )
+            )
+
+            assert result.success is False
+            assert result.error_code == "provider_managed"
+            assert "passwordless" in result.message
+            assert "administrator" in result.message
+            assert user.email == email
+        finally:
+            db.close()
+
+    def test_update_current_user_email_rejects_duplicate(self, test_db):
+        setup_first_admin()
+        response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "firstuser",
+                "email": "first@example.com",
+                "password": "password123",
+            },
+        )
+        assert response.status_code == 200
+
+        response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "seconduser",
+                "email": "second@example.com",
+                "password": "password123",
+            },
+        )
+        assert response.status_code == 200
+
+        token = login_and_get_token("seconduser", "password123")
+        response = client.patch(
+            "/api/auth/email",
+            json={"email": "first@example.com", "current_password": "password123"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Email already exists"
+
+    def test_login_invalid_credentials(self, test_db, test_user_data):
+        """Test login with invalid credentials"""
+        setup_first_admin()
+        # First register the user
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        # Try to login with wrong password
+        wrong_credentials = {
+            "username": test_user_data["username"],
+            "password": "wrongpassword",
+        }
+        response = client.post("/api/auth/login", json=wrong_credentials)
+        assert response.status_code == 401
+        data = response.json()
+        assert "detail" in data
+        assert "Incorrect username or password" in data["detail"]
+
+    def test_login_nonexistent_user(self, test_db):
+        """Test login with non-existent user"""
+        credentials = {"username": "nonexistent", "password": "password123"}
+        response = client.post("/api/auth/login", json=credentials)
+        assert response.status_code == 401
+        data = response.json()
+        assert "detail" in data
+        assert "Incorrect username or password" in data["detail"]
+
+    def test_login_does_not_leak_refresh_token_on_db_commit_failure(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """Same class of gap fixed in generic_oauth_callback: a DB error
+        while persisting the freshly-issued refresh_token must not echo it
+        back via str(e) -- SQLAlchemy's default StatementError.__str__
+        includes bound parameters, and this handler used to render str(e)
+        directly into the response detail. hide_parameters=True on the
+        engine (models/database.py) now hides it there too, but this test
+        forces a synthetic error message to pin the handler's own behavior
+        independently of that."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        from sqlalchemy.orm import Session as OrmSession
+
+        def failing_commit(self):
+            raise RuntimeError(
+                "(sqlite3.IntegrityError) UNIQUE constraint failed "
+                "[parameters: {'refresh_token': 'super-secret-refresh-token'}]"
+            )
+
+        monkeypatch.setattr(OrmSession, "commit", failing_commit)
+
+        response = client.post("/api/auth/login", json=test_user_data)
+
+        assert response.status_code == 500
+        assert "super-secret-refresh-token" not in response.text
+
+    def test_register_success(self, test_db, test_user_data):
+        """Test successful user registration"""
+        from xagent.web.models.user import UserDefaultModel, UserModel
+
+        setup_first_admin()
+        response = client.post("/api/auth/register", json=test_user_data)
+        print(f"Response status: {response.status_code}")
+        print(f"Response content: {response.text}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["message"] == "Registration successful"
+        assert data["user"]["username"] == test_user_data["username"]
+        assert "id" in data["user"]
+        assert "createdAt" in data["user"]
+
+        # Verify registration does NOT create UserModel or UserDefaultModel
+        # (dynamic model sharing: no pre-creation on register)
+        db = TestingSessionLocal()
+        new_user = (
+            db.query(User).filter(User.username == test_user_data["username"]).first()
+        )
+        assert new_user is not None
+        user_models = db.query(UserModel).filter(UserModel.user_id == new_user.id).all()
+        assert len(user_models) == 0, "Registration should not create UserModel records"
+        user_defaults = (
+            db.query(UserDefaultModel)
+            .filter(UserDefaultModel.user_id == new_user.id)
+            .all()
+        )
+        assert len(user_defaults) == 0, (
+            "Registration should not create UserDefaultModel records"
+        )
+        db.close()
+
+    def test_register_enforces_configured_password_minimum(self, test_db, monkeypatch):
+        monkeypatch.setattr(auth_api, "PASSWORD_MIN_LENGTH", 8)
+        setup_first_admin()
+
+        too_short = client.post(
+            "/api/auth/register",
+            json={
+                "username": "short-password-user",
+                "email": "short-password@example.com",
+                "password": "1234567",
+            },
+        )
+        exact_minimum = client.post(
+            "/api/auth/register",
+            json={
+                "username": "minimum-password-user",
+                "email": "minimum-password@example.com",
+                "password": "12345678",
+            },
+        )
+
+        assert too_short.status_code == 200
+        assert too_short.json() == {
+            "success": False,
+            "message": "Password must be at least 8 characters",
+            "user": None,
+        }
+        assert exact_minimum.status_code == 200
+        assert exact_minimum.json()["success"] is True
+
+    def test_register_duplicate_username(self, test_db, test_user_data):
+        """Test registration with duplicate username"""
+        setup_first_admin()
+        # Register first user
+        response1 = client.post("/api/auth/register", json=test_user_data)
+        assert response1.status_code == 200
+
+        # Try to register same username again
+        response2 = client.post("/api/auth/register", json=test_user_data)
+        assert response2.status_code == 200
+        data = response2.json()
+        assert data["success"] is False
+        assert data["message"] == "Username already exists"
+
+    def test_register_duplicate_email(self, test_db, test_user_data):
+        """Test registration with duplicate email"""
+        setup_first_admin()
+        response1 = client.post("/api/auth/register", json=test_user_data)
+        assert response1.status_code == 200
+
+        duplicate_email_data = {
+            "username": "another-user",
+            "email": test_user_data["email"],
+            "password": "anotherpassword123",
+        }
+        response2 = client.post("/api/auth/register", json=duplicate_email_data)
+        assert response2.status_code == 200
+        data = response2.json()
+        assert data["success"] is False
+        assert data["message"] == "Email already exists"
+
+    def test_register_missing_fields(self, test_db):
+        """Test registration with missing fields"""
+        incomplete_data = {
+            "username": "testuser"
+            # Missing password
+        }
+        response = client.post("/api/auth/register", json=incomplete_data)
+        assert response.status_code == 422  # Validation error
+
+    def test_register_requires_email(self, test_db):
+        setup_first_admin()
+        response = client.post(
+            "/api/auth/register",
+            json={"username": "testuser", "password": "testpassword123"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Email is required"
+
+    def test_auth_check_endpoint(self, test_db):
+        """Test auth check endpoint"""
+        response = client.get("/api/auth/check")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["message"] == "Authentication API is working"
+
+    def test_password_hashing(self, test_db, test_user_data):
+        """Test that passwords are properly hashed"""
+        setup_first_admin()
+        # Register user
+        response = client.post("/api/auth/register", json=test_user_data)
+        assert response.status_code == 200
+
+        # Check database directly
+        db = TestingSessionLocal()
+
+        user = (
+            db.query(User).filter(User.username == test_user_data["username"]).first()
+        )
+        assert user is not None
+        assert user.password_hash != test_user_data["password"]  # Should be hashed
+        assert str(user.password_hash).startswith("$2b$")
+        assert verify_password(test_user_data["password"], str(user.password_hash))
+
+        db.close()
+
+    def test_admin_user_creation(self, test_db, test_admin_data):
+        response = client.post("/api/auth/setup-admin", json=test_admin_data)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        # Check database directly
+        db = TestingSessionLocal()
+
+        admin_user = (
+            db.query(User).filter(User.username == test_admin_data["username"]).first()
+        )
+        assert admin_user is not None
+
+        assert bool(admin_user.is_admin) is True
+        assert admin_user.email == test_admin_data["email"]
+        db.close()
+
+    def test_multiple_users(self, test_db):
+        """Test creating multiple users"""
+        setup_first_admin()
+        users = [
+            {
+                "username": "user1",
+                "email": "user1@example.com",
+                "password": "password1",
+            },
+            {
+                "username": "user2",
+                "email": "user2@example.com",
+                "password": "password2",
+            },
+            {
+                "username": "user3",
+                "email": "user3@example.com",
+                "password": "password3",
+            },
+        ]
+
+        for user_data in users:
+            response = client.post("/api/auth/register", json=user_data)
+            assert response.status_code == 200
+
+        # Verify all users can login
+        for user_data in users:
+            response = client.post("/api/auth/login", json=user_data)
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["user"]["username"] == user_data["username"]
+
+    def test_setup_status_before_and_after_setup(self, test_db):
+        status_before = client.get("/api/auth/setup-status")
+        assert status_before.status_code == 200
+        data_before = status_before.json()
+        assert data_before["needs_setup"] is True
+        assert data_before["password_min_length"] == auth_api.PASSWORD_MIN_LENGTH
+
+        setup_first_admin()
+
+        status_after = client.get("/api/auth/setup-status")
+        assert status_after.status_code == 200
+        data_after = status_after.json()
+        assert data_after["initialized"] is True
+        assert data_after["needs_setup"] is False
+
+    def test_setup_admin_rejected_after_initialized(self, test_db):
+        setup_first_admin()
+        response = client.post(
+            "/api/auth/setup-admin",
+            json={
+                "username": "root2",
+                "email": "root2@example.com",
+                "password": "root2345",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Setup already completed"
+
+    def test_forgot_password_and_reset_password(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        assert register_response.json()["success"] is True
+
+        sent_payload: dict[str, str] = {}
+
+        def fake_send_password_reset_email(
+            to_email: str, reset_link: str, app_name: str
+        ) -> None:
+            sent_payload["to_email"] = to_email
+            sent_payload["reset_link"] = reset_link
+            sent_payload["app_name"] = app_name
+
+        monkeypatch.setattr(
+            "xagent.web.api.auth.send_password_reset_email",
+            fake_send_password_reset_email,
+        )
+        monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com")
+
+        forgot_response = client.post(
+            "/api/auth/forgot-password", json={"email": test_user_data["email"]}
+        )
+        assert forgot_response.status_code == 200
+        forgot_data = forgot_response.json()
+        assert forgot_data["success"] is True
+        assert (
+            forgot_data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+        assert sent_payload["to_email"] == test_user_data["email"]
+        assert sent_payload["reset_link"].startswith(
+            "https://app.example.com/reset-password#token="
+        )
+        assert urlparse(sent_payload["reset_link"]).query == ""
+
+        token = parse_qs(urlparse(sent_payload["reset_link"]).fragment).get(
+            "token", [""]
+        )[0]
+        assert token
+        reset_response = client.post(
+            "/api/auth/reset-password",
+            json={"token": token, "new_password": "newpassword123"},
+        )
+        assert reset_response.status_code == 200
+        reset_data = reset_response.json()
+        assert reset_data["success"] is True
+
+        login_response = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["username"],
+                "password": "newpassword123",
+            },
+        )
+        assert login_response.status_code == 200
+
+    def test_forgot_password_unknown_email_returns_generic_success(
+        self, test_db, monkeypatch
+    ):
+        setup_first_admin()
+
+        def fail_if_called(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("email sender should not be called")
+
+        monkeypatch.setattr(
+            "xagent.web.api.auth.send_password_reset_email",
+            fail_if_called,
+        )
+
+        response = client.post(
+            "/api/auth/forgot-password", json={"email": "unknown@example.com"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert (
+            data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+
+    def test_forgot_password_ignores_origin_header_for_reset_link(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        sent_payload: dict[str, str] = {}
+
+        def fake_send_password_reset_email(
+            to_email: str, reset_link: str, app_name: str
+        ) -> None:
+            sent_payload["to_email"] = to_email
+            sent_payload["reset_link"] = reset_link
+            sent_payload["app_name"] = app_name
+
+        monkeypatch.setattr(
+            "xagent.web.api.auth.send_password_reset_email",
+            fake_send_password_reset_email,
+        )
+        monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://trusted.example/app/")
+
+        response = client.post(
+            "/api/auth/forgot-password",
+            json={"email": test_user_data["email"]},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert response.status_code == 200
+        assert sent_payload["to_email"] == test_user_data["email"]
+        parsed_link = urlparse(sent_payload["reset_link"])
+        assert parsed_link.scheme == "https"
+        assert parsed_link.netloc == "trusted.example"
+        assert parsed_link.path == "/app/reset-password"
+        assert parsed_link.query == ""
+        assert "token" in parse_qs(parsed_link.fragment)
+
+    def test_forgot_password_delivery_failure_returns_generic_success(
+        self, test_db, test_user_data, monkeypatch, caplog
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        monkeypatch.delenv("XAGENT_APP_BASE_URL", raising=False)
+
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="xagent.web.api.auth"):
+            response = client.post(
+                "/api/auth/forgot-password",
+                json={"email": test_user_data["email"]},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert (
+            data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+        assert any(
+            "Failed to send password reset email" in r.message for r in caplog.records
+        )
+
+    def test_register_rejects_email_shaped_username(self, test_db):
+        setup_first_admin()
+
+        response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "person@example.com",
+                "email": "newperson@example.org",
+                "password": "password123",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Username cannot be an email address"
+
+    def test_register_rejects_email_colliding_with_existing_legacy_username(
+        self, test_db
+    ):
+        setup_first_admin()
+        db = TestingSessionLocal()
+        db.add(
+            User(
+                username="legacy@example.com",
+                email="legacy-user@example.com",
+                password_hash=hash_password("password123"),
+                is_admin=False,
+            )
+        )
+        db.commit()
+        db.close()
+
+        conflict_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "another-user",
+                "email": "legacy@example.com",
+                "password": "password123",
+            },
+        )
+        assert conflict_response.status_code == 200
+        conflict_data = conflict_response.json()
+        assert conflict_data["success"] is False
+        assert conflict_data["message"] == "Email conflicts with an existing username"
+
+    def test_update_current_user_email_rejects_existing_legacy_username_namespace(
+        self, test_db
+    ):
+        setup_first_admin()
+        db = TestingSessionLocal()
+        db.add(
+            User(
+                username="legacy@example.com",
+                email="legacy-existing@example.com",
+                password_hash=hash_password("password123"),
+                is_admin=False,
+            )
+        )
+        db.commit()
+        db.close()
+
+        client.post(
+            "/api/auth/register",
+            json={
+                "username": "updater",
+                "email": "updater@example.com",
+                "password": "password123",
+            },
+        )
+
+        token = login_and_get_token("updater", "password123")
+        conflict_response = client.patch(
+            "/api/auth/email",
+            json={
+                "email": "legacy@example.com",
+                "current_password": "password123",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert conflict_response.status_code == 200
+        conflict_data = conflict_response.json()
+        assert conflict_data["success"] is False
+        assert conflict_data["message"] == "Email conflicts with an existing username"
+
+    def test_login_prefers_email_lookup_when_identifier_is_email(self, test_db):
+        setup_first_admin()
+        db = TestingSessionLocal()
+        email_user = User(
+            username="email-owner",
+            email="shared@example.com",
+            password_hash=hash_password("email-password"),
+            is_admin=False,
+        )
+        conflicting_username_user = User(
+            username="shared@example.com",
+            email="other@example.com",
+            password_hash=hash_password("username-password"),
+            is_admin=False,
+        )
+        db.add(email_user)
+        db.add(conflicting_username_user)
+        db.commit()
+        db.close()
+
+        response = client.post(
+            "/api/auth/login",
+            json={"username": "shared@example.com", "password": "email-password"},
+        )
+        assert response.status_code == 200
+        assert response.json()["user"]["username"] == "email-owner"
+
+    def test_register_switch_requires_admin(self, test_db):
+        setup_first_admin()
+
+        client.post(
+            "/api/auth/register",
+            json={
+                "username": "normal",
+                "email": "normal@example.com",
+                "password": "normal123",
+            },
+        )
+        normal_token = login_and_get_token("normal", "normal123")
+
+        response = client.patch(
+            "/api/auth/register-switch",
+            json={"enabled": False},
+            headers={"Authorization": f"Bearer {normal_token}"},
+        )
+        assert response.status_code == 403
+
+    def test_register_switch_disables_registration(self, test_db):
+        setup_first_admin()
+        admin_token = login_and_get_token("administrator", "admin123")
+
+        disable_response = client.patch(
+            "/api/auth/register-switch",
+            json={"enabled": False},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert disable_response.status_code == 200
+        assert disable_response.json()["registration_enabled"] is False
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "blocked",
+                "email": "blocked@example.com",
+                "password": "blocked123",
+            },
+        )
+        assert register_response.status_code == 200
+        data = register_response.json()
+        assert data["success"] is False
+        assert data["message"] == "Registration is disabled"

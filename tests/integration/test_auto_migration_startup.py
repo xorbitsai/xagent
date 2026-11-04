@@ -1,0 +1,1993 @@
+"""Integration tests for automatic LanceDB migration on application startup.
+
+This module tests the automatic migration logic that runs during application
+startup to add user_id fields to existing LanceDB tables.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+import tempfile
+import threading
+from types import ModuleType
+
+import pyarrow as pa
+import pytest
+
+from xagent.core.tools.core.RAG_tools.core.config import MIN_INT64
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    check_table_needs_migration,
+)
+from xagent.migrations.lancedb.backfill_user_id import (
+    ORPHANED_PERMANENT,
+    ORPHANED_TEMPORARY,
+    backfill_all,
+    backfill_chunks_table,
+    backfill_orphaned_chunks,
+    backfill_orphaned_embeddings,
+)
+from xagent.providers.vector_store.lancedb import get_connection_from_env
+from xagent.sandbox.base import SandboxRuntimeConflictError
+
+
+def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid chat-channel startup work in migration tests.
+
+    ``startup_event`` optionally starts the Telegram, Feishu, and Slack managers.
+
+    We inject lightweight stub modules into ``sys.modules`` instead of
+    ``monkeypatch.setattr("...telegram.bot...", ...)``, because importing the real
+    ``telegram.bot`` or ``feishu.bot`` pulls optional dependencies.
+    """
+
+    class _FakeTelegramChannel:
+        enabled = False
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    class _FakeChannelManager:
+        enabled = False  # Disabled to prevent task creation in tests
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    # Create fake telegram.bot module
+    fake_telegram_bot = ModuleType("xagent.web.channels.telegram.bot")
+    fake_telegram_bot.get_telegram_channel = lambda: _FakeTelegramChannel()
+    monkeypatch.setitem(
+        sys.modules, "xagent.web.channels.telegram.bot", fake_telegram_bot
+    )
+
+    # Create fake feishu.bot module
+    fake_feishu_bot = ModuleType("xagent.web.channels.feishu.bot")
+    fake_feishu_bot.get_feishu_channel = lambda: _FakeChannelManager()
+    monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", fake_feishu_bot)
+
+    fake_slack_bot = ModuleType("xagent.web.channels.slack.bot")
+    fake_slack_bot.get_slack_channel = lambda: _FakeChannelManager()
+    monkeypatch.setitem(sys.modules, "xagent.web.channels.slack.bot", fake_slack_bot)
+
+
+def _patch_task_command_dispatcher_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep LanceDB startup tests isolated from the durable DB dispatcher."""
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.start_task_command_dispatcher",
+        lambda _executor: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def unregister_startup_task_extensions():
+    """Undo the task extensions ``startup_event()`` registers.
+
+    These tests call ``startup_event()`` without the matching shutdown, so the
+    providers it registers (e.g. ``local_browser``) would otherwise stay in the
+    process-wide registry and send later tests down the provider branch.
+    """
+    from xagent.web.services.task_runtime import (
+        registered_task_extensions,
+        unregister_task_extension,
+    )
+
+    before = set(registered_task_extensions())
+    yield
+    for name in registered_task_extensions():
+        if name not in before:
+            unregister_task_extension(name)
+
+
+@pytest.fixture
+def temp_lancedb_dir():
+    """Create a temporary directory for LanceDB."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        original_env = os.environ.get("LANCEDB_DIR")
+        os.environ["LANCEDB_DIR"] = temp_dir
+        yield temp_dir
+        if original_env is not None:
+            os.environ["LANCEDB_DIR"] = original_env
+        else:
+            os.environ.pop("LANCEDB_DIR", None)
+
+
+def test_auto_migration_detects_old_schema(temp_lancedb_dir):
+    """Test that auto-migration detects tables with old schema (missing user_id)."""
+    conn = get_connection_from_env()
+
+    # Create tables with old schema (without user_id)
+    old_chunks_schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("chunk_id", pa.string()),
+            pa.field("text", pa.large_string()),
+            pa.field("metadata", pa.string()),
+        ]
+    )
+    conn.create_table("chunks", schema=old_chunks_schema)
+
+    old_docs_schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("source_path", pa.string()),
+        ]
+    )
+    conn.create_table("documents", schema=old_docs_schema)
+
+    # Verify that migration is needed
+    assert check_table_needs_migration(conn, "chunks") is True
+    assert check_table_needs_migration(conn, "documents") is True
+
+
+def test_auto_migration_skips_new_schema(temp_lancedb_dir):
+    """Test that auto-migration skips tables with new schema (has user_id)."""
+    conn = get_connection_from_env()
+
+    # Create tables with new schema (with user_id)
+    new_chunks_schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("chunk_id", pa.string()),
+            pa.field("text", pa.large_string()),
+            pa.field("metadata", pa.string()),
+            pa.field("user_id", pa.int32(), nullable=True),
+        ]
+    )
+    conn.create_table("chunks", schema=new_chunks_schema)
+
+    # Verify that no migration is needed
+    assert check_table_needs_migration(conn, "chunks") is False
+
+
+def test_auto_migration_handles_missing_tables(temp_lancedb_dir):
+    """Test that auto-migration handles non-existent tables gracefully."""
+    conn = get_connection_from_env()
+
+    # Check non-existent tables
+    assert check_table_needs_migration(conn, "nonexistent_table") is False
+    assert check_table_needs_migration(conn, "chunks") is False
+    assert check_table_needs_migration(conn, "documents") is False
+
+
+def test_migration_detection_for_multiple_tables(temp_lancedb_dir):
+    """Test that migration detection works correctly for multiple tables."""
+    conn = get_connection_from_env()
+
+    # Create multiple tables with old schema
+    old_schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("text", pa.string()),
+        ]
+    )
+
+    conn.create_table("chunks", schema=old_schema)
+    conn.create_table("documents", schema=old_schema)
+    conn.create_table("parses", schema=old_schema)
+
+    # All should need migration
+    assert check_table_needs_migration(conn, "chunks") is True
+    assert check_table_needs_migration(conn, "documents") is True
+    assert check_table_needs_migration(conn, "parses") is True
+
+    # Non-existent table should not need migration
+    assert check_table_needs_migration(conn, "nonexistent") is False
+
+
+def test_auto_migration_handles_embeddings_tables(temp_lancedb_dir):
+    """Test that auto-migration detects embeddings tables correctly."""
+    conn = get_connection_from_env()
+
+    # Create embeddings table with old schema
+    old_embeddings_schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("chunk_id", pa.string()),
+            pa.field("vector", pa.list_(pa.float32())),
+            pa.field("text", pa.large_string()),
+        ]
+    )
+    conn.create_table("embeddings_test_model", schema=old_embeddings_schema)
+
+    # Verify that migration is needed
+    assert check_table_needs_migration(conn, "embeddings_test_model") is True
+
+    # Create embeddings table with new schema
+    new_embeddings_schema = pa.schema(
+        [
+            pa.field("collection", pa.string()),
+            pa.field("doc_id", pa.string()),
+            pa.field("chunk_id", pa.string()),
+            pa.field("vector", pa.list_(pa.float32())),
+            pa.field("text", pa.large_string()),
+            pa.field("user_id", pa.int32(), nullable=True),
+        ]
+    )
+    conn.create_table("embeddings_test_model_new", schema=new_embeddings_schema)
+
+    # Verify that no migration is needed
+    assert check_table_needs_migration(conn, "embeddings_test_model_new") is False
+
+
+def test_two_phase_migration_recovers_orphaned_records(temp_lancedb_dir):
+    """Test that two-phase migration recovers orphaned records when documents are created after chunks."""
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        ensure_chunks_table,
+        ensure_documents_table,
+    )
+
+    conn = get_connection_from_env()
+
+    # Create chunks table using ensure_chunks_table (creates proper schema)
+    ensure_chunks_table(conn)
+    ensure_documents_table(conn)
+
+    # Add some chunks without user_id (simulating old data)
+    chunks_table = conn.open_table("chunks")
+    chunks_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_1",
+                "parse_hash": "hash1",
+                "chunk_id": "chunk_1",
+                "index": 0,
+                "text": "Test chunk 1",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch1",
+                "config_hash": "cfg1",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            },
+            {
+                "collection": "test",
+                "doc_id": "doc_2",
+                "parse_hash": "hash2",
+                "chunk_id": "chunk_2",
+                "index": 0,
+                "text": "Test chunk 2",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch2",
+                "config_hash": "cfg2",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            },
+        ]
+    )
+
+    # Phase 1: Run migration - chunks should be marked as orphaned (user_id = ORPHANED_TEMPORARY)
+    result_phase1 = backfill_chunks_table(dry_run=False, conn=conn)
+    assert result_phase1["skipped"] == 2  # Both chunks orphaned in phase 1
+    assert result_phase1["backfilled"] == 0
+
+    # Verify that chunks are marked with ORPHANED_TEMPORARY after Phase 1
+    phase1_chunks = conn.open_table("chunks").search().to_arrow()
+    phase1_chunk_data = phase1_chunks.to_pylist()
+    for chunk in phase1_chunk_data:
+        assert (
+            chunk["user_id"] == ORPHANED_TEMPORARY
+        )  # Should be marked as temporary orphan
+
+    # Now add documents (simulating concurrent document creation)
+    docs_table = conn.open_table("documents")
+    docs_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_1",
+                "source_path": "/path/doc1.txt",
+                "file_type": "txt",
+                "content_hash": "h1",
+                "uploaded_at": 1700000000000,
+                "title": "Doc 1",
+                "language": "en",
+                "user_id": 100,
+            },
+            {
+                "collection": "test",
+                "doc_id": "doc_2",
+                "source_path": "/path/doc2.txt",
+                "file_type": "txt",
+                "content_hash": "h2",
+                "uploaded_at": 1700000000000,
+                "title": "Doc 2",
+                "language": "en",
+                "user_id": 200,
+            },
+        ]
+    )
+
+    # Phase 2: Retry orphaned chunks
+    result_phase2 = backfill_orphaned_chunks(dry_run=False, conn=conn)
+
+    # Verify that orphaned chunks were recovered
+    assert result_phase2["backfilled"] == 2  # Both chunks recovered
+    assert result_phase2["skipped"] == 0  # No longer orphaned
+
+    # Verify final state
+    final_chunks = conn.open_table("chunks").search().to_arrow()
+    assert len(final_chunks) == 2
+    # Check that user_id values are correct
+    chunk_user_ids = final_chunks.to_pylist()
+    doc_1_chunk = next(c for c in chunk_user_ids if c["doc_id"] == "doc_1")
+    doc_2_chunk = next(c for c in chunk_user_ids if c["doc_id"] == "doc_2")
+    assert doc_1_chunk["user_id"] == 100
+    assert doc_2_chunk["user_id"] == 200
+
+
+def test_two_phase_migration_handles_permanently_orphaned_records(temp_lancedb_dir):
+    """Test that permanently orphaned records (no matching document ever exists) are marked correctly."""
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        ensure_chunks_table,
+        ensure_documents_table,
+    )
+
+    conn = get_connection_from_env()
+
+    # Create chunks and documents tables
+    ensure_chunks_table(conn)
+    ensure_documents_table(conn)
+
+    # Add a chunk with a doc_id that will never have a matching document
+    chunks_table = conn.open_table("chunks")
+    chunks_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "deleted_doc",
+                "parse_hash": "hash_deleted",
+                "chunk_id": "orphaned_chunk",
+                "index": 0,
+                "text": "This chunk has no matching document",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch_deleted",
+                "config_hash": "cfg_deleted",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            }
+        ]
+    )
+
+    # Run full migration (both phases)
+    result = backfill_all(dry_run=False, conn=conn)
+
+    # Verify results
+    assert result["chunks"]["backfilled"] == 0  # No chunks backfilled
+    assert result["chunks"]["skipped"] == 1  # One chunk permanently orphaned
+
+    # Verify the chunk is marked with user_id = ORPHANED_PERMANENT
+    final_chunks = conn.open_table("chunks").search().to_arrow()
+    chunk_data = final_chunks.to_pylist()[0]
+    assert chunk_data["user_id"] == ORPHANED_PERMANENT  # Marked as permanently orphaned
+
+
+def test_two_phase_migration_with_mixed_scenarios(temp_lancedb_dir):
+    """Test two-phase migration with a mix of normal, temporarily orphaned, and permanently orphaned records."""
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        ensure_chunks_table,
+        ensure_documents_table,
+    )
+
+    conn = get_connection_from_env()
+
+    # Create chunks and documents tables
+    ensure_chunks_table(conn)
+    ensure_documents_table(conn)
+
+    # Add documents for doc_1 and doc_3 (doc_2 will be added later, doc_4 never exists)
+    docs_table = conn.open_table("documents")
+    docs_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_1",
+                "source_path": "/path/doc1.txt",
+                "file_type": "txt",
+                "content_hash": "h1",
+                "uploaded_at": 1700000000000,
+                "title": "Doc 1",
+                "language": "en",
+                "user_id": 100,
+            },
+            {
+                "collection": "test",
+                "doc_id": "doc_3",
+                "source_path": "/path/doc3.txt",
+                "file_type": "txt",
+                "content_hash": "h3",
+                "uploaded_at": 1700000000000,
+                "title": "Doc 3",
+                "language": "en",
+                "user_id": 300,
+            },
+        ]
+    )
+
+    # Add chunks with proper schema
+    chunks_table = conn.open_table("chunks")
+    chunks_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_1",
+                "parse_hash": "hash1",
+                "chunk_id": "chunk_1",
+                "index": 0,
+                "text": "Chunk with doc",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch1",
+                "config_hash": "cfg1",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            },
+            {
+                "collection": "test",
+                "doc_id": "doc_2",
+                "parse_hash": "hash2",
+                "chunk_id": "chunk_2",
+                "index": 0,
+                "text": "Chunk without doc yet",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch2",
+                "config_hash": "cfg2",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            },
+            {
+                "collection": "test",
+                "doc_id": "doc_3",
+                "parse_hash": "hash3",
+                "chunk_id": "chunk_3",
+                "index": 0,
+                "text": "Another chunk with doc",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch3",
+                "config_hash": "cfg3",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            },
+            {
+                "collection": "test",
+                "doc_id": "doc_4",
+                "parse_hash": "hash4",
+                "chunk_id": "chunk_4",
+                "index": 0,
+                "text": "Chunk with deleted doc",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch4",
+                "config_hash": "cfg4",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            },
+        ]
+    )
+
+    # Phase 1: Initial migration
+    result_phase1 = backfill_chunks_table(dry_run=False, conn=conn)
+
+    # chunk_1 and chunk_3 should be backfilled
+    # chunk_2 and chunk_4 should be marked orphaned
+    assert result_phase1["backfilled"] == 2
+    assert result_phase1["skipped"] == 2
+
+    # Verify that chunk_2 and chunk_4 are marked with ORPHANED_TEMPORARY after Phase 1
+    phase1_chunks = conn.open_table("chunks").search().to_arrow()
+    phase1_chunk_data = phase1_chunks.to_pylist()
+    chunk_2_phase1 = next(c for c in phase1_chunk_data if c["chunk_id"] == "chunk_2")
+    chunk_4_phase1 = next(c for c in phase1_chunk_data if c["chunk_id"] == "chunk_4")
+    assert chunk_2_phase1["user_id"] == ORPHANED_TEMPORARY
+    assert chunk_4_phase1["user_id"] == ORPHANED_TEMPORARY
+
+    # Now add document for doc_2 (simulating late-arriving document)
+    docs_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_2",
+                "source_path": "/path/doc2.txt",
+                "file_type": "txt",
+                "content_hash": "h2",
+                "uploaded_at": 1700000000000,
+                "title": "Doc 2",
+                "language": "en",
+                "user_id": 200,
+            }
+        ]
+    )
+
+    # Phase 2: Retry orphaned chunks
+    result_phase2 = backfill_orphaned_chunks(dry_run=False, conn=conn)
+
+    # chunk_2 should be recovered
+    # chunk_4 remains orphaned
+    assert result_phase2["backfilled"] == 1
+    assert result_phase2["skipped"] == 1
+
+    # Verify final state
+    final_chunks = conn.open_table("chunks").search().to_arrow()
+    chunk_data = final_chunks.to_pylist()
+
+    # Find each chunk and verify user_id
+    chunk_1 = next(c for c in chunk_data if c["chunk_id"] == "chunk_1")
+    chunk_2 = next(c for c in chunk_data if c["chunk_id"] == "chunk_2")
+    chunk_3 = next(c for c in chunk_data if c["chunk_id"] == "chunk_3")
+    chunk_4 = next(c for c in chunk_data if c["chunk_id"] == "chunk_4")
+
+    assert chunk_1["user_id"] == 100  # Backfilled in phase 1
+    assert chunk_2["user_id"] == 200  # Recovered in phase 2
+    assert chunk_3["user_id"] == 300  # Backfilled in phase 1
+    assert chunk_4["user_id"] == ORPHANED_PERMANENT  # Permanently orphaned
+
+
+def test_two_phase_migration_with_no_orphaned_records(temp_lancedb_dir):
+    """Test that phase 2 is skipped when there are no orphaned records."""
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        ensure_chunks_table,
+        ensure_documents_table,
+    )
+
+    conn = get_connection_from_env()
+
+    # Create chunks and documents tables
+    ensure_chunks_table(conn)
+    ensure_documents_table(conn)
+
+    # Add document and chunk
+    docs_table = conn.open_table("documents")
+    docs_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_1",
+                "source_path": "/path/doc1.txt",
+                "file_type": "txt",
+                "content_hash": "h1",
+                "uploaded_at": 1700000000000,
+                "title": "Doc 1",
+                "language": "en",
+                "user_id": 100,
+            }
+        ]
+    )
+
+    chunks_table = conn.open_table("chunks")
+    chunks_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_1",
+                "parse_hash": "hash1",
+                "chunk_id": "chunk_1",
+                "index": 0,
+                "text": "Test chunk",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch1",
+                "config_hash": "cfg1",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": None,
+            }
+        ]
+    )
+
+    # Run full migration
+    result = backfill_all(dry_run=False, conn=conn)
+
+    # All records should be backfilled in phase 1, phase 2 should be skipped
+    assert result["chunks"]["backfilled"] == 1
+    assert result["chunks"]["skipped"] == 0  # No orphaned records
+    assert result["chunks"].get("failed", 0) == 0
+
+    # Verify final state
+    final_chunks = conn.open_table("chunks").search().to_arrow()
+    chunk_data = final_chunks.to_pylist()[0]
+    assert chunk_data["user_id"] == 100
+
+
+def test_backfill_all_remaps_legacy_minus_one_orphans(temp_lancedb_dir):
+    """Legacy -1 orphan markers are remapped and then retried in phase 2."""
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        ensure_chunks_table,
+        ensure_documents_table,
+    )
+
+    conn = get_connection_from_env()
+    ensure_chunks_table(conn)
+    ensure_documents_table(conn)
+
+    docs_table = conn.open_table("documents")
+    docs_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_legacy",
+                "source_path": "/path/doc_legacy.txt",
+                "file_type": "txt",
+                "content_hash": "hash_legacy",
+                "uploaded_at": 1700000000000,
+                "title": "Legacy Doc",
+                "language": "en",
+                "user_id": 777,
+            }
+        ]
+    )
+
+    chunks_table = conn.open_table("chunks")
+    chunks_table.add(
+        [
+            {
+                "collection": "test",
+                "doc_id": "doc_legacy",
+                "parse_hash": "hash_legacy",
+                "chunk_id": "chunk_legacy",
+                "index": 0,
+                "text": "legacy orphaned chunk",
+                "page_number": 1,
+                "section": "",
+                "anchor": "",
+                "json_path": "",
+                "chunk_hash": "ch_legacy",
+                "config_hash": "cfg_legacy",
+                "created_at": 1700000000000,
+                "metadata": "{}",
+                "user_id": -1,  # historical transitional value
+            }
+        ]
+    )
+
+    result = backfill_all(dry_run=False, conn=conn)
+
+    # Legacy -1 rows should be remapped to MIN_INT64 then recovered in phase 2.
+    assert result["chunks"]["backfilled"] == 1
+    assert result["chunks"]["skipped"] == 0
+
+    final_chunks = conn.open_table("chunks").search().to_arrow().to_pylist()
+    assert len(final_chunks) == 1
+    assert final_chunks[0]["user_id"] == 777
+    assert final_chunks[0]["user_id"] != -1
+    assert final_chunks[0]["user_id"] != MIN_INT64
+
+
+def test_phase2_ensures_tables_exist(temp_lancedb_dir):
+    """Phase 2 helpers should be callable without prior Phase 1 table creation."""
+    conn = get_connection_from_env()
+
+    # Should not raise even if tables don't exist yet.
+    res_chunks = backfill_orphaned_chunks(dry_run=True, conn=conn)
+    assert res_chunks["table"] == "chunks"
+
+    res_embeddings = backfill_orphaned_embeddings(dry_run=True, conn=conn)
+    assert res_embeddings["table"] == "embeddings"
+
+
+@pytest.mark.asyncio
+async def test_startup_event_skips_when_auto_migrate_disabled(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """Startup should not create migration task when auto migration is disabled."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            return False
+
+        async def cleanup(self) -> None:
+            return None
+
+        async def warmup(self) -> None:
+            return None
+
+    class _FakeConn:
+        pass
+
+    migration_called = {"value": False}
+    lease_recovery_starts = []
+    runtime_start_order: list[str] = []
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    task_execution_module = importlib.import_module(
+        "xagent.web.services.task_execution"
+    )
+    monkeypatch.setattr(
+        task_execution_module.background_task_manager,
+        "start_accepting",
+        lambda: runtime_start_order.append("admission"),
+    )
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "start_trigger_dispatcher_task",
+        lambda _app: runtime_start_order.append("trigger"),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "start_task_lease_recovery_task",
+        lambda app_instance: lease_recovery_starts.append(app_instance),
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.check_table_needs_migration",
+        lambda _conn, table_name: table_name == "chunks",
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.list_embeddings_table_names",
+        lambda _conn: [],
+    )
+
+    def _fake_backfill_all(*, dry_run: bool = False, conn=None) -> dict:
+        migration_called["value"] = True
+        return {
+            "chunks": {"backfilled": 1, "skipped": 0, "failed": 0},
+            "embeddings": {"backfilled": 0, "skipped": 0, "failed": 0},
+            "locked": True,
+        }
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(
+        "xagent.migrations.lancedb.backfill_user_id.backfill_all",
+        _fake_backfill_all,
+    )
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+    monkeypatch.setattr(
+        web_app_module,
+        "start_app_process_diagnostics",
+        lambda _app: runtime_start_order.append("diagnostics"),
+    )
+
+    await web_app_module.startup_event()
+    if created_tasks:
+        await asyncio.gather(*created_tasks)
+
+    assert created_tasks == []
+    assert migration_called["value"] is False
+    assert lease_recovery_starts == [web_app_module.app]
+    assert runtime_start_order == ["admission", "trigger", "diagnostics"]
+
+
+@pytest.mark.asyncio
+async def test_startup_event_triggers_background_auto_migration(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """Startup should create task and execute backfill when enabled and needed."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            return False
+
+        async def cleanup(self) -> None:
+            return None
+
+        async def warmup(self) -> None:
+            return None
+
+    class _FakeConn:
+        pass
+
+    migration_called = {"value": False}
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.check_table_needs_migration",
+        lambda _conn, table_name: table_name == "chunks",
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.list_embeddings_table_names",
+        lambda _conn: [],
+    )
+
+    def _fake_backfill_all(*, dry_run: bool = False, conn=None) -> dict:
+        migration_called["value"] = True
+        return {
+            "chunks": {"backfilled": 1, "skipped": 0, "failed": 0},
+            "embeddings": {"backfilled": 0, "skipped": 0, "failed": 0},
+            "locked": True,
+        }
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(
+        "xagent.migrations.lancedb.backfill_user_id.backfill_all",
+        _fake_backfill_all,
+    )
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+
+    # The cleanup task itself is gated off under pytest (it walks the real
+    # uploads tree), so it contributes no entry to created_tasks and the count
+    # assertion below cannot see it. Spy on the call site so deleting it from
+    # startup_event fails a test instead of silently disabling the sweep in
+    # production.
+    cleanup_scheduled: list[object] = []
+
+    def _spy_start_temp_file_cleanup_task(app_instance):
+        cleanup_scheduled.append(app_instance)
+        return None
+
+    monkeypatch.setattr(
+        web_app_module,
+        "start_temp_file_cleanup_task",
+        _spy_start_temp_file_cleanup_task,
+    )
+
+    await web_app_module.startup_event()
+    if created_tasks:
+        await asyncio.gather(*created_tasks)
+
+    # We expect 2 tasks: backfill migration + uploaded files reconcile. The
+    # orphaned temp-file cleanup task is gated off under pytest (it walks the
+    # real uploads tree); its wiring/shutdown lifecycle is covered directly by
+    # test_shutdown_event_stops_temp_file_cleanup_without_cancel below.
+    assert len(created_tasks) == 2
+    assert migration_called["value"] is True
+    assert cleanup_scheduled == [web_app_module.app]
+
+
+@pytest.mark.asyncio
+async def test_startup_event_no_task_when_no_table_needs_migration(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """Startup should not create migration task when no table needs migration."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            return False
+
+        async def cleanup(self) -> None:
+            return None
+
+        async def warmup(self) -> None:
+            return None
+
+    class _FakeConn:
+        pass
+
+    migration_called = {"value": False}
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.check_table_needs_migration",
+        lambda _conn, _table_name: False,
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.list_embeddings_table_names",
+        lambda _conn: [],
+    )
+
+    def _fake_backfill_all(*, dry_run: bool = False, conn=None) -> dict:
+        migration_called["value"] = True
+        return {
+            "chunks": {"backfilled": 0, "skipped": 0, "failed": 0},
+            "embeddings": {"backfilled": 0, "skipped": 0, "failed": 0},
+            "locked": True,
+        }
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(
+        "xagent.migrations.lancedb.backfill_user_id.backfill_all",
+        _fake_backfill_all,
+    )
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+
+    await web_app_module.startup_event()
+    if created_tasks:
+        await asyncio.gather(*created_tasks)
+
+    # We expect 1 task: uploaded files reconcile (runs under auto_migrate even
+    # without migration needs). The orphaned temp-file cleanup task is gated off
+    # under pytest; its lifecycle is covered by the dedicated shutdown test.
+    assert len(created_tasks) == 1
+    assert migration_called["value"] is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Shutdown must signal the cleanup stop flag first and NOT cancel the task.
+
+    Covers the two round-2 majors on the shutdown path: the stop flag is set
+    before any other teardown (so an earlier hang cannot strand the executor
+    thread), and the task is awaited via asyncio.wait rather than cancelled.
+
+    On the happy path (the walk finishes almost immediately) asyncio.wait and
+    asyncio.wait_for behave identically, so that alone can't tell them apart --
+    a prior version of this test made exactly that mistake. The walk task
+    below deliberately blocks past a (monkeypatched, tiny) shutdown timeout
+    without checking `stop`, forcing a genuine timeout: asyncio.wait leaves
+    the task pending past it, while asyncio.wait_for would cancel it.
+    """
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    async def _anoop(*args, **kwargs):
+        return None
+
+    def _noop(*args, **kwargs):
+        return None
+
+    # Neutralize the unrelated teardown steps so only the temp-cleanup stop/await
+    # path is exercised.
+    for name in (
+        "stop_orphan_upload_gc_task",
+        "stop_uploaded_file_recovery_task",
+        "stop_task_lease_recovery_task",
+    ):
+        monkeypatch.setattr(web_app_module, name, _anoop)
+    monkeypatch.setattr(web_app_module, "unregister_local_browser_runtime", _noop)
+    for name in (
+        "_task_command_dispatcher_task",
+        "_sandbox_idle_sweep_task",
+        "_file_storage_startup_sync_task",
+        "_trigger_dispatcher_task",
+        "_migration_task",
+    ):
+        monkeypatch.setattr(web_app_module, name, None)
+
+    class _FakeBackgroundTaskManager:
+        async def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution.background_task_manager",
+        _FakeBackgroundTaskManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_lease_service.wait_for_heartbeat_manager_idle",
+        _anoop,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_runtime.shutdown_task_runtime_hook_executor",
+        _noop,
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: None,
+    )
+
+    # Real but tiny, so the wait genuinely times out without slowing the suite.
+    monkeypatch.setattr(
+        web_app_module,
+        "get_temp_file_cleanup_shutdown_timeout_seconds",
+        lambda: 0.05,
+    )
+
+    stop = threading.Event()
+    flush_saw_stop = {}
+
+    def _spy_flush() -> None:
+        # N2: the stop flag must already be set by the time the first teardown
+        # step (flush_langfuse) runs.
+        flush_saw_stop["set"] = stop.is_set()
+
+    monkeypatch.setattr(web_app_module, "flush_langfuse", _spy_flush)
+
+    started = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def _cooperative_walk() -> None:
+        started.set()
+        # Simulate being mid-scan, past the point where `stop` would next be
+        # polled, until the test releases `resume` below -- this is what
+        # forces the shutdown wait to genuinely time out.
+        await resume.wait()
+
+    task = asyncio.create_task(_cooperative_walk())
+    await started.wait()
+
+    app.state.temp_file_cleanup_stop = stop
+    app.state.temp_file_cleanup_task = task
+
+    await web_app_module.shutdown_event()
+
+    try:
+        assert flush_saw_stop["set"] is True
+        assert stop.is_set()
+        # The timeout above genuinely elapsed while the walk was still blocked on
+        # `resume`. asyncio.wait_for would have cancelled the task by now;
+        # asyncio.wait leaves it running, untouched.
+        assert not task.done()
+        assert not task.cancelled()
+        # The walk outlived the bounded wait, so its handles must be RETAINED.
+        # Clearing them here would discard the only stop handle and let a
+        # re-entrant startup schedule a second concurrent sweep over the same
+        # tree -- the exact case start_temp_file_cleanup_task's guard exists for.
+        assert app.state.temp_file_cleanup_task is task
+        assert app.state.temp_file_cleanup_stop is stop
+
+        resume.set()
+        await task
+
+        # Once the walk has actually finished, a later shutdown releases them.
+        await web_app_module.shutdown_event()
+        assert app.state.temp_file_cleanup_task is None
+        assert app.state.temp_file_cleanup_stop is None
+    finally:
+        # Never leave a pending task or populated app.state behind for the rest
+        # of the session, even if an assertion above fails.
+        resume.set()
+        if not task.done():
+            await task
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+
+@pytest.mark.asyncio
+async def test_start_temp_file_cleanup_task_wires_stop_event(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The pytest-gated wiring block itself must actually wire things up.
+
+    Regression guard: an earlier commit on this PR asserted
+    app.state.temp_file_cleanup_task is not None and
+    isinstance(app.state.temp_file_cleanup_stop, threading.Event) directly
+    against startup_event(), but those assertions were dropped rather than
+    reworked when the PYTEST_CURRENT_TEST gate was introduced, leaving this
+    block untested. Calling start_temp_file_cleanup_task directly (rather
+    than the full startup_event) exercises its own pytest gate without also
+    un-gating the unrelated trigger/lease-recovery/orphan-GC loops that share
+    the same env-var check elsewhere in startup_event.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    seen_stop_events: list[threading.Event] = []
+
+    def _fake_cleanup_orphaned_temp_files(*, stop_event=None) -> int:
+        seen_stop_events.append(stop_event)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _fake_cleanup_orphaned_temp_files,
+    )
+
+    task = web_app_module.start_temp_file_cleanup_task(app)
+    stop_event = app.state.temp_file_cleanup_stop
+
+    assert task is not None
+    assert task is app.state.temp_file_cleanup_task
+    assert isinstance(stop_event, threading.Event)
+
+    await task
+
+    # Pins that the exact stop-event object stored on app.state is the one
+    # actually threaded into the walk -- a wiring bug here would silently
+    # make shutdown's stop signal a no-op.
+    assert seen_stop_events == [stop_event]
+
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """A startup that fails must not leave the sweep walking unsignaled.
+
+    Starlette's default lifespan is an ``async with``: when startup raises,
+    ``__aexit__`` -- and therefore ``shutdown_event`` -- never runs, so the
+    only ``stop_event.set()`` is skipped. Sandbox static readiness raises
+    deliberately on a mount conflict, so the walk would keep sweeping the
+    whole uploads tree in an executor thread that ``asyncio.run()``'s teardown
+    then joins (with no timeout at all before 3.12), turning a fast
+    config-error crash into a multi-minute one.
+
+    Asserts the invariant rather than a call position: after the failure there
+    must be no cleanup task that is both unfinished and unsignaled. Scheduling
+    the sweep only after every failure-prone startup step satisfies it, and so
+    would signalling the flag on the way out.
+
+    The invariant alone is weak here -- today it holds because the sweep is
+    never reached, so ``task is None`` satisfies it -- so this also pins the
+    reason: the induced failure must land *before* the scheduling point. That
+    is the regression worth catching, because moving the scheduling earlier is
+    what would leave a walk running with no way to stop it.
+    """
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            return True
+
+        def requires_host_workspace_access(self) -> bool:
+            return True
+
+        def validate_host_workspace_access(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            return None
+
+        async def warmup(self) -> None:
+            return None
+
+    class _FakeConn:
+        pass
+
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+    real_to_thread = asyncio.to_thread
+
+    # The sweep only runs under the auto-migrate gate, so it has to be on for
+    # the failure path under test to be reachable at all.
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
+    # The same genuine SANDBOX_VOLUMES/code-mount conflict as
+    # test_startup_event_raises_on_readiness_conflict_with_probe_true. Static
+    # readiness runs well before the sweep is scheduled, so this failure lands
+    # ahead of every position the sweep must not be scheduled at.
+    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.build_code_mount_volumes",
+        lambda: [("/foo", "/guest2", "ro")],
+    )
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.check_table_needs_migration",
+        lambda _conn, table_name: False,
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.list_embeddings_table_names",
+        lambda _conn: [],
+    )
+
+    # The uploaded-files reconcile task is scheduled just before the sweep and
+    # is not what this test is about; stub its units of work so it cannot spray
+    # unrelated LanceDB/DB tracebacks over this test's output.
+    class _FakeSession:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "xagent.migrations.lancedb.backfill_uploaded_file_links.backfill_all",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.kb_file_service.reconcile_uploaded_files",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", _FakeSession)
+
+    def _blocking_cleanup(*, stop_event=None) -> int:
+        # Stand in for a real sweep of a large tree: an executor walk that only
+        # unwinds once the cooperative stop flag is set. The timeout is a test
+        # safety net so a regression cannot hang the suite, not part of the
+        # contract under test.
+        assert stop_event is not None
+        stop_event.wait(timeout=30)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _blocking_cleanup,
+    )
+
+    real_start = web_app_module.start_temp_file_cleanup_task
+    scheduling_reached = []
+
+    def _start_ungated(app_instance):
+        # Exercise the REAL wrapper, whose own PYTEST_CURRENT_TEST gate would
+        # otherwise skip the sweep entirely. Clearing the variable only around
+        # this call keeps the five unrelated gates in startup_event (trigger
+        # dispatcher, lease/upload recovery, orphan GC, metadata rebuild) in
+        # force, so the failure path is the only thing this test un-gates.
+        scheduling_reached.append(app_instance)
+        saved = os.environ.pop("PYTEST_CURRENT_TEST", None)
+        try:
+            return real_start(app_instance)
+        finally:
+            if saved is not None:
+                os.environ["PYTEST_CURRENT_TEST"] = saved
+
+    monkeypatch.setattr(web_app_module, "start_temp_file_cleanup_task", _start_ungated)
+
+    async def _selective_to_thread(fn, *args, **kwargs):
+        # The sweep must run in a real thread: the stub above blocks until the
+        # stop flag is set, which can never happen if it runs inline on the
+        # event loop. Everything else stays inline, like the sibling tests.
+        if fn is _blocking_cleanup:
+            return await real_to_thread(fn, *args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _selective_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+
+    try:
+        with pytest.raises(SandboxRuntimeConflictError):
+            await web_app_module.startup_event()
+
+        # WHY: pins the reason the invariant below holds -- the raising step
+        # comes first, so the sweep was never scheduled. Without this, moving
+        # the scheduling earlier could still satisfy it and pass on luck.
+        assert scheduling_reached == []
+
+        task = getattr(app.state, "temp_file_cleanup_task", None)
+        stop = getattr(app.state, "temp_file_cleanup_stop", None)
+        assert task is None or task.done() or (stop is not None and stop.is_set())
+    finally:
+        # Never leave a blocked executor thread, a pending task, or populated
+        # app.state behind for the rest of the session.
+        stop = getattr(app.state, "temp_file_cleanup_stop", None)
+        if stop is not None:
+            stop.set()
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+        if created_tasks:
+            await asyncio.gather(*created_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """Sandbox readiness must run before cleanup(), which must run before
+    warmup() -- a static mount-conflict must fail startup before any
+    container is touched."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    call_order: list[str] = []
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            call_order.append("probe")
+            return False
+
+        async def cleanup(self) -> None:
+            call_order.append("cleanup")
+
+        async def warmup(self) -> None:
+            call_order.append("warmup")
+
+    class _FakeConn:
+        pass
+
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+
+    await web_app_module.startup_event()
+    if created_tasks:
+        await asyncio.gather(*created_tasks)
+
+    assert call_order == ["probe", "cleanup", "warmup"]
+
+
+@pytest.mark.asyncio
+async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """probe=True plus a genuine SANDBOX_VOLUMES/code-mount conflict must
+    fail startup outright, before cleanup()/warmup() ever run -- the actual
+    static-conflict path ``check_sandbox_static_readiness`` exists to guard,
+    not just the probe=False short-circuit the sibling test above covers."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    call_order: list[str] = []
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            call_order.append("probe")
+            return True
+
+        def requires_host_workspace_access(self) -> bool:
+            return True
+
+        def validate_host_workspace_access(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            call_order.append("cleanup")
+
+        async def warmup(self) -> None:
+            call_order.append("warmup")
+
+    class _FakeConn:
+        pass
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
+    # A genuine host-path conflict between SANDBOX_VOLUMES and the code
+    # mounts, same shape as test_sandbox_manager_readiness.py's
+    # test_readiness_raises_on_host_conflict.
+    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.build_code_mount_volumes",
+        lambda: [("/foo", "/guest2", "ro")],
+    )
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+
+    with pytest.raises(SandboxRuntimeConflictError):
+        await web_app_module.startup_event()
+
+    assert call_order == ["probe"]
+
+
+@pytest.mark.asyncio
+async def test_startup_event_skips_sandbox_readiness_when_manager_is_none(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """``get_sandbox_manager()`` can swallow a factory exception and return
+    None (sandbox disabled or init failed); startup must skip readiness
+    (and cleanup/warmup) entirely rather than raise."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    class _FakeConn:
+        pass
+
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: None,
+    )
+    readiness_called = {"value": False}
+
+    async def _fail_if_called(_sandbox_mgr) -> None:
+        readiness_called["value"] = True
+
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.check_sandbox_static_readiness",
+        _fail_if_called,
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+
+    await web_app_module.startup_event()
+    if created_tasks:
+        await asyncio.gather(*created_tasks)
+
+    assert readiness_called["value"] is False
+
+
+@pytest.mark.asyncio
+async def test_startup_reports_a_still_unwinding_previous_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A retained generation that is already stop-signalled is not "running".
+
+    A shutdown whose bounded wait expires deliberately keeps the pending task
+    and its already-set stop event, so the next startup on the same app object
+    hits the re-entrancy guard. Scheduling a second walk there is still wrong,
+    but reporting a live sweep is a lie: that generation is unwinding and this
+    startup gets none. Only reachable when one app object runs lifespan twice
+    (the test suite's module-level app), never in a deployment that exits
+    after shutdown.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    unwind = threading.Event()
+    sweeps_started: list[threading.Event] = []
+
+    def _stalled_cleanup(*, stop_event=None) -> int:
+        sweeps_started.append(stop_event)
+        unwind.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _stalled_cleanup,
+    )
+
+    try:
+        first = web_app_module.start_temp_file_cleanup_task(app)
+        assert first is not None
+        first_stop = app.state.temp_file_cleanup_stop
+
+        # A shutdown whose bounded wait expired: signalled, but still pending.
+        first_stop.set()
+        assert not first.done()
+
+        # A handler on the module logger rather than caplog: this app configures
+        # root logging on import, which displaces caplog's own root handler.
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        collector = _Collect()
+        web_app_module.logger.addHandler(collector)
+        try:
+            second = web_app_module.start_temp_file_cleanup_task(app)
+        finally:
+            web_app_module.logger.removeHandler(collector)
+
+        assert second is first
+        assert app.state.temp_file_cleanup_stop is first_stop
+        assert [
+            r for r in records if r.levelno == logging.WARNING and "unwinding" in r.msg
+        ]
+        assert not [r for r in records if "Scheduled background" in r.msg]
+    finally:
+        unwind.set()
+        await first
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+    # The guard held: exactly one sweep ran, using the first generation's flag.
+    assert sweeps_started == [first_stop]
+
+
+@pytest.mark.asyncio
+async def test_background_cleanup_logs_a_failing_sweep_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A sweep that raises must be reported with its traceback, not swallowed.
+
+    The walk runs unattended in an executor thread: nothing awaits the task
+    for a result and no request path sees the exception, so this WARNING is
+    the failure's only surface. Without it a sweep that never cleans anything
+    looks exactly like one with nothing to clean.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    def _failing_cleanup(*, stop_event=None) -> int:
+        raise OSError("uploads root vanished mid-sweep")
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _failing_cleanup,
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    collector = _Collect()
+    web_app_module.logger.addHandler(collector)
+    try:
+        task = web_app_module.start_temp_file_cleanup_task(app)
+        assert task is not None
+        await task
+        # Nothing retrieves this task's result in production, so a failure
+        # left on it would surface only as an "exception was never retrieved"
+        # warning at interpreter exit -- long after the sweep mattered.
+        assert task.exception() is None
+    finally:
+        web_app_module.logger.removeHandler(collector)
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+    failures = [
+        r
+        for r in records
+        if r.levelno == logging.WARNING and "cleanup failed" in r.getMessage()
+    ]
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None
+    assert "uploads root vanished mid-sweep" in logging.Formatter().formatException(
+        failures[0].exc_info
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reuses_a_live_unsignaled_cleanup_generation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A live, unsignalled sweep is handed back, not joined by a second walk.
+
+    Sibling of the still-unwinding case above: same guard, opposite state.
+    Two concurrent walks over one tree would race each other's unlinks, and
+    the newer generation's stop event would overwrite the older one's on
+    app.state -- orphaning the only handle that can stop the walk in flight.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    release = threading.Event()
+    sweeps_started: list[threading.Event] = []
+
+    def _stalled_cleanup(*, stop_event=None) -> int:
+        sweeps_started.append(stop_event)
+        release.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _stalled_cleanup,
+    )
+
+    try:
+        first = web_app_module.start_temp_file_cleanup_task(app)
+        assert first is not None
+        first_stop = app.state.temp_file_cleanup_stop
+
+        # Still sweeping and never signalled -- unlike the unwinding sibling.
+        assert not first.done()
+        assert not first_stop.is_set()
+
+        second = web_app_module.start_temp_file_cleanup_task(app)
+
+        assert second is first
+        assert app.state.temp_file_cleanup_task is first
+        assert app.state.temp_file_cleanup_stop is first_stop
+        assert not first_stop.is_set()
+    finally:
+        release.set()
+        await first
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+    # The guard held: one walk, still holding the flag shutdown would set.
+    assert sweeps_started == [first_stop]

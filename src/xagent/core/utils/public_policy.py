@@ -1,0 +1,13 @@
+"""Server-owned destination-policy contract; never populated from request data."""
+
+from typing import Protocol
+
+
+class HttpDestinationPolicy(Protocol):
+    def destination(self, url: str) -> tuple[str, int]: ...
+
+    def validate_resolved(self, url: str, addresses: list[str]) -> None: ...
+
+    def resolve_sync(self, url: str) -> list[str]: ...
+
+    async def resolve(self, url: str) -> list[str]: ...

@@ -1,0 +1,963 @@
+"""Test cases for Gemini LLM implementation using official SDK."""
+
+from types import SimpleNamespace
+from typing import Any, Dict
+from unittest.mock import MagicMock
+
+import pytest
+import pytest_mock
+
+from xagent.core.agent import PatternRuntime
+from xagent.core.model.chat.basic.gemini import GeminiLLM
+from xagent.core.model.chat.types import ChunkType
+
+
+@pytest.fixture
+def gemini_llm_config() -> Dict[str, Any]:
+    """Gemini LLM configuration for testing."""
+    return {
+        "model_name": "gemini-2.0-flash-exp",
+        "api_key": "test-api-key",
+    }
+
+
+class TestGeminiLLMSDK:
+    """Test cases for Gemini LLM implementation using official SDK."""
+
+    @pytest.fixture
+    def llm(self, gemini_llm_config: Dict[str, str]) -> GeminiLLM:
+        """Fixture providing Gemini LLM instance."""
+        return GeminiLLM(**gemini_llm_config)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _weather_tools() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state",
+                            }
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_basic_chat_completion_with_sdk(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test basic chat completion functionality using SDK."""
+        # Mock the SDK client at the genai module level
+        mock_sdk_client = MagicMock()
+        mock_response = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+
+        # Setup the mock response structure
+        mock_part.text = "Hello World"
+        mock_part.function_call = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = MagicMock()
+        mock_response.usage_metadata.prompt_token_count = 10
+        mock_response.usage_metadata.candidates_token_count = 5
+
+        # Mock the Client constructor
+        mocker.patch("google.genai.Client", return_value=mock_sdk_client)
+
+        # Create async mock for generate_content
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_sdk_client.aio.models.generate_content = mock_generate_content
+
+        messages = [
+            {
+                "role": "user",
+                "content": "Hello! Please respond with just 'Hello World'.",
+            }
+        ]
+
+        response = await llm.chat(messages)
+
+        # Verify response
+        assert isinstance(response, str)
+        assert response == "Hello World"
+        print(f"Basic chat response: {response}")
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_with_sdk(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test streaming chat functionality using SDK."""
+        # Mock the SDK client for streaming
+        mock_client = MagicMock()
+
+        # Create mock chunks
+        mock_chunk1 = MagicMock()
+        mock_chunk1.usage_metadata = MagicMock()
+        mock_chunk1.usage_metadata.prompt_token_count = 8
+        mock_chunk1.usage_metadata.candidates_token_count = 9
+        mock_chunk1.candidates = None  # First chunk has usage only
+
+        mock_chunk2 = MagicMock()
+        mock_candidate2 = MagicMock()
+        mock_content2 = MagicMock()
+        mock_part2 = MagicMock()
+        mock_part2.text = "1"
+        mock_part2.function_call = None
+        mock_content2.parts = [mock_part2]
+        mock_candidate2.content = mock_content2
+        mock_chunk2.candidates = [mock_candidate2]
+        mock_chunk2.usage_metadata = None
+
+        mock_chunk3 = MagicMock()
+        mock_chunk3.candidates = None  # End chunk
+
+        # Setup streaming response (async iterator)
+        async def mock_stream():
+            for chunk in [mock_chunk1, mock_chunk2, mock_chunk3]:
+                yield chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+
+        # Patch the _ensure_client to return our mock
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Count from 1 to 3."}]
+
+        chunks = []
+        usage_received = False
+        async for chunk in llm.stream_chat(messages):
+            chunks.append(chunk)
+            if chunk.is_usage():
+                usage_received = True
+
+        # Verify we got the expected chunks
+        assert len(chunks) >= 2  # At least usage + token + end
+        assert usage_received, "Usage chunk should be received"
+        print(f"Stream chat got {len(chunks)} chunks, usage received: {usage_received}")
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_tool_calls_keep_distinct_runtime_indices(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Separate Gemini streamed function calls must not merge in runtime."""
+        mock_client = MagicMock()
+
+        def make_function_call_chunk(name: str, args: dict[str, Any]) -> MagicMock:
+            mock_chunk = MagicMock()
+            mock_candidate = MagicMock()
+            mock_content = MagicMock()
+            mock_part = MagicMock()
+            mock_function_call = MagicMock()
+
+            mock_function_call.name = name
+            mock_function_call.args = args
+            mock_function_call.partial_args = []
+            mock_function_call.will_continue = None
+            mock_part.function_call = mock_function_call
+            mock_part.text = None
+            mock_content.parts = [mock_part]
+            mock_candidate.content = mock_content
+            mock_chunk.candidates = [mock_candidate]
+            mock_chunk.usage_metadata = None
+            return mock_chunk
+
+        async def mock_stream():
+            yield make_function_call_chunk(
+                "prepare_html_asset",
+                {
+                    "file_id": "file-1",
+                    "html_path": "poster.html",
+                    "alias": "logo.png",
+                },
+            )
+            yield make_function_call_chunk(
+                "generate_image",
+                {
+                    "prompt": "Modern Humanistic Conceptual Illustration",
+                    "aspect_ratio": "16:9",
+                },
+            )
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        runtime = PatternRuntime()
+        result = await runtime.run_streaming_llm_call(
+            llm,
+            messages=[{"role": "user", "content": "Make a banner."}],
+            tools=[],
+        )
+
+        tool_calls = result["tool_calls"]
+        assert [call["index"] for call in tool_calls] == [0, 1]
+        assert [call["function"]["name"] for call in tool_calls] == [
+            "prepare_html_asset",
+            "generate_image",
+        ]
+        assert tool_calls[0]["function"]["arguments"] == (
+            '{"file_id": "file-1", "html_path": "poster.html", "alias": "logo.png"}'
+        )
+        assert tool_calls[1]["function"]["arguments"] == (
+            '{"prompt": "Modern Humanistic Conceptual Illustration", '
+            '"aspect_ratio": "16:9"}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_tool_call_end_chunk_reports_tool_calls(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """The trailing END chunk must not overwrite a tool-call finish reason."""
+        mock_client = MagicMock()
+
+        def make_function_call_chunk(name: str, args: dict[str, Any]) -> MagicMock:
+            mock_chunk = MagicMock()
+            mock_candidate = MagicMock()
+            mock_content = MagicMock()
+            mock_part = MagicMock()
+            mock_function_call = MagicMock()
+
+            mock_function_call.name = name
+            mock_function_call.args = args
+            mock_function_call.partial_args = []
+            mock_function_call.will_continue = None
+            mock_part.function_call = mock_function_call
+            mock_part.text = None
+            mock_content.parts = [mock_part]
+            mock_candidate.content = mock_content
+            mock_chunk.candidates = [mock_candidate]
+            mock_chunk.usage_metadata = None
+            return mock_chunk
+
+        async def mock_stream():
+            yield make_function_call_chunk("get_weather", {"location": "Boston"})
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        runtime = PatternRuntime()
+        result = await runtime.run_streaming_llm_call(
+            llm,
+            messages=[{"role": "user", "content": "What's the weather in Boston?"}],
+            tools=[],
+        )
+
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_end_chunk_reports_length_on_max_tokens(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """A MAX_TOKENS candidate finish reason must surface as "length"."""
+        mock_client = MagicMock()
+
+        mock_chunk = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+        mock_part.text = "truncated output"
+        mock_part.function_call = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        mock_candidate.finish_reason = SimpleNamespace(name="MAX_TOKENS")
+        mock_chunk.candidates = [mock_candidate]
+        mock_chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield mock_chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Write a long story."}]
+
+        end_chunk = None
+        async for chunk in llm.stream_chat(messages):
+            if chunk.type == ChunkType.END:
+                end_chunk = chunk
+
+        assert end_chunk is not None
+        assert end_chunk.finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_end_chunk_reports_stop_for_plain_text(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """A plain text stream keeps the unchanged "stop" finish reason."""
+        mock_client = MagicMock()
+
+        mock_chunk = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+        mock_part.text = "hello there"
+        mock_part.function_call = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        # Default MagicMock finish_reason: not a MAX_TOKENS string, exercises
+        # the defensive getattr/isinstance checks against a non-string value.
+        mock_chunk.candidates = [mock_candidate]
+        mock_chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield mock_chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Say hello."}]
+
+        end_chunk = None
+        async for chunk in llm.stream_chat(messages):
+            if chunk.type == ChunkType.END:
+                end_chunk = chunk
+
+        assert end_chunk is not None
+        assert end_chunk.finish_reason == "stop"
+
+    @pytest.mark.asyncio
+    async def test_tool_calling_with_sdk(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test tool calling functionality using SDK."""
+        # Mock the SDK client
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+        mock_function_call = MagicMock()
+
+        # Setup function call mock
+        mock_function_call.name = "get_weather"
+        mock_function_call.args = {"location": "Boston"}
+        mock_part.function_call = mock_function_call
+        mock_part.text = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = MagicMock()
+        mock_response.usage_metadata.prompt_token_count = 15
+        mock_response.usage_metadata.candidates_token_count = 10
+
+        # Create async mock for generate_content
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_client.aio.models.generate_content = mock_generate_content
+
+        # Patch the _ensure_client to return our mock
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "What's the weather like in Boston?"}]
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "The city and state",
+                            }
+                        },
+                        "required": ["location"],
+                    },
+                },
+            }
+        ]
+
+        response = await llm.chat(messages, tools=tools)
+
+        # Verify tool call response structure
+        assert isinstance(response, dict)
+        assert response.get("type") == "tool_call"
+        assert "tool_calls" in response
+
+        tool_calls = response["tool_calls"]
+        assert len(tool_calls) > 0
+        assert tool_calls[0]["function"]["name"] == "get_weather"
+        print(f"Tool calling response: {response}")
+
+    def test_tool_schema_removes_nested_additional_properties(
+        self, llm: GeminiLLM
+    ) -> None:
+        """Gemini rejects additionalProperties even inside nested anyOf schemas."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_docs",
+                    "description": "Search documents",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filters": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "string"},
+                                    },
+                                    {"type": "null"},
+                                ]
+                            },
+                            "options": {
+                                "any_of": [
+                                    {
+                                        "type": "object",
+                                        "additional_properties": False,
+                                    }
+                                ]
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+        gemini_tools = llm._convert_tools_to_gemini_format(tools)
+        schema = gemini_tools["function_declarations"][0]["parameters"]
+        schema_text = str(schema)
+
+        assert "additionalProperties" not in schema_text
+        assert "additional_properties" not in schema_text
+        assert "anyOf" in schema_text
+        assert "any_of" in schema_text
+
+    def test_tool_choice_none_disables_function_calling(self, llm: GeminiLLM) -> None:
+        """tool_choice='none' should disable Gemini function calling."""
+        from google.genai import types
+
+        config = llm._build_gemini_tool_config(
+            self._weather_tools(), tool_choice="none"
+        )
+
+        function_config = config["tool_config"].function_calling_config
+        assert function_config.mode == types.FunctionCallingConfigMode.NONE
+
+    def test_tool_choice_required_forces_function_calling(self, llm: GeminiLLM) -> None:
+        """tool_choice='required' should force a Gemini function call."""
+        from google.genai import types
+
+        config = llm._build_gemini_tool_config(
+            self._weather_tools(), tool_choice="required"
+        )
+
+        function_config = config["tool_config"].function_calling_config
+        assert function_config.mode == types.FunctionCallingConfigMode.ANY
+        assert function_config.allowed_function_names is None
+
+    def test_tool_choice_function_restricts_allowed_function_names(
+        self, llm: GeminiLLM
+    ) -> None:
+        """Dict tool_choice should restrict Gemini to the requested function."""
+        from google.genai import types
+
+        config = llm._build_gemini_tool_config(
+            self._weather_tools(),
+            tool_choice={
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+        )
+
+        function_config = config["tool_config"].function_calling_config
+        assert function_config.mode == types.FunctionCallingConfigMode.ANY
+        assert function_config.allowed_function_names == ["get_weather"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_yields_error_for_diagnostic_only_stream(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """A Gemini stream with diagnostics but no content/tools should emit ERROR."""
+        mock_client = MagicMock()
+        mock_chunk = MagicMock()
+        mock_candidate = MagicMock()
+        mock_candidate.finish_reason = "SAFETY"
+        mock_candidate.finish_message = "Blocked by safety filters"
+        mock_candidate.safety_ratings = [{"category": "HARM_CATEGORY_DANGEROUS"}]
+        mock_candidate.content = None
+        mock_chunk.candidates = [mock_candidate]
+        mock_chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield mock_chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Say something unsafe."}]
+
+        chunks = [chunk async for chunk in llm.stream_chat(messages)]
+
+        assert len(chunks) == 1
+        assert chunks[0].type == ChunkType.ERROR
+        assert "Gemini stream ended without text" in chunks[0].content
+        assert "SAFETY" in chunks[0].content
+
+    @pytest.mark.asyncio
+    async def test_json_mode_with_sdk(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test JSON mode (should_chat_directly scenario) using SDK."""
+        # Mock the SDK client
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+
+        # Setup JSON response
+        mock_part.text = '{"greeting": "Hello", "count": 1}'
+        mock_part.function_call = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = MagicMock()
+        mock_response.usage_metadata.prompt_token_count = 14
+        mock_response.usage_metadata.candidates_token_count = 20
+
+        # Create async mock for generate_content
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_client.aio.models.generate_content = mock_generate_content
+
+        # Patch the _ensure_client to return our mock
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [
+            {
+                "role": "user",
+                "content": 'Respond with JSON with keys "greeting" and "count".',
+            }
+        ]
+
+        response = await llm.chat(messages, response_format={"type": "json_object"})
+
+        # Verify JSON response
+        assert isinstance(response, str)
+        assert "greeting" in response
+        assert "count" in response
+        print(f"JSON mode response: {response}")
+
+    @pytest.mark.asyncio
+    async def test_base_url_handling(self, gemini_llm_config: Dict[str, str]) -> None:
+        """Test that base_url is correctly handled (version path removal)."""
+        # Test 1: base_url without version path
+        llm1 = GeminiLLM(base_url="https://proxy.com", **gemini_llm_config)
+        llm1._ensure_client()
+        # Should keep the URL as-is
+        assert llm1._client is not None
+
+        # Test 2: base_url with /v1beta
+        llm2 = GeminiLLM(base_url="https://proxy.com/v1beta", **gemini_llm_config)
+        llm2._ensure_client()
+        # Should remove /v1beta from the URL (SDK adds it back)
+        assert llm2._client is not None
+
+        # Test 3: base_url with /v1
+        llm3 = GeminiLLM(base_url="https://proxy.com/v1", **gemini_llm_config)
+        llm3._ensure_client()
+        # Should remove /v1 from the URL
+        assert llm3._client is not None
+
+        print("Base URL handling tests passed")
+
+    @pytest.mark.asyncio
+    async def test_context_manager(self, gemini_llm_config: Dict[str, str]) -> None:
+        """Test async context manager functionality."""
+        async with GeminiLLM(**gemini_llm_config) as llm:  # type: ignore[arg-type]
+            # Verify client is initialized
+            assert llm._client is not None
+            print("Context manager test passed")
+
+        # Verify the client was properly closed
+        assert llm._client is None
+
+    @pytest.mark.asyncio
+    async def test_error_handling_missing_api_key(
+        self, gemini_llm_config: Dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test error handling when API key is missing."""
+        # Remove all API key environment variables
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+        # Create LLM without API key
+        config = gemini_llm_config.copy()
+        config["api_key"] = None  # type: ignore[assignment]
+
+        llm = GeminiLLM(**config)  # type: ignore[arg-type]
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Should raise a RuntimeError
+        with pytest.raises(
+            RuntimeError, match="GEMINI_API_KEY or GOOGLE_API_KEY must be set"
+        ):
+            await llm.chat(messages)
+
+    @pytest.mark.asyncio
+    async def test_cleanup(self, gemini_llm_config: Dict[str, str]) -> None:
+        """Test that client cleanup works properly."""
+        llm = GeminiLLM(**gemini_llm_config)  # type: ignore[arg-type]
+
+        # Initialize client
+        llm._ensure_client()
+
+        # Verify client was created
+        assert llm._client is not None
+
+        # Close the client
+        await llm.close()
+
+        # Verify client is closed
+        assert llm._client is None
+
+    @pytest.mark.asyncio
+    async def test_abilities_property(self, gemini_llm_config: Dict[str, str]) -> None:
+        """Test that abilities are correctly set based on model name."""
+        # Test vision model
+        vision_llm = GeminiLLM(model_name="gemini-pro-vision", api_key="test-key")
+        assert "vision" in vision_llm.abilities
+
+        # Gemini chat models are natively multimodal.
+        chat_llm = GeminiLLM(model_name="gemini-1.5-pro", api_key="test-key")
+        assert "vision" in chat_llm.abilities
+        assert "chat" in chat_llm.abilities
+        assert "tool_calling" in chat_llm.abilities
+
+    def test_native_video_conversion_uses_inline_data_and_offsets(self) -> None:
+        llm = GeminiLLM(model_name="gemini-2.5-flash", api_key="test-key")
+        content = llm.build_native_video_content(
+            "data:video/mp4;base64,ZmFrZV92aWRlbw==",
+            start_time=1.5,
+            end_time=4,
+        )
+
+        _, messages = llm._convert_messages_to_gemini_format(
+            [{"role": "user", "content": [content]}]
+        )
+
+        assert messages == [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "video/mp4",
+                            "data": "ZmFrZV92aWRlbw==",
+                        },
+                        "video_metadata": {
+                            "start_offset": "1.5s",
+                            "end_offset": "4s",
+                        },
+                    }
+                ],
+            }
+        ]
+
+    def test_native_video_conversion_rejects_unsupported_remote_url(self) -> None:
+        llm = GeminiLLM(model_name="gemini-2.5-flash", api_key="test-key")
+
+        with pytest.raises(ValueError, match="inline local video"):
+            llm.build_native_video_content("https://example.com/clip.mp4")
+
+    @pytest.mark.asyncio
+    async def test_supports_thinking_mode(self, llm: GeminiLLM) -> None:
+        """Test that Gemini does not support thinking mode."""
+        assert llm.supports_thinking_mode is False
+
+    @pytest.mark.asyncio
+    async def test_429_rate_limit_error_is_retryable(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test that 429 rate limit errors are properly caught and converted to LLMRetryableError."""
+        from google.genai import errors as genai_errors
+
+        from xagent.core.model.chat.exceptions import LLMRetryableError
+
+        # Create a mock 429 error
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 429
+        mock_response.json.return_value = {
+            "error": {
+                "code": 429,
+                "message": "RESOURCE_EXHAUSTED",
+                "status": "PERMISSION_DENIED",
+            }
+        }
+
+        # Mock the SDK to raise 429 error
+        mock_client = mocker.MagicMock()
+
+        async def mock_generate_content_error(*args, **kwargs):
+            raise genai_errors.ClientError(
+                code=429,
+                response_json={"error": {"code": 429, "message": "RESOURCE_EXHAUSTED"}},
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
+
+        # Patch the Client constructor
+        mocker.patch("google.genai.Client", return_value=mock_client)
+
+        messages = [{"role": "user", "content": "Test"}]
+
+        # Should raise LLMRetryableError
+        with pytest.raises(LLMRetryableError, match="code=429"):
+            await llm.chat(messages)
+
+        print("✅ 429 rate limit error correctly caught as retryable")
+
+    @pytest.mark.asyncio
+    async def test_500_server_error_is_retryable(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test that 500 server errors are properly caught and converted to LLMRetryableError."""
+        from google.genai import errors as genai_errors
+
+        from xagent.core.model.chat.exceptions import LLMRetryableError
+
+        # Create a mock 500 error
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 500
+        mock_response.json.return_value = {
+            "error": {
+                "code": 500,
+                "message": "Internal Server Error",
+            }
+        }
+
+        # Mock the SDK to raise 500 error
+        mock_client = mocker.MagicMock()
+
+        async def mock_generate_content_error(*args, **kwargs):
+            raise genai_errors.ClientError(
+                code=500,
+                response_json={
+                    "error": {"code": 500, "message": "Internal Server Error"}
+                },
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
+
+        # Patch the Client constructor
+        mocker.patch("google.genai.Client", return_value=mock_client)
+
+        messages = [{"role": "user", "content": "Test"}]
+
+        # Should raise LLMRetryableError
+        with pytest.raises(LLMRetryableError, match="code=500"):
+            await llm.chat(messages)
+
+        print("✅ 500 server error correctly caught as retryable")
+
+    @pytest.mark.asyncio
+    async def test_context_overflow_uses_typed_non_retryable_error(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from google.genai import errors as genai_errors
+
+        from xagent.core.model.chat.error import retry_on
+        from xagent.core.model.chat.exceptions import LLMContextLengthError
+
+        message = (
+            "The input token count (461428) exceeds the maximum number of "
+            "tokens allowed (131072)."
+        )
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"error": {"code": 400, "message": message}}
+        mock_client = mocker.MagicMock()
+
+        async def mock_generate_content_error(*args: Any, **kwargs: Any) -> None:
+            raise genai_errors.ClientError(
+                code=400,
+                response_json={"error": {"code": 400, "message": message}},
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
+        mocker.patch("google.genai.Client", return_value=mock_client)
+
+        with pytest.raises(LLMContextLengthError) as exc_info:
+            await llm.chat([{"role": "user", "content": "Test"}])
+
+        assert message in str(exc_info.value)
+        assert retry_on(exc_info.value) is False
+
+    @pytest.mark.asyncio
+    async def test_504_deadline_exceeded_error_is_retryable(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """Test that Gemini DEADLINE_EXCEEDED errors are retryable."""
+        from google.genai import errors as genai_errors
+
+        from xagent.core.model.chat.exceptions import LLMRetryableError
+
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 504
+        mock_response.json.return_value = {
+            "error": {
+                "code": 504,
+                "message": "Deadline expired before operation could complete.",
+                "status": "DEADLINE_EXCEEDED",
+            }
+        }
+
+        mock_client = mocker.MagicMock()
+
+        async def mock_generate_content_error(*args, **kwargs):
+            raise genai_errors.ClientError(
+                code=504,
+                response_json={
+                    "error": {
+                        "code": 504,
+                        "message": "Deadline expired before operation could complete.",
+                        "status": "DEADLINE_EXCEEDED",
+                    }
+                },
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
+        mocker.patch("google.genai.Client", return_value=mock_client)
+
+        messages = [{"role": "user", "content": "Test"}]
+
+        with pytest.raises(LLMRetryableError, match="code=504"):
+            await llm.chat(messages)
+
+
+class TestGeminiPromptCacheUsage:
+    """cached_content_token_count is recorded as cached input tokens."""
+
+    @pytest.fixture
+    def llm(self, gemini_llm_config: Dict[str, str]) -> GeminiLLM:
+        return GeminiLLM(**gemini_llm_config)  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_chat_records_cached_content_tokens(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_part = MagicMock()
+        mock_part.text = "ok"
+        mock_part.function_call = None
+        mock_content = MagicMock()
+        mock_content.parts = [mock_part]
+        mock_candidate = MagicMock()
+        mock_candidate.content = mock_content
+
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = MagicMock()
+        mock_response.usage_metadata.prompt_token_count = 100
+        mock_response.usage_metadata.candidates_token_count = 5
+        mock_response.usage_metadata.cached_content_token_count = 60
+
+        mock_sdk_client = MagicMock()
+        mocker.patch("google.genai.Client", return_value=mock_sdk_client)
+
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_sdk_client.aio.models.generate_content = mock_generate_content
+
+        with TokenContextManager() as manager:
+            await llm.chat([{"role": "user", "content": "hi"}])
+            usage = manager.get_usage()
+
+        assert usage.input_tokens == 100
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_usage_chunk_carries_cached_tokens(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        usage_chunk = MagicMock()
+        usage_chunk.usage_metadata = MagicMock()
+        usage_chunk.usage_metadata.prompt_token_count = 100
+        usage_chunk.usage_metadata.candidates_token_count = 5
+        usage_chunk.usage_metadata.cached_content_token_count = 60
+        usage_chunk.candidates = None
+
+        end_chunk = MagicMock()
+        end_chunk.candidates = None
+        end_chunk.usage_metadata = None
+
+        async def mock_stream():
+            for chunk in [usage_chunk, end_chunk]:
+                yield chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        with TokenContextManager() as manager:
+            chunks = [
+                chunk
+                async for chunk in llm.stream_chat([{"role": "user", "content": "hi"}])
+            ]
+            usage = manager.get_usage()
+
+        inp = next(d for d in usage.details if d["type"] == "input")
+        assert inp["cached_tokens"] == 60
+
+        usage_payloads = [c.usage for c in chunks if c.is_usage()]
+        assert usage_payloads and usage_payloads[0]["cached_input_tokens"] == 60

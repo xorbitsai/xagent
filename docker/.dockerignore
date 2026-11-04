@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.py?
+*.swp
+*.swo
+*.log
+
+# Editors
+.vscode
+.idea
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+
+# Frontend (use separate Dockerfile)
+frontend/
+
+# Tests
+tests/
+
+# Local env files
+.env
+
+# Docker
+docker-compose.yml
+Dockerfile*
+
+# Deploy
+deploy/supervisord.conf
+deploy/nginx.conf

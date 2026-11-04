@@ -1,0 +1,7 @@
+name: parallel_search
+description: Search the web and fetch page excerpts with Parallel Search MCP
+managed: external
+transport: streamable_http
+url: https://search.parallel.ai/mcp
+headers:
+  User-Agent: xagent/parallel-search-example

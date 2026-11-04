@@ -1,0 +1,1049 @@
+import json
+import math
+import multiprocessing
+import multiprocessing.connection
+import time
+from pathlib import Path
+
+import lancedb  # type: ignore
+import pyarrow as pa  # type: ignore
+import pytest
+from filelock import FileLock, Timeout
+
+from xagent.core.memory import storage_admission, vector_compatibility
+from xagent.core.memory.lancedb_maintenance import (
+    MAINTENANCE_METADATA_KEY,
+    MAINTENANCE_TABLE_VERSION_KEY,
+    MAINTENANCE_VERSION,
+    MaintenanceOutcome,
+    MaintenanceStatus,
+    lancedb_lock_path,
+    maintain_lancedb_memory_table,
+)
+from xagent.core.memory.scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN
+from xagent.core.memory.storage_admission import (
+    ADMISSION_FAILED_DETAIL,
+    REPAIR_REQUIRED_DETAIL,
+    DormantLanceDBMemoryHandle,
+    MemoryStorageMode,
+    StorageAdmissionState,
+    admit_lancedb_memory_storage,
+)
+from xagent.core.memory.vector_compatibility import (
+    FULL_ADMISSION_METADATA_KEY,
+    FULL_ADMISSION_TABLE_VERSION_KEY,
+    FULL_ADMISSION_VERSION,
+    VECTOR_IDENTITY_METADATA_KEY,
+    EmbeddingIdentity,
+    VectorCompatibility,
+    create_or_recreate_vector_capable_table,
+    prepare_lancedb_memory_table,
+)
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+
+IDENTITY = EmbeddingIdentity(
+    "openai", "text-embedding-3-small", "https://api.openai.com/v1/embeddings", 4, None
+)
+# Same dimension as IDENTITY, so only the stored identity distinguishes the two
+# vector spaces; a dimension check alone would not catch a mix-up.
+FOREIGN_IDENTITY = EmbeddingIdentity(
+    "openai", "text-embedding-3-large", "https://api.openai.com/v1/embeddings", 4, None
+)
+
+
+def _connection(tmp_path, *, invalid=False):
+    connection = lancedb.connect(tmp_path)
+    rows = 5
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": [
+                    None if invalid and index == 4 else f"note-{index}"
+                    for index in range(rows)
+                ],
+                "text": [f"text-{index}" for index in range(rows)],
+                "metadata": [json.dumps({"user_id": index}) for index in range(rows)],
+            }
+        ),
+    )
+    _safe_close_table(table)
+    return connection
+
+
+def _snapshot(connection):
+    table = connection.open_table("memories")
+    try:
+        return table.version, table.schema, table.to_arrow().to_pylist()
+    finally:
+        _safe_close_table(table)
+
+
+def _admit(connection, **kwargs):
+    return admit_lancedb_memory_storage(
+        DormantLanceDBMemoryHandle(connection, "memories"),
+        IDENTITY,
+        writers_quiesced=True,
+        batch_size=2,
+        **kwargs,
+    )
+
+
+def _admit_after_lock_attempt(database_path, events):
+    original_lock = storage_admission.FileLock
+
+    class SignalingLock:
+        def __init__(self, *args, **kwargs):
+            self._lock = original_lock(*args, **kwargs)
+
+        def __enter__(self):
+            # Probe before blocking so the parent learns whether admission
+            # actually contends for the lock it holds, rather than inferring
+            # it from how long the child took to get here.
+            try:
+                self._lock.acquire(timeout=0)
+            except Timeout:
+                events.send("contended")
+                return self._lock.__enter__()
+            events.send("uncontended")
+            return self._lock
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+    storage_admission.FileLock = SignalingLock
+    # Generous enough that a loaded runner cannot exhaust it while the parent
+    # creates the table; the parent releases the lock on every path.
+    outcome = _admit(lancedb.connect(database_path), lock_timeout=300)
+    events.send(outcome.state.value)
+
+
+def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
+    tmp_path, monkeypatch
+):
+    connection = _connection(tmp_path)
+    before_version = _snapshot(connection)[0]
+    scanned = []
+    null_types = []
+    original = vector_compatibility._checkpoint
+    original_nulls = vector_compatibility.pa.nulls
+
+    def observe(stage, batch=None):
+        if stage == "scan_batch":
+            scanned.append(batch)
+        original(stage, batch)
+
+    monkeypatch.setattr(vector_compatibility, "_checkpoint", observe)
+
+    def observe_nulls(size, type):
+        null_types.append(type)
+        return original_nulls(size, type)
+
+    monkeypatch.setattr(vector_compatibility.pa, "nulls", observe_nulls)
+    outcome = _admit(connection)
+    table = connection.open_table("memories")
+    field = table.schema.field("user_id")
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.VECTOR
+    assert outcome.admitted.capabilities.vector_search is True
+    assert table.version == before_version + 1
+    assert field.metadata[MAINTENANCE_METADATA_KEY] == MAINTENANCE_VERSION
+    assert field.metadata[MAINTENANCE_TABLE_VERSION_KEY] == str(table.version).encode()
+    assert field.metadata[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    version_key = field.metadata[FULL_ADMISSION_TABLE_VERSION_KEY]
+    assert version_key == str(table.version).encode()
+    assert table.schema.field("vector").type == pa.list_(pa.float32(), 4)
+    assert table.to_arrow()["vector"].to_pylist() == [None] * 5
+    assert null_types == [pa.list_(pa.float32(), 4)] * 3
+    assert scanned == [2, 2, 1]
+    scanned.clear()
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    assert scanned == []
+    # The marker records migration state, so an ordinary commit after
+    # admission leaves the next admission read-only: nothing is rescanned.
+    table.delete("id = 'note-0'")
+    version = table.version
+    _safe_close_table(table)
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    assert scanned == []
+    assert _snapshot(connection)[0] == version
+
+
+def _ordinary_row(identity):
+    """A row as the admitted runtime writes it, scope columns included."""
+    return {
+        "id": identity,
+        "text": f"text-{identity}",
+        "metadata": json.dumps({"user_id": 1}),
+        "vector": [1.0, 2.0, 3.0, 4.0],
+        USER_ID_COLUMN: 1,
+        SCOPE_DIMS_COLUMN: [],
+    }
+
+
+def _ordinary_write(connection, identity):
+    table = connection.open_table("memories")
+    try:
+        table.add([_ordinary_row(identity)])
+    finally:
+        _safe_close_table(table)
+
+
+def _ids(connection):
+    return {row["id"] for row in _snapshot(connection)[2]}
+
+
+def test_readmission_after_an_ordinary_write_is_read_only(tmp_path):
+    """Every worker boot admits; a migrated table must not be rewritten then."""
+    connection = _connection(tmp_path)
+    first = _admit(connection)
+    assert first.state is StorageAdmissionState.ADMITTED
+    _ordinary_write(connection, "note-post")
+    version, schema, _rows = _snapshot(connection)
+
+    second = _admit(connection)
+
+    assert second.state is StorageAdmissionState.ADMITTED
+    assert second.admitted.capabilities == first.admitted.capabilities
+    assert second.admitted.vector_compatibility is VectorCompatibility.MATCHING
+    after_version, after_schema, _after_rows = _snapshot(connection)
+    assert after_version == version
+    assert after_schema == schema
+    assert _ids(connection) == {f"note-{index}" for index in range(5)} | {"note-post"}
+
+
+def test_write_committed_during_readmission_survives(tmp_path, monkeypatch):
+    """A sibling that is already serving may commit while a worker admits.
+
+    The concurrent row lands at the first point admission reaches past its
+    initial read of the table: the overwrite, if admission ever rewrote an
+    already-migrated table, or the vector-space classification otherwise.
+    """
+    connection = _connection(tmp_path)
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    _ordinary_write(connection, "note-post")
+    written = []
+
+    def commit_concurrent_row():
+        if not written:
+            written.append(True)
+            _ordinary_write(connection, "note-concurrent")
+
+    original_create = connection.create_table
+
+    def create_table(*args, **kwargs):
+        if kwargs.get("mode") == "overwrite":
+            commit_concurrent_row()
+        return original_create(*args, **kwargs)
+
+    original_classify = vector_compatibility.classify_vector_compatibility
+
+    def classify(schema, identity):
+        commit_concurrent_row()
+        return original_classify(schema, identity)
+
+    monkeypatch.setattr(connection, "create_table", create_table)
+    monkeypatch.setattr(vector_compatibility, "classify_vector_compatibility", classify)
+
+    outcome = _admit(connection)
+
+    assert written == [True]
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert {"note-post", "note-concurrent"} <= _ids(connection)
+
+
+def test_legacy_table_is_still_migrated_on_first_admission(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    before_version = _snapshot(connection)[0]
+    scanned = []
+    original = vector_compatibility._checkpoint
+
+    def observe(stage, batch=None):
+        if stage == "scan_batch":
+            scanned.append(batch)
+        original(stage, batch)
+
+    monkeypatch.setattr(vector_compatibility, "_checkpoint", observe)
+
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert scanned == [2, 2, 1]
+    version, schema, rows = _snapshot(connection)
+    assert version == before_version + 1
+    marker = schema.field(USER_ID_COLUMN).metadata
+    assert marker[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    assert [row[USER_ID_COLUMN] for row in rows] == list(range(5))
+
+
+def test_identity_drift_after_migration_still_classifies_as_mismatching(tmp_path):
+    """Read-only readmission still compares the stored space with the authority."""
+    connection = _connection(tmp_path)
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    _ordinary_write(connection, "note-post")
+    version, schema, rows = _snapshot(connection)
+
+    outcome = admit_lancedb_memory_storage(
+        DormantLanceDBMemoryHandle(connection, "memories"),
+        FOREIGN_IDENTITY,
+        writers_quiesced=True,
+        batch_size=2,
+    )
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.vector_compatibility is VectorCompatibility.MISMATCHING
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.TEXT_ONLY
+    assert outcome.admitted.capabilities.vector_search is False
+    assert _snapshot(connection) == (version, schema, rows)
+
+
+def test_invalid_and_mid_commit_failure_leave_original_unchanged(tmp_path, monkeypatch):
+    invalid = _connection(tmp_path / "invalid", invalid=True)
+    before = _snapshot(invalid)
+    outcome = _admit(invalid)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert _snapshot(invalid) == before
+    assert not list((tmp_path / "invalid").glob(".memory-stage-*"))
+    assert not list((tmp_path / "invalid").glob(".memory-seen-*"))
+
+    incompatible = lancedb.connect(tmp_path / "incompatible")
+    table = incompatible.create_table(
+        "memories",
+        pa.table({"id": [1], "text": ["text"], "metadata": ["{}"]}),
+    )
+    _safe_close_table(table)
+    before = _snapshot(incompatible)
+    assert _admit(incompatible).state is StorageAdmissionState.BLOCKED_REPAIR
+    assert _snapshot(incompatible) == before
+
+    connection = _connection(tmp_path / "failure")
+    before = _snapshot(connection)
+
+    def fail(stage, batch=None):
+        if stage == "commit_batch" and batch == 1:
+            raise RuntimeError("secret backend path /do/not/expose")
+
+    monkeypatch.setattr(vector_compatibility, "_checkpoint", fail)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+    assert "secret" not in outcome.detail
+    assert _snapshot(connection) == before
+
+
+def test_absent_leaves_only_coordination_lock_and_pagination_finds_late_table(tmp_path):
+    absent_path = tmp_path / "absent"
+    connection = lancedb.connect(absent_path)
+    before = set(absent_path.iterdir())
+    admission_path = Path(lancedb_lock_path(connection, "memories", "admission"))
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ABSENT
+    assert set(absent_path.iterdir()) == before | {admission_path}
+    assert list(connection.table_names(limit=100)) == []
+
+    paged = lancedb.connect(tmp_path / "paged")
+    for index in range(11):
+        table = paged.create_table(
+            f"decoy-{index:02d}", schema=pa.schema([("x", pa.string())])
+        )
+        _safe_close_table(table)
+    table = paged.create_table(
+        "memories",
+        pa.table({"id": ["kept"], "text": ["text"], "metadata": ["{}"]}),
+    )
+    _safe_close_table(table)
+    assert _admit(paged).state is StorageAdmissionState.ADMITTED
+
+
+def test_absent_admission_waits_for_lifecycle_lock(tmp_path):
+    database_path = tmp_path / "lifecycle-race"
+    connection = lancedb.connect(database_path)
+    admission_path = lancedb_lock_path(connection, "memories", "admission")
+    context = multiprocessing.get_context("spawn")
+    events, child_events = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_admit_after_lock_attempt,
+        args=(str(database_path), child_events),
+    )
+
+    try:
+        with FileLock(admission_path):
+            process.start()
+            child_events.close()
+            # Wake on the child's lock probe or on its exit, whichever comes
+            # first, so a slow spawn under parallel load only delays the test.
+            # The timeout is a hang guard, not a speed budget.
+            multiprocessing.connection.wait([events, process.sentinel], timeout=300)
+            assert events.poll() and events.recv() == "contended"
+            table = connection.create_table(
+                "memories",
+                pa.table({"id": ["created"], "text": ["text"], "metadata": ["{}"]}),
+            )
+            _safe_close_table(table)
+        process.join(300)
+        assert process.exitcode == 0
+        assert events.recv() == StorageAdmissionState.ADMITTED.value
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+
+def test_typed_unavailable_states_and_safe_details(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    dormant = DormantLanceDBMemoryHandle(connection, "memories")
+    outcome = admit_lancedb_memory_storage(dormant, IDENTITY, writers_quiesced=False)
+    assert outcome.state is StorageAdmissionState.QUIESCENCE_REQUIRED
+
+    admission_path = lancedb_lock_path(connection, "memories", "admission")
+    with FileLock(admission_path):
+        outcome = _admit(connection, lock_timeout=0.05)
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+
+    monkeypatch.setattr(
+        "xagent.core.memory.storage_admission.prepare_lancedb_memory_table",
+        lambda *_args, **_kwargs: MaintenanceOutcome(MaintenanceStatus.INCOMPLETE),
+    )
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.MAINTENANCE_INCOMPLETE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+
+    def fail_discovery(*_args, **_kwargs):
+        raise OSError("credential at /private/backend")
+
+    monkeypatch.setattr(
+        "xagent.core.memory.storage_admission._lancedb_table_exists", fail_discovery
+    )
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+
+
+def test_mismatching_vectors_have_typed_text_only_capability(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": ["legacy"],
+                "text": ["text"],
+                "metadata": ["{}"],
+                "vector": pa.array([[1.0] * 4], pa.list_(pa.float32(), 4)),
+            }
+        ),
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.TEXT_ONLY
+    assert outcome.admitted.capabilities.vector_search is False
+
+
+@pytest.mark.parametrize("case", ["nan", "wrong_length"])
+def test_malformed_existing_vectors_are_blocked_without_mutation(tmp_path, case):
+    connection = lancedb.connect(tmp_path)
+    vectors = [[math.nan, 0.0, 0.0, 0.0]]
+    vector_type = pa.list_(pa.float32(), 4)
+    if case == "wrong_length":
+        vectors = [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0]]
+        vector_type = pa.list_(pa.float32())
+    rows = len(vectors)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": [f"note-{index}" for index in range(rows)],
+                "text": ["text"] * rows,
+                "metadata": ["{}"] * rows,
+                "badvec": pa.array(vectors, type=vector_type),
+            }
+        ),
+    )
+    table.alter_columns({"path": "badvec", "rename": "vector"})
+    _safe_close_table(table)
+    before = _snapshot(connection)
+
+    outcome = _admit(connection)
+    after = _snapshot(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert after[:2] == before[:2]
+    if case == "nan":
+        assert math.isnan(after[2][0]["vector"][0])
+    else:
+        assert after[2] == before[2]
+
+
+def test_existing_null_vectors_are_preserved(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    vector_type = pa.list_(pa.float32(), 4)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": ["null", "valid"],
+                "text": ["a", "b"],
+                "metadata": ["{}", "{}"],
+                "vector": pa.array([None, [1.0, 2.0, 3.0, 4.0]], vector_type),
+            }
+        ),
+        on_bad_vectors="null",
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert _snapshot(connection)[2][0]["vector"] is None
+
+
+def test_compatibility_is_classified_from_the_committed_table(tmp_path, monkeypatch):
+    """Classification describes the commit, and is derived while it is held."""
+    connection = _connection(tmp_path)
+    original = vector_compatibility.classify_vector_compatibility
+    classified = []
+
+    def record(schema, identity):
+        classified.append(schema)
+        return original(schema, identity)
+
+    monkeypatch.setattr(vector_compatibility, "classify_vector_compatibility", record)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.vector_compatibility is VectorCompatibility.MATCHING
+    assert outcome.maintenance.vector_compatibility is VectorCompatibility.MATCHING
+    version, committed, _rows = _snapshot(connection)
+    assert version == 2
+    # Classified exactly once, from the schema maintenance committed -- never
+    # from the pre-maintenance state, which carried no vectors at all, and
+    # never from a re-read a concurrent writer could have invalidated.
+    assert len(classified) == 1
+    assert classified[0].field("vector").type == pa.list_(pa.float32(), 4)
+    assert (
+        classified[0].field(USER_ID_COLUMN).metadata[FULL_ADMISSION_TABLE_VERSION_KEY]
+        == str(version).encode()
+    )
+    identity_key = classified[0].metadata[VECTOR_IDENTITY_METADATA_KEY]
+    assert identity_key == committed.metadata[VECTOR_IDENTITY_METADATA_KEY]
+
+
+class _FailAfterCommitConnection:
+    """Fail every table inspection attempted after the overwrite commits."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.committed = False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def open_table(self, name):
+        if self.committed:
+            raise OSError("post-commit inspection at /private/backend")
+        return self._inner.open_table(name)
+
+    def create_table(self, *args, **kwargs):
+        table = self._inner.create_table(*args, **kwargs)
+        self.committed = True
+        return table
+
+
+def test_admission_never_inspects_the_table_after_the_commit(tmp_path):
+    connection = _connection(tmp_path)
+    guarded = _FailAfterCommitConnection(connection)
+
+    outcome = _admit(guarded)
+
+    # A backend failure after the durable commit used to be reported as an
+    # ordinary retryable outcome, leaving the caller unable to tell "nothing
+    # was mutated" from "committed but unverified". There is no such read left.
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.vector_compatibility is VectorCompatibility.MATCHING
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.VECTOR
+    version, schema, _rows = _snapshot(connection)
+    assert version == 2
+    assert schema.field("vector").type == pa.list_(pa.float32(), 4)
+    # The injected failure really is live: any post-commit read would have hit it.
+    assert guarded.committed
+    with pytest.raises(OSError, match="post-commit inspection"):
+        guarded.open_table("memories")
+
+
+def test_recreation_never_inspects_the_table_after_the_commit(tmp_path):
+    connection = _connection(tmp_path)
+    guarded = _FailAfterCommitConnection(connection)
+
+    # The lifecycle recreation entry point used to re-open the table once the
+    # overwrite had committed, so a backend failure in that read looked exactly
+    # like "nothing was mutated". It now reads the classification maintenance
+    # made under its own lock, and there is no post-commit read left to fail.
+    assert (
+        create_or_recreate_vector_capable_table(guarded, "memories", IDENTITY)
+        is VectorCompatibility.MATCHING
+    )
+
+    version, schema, _rows = _snapshot(connection)
+    assert version == 2
+    assert schema.field("vector").type == pa.list_(pa.float32(), 4)
+    # The injected failure really is live: any post-commit read would have hit it.
+    assert guarded.committed
+    with pytest.raises(OSError, match="post-commit inspection"):
+        guarded.open_table("memories")
+
+
+def test_empty_vectorless_table_is_admitted_with_typed_null_vectors(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        schema=pa.schema(
+            [("id", pa.string()), ("text", pa.string()), ("metadata", pa.string())]
+        ),
+    )
+    assert table.count_rows() == 0
+    _safe_close_table(table)
+
+    # With nothing staged to scan, the supplied schema is the only description
+    # of the table the overwrite must produce.
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.VECTOR
+    assert outcome.admitted.vector_compatibility is VectorCompatibility.MATCHING
+    version, schema, rows = _snapshot(connection)
+    assert rows == []
+    assert version == 2
+    assert schema.field("vector").type == pa.list_(pa.float32(), 4)
+    assert schema.field("vector").nullable
+    assert schema.field(SCOPE_DIMS_COLUMN).type == pa.list_(pa.string())
+    metadata = schema.field(USER_ID_COLUMN).metadata
+    assert metadata[MAINTENANCE_METADATA_KEY] == MAINTENANCE_VERSION
+    assert metadata[MAINTENANCE_TABLE_VERSION_KEY] == str(version).encode()
+    assert metadata[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    assert metadata[FULL_ADMISSION_TABLE_VERSION_KEY] == str(version).encode()
+    # The markers are version-bound, so the committed table is admitted again
+    # through the fast path without a second rewrite.
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    assert _snapshot(connection)[0] == version
+
+
+# A regression here would wait forever rather than fail, so bound the test.
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("lock_timeout", [0, -1.0, math.inf, math.nan, True, "1"])
+def test_invalid_lock_timeout_is_rejected_before_any_lock(tmp_path, lock_timeout):
+    connection = _connection(tmp_path)
+    before = _snapshot(connection)
+    admission_path = lancedb_lock_path(connection, "memories", "admission")
+    maintenance_path = lancedb_lock_path(connection, "memories", "maintenance")
+    # Both locks are held, so a timeout that reaches FileLock either waits
+    # forever or gives up; neither may happen for a value the contract rejects.
+    with FileLock(admission_path), FileLock(maintenance_path):
+        with pytest.raises(ValueError, match="finite positive"):
+            _admit(connection, lock_timeout=lock_timeout)
+        with pytest.raises(ValueError, match="finite positive"):
+            prepare_lancedb_memory_table(
+                connection,
+                "memories",
+                IDENTITY,
+                batch_size=2,
+                lock_timeout=lock_timeout,
+            )
+    assert _snapshot(connection) == before
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("scope", ["admission", "maintenance"])
+def test_contended_lock_returns_a_typed_retryable_outcome(tmp_path, scope):
+    connection = _connection(tmp_path)
+    before = _snapshot(connection)
+    started = time.monotonic()
+    with FileLock(lancedb_lock_path(connection, "memories", scope)):
+        outcome = _admit(connection, lock_timeout=0.05)
+    assert time.monotonic() - started < 10
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+    assert _snapshot(connection) == before
+
+
+# One contract: a persisted user_id that does not denote exactly one in-range
+# owner blocks the rewrite, whether coercing it overflows ("1e309", "Infinity"),
+# raises ValueError ("NaN", the strings naming them) or silently succeeds on a
+# value that is not an owner (a fractional float, a bool, a list).
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        '{"user_id":1e309}',
+        '{"user_id":Infinity}',
+        '{"user_id":-Infinity}',
+        '{"user_id":NaN}',
+        '{"user_id":"nan"}',
+        '{"user_id":"Infinity"}',
+        '{"user_id":1.5}',
+        '{"user_id":true}',
+        '{"user_id":[1]}',
+        # json.loads rounds this text to 9007199254740992.0 before any
+        # validation sees it, so int() would stage a different owner than the
+        # metadata names. 2**53 is what both spellings collapse to, so a float
+        # that large names no single owner either and is rejected too.
+        '{"user_id":9007199254740993.0}',
+        '{"user_id":9007199254740992.0}',
+    ],
+)
+def test_unusable_legacy_user_id_requires_repair(tmp_path, metadata):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table({"id": ["bad"], "text": ["text"], "metadata": [metadata]}),
+    )
+    _safe_close_table(table)
+    before = _snapshot(connection)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    # Pinned as well as the public state: the owner is what the scan refused,
+    # so a future change that reached BLOCKED_REPAIR for some other reason
+    # would no longer be exercising this contract.
+    assert outcome.maintenance.status is MaintenanceStatus.INVALID_LEGACY_DATA
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert _snapshot(connection) == before
+
+
+# The other half of that contract: every spelling admission resolved before
+# still admits, and still lands on the same owner.
+@pytest.mark.parametrize(
+    ("metadata", "user_id"),
+    [
+        ('{"user_id":5}', 5),
+        ('{"user_id":5.0}', 5),
+        ('{"user_id":"5"}', 5),
+        # The largest float that still names exactly one owner.
+        ('{"user_id":9007199254740991.0}', 2**53 - 1),
+        # Past that range only the lossy float spelling is refused: a JSON
+        # integer token decodes exactly however large it is, and so does a
+        # numeric string, so the owner itself is never unreachable.
+        ('{"user_id":9007199254740993}', 2**53 + 1),
+        ('{"user_id":"9007199254740993"}', 2**53 + 1),
+    ],
+)
+def test_resolvable_legacy_user_id_still_admits(tmp_path, metadata, user_id):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table({"id": ["note"], "text": ["text"], "metadata": [metadata]}),
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert _snapshot(connection)[2][0][USER_ID_COLUMN] == user_id
+
+
+def test_distant_duplicate_is_rejected_without_mutation(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": ["duplicate", "middle", "duplicate"],
+                "text": ["a", "b", "c"],
+                "metadata": ["{}", "{}", "{}"],
+            }
+        ),
+    )
+    _safe_close_table(table)
+    before = _snapshot(connection)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert _snapshot(connection) == before
+
+
+def test_post_commit_cleanup_failure_keeps_success(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    original = vector_compatibility.os.unlink
+
+    def fail_cleanup(path):
+        if ".memory-" in Path(path).name:
+            raise PermissionError("private path must not escape")
+        original(path)
+
+    monkeypatch.setattr(vector_compatibility.os, "unlink", fail_cleanup)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.detail is None
+    assert _snapshot(connection)[0] == 2
+
+
+def test_admission_lock_precedes_maintenance_and_has_one_production_caller(
+    tmp_path, monkeypatch
+):
+    connection = _connection(tmp_path)
+    admission_path = lancedb_lock_path(connection, "memories", "admission")
+    original = vector_compatibility.prepare_lancedb_memory_table
+
+    def guarded(*args, **kwargs):
+        with pytest.raises(Timeout):
+            FileLock(admission_path, timeout=0).acquire()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "xagent.core.memory.storage_admission.prepare_lancedb_memory_table", guarded
+    )
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+
+    # The legacy recreation entry point holds the same lock across the same span,
+    # so it cannot publish a vector space another admission is already reading.
+    monkeypatch.setattr(vector_compatibility, "prepare_lancedb_memory_table", guarded)
+    assert (
+        create_or_recreate_vector_capable_table(connection, "memories", IDENTITY)
+        is VectorCompatibility.MATCHING
+    )
+
+    # Layer D is the lifecycle caller this primitive was written for, and it is
+    # the only one: nothing on a request path may admit storage.
+    source_root = Path(__file__).parents[3] / "src" / "xagent"
+    callers = sorted(
+        path
+        for path in source_root.rglob("*.py")
+        if path.name != "__init__.py"
+        and "admit_lancedb_memory_storage(" in path.read_text(encoding="utf-8")
+    )
+    assert callers == sorted(
+        [
+            source_root / "core" / "memory" / "storage_admission.py",
+            source_root / "web" / "memory_lifecycle.py",
+        ]
+    )
+
+
+def _scope_maintained_connection(tmp_path, *, drop_text, vector):
+    """Seed a table whose only completion marker is the scope-only one."""
+    connection = lancedb.connect(tmp_path)
+    row = {"id": "note-0", "text": "text-0", "metadata": json.dumps({"user_id": 3})}
+    fields = [("id", pa.string()), ("text", pa.string()), ("metadata", pa.string())]
+    if drop_text:
+        del row["text"], fields[1]
+    # LanceDB refuses to write NaNs into a column named "vector", so the legacy
+    # values are staged under another name and renamed into place.
+    row["badvec"] = vector
+    fields.append(("badvec", pa.list_(pa.float32(), 4)))
+    identity = json.dumps(IDENTITY.as_dict(), sort_keys=True, separators=(",", ":"))
+    schema = pa.schema(
+        fields, metadata={VECTOR_IDENTITY_METADATA_KEY: identity.encode()}
+    )
+    table = connection.create_table(
+        "memories", pa.Table.from_pylist([row], schema=schema)
+    )
+    table.alter_columns({"path": "badvec", "rename": "vector"})
+    _safe_close_table(table)
+
+    assert (
+        maintain_lancedb_memory_table(connection, "memories").status
+        is MaintenanceStatus.COMPLETE
+    )
+    metadata = _snapshot(connection)[1].field(USER_ID_COLUMN).metadata
+    assert metadata[MAINTENANCE_METADATA_KEY] == MAINTENANCE_VERSION
+    assert FULL_ADMISSION_METADATA_KEY not in metadata
+    return connection
+
+
+@pytest.mark.parametrize("case", ["missing_text", "nan_vector"])
+def test_scope_only_marker_never_certifies_admission(tmp_path, case):
+    nan_case = case == "nan_vector"
+    connection = _scope_maintained_connection(
+        tmp_path,
+        drop_text=not nan_case,
+        vector=[math.nan, 0.0, 0.0, 0.0] if nan_case else [1.0, 2.0, 3.0, 4.0],
+    )
+    before = _snapshot(connection)
+
+    outcome = _admit(connection)
+    after = _snapshot(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert after[:2] == before[:2]
+    if nan_case:
+        # The rejected table keeps its own bytes; admission never "repairs" it.
+        assert math.isnan(after[2][0]["vector"][0])
+    else:
+        assert after[2] == before[2]
+
+
+# The generation the base branch's validator stamped tables with, before the
+# strict ``user_id`` scan existed. A fixture carrying it stands in for every
+# table already certified when the bumped generation ships.
+BASE_FULL_ADMISSION_VERSION = b"1"
+
+
+def _previously_certified_connection(tmp_path, metadata):
+    """Seed a table a previous validator generation certified at its version.
+
+    Everything ``_is_fully_admitted`` inspects is present and current: the
+    required columns and their types, a fixed-size float32 vector column, and a
+    full-admission marker bound to this table's own version. Only the marker's
+    generation is stale, and the staged ``user_id`` is the projection that
+    generation would have written for ``metadata`` -- ``int(1.5)`` for a value
+    the strict scan now rejects, the real owner for one it accepts.
+    """
+    assert BASE_FULL_ADMISSION_VERSION != FULL_ADMISSION_VERSION
+    connection = lancedb.connect(tmp_path)
+    identity = json.dumps(IDENTITY.as_dict(), sort_keys=True, separators=(",", ":"))
+    marker = {
+        MAINTENANCE_METADATA_KEY: MAINTENANCE_VERSION,
+        MAINTENANCE_TABLE_VERSION_KEY: b"1",
+        FULL_ADMISSION_METADATA_KEY: BASE_FULL_ADMISSION_VERSION,
+        FULL_ADMISSION_TABLE_VERSION_KEY: b"1",
+    }
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("metadata", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), 4)),
+            pa.field(USER_ID_COLUMN, pa.int64(), metadata=marker),
+            pa.field(SCOPE_DIMS_COLUMN, pa.list_(pa.string())),
+        ],
+        metadata={VECTOR_IDENTITY_METADATA_KEY: identity.encode()},
+    )
+    row = {
+        "id": "note-0",
+        "text": "text-0",
+        "metadata": metadata,
+        "vector": [1.0, 2.0, 3.0, 4.0],
+        USER_ID_COLUMN: int(float(json.loads(metadata)["user_id"])),
+        SCOPE_DIMS_COLUMN: [],
+    }
+    table = connection.create_table(
+        "memories", pa.Table.from_pylist([row], schema=schema)
+    )
+    version = table.version
+    _safe_close_table(table)
+    # The marker is otherwise live: it names this table's own version, so its
+    # generation is the only thing that can keep it off the fast path.
+    assert version == 1
+    return connection
+
+
+def test_previously_certified_table_is_rescanned_and_blocked_when_invalid(tmp_path):
+    """A stale certificate never short-circuits a stricter validator.
+
+    The old validator read ``1.5`` as owner ``1``, staged it and stamped the
+    table complete. Honouring that marker would leave the vector path pushing
+    down an owner the authoritative metadata never named, so the generation
+    bump has to force the rescan that rejects the row instead.
+    """
+    connection = _previously_certified_connection(tmp_path, '{"user_id": 1.5}')
+    before = _snapshot(connection)
+
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert outcome.maintenance.status is MaintenanceStatus.INVALID_LEGACY_DATA
+    after = _snapshot(connection)
+    # Same version, same schema, same rows -- including the wrong owner the old
+    # path persisted, which admission refuses to certify and never rewrites.
+    assert after == before
+    marker = after[1].field(USER_ID_COLUMN).metadata
+    assert marker[FULL_ADMISSION_METADATA_KEY] == BASE_FULL_ADMISSION_VERSION
+    assert marker[FULL_ADMISSION_METADATA_KEY] != FULL_ADMISSION_VERSION
+    assert marker[FULL_ADMISSION_TABLE_VERSION_KEY] == str(before[0]).encode()
+
+
+def test_previously_certified_table_is_recertified_when_valid(tmp_path, monkeypatch):
+    """The other half of the bump: a sound table is rescanned, then re-stamped."""
+    connection = _previously_certified_connection(tmp_path, '{"user_id": 7}')
+    before_version = _snapshot(connection)[0]
+    scanned = []
+    original = vector_compatibility._checkpoint
+
+    def observe(stage, batch=None):
+        if stage == "scan_batch":
+            scanned.append(batch)
+        original(stage, batch)
+
+    monkeypatch.setattr(vector_compatibility, "_checkpoint", observe)
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    # The stale marker bought no shortcut: the row really went through the scan.
+    assert scanned == [1]
+    version, schema, rows = _snapshot(connection)
+    assert version == before_version + 1
+    assert rows[0][USER_ID_COLUMN] == 7
+    marker = schema.field(USER_ID_COLUMN).metadata
+    assert marker[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    assert marker[FULL_ADMISSION_TABLE_VERSION_KEY] == str(version).encode()
+    # Certified under the current generation, so the one-time rescan really is
+    # one-time: the next admission takes the fast path and rewrites nothing.
+    scanned.clear()
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    assert scanned == []
+    assert _snapshot(connection)[0] == version
+
+
+def _admit_foreign_identity_after_snapshot(path, snapshotted, committed, results):
+    original = storage_admission.prepare_lancedb_memory_table
+
+    def wait_for_foreign_commit(*args, **kwargs):
+        # Park where a pre-maintenance snapshot would have been taken, so the
+        # other vector space lands before this admission classifies anything.
+        snapshotted.set()
+        assert committed.wait(30)
+        return original(*args, **kwargs)
+
+    storage_admission.prepare_lancedb_memory_table = wait_for_foreign_commit
+    outcome = admit_lancedb_memory_storage(
+        DormantLanceDBMemoryHandle(lancedb.connect(path), "memories"),
+        FOREIGN_IDENTITY,
+        writers_quiesced=True,
+        batch_size=2,
+    )
+    admitted = outcome.admitted
+    results.put(
+        (
+            outcome.state.value,
+            None if admitted is None else admitted.capabilities.mode.value,
+            None if admitted is None else admitted.vector_compatibility.value,
+        )
+    )
+
+
+def test_interleaved_recreation_never_certifies_a_foreign_vector_space(tmp_path):
+    connection = _connection(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    snapshotted, committed = context.Event(), context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_admit_foreign_identity_after_snapshot,
+        args=(str(tmp_path), snapshotted, committed, results),
+    )
+
+    process.start()
+    try:
+        assert snapshotted.wait(30)
+        # The local identity commits its own vectors mid-flight.
+        assert (
+            prepare_lancedb_memory_table(
+                connection, "memories", IDENTITY, batch_size=2, lock_timeout=10
+            ).status
+            is MaintenanceStatus.COMPLETE
+        )
+        version, schema, _rows = _snapshot(connection)
+        committed.set()
+        process.join(60)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+    assert process.exitcode == 0
+
+    # The other caller is told the truth about the space it would read, and it
+    # neither certifies itself over those vectors nor rewrites them.
+    assert results.get(timeout=5) == (
+        StorageAdmissionState.ADMITTED.value,
+        MemoryStorageMode.TEXT_ONLY.value,
+        VectorCompatibility.MISMATCHING.value,
+    )
+    after_version, after_schema, _after_rows = _snapshot(connection)
+    assert after_version == version
+    assert (
+        after_schema.metadata[VECTOR_IDENTITY_METADATA_KEY]
+        == (schema.metadata[VECTOR_IDENTITY_METADATA_KEY])
+    )

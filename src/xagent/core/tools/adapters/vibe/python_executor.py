@@ -1,0 +1,214 @@
+"""
+Python Code Execution Tool for xagent
+Framework wrapper around the pure Python executor tool
+"""
+
+import asyncio
+import logging
+from typing import Any, Dict, Mapping, Optional, Type
+
+from pydantic import BaseModel, Field
+
+from .....config import get_python_executor_timeout_seconds, in_sandbox_tool_runner
+from ....workspace import TaskWorkspace
+from ...artifacts import (
+    build_generated_file_metadata,
+    changed_generated_artifact_files,
+    snapshot_generated_artifact_files,
+)
+from ...core.python_executor import PythonExecutorCore
+from ...core.python_subprocess import run_python_code_in_subprocess
+from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .function import FunctionTool
+from .sandboxed_tool.sandbox_config import sandbox_config
+
+logger = logging.getLogger(__name__)
+
+
+class PythonExecutorFunctionTool(FunctionTool):
+    """Python executor tool with BASIC category."""
+
+    category = ToolCategory.BASIC
+
+
+class PythonExecutorArgs(BaseModel):
+    code: str = Field(description="Python code to execute")
+    capture_output: bool = Field(
+        default=True, description="Whether to capture stdout/stderr"
+    )
+
+
+class PythonExecutorResult(BaseModel):
+    success: bool = Field(description="Whether the code executed successfully")
+    output: str = Field(description="Output from the code execution")
+    error: str = Field(default="", description="Error message if execution failed")
+    generated_files: list[str] = Field(default_factory=list)
+    file_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PythonExecutorTool(AbstractBaseTool):
+    """Framework wrapper for the pure Python executor tool"""
+
+    def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
+        self._visibility = ToolVisibility.PUBLIC
+        self._workspace = workspace
+
+    @property
+    def name(self) -> str:
+        return "python_executor"
+
+    @property
+    def description(self) -> str:
+        return """Execute Python code safely and return the output.
+        Supports most Python operations including calculations, data processing, and visualization.
+        Captures stdout and stderr from the execution."""
+
+    @property
+    def tags(self) -> list[str]:
+        return ["python", "code", "execution", "computation"]
+
+    def args_type(self) -> Type[BaseModel]:
+        return PythonExecutorArgs
+
+    def return_type(self) -> Type[BaseModel]:
+        return PythonExecutorResult
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        exec_args = PythonExecutorArgs.model_validate(args)
+
+        # Determine working directory
+        working_directory = self._get_working_directory()
+
+        # Add workspace environment variables if workspace is available
+        workspace_env = self._get_workspace_env()
+
+        # Add workspace variables to the executor's globals if available
+        if workspace_env:
+            # Inject workspace variables into the code execution environment
+            env_code = "\n".join([f"{k} = {repr(v)}" for k, v in workspace_env.items()])
+            full_code = f"{env_code}\n\n{exec_args.code}"
+        else:
+            full_code = exec_args.code
+
+        # Execute code within auto_register context
+        if self._workspace and working_directory:
+            files_before = snapshot_generated_artifact_files(working_directory)
+            with self._workspace.auto_register_files():
+                result = self._execute(
+                    full_code, exec_args.capture_output, working_directory
+                )
+            if result.get("success"):
+                files_after = snapshot_generated_artifact_files(working_directory)
+                result.update(
+                    build_generated_file_metadata(
+                        workspace=self._workspace,
+                        file_paths=changed_generated_artifact_files(
+                            files_before, files_after
+                        ),
+                    )
+                )
+        else:
+            result = self._execute(
+                full_code, exec_args.capture_output, working_directory
+            )
+
+        return PythonExecutorResult(**result).model_dump()
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        return await asyncio.to_thread(self.run_json_sync, args)
+
+    @staticmethod
+    def _execute(
+        code: str, capture_output: bool, working_directory: Optional[str]
+    ) -> Dict[str, Any]:
+        """Run the code on the host under the configured limit, or in-process
+        inside the sandbox runner, which the sandbox wrapper bounds."""
+        if in_sandbox_tool_runner():
+            # The sandbox wrapper already bounds this runner process; a second
+            # interpreter here would only add startup cost.
+            return PythonExecutorCore(working_directory).execute_code(
+                code, capture_output
+            )
+        return run_python_code_in_subprocess(
+            code,
+            capture_output=capture_output,
+            working_directory=working_directory,
+            timeout_seconds=get_python_executor_timeout_seconds(),
+        )
+
+    def _get_working_directory(self) -> Optional[str]:
+        """Determine the working directory based on workspace settings"""
+        if self._workspace:
+            # Use workspace output directory as working directory
+            return str(self._workspace.resolve_path(""))
+        return None
+
+    def _get_workspace_env(self) -> Optional[Dict[str, str]]:
+        """Get workspace environment variables"""
+        if not self._workspace:
+            return None
+
+        return {
+            "WORKSPACE_OUTPUT_DIR": str(self._workspace.resolve_path("")),
+            "WORKSPACE_INPUT_DIR": str(self._workspace.resolve_path("", "input")),
+            "WORKSPACE_TEMP_DIR": str(self._workspace.resolve_path("", "temp")),
+            "WORKSPACE_DIR": str(self._workspace.workspace_dir.resolve()),
+        }
+
+
+@sandbox_config(
+    packages=[
+        "pandas>=1.3.0",
+        "numpy>=1.21.0",
+        "matplotlib>=3.5.0",
+        "openpyxl>=3.1.0",  # required by the xlsx-financial-report skill
+        "python-docx>=1.1.0",  # for .docx generation; skill lands in #1640
+    ],
+    exec_timeout=get_python_executor_timeout_seconds,
+)
+class PythonExecutorToolForBasic(PythonExecutorTool):
+    """Python executor tool with BASIC category."""
+
+    category = ToolCategory.BASIC
+
+    @property
+    def name(self) -> str:
+        return "execute_python_code"
+
+
+def get_python_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionTool:
+    """
+    Create a workspace-bound Python executor tool.
+
+    Args:
+        info: Dictionary containing workspace information
+
+    Returns:
+        A Python executor tool bound to the specified workspace
+    """
+    # Extract workspace from info if provided
+    workspace = None
+    if info and "workspace" in info:
+        workspace = (
+            info["workspace"] if isinstance(info["workspace"], TaskWorkspace) else None
+        )
+
+    # Create workspace-bound Python executor
+    executor = PythonExecutorTool(workspace=workspace)
+
+    # Wrap as LangChain tool
+    def execute_python_code(code: str, capture_output: bool = True) -> Dict[str, Any]:
+        result: Dict[str, Any] = executor.run_json_sync(
+            {"code": code, "capture_output": capture_output}
+        )
+        return result
+
+    return PythonExecutorFunctionTool(
+        execute_python_code, description=executor.description
+    )
+
+
+def create_python_executor_tool(workspace: TaskWorkspace) -> AbstractBaseTool:
+    """Create Python executor tool bound to workspace"""
+    return PythonExecutorTool(workspace)

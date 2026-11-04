@@ -1,0 +1,4562 @@
+"""Test model management API functionality"""
+
+import asyncio
+import json
+import os
+import tempfile
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import quote
+
+import httpx
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from tests.shared.auth_database import auth_db_override
+from xagent.core.model.chat.basic.bedrock import BedrockLLM
+from xagent.core.model.chat.basic.claude import AnthropicAuthenticationError
+from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
+from xagent.web.api import model as model_module
+from xagent.web.api.auth import auth_router
+from xagent.web.api.model import model_router
+from xagent.web.models.auth_database import get_auth_db
+from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig
+from xagent.web.models.database import Base, get_db, get_engine, get_session_local
+from xagent.web.models.model import Model as DBModel
+from xagent.web.models.user import UserDefaultModel, UserModel
+from xagent.web.services.llm_utils import (
+    PLATFORM_MODEL_MANAGER,
+    AutoModelUnavailableError,
+    CoreStorage,
+    PlatformModelIdentityError,
+    PlatformModelStore,
+)
+
+# Create temporary directory for database
+
+
+def override_get_db():
+    db = None
+    try:
+        db = next(get_db())
+        yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
+# Create test app without startup events
+test_app = FastAPI()
+test_app.include_router(auth_router)
+test_app.include_router(model_router)
+test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
+
+# Create test client
+client = TestClient(test_app)
+
+
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://compatible.example.com/v1/models")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"upstream returned {status_code}", request=request, response=response
+    )
+
+
+def ensure_system_initialized() -> None:
+    status_response = client.get("/api/auth/setup-status")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+
+    if status_data.get("needs_setup", True):
+        setup_response = client.post(
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
+        )
+        assert setup_response.status_code == 200
+        assert setup_response.json().get("success") is True
+
+
+@pytest.fixture
+def standalone_hook():
+    from xagent.web.services import quota_hooks
+
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    yield SimpleNamespace(calls=calls)
+    quota_hooks.set_standalone_usage_hook(None)
+
+
+@pytest.fixture(scope="function")
+def test_db():
+    """Create test database"""
+    # Base.metadata.create_all(bind=engine)
+    # Initialize database with default users
+    from xagent.web.models.database import init_db
+
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    SQLALCHEMY_DATABASE_URL = f"sqlite:///{temp_db_path}"
+
+    # Note: Previously mocked try_upgrade_db to skip db migrations.
+    # Now removed the mock to test the complete init_db() flow.
+    # For new databases (like this temp one), try_upgrade_db only stamps
+    # the latest revision without running migrations, which is safe and correct.
+    init_db(db_url=SQLALCHEMY_DATABASE_URL)
+
+    engine = get_engine()
+
+    yield
+
+    # Cleanup
+    Base.metadata.drop_all(bind=engine)
+    try:
+        import shutil
+
+        shutil.rmtree(temp_dir)
+    except OSError:
+        pass
+
+
+@pytest.fixture(scope="function")
+def admin_user(test_db):
+    """Create admin user for testing"""
+    ensure_system_initialized()
+
+    db = next(get_db())
+    from xagent.web.models.user import User
+
+    admin = db.query(User).filter(User.username == "admin").first()
+    assert admin is not None
+    user_info = {"id": admin.id, "username": admin.username}
+    db.close()
+    return user_info
+
+
+@pytest.fixture(scope="function")
+def regular_user(test_db):
+    """Create regular user for testing"""
+    ensure_system_initialized()
+
+    user_data = {
+        "username": "regularuser",
+        "email": "regularuser@example.com",
+        "password": "password123",
+    }
+    response = client.post("/api/auth/register", json=user_data)
+    assert response.status_code == 200
+    assert response.json().get("success") is True
+    return response.json()["user"]
+
+
+@pytest.fixture(scope="function")
+def admin_headers(admin_user):
+    """Authentication headers for admin user"""
+    response = client.post(
+        "/api/auth/login",
+        json={"username": admin_user["username"], "password": "admin123"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("success") is True
+    return {"Authorization": f"Bearer {data['access_token']}"}
+
+
+@pytest.fixture(scope="function")
+def regular_headers(regular_user):
+    """Authentication headers for regular user"""
+    response = client.post(
+        "/api/auth/login",
+        json={"username": regular_user["username"], "password": "password123"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("success") is True
+    return {"Authorization": f"Bearer {data['access_token']}"}
+
+
+@pytest.fixture(scope="function")
+def sample_model_data():
+    """Sample model data for testing"""
+    return {
+        "model_id": "test-openai-model",
+        "category": "llm",
+        "model_provider": "openai",
+        "model_name": "gpt-4",
+        "api_key": "test-api-key",
+        "base_url": "https://api.openai.com/v1",
+        "temperature": 0.7,
+        "abilities": ["chat", "tool_calling"],
+        "description": "Test OpenAI model",
+        "share_with_users": False,
+    }
+
+
+@pytest.fixture(scope="function")
+def sample_embedding_model_data():
+    return {
+        "model_id": "test-embedding-model",
+        "category": "embedding",
+        "model_provider": "openai",
+        "model_name": "text-embedding-3-small",
+        "api_key": "test-api-key",
+        "base_url": "https://api.openai.com/v1",
+        "dimension": 1536,
+        "abilities": ["embedding"],
+        "description": "Test embedding model",
+        "share_with_users": False,
+    }
+
+
+@pytest.fixture(scope="function")
+def sample_speech_model_data():
+    return {
+        "model_id": "test-speech-model",
+        "category": "speech",
+        "model_provider": "xinference",
+        "model_name": "speech-dual-model",
+        "api_key": "test-api-key",
+        "base_url": "http://localhost:9997",
+        "abilities": ["asr", "tts"],
+        "description": "Test speech model",
+        "share_with_users": False,
+    }
+
+
+@pytest.fixture(scope="function")
+def sample_image_model_data():
+    return {
+        "model_id": "test-image-model",
+        "category": "image",
+        "model_provider": "dashscope",
+        "model_name": "qwen-image",
+        "api_key": "test-api-key",
+        "base_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+        "abilities": ["generate"],
+        "description": "Test image model",
+        "share_with_users": False,
+    }
+
+
+@pytest.fixture(scope="function")
+def sample_video_model_data():
+    return {
+        "model_id": "test-video-model",
+        "category": "video",
+        "model_provider": "volcengine-ark",
+        "model_name": "doubao-seedance-2-0-fast-260128",
+        "api_key": "test-api-key",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "abilities": ["generate"],
+        "description": "Test Seedance video model",
+        "share_with_users": False,
+    }
+
+
+def _platform_config(model_id: str, category: str = "llm"):
+    common = {
+        "id": model_id,
+        "model_provider": "openai",
+        "api_key": "platform-key",
+        "base_url": "https://api.openai.com/v1",
+    }
+    if category == "embedding":
+        return EmbeddingModelConfig(
+            **common,
+            model_name="text-embedding-3-small",
+            abilities=["embedding"],
+            dimension=1536,
+        )
+    return ChatModelConfig(**common, model_name="gpt-4", abilities=["chat"])
+
+
+@pytest.mark.parametrize("provider", ["xinference", "elevenlabs"])
+def test_speech_defaults_survive_create_read_update_and_clear(
+    test_db, regular_headers, sample_speech_model_data, provider
+):
+    settings = {
+        "language": "en",
+        "voice": "configured-voice",
+        "format": "pcm",
+        "sample_rate": 16000,
+    }
+    payload = {**sample_speech_model_data, "model_provider": provider, **settings}
+    created = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert created.status_code == 200, created.text
+    saved = created.json()
+    assert {key: saved[key] for key in settings} == settings
+    model_id = saved["model_id"]
+    detail_url = f"/api/models/by-id/{model_id}"
+
+    detail = client.get(detail_url, headers=regular_headers)
+    assert detail.status_code == 200
+    assert {key: detail.json()[key] for key in settings} == settings
+    listed = client.get("/api/models/", headers=regular_headers)
+    assert listed.status_code == 200
+    listed_model = next(item for item in listed.json() if item["model_id"] == model_id)
+    assert {key: listed_model[key] for key in settings} == settings
+
+    db = next(get_db())
+    try:
+        config = CoreStorage(db, DBModel).load(model_id)
+        assert {key: getattr(config, key) for key in settings} == settings
+    finally:
+        db.close()
+
+    changed = {"voice": "updated-voice", "sample_rate": 24000}
+    updated = client.put(detail_url, json=changed, headers=regular_headers)
+    assert updated.status_code == 200, updated.text
+    expected = {**settings, **changed}
+    refreshed = client.get("/api/models/", headers=regular_headers)
+    refreshed_model = next(
+        item for item in refreshed.json() if item["model_id"] == model_id
+    )
+    assert {key: refreshed_model[key] for key in expected} == expected
+
+    cleared = client.put(
+        detail_url, json={key: None for key in settings}, headers=regular_headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    reread = client.get(detail_url, headers=regular_headers)
+    assert {key: reread.json()[key] for key in settings} == {
+        key: None for key in settings
+    }
+
+
+@pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
+def test_user_creation_rejects_platform_namespace(
+    test_db, regular_headers, sample_model_data, path
+):
+    payload = {**sample_model_data, "model_id": "platform/forged"}
+
+    response = client.post(path, headers=regular_headers, json=payload)
+
+    assert response.status_code == 403
+    db = next(get_db())
+    try:
+        assert db.query(DBModel).filter_by(model_id="platform/forged").first() is None
+    finally:
+        db.close()
+
+
+@pytest.fixture
+def realtime_asr_record(regular_headers, sample_speech_model_data):
+    payload = {
+        **sample_speech_model_data,
+        "model_id": "live-only-asr",
+        "model_name": "scribe_v2_realtime",
+        "model_provider": "elevenlabs",
+        "abilities": ["asr"],
+    }
+    response = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_file_transcription_rejects_live_only_asr_before_provider_call(
+    realtime_asr_record, regular_headers, explicit
+):
+    with patch("xagent.core.model.asr.adapter.get_asr_model_instance") as factory:
+        response = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+            data={"model_id": realtime_asr_record["model_id"]} if explicit else {},
+        )
+    assert response.status_code == (400 if explicit else 404), response.text
+    factory.assert_not_called()
+
+
+def test_live_only_asr_cannot_become_file_asr_default(
+    realtime_asr_record, regular_headers
+):
+    response = client.post(
+        "/api/models/user-default",
+        headers=regular_headers,
+        json={"model_id": realtime_asr_record["id"], "config_type": "asr"},
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("legacy_default", [False, True])
+def test_file_asr_resolution_skips_realtime_candidates_and_legacy_defaults(
+    realtime_asr_record,
+    regular_user,
+    regular_headers,
+    sample_speech_model_data,
+    legacy_default,
+):
+    response = client.post(
+        "/api/models/",
+        headers=regular_headers,
+        json={
+            **sample_speech_model_data,
+            "model_id": "batch-asr",
+            "model_name": "scribe_v2",
+            "model_provider": "elevenlabs",
+            "abilities": ["asr"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    if legacy_default:
+        db = next(get_db())
+        try:
+            db.add(
+                UserDefaultModel(
+                    user_id=regular_user["id"],
+                    model_id=realtime_asr_record["id"],
+                    config_type="asr",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+    fake = SimpleNamespace(
+        transcribe=AsyncMock(return_value="recognized"), aclose=AsyncMock()
+    )
+    with patch(
+        "xagent.core.model.asr.adapter.get_asr_model_instance", return_value=fake
+    ) as factory:
+        transcribed = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+        )
+    assert transcribed.status_code == 200, transcribed.text
+    assert transcribed.json()["model_id"] == "batch-asr"
+    assert factory.call_args.args[0].model_name == "scribe_v2"
+
+
+@pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
+def test_user_creation_rejects_auto_router_namespace(
+    test_db, regular_headers, sample_model_data, path
+):
+    payload = {**sample_model_data, "model_id": "auto-router-999"}
+
+    response = client.post(path, headers=regular_headers, json=payload)
+
+    assert response.status_code == 403
+    assert "auto-router-" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
+def test_model_create_rejects_internal_id_exceeding_storage_limit(
+    test_db, regular_headers, sample_model_data, path
+):
+    payload = {**sample_model_data, "model_id": "m" * 101}
+
+    response = client.post(path, headers=regular_headers, json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "model_id"
+
+
+def test_model_name_request_limits_match_storage_contract(
+    test_db, regular_headers, sample_model_data
+):
+    oversized_name = "m" * 2049
+
+    create_response = client.post(
+        "/api/models/",
+        headers=regular_headers,
+        json={**sample_model_data, "model_name": oversized_name},
+    )
+    assert create_response.status_code == 422
+
+    created = client.post(
+        "/api/models/", headers=regular_headers, json=sample_model_data
+    )
+    assert created.status_code == 200
+    update_response = client.put(
+        f"/api/models/{sample_model_data['model_id']}",
+        headers=regular_headers,
+        json={"model_name": oversized_name},
+    )
+    assert update_response.status_code == 422
+
+    connection_response = client.post(
+        "/api/models/test-connection",
+        headers=regular_headers,
+        json={
+            "model_provider": "openai",
+            "model_name": oversized_name,
+            "api_key": "test-api-key",
+        },
+    )
+    assert connection_response.status_code == 422
+
+
+def test_trusted_platform_store_persists_provenance_without_user_ownership(test_db):
+    db = next(get_db())
+    try:
+        store = PlatformModelStore(db)
+        created = store.create(_platform_config("platform/toby-embedding", "embedding"))
+
+        assert created.managed_by == PLATFORM_MODEL_MANAGER
+        assert store.get("platform/toby-embedding") is created
+        assert db.query(UserModel).filter_by(model_id=created.id).first() is None
+        assert db.query(UserDefaultModel).filter_by(model_id=created.id).first() is None
+    finally:
+        db.close()
+
+
+def test_trusted_platform_store_does_not_adopt_preclaimed_collision(test_db):
+    db = next(get_db())
+    try:
+        collision = DBModel(
+            model_id="platform/preclaimed",
+            category="llm",
+            model_provider="openai",
+            model_name="tenant-model",
+            api_key="tenant-key",
+            abilities=["chat"],
+            is_active=True,
+        )
+        db.add(collision)
+        db.commit()
+
+        store = PlatformModelStore(db)
+        assert store.get("platform/preclaimed") is None
+        with pytest.raises(PlatformModelIdentityError, match="already claimed"):
+            store.create(_platform_config("platform/preclaimed"))
+
+        db.refresh(collision)
+        assert collision.managed_by is None
+        assert collision.model_name == "tenant-model"
+        assert collision.is_active is True
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("initial_category", "requested_category"),
+    [("llm", "embedding"), ("embedding", "llm")],
+)
+def test_platform_category_is_immutable_without_partial_mutation(
+    test_db, admin_user, admin_headers, initial_category, requested_category
+):
+    db = next(get_db())
+    model_id = f"platform/category-{initial_category}"
+    try:
+        created = PlatformModelStore(db).create(
+            _platform_config(model_id, initial_category)
+        )
+        ownership = UserModel(
+            user_id=admin_user["id"],
+            model_id=created.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_shared=False,
+        )
+        db.add(ownership)
+        db.add(
+            UserDefaultModel(
+                user_id=admin_user["id"],
+                model_id=created.id,
+                config_type="general" if initial_category == "llm" else "embedding",
+            )
+        )
+        db.commit()
+        ownership_id = ownership.id
+        default_id = db.query(UserDefaultModel).filter_by(model_id=created.id).one().id
+    finally:
+        db.close()
+
+    response = client.put(
+        f"/api/models/by-id/{quote(model_id, safe='')}",
+        headers=admin_headers,
+        json={
+            "category": requested_category,
+            "model_name": "mutated-name",
+            "share_with_users": True,
+        },
+    )
+
+    assert response.status_code == 409
+    db = next(get_db())
+    try:
+        unchanged = db.query(DBModel).filter_by(model_id=model_id).one()
+        assert unchanged.category == initial_category
+        assert unchanged.model_name != "mutated-name"
+        assert db.query(UserModel).filter_by(id=ownership_id).one().is_shared is False
+        assert (
+            db.query(UserDefaultModel).filter_by(id=default_id).one().model_id
+            == unchanged.id
+        )
+    finally:
+        db.close()
+
+
+def test_preclaimed_platform_id_cannot_be_updated_deactivated_or_deleted(
+    test_db, admin_user, admin_headers
+):
+    db = next(get_db())
+    try:
+        collision = DBModel(
+            model_id="platform/tenant-row",
+            category="llm",
+            model_provider="openai",
+            model_name="tenant-model",
+            api_key="tenant-key",
+            abilities=["chat"],
+            is_active=True,
+        )
+        db.add(collision)
+        db.flush()
+        db.add(
+            UserModel(
+                user_id=admin_user["id"],
+                model_id=collision.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_shared=False,
+            )
+        )
+        db.commit()
+        with pytest.raises(PlatformModelIdentityError):
+            CoreStorage(db, DBModel).set_model_active(collision.model_id, False)
+    finally:
+        db.close()
+
+    path = f"/api/models/by-id/{quote('platform/tenant-row', safe='')}"
+    assert (
+        client.put(
+            path, headers=admin_headers, json={"model_name": "forged"}
+        ).status_code
+        == 403
+    )
+    assert client.delete(path, headers=admin_headers).status_code == 403
+
+    db = next(get_db())
+    try:
+        unchanged = db.query(DBModel).filter_by(model_id="platform/tenant-row").one()
+        assert unchanged.managed_by is None
+        assert unchanged.model_name == "tenant-model"
+        assert unchanged.is_active is True
+    finally:
+        db.close()
+
+
+def test_ordinary_model_create_update_delete_remains_compatible(
+    test_db, admin_headers, sample_model_data
+):
+    created = client.post("/api/models/", headers=admin_headers, json=sample_model_data)
+    assert created.status_code == 200
+
+    updated = client.put(
+        "/api/models/test-openai-model",
+        headers=admin_headers,
+        json={"model_name": "gpt-4o"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["model_name"] == "gpt-4o"
+
+    deleted = client.delete("/api/models/test-openai-model", headers=admin_headers)
+    assert deleted.status_code == 200
+
+
+def test_long_model_credential_round_trips_through_runtime_adapter(
+    test_db, admin_headers, sample_model_data
+):
+    """Exercise encrypted credential lifecycle; schema width is tested on Postgres."""
+    first_key = "a" * 1000
+    payload = {
+        **sample_model_data,
+        "model_id": "long-credential-model",
+        "model_provider": "claude",
+        "model_name": "au.anthropic.claude-opus-5-5",
+        "base_url": "https://bedrock.example.com/anthropic/v1",
+        "api_key": first_key,
+    }
+
+    created = client.post("/api/models/", headers=admin_headers, json=payload)
+    assert created.status_code == 200
+
+    db = next(get_db())
+    try:
+        stored = db.query(DBModel).filter_by(model_id="long-credential-model").one()
+        assert len(stored._api_key_encrypted) > 500
+        assert stored.api_key == first_key
+        runtime = CoreStorage(db, DBModel).get_llm_by_id("long-credential-model")
+        assert runtime is not None
+        assert runtime.api_key == first_key
+        assert runtime.base_url == "https://bedrock.example.com/anthropic/v1"
+    finally:
+        db.close()
+
+    second_key = "b" * 1200
+    updated = client.put(
+        "/api/models/long-credential-model",
+        headers=admin_headers,
+        json={"api_key": second_key},
+    )
+    assert updated.status_code == 200
+
+    db = next(get_db())
+    try:
+        stored = db.query(DBModel).filter_by(model_id="long-credential-model").one()
+        assert len(stored._api_key_encrypted) > 500
+        assert stored.api_key == second_key
+        loaded = CoreStorage(db, DBModel).load("long-credential-model")
+        assert loaded.api_key == second_key
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_validate_provider_model_listing_honors_caller_supplied_timeout():
+    """The listing helper must use the caller's budget, not a literal of its own.
+
+    Guards against reintroducing the second hardcoded timeout this helper
+    used to carry independently of ``test_model_connection``'s own budget
+    (xorbitsai/xagent#1960): the two ``asyncio.wait_for`` layers wrapping a listing
+    call (the endpoint's own, and this helper's inner one around the actual
+    provider fetch) must always share the exact same number, sourced from
+    the ``timeout_seconds`` parameter -- never a second literal in here.
+    """
+
+    async def slow_fetch(*_args, **_kwargs):
+        await asyncio.sleep(0.2)
+        return [{"id": "gpt-4o-mini", "abilities": ["chat"]}]
+
+    with patch(
+        "xagent.web.services.model_list_service.fetch_models_from_provider",
+        side_effect=slow_fetch,
+    ):
+        with pytest.raises(asyncio.TimeoutError):
+            await model_module._validate_provider_model_listing(
+                provider="openai",
+                model_name="gpt-4o-mini",
+                api_key="key",
+                base_url=None,
+                timeout_seconds=0.05,
+            )
+
+        # A budget comfortably larger than the fetch's delay must succeed.
+        # This is what actually pins the parameter as the value in effect:
+        # a mutant that reverts to a hardcoded 10.0 inside the helper would
+        # also pass this half alone, but would fail the 0.05s case above by
+        # never timing out.
+        await model_module._validate_provider_model_listing(
+            provider="openai",
+            model_name="gpt-4o-mini",
+            api_key="key",
+            base_url=None,
+            timeout_seconds=1.0,
+        )
+
+
+def test_xinference_tts_models_route_is_removed():
+    """An anonymous caller must not make the server fetch a caller-supplied URL.
+
+    The route took ``base_url`` without authentication (xorbitsai/xagent#3444)
+    and had no callers, so it was removed rather than guarded.
+    """
+    with patch(
+        "xagent.core.model.tts.xinference.XinferenceTTS.list_available_models",
+        return_value=[],
+    ) as list_models:
+        response = client.get(
+            "/api/models/xinference/tts-models",
+            params={"base_url": "http://xinference.example.com:9997"},
+        )
+
+    assert response.status_code == 404
+    list_models.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_speech_voice_listing_uses_accessible_model_and_closes_client(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, caplog, failure
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    provider = SimpleNamespace(
+        api_key="synthetic-secret",
+        supports_voice_listing=True,
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "voice-one", "name": "Rachel", "extra": "private metadata"}
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    if failure:
+        provider.list_available_voices.side_effect = RuntimeError("synthetic-secret")
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    assert client.get(
+        "/api/models/speech/voices", params={"model_id": model_id}
+    ).status_code in {401, 403}
+    factory.assert_not_called()
+    assert (
+        client.get(
+            "/api/models/speech/voices",
+            params={"model_id": "missing"},
+            headers=regular_headers,
+        ).status_code
+        == 404
+    )
+    factory.assert_not_called()
+    with monkeypatch.context() as hidden:
+        hidden.setattr(model_module, "_passes_model_visibility_hook", lambda *_: False)
+        assert (
+            client.get(
+                "/api/models/speech/voices",
+                params={"model_id": model_id},
+                headers=regular_headers,
+            ).status_code
+            == 404
+        )
+    factory.assert_not_called()
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (502 if failure else 200), response.text
+    if not failure:
+        assert response.json() == [{"voice_id": "voice-one", "name": "Rachel"}]
+    assert "synthetic-secret" not in response.text + caplog.text
+    provider.aclose.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "case", ["inactive", "non_speech", "non_tts", "unsupported", "malformed_ids"]
+)
+def test_speech_voice_listing_capability_and_output_boundaries(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, case
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    if case in {"inactive", "non_speech", "non_tts"}:
+        with get_session_local()() as db:
+            saved = db.query(DBModel).filter_by(model_id=model_id).one()
+            if case == "inactive":
+                saved.is_active = False
+            if case == "non_speech":
+                saved.category = "llm"
+            if case == "non_tts":
+                saved.abilities = ["asr"]
+            db.commit()
+    provider = SimpleNamespace(
+        supports_voice_listing=case != "unsupported",
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "safe-voice", "name": "Rachel"},
+                {"voice_id": "../private"},
+                {"voice_id": 123},
+                {},
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (
+        200 if case == "malformed_ids" else 404 if case == "inactive" else 400
+    ), response.text
+    if case in {"inactive", "non_speech", "non_tts"}:
+        factory.assert_not_called()
+    else:
+        provider.aclose.assert_awaited_once()
+        if case == "unsupported":
+            provider.list_available_voices.assert_not_called()
+        else:
+            assert response.json() == [{"voice_id": "safe-voice", "name": "Rachel"}]
+
+
+class TestModelAPI:
+    """Test model management API endpoints"""
+
+    def test_auto_config_binds_existing_models_and_blocks_candidate_delete(
+        self, test_db, regular_user, regular_headers, sample_model_data, monkeypatch
+    ):
+        first = client.post(
+            "/api/models/",
+            json={
+                **sample_model_data,
+                "abilities": ["chat", "tool_calling", "vision"],
+            },
+            headers=regular_headers,
+        )
+        second_payload = {
+            **sample_model_data,
+            "model_id": "test-second-model",
+            "model_name": "gpt-4.1",
+        }
+        second = client.post(
+            "/api/models/", json=second_payload, headers=regular_headers
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        class Catalog:
+            @staticmethod
+            def known_model_ids():
+                return ("openai/gpt-5.5", "deepseek/deepseek-v4-flash")
+
+            @staticmethod
+            def get(profile_id):
+                return SimpleNamespace(
+                    input_modalities=("text", "image")
+                    if profile_id == "openai/gpt-5.5"
+                    else ("text",)
+                )
+
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            lambda: Catalog(),
+        )
+        with patch(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            return_value=Catalog(),
+        ):
+            response = client.put(
+                "/api/models/auto-config",
+                headers=regular_headers,
+                json={
+                    "strategy": "quality",
+                    "fallback_model_id": second.json()["id"],
+                    "set_as_default": True,
+                    "candidates": [
+                        {
+                            "target_model_id": first.json()["id"],
+                            "routing_model_id": "openai/gpt-5.5",
+                        },
+                        {
+                            "target_model_id": second.json()["id"],
+                            "routing_model_id": "deepseek/deepseek-v4-flash",
+                        },
+                    ],
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["configured"] is True
+        # Legacy clients may still send a strategy, but configured Auto now always
+        # uses xrouter's single-model "auto" policy.
+        assert data["strategy"] == "balanced"
+        assert data["mode"] == "routing"
+        assert data["auto_model"]["model_provider"] == "router"
+        assert data["auto_model"]["model_name"] == "auto"
+        assert data["auto_model"]["can_delete"] is False
+        assert "vision" not in data["auto_model"]["abilities"]
+        assert [candidate["routing_model_id"] for candidate in data["candidates"]] == [
+            "openai/gpt-5.5",
+            "deepseek/deepseek-v4-flash",
+        ]
+
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert config.mode == "routing"
+            assert [candidate.position for candidate in config.candidates] == [0, 1]
+        finally:
+            db.close()
+
+        get_response = client.get("/api/models/auto-config", headers=regular_headers)
+        assert get_response.status_code == 200
+        assert get_response.json()["auto_model"]["id"] == data["auto_model"]["id"]
+        assert get_response.json()["strategy"] == "balanced"
+
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        assert defaults_response.status_code == 200
+        general_default = next(
+            item
+            for item in defaults_response.json()
+            if item["config_type"] == "general"
+        )
+        assert general_default["model_id"] == data["auto_model"]["id"]
+
+        with patch(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            return_value=Catalog(),
+        ):
+            update_response = client.put(
+                "/api/models/auto-config",
+                headers=regular_headers,
+                json={
+                    "fallback_model_id": second.json()["id"],
+                    "candidates": [
+                        {
+                            "target_model_id": second.json()["id"],
+                            "routing_model_id": "deepseek/deepseek-v4-flash",
+                        },
+                        {
+                            "target_model_id": first.json()["id"],
+                            "routing_model_id": "openai/gpt-5.5",
+                        },
+                    ],
+                },
+            )
+        assert update_response.status_code == 200
+        expected_updated_profiles = [
+            "deepseek/deepseek-v4-flash",
+            "openai/gpt-5.5",
+        ]
+        assert [
+            candidate["routing_model_id"]
+            for candidate in update_response.json()["candidates"]
+        ] == expected_updated_profiles
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert [
+                (candidate.routing_model_id, candidate.position)
+                for candidate in config.candidates
+            ] == list(zip(expected_updated_profiles, [0, 1], strict=True))
+        finally:
+            db.close()
+        defaults_after_update = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        assert defaults_after_update.status_code == 200
+        assert any(
+            item["config_type"] == "general"
+            and item["model_id"] == data["auto_model"]["id"]
+            for item in defaults_after_update.json()
+        )
+
+        list_response = client.get("/api/models/", headers=regular_headers)
+        assert list_response.status_code == 200
+        assert any(
+            model["model_provider"] == "router" for model in list_response.json()
+        )
+
+        fake_llm = AsyncMock()
+        fake_llm.chat.return_value = "ok"
+        with patch.object(
+            model_module.CoreStorage,
+            "get_llm_by_id",
+            return_value=fake_llm,
+        ) as get_llm:
+            all_test_response = client.post("/api/models/test", headers=regular_headers)
+            auto_test_response = client.post(
+                "/api/models/test",
+                headers=regular_headers,
+                json={"model_ids": [data["auto_model"]["model_id"]]},
+            )
+        assert all_test_response.status_code == 200
+        assert auto_test_response.status_code == 200
+        assert auto_test_response.json() == []
+        assert data["auto_model"]["model_id"] not in {
+            call.args[0] for call in get_llm.call_args_list
+        }
+
+        from xagent.core.model.chat.basic.router import RouterLLM
+        from xagent.web.services.llm_utils import UserAwareModelStorage
+
+        db = next(get_db())
+        try:
+            llm = UserAwareModelStorage(db).get_llm_by_id(
+                data["auto_model"]["model_id"], regular_user["id"]
+            )
+            assert isinstance(llm, RouterLLM)
+            assert llm.model_name == "auto"
+            assert llm._candidate_models == (
+                "deepseek/deepseek-v4-flash",
+                "openai/gpt-5.5",
+            )
+            assert llm._fallback_model == "deepseek/deepseek-v4-flash"
+            downstream = llm._downstream_resolver("openai/gpt-5.5")
+            assert downstream.model_id == first.json()["model_id"]
+            # A candidate keeps its saved budget unless the router says this
+            # call can move to the fallback. Even then only the failures the
+            # fallback takes over stop after two attempts; the rest keep the
+            # saved count, and the fallback never gives up early.
+            assert downstream._retry_wrapper.max_retries == 10
+            assert downstream._retry_wrapper.budget.failover_max_attempts is None
+            limited = llm._downstream_resolver("openai/gpt-5.5", limit_attempts=True)
+            assert limited._retry_wrapper.max_retries == 10
+            assert limited._retry_wrapper.budget.failover_max_attempts == 2
+            fallback_downstream = llm._downstream_resolver(
+                "deepseek/deepseek-v4-flash", limit_attempts=True
+            )
+            assert (
+                fallback_downstream._retry_wrapper.budget.failover_max_attempts is None
+            )
+
+            first_db_model = db.get(DBModel, first.json()["id"])
+            second_db_model = db.get(DBModel, second.json()["id"])
+            assert first_db_model is not None
+            assert second_db_model is not None
+
+            first_db_model.is_active = False
+            db.flush()
+            degraded_llm = UserAwareModelStorage(db).get_llm_by_id(
+                data["auto_model"]["model_id"], regular_user["id"]
+            )
+            assert isinstance(degraded_llm, RouterLLM)
+            assert degraded_llm._candidate_models == ("deepseek/deepseek-v4-flash",)
+            assert degraded_llm._fallback_model == "deepseek/deepseek-v4-flash"
+
+            second_db_model.is_active = False
+            db.flush()
+            with pytest.raises(
+                AutoModelUnavailableError,
+                match="Auto model has no active configured candidates",
+            ):
+                UserAwareModelStorage(db).get_llm_by_id(
+                    data["auto_model"]["model_id"], regular_user["id"]
+                )
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.create_llm_from_env"
+                ) as env_fallback,
+                pytest.raises(
+                    AutoModelUnavailableError,
+                    match="Auto model has no active configured candidates",
+                ),
+            ):
+                UserAwareModelStorage(db).get_configured_defaults(regular_user["id"])
+            env_fallback.assert_not_called()
+        finally:
+            db.rollback()
+            db.close()
+
+        delete_response = client.delete(
+            f"/api/models/{first.json()['model_id']}", headers=regular_headers
+        )
+        assert delete_response.status_code == 409
+        assert "Auto configuration" in delete_response.json()["detail"]
+
+    @pytest.mark.parametrize("owner_action", ["unshare", "category", "delete"])
+    def test_other_users_auto_binding_does_not_control_model_owner(
+        self,
+        test_db,
+        regular_user,
+        admin_user,
+        admin_headers,
+        owner_action,
+    ):
+        db = next(get_db())
+        try:
+            target = DBModel(
+                model_id=f"cross-tenant-{owner_action}",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="owner-key",
+                abilities=["chat"],
+                is_active=True,
+            )
+            router_model = DBModel(
+                model_id=f"auto-router-test-{owner_action}",
+                category="llm",
+                model_provider="router",
+                model_name="auto",
+                api_key="",
+                abilities=["chat"],
+                is_active=True,
+            )
+            db.add_all([target, router_model])
+            db.flush()
+            db.add(
+                UserModel(
+                    user_id=admin_user["id"],
+                    model_id=target.id,
+                    is_owner=True,
+                    can_edit=True,
+                    can_delete=True,
+                    is_shared=owner_action == "unshare",
+                )
+            )
+            config = AutoModelConfig(
+                user_id=regular_user["id"],
+                router_model_id=router_model.id,
+                strategy="balanced",
+                fallback_model_id=target.id,
+            )
+            db.add(config)
+            db.flush()
+            db.add(
+                AutoModelCandidate(
+                    config_id=config.id,
+                    routing_model_id="openai/gpt-5.5",
+                    target_model_id=target.id,
+                    position=0,
+                )
+            )
+            db.commit()
+            target_id = int(target.id)
+            config_id = int(config.id)
+        finally:
+            db.close()
+
+        if owner_action == "delete":
+            response = client.delete(
+                f"/api/models/cross-tenant-{owner_action}",
+                headers=admin_headers,
+            )
+        else:
+            update = (
+                {"share_with_users": False}
+                if owner_action == "unshare"
+                else {"category": "embedding"}
+            )
+            response = client.put(
+                f"/api/models/cross-tenant-{owner_action}",
+                headers=admin_headers,
+                json=update,
+            )
+
+        assert response.status_code == 200
+        db = next(get_db())
+        try:
+            assert (
+                db.query(AutoModelCandidate)
+                .filter(AutoModelCandidate.target_model_id == target_id)
+                .count()
+                == 0
+            )
+            assert db.get(AutoModelConfig, config_id).fallback_model_id is None
+        finally:
+            db.close()
+
+    def test_auto_config_rejects_duplicate_profile_mapping(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        first = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        second = client.post(
+            "/api/models/",
+            json={
+                **sample_model_data,
+                "model_id": "another-model",
+                "model_name": "gpt-4.1",
+            },
+            headers=regular_headers,
+        )
+        response = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "fallback_model_id": first.json()["id"],
+                "candidates": [
+                    {
+                        "target_model_id": first.json()["id"],
+                        "routing_model_id": "openai/gpt-5.5",
+                    },
+                    {
+                        "target_model_id": second.json()["id"],
+                        "routing_model_id": "openai/gpt-5.5",
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 422
+
+    @staticmethod
+    def _sequential_targets(sample_model_data):
+        """Tuas DeepSeek, Tuas GLM, and official DeepSeek as separate endpoints."""
+        return [
+            {
+                **sample_model_data,
+                "model_id": "tuas-deepseek",
+                "model_name": "deepseek-v4.1-flash",
+                "api_key": "tuas-key",
+                "base_url": "https://tuas.example/v1",
+                "context_window": 128_000,
+            },
+            {
+                **sample_model_data,
+                "model_id": "tuas-glm",
+                "model_name": "glm-5.3",
+                "api_key": "tuas-key",
+                "base_url": "https://tuas.example/v1",
+                "context_window": 200_000,
+            },
+            {
+                **sample_model_data,
+                "model_id": "official-deepseek",
+                "model_name": "deepseek-chat",
+                "api_key": "deepseek-key",
+                "base_url": "https://api.deepseek.example/v1",
+                "context_window": 1_000_000,
+                "abilities": ["chat", "tool_calling", "vision"],
+            },
+        ]
+
+    @staticmethod
+    def _sequential_catalog():
+        class Catalog:
+            @staticmethod
+            def known_model_ids():
+                return ("deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3")
+
+            @staticmethod
+            def get(_profile_id):
+                return SimpleNamespace(input_modalities=("text",))
+
+        return Catalog()
+
+    def test_auto_config_persists_sequential_failover_order(
+        self, test_db, regular_user, regular_headers, sample_model_data, monkeypatch
+    ):
+        from xagent.core.model.chat.basic.router import RouterLLM
+        from xagent.web.services.llm_utils import UserAwareModelStorage
+
+        targets = self._sequential_targets(sample_model_data)
+        target_ids = []
+        for target in targets:
+            created = client.post("/api/models/", json=target, headers=regular_headers)
+            assert created.status_code == 200
+            target_ids.append(created.json()["id"])
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+        profiles = [
+            "deepseek/deepseek-v4.1-flash",
+            "z-ai/glm-5.3",
+            "deepseek/deepseek-v4.1-flash",
+        ]
+
+        response = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "mode": "sequential_failover",
+                "candidates": [
+                    {"target_model_id": target_id, "routing_model_id": profile}
+                    for target_id, profile in zip(target_ids, profiles, strict=True)
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["mode"] == "sequential_failover"
+        assert data["fallback_model_id"] is None
+        assert [
+            (item["target_model_id"], item["routing_model_id"])
+            for item in data["candidates"]
+        ] == list(zip(target_ids, profiles, strict=True))
+        loaded = client.get("/api/models/auto-config", headers=regular_headers)
+        assert loaded.json()["mode"] == "sequential_failover"
+        assert loaded.json()["candidates"] == data["candidates"]
+
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert config.mode == "sequential_failover"
+            assert [
+                (candidate.target_model_id, candidate.position)
+                for candidate in config.candidates
+            ] == list(zip(target_ids, [0, 1, 2], strict=True))
+
+            # Hydration must not need the profile catalog in sequential mode;
+            # each candidate carries its saved endpoint's own identity.
+            monkeypatch.setattr(
+                "xagent.web.services.auto_model_service.load_router_profile_catalog",
+                Mock(side_effect=AssertionError("catalog not needed")),
+            )
+            llm = UserAwareModelStorage(db).get_llm_by_id(
+                data["auto_model"]["model_id"], regular_user["id"]
+            )
+            assert isinstance(llm, RouterLLM)
+            assert llm.uses_sequential_failover
+            assert llm._fallback_model is None
+            candidates = list(llm._candidate_models)
+            assert len(candidates) == 3
+            assert [llm._profile_id(candidate) for candidate in candidates] == profiles
+            assert [llm._input_modalities(candidate) for candidate in candidates] == [
+                ("text",),
+                ("text",),
+                ("text", "image"),
+            ]
+            resolved = [llm._downstream_resolver(candidate) for candidate in candidates]
+            assert [
+                (
+                    downstream.model_id,
+                    downstream.model_name,
+                    downstream.base_url,
+                    downstream.api_key,
+                    downstream.context_window,
+                )
+                for downstream in resolved
+            ] == [
+                (
+                    target["model_id"],
+                    target["model_name"],
+                    target["base_url"],
+                    target["api_key"],
+                    target["context_window"],
+                )
+                for target in targets
+            ]
+            # A candidate that can still move on gets the short failover budget;
+            # sequential mode has no fallback, so the router decides who is last.
+            for candidate in candidates:
+                limited = llm._downstream_resolver(candidate, limit_attempts=True)
+                assert limited._retry_wrapper.budget.failover_max_attempts == 2
+        finally:
+            db.close()
+
+    def test_auto_config_mode_switch_on_existing_config(
+        self, test_db, regular_headers, sample_model_data, monkeypatch
+    ):
+        ids = [
+            client.post(
+                "/api/models/",
+                json={**sample_model_data, "model_id": f"switch-{index}"},
+                headers=regular_headers,
+            ).json()["id"]
+            for index in range(2)
+        ]
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+
+        def save(mode: str, order: list[int]):
+            return client.put(
+                "/api/models/auto-config",
+                headers=regular_headers,
+                json={
+                    "mode": mode,
+                    "candidates": [
+                        {
+                            "target_model_id": target_id,
+                            "routing_model_id": profile,
+                        }
+                        for target_id, profile in zip(
+                            order,
+                            ("deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3"),
+                            strict=True,
+                        )
+                    ],
+                },
+            )
+
+        assert save("routing", ids).json()["mode"] == "routing"
+        switched = save("sequential_failover", ids[::-1])
+        assert switched.status_code == 200
+        assert switched.json()["mode"] == "sequential_failover"
+        assert [item["target_model_id"] for item in switched.json()["candidates"]] == (
+            ids[::-1]
+        )
+        reloaded = client.get("/api/models/auto-config", headers=regular_headers)
+        assert reloaded.json()["mode"] == "sequential_failover"
+        assert save("routing", ids).json()["mode"] == "routing"
+
+    @pytest.mark.parametrize(
+        ("mode", "same_target", "fallback", "message"),
+        [
+            (
+                "sequential_failover",
+                False,
+                True,
+                "does not accept fallback_model_id",
+            ),
+            (
+                "sequential_failover",
+                True,
+                False,
+                "Each saved model can only appear once",
+            ),
+            ("routing", False, False, "Each routing profile can only appear once"),
+        ],
+    )
+    def test_auto_config_mode_specific_validation(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_model_data,
+        mode,
+        same_target,
+        fallback,
+        message,
+    ):
+        first = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        ).json()["id"]
+        second = client.post(
+            "/api/models/",
+            json={**sample_model_data, "model_id": "another-model"},
+            headers=regular_headers,
+        ).json()["id"]
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "candidates": [
+                {"target_model_id": first, "routing_model_id": "openai/gpt-5.5"},
+                {
+                    "target_model_id": first if same_target else second,
+                    "routing_model_id": "openai/gpt-5.5",
+                },
+            ],
+        }
+        if fallback:
+            payload["fallback_model_id"] = first
+
+        response = client.put(
+            "/api/models/auto-config", headers=regular_headers, json=payload
+        )
+
+        assert response.status_code == 422
+        assert message in response.text
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"mode": "sequential_failover", "candidates": []},
+            {
+                "mode": "priority",
+                "candidates": [
+                    {"target_model_id": 1, "routing_model_id": "openai/gpt-5.5"}
+                ],
+            },
+        ],
+    )
+    def test_auto_config_rejects_invalid_sequential_payload(
+        self, test_db, regular_headers, payload
+    ):
+        response = client.put(
+            "/api/models/auto-config", headers=regular_headers, json=payload
+        )
+
+        assert response.status_code == 422
+
+    def test_sequential_auto_rejects_inaccessible_target(
+        self,
+        test_db,
+        admin_headers,
+        regular_headers,
+        sample_model_data,
+        monkeypatch,
+    ):
+        own = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        ).json()["id"]
+        foreign = client.post(
+            "/api/models/",
+            json={**sample_model_data, "model_id": "admin-private"},
+            headers=admin_headers,
+        ).json()["id"]
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+
+        response = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "mode": "sequential_failover",
+                "candidates": [
+                    {
+                        "target_model_id": own,
+                        "routing_model_id": "deepseek/deepseek-v4.1-flash",
+                    },
+                    {
+                        "target_model_id": foreign,
+                        "routing_model_id": "deepseek/deepseek-v4.1-flash",
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 400
+        assert str(foreign) in response.text
+
+    def test_sequential_target_abilities_edit_skips_profile_match(
+        self, test_db, regular_headers, sample_model_data, monkeypatch
+    ):
+        target = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        ).json()
+        monkeypatch.setattr(
+            "xagent.web.services.auto_model_service.load_router_profile_catalog",
+            self._sequential_catalog,
+        )
+        saved = client.put(
+            "/api/models/auto-config",
+            headers=regular_headers,
+            json={
+                "mode": "sequential_failover",
+                "candidates": [
+                    {
+                        "target_model_id": target["id"],
+                        "routing_model_id": "deepseek/deepseek-v4.1-flash",
+                    }
+                ],
+            },
+        )
+        assert saved.status_code == 200
+
+        # The text-only profile would reject a vision endpoint in routing mode,
+        # but sequential candidates take modalities from the saved target.
+        response = client.put(
+            f"/api/models/{target['id']}",
+            headers=regular_headers,
+            json={"abilities": ["chat", "tool_calling", "vision"]},
+        )
+
+        assert response.status_code == 200
+        assert "vision" in response.json()["abilities"]
+
+    def test_test_connection_embedding_uses_embedding_adapter(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Embedding connection tests should use the embedding adapter instead of chat-only adapter."""
+        embedding_model = Mock()
+        embedding_model.encode = Mock(return_value=[0.1, 0.2, 0.3])
+
+        with patch(
+            "xagent.core.model.embedding.adapter.create_embedding_adapter",
+            return_value=embedding_model,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": "text-embedding-3-small",
+                    "api_key": "test-api-key",
+                    "base_url": "https://api.openai.com/v1",
+                    "category": "embedding",
+                    "dimension": 1536,
+                    "abilities": ["embedding"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        embedding_model.encode.assert_called_once_with("hello")
+
+    def test_test_connection_strips_whitespace_from_request_fields(
+        self, test_db, regular_user, regular_headers
+    ):
+        """model_name/api_key/base_url padded with whitespace must reach the
+        chat adapter trimmed — guards ModelConnectionTestRequest's
+        strip_string_fields validator, which nothing else exercises."""
+        captured = {}
+
+        class FakeLLM:
+            async def chat(self, messages, **kwargs):
+                return {"content": "hi"}
+
+        def fake_create_base_llm(config):
+            captured["model_name"] = config.model_name
+            captured["api_key"] = config.api_key
+            captured["base_url"] = config.base_url
+            return FakeLLM()
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            side_effect=fake_create_base_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": "  gpt-4o-mini  ",
+                    "api_key": "  test-api-key  ",
+                    "base_url": "  https://api.openai.com/v1  ",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert captured["model_name"] == "gpt-4o-mini"
+        assert captured["api_key"] == "test-api-key"
+        assert captured["base_url"] == "https://api.openai.com/v1"
+
+    def test_test_connection_image_fails_when_requested_ability_is_unsupported(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Image connection tests should fail instead of returning a false positive."""
+        with (
+            patch(
+                "xagent.core.model.image.adapter.create_image_model",
+                return_value=Mock(),
+            ),
+            patch(
+                "xagent.web.services.model_list_service.fetch_models_from_provider",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "id": "qwen-image",
+                            "abilities": ["generate"],
+                        }
+                    ]
+                ),
+            ),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "dashscope",
+                    "model_name": "qwen-image",
+                    "api_key": "test-api-key",
+                    "base_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                    "category": "image",
+                    "abilities": ["edit"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert "does not support abilities: edit" in data["error"]
+
+    def test_test_connection_speech_xinference_supports_empty_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Speech connection tests should work for Xinference without requiring an API key."""
+        with (
+            patch(
+                "xagent.web.services.model_list_service.fetch_models_from_provider",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "id": "whisper-base",
+                            "abilities": ["asr"],
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "xagent.core.model.xinference_base.BaseXinferenceModel._ensure_model_handle",
+                new=AsyncMock(return_value=object()),
+            ),
+            patch(
+                "xagent.core.model.xinference_base.BaseXinferenceModel.aclose",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "xinference",
+                    "model_name": "whisper-base",
+                    "api_key": "",
+                    "base_url": "http://localhost:9997",
+                    "category": "speech",
+                    "abilities": ["asr"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+
+    def test_test_connection_speech_elevenlabs_uses_model_listing(
+        self, test_db, regular_user, regular_headers
+    ):
+        """ElevenLabs TTS connection checks should not synthesize paid audio."""
+        with patch(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "eleven_v3",
+                        "abilities": ["tts"],
+                    }
+                ]
+            ),
+        ) as mock_fetch:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "eleven_v3",
+                    "api_key": "test-api-key",
+                    "category": "speech",
+                    "abilities": ["tts"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        mock_fetch.assert_awaited_once()
+
+    def test_test_connection_speech_elevenlabs_uses_listing_for_custom_asr(
+        self, test_db, regular_user, regular_headers
+    ):
+        """ElevenLabs speech checks should not infer abilities from name prefixes."""
+        with patch(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "custom_transcriber",
+                        "abilities": ["asr"],
+                    }
+                ]
+            ),
+        ) as mock_fetch:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "custom_transcriber",
+                    "api_key": "test-api-key",
+                    "category": "speech",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        mock_fetch.assert_awaited_once()
+
+    def test_test_connection_speech_elevenlabs_asr_uses_model_listing(
+        self, test_db, regular_user, regular_headers
+    ):
+        """ElevenLabs ASR connection checks should not transcribe paid audio."""
+        with patch(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "id": "scribe_v2",
+                        "abilities": ["asr"],
+                    }
+                ]
+            ),
+        ) as mock_fetch:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "scribe_v2",
+                    "api_key": "test-api-key",
+                    "category": "speech",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "passed"
+        mock_fetch.assert_awaited_once()
+
+    def test_test_connection_sound_effect_does_not_require_catalog_match(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Sound-effect checks should probe auth without a billed generation."""
+        sound_effect_model = Mock()
+        sound_effect_model.validate_connection = AsyncMock(return_value=None)
+        sound_effect_model.aclose = AsyncMock(return_value=None)
+
+        with patch(
+            "xagent.core.model.sound_effect.create_sound_effect_model",
+            return_value=sound_effect_model,
+        ) as create_model:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "elevenlabs",
+                    "model_name": "future-sfx-model",
+                    "api_key": "test-api-key",
+                    "category": "sound_effect",
+                    "abilities": ["generate"],
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        assert create_model.call_args.args[0].model_name == "future-sfx-model"
+        sound_effect_model.validate_connection.assert_awaited_once_with()
+        sound_effect_model.aclose.assert_awaited_once_with()
+
+    def test_test_connection_llm_timeout_reports_app_budget_not_network(
+        self, test_db, regular_user, regular_headers
+    ):
+        """A connection-test timeout must name the app's own wait budget.
+
+        xorbitsai/xagent#1960: the old message ("Please check your network connection
+        and provider status") told the user to go check their network when
+        the actual cause was this endpoint's own wait budget (10 seconds at
+        the time) expiring before a slow or reasoning-heavy model answered.
+        The provider was never shown to be unhealthy.
+        """
+
+        class SlowLLM:
+            async def chat(self, messages, **kwargs):
+                raise asyncio.TimeoutError()
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=SlowLLM(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": "gpt-4o-mini",
+                    "api_key": "test-api-key",
+                    "base_url": "https://api.openai.com/v1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert data["message"] == "Connection timed out"
+        # Pin the contract value independently of the production constant:
+        # deriving the expected copy from _CONNECTION_TEST_TIMEOUT_SECONDS
+        # would keep this test green if the budget silently regressed.
+        assert model_module._CONNECTION_TEST_TIMEOUT_SECONDS == 60.0
+        assert "60 seconds" in data["error"]
+        assert "network" not in data["error"].lower()
+
+    def test_create_model_as_admin(
+        self, test_db, admin_user, admin_headers, sample_model_data
+    ):
+        """Test model creation as admin user"""
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model_id"] == sample_model_data["model_id"]
+        assert data["category"] == sample_model_data["category"]
+        assert data["model_provider"] == sample_model_data["model_provider"]
+        assert data["is_owner"] is True
+        assert data["can_edit"] is True
+        assert data["can_delete"] is True
+        assert data["is_shared"] is False
+
+    def test_create_model_as_regular_user(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test model creation as regular user"""
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model_id"] == sample_model_data["model_id"]
+        assert data["is_owner"] is True
+        assert data["can_edit"] is True
+        assert data["can_delete"] is True
+        assert data["is_shared"] is False
+
+    def test_bedrock_settings_survive_create_list_and_runtime_reload(
+        self, test_db, regular_user, regular_headers
+    ):
+        system_profile_arn = "arn:aws:bedrock:us-west-2::inference-profile/" + "a" * 64
+        application_profile_arn = (
+            "arn:aws:bedrock:us-west-2:123456789012:"
+            "application-inference-profile/" + "b" * 64
+        )
+        assert len(system_profile_arn) > 100
+        assert len(application_profile_arn) > 100
+        payload = {
+            "model_id": "bedrock-profile",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": system_profile_arn,
+            "api_key": "b" * 1000,
+            "base_url": "https://bedrock-runtime.us-west-2.amazonaws.com",
+            "bedrock_region": "us-west-2",
+            "bedrock_auth_mode": "api_key",
+            "abilities": ["chat", "tool_calling"],
+        }
+
+        created = client.post("/api/models/", json=payload, headers=regular_headers)
+        assert created.status_code == 200
+        assert created.json()["model_name"] == system_profile_arn
+        assert created.json()["bedrock_region"] == "us-west-2"
+        assert created.json()["bedrock_auth_mode"] == "api_key"
+
+        updated = client.put(
+            "/api/models/bedrock-profile",
+            json={"model_name": application_profile_arn},
+            headers=regular_headers,
+        )
+        assert updated.status_code == 200
+        assert updated.json()["model_name"] == application_profile_arn
+
+        listed = client.get("/api/models/", headers=regular_headers)
+        assert listed.status_code == 200
+        saved = next(
+            item for item in listed.json() if item["model_id"] == "bedrock-profile"
+        )
+        assert saved["bedrock_region"] == "us-west-2"
+        assert saved["bedrock_auth_mode"] == "api_key"
+        assert saved["model_name"] == application_profile_arn
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-profile")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-profile")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_region == "us-west-2"
+        assert config.bedrock_auth_mode == "api_key"
+        assert config.api_key == "b" * 1000
+        assert llm is not None
+        assert llm._inner.region_name == "us-west-2"
+        assert llm._inner.auth_mode == "api_key"
+        assert config.model_name == application_profile_arn
+        assert llm._inner.model_name == application_profile_arn
+
+    def test_bedrock_connection_test_uses_native_runtime(
+        self, test_db, regular_user, regular_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **request: Any) -> dict[str, Any]:
+                assert request["modelId"] == "amazon.nova-lite-v1:0"
+                assert request["messages"][-1]["content"] == [{"text": "Hello"}]
+                assert request["inferenceConfig"]["maxTokens"] == 16
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "Hello from Bedrock"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 2},
+                }
+
+        with patch.object(
+            BedrockLLM,
+            "_build_client",
+            return_value=SyntheticBedrockClient(),
+        ) as build_client:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "amazon.nova-lite-v1:0",
+                    "api_key": "bedrock-test-token",
+                    "bedrock_region": "us-east-1",
+                    "bedrock_auth_mode": "api_key",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        build_client.assert_called_once_with()
+
+    def test_bedrock_credentials_chain_connection_test_as_admin(
+        self, test_db, admin_user, admin_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **_request: Any) -> dict[str, Any]:
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "ok"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1},
+                }
+
+        with patch.object(
+            BedrockLLM,
+            "_build_client",
+            return_value=SyntheticBedrockClient(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "amazon.nova-lite-v1:0",
+                    "api_key": "your-aws-key",
+                    "bedrock_region": "us-east-1",
+                    "bedrock_auth_mode": "credentials_chain",
+                    "category": "llm",
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+
+    def test_bedrock_credentials_chain_does_not_require_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+                "abilities": ["chat", "tool_calling"],
+            },
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+        db = next(get_db())
+        try:
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-chain")
+        finally:
+            db.close()
+        assert llm is not None
+        assert llm._inner.auth_mode == "aws_credentials"
+
+    def test_bedrock_credentials_chain_rejects_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-with-key",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "must-not-be-retained",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 400
+        assert "cannot include an API key" in response.json()["detail"]
+
+    def test_bedrock_credentials_chain_requires_admin(
+        self, test_db, regular_user, regular_headers
+    ):
+        payload = {
+            "model_id": "bedrock-chain-forbidden",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": "amazon.nova-lite-v1:0",
+            "bedrock_region": "us-east-1",
+            "bedrock_auth_mode": "credentials_chain",
+        }
+
+        create_response = client.post(
+            "/api/models/", json=payload, headers=regular_headers
+        )
+        test_response = client.post(
+            "/api/models/test-connection", json=payload, headers=regular_headers
+        )
+
+        assert create_response.status_code == 403
+        assert test_response.status_code == 403
+        assert "Only administrators" in create_response.json()["detail"]
+
+        api_key_payload = {
+            **payload,
+            "model_id": "bedrock-chain-update-forbidden",
+            "api_key": "key",
+            "bedrock_auth_mode": "api_key",
+        }
+        created = client.post(
+            "/api/models/", json=api_key_payload, headers=regular_headers
+        )
+        assert created.status_code == 200
+        update_response = client.put(
+            "/api/models/bedrock-chain-update-forbidden",
+            json={"bedrock_auth_mode": "credentials_chain"},
+            headers=regular_headers,
+        )
+        assert update_response.status_code == 403
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "http://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://sts.us-east-1.amazonaws.com",
+            "https://attacker.example",
+        ],
+    )
+    def test_bedrock_credentials_chain_rejects_unsafe_endpoint(
+        self, test_db, admin_user, admin_headers, endpoint
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-unsafe",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "base_url": endpoint,
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 400
+        assert "HTTPS Amazon Bedrock runtime endpoint" in response.json()["detail"]
+
+    def test_bedrock_credentials_chain_normalizes_placeholder_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-placeholder",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "your-aws-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-chain-placeholder")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-chain-placeholder")
+        finally:
+            db.close()
+        assert config.api_key == ""
+        assert llm is not None
+        assert llm._inner.auth_mode == "aws_credentials"
+
+    def test_admin_shared_credentials_chain_model_remains_available_to_users(
+        self,
+        test_db,
+        admin_user,
+        admin_headers,
+        regular_user,
+        regular_headers,
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-shared",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+                "share_with_users": True,
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200
+        selected = client.post(
+            "/api/models/user-default",
+            json={"model_id": created.json()["id"], "config_type": "general"},
+            headers=admin_headers,
+        )
+        assert selected.status_code == 200
+
+        fetched = client.get(
+            "/api/models/bedrock-chain-shared", headers=regular_headers
+        )
+        defaults = client.get("/api/models/user-default", headers=regular_headers)
+
+        assert fetched.status_code == 200
+        assert fetched.json()["bedrock_auth_mode"] == "credentials_chain"
+        assert fetched.json()["can_edit"] is False
+        assert defaults.status_code == 200
+        fallback = next(
+            item for item in defaults.json() if item["config_type"] == "general"
+        )
+        assert fallback["model"]["bedrock_region"] == "us-east-1"
+        assert fallback["model"]["bedrock_auth_mode"] == "credentials_chain"
+
+    def test_switching_bedrock_to_credentials_chain_clears_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-switch-auth",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-switch-auth",
+            json={"bedrock_auth_mode": "credentials_chain"},
+            headers=admin_headers,
+        )
+        assert updated.status_code == 200
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-switch-auth")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-switch-auth")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_auth_mode == "credentials_chain"
+        assert config.api_key == ""
+        assert llm is not None
+        assert llm._inner.auth_mode == "aws_credentials"
+
+    def test_switching_bedrock_to_credentials_chain_rejects_new_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-invalid-switch",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "old-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-invalid-switch",
+            json={
+                "bedrock_auth_mode": "credentials_chain",
+                "api_key": "new-key",
+            },
+            headers=admin_headers,
+        )
+
+        assert updated.status_code == 400
+        assert "cannot include an API key" in updated.json()["detail"]
+
+    def test_switching_to_bedrock_does_not_inherit_credentials_or_endpoint(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        created = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert created.status_code == 200
+        switch_payload = {
+            "model_provider": "bedrock",
+            "model_name": "amazon.nova-lite-v1:0",
+            "bedrock_region": "us-east-1",
+        }
+
+        missing_key = client.put(
+            f"/api/models/{sample_model_data['model_id']}",
+            json=switch_payload,
+            headers=regular_headers,
+        )
+        switched = client.put(
+            f"/api/models/{sample_model_data['model_id']}",
+            json={**switch_payload, "api_key": "new-bedrock-key"},
+            headers=regular_headers,
+        )
+
+        assert missing_key.status_code == 400
+        assert "API key is required" in missing_key.json()["detail"]
+        assert switched.status_code == 200
+        assert switched.json()["base_url"] is None
+        assert switched.json()["bedrock_auth_mode"] == "api_key"
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load(sample_model_data["model_id"])
+        finally:
+            db.close()
+        assert config.api_key == "new-bedrock-key"
+        assert config.base_url is None
+        assert config.bedrock_auth_mode == "api_key"
+
+    def test_switching_bedrock_credentials_chain_to_api_key_requires_new_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        payload = {
+            "model_id": "bedrock-chain-to-key",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": "amazon.nova-lite-v1:0",
+            "bedrock_region": "us-east-1",
+            "bedrock_auth_mode": "credentials_chain",
+        }
+        created = client.post("/api/models/", json=payload, headers=admin_headers)
+        assert created.status_code == 200
+
+        missing_key = client.put(
+            "/api/models/bedrock-chain-to-key",
+            json={"bedrock_auth_mode": "api_key"},
+            headers=admin_headers,
+        )
+        updated = client.put(
+            "/api/models/bedrock-chain-to-key",
+            json={"bedrock_auth_mode": "api_key", "api_key": "new-key"},
+            headers=admin_headers,
+        )
+
+        assert missing_key.status_code == 400
+        assert "API key is required" in missing_key.json()["detail"]
+        assert updated.status_code == 200
+        assert updated.json()["bedrock_auth_mode"] == "api_key"
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-chain-to-key")
+        finally:
+            db.close()
+        assert config.api_key == "new-key"
+        assert config.bedrock_auth_mode == "api_key"
+
+    @pytest.mark.parametrize("legacy_auth_mode", [None, "auto"])
+    def test_legacy_bedrock_settings_allow_unrelated_update_but_fail_closed(
+        self, test_db, regular_user, regular_headers, legacy_auth_mode
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "legacy-bedrock",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "legacy-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+        db = next(get_db())
+        try:
+            row = db.query(DBModel).filter_by(model_id="legacy-bedrock").one()
+            row.bedrock_region = None
+            row.bedrock_auth_mode = legacy_auth_mode
+            row.api_key = ""
+            db.commit()
+        finally:
+            db.close()
+
+        updated = client.put(
+            "/api/models/legacy-bedrock",
+            json={"description": "legacy row remains editable"},
+            headers=regular_headers,
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["description"] == "legacy row remains editable"
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("legacy-bedrock")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("legacy-bedrock")
+        finally:
+            db.close()
+        assert config.bedrock_auth_mode == "api_key"
+        assert llm is None
+
+    def test_bedrock_region_update_validates_and_persists_effective_mode(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-region-update",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        invalid = client.put(
+            "/api/models/bedrock-region-update",
+            json={"bedrock_region": "US-EAST-1"},
+            headers=regular_headers,
+        )
+        valid = client.put(
+            "/api/models/bedrock-region-update",
+            json={"bedrock_region": "eu-west-1"},
+            headers=regular_headers,
+        )
+
+        assert invalid.status_code == 400
+        assert valid.status_code == 200
+        assert valid.json()["bedrock_region"] == "eu-west-1"
+        assert valid.json()["bedrock_auth_mode"] == "api_key"
+
+    def test_bedrock_rejects_non_llm_create(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-embedding",
+                "category": "embedding",
+                "model_provider": "bedrock",
+                "model_name": "amazon.titan-embed-text-v2:0",
+                "api_key": "key",
+                "bedrock_region": "us-east-1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "only for LLM" in response.json()["detail"]
+
+    def test_switching_away_from_bedrock_clears_provider_settings(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-to-openai",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "bedrock-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-to-openai",
+            json={
+                "model_provider": "openai",
+                "model_name": "gpt-4",
+                "api_key": "openai-key",
+                "base_url": "https://api.openai.com/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["bedrock_region"] is None
+        assert updated.json()["bedrock_auth_mode"] is None
+
+    def test_non_bedrock_fields_do_not_prune_auto_references(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        created = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert created.status_code == 200
+        db = next(get_db())
+        try:
+            target = (
+                db.query(DBModel)
+                .filter_by(model_id=sample_model_data["model_id"])
+                .one()
+            )
+            router_model = DBModel(
+                model_id="auto-router-bedrock-field-test",
+                category="llm",
+                model_provider="router",
+                model_name="auto",
+                api_key="",
+                abilities=["chat"],
+                is_active=True,
+            )
+            db.add(router_model)
+            db.flush()
+            config = AutoModelConfig(
+                user_id=regular_user["id"],
+                router_model_id=router_model.id,
+                strategy="balanced",
+            )
+            db.add(config)
+            db.flush()
+            candidate = AutoModelCandidate(
+                config_id=config.id,
+                routing_model_id="openai/gpt-5.5",
+                target_model_id=target.id,
+                position=0,
+            )
+            db.add(candidate)
+            db.commit()
+            candidate_id = int(candidate.id)
+        finally:
+            db.close()
+
+        response = client.put(
+            f"/api/models/{sample_model_data['model_id']}",
+            json={
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["bedrock_region"] is None
+        assert response.json()["bedrock_auth_mode"] is None
+        db = next(get_db())
+        try:
+            assert db.get(AutoModelCandidate, candidate_id) is not None
+        finally:
+            db.close()
+
+    def test_default_model_response_includes_bedrock_settings(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-default",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "key",
+                "bedrock_region": "us-west-2",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+        selected = client.post(
+            "/api/models/user-default",
+            json={"model_id": created.json()["id"], "config_type": "general"},
+            headers=regular_headers,
+        )
+        assert selected.status_code == 200
+
+        response = client.get("/api/models/default/general", headers=regular_headers)
+
+        assert response.status_code == 200
+        assert response.json()["bedrock_region"] == "us-west-2"
+        assert response.json()["bedrock_auth_mode"] == "api_key"
+
+    def test_bedrock_rejects_mantle_endpoint(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-mantle",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert response.status_code == 400
+        assert "does not support Converse" in response.json()["detail"]
+
+    def test_create_shared_model_as_admin(
+        self, test_db, admin_user, admin_headers, sample_model_data
+    ):
+        """Test creating shared model as admin user"""
+        sample_model_data["share_with_users"] = True
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=admin_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_shared"] is True
+
+    def test_create_shared_model_as_regular_user_fails(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test that regular user cannot create shared models"""
+        sample_model_data["share_with_users"] = True
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert response.status_code == 403
+        data = response.json()
+        assert "Only administrators can share models" in data["detail"]
+
+    def test_get_user_models(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test getting user's models"""
+        # Create a model first
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        # Get user models
+        response = client.get("/api/models/", headers=regular_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["model_id"] == sample_model_data["model_id"]
+
+    def test_get_model_by_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test getting specific model by ID"""
+        # Create a model first
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+        model_id_str = create_response.json()["model_id"]
+        model_id_int = create_response.json()["id"]
+
+        # Get model by string model_id (as expected by API)
+        response = client.get(f"/api/models/{model_id_str}", headers=regular_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == model_id_int
+        assert data["model_id"] == sample_model_data["model_id"]
+
+    def test_update_model_as_owner(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test updating model as owner"""
+        # Create a model first
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+        model_id_str = create_response.json()["model_id"]
+
+        # Update model
+        update_data = {"temperature": 0.8, "description": "Updated description"}
+        response = client.put(
+            f"/api/models/{model_id_str}", json=update_data, headers=regular_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["temperature"] == 0.8
+        assert data["description"] == "Updated description"
+
+    def test_delete_model_as_owner(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test deleting model as owner"""
+        # Create a model first
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+        model_id_str = create_response.json()["model_id"]
+
+        # Delete model
+        response = client.delete(f"/api/models/{model_id_str}", headers=regular_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["message"] == "Model deleted successfully"
+
+        # Verify model is deleted
+        get_response = client.get(
+            f"/api/models/{model_id_str}", headers=regular_headers
+        )
+        assert get_response.status_code == 404
+
+    def test_get_model_by_path_with_slash_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test getting a model whose model_id contains a slash."""
+        sample_model_data["model_id"] = "google/gemini-2.5-flash"
+
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        response = client.get(
+            f"/api/models/by-id/{quote(sample_model_data['model_id'], safe='')}",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model_id"] == sample_model_data["model_id"]
+
+    def test_update_model_by_path_with_slash_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test updating a model whose model_id contains a slash."""
+        sample_model_data["model_id"] = "google/gemini-2.5-flash"
+
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        response = client.put(
+            f"/api/models/by-id/{quote(sample_model_data['model_id'], safe='')}",
+            json={"temperature": 0.5, "description": "Slash-safe update"},
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["temperature"] == 0.5
+        assert data["description"] == "Slash-safe update"
+
+    def test_delete_model_by_path_with_slash_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test deleting a model whose model_id contains a slash."""
+        sample_model_data["model_id"] = "google/gemini-2.5-flash"
+
+        create_response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert create_response.status_code == 200
+
+        delete_response = client.delete(
+            f"/api/models/by-id/{quote(sample_model_data['model_id'], safe='')}",
+            headers=regular_headers,
+        )
+        assert delete_response.status_code == 200
+        assert delete_response.json()["message"] == "Model deleted successfully"
+
+    def test_get_nonexistent_model(self, test_db, regular_user, regular_headers):
+        """Test getting non-existent model"""
+        response = client.get("/api/models/99999", headers=regular_headers)
+        assert response.status_code == 404
+
+    def test_update_nonexistent_model(self, test_db, regular_user, regular_headers):
+        """Test updating non-existent model"""
+        update_data = {"temperature": 0.8}
+        response = client.put(
+            "/api/models/99999", json=update_data, headers=regular_headers
+        )
+        assert response.status_code == 404
+
+    def test_delete_nonexistent_model(self, test_db, regular_user, regular_headers):
+        """Test deleting non-existent model"""
+        response = client.delete("/api/models/99999", headers=regular_headers)
+        assert response.status_code == 404
+
+    def test_create_model_with_missing_fields(
+        self, test_db, regular_user, regular_headers
+    ):
+        """Test creating model with missing required fields"""
+        incomplete_data = {
+            "model_id": "test-model"
+            # Missing required fields
+        }
+        response = client.post(
+            "/api/models/", json=incomplete_data, headers=regular_headers
+        )
+        assert response.status_code == 422  # Validation error
+
+    def test_create_duplicate_model_id(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test creating model with duplicate model_id"""
+        # Create first model
+        response1 = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert response1.status_code == 200
+
+        # Try to create model with same model_id
+        response2 = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert response2.status_code == 400
+        data = response2.json()
+        assert "Model ID already exists" in data["detail"]
+
+    def test_user_model_isolation(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test that users only see their own models and shared models"""
+        # Create a model as regular user
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert response.status_code == 200
+
+        # Create another user
+        user2_data = {
+            "username": "user2",
+            "email": "user2@example.com",
+            "password": "password2",
+        }
+        user2_response = client.post("/api/auth/register", json=user2_data)
+        assert user2_response.status_code == 200
+
+        # Login as user2
+        login2 = client.post(
+            "/api/auth/login", json={"username": "user2", "password": "password2"}
+        )
+        user2_headers = {"Authorization": f"Bearer {login2.json()['access_token']}"}
+
+        # User2 should not see user1's private model
+        models_response = client.get("/api/models/", headers=user2_headers)
+        assert models_response.status_code == 200
+        data = models_response.json()
+        assert len(data) == 0  # User2 shouldn't see user1's private model
+
+    def test_model_with_abilities(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        """Test creating model with abilities"""
+        sample_model_data["abilities"] = ["chat", "tool_calling", "vision"]
+        response = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["abilities"] == ["chat", "tool_calling", "vision"]
+
+    def test_reject_embedding_model_as_general_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_embedding_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_embedding_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        embedding_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": embedding_model_id, "config_type": "general"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
+
+    def test_allow_embedding_model_as_embedding_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_embedding_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_embedding_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        embedding_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": embedding_model_id, "config_type": "embedding"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "embedding"
+
+    def test_allow_dual_speech_model_for_individual_asr_and_tts_defaults(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_speech_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        speech_model_id = create_response.json()["id"]
+
+        asr_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert asr_response.status_code == 200
+        assert asr_response.json()["config_type"] == "asr"
+
+        tts_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "tts"},
+            headers=regular_headers,
+        )
+        assert tts_response.status_code == 200
+        assert tts_response.json()["config_type"] == "tts"
+
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        assert defaults_response.status_code == 200
+        defaults = {
+            item["config_type"]: item["model"]["model_id"]
+            for item in defaults_response.json()
+        }
+        assert defaults["asr"] == sample_speech_model_data["model_id"]
+        assert defaults["tts"] == sample_speech_model_data["model_id"]
+
+    def test_create_sound_effect_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "sound-effect-default",
+                "category": "sound_effect",
+                "model_provider": "elevenlabs",
+                "model_name": "eleven_text_to_sound_v2",
+                "api_key": "test-key",
+                "abilities": ["generate"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        assert create_response.json()["category"] == "sound_effect"
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={
+                "model_id": create_response.json()["id"],
+                "config_type": "sound_effect",
+            },
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "sound_effect"
+
+    def test_create_music_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "music-default",
+                "category": "music",
+                "model_provider": "elevenlabs",
+                "model_name": "music_v2",
+                "api_key": "test-key",
+                "abilities": ["generate"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        assert create_response.json()["category"] == "music"
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={
+                "model_id": create_response.json()["id"],
+                "config_type": "music",
+            },
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "music"
+
+    def test_transcribe_speech_requires_asr_model(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        response = client.post(
+            "/api/models/speech/transcribe",
+            files={"file": ("voice.webm", b"audio-bytes", "audio/webm")},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "No ASR model is configured"
+
+    def test_transcribe_speech_rejects_oversized_audio(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+    ):
+        with patch("xagent.web.api.model.MAX_TRANSCRIBE_UPLOAD_BYTES", 4):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.webm", b"audio", "audio/webm")},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 413
+        assert response.json()["detail"] == "Audio file is too large"
+
+    def test_transcribe_speech_uses_user_default_asr_model(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        first_model = dict(sample_speech_model_data)
+        first_model["model_id"] = "test-asr-first"
+        first_model["model_name"] = "asr-first"
+        first_model["abilities"] = ["asr"]
+        second_model = dict(sample_speech_model_data)
+        second_model["model_id"] = "test-asr-second"
+        second_model["model_name"] = "asr-second"
+        second_model["abilities"] = ["asr"]
+
+        first_response = client.post(
+            "/api/models/",
+            json=first_model,
+            headers=regular_headers,
+        )
+        assert first_response.status_code == 200
+        second_response = client.post(
+            "/api/models/",
+            json=second_model,
+            headers=regular_headers,
+        )
+        assert second_response.status_code == 200
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": second_response.json()["id"], "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert default_response.status_code == 200
+
+        class FakeASR:
+            def __init__(self, model_name: str):
+                self.model_name = model_name
+                self.calls = []
+                self.closed = False
+
+            async def transcribe(self, audio, language=None, format=None):
+                self.calls.append(
+                    {"audio": audio, "language": language, "format": format}
+                )
+                return f"text from {self.model_name}"
+
+            async def aclose(self):
+                self.closed = True
+
+        created_models = []
+
+        def create_fake_asr(db_model):
+            fake_asr = FakeASR(db_model.model_name)
+            created_models.append(fake_asr)
+            return fake_asr
+
+        with patch(
+            "xagent.core.model.asr.adapter.get_asr_model_instance",
+            side_effect=create_fake_asr,
+        ):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.webm", b"audio-bytes", "audio/webm")},
+                data={"language": "en"},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["text"] == "text from asr-second"
+        assert data["model_id"] == "test-asr-second"
+        assert len(created_models) == 1
+        assert created_models[0].calls == [
+            {"audio": b"audio-bytes", "language": "en", "format": "webm"}
+        ]
+        assert created_models[0].closed is True
+
+    def _create_asr_model(self, regular_headers, sample_speech_model_data):
+        model = dict(sample_speech_model_data, model_id="test-asr", abilities=["asr"])
+        response = client.post("/api/models/", json=model, headers=regular_headers)
+        assert response.status_code == 200
+        response = client.post(
+            "/api/models/user-default",
+            json={"model_id": response.json()["id"], "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+    def test_transcribe_speech_bills_the_requesting_user_once(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        """The real ASR provider records the call; the endpoint delivers it."""
+        from xagent.core.model.asr.xinference import XinferenceASR
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+
+        async def transcriptions(**_kwargs):
+            return {"text": "hello", "duration": 2.5}
+
+        async def handle(_self):
+            return SimpleNamespace(transcriptions=transcriptions)
+
+        with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        [(user_id, details, source)] = standalone_hook.calls
+        assert (user_id, source) == (regular_user["id"], "speech_transcribe")
+        [row] = details
+        assert (row["call_type"], row["quantity"], row["model_id"]) == (
+            "asr",
+            2.5,
+            "test-asr",
+        )
+
+    def test_transcribe_speech_rejected_by_the_provider_bills_nothing(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        from xagent.core.model.asr.xinference import XinferenceASR
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+
+        async def transcriptions(**_kwargs):
+            raise RuntimeError("model not launched")
+
+        async def handle(_self):
+            return SimpleNamespace(transcriptions=transcriptions)
+
+        with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+            response = client.post(
+                "/api/models/speech/transcribe",
+                files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 500
+        assert standalone_hook.calls == []
+
+    def test_transcribe_speech_refused_by_the_gate_is_a_402_without_a_call(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        from xagent.core.model.asr.xinference import XinferenceASR
+        from xagent.web.services import quota_hooks
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+        handle = AsyncMock()
+        gate_calls: list = []
+
+        def gate(user_id, source):
+            gate_calls.append((user_id, source))
+            return {"code": "ai_credits_exhausted", "message": "Out of AI credits"}
+
+        quota_hooks.set_standalone_gate_hook(gate)
+        try:
+            with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+                response = client.post(
+                    "/api/models/speech/transcribe",
+                    files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                    headers=regular_headers,
+                )
+        finally:
+            quota_hooks.set_standalone_gate_hook(None)
+
+        assert response.status_code == 402
+        detail = response.json()["detail"]
+        assert detail["code"] == "standalone_usage_refused"
+        assert detail["reason"]["code"] == "ai_credits_exhausted"
+        assert gate_calls == [(regular_user["id"], "speech_transcribe")]
+        handle.assert_not_called()
+        assert standalone_hook.calls == []
+
+    @pytest.mark.parametrize("category", ["embedding", "rerank"])
+    def test_connection_probe_is_recorded_for_the_operator(
+        self, test_db, regular_user, regular_headers, standalone_hook, category
+    ):
+        import requests as real_requests
+
+        def ok(body):
+            response = real_requests.Response()
+            response.status_code = 200
+            response._content = json.dumps(body).encode()
+            return response
+
+        embed_body = {"data": [{"embedding": [0.1]}], "usage": {"prompt_tokens": 1}}
+        rerank_body = {"results": [{"index": 0}], "usage": {"total_tokens": 4}}
+        session = SimpleNamespace(headers={}, post=lambda url, json: ok(embed_body))
+        with (
+            patch(
+                "xagent.core.model.embedding.openai.OpenAIEmbedding._get_session",
+                lambda _self: session,
+            ),
+            patch(
+                "xagent.core.model.rerank.dashscope.requests.post",
+                lambda *args, **kwargs: ok(rerank_body),
+            ),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "category": category,
+                    "model_provider": "openai"
+                    if category == "embedding"
+                    else "dashscope",
+                    "model_name": "text-embedding-3-small"
+                    if category == "embedding"
+                    else "qwen3-rerank",
+                    "api_key": "k",
+                    "base_url": "https://embeddings.test/v1",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.json()["status"] == "passed"
+        [(user_id, [row], source)] = standalone_hook.calls
+        assert (user_id, source) == (regular_user["id"], "model_probe")
+        # An unsaved model has no configured id: recorded, never priced.
+        assert (row["call_type"], row["model_id"]) == (category, "")
+
+    def test_a_timed_out_probe_still_delivers_its_usage(
+        self, test_db, regular_user, regular_headers, standalone_hook
+    ):
+        import threading
+
+        import requests as real_requests
+
+        from xagent.web.api import model as model_module
+
+        release, delivered = threading.Event(), threading.Event()
+
+        def slow_ok(url, json):
+            # The provider answers (and bills) after the probe gave up.
+            release.wait(5)
+            response = real_requests.Response()
+            response.status_code = 200
+            response._content = b'{"data": [{"embedding": [0.1]}]}'
+            return response
+
+        def hook(*args):
+            standalone_hook.calls.append(args)
+            delivered.set()
+
+        from xagent.web.services import quota_hooks
+
+        quota_hooks.set_standalone_usage_hook(hook)
+        session = SimpleNamespace(headers={}, post=slow_ok)
+        with (
+            patch(
+                "xagent.core.model.embedding.openai.OpenAIEmbedding._get_session",
+                lambda _self: session,
+            ),
+            patch.object(model_module, "_CONNECTION_TEST_TIMEOUT_SECONDS", 0.05),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "category": "embedding",
+                    "model_provider": "openai",
+                    "model_name": "text-embedding-3-small",
+                    "api_key": "k",
+                    "base_url": "https://embeddings.test/v1",
+                },
+                headers=regular_headers,
+            )
+            assert response.json()["message"] == "Connection timed out"
+            release.set()
+            assert delivered.wait(5)
+
+        [(user_id, [row], source)] = standalone_hook.calls
+        assert (user_id, source, row["call_type"]) == (
+            regular_user["id"],
+            "model_probe",
+            "embedding",
+        )
+
+    def test_reject_asr_only_speech_model_as_tts_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        sample_speech_model_data["abilities"] = ["asr"]
+        create_response = client.post(
+            "/api/models/",
+            json=sample_speech_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        speech_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "tts"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
+
+    def test_reject_generate_only_image_model_as_image_edit_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_image_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_image_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        image_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": image_model_id, "config_type": "image_edit"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
+
+    def test_create_video_model_and_set_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_video_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_video_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        video_model = create_response.json()
+        assert video_model["category"] == "video"
+        assert video_model["model_provider"] == "volcengine-ark"
+        assert video_model["abilities"] == ["generate"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": video_model["id"], "config_type": "video"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 200
+        assert default_response.json()["config_type"] == "video"
+
+    def test_dreamina_video_model_defaults_to_byteplus_base_url(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_video_model_data,
+    ):
+        sample_video_model_data["model_id"] = "test-dreamina-video-model"
+        sample_video_model_data["model_provider"] = "byteplus-ark"
+        sample_video_model_data["model_name"] = "dreamina-seedance-2-0-fast-260128"
+        sample_video_model_data.pop("base_url")
+
+        create_response = client.post(
+            "/api/models/",
+            json=sample_video_model_data,
+            headers=regular_headers,
+        )
+
+        assert create_response.status_code == 200
+        assert (
+            create_response.json()["base_url"]
+            == "https://ark.ap-southeast.bytepluses.com/api/v3"
+        )
+
+    def test_list_supported_providers_includes_deepseek(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        deepseek = next(
+            (provider for provider in providers if provider["id"] == "deepseek"),
+            None,
+        )
+        assert deepseek is not None
+        assert deepseek["name"] == "DeepSeek"
+        assert deepseek["category"] == ["llm"]
+        assert deepseek["default_base_url"] == "https://api.deepseek.com"
+
+    def test_list_supported_providers_includes_bedrock(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported", headers=regular_headers
+        )
+        assert response.status_code == 200
+        bedrock = next(
+            provider
+            for provider in response.json()["providers"]
+            if provider["id"] == "bedrock"
+        )
+        assert bedrock["category"] == ["llm"]
+        assert bedrock["requires_base_url"] is False
+
+    def test_list_supported_providers_includes_multi_category_provider(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        openai = next(
+            (provider for provider in providers if provider["id"] == "openai"),
+            None,
+        )
+        assert openai is not None
+        assert openai["name"] == "OpenAI"
+        assert openai["category"] == ["llm", "embedding"]
+        assert openai["default_base_url"] == "https://api.openai.com/v1"
+
+    def test_list_supported_providers_includes_openai_compatible(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        openai_compatible = next(
+            (
+                provider
+                for provider in providers
+                if provider["id"] == "openai-compatible"
+            ),
+            None,
+        )
+        assert openai_compatible is not None
+        assert openai_compatible["name"] == "OpenAI-Compatible"
+        assert openai_compatible["category"] == ["llm", "embedding"]
+        assert openai_compatible["requires_base_url"] is True
+        assert openai_compatible.get("default_base_url") is None
+
+    def test_fetch_openai_compatible_provider_models_is_wired(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """Regression test: openai-compatible must be registered in
+        PROVIDER_FETCHERS, or this endpoint 400s with "Unsupported provider".
+        Only the network-facing SDK call is faked; the real PROVIDER_FETCHERS
+        entry (or absence of one) is exercised as-is."""
+        from xagent.core.model.chat.basic.openai import OpenAILLM
+
+        async def fake_list_available_models(api_key, base_url=None):
+            return [
+                {
+                    "id": "custom-model",
+                    "object": "model",
+                    "owned_by": "openai-compatible",
+                }
+            ]
+
+        monkeypatch.setattr(
+            OpenAILLM, "list_available_models", fake_list_available_models
+        )
+
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={
+                "api_key": "test-api-key",
+                "base_url": "https://custom.example.com/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [model["id"] for model in data["models"]] == ["custom-model"]
+
+    def test_fetch_provider_models_strips_whitespace_from_api_key_and_base_url(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """A base_url/api_key padded with whitespace must reach the fetcher
+        trimmed, not verbatim — otherwise a value like " https://foo.com "
+        would silently reach the downstream provider with stray whitespace."""
+        from xagent.core.model.chat.basic.openai import OpenAILLM
+
+        captured = {}
+
+        async def fake_list_available_models(api_key, base_url=None):
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            return []
+
+        monkeypatch.setattr(
+            OpenAILLM, "list_available_models", fake_list_available_models
+        )
+
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={
+                "api_key": "  test-api-key  ",
+                "base_url": "  https://custom.example.com/v1  ",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert captured["api_key"] == "test-api-key"
+        assert captured["base_url"] == "https://custom.example.com/v1"
+
+    def test_claude_compatible_endpoint_without_catalog_allows_manual_entry(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        from xagent.core.model.chat.basic.claude import ModelCatalogUnavailableError
+
+        fetch = AsyncMock(
+            side_effect=ModelCatalogUnavailableError("catalog is unavailable")
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://bedrock.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "provider": "claude",
+            "models": [],
+            "count": 0,
+            "catalog_unavailable": True,
+            "warning": (
+                "This compatible endpoint does not provide a model catalog. "
+                "Enter the model name manually, then test the model connection."
+            ),
+        }
+        fetch.assert_awaited_once_with(
+            "claude",
+            "synthetic-secret",
+            "https://bedrock.example.com/anthropic/v1",
+            raise_on_error=True,
+        )
+
+    @pytest.mark.parametrize("upstream_status", [401, 403])
+    def test_claude_catalog_auth_failure_uses_provider_error_semantics(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        monkeypatch,
+        upstream_status,
+    ):
+        error = AnthropicAuthenticationError(
+            "Invalid Anthropic API key", upstream_status
+        )
+        fetch = AsyncMock(side_effect=error)
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://compatible.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == {
+            "code": "provider_auth_failed",
+            "message": "Invalid Anthropic API key",
+            "upstream_status": upstream_status,
+        }
+        assert response.json().get("catalog_unavailable") is None
+        assert "synthetic-secret" not in response.text
+
+    @pytest.mark.parametrize(
+        "error",
+        [httpx.ReadTimeout("timed out"), _http_status_error(503)],
+        ids=["timeout", "upstream-503"],
+    )
+    def test_claude_catalog_operational_failure_returns_bad_gateway(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        monkeypatch,
+        error,
+    ):
+        fetch = AsyncMock(side_effect=error)
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://compatible.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 502
+        assert response.json().get("catalog_unavailable") is None
+        assert "synthetic-secret" not in response.text
+
+    def test_claude_compatible_provider_uses_strict_catalog_errors(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        fetch = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/kimi-for-coding/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://api.kimi.com/coding",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 502
+        fetch.assert_awaited_once_with(
+            "kimi-for-coding",
+            "synthetic-secret",
+            "https://api.kimi.com/coding",
+            raise_on_error=True,
+        )
+
+    def test_fetch_provider_models_requires_base_url_for_openai_compatible(
+        self, test_db, regular_user, regular_headers
+    ):
+        """openai-compatible is marked requires_base_url in provider metadata;
+        omitting base_url must be rejected server-side rather than silently
+        falling back to the OpenAI SDK's default endpoint."""
+        response = client.post(
+            "/api/models/providers/openai-compatible/models",
+            json={"api_key": "test-api-key"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "base_url is required" in response.json()["detail"]
+
+    def test_fetch_provider_models_requires_base_url_for_xinference(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/providers/xinference/models",
+            json={"api_key": "test-api-key"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "base_url is required" in response.json()["detail"]
+
+    def test_fetch_provider_models_base_url_rule_matches_supported_providers(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """The native page fetches models for a listed provider and category;
+        omitting base_url is rejected exactly when the listing marks it
+        mandatory. Only the catalog read is faked, so the endpoint's own
+        checks run as-is."""
+        fetch = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+        listed = client.get(
+            "/api/models/providers/supported", headers=regular_headers
+        ).json()["providers"]
+        assert listed
+
+        outcomes = {}
+        expected = {}
+        for provider in listed:
+            for category in [None, *provider.get("category", [])]:
+                response = client.post(
+                    f"/api/models/providers/{provider['id']}/models",
+                    json={"api_key": "test-api-key", "category": category},
+                    headers=regular_headers,
+                )
+                key = (provider["id"], category)
+                outcomes[key] = (
+                    response.status_code,
+                    "base_url is required" in str(response.json().get("detail", "")),
+                )
+                expected[key] = (
+                    (400, True) if provider["requires_base_url"] else (200, False)
+                )
+
+        assert outcomes == expected
+
+    def test_fetch_provider_models_requires_base_url_for_credential_field_endpoints(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """With a catalog fetcher registered for Azure, its endpoint (built by
+        official_endpoint_for_provider) would arrive as base_url, so omitting
+        it is rejected for any spelling of the provider instead of falling
+        back to a default endpoint. Azure has no catalog fetcher today, so the
+        test registers one to reach the check."""
+        from xagent.core.model.providers import official_endpoint_for_provider
+        from xagent.web.services.model_list_service import PROVIDER_FETCHERS
+
+        fetch = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+        monkeypatch.setitem(
+            PROVIDER_FETCHERS, "azure_openai", AsyncMock(return_value=[])
+        )
+
+        for provider in ("azure_openai", "Azure_OpenAI"):
+            response = client.post(
+                f"/api/models/providers/{provider}/models",
+                json={"api_key": "test-api-key"},
+                headers=regular_headers,
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"] == (
+                f"base_url is required for the {provider} provider"
+            )
+        fetch.assert_not_awaited()
+
+        endpoint = official_endpoint_for_provider(
+            "azure_openai", {"resource_name": "my-team"}
+        )
+        response = client.post(
+            "/api/models/providers/azure_openai/models",
+            json={"api_key": "test-api-key", "base_url": endpoint},
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+        fetch.assert_awaited_once_with(
+            "azure_openai", "test-api-key", endpoint, raise_on_error=False
+        )
+
+    def test_list_supported_providers_includes_elevenlabs_audio_generation(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        elevenlabs = next(
+            (provider for provider in providers if provider["id"] == "elevenlabs"),
+            None,
+        )
+        assert elevenlabs is not None
+        assert elevenlabs["name"] == "ElevenLabs"
+        assert elevenlabs["category"] == ["speech", "sound_effect", "music"]
+
+    def test_list_supported_providers_includes_ark_platforms(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported",
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        providers = response.json()["providers"]
+        volcengine = next(
+            (provider for provider in providers if provider["id"] == "volcengine-ark"),
+            None,
+        )
+        byteplus = next(
+            (provider for provider in providers if provider["id"] == "byteplus-ark"),
+            None,
+        )
+        assert volcengine is not None
+        assert volcengine["name"] == "Volcengine Ark"
+        assert volcengine["category"] == ["video"]
+        assert (
+            volcengine["default_base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
+        )
+        assert byteplus is not None
+        assert byteplus["name"] == "BytePlus Ark"
+        assert byteplus["category"] == ["video"]
+        assert (
+            byteplus["default_base_url"]
+            == "https://ark.ap-southeast.bytepluses.com/api/v3"
+        )
+
+    def test_fetch_deepseek_provider_models_returns_curated_models(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/providers/deepseek/models",
+            json={"api_key": "test-api-key"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 3
+        assert [model["id"] for model in data["models"]] == [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+        ]
+        assert data["models"][0]["abilities"] == [
+            "chat",
+            "tool_calling",
+            "thinking_mode",
+        ]
+
+    def test_fetch_dashscope_embedding_models_uses_curated_list(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/providers/dashscope/models",
+            json={"api_key": "test-api-key", "category": "embedding"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        assert [model["id"] for model in data["models"]] == [
+            "text-embedding-v4",
+            "text-embedding-v3",
+        ]
+        assert all(model["owned_by"] == "dashscope" for model in data["models"])
+
+    def test_fetch_ark_provider_models_returns_platform_scoped_seedance(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        async def fake_fetch_openai_models(api_key, base_url):
+            if "bytepluses.com" in base_url:
+                return [
+                    {"id": "dreamina-seedance-2-0-fast-260128"},
+                    {"id": "dreamina-seedream-4-0"},
+                ]
+            return [
+                {"id": "doubao-seedance-1-5-pro-251215"},
+                {"id": "doubao-seedance-2-0-fast-260128"},
+                {"id": "doubao-1-5-pro-32k-250115"},
+            ]
+
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_openai_models",
+            fake_fetch_openai_models,
+        )
+
+        domestic_response = client.post(
+            "/api/models/providers/volcengine-ark/models",
+            json={"api_key": "test-api-key", "category": "video"},
+            headers=regular_headers,
+        )
+
+        assert domestic_response.status_code == 200
+        domestic_data = domestic_response.json()
+        domestic_models = {model["id"]: model for model in domestic_data["models"]}
+        assert "doubao-seedance-1-5-pro-251215" in domestic_models
+        assert "doubao-seedance-2-0-fast-260128" in domestic_models
+        assert "doubao-1-5-pro-32k-250115" not in domestic_models
+        assert "dreamina-seedance-2-0-fast-260128" not in domestic_models
+        assert (
+            domestic_models["doubao-seedance-2-0-fast-260128"]["default_base_url"]
+            == "https://ark.cn-beijing.volces.com/api/v3"
+        )
+
+        byteplus_response = client.post(
+            "/api/models/providers/byteplus-ark/models",
+            json={"api_key": "test-api-key", "category": "video"},
+            headers=regular_headers,
+        )
+
+        assert byteplus_response.status_code == 200
+        byteplus_data = byteplus_response.json()
+        byteplus_models = {model["id"]: model for model in byteplus_data["models"]}
+        assert "dreamina-seedance-2-0-fast-260128" in byteplus_models
+        assert "dreamina-seedream-4-0" not in byteplus_models
+        assert "doubao-seedance-2-0-fast-260128" not in byteplus_models
+        assert (
+            byteplus_models["dreamina-seedance-2-0-fast-260128"]["default_base_url"]
+            == "https://ark.ap-southeast.bytepluses.com/api/v3"
+        )
+        assert (
+            byteplus_models["dreamina-seedance-2-0-fast-260128"]["category"] == "video"
+        )
+        assert byteplus_models["dreamina-seedance-2-0-fast-260128"]["abilities"] == [
+            "generate"
+        ]
+
+    def test_fetch_xinference_video_provider_models(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def json(self):
+                return {
+                    "data": [
+                        {
+                            "id": "wan-video",
+                            "model_name": "Wan2.1-1.3B",
+                            "model_type": "video",
+                            "model_ability": ["text_to_video"],
+                        },
+                        {
+                            "id": "chat-model",
+                            "model_name": "qwen",
+                            "model_type": "LLM",
+                            "model_ability": ["chat"],
+                        },
+                    ]
+                }
+
+        class FakeClientSession:
+            created_timeouts = []
+
+            def __init__(self, *args, **kwargs):
+                _ = args
+                self.created_timeouts.append(kwargs.get("timeout"))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def get(self, url, headers=None):
+                assert url == "http://localhost:9997/v1/models"
+                assert headers == {}
+                return FakeResponse()
+
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.aiohttp.ClientSession",
+            FakeClientSession,
+        )
+
+        response = client.post(
+            "/api/models/providers/xinference/models",
+            json={
+                "api_key": "",
+                "base_url": "http://localhost:9997",
+                "category": "video",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert data["models"] == [
+            {
+                "id": "Wan2.1-1.3B",
+                "model_uid": "wan-video",
+                "model_type": "video",
+                "category": "video",
+                "model_ability": ["generate"],
+                "abilities": ["generate"],
+                "description": "",
+            }
+        ]
+        assert FakeClientSession.created_timeouts[0].total == 30.0
+
+    def test_fetch_xinference_video_provider_models_handles_unexpected_response(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def json(self):
+                return []
+
+        class FakeClientSession:
+            def __init__(self, *args, **kwargs):
+                _ = args, kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def get(self, url, headers=None):
+                assert url == "http://localhost:9997/v1/models"
+                assert headers == {}
+                return FakeResponse()
+
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.aiohttp.ClientSession",
+            FakeClientSession,
+        )
+
+        response = client.post(
+            "/api/models/providers/xinference/models",
+            json={
+                "api_key": "",
+                "base_url": "http://localhost:9997",
+                "category": "video",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 0
+        assert data["models"] == []
+
+    def test_create_deepseek_rejects_legacy_alias(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "legacy-deepseek-chat",
+                "category": "llm",
+                "model_provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "api_key": "test-api-key",
+                "abilities": ["chat", "tool_calling", "thinking_mode"],
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "Unsupported DeepSeek model" in response.json()["detail"]
+
+    def test_update_deepseek_rejects_legacy_alias(
+        self, test_db, regular_user, regular_headers
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "valid-deepseek",
+                "category": "llm",
+                "model_provider": "deepseek",
+                "model_name": "deepseek-v4-flash",
+                "api_key": "test-api-key",
+                "abilities": ["chat", "tool_calling", "thinking_mode"],
+            },
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+
+        response = client.put(
+            "/api/models/valid-deepseek",
+            json={"model_name": "deepseek-reasoner"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "Unsupported DeepSeek model" in response.json()["detail"]
+
+    def test_test_connection_deepseek_disables_thinking(
+        self, test_db, regular_user, regular_headers
+    ):
+        mock_llm = Mock()
+        mock_llm.chat = AsyncMock(
+            return_value={"type": "text", "content": "ok", "raw": {}}
+        )
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=mock_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "deepseek",
+                    "model_name": "deepseek-v4-flash",
+                    "api_key": "test-api-key",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        mock_llm.chat.assert_awaited_once_with(
+            [{"role": "user", "content": "Hello"}],
+            max_tokens=16,
+            thinking={"type": "disabled"},
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "model_provider",
+            "model_name",
+            "temperature",
+            "expected_default_temperature",
+        ),
+        [
+            ("openai", "openai/gpt-5.6-sol", None, None),
+            ("openai", "gpt-4o", 0.0, 0.0),
+            ("openai", "o1", 0.5, None),
+            ("openai", "gpt-4o", 0.5, 0.5),
+            ("bedrock", "openai.gpt-oss-120b-1:0", 0.5, 0.5),
+        ],
+        ids=[
+            "unset_temperature_is_never_invented",
+            "explicit_zero_is_not_swallowed",
+            "reasoning_model_still_rejects_explicit_temperature",
+            "non_reasoning_model_forwards_explicit_temperature",
+            "gpt_oss_budget_handling_does_not_change_temperature",
+        ],
+    )
+    def test_test_connection_llm_default_temperature_matches_request(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        model_provider,
+        model_name,
+        temperature,
+        expected_default_temperature,
+    ):
+        """The connection test must forward only a temperature the caller
+        actually set, never invent one, and never let 0.0 be treated as
+        falsy."""
+        captured = {}
+
+        def fake_create_base_llm(config):
+            captured["default_temperature"] = config.default_temperature
+
+            class FakeLLM:
+                async def chat(self, messages, **kwargs):
+                    return {"content": "hi"}
+
+            return FakeLLM()
+
+        payload = {
+            "model_provider": model_provider,
+            "model_name": model_name,
+            "api_key": "test-api-key",
+            "category": "llm",
+        }
+        if model_provider == "openai":
+            payload["base_url"] = "https://api.openai.com/v1"
+        else:
+            payload["bedrock_region"] = "us-east-1"
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            side_effect=fake_create_base_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json=payload,
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert captured["default_temperature"] == expected_default_temperature
+
+    @pytest.mark.parametrize(
+        ("model_provider", "model_name", "expected_chat_kwargs"),
+        [
+            ("openai", "o1", {}),
+            ("openai", "gpt-4o", {"max_tokens": 16}),
+            ("bedrock", "openai.gpt-oss-20b-1:0", {}),
+            ("bedrock", "us.openai.gpt-oss-120b-1:0", {}),
+            (
+                "bedrock",
+                "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+                "us.openai.gpt-oss-120b-1:0",
+                {},
+            ),
+            ("openai", "openai.gpt-oss-120b-1:0", {"max_tokens": 16}),
+        ],
+        ids=[
+            "reasoning_model_lets_adapter_pick_max_tokens",
+            "non_reasoning_model_still_caps_max_tokens_at_16",
+            "bedrock_gpt_oss_20b_uses_adapter_budget",
+            "bedrock_regional_gpt_oss_120b_uses_adapter_budget",
+            "bedrock_profile_gpt_oss_120b_uses_adapter_budget",
+            "gpt_oss_name_does_not_change_other_providers",
+        ],
+    )
+    def test_test_connection_llm_max_tokens_matches_reasoning_heuristic(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        model_provider,
+        model_name,
+        expected_chat_kwargs,
+    ):
+        """Probe budgets must stay cheap except where reasoning needs the
+        adapter's usable default."""
+        mock_llm = Mock()
+        mock_llm.chat = AsyncMock(
+            return_value={"type": "text", "content": "ok", "raw": {}}
+        )
+
+        payload = {
+            "model_provider": model_provider,
+            "model_name": model_name,
+            "api_key": "test-api-key",
+            "category": "llm",
+        }
+        if model_provider == "openai":
+            payload["base_url"] = "https://api.openai.com/v1"
+        else:
+            payload["bedrock_region"] = "us-east-1"
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=mock_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json=payload,
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        mock_llm.chat.assert_awaited_once_with(
+            [{"role": "user", "content": "Hello"}], **expected_chat_kwargs
+        )
+
+    def test_bedrock_gpt_oss_native_probe_uses_adapter_default_budget(
+        self, test_db, regular_user, regular_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **request: Any) -> dict[str, Any]:
+                assert request["modelId"] == "us.openai.gpt-oss-120b-1:0"
+                assert request["inferenceConfig"]["maxTokens"] == 4096
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "Hello from GPT-OSS"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 32},
+                }
+
+        with patch.object(
+            BedrockLLM,
+            "_build_client",
+            return_value=SyntheticBedrockClient(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "us.openai.gpt-oss-120b-1:0",
+                    "api_key": "test-api-key",
+                    "bedrock_region": "us-east-1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+
+    def test_bedrock_gpt_oss_probe_reaches_reasoning_and_final_text(
+        self, test_db, regular_user, regular_headers
+    ):
+        observed = {}
+
+        class BudgetSensitiveReasoningLLM:
+            async def chat(self, messages, **kwargs):
+                observed["messages"] = messages
+                observed["kwargs"] = kwargs
+                effective_budget = kwargs.get("max_tokens", 4096)
+                if effective_budget <= 16:
+                    raise RuntimeError("reasoning-only response exhausted the budget")
+                response = {
+                    "reasoning_content": "The greeting is straightforward.",
+                    "content": "Hello!",
+                }
+                assert response["reasoning_content"]
+                assert response["content"]
+                return response
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=BudgetSensitiveReasoningLLM(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "us.openai.gpt-oss-120b-1:0",
+                    "api_key": "test-api-key",
+                    "bedrock_region": "us-east-1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        assert observed == {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "kwargs": {},
+        }
+
+    def test_saved_model_probes_share_reasoning_budget_policy(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        ordinary = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        known_reasoning = client.post(
+            "/api/models/",
+            json={
+                **sample_model_data,
+                "model_id": "saved-o1",
+                "model_name": "o1",
+            },
+            headers=regular_headers,
+        )
+        gpt_oss = client.post(
+            "/api/models/",
+            json={
+                "model_id": "saved-bedrock-gpt-oss",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "eu.openai.gpt-oss-20b-1:0",
+                "api_key": "test-api-key",
+                "bedrock_region": "eu-west-1",
+                "abilities": ["chat"],
+            },
+            headers=regular_headers,
+        )
+        assert ordinary.status_code == 200
+        assert known_reasoning.status_code == 200
+        assert gpt_oss.status_code == 200
+
+        llms = {
+            "test-openai-model": AsyncMock(),
+            "saved-o1": AsyncMock(),
+            "saved-bedrock-gpt-oss": AsyncMock(),
+        }
+        for llm in llms.values():
+            llm.chat.return_value = {"content": "ok"}
+
+        with patch.object(
+            model_module.CoreStorage,
+            "get_llm_by_id",
+            side_effect=lambda model_id: llms[model_id],
+        ):
+            response = client.post(
+                "/api/models/test",
+                json={"model_ids": list(llms)},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert {item["status"] for item in response.json()} == {"passed"}
+        message = [{"role": "user", "content": "Test message - are you working?"}]
+        llms["test-openai-model"].chat.assert_awaited_once_with(message, max_tokens=16)
+        llms["saved-o1"].chat.assert_awaited_once_with(message)
+        llms["saved-bedrock-gpt-oss"].chat.assert_awaited_once_with(message)

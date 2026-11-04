@@ -1,0 +1,2569 @@
+import asyncio
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Dict, NamedTuple, NoReturn, Optional, Tuple, cast
+from urllib.parse import quote
+from uuid import uuid4
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session
+
+from ...config import (
+    get_file_delivery_accel_redirect_enabled,
+    get_file_delivery_accel_redirect_prefix,
+    get_file_delivery_redirect_enabled,
+    get_file_delivery_signed_url_ttl_seconds,
+    get_file_stream_ticket_ttl_seconds,
+    get_storage_root,
+    get_uploads_dir,
+)
+from ...core.artifact_validation.defaults import default_registry
+from ...core.artifact_validation.service import validate_artifact
+from ...core.execution_scope import resolve_execution_scope
+from ...core.file_storage import get_user_file_storage, normalize_storage_key
+from ...core.tools.adapters.vibe.file_tool import read_file
+from ...core.tools.core import pptx_conversion
+from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
+from ...core.utils.svg import rasterize_svg_bytes
+from ...core.workspace import scoped_user_root
+from .. import jwt_codec as jwt
+from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from ..auth_dependencies import (
+    _AccessTokenRejected,
+    _validate_access_token_claim_bindability,
+    get_current_user,
+    is_admin_user,
+    optional_security,
+)
+from ..auth_sessions import matches_user_session, user_session_claims
+from ..config import (
+    BINARY_EXTENSIONS,
+    MAX_FILE_SIZE,
+    MAX_FILE_SIZE_LABEL,
+    get_upload_path,
+    is_allowed_file,
+)
+from ..content_security import is_active_content_type
+from ..jwt_codec import JWTError
+from ..models.database import get_db, release_db_connection_if_clean
+from ..models.task import Task
+from ..models.uploaded_file import UploadedFile
+from ..models.user import User
+from ..services.db_runtime import (
+    await_task_settlement,
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
+from ..services.external_media import (
+    ExternalMediaPurpose,
+    ExternalMediaTicketRejected,
+    ExternalMediaUnavailable,
+    instagram_image_requires_normalization,
+    instagram_jpeg_bytes,
+    redeem_external_media_ticket,
+)
+from ..services.kb_file_service import (
+    KB_RETAINED_DIR,
+    aggregate_uploaded_file_statuses,
+)
+from ..services.managed_file_ref import (
+    FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    NAMESPACE_AUTHORITY_ERRORS,
+    DurableObjectIntegrityError,
+    DurableObjectMissingError,
+    DurableStorageOperationError,
+    ManagedFileRef,
+    UploadedFileLocalPathRecord,
+    guess_media_type,
+    log_durable_storage_fault,
+)
+from ..services.uploaded_file_cleanup_publication import (
+    FilePublicationUnavailable,
+    async_managed_copy,
+    guard_preview_publication,
+    preview_cache_hit,
+)
+from ..services.uploaded_file_store import (
+    LocalUploadRegistration,
+    UploadedFileStore,
+    UploadedFileVersionConflict,
+    compensate_registered_uploads_sync,
+    delete_legacy_preview_caches,
+    delete_registered_preview_caches,
+    register_local_uploads_sync,
+    upload_path_is_registered_sync,
+)
+from .auth import create_access_token
+from .legacy_file import (
+    infer_user_id_from_legacy_path,
+    is_valid_uuid,
+    resolve_legacy_file_path,
+    resolve_legacy_file_path_cross_user,
+)
+
+# Optional import for python-pptx (used for upload-time text preview).
+pptx: ModuleType | None = None
+# Kept around as a defensive placeholder so future call sites can raise a
+# helpful error if python-pptx is missing instead of failing with
+# AttributeError. Currently unused — _pptx_text_preview just no-ops when
+# pptx is None.
+pptx_not_installed_exception = RuntimeError(
+    "python-pptx is not installed. "
+    "Install with: pip install 'xagent[document-processing]'"
+)
+try:
+    import pptx
+except ImportError:
+    pptx = None
+
+logger = logging.getLogger(__name__)
+
+file_router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+def _raise_durable_storage_unavailable(
+    exc: Exception, operation: str, **fields: object
+) -> NoReturn:
+    """Log the durable-storage fault, then raise the retryable 503.
+
+    ``NoReturn`` rather than a factory returning the exception: logging and
+    raising are one step, so the type forbids a caller that logs without
+    raising (a phantom fault in the log) or raises without logging (the cause
+    lost, which is the bug #1467 was filed for). The 503 body is deliberately
+    detail-free, which is what makes the log the only record.
+
+    The 503 body carries no detail from ``exc``. The storage key rides on the
+    exception's ``storage_key`` attribute rather than its message (#1643), so
+    the log line renders it as a field while ``str(exc)`` stays safe wherever
+    it escapes. Pass request identifiers as ``fields``, and keep ``operation``
+    a bounded label so it stays aggregatable.
+
+    ``exc`` is ``Exception``, not ``BaseException``, so mypy rejects a caller
+    that hands over an ``asyncio.CancelledError`` or ``KeyboardInterrupt``:
+    a cancelled request has not shown the object store to be unwell, and 503
+    would tell the client to retry something deliberately stopped.
+    """
+    log_durable_storage_fault(logger, operation, exc, **fields)
+    raise HTTPException(
+        status_code=503,
+        detail="Durable storage is temporarily unavailable",
+    ) from exc
+
+
+def _file_integrity_failed() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    )
+
+
+def _content_disposition_header(disposition: str, filename: str) -> str:
+    safe_name = Path(filename).name or "file"
+    fallback_name = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else "_" for character in safe_name
+    )
+    escaped_name = fallback_name.replace("\\", "\\\\").replace('"', '\\"')
+    encoded_name = quote(safe_name, safe="")
+    return (
+        f"{disposition}; filename=\"{escaped_name}\"; filename*=UTF-8''{encoded_name}"
+    )
+
+
+def _inline_download_disposition(media_type: str) -> str:
+    if media_type == "image/svg+xml":
+        return "attachment"
+    return (
+        "inline"
+        if media_type.startswith(("image/", "video/", "audio/", "text/"))
+        else "attachment"
+    )
+
+
+def _preview_can_redirect(path: Path, media_type: str) -> bool:
+    if path.suffix.lower() in {".pptx", ".ppt"}:
+        return False
+    return not is_active_content_type(media_type)
+
+
+def _svg_png_cache_path(svg_path: Path, file_id: Optional[str] = None) -> Path:
+    """Return the on-disk cache path for a rasterized SVG preview.
+
+    Mirrors ``_pptx_pdf_cache_path``'s cache-dir-outside-uploads pattern.
+
+    A single registered ``file_id`` can be asked to preview multiple
+    distinct SVGs (e.g. relative-path assets alongside a base upload), so
+    the cache key includes a hash of the resolved source path even when
+    ``file_id`` is given — otherwise two different SVGs registered under
+    the same ``file_id`` would collide on one cache entry and the second
+    preview request would read back the first asset's PNG. The ``file_id``
+    prefix is kept so ``delete_svg_png_cache`` can still glob-remove every
+    derived preview for a deleted upload.
+    """
+
+    import hashlib
+
+    cache_dir = get_storage_root() / "svg_png_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path_key = hashlib.sha256(str(svg_path.resolve()).encode()).hexdigest()[:24]
+    if file_id:
+        return cache_dir / f"{file_id}.{path_key}.preview.png"
+    return cache_dir / f"{path_key}.preview.png"
+
+
+def _rasterize_svg_preview(svg_path: Path, file_id: Optional[str] = None) -> Path:
+    cached = preview_cache_hit(
+        svg_path, _svg_png_cache_path(svg_path, file_id), file_id
+    )
+    if cached is not None:
+        return cached
+    return _rasterize_svg_preview_uncached(svg_path, file_id)
+
+
+@guard_preview_publication
+def _rasterize_svg_preview_uncached(
+    svg_path: Path, file_id: Optional[str] = None
+) -> Path:
+    cache_path = _svg_png_cache_path(svg_path, file_id)
+    try:
+        if (
+            cache_path.exists()
+            and cache_path.stat().st_mtime >= svg_path.stat().st_mtime
+        ):
+            return cache_path
+    except OSError:
+        pass
+    png = rasterize_svg_bytes(svg_path.read_bytes())
+    # Use a per-call unique temp name: concurrent previews of the same
+    # cache-miss SVG would otherwise race on one fixed ".png.tmp" path,
+    # where the first replace() consumes the file the second is about to
+    # rename, raising FileNotFoundError. Renaming distinct temp files onto
+    # the same destination is itself atomic and needs no extra locking.
+    tmp = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    tmp.write_bytes(png)
+    os.replace(tmp, cache_path)
+    return cache_path
+
+
+async def _inline_preview_response(
+    path: Path,
+    *,
+    filename: str,
+    media_type: str,
+    file_id: Optional[str] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    validation_only: bool = False,
+    public_validation: bool = False,
+) -> Response:
+    """Build the final inline preview FileResponse, rasterizing SVG to PNG.
+
+    Raw SVG bytes are never served inline — an embedded ``<script>`` would
+    execute on direct top-level navigation to this response. Every other
+    media type is served as-is.
+
+    ``extra_headers`` lets a caller layer route-specific headers (e.g. the
+    public/tokened route's or a ticket-authenticated request's
+    ``Cache-Control``) without changing behavior for other callers — this
+    helper is shared by the authenticated, public, and ticket-authenticated
+    preview endpoints, and the plain Bearer-authenticated in-app path relies
+    on normal browser caching for repeatedly-rendered chat images.
+    """
+
+    if validation_only:
+        report = await asyncio.to_thread(
+            validate_artifact, path, filename=filename, public=public_validation
+        )
+        return JSONResponse(
+            {**report.as_dict(), "supported": default_registry().supports(filename)},
+            media_type="application/vnd.xagent.validation+json",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    if media_type == "image/svg+xml":
+        try:
+            # CairoSVG rasterization is CPU-bound and can run up to the
+            # 4096x4096 pixel budget even for a small (<=5MB) SVG; offload
+            # it so one cache-miss preview cannot stall every other request
+            # on this event loop (the public preview endpoint makes this
+            # externally triggerable).
+            png_path = await asyncio.to_thread(_rasterize_svg_preview, path, file_id)
+        except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+            raise HTTPException(status_code=404, detail="File not found") from exc
+        except DurableStorageOperationError as exc:
+            _raise_durable_storage_unavailable(exc, "svg preview", file_id=file_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="SVG cannot be safely previewed",
+            ) from exc
+        return FileResponse(
+            path=str(png_path),
+            filename=Path(filename).with_suffix(".png").name,
+            media_type="image/png",
+            headers={
+                **(extra_headers or {}),
+                # These two win over any same-named extra_headers entry: they
+                # are security invariants (the second prevents this rasterized
+                # PNG from being sniffed back into script-executable content),
+                # not caller-tunable behavior.
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type=media_type,
+        headers={
+            **(extra_headers or {}),
+            # See the invariant note in the SVG branch above. User markup is
+            # always downloaded instead of being interpreted as a same-origin
+            # document, including ticket-authenticated previews.
+            "Content-Disposition": (
+                _content_disposition_header("attachment", filename)
+                if is_active_content_type(media_type)
+                else "inline"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+# The public/tokened preview route (unlike the authenticated in-app one) is
+# now loaded directly as <img>/<audio>/<video> src on public share surfaces
+# (#1196), which fetches automatically on render with no user action. A
+# response with no Cache-Control lets the browser write the tokened URL and
+# its bytes to disk cache, where they can outlive the guest session. This
+# header must NOT be applied to the authenticated preview route: chat images
+# there rely on ordinary browser caching across repeated renders.
+#
+# Reused as-is (not a separate constant) for the ticket-authenticated branch
+# of the Bearer preview route below: a stream ticket rides in a URL a media
+# element auto-fetches on render too, so the same disk-cache exposure and
+# the same fix apply -- see where this is threaded through preview_file as
+# ``cache_headers``, which is the single choke point for every
+# content-serving exit of that endpoint that can serve a ticket-
+# authenticated request (the redirect fast paths included; error exits
+# raise a bare HTTPException and carry no Cache-Control at all, which is
+# fine since 404 is the only heuristically-cacheable one and no content is
+# at stake there).
+_PUBLIC_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
+
+
+def _durable_redirect_response(
+    file_ref: ManagedFileRef,
+    *,
+    filename: str,
+    media_type: str,
+    disposition: str,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> RedirectResponse | None:
+    if not get_file_delivery_redirect_enabled():
+        return None
+
+    try:
+        signed_url = file_ref.signed_access_url(
+            expires=get_file_delivery_signed_url_ttl_seconds(),
+            content_type=media_type,
+            content_disposition=_content_disposition_header(disposition, filename),
+        )
+    except DurableObjectIntegrityError as exc:
+        raise _file_integrity_failed() from exc
+    except DurableStorageOperationError as exc:
+        _raise_durable_storage_unavailable(
+            exc, "signed durable redirect", file_id=file_ref.record.file_id
+        )
+
+    if not signed_url:
+        return None
+
+    # extra_headers (e.g. a ticket-authenticated request's Cache-Control) is
+    # best-effort on this response only: browsers don't cache a 307 without
+    # explicit caching headers regardless, and the bytes the client actually
+    # receives come from ``signed_url`` (the durable-object provider), whose
+    # own headers -- governed by its short, provider-side expiry -- are what
+    # actually controls caching for that content, not anything set here.
+    return RedirectResponse(url=signed_url, status_code=307, headers=extra_headers)
+
+
+def _accel_redirect_response(
+    path: Path,
+    *,
+    owner_user_id: int,
+    filename: str,
+    media_type: str,
+    disposition: str,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Response | None:
+    if not get_file_delivery_accel_redirect_enabled():
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+
+    _ensure_under_uploads(path, owner_user_id)
+    uploads_root = get_uploads_dir().resolve()
+    try:
+        relative_path = path.resolve().relative_to(uploads_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+    internal_prefix = get_file_delivery_accel_redirect_prefix()
+    internal_uri = (
+        internal_prefix.rstrip("/") + "/" + quote(relative_path.as_posix(), safe="/")
+    )
+    # extra_headers is best-effort here too: whether it survives nginx's
+    # internal X-Accel-Redirect (which by default regenerates the response
+    # for the internal location rather than forwarding these headers
+    # verbatim) is reverse-proxy-config-dependent, same caveat that already
+    # applies to Content-Disposition on this exact response.
+    return Response(
+        status_code=200,
+        media_type=media_type,
+        headers={
+            **(extra_headers or {}),
+            "X-Accel-Redirect": internal_uri,
+            "Content-Disposition": _content_disposition_header(disposition, filename),
+        },
+    )
+
+
+def _registered_file_response(
+    path: Path,
+    *,
+    filename: str,
+    media_type: str,
+    disposition: str,
+) -> FileResponse:
+    return FileResponse(
+        path=str(path),
+        filename=filename,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": _content_disposition_header(disposition, filename),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def build_registered_file_download_response(
+    file_record: UploadedFileLocalPathRecord,
+    *,
+    owner_user_id: int,
+    disposition: str,
+) -> Response:
+    """Serve one registered file, shared by the JWT and SDK download routes.
+
+    ``disposition`` is the caller's policy (``inline`` for the JWT route,
+    ``attachment`` for the SDK); path containment and durable fallback stay
+    identical for both.
+    """
+
+    file_ref = ManagedFileRef(file_record)
+    local_path = file_ref.local_path
+    filename = str(file_record.filename)
+    media_type = guess_media_type(filename)
+    local_path_is_trusted = _is_under_uploads(local_path, owner_user_id)
+    redirect_response = _durable_redirect_response(
+        file_ref,
+        filename=filename,
+        media_type=media_type,
+        disposition=disposition,
+    )
+    if redirect_response is not None:
+        return redirect_response
+    if local_path_is_trusted and local_path.exists() and local_path.is_file():
+        accel_response = _accel_redirect_response(
+            local_path,
+            owner_user_id=owner_user_id,
+            filename=filename,
+            media_type=media_type,
+            disposition=disposition,
+        )
+        if accel_response is not None:
+            return accel_response
+        return _registered_file_response(
+            local_path,
+            filename=filename,
+            media_type=media_type,
+            disposition=disposition,
+        )
+    if file_ref.has_durable_object:
+        try:
+            if local_path_is_trusted:
+                restored_path = await async_managed_copy(file_ref, restore_local=True)
+                accel_response = _accel_redirect_response(
+                    restored_path,
+                    owner_user_id=owner_user_id,
+                    filename=filename,
+                    media_type=media_type,
+                    disposition=disposition,
+                )
+                if accel_response is not None:
+                    return accel_response
+            else:
+                restored_path = await async_managed_copy(
+                    file_ref, allow_existing_local=False
+                )
+            return _registered_file_response(
+                restored_path,
+                filename=filename,
+                media_type=media_type,
+                disposition=disposition,
+            )
+        except DurableObjectIntegrityError as exc:
+            raise _file_integrity_failed() from exc
+        except FilePublicationUnavailable as exc:
+            raise HTTPException(status_code=404, detail="File not found") from exc
+        except DurableObjectMissingError:
+            restored_path = file_ref.local_path
+            _ensure_under_uploads(restored_path, owner_user_id)
+            return _registered_file_response(
+                restored_path,
+                filename=filename,
+                media_type=media_type,
+                disposition=disposition,
+            )
+        except DurableStorageOperationError as exc:
+            _raise_durable_storage_unavailable(
+                exc, "download", file_id=str(file_record.file_id)
+            )
+    _ensure_under_uploads(local_path, owner_user_id)
+
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return _registered_file_response(
+        local_path,
+        filename=filename,
+        media_type=media_type,
+        disposition=disposition,
+    )
+
+
+_UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
+
+
+class _InvalidUploadPathError(ValueError):
+    """Path-construction validation failure for a request upload."""
+
+
+def _delete_staged_upload(path: Path) -> None:
+    """Best-effort removal which never replaces the staging failure."""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to clean up local upload: %s", path)
+
+
+def _reserve_and_copy_upload(
+    uploaded: UploadFile,
+    *,
+    task_id: str | None,
+    folder: str | None,
+    user_id: int,
+) -> Path:
+    """Reserve one local upload path and copy bytes through its descriptor.
+
+    This synchronous worker owns path construction, exclusive reservation, and
+    bounded source reads. Registered paths remain owned even after local cache
+    eviction. Exclusive creation also protects concurrent uploads; errors from
+    source reads or destination writes remain I/O failures and clean the exact
+    reserved candidate.
+    """
+
+    try:
+        path = get_upload_path(uploaded.filename or "", task_id, folder, user_id)
+    except ValueError as exc:
+        raise _InvalidUploadPathError(str(exc)) from exc
+    stem = path.stem
+    suffix = path.suffix
+    candidate = path
+    suffix_index = 1
+
+    while True:
+        if candidate.exists() or upload_path_is_registered_sync(candidate):
+            candidate = path.parent / f"{stem}_{suffix_index}{suffix}"
+            suffix_index += 1
+            continue
+        try:
+            destination = open(candidate, "xb")
+        except FileExistsError:
+            candidate = path.parent / f"{stem}_{suffix_index}{suffix}"
+            suffix_index += 1
+            continue
+
+        total_size = 0
+        try:
+            with destination:
+                while True:
+                    chunk = uploaded.file.read(_UPLOAD_COPY_BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > MAX_FILE_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"File size exceeds maximum limit of "
+                                f"{MAX_FILE_SIZE_LABEL}"
+                            ),
+                        )
+                    destination.write(chunk)
+        except BaseException:
+            _delete_staged_upload(candidate)
+            raise
+        return candidate
+
+
+async def _stage_uploaded_file(
+    uploaded: UploadFile,
+    *,
+    task_id: str | None,
+    folder: str | None,
+    user_id: int,
+    written_paths: list[Path],
+    written_identities: dict[Path, tuple[int, int]],
+) -> Path:
+    """Run local staging off-loop and publish its path to request cleanup."""
+
+    def stage() -> tuple[Path, tuple[int, int]]:
+        path = _reserve_and_copy_upload(
+            uploaded,
+            task_id=task_id,
+            folder=folder,
+            user_id=user_id,
+        )
+        info = path.lstat()
+        return path, (info.st_dev, info.st_ino)
+
+    worker = asyncio.create_task(asyncio.to_thread(stage))
+    result, cancellation = await await_task_settlement(worker)
+    target_path, identity = result
+    # The request cleanup owner knows this exact path before any subsequent
+    # preview, registration, or cancellation-cleanup await point.
+    written_paths.append(target_path)
+    written_identities[target_path] = identity
+    if cancellation is not None:
+        raise cancellation
+    return target_path
+
+
+async def store_uploaded_files(
+    *,
+    upload_items: list[UploadFile],
+    task_type: str,
+    task_id: str | None,
+    folder: str | None,
+    user_id: int,
+    single_file_mode: bool,
+    upload_source: str | None = None,
+) -> Dict[str, Any]:
+    """Store request bytes without retaining a database connection across I/O."""
+
+    parsed_task_id = _parse_task_id(task_id)
+    uploaded_files: list[dict[str, Any]] = []
+    written_paths: list[Path] = []
+    written_identities: dict[Path, tuple[int, int]] = {}
+    registrations: list[LocalUploadRegistration] = []
+    previews: dict[str, Any] = {}
+    completed = False
+
+    try:
+        # Off-turn (this runs outside the ExecutionScopeContext/
+        # resolve_execution_scope turn boundary, from the upload HTTP
+        # endpoint) but a write path: the resolved scope selects the
+        # namespace (workspace segments / storage key) these bytes are
+        # written under. Unlike the off-turn *read* paths that call
+        # resolve_execution_scope_off_turn() and downgrade an authority
+        # mismatch to a warning, namespace selection for a write must not be
+        # downgraded -- so this calls resolve_execution_scope() directly and
+        # stays fail-closed: an ExecutionScopeAuthorityError propagates past
+        # the DurableStorageOperationError handler below to the
+        # application-level namespace-authority handler (500, no retry
+        # advertised) rather than silently writing under the wrong namespace.
+        upload_execution_scope = (
+            await run_db_io_cancellation_safe(
+                lambda: resolve_execution_scope(parsed_task_id)
+            )
+            if parsed_task_id is not None
+            else None
+        )
+        for uploaded in upload_items:
+            if not uploaded.filename or not uploaded.filename.strip():
+                raise HTTPException(status_code=422, detail="No filename provided")
+            if not is_allowed_file(uploaded.filename, task_type):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"File type {Path(uploaded.filename).suffix.lower()} not supported for task type {task_type}",
+                )
+
+            try:
+                target_path = await _stage_uploaded_file(
+                    uploaded,
+                    task_id=task_id,
+                    folder=folder,
+                    user_id=user_id,
+                    written_paths=written_paths,
+                    written_identities=written_identities,
+                )
+            except _InvalidUploadPathError as e:
+                logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid folder name: {str(e)}"
+                ) from e
+
+            file_id = str(uuid4())
+
+            content_preview = ""
+            file_extension = Path(uploaded.filename).suffix.lower()
+            if file_extension == ".pptx":
+                try:
+                    preview_task = asyncio.create_task(
+                        asyncio.to_thread(_pptx_text_preview, target_path)
+                    )
+                    preview_content = await drain_async_task_cancellation_safe(
+                        preview_task
+                    )
+                    content_preview = (
+                        preview_content[:500] + "..."
+                        if len(preview_content) > 500
+                        else preview_content
+                    )
+                except Exception:
+                    content_preview = ""
+            elif file_extension == ".ppt":
+                content_preview = ""
+            elif file_extension not in BINARY_EXTENSIONS:
+                try:
+                    preview_task = asyncio.create_task(
+                        asyncio.to_thread(read_file, str(target_path))
+                    )
+                    preview_content = await drain_async_task_cancellation_safe(
+                        preview_task
+                    )
+                    content_preview = (
+                        preview_content[:500] + "..."
+                        if isinstance(preview_content, str)
+                        and len(preview_content) > 500
+                        else preview_content
+                    )
+                except Exception:
+                    content_preview = ""
+
+            previews[file_id] = content_preview
+            registrations.append(
+                LocalUploadRegistration(
+                    local_path=target_path,
+                    user_id=user_id,
+                    file_id=file_id,
+                    task_id=parsed_task_id,
+                    filename=Path(uploaded.filename).name,
+                    mime_type=uploaded.content_type,
+                    upload_source=upload_source,
+                    execution_scope=upload_execution_scope,
+                )
+            )
+
+        registered = await run_db_io_cancellation_safe(
+            lambda: register_local_uploads_sync(registrations)
+        )
+        for file_record in registered:
+            uploaded_files.append(
+                {
+                    "file_id": file_record.file_id,
+                    "filename": file_record.filename,
+                    "file_size": file_record.file_size,
+                    "mime_type": file_record.mime_type,
+                    "content_preview": previews.get(file_record.file_id, ""),
+                }
+            )
+        completed = True
+    except DurableStorageOperationError as exc:
+        # No single ``file_id``: this is a batch registration, and any of the
+        # files in it may be the one that failed. Tenant and task still
+        # correlate a 503 burst to who and what was affected, which is the
+        # question asked first during an outage.
+        _raise_durable_storage_unavailable(
+            exc, "upload", user_id=user_id, task_id=parsed_task_id
+        )
+    finally:
+        if not completed:
+
+            async def _cleanup() -> None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: compensate_registered_uploads_sync(
+                            tuple(
+                                registration.compensation_claim
+                                for registration in registrations
+                            )
+                        )
+                    )
+                finally:
+
+                    def _delete_local_paths() -> None:
+                        for path in written_paths:
+                            try:
+                                if upload_path_is_registered_sync(path):
+                                    continue
+                                try:
+                                    info = path.lstat()
+                                except FileNotFoundError:
+                                    continue
+                                if (info.st_dev, info.st_ino) == written_identities[
+                                    path
+                                ]:
+                                    _delete_staged_upload(path)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to reconcile staged upload path: %s", path
+                                )
+
+                    cleanup_worker = asyncio.create_task(
+                        asyncio.to_thread(_delete_local_paths)
+                    )
+                    await drain_async_task_cancellation_safe(cleanup_worker)
+
+            cleanup_task = asyncio.create_task(_cleanup())
+            try:
+                await drain_async_task_cancellation_safe(cleanup_task)
+            except asyncio.CancelledError:
+                raise
+            except DurableStorageOperationError as exc:
+                # The double fault: the upload already failed against durable
+                # storage, and compensating against the same backend failed
+                # too -- the shape of the incident this reporting exists for.
+                # The generic arm below would log it, but without the fields
+                # that let a burst be aggregated, so it is named here instead.
+                # It stays swallowed: best-effort cleanup inside the
+                # ``finally`` of a request that is already failing.
+                log_durable_storage_fault(
+                    logger,
+                    "upload compensation",
+                    exc,
+                    user_id=user_id,
+                    task_id=parsed_task_id,
+                )
+            except Exception:
+                logger.exception("Failed to compensate cancelled/failed upload")
+
+    if single_file_mode:
+        first_file = uploaded_files[0]
+        return {
+            "success": True,
+            "file_id": first_file["file_id"],
+            "filename": first_file["filename"],
+            "file_size": first_file["file_size"],
+            "mime_type": first_file["mime_type"],
+            "task_type": task_type,
+            "content_preview": first_file["content_preview"],
+            "message": f"Successfully uploaded {first_file['filename']}",
+        }
+
+    return {
+        "success": True,
+        "files": uploaded_files,
+        "total_files": len(uploaded_files),
+        "task_type": task_type,
+        "message": f"Successfully uploaded {len(uploaded_files)} files",
+    }
+
+
+def _user_id_value(user: User) -> int:
+    return int(getattr(user, "id"))
+
+
+def _file_user_id_value(file_record: UploadedFile) -> int:
+    return int(getattr(file_record, "user_id"))
+
+
+def _is_admin_user(user: User) -> bool:
+    return is_admin_user(user)
+
+
+def _parse_task_id(task_id: Optional[str]) -> Optional[int]:
+    if task_id is None or task_id == "":
+        return None
+    try:
+        return int(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid task_id") from exc
+
+
+def _ensure_under_uploads(path: Path, user_id: int) -> None:
+    if _is_under_uploads(path, user_id):
+        return
+
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _is_under_uploads(path: Path, user_id: int) -> bool:
+    resolved_path = path.resolve()
+    uploads_dir = get_uploads_dir()
+    uploads_root = uploads_dir.resolve()
+    user_root = scoped_user_root(uploads_dir, user_id).resolve()
+    try:
+        resolved_path.relative_to(uploads_root)
+        resolved_path.relative_to(user_root)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_public_preview_target(
+    base_path: Path, relative_path: Optional[str], user_id: int
+) -> Path:
+    _ensure_under_uploads(base_path, user_id)
+    if not relative_path:
+        return base_path
+
+    base_dir = base_path.parent.resolve()
+    candidate = (base_dir / relative_path).resolve()
+
+    try:
+        candidate.relative_to(base_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+    _ensure_under_uploads(candidate, user_id)
+    return candidate
+
+
+@dataclass(frozen=True)
+class PublicFileCredential:
+    """Guest credential presented to one public file request.
+
+    ``token`` is a guest token from the Authorization header; ``ticket_claims``
+    are the claims of a file ticket already verified against the route file.
+    """
+
+    # repr=False on both: neither credential may be rendered in logs/tracebacks.
+    token: str | None = field(default=None, repr=False)
+    ticket_claims: dict[str, Any] | None = field(default=None, repr=False)
+
+
+def _validate_public_task_file_access(
+    db: Session,
+    file_record: UploadedFile,
+    credential: PublicFileCredential,
+) -> dict[str, Any] | None:
+    """Apply guest-token isolation without changing normal file capabilities.
+
+    Ordinary signed-in tasks use the unguessable file ID as the capability for
+    public preview and download URLs. Share and widget tasks additionally bind
+    file access to a guest credential -- the guest token in the Authorization
+    header, or a file-bound ticket minted from it -- which must resolve to the
+    same task. Credentials are only interpreted for guest-bound files, so a
+    signed-in client's own Bearer header on this route is simply unused.
+
+    Returns the guest claims that were validated for a guest-bound file (so a
+    ticket can be minted from them), or ``None`` when the file is not
+    guest-bound and no credential was consulted.
+    """
+    if (
+        file_record.detached_reason is not None
+        or file_record.storage_status == "compensating"
+    ):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not file_record.task_id:
+        return None
+
+    task = db.query(Task).filter(Task.id == file_record.task_id).first()
+    if not task or not isinstance(task.agent_config, dict):
+        return None
+
+    from .public_chat_access import (
+        get_public_chat_user,
+        get_share_chat_user,
+        get_task_for_public_context,
+        get_task_for_share_context,
+        resolve_public_file_guest,
+    )
+
+    guest_id = task.agent_config.get("guest_id")
+    if task.agent_config.get("auth_mode") == "share":
+        share_context, claims = resolve_public_file_guest(
+            credential, db, get_share_chat_user, task_guest_id=guest_id
+        )
+        get_task_for_share_context(db, int(task.id), share_context)
+        return claims
+
+    if not isinstance(guest_id, str) or not guest_id:
+        return None
+
+    widget_context, claims = resolve_public_file_guest(
+        credential, db, get_public_chat_user, task_guest_id=guest_id
+    )
+    get_task_for_public_context(db, int(task.id), widget_context)
+    return claims
+
+
+def _public_file_credential(
+    file_id: str,
+    ticket: Optional[str] = Query(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+) -> PublicFileCredential:
+    """Collect the guest credential for a public file route.
+
+    The guest token is only read from the Authorization header; the retired
+    ``?token=`` query parameter is ignored. A present ``ticket`` is verified on
+    its own (signature, expiry, purpose, binding to this route's file id) and
+    never falls through to the header, mirroring the stream-ticket contract.
+    """
+    from .public_chat_access import verify_public_file_ticket
+
+    if ticket:
+        return PublicFileCredential(
+            ticket_claims=verify_public_file_ticket(ticket, file_id)
+        )
+    return PublicFileCredential(
+        token=credentials.credentials if credentials is not None else None
+    )
+
+
+def _find_registered_preview_asset(
+    db: Session,
+    *,
+    base_record: UploadedFile,
+    target_path: Path,
+    relative_path: str,
+) -> Optional[UploadedFile]:
+    target_path_candidates = {str(target_path)}
+    try:
+        target_path_candidates.add(str(target_path.resolve(strict=False)))
+    except OSError:
+        pass
+    try:
+        base_path = Path(str(base_record.storage_path))
+        target_path_candidates.add(str(base_path.parent / relative_path))
+    except (TypeError, ValueError):
+        pass
+    asset_record = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.user_id == base_record.user_id,
+            UploadedFile.storage_path.in_(target_path_candidates),
+        )
+        .first()
+    )
+    if asset_record is not None:
+        return asset_record
+
+    base_workspace_path = str(base_record.workspace_relative_path or "")
+    if not base_workspace_path:
+        return None
+    base_dir = Path(base_workspace_path).parent
+    asset_workspace_path = str((base_dir / relative_path).as_posix())
+    return (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.user_id == base_record.user_id,
+            UploadedFile.task_id == base_record.task_id,
+            UploadedFile.workspace_relative_path == asset_workspace_path,
+        )
+        .first()
+    )
+
+
+def _to_unix_timestamp(path: Path, fallback: Any) -> int:
+    if path.exists():
+        return int(path.stat().st_mtime)
+    if fallback is not None and hasattr(fallback, "timestamp"):
+        return int(fallback.timestamp())
+    return 0
+
+
+def _extract_relative_path(storage_path: Path, user_id: int) -> str:
+    user_root = scoped_user_root(get_uploads_dir(), user_id)
+    try:
+        return str(storage_path.relative_to(user_root))
+    except ValueError:
+        return storage_path.name
+
+
+def _collect_backfill_user_ids(user: User) -> list[int]:
+    if not _is_admin_user(user):
+        return [_user_id_value(user)]
+
+    user_ids: list[int] = []
+    if not get_uploads_dir().exists():
+        return user_ids
+
+    for child in get_uploads_dir().iterdir():
+        if not child.is_dir() or not child.name.startswith("user_"):
+            continue
+        try:
+            user_ids.append(int(child.name.replace("user_", "", 1)))
+        except ValueError:
+            continue
+    return user_ids
+
+
+def _infer_backfill_task_id(
+    db: Session, file_path: Path, user_id: int
+) -> Optional[int]:
+    from ..models.task import Task
+
+    user_root = scoped_user_root(get_uploads_dir(), user_id)
+    try:
+        rel_parts = file_path.relative_to(user_root).parts
+    except ValueError:
+        return None
+
+    if not rel_parts:
+        return None
+    first_part = rel_parts[0]
+    task_id_part: Optional[str] = None
+    if first_part.startswith("web_task_"):
+        task_id_part = first_part.replace("web_task_", "", 1)
+    elif first_part.startswith("task_"):
+        task_id_part = first_part.replace("task_", "", 1)
+
+    if task_id_part is None:
+        return None
+
+    try:
+        task_id = int(task_id_part)
+    except ValueError:
+        return None
+
+    task = db.query(Task.id).filter(Task.id == task_id, Task.user_id == user_id).first()
+    return task_id if task is not None else None
+
+
+def _backfill_uploaded_file_records(db: Session, user: User) -> None:
+    if not get_uploads_dir().exists():
+        return
+
+    target_user_ids = _collect_backfill_user_ids(user)
+    if not target_user_ids:
+        return
+
+    existing_records: dict[str, tuple[str, bool]] = {
+        cast(str, row.storage_path): (
+            str(row.file_id),
+            bool(row.storage_key),
+        )
+        for row in db.query(UploadedFile)
+        .filter(UploadedFile.user_id.in_(target_user_ids))
+        .all()
+    }
+
+    created = 0
+    for target_user_id in target_user_ids:
+        user_root = scoped_user_root(get_uploads_dir(), target_user_id)
+        if not user_root.exists() or not user_root.is_dir():
+            continue
+
+        for candidate in user_root.rglob("*"):
+            if not candidate.is_file():
+                continue
+
+            storage_path: str = str(candidate)
+            existing_identity = existing_records.get(storage_path)
+            if existing_identity is not None:
+                existing_file_id, has_storage_key = existing_identity
+                if not has_storage_key:
+                    try:
+                        UploadedFileStore(db).upsert_by_storage_path(
+                            user_id=target_user_id,
+                            file_id=existing_file_id,
+                            filename=candidate.name,
+                            storage_path=candidate,
+                            mime_type=guess_media_type(candidate.name),
+                            file_size=candidate.stat().st_size,
+                        )
+                    except UploadedFileVersionConflict:
+                        logger.warning(
+                            "Skipped uploaded-file backfill for an in-flight "
+                            "or concurrently changed record: %s",
+                            existing_file_id,
+                        )
+                    else:
+                        existing_records[storage_path] = (
+                            existing_file_id,
+                            True,
+                        )
+                        created += 1
+                continue
+            # A stray retained copy must not get a row that owns its retained path.
+            if candidate.relative_to(user_root).parts[0] == KB_RETAINED_DIR:
+                continue
+
+            file_id = str(uuid4())
+            task_id = _infer_backfill_task_id(db, candidate, target_user_id)
+            file_record = UploadedFileStore(db).upsert_by_storage_path(
+                user_id=target_user_id,
+                file_id=file_id,
+                filename=candidate.name,
+                mime_type=guess_media_type(candidate.name),
+                storage_path=candidate,
+                file_size=candidate.stat().st_size,
+                task_id=task_id,
+            )
+            existing_records[storage_path] = (str(file_record.file_id), True)
+            created += 1
+
+    if created > 0:
+        logger.info("Backfilled %s uploaded_files records", created)
+    release_db_connection_if_clean(db)
+
+
+def _get_file_record(db: Session, file_id: str) -> UploadedFile:
+    file_record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    return file_record
+
+
+def _resolve_file_path(
+    db: Session, file_id_or_path: str, user_id: int
+) -> Tuple[Optional[UploadedFile], Path, int]:
+    """
+    Resolve file_id or legacy path to file record and actual path.
+
+    This function handles both:
+    - New system: UUID file_id that maps to a database record
+    - Legacy system: Relative paths like "web_task_235/output/file.jpeg"
+    - Workspace system: Files created by agents in workspace directories
+
+    Args:
+        db: Database session
+        file_id_or_path: Either a UUID file_id or a legacy file path
+        user_id: Current user's ID for permission checks
+
+    Returns:
+        Tuple of (file_record or None, file_path, owner_user_id)
+
+    Raises:
+        HTTPException: If file is not found
+    """
+    # If it's a valid UUID, try to find by file_id (new system)
+    if is_valid_uuid(file_id_or_path):
+        file_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.file_id == file_id_or_path)
+            .first()
+        )
+        if file_record:
+            return (
+                file_record,
+                Path(str(file_record.storage_path)),
+                _file_user_id_value(file_record),
+            )
+
+    # For legacy paths, resolve from filesystem
+    # First try to find in current user's directory
+    file_path = resolve_legacy_file_path(file_id_or_path, user_id)
+    owner_user_id = user_id
+
+    # If not found and user is admin, try to infer owner from path and search all users
+    if file_path is None:
+        # Try to infer the correct user_id from the path
+        inferred_user_id = infer_user_id_from_legacy_path(db, file_id_or_path)
+        if inferred_user_id is not None:
+            file_path = resolve_legacy_file_path(file_id_or_path, inferred_user_id)
+            if file_path is not None:
+                owner_user_id = inferred_user_id
+
+        # If still not found and user is admin, try searching in all user directories
+        if file_path is None and _is_admin_user_by_id(db, user_id):
+            result = resolve_legacy_file_path_cross_user(file_id_or_path)
+            if result is not None:
+                file_path, owner_user_id = result
+
+    if file_path is None:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Try to find a matching database record (might exist for backfilled files)
+    file_record = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(file_path))
+        .first()
+    )
+
+    return (file_record, file_path, owner_user_id)
+
+
+def _is_admin_user_by_id(db: Session, user_id: int) -> bool:
+    """Check if a user is admin by user ID."""
+    from ..models.user import User
+
+    user = db.query(User).filter(User.id == user_id).first()
+    return user is not None and getattr(user, "is_admin", False)
+
+
+def _check_file_access(file_record: UploadedFile, user: User) -> None:
+    if _is_admin_user(user):
+        return
+    if _file_user_id_value(file_record) != _user_id_value(user):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _pptx_text_preview(path: Path) -> str:
+    """Extract a plain-text preview from a .pptx file for upload responses.
+
+    Concatenates each slide's shape text and speaker notes. Returns an empty
+    string if python-pptx is not installed, the file is not .pptx, or
+    extraction fails.
+    """
+    if not pptx or path.suffix.lower() != ".pptx":
+        return ""
+    try:
+        prs = pptx.Presentation(str(path))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to open pptx for preview: %s", exc)
+        return ""
+
+    blocks, _stats = collect_pptx_slide_blocks(prs)
+    return "\n\n".join(blocks)
+
+
+def _pptx_pdf_cache_path(pptx_path: Path, file_id: Optional[str] = None) -> Path:
+    """Return the on-disk cache path for a converted PDF preview.
+
+    Caches are stored in ``<storage_root>/pptx_pdf_cache/`` — a dedicated
+    directory outside the uploads tree.  Keeping them out of uploads:
+
+    * prevents reconcile / backfill from treating ``.pptx.preview.pdf``
+      sidecars as normal user-uploaded files;
+    * avoids leaking derived content after a source upload is deleted
+      (delete_file() explicitly removes the cache entry by file_id);
+    * lets the uploads tree stay clean — only files written by users or
+      the upload endpoint live there.
+
+    For registered UUID files the cache key is the ``file_id``, which lets
+    ``delete_file()`` remove all of its export variants.  For legacy / non-UUID
+    paths we fall back to a SHA-256 prefix of the resolved source path; legacy
+    source deletion uses that same prefix to remove its previews.
+    """
+    return pptx_conversion.pptx_pdf_cache_path(pptx_path, file_id)
+
+
+async def _convert_pptx_to_pdf(
+    pptx_path: Path, file_id: Optional[str] = None
+) -> Optional[Path]:
+    if pptx_path.suffix.lower() != ".pptx":
+        return None
+    cached = await asyncio.to_thread(
+        preview_cache_hit, pptx_path, _pptx_pdf_cache_path(pptx_path, file_id), file_id
+    )
+    if cached is not None:
+        return cached
+    return await _convert_pptx_to_pdf_uncached(pptx_path, file_id)
+
+
+@guard_preview_publication
+async def _convert_pptx_to_pdf_uncached(
+    pptx_path: Path, file_id: Optional[str] = None
+) -> Optional[Path]:
+    """Convert a .pptx to PDF via LibreOffice with on-disk caching.
+
+    Returns the path to the cached PDF on success, or ``None`` when soffice
+    isn't available / conversion failed. The caller decides whether to
+    surface a 503 (so the frontend can fall back) or just keep going.
+
+    The fact that this can return ``None`` is the whole point of the
+    preview-pdf endpoint: on developer machines without LibreOffice we
+    don't break the UX — we let the frontend fall back to its canvas
+    renderer. Production images (Docker) pre-install libreoffice so this
+    path always succeeds there.
+
+    The LibreOffice process handling (argv list, per-call user profile,
+    timeout, kill/wait) is shared with the slide render tool in
+    :mod:`xagent.core.tools.core.pptx_conversion`. This function keeps the
+    preview-specific parts: the managed cache, the publication guard, the
+    same-filesystem temporary directory and the atomic cache publish.
+
+    ``file_id`` is forwarded to ``_pptx_pdf_cache_path`` so the cache entry
+    lands in the managed cache directory (keyed by file_id) rather than as
+    a sidecar next to the source file.
+    """
+    if pptx_path.suffix.lower() != ".pptx":
+        return None
+
+    cache_path = _pptx_pdf_cache_path(pptx_path, file_id)
+    try:
+        if (
+            cache_path.exists()
+            and cache_path.stat().st_mtime >= pptx_path.stat().st_mtime
+        ):
+            return cache_path
+    except OSError:
+        pass
+
+    import tempfile
+
+    try:
+        # Pin the temp dir to the same directory as `cache_path` so the final
+        # rename is a single intra-filesystem syscall. Without `dir=...`,
+        # `tempfile.TemporaryDirectory()` uses the system default (typically
+        # /tmp), which on Docker/production layouts is a different mount than
+        # the uploads volume — the later `replace()` would then fail with
+        # EXDEV (Invalid cross-device link). Per PR #542 review.
+        with tempfile.TemporaryDirectory(
+            dir=cache_path.parent, prefix=f".{file_id or cache_path.stem}.preview-"
+        ) as temp_dir:
+            try:
+                converted_pdf = await pptx_conversion.convert_pptx_to_pdf(
+                    pptx_path,
+                    Path(temp_dir),
+                    timeout_seconds=(
+                        pptx_conversion.DEFAULT_PPTX_CONVERSION_TIMEOUT_SECONDS
+                    ),
+                )
+            except pptx_conversion.PptxConverterUnavailableError:
+                # soffice binary is missing — this is the expected "fallback"
+                # path on developer machines. Log once at INFO so it doesn't
+                # spam.
+                logger.info(
+                    "soffice not on PATH; .pptx PDF previews will fall back to "
+                    "client-side rendering"
+                )
+                return None
+            except pptx_conversion.PptxConversionError as exc:
+                logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
+                return None
+            # The PDF is already fully written and closed inside the temp dir,
+            # and the temp dir lives in the same filesystem as `cache_path`
+            # (see `dir=` above), so `replace()` is a single atomic rename.
+            # No `.tmp` intermediate needed — that previous two-step dance
+            # could leave orphans if a concurrent request raced. Per PR #542
+            # review.
+            try:
+                converted_pdf.replace(cache_path)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to cache pptx preview PDF at %s: %s", cache_path, exc
+                )
+                return None
+            return cache_path
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
+        return None
+
+
+@file_router.post("/upload")
+async def upload_file(
+    file: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    task_type: str = Form(...),
+    message: str = Form(""),
+    task_id: str = Form(None),
+    folder: str = Form(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    del message
+    upload_items: list[UploadFile] = []
+    if file is not None:
+        upload_items.append(file)
+    if files:
+        upload_items.extend(files)
+
+    if not upload_items:
+        raise HTTPException(status_code=422, detail="No files provided")
+
+    user_id = _user_id_value(user)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail="Upload authorization could not be finalized",
+        )
+
+    single_file_mode = file is not None and (not files)
+    return await store_uploaded_files(
+        upload_items=upload_items,
+        task_type=task_type,
+        task_id=task_id,
+        folder=folder,
+        user_id=user_id,
+        single_file_mode=single_file_mode,
+    )
+
+
+@file_router.get("/list")
+async def list_files(
+    page: int = Query(1, ge=1, description="Page number"),
+    size: int = Query(20, ge=1, le=100, description="Page size"),
+    search: str = Query("", description="Search filename or path"),
+    task_id: int | None = Query(None, description="Filter by task ID"),
+    uploads_only: bool = Query(False, description="Only include user uploads"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = db.query(UploadedFile).filter(
+        UploadedFile.detached_reason.is_(None),
+        UploadedFile.storage_status != "compensating",
+    )
+    if not _is_admin_user(user):
+        query = query.filter(UploadedFile.user_id == _user_id_value(user))
+
+    normalized_search = search.strip()
+    if normalized_search:
+        like_pattern = f"%{normalized_search}%"
+        query = query.filter(
+            or_(
+                UploadedFile.filename.ilike(like_pattern),
+                UploadedFile.workspace_relative_path.ilike(like_pattern),
+                UploadedFile.storage_path.ilike(like_pattern),
+            )
+        )
+
+    if task_id is not None:
+        query = query.filter(UploadedFile.task_id == task_id)
+    elif uploads_only:
+        query = query.filter(UploadedFile.task_id.is_(None))
+
+    total_count = query.count()
+    total_pages = max((total_count + size - 1) // size, 1)
+    current_page = min(page, total_pages)
+    offset = (current_page - 1) * size
+    records = (
+        query.order_by(UploadedFile.created_at.desc(), UploadedFile.id.desc())
+        .offset(offset)
+        .limit(size)
+        .all()
+    )
+    file_status_map = aggregate_uploaded_file_statuses(
+        file_ids=[str(record.file_id) for record in records if record.file_id],
+        user_id=_user_id_value(user),
+        is_admin=_is_admin_user(user),
+    )
+    files = []
+    for record in records:
+        path = Path(str(record.storage_path))
+        record_user_id = _file_user_id_value(record)
+        relative_path = _extract_relative_path(path, record_user_id)
+        files.append(
+            {
+                "file_id": record.file_id,
+                "filename": record.filename,
+                "file_size": record.file_size,
+                "modified_time": _to_unix_timestamp(path, record.created_at),
+                "file_type": path.suffix.lower().lstrip("."),
+                "relative_path": relative_path,
+                "task_id": record.task_id,
+                "user_id": record_user_id,
+                "ingestion_status": file_status_map.get(str(record.file_id), "UNKNOWN"),
+            }
+        )
+
+    return {
+        "files": files,
+        "total_count": total_count,
+        "page": current_page,
+        "size": size,
+        "pages": total_pages,
+    }
+
+
+@file_router.get("/tasks")
+async def list_file_tasks(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = (
+        db.query(
+            Task.id.label("task_id"),
+            Task.title.label("title"),
+            func.count(UploadedFile.id).label("file_count"),
+            func.max(UploadedFile.created_at).label("latest_file_at"),
+        )
+        .join(UploadedFile, UploadedFile.task_id == Task.id)
+        .filter(UploadedFile.task_id.isnot(None))
+    )
+
+    if not _is_admin_user(user):
+        query = query.filter(
+            UploadedFile.user_id == _user_id_value(user),
+            Task.user_id == _user_id_value(user),
+        )
+
+    rows = (
+        query.group_by(Task.id, Task.title)
+        .order_by(
+            func.max(UploadedFile.created_at).desc(),
+            Task.id.desc(),
+        )
+        .all()
+    )
+
+    return {
+        "tasks": [
+            {
+                "task_id": int(row.task_id),
+                "title": str(row.title or f"Task {row.task_id}"),
+                "file_count": int(row.file_count or 0),
+            }
+            for row in rows
+        ]
+    }
+
+
+@file_router.get("/task/{task_id}")
+async def list_task_files(
+    task_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Get all files for a specific task.
+
+    More efficient than /api/files/list as it filters at database level.
+    Only returns files that are already registered in the database.
+    """
+    # Query files for this task
+    query = db.query(UploadedFile).filter(UploadedFile.task_id == task_id)
+
+    # Permission check: only show user's own files unless admin
+    if not _is_admin_user(user):
+        query = query.filter(UploadedFile.user_id == _user_id_value(user))
+
+    records = query.order_by(UploadedFile.created_at.desc()).all()
+
+    files = []
+    for record in records:
+        file_ref = ManagedFileRef(record)
+        path = file_ref.local_path
+        if not path.exists() and not file_ref.has_durable_object:
+            # Skip files that no longer exist on disk
+            continue
+
+        record_user_id = _file_user_id_value(record)
+        relative_path = _extract_relative_path(path, record_user_id)
+
+        # Categorize by directory (input/output/temp)
+        path_parts = relative_path.split("/")
+        file_category = "other"
+        if len(path_parts) >= 2:
+            subdir = path_parts[1]  # e.g., "input", "output", "temp"
+            if subdir in ["input", "output", "temp"]:
+                file_category = subdir
+
+        files.append(
+            {
+                "file_id": record.file_id,
+                "filename": record.filename,
+                "file_size": record.file_size,
+                "modified_time": _to_unix_timestamp(path, record.created_at),
+                "file_type": path.suffix.lower().lstrip("."),
+                "relative_path": relative_path,
+                "category": file_category,
+                "task_id": record.task_id,
+                "user_id": record_user_id,
+            }
+        )
+
+    return {"files": files, "total_count": len(files), "task_id": task_id}
+
+
+@file_router.get("/download/{file_id:path}", response_model=None)
+async def download_file(
+    file_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    file_record, full_path, owner_user_id = _resolve_file_path(
+        db, file_id, _user_id_value(user)
+    )
+
+    # Check access permissions
+    if file_record:
+        _check_file_access(file_record, user)
+        return await build_registered_file_download_response(
+            file_record,
+            owner_user_id=owner_user_id,
+            disposition=_inline_download_disposition(
+                guess_media_type(str(file_record.filename))
+            ),
+        )
+    else:
+        # For legacy files without records, check ownership
+        if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
+            raise HTTPException(status_code=403, detail="Access denied")
+        file_name = full_path.name
+        media_type = guess_media_type(file_name)
+
+    _ensure_under_uploads(full_path, owner_user_id)
+
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # For images and other viewable content, set Content-Disposition to inline
+    # to allow browser to display the file instead of downloading it
+    content_disposition = _inline_download_disposition(media_type)
+
+    accel_response = _accel_redirect_response(
+        full_path,
+        owner_user_id=owner_user_id,
+        filename=file_name,
+        media_type=media_type,
+        disposition=content_disposition,
+    )
+    if accel_response is not None:
+        return accel_response
+
+    return FileResponse(
+        path=str(full_path),
+        filename=file_name,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": _content_disposition_header(
+                content_disposition, file_name
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+# Media elements (<video>/<audio>) cannot attach an Authorization header, so
+# the authenticated preview route also accepts a short-lived, file-scoped
+# ticket via the ``ticket`` query param as an alternative to the Bearer
+# header. This lets those elements load the route's URL directly instead of
+# blob-fetching the whole file first, which restores HTTP range requests
+# (seek-before-download, progressive playback) on the authenticated path —
+# the public/tokened route already gets this by carrying its own token in
+# the query string; see ``createPublicFileAccessPolicy`` on the frontend.
+#
+# The ticket only proves "a recent Bearer-authenticated request minted this
+# for this exact file_id" — it resolves the *same* User the Bearer header
+# would, so it grants no privilege beyond what that user's own Bearer token
+# already grants, and _check_file_access/_is_admin_user below still enforce
+# ownership exactly as they do for the Bearer path. Binding the ticket to one
+# file_id means a leaked ticket can only be replayed against that one file,
+# not enumerated against others. Unlike a Bearer header, though, this
+# credential rides in a URL a media element loads directly — the frontend
+# (inline-file-preview.tsx) never puts the ticketed URL anywhere a user
+# could put it in the address bar, browser history, or a copied link (the
+# "Open" affordance deliberately never exposes it either), so the realistic
+# exposure is proxy/CDN/server access logs and a devtools network panel.
+# Its TTL is kept independently short regardless
+# (get_file_stream_ticket_ttl_seconds(), minutes not hours) rather than
+# matching the user's own access token, since those vectors are still real.
+FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
+
+# See _PUBLIC_PREVIEW_CACHE_HEADERS above: a stream ticket rides in a URL a
+# media element auto-fetches on render too, so preview_file below reuses
+# that same constant/rationale as ``cache_headers`` whenever a ticket
+# authenticated the request, rather than a second identical constant.
+
+
+@file_router.api_route(
+    "/external-media/{file_id}",
+    methods=["GET", "HEAD"],
+    response_model=None,
+    include_in_schema=False,
+)
+def external_media_file(
+    file_id: str,
+    ticket: str = Query(...),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve one registered image to the external service named by its ticket."""
+
+    try:
+        redeemed = redeem_external_media_ticket(
+            db,
+            file_id=file_id,
+            ticket=ticket,
+        )
+    except ExternalMediaTicketRejected:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired external media ticket",
+        ) from None
+
+    record = redeemed.record
+    file_ref = ManagedFileRef(record)
+    try:
+        path = file_ref.materialize(
+            allow_existing_local=_is_under_uploads(
+                file_ref.local_path,
+                int(record.user_id),
+            )
+        )
+    except DurableObjectIntegrityError as exc:
+        raise _file_integrity_failed() from exc
+    except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    except DurableStorageOperationError as exc:
+        _raise_durable_storage_unavailable(
+            exc,
+            "external media delivery",
+            file_id=record.file_id,
+        )
+
+    response_headers = {
+        "Cache-Control": "no-store, max-age=0",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+    try:
+        normalize_for_instagram = (
+            redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            and instagram_image_requires_normalization(path)
+        )
+    except ExternalMediaUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if normalize_for_instagram:
+        try:
+            content = instagram_jpeg_bytes(path)
+        except ExternalMediaUnavailable as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        return Response(
+            content=content,
+            media_type="image/jpeg",
+            headers={
+                **response_headers,
+                "Content-Disposition": _content_disposition_header(
+                    "inline", f"{Path(str(record.filename)).stem}.jpg"
+                ),
+            },
+        )
+
+    return FileResponse(
+        path,
+        media_type=(
+            "image/jpeg"
+            if redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            else redeemed.media_type
+        ),
+        headers={
+            **response_headers,
+            "Content-Disposition": _content_disposition_header(
+                "inline", str(record.filename)
+            ),
+        },
+    )
+
+
+def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
+    try:
+        claims = jwt.decode(
+            ticket,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_sub": False},
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+
+    if (
+        claims.get("type") != FILE_STREAM_TICKET_TYPE
+        or claims.get("file_id") != file_id
+    ):
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+
+    # Reuse the same claim-bindability hardening access tokens get
+    # (_resolve_access_token_user in auth_dependencies.py) rather than a
+    # second, weaker copy: exact str/int typing, utf-8-strict encodability,
+    # and the Postgres NUL-byte guard all apply identically to a ticket's
+    # sub/user_id claims. This server is the sole minter, so malformed
+    # claims aren't attacker-reachable today, but a second bespoke check
+    # here would silently drift from the first if either is ever changed.
+    try:
+        username, user_id = _validate_access_token_claim_bindability(
+            claims.get("sub"), claims.get("user_id"), db
+        )
+    except _AccessTokenRejected:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired ticket"
+        ) from None
+
+    user = db.query(User).filter(User.username == username, User.id == user_id).first()
+    if user is None or not matches_user_session(user, claims):
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+    return user
+
+
+class _AuthenticatedFileRequest(NamedTuple):
+    """Which user asked, and whether a stream ticket is what let them in.
+
+    ``via_stream_ticket`` is a plain bool, not the raw ticket string: nothing
+    downstream needs the ticket's own content again (redemption already
+    happened above), only whether the ticket path is what authenticated this
+    request -- resolve_file_path takes the user separately, and the only
+    other read site (``cache_headers`` below) only ever checks truthiness.
+    """
+
+    user: User
+    via_stream_ticket: bool
+
+
+def _user_from_bearer_or_stream_ticket(
+    file_id: str,
+    ticket: Optional[str] = Query(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    db: Session = Depends(get_db),
+) -> _AuthenticatedFileRequest:
+    """Resolve the requesting user, and echo back which credential won.
+
+    Returning ``via_stream_ticket`` alongside ``user`` lets ``preview_file``
+    below read whether a ticket authenticated this request (to decide
+    ``cache_headers``) without redeclaring its own ``ticket: Query(...)``
+    parameter -- FastAPI would resolve that redeclaration to the same value
+    from the same request every time, but two independent declarations of
+    the same query param with no shared source is the kind of thing that
+    can silently drift if one is ever edited (e.g. a default) without the
+    other.
+    """
+    if ticket:
+        # A present ticket is checked on its own and never falls through to
+        # the Bearer header below, even if the ticket is garbage/expired and
+        # a valid Bearer header is also present: a ticket is the credential
+        # this specific request opted into (e.g. a media element's src), so
+        # treating a broken one as "ignore it, try the header instead" would
+        # mask exactly the failure (expired mid-session, wrong file_id) the
+        # caller's fallback-and-remint logic (reportLoadFailure on the
+        # frontend) exists to detect and recover from.
+        return _AuthenticatedFileRequest(
+            _user_from_stream_ticket(db, ticket, file_id), True
+        )
+    if credentials is None:
+        # This endpoint predates the ticket param and used the default
+        # HTTPBearer(auto_error=True), which raises 403 "Not authenticated"
+        # -- not 401 -- when the Authorization header is absent entirely
+        # (401 is reserved for a credential that IS present but rejected: an
+        # invalid ticket above, or an invalid/expired Bearer token via
+        # get_current_user below). Switching a completely-missing credential
+        # to 401 would be an unannounced breaking change to this
+        # pre-existing endpoint's error contract. Not preserved exactly: a
+        # malformed (non-"Bearer ...") Authorization header used to get its
+        # own "Invalid authentication credentials" detail from HTTPBearer;
+        # optional_security collapses that case into this same branch, so it
+        # now reads "Not authenticated" too. Status code is unaffected
+        # (still 403); only the message text differs, which no client here
+        # parses. Whether a missing header actually gets 403 (vs. FastAPI's
+        # own default auto_error=True behavior, which changed to 401 on
+        # some later FastAPI release) depends on the installed FastAPI
+        # version: uv.lock pins 0.115.14 (403), but pyproject.toml's own
+        # constraint is an unbounded ">=0.35.0", and an environment resolved
+        # against that constraint rather than the lock file can land on a
+        # version where this is 401 instead -- confirmed empirically against
+        # fastapi==0.135.1 while writing this. This function's own explicit
+        # 403 raise below is unaffected either way; only the *other* file
+        # routes' plain Depends(get_current_user) dependencies (which rely
+        # on HTTPBearer's built-in auto_error, not a manual check like this
+        # one) are exposed to that drift for a missing header specifically
+        # -- see test_mint_endpoint_requires_a_bearer_credential, which
+        # deliberately doesn't assert a specific code for that case.
+        raise HTTPException(status_code=403, detail="Not authenticated")
+    return _AuthenticatedFileRequest(get_current_user(credentials, db), False)
+
+
+@file_router.get("/stream-tickets/{file_id:path}", response_model=None)
+async def issue_preview_stream_ticket(
+    file_id: str,
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """Mint a short-lived ticket for streaming this one file via query param.
+
+    Deliberately a sibling route under its own ``/stream-tickets/`` prefix
+    rather than a suffix nested under ``/preview/{file_id:path}``: the
+    ``:path`` converter matches slashes, and a legacy ``file_id`` can be an
+    arbitrary relative path (e.g. ``web_task_235/output/ticket``) — nesting
+    would risk a real file literally named ``ticket`` colliding with this
+    endpoint. A disjoint URL prefix makes that collision structurally
+    impossible regardless of ``file_id`` content.
+
+    Authorization for the file itself is deferred to (and fully enforced
+    by) ``preview_file`` when the ticket is redeemed — this endpoint only
+    needs to know a Bearer-authenticated user is asking, the same
+    precondition ``preview_file`` already requires today.
+    """
+    ticket = create_access_token(
+        {
+            **user_session_claims(user),
+            "type": FILE_STREAM_TICKET_TYPE,
+            "file_id": file_id,
+        },
+        expires_delta=timedelta(seconds=get_file_stream_ticket_ttl_seconds()),
+    )
+    # Derived from the router's own mount prefix rather than hardcoded, so
+    # this can't silently drift from preview_file's actual path if either
+    # ever changes. Deliberately not request.url_for(...): verified it does
+    # NOT percent-encode a path-converter parameter at all (a file_id
+    # containing e.g. "?" would corrupt the query string boundary this
+    # ticket is appended to) -- quote(..., safe='') is the safe primitive
+    # here, and a Starlette round-trip confirms it handles slash-bearing
+    # legacy file_id values correctly against ``{file_id:path}``.
+    preview_path = f"{file_router.prefix}/preview/{quote(file_id, safe='')}"
+    return {"path": f"{preview_path}?ticket={ticket}"}
+
+
+@file_router.get("/preview/{file_id:path}", response_model=None)
+async def preview_file(
+    file_id: str,
+    auth: _AuthenticatedFileRequest = Depends(_user_from_bearer_or_stream_ticket),
+    db: Session = Depends(get_db),
+    validation_only: bool = False,
+) -> Any:
+    user, via_stream_ticket = auth
+    cache_headers = _PUBLIC_PREVIEW_CACHE_HEADERS if via_stream_ticket else None
+    file_record, full_path, owner_user_id = _resolve_file_path(
+        db, file_id, _user_id_value(user)
+    )
+
+    # Check access permissions
+    if file_record:
+        _check_file_access(file_record, user)
+        file_ref = ManagedFileRef(file_record)
+        file_name = str(file_record.filename)
+        media_type = guess_media_type(file_name)
+        local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
+        # Deliberately not gated on "not ticket": a ticket-authenticated
+        # request is a media element loading this URL for progressive
+        # playback, which is exactly the case object-storage/nginx offload
+        # matters most for. Excluding it here would force large media
+        # through the app process on every ticketed request, defeating the
+        # performance goal this ticket mechanism exists for. cache_headers
+        # (computed above, per-request, from whether a ticket was used) is
+        # still threaded through so the no-store invariant travels with the
+        # request regardless of which exit serves it.
+        #
+        # On this exit specifically, the bytes a ticketed request actually
+        # streams are governed by get_file_delivery_signed_url_ttl_seconds()
+        # (XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, default 300s) -- not
+        # the stream ticket's own TTL (default 600s) -- since the ticket
+        # only authorizes minting this redirect once; the object store's own
+        # signed URL governs everything after that first hop. The effective
+        # session for a long video is therefore min(ticket TTL at the first
+        # hop, signed-URL TTL thereafter), and an operator tuning either
+        # XAGENT_*_TTL_SECONDS knob in isolation can unexpectedly cut
+        # playback off at the other one.
+        if not validation_only and _preview_can_redirect(full_path, media_type):
+            redirect_response = _durable_redirect_response(
+                file_ref,
+                filename=file_name,
+                media_type=media_type,
+                disposition="inline",
+                extra_headers=cache_headers,
+            )
+            if redirect_response is not None:
+                return redirect_response
+            if local_path_is_trusted:
+                accel_response = _accel_redirect_response(
+                    full_path,
+                    owner_user_id=owner_user_id,
+                    filename=file_name,
+                    media_type=media_type,
+                    disposition="inline",
+                    extra_headers=cache_headers,
+                )
+                if accel_response is not None:
+                    return accel_response
+        if file_ref.has_durable_object:
+            try:
+                materialized_path = await async_managed_copy(
+                    file_ref, allow_existing_local=local_path_is_trusted
+                )
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                _raise_durable_storage_unavailable(exc, "preview", file_id=file_id)
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
+            except DurableObjectMissingError:
+                materialized_path = file_ref.local_path
+                _ensure_under_uploads(materialized_path, owner_user_id)
+            release_db_connection_if_clean(db)
+            return await _inline_preview_response(
+                materialized_path,
+                filename=file_name,
+                media_type=media_type,
+                file_id=file_id if is_valid_uuid(file_id) else None,
+                extra_headers=cache_headers,
+                validation_only=validation_only,
+                public_validation=via_stream_ticket,
+            )
+    else:
+        # For legacy files without records, check ownership
+        if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
+            raise HTTPException(status_code=403, detail="Access denied")
+        file_name = full_path.name
+        media_type = guess_media_type(file_name)
+
+    _ensure_under_uploads(full_path, owner_user_id)
+
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if not validation_only and _preview_can_redirect(full_path, media_type):
+        # See the comment on the equivalent branch above: not gated on
+        # ticket presence, for the same reason.
+        accel_response = _accel_redirect_response(
+            full_path,
+            owner_user_id=owner_user_id,
+            filename=file_name,
+            media_type=media_type,
+            disposition="inline",
+            extra_headers=cache_headers,
+        )
+        if accel_response is not None:
+            return accel_response
+
+    release_db_connection_if_clean(db)
+    return await _inline_preview_response(
+        full_path,
+        filename=file_name,
+        media_type=media_type,
+        file_id=file_id if is_valid_uuid(file_id) else None,
+        extra_headers=cache_headers,
+        validation_only=validation_only,
+        public_validation=via_stream_ticket,
+    )
+
+
+@file_router.get("/preview-pdf/{file_id:path}", response_model=None)
+async def preview_pptx_as_pdf(
+    file_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Return a PDF rendering of a .pptx for high-fidelity in-browser preview.
+
+    The frontend hits this endpoint first; if it succeeds it shows the PDF
+    in an ``<iframe>`` (vector, text-selectable, perfect font metrics).
+    On a 503 response — meaning the server doesn't have LibreOffice on
+    PATH — the frontend falls back to the existing ``pptxviewjs`` canvas
+    renderer so the UX still works on developer machines without soffice
+    installed.
+
+    Mirrors the durable-storage restore path that ``/preview`` uses: for
+    files whose local copy was reaped but whose ``storage_key`` is still in
+    durable storage, we materialize before conversion (returning 409 on
+    checksum mismatch, 503 on durable backend failure — same semantics as
+    ``/preview``). Without this, durable-only ``.pptx`` files would 404 here
+    and silently fall back to the canvas renderer, which is exactly the
+    UX regression flagged in PR #542 review.
+    """
+    file_record, full_path, owner_user_id = _resolve_file_path(
+        db, file_id, _user_id_value(user)
+    )
+
+    # Resolve the local .pptx path. If the file is backed by durable
+    # storage and not currently on disk, restore it first.
+    pptx_path = full_path
+    if file_record:
+        _check_file_access(file_record, user)
+        file_name = str(file_record.filename)
+        file_ref = ManagedFileRef(file_record)
+        local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
+        if file_ref.has_durable_object:
+            try:
+                pptx_path = await async_managed_copy(
+                    file_ref, allow_existing_local=local_path_is_trusted
+                )
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                _raise_durable_storage_unavailable(exc, "pptx preview", file_id=file_id)
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
+            except DurableObjectMissingError:
+                # Durable record points at nothing; fall back to whatever
+                # is on disk (or 404 below if it's gone too).
+                pptx_path = file_ref.local_path
+                _ensure_under_uploads(pptx_path, owner_user_id)
+        else:
+            _ensure_under_uploads(full_path, owner_user_id)
+    else:
+        if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
+            raise HTTPException(status_code=403, detail="Access denied")
+        file_name = full_path.name
+        _ensure_under_uploads(full_path, owner_user_id)
+
+    if pptx_path is None or not pptx_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if pptx_path.suffix.lower() != ".pptx":
+        raise HTTPException(
+            status_code=400, detail="preview-pdf only supports .pptx files"
+        )
+
+    # Pass the UUID file_id so the cache entry lands in the managed
+    # cache directory (keyed by file_id) rather than as a sidecar next to
+    # the source file.  Legacy / non-UUID ids pass None and fall back to
+    # the path-hash key.
+    managed_file_id = file_id if is_valid_uuid(file_id) else None
+    release_db_connection_if_clean(db)
+    try:
+        pdf_path = await _convert_pptx_to_pdf(pptx_path, file_id=managed_file_id)
+    except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    if pdf_path is None:
+        # Distinct 503 lets the frontend fall back gracefully instead of
+        # showing an error banner.
+        raise HTTPException(
+            status_code=503,
+            detail="LibreOffice unavailable; client should fall back to canvas renderer",
+        )
+
+    return FileResponse(
+        path=str(pdf_path),
+        filename=Path(file_name).stem + ".pdf",
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline"},
+    )
+
+
+@file_router.post("/public/tickets/{file_id:path}", response_model=None)
+async def issue_public_file_ticket(
+    file_id: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Exchange the header-carried guest token for a file-bound ticket.
+
+    For URLs the browser loads itself (media elements, HTML preview assets),
+    which cannot send an Authorization header. The ticket is short-lived,
+    bound to this one registered file (and relative assets under it), only
+    reads files, and is revalidated against the live share/widget deployment
+    on every use. The long-lived guest token never appears in a URL. Its
+    lifetime is ``XAGENT_FILE_STREAM_TICKET_TTL_SECONDS``.
+    """
+    from .public_chat_access import (
+        create_public_file_ticket,
+        decode_public_guest_token,
+    )
+
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    file_record = (
+        db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        if is_valid_uuid(file_id)
+        else None
+    )
+    if file_record is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    guest_claims = _validate_public_task_file_access(
+        db, file_record, PublicFileCredential(token=credentials.credentials)
+    )
+    if guest_claims is None:
+        # Not a guest-bound file: the file id alone already opens it, but the
+        # mint still requires a genuine guest token rather than none at all.
+        guest_claims = decode_public_guest_token(credentials.credentials)
+    ttl_seconds = get_file_stream_ticket_ttl_seconds()
+    ticket = create_public_file_ticket(
+        guest_claims, file_id=file_id, ttl_seconds=ttl_seconds
+    )
+    return {"ticket": ticket, "expires_in": ttl_seconds}
+
+
+@file_router.get("/public/download/{file_id:path}", response_model=None)
+async def public_download_file(
+    file_id: str,
+    credential: PublicFileCredential = Depends(_public_file_credential),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Public source-download endpoint for the chat file-card 'Open' link.
+
+    Resolves registered UUID file capabilities only, never legacy paths,
+    and always returns
+    ``Content-Disposition: attachment; filename="..."`` so the browser
+    saves under the source filename instead of trying to render the
+    bytes inline. Used by ``InlineFilePreview`` 'Open' affordances
+    that render as plain ``<a href>``: those clicks — plus middle-
+    click / right-click "open in new tab" / "copy link" — don't carry
+    the frontend's bearer token, so the auth'd
+    ``/api/files/download/{file_id}`` route would 401 every plain
+    browser navigation.
+
+    For ordinary files the ``file_id`` is the only required capability,
+    matching the ``public/preview`` contract. Files of share/widget guest
+    tasks additionally need a guest credential: the guest token in the
+    ``Authorization`` header, or -- for plain browser navigations, which
+    cannot send that header -- a short-lived ``?ticket=`` minted by
+    ``POST /public/tickets/{file_id}``. The public frontend adds that ticket
+    to the 'Open' href at click time. The retired ``?token=`` query
+    parameter is ignored. ``relative_path`` is intentionally NOT
+    supported: 'Open' always targets the registered source artifact, never
+    a sub-path inside it.
+    """
+    file_record: Optional[UploadedFile] = None
+    target_path: Optional[Path] = None
+    target_is_durable = False
+    file_name: str
+
+    if is_valid_uuid(file_id):
+        file_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        )
+
+    if file_record:
+        _validate_public_task_file_access(db, file_record, credential)
+        file_ref = ManagedFileRef(file_record)
+        owner_user_id = _file_user_id_value(file_record)
+        file_name = str(file_record.filename)
+        local_path_is_trusted = _is_under_uploads(file_ref.local_path, owner_user_id)
+        if file_ref.has_durable_object:
+            try:
+                target_path = await async_managed_copy(
+                    file_ref, allow_existing_local=local_path_is_trusted
+                )
+                target_is_durable = True
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                _raise_durable_storage_unavailable(
+                    exc, "public download", file_id=file_id
+                )
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
+            except DurableObjectMissingError:
+                target_path = file_ref.local_path
+        else:
+            target_path = file_ref.local_path
+    else:
+        # Legacy paths have no unguessable capability and no owner context.
+        # Never resolve them across all user directories from a public route.
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if not target_is_durable:
+        _ensure_under_uploads(target_path, owner_user_id)
+
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Pass filename= and let Starlette compose the Content-Disposition header.
+    # Starlette 0.36+ generates ``filename*=utf-8''<percent-encoded>`` for
+    # non-ASCII names (e.g. 报告.pptx) via urllib.parse.quote, so we must NOT
+    # set the header manually: a raw ``filename="报告.pptx"`` string would be
+    # latin-1 encoded by the ASGI layer and raise UnicodeEncodeError.
+    # The default content_disposition_type is already "attachment", so we
+    # only need to pass filename= here.
+    return FileResponse(
+        path=str(target_path),
+        filename=file_name,
+        media_type=guess_media_type(file_name),
+    )
+
+
+@file_router.get("/public/preview/{file_id:path}", response_model=None)
+async def public_preview_file(
+    file_id: str,
+    relative_path: Optional[str] = Query(default=None),
+    credential: PublicFileCredential = Depends(_public_file_credential),
+    db: Session = Depends(get_db),
+    validation_only: bool = False,
+) -> Any:
+    """Preview a registered UUID capability; legacy paths are never public."""
+    file_record = None
+    base_path = None
+    owner_user_id = None
+
+    if is_valid_uuid(file_id):
+        file_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        )
+
+    if file_record:
+        _validate_public_task_file_access(db, file_record, credential)
+        file_ref = ManagedFileRef(file_record)
+        base_path = file_ref.local_path
+        owner_user_id = _file_user_id_value(file_record)
+        if file_ref.has_durable_object and not relative_path:
+            try:
+                target_path = await async_managed_copy(
+                    file_ref,
+                    allow_existing_local=_is_under_uploads(base_path, owner_user_id),
+                )
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                _raise_durable_storage_unavailable(
+                    exc, "public preview", file_id=file_id
+                )
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
+            except DurableObjectMissingError:
+                target_path = file_ref.local_path
+                _ensure_under_uploads(target_path, owner_user_id)
+            filename = str(file_record.filename)
+            release_db_connection_if_clean(db)
+            return await _inline_preview_response(
+                target_path,
+                filename=filename,
+                media_type=guess_media_type(filename),
+                file_id=file_id if is_valid_uuid(file_id) else None,
+                extra_headers=_PUBLIC_PREVIEW_CACHE_HEADERS,
+                validation_only=validation_only,
+                public_validation=True,
+            )
+    else:
+        # Legacy paths have no unguessable capability and no owner context.
+        # Never resolve them across all user directories from a public route.
+        raise HTTPException(status_code=404, detail="File not found")
+
+    target_path = _resolve_public_preview_target(
+        base_path,
+        relative_path,
+        owner_user_id,
+    )
+
+    if (
+        file_record is not None
+        and relative_path
+        and (not target_path.exists() or not target_path.is_file())
+    ):
+        asset_record = _find_registered_preview_asset(
+            db,
+            base_record=file_record,
+            target_path=target_path,
+            relative_path=relative_path,
+        )
+        if asset_record is not None:
+            _validate_public_task_file_access(db, asset_record, credential)
+            asset_ref = ManagedFileRef(asset_record)
+            try:
+                target_path = await async_managed_copy(asset_ref, restore_local=True)
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                # ``asset_record`` is a different row from the route's
+                # ``file_id``: the base record is the document, this is the
+                # preview asset registered under it, and it is the asset's
+                # restore that failed. Logging the route parameter here named an
+                # object that is fine.
+                _raise_durable_storage_unavailable(
+                    exc,
+                    "public preview task asset",
+                    file_id=asset_record.file_id,
+                )
+            except FilePublicationUnavailable as exc:
+                raise HTTPException(status_code=404, detail="File not found") from exc
+            except DurableObjectMissingError:
+                target_path = asset_ref.local_path
+            _ensure_under_uploads(target_path, owner_user_id)
+
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    release_db_connection_if_clean(db)
+    return await _inline_preview_response(
+        target_path,
+        filename=target_path.name,
+        media_type=guess_media_type(target_path.name),
+        file_id=file_id if is_valid_uuid(file_id) else None,
+        extra_headers=_PUBLIC_PREVIEW_CACHE_HEADERS,
+        validation_only=validation_only,
+        public_validation=True,
+    )
+
+
+@file_router.post("/backfill")
+async def backfill_files(
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Manually trigger file backfill to sync filesystem with database.
+
+    This is a maintenance operation that scans the filesystem and creates
+    database records for any unregistered files. Only available to admins.
+    """
+    if not _is_admin_user(user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        _backfill_uploaded_file_records(db, user)
+        return {"success": True, "message": "File backfill completed successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Backfill failed: {str(e)}") from e
+
+
+@file_router.delete("/{file_id:path}")
+async def delete_file(
+    file_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    file_record, file_path, owner_user_id = _resolve_file_path(
+        db, file_id, _user_id_value(user)
+    )
+
+    # Check access permissions
+    if file_record:
+        _check_file_access(file_record, user)
+        file_name = str(file_record.filename)
+    else:
+        # For legacy files without records, check ownership
+        if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
+            raise HTTPException(status_code=403, detail="Access denied")
+        file_name = file_path.name
+
+    _ensure_under_uploads(file_path, owner_user_id)
+    legacy_cache_source = file_path.resolve() if file_record is None else None
+
+    if file_record:
+        storage_key = str(file_record.storage_key or "")
+        storage_status = str(file_record.storage_status or "")
+        if storage_key and storage_status == "available":
+            # Validate the persisted key *before* the try. A malformed one
+            # (null byte, empty, ``.``/``..`` segment -- rejected even in
+            # tolerant mode) is permanent, and no retry clears it, which is
+            # the half of #1473 about ``ValueError``. Doing it here rather
+            # than catching ``ValueError`` around the call is what keeps a
+            # *backend* ``ValueError`` -- ``fs.exists``/``fs.rm`` raise it
+            # too -- on the retryable path below where it belongs.
+            normalize_storage_key(storage_key, strict=False)
+            try:
+                get_user_file_storage(_file_user_id_value(file_record)).delete(
+                    storage_key
+                )
+            except NAMESPACE_AUTHORITY_ERRORS:
+                # A containment violation is permanent too, and has its own
+                # handler in web/app.py -- consistent with every other site in
+                # this file.
+                raise
+            except Exception as exc:
+                _raise_durable_storage_unavailable(
+                    exc,
+                    "durable cleanup before row delete",
+                    file_id=file_id,
+                    storage_key=storage_key,
+                )
+
+        db.delete(file_record)
+        db.commit()
+        try:
+            if file_path.exists() and file_path.is_file():
+                file_path.unlink()
+        except OSError:
+            logger.warning("Failed to clean up deleted local file: %s", file_path)
+    elif file_path.exists() and file_path.is_file():
+        file_path.unlink()
+
+    # Derived previews are invalidated only through their matching identity
+    # owner. A route path is never reused as a registered cache key.
+    if file_record is not None:
+        delete_registered_preview_caches(str(file_record.file_id))
+    else:
+        assert legacy_cache_source is not None
+        delete_legacy_preview_caches(legacy_cache_source)
+
+    return {
+        "success": True,
+        "message": f"File {file_name} deleted successfully",
+        "file_id": file_id,
+    }

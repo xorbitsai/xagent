@@ -1,0 +1,1129 @@
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Callable, List, Optional, Union
+from uuid import uuid4
+
+import pyarrow as pa  # type: ignore
+import pyarrow.compute as pc  # type: ignore
+
+from ...providers.vector_store.lancedb import (
+    LanceDBConnectionManager,
+    LanceDBVectorStore,
+)
+from ..model.embedding import BaseEmbedding, DashScopeEmbedding
+from ..model.embedding.adapter import create_embedding_adapter
+from ..model.model import EmbeddingModelConfig
+from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from ..utils.lancedb_sql import sql_string_literal
+from .base import MemoryStore
+from .core import MemoryNote, MemoryResponse
+from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
+from .schema_migration import (
+    MemoryMismatchKind,
+    classify_memory_schema_mismatch,
+    migrate_table_swap,
+)
+from .scope_columns import (
+    SCOPE_DIMS_COLUMN,
+    USER_ID_COLUMN,
+    build_scope_where,
+    coerce_user_id,
+    derive_scope_columns,
+    encode_scope_dims,
+    scope_dim_where_term,
+)
+from .storage_admission import AdmittedLanceDBMemoryStore, DormantLanceDBMemoryHandle
+from .vector_compatibility import (
+    EmbeddingIdentity,
+    _is_fully_admitted,
+    classify_vector_compatibility,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class LanceDBMemoryStore(MemoryStore):
+    """LanceDB-based memory store implementation with vector search capabilities."""
+
+    _embedding_model: Optional[BaseEmbedding]
+    # Rows per backend batch on the streamed text-search path.
+    _stream_batch_size: int = DEFAULT_STREAM_BATCH_SIZE
+
+    def __init__(
+        self,
+        db_dir: str,
+        collection_name: str = "memories",
+        embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]] = None,
+        similarity_threshold: float = 1.0,
+        **embedding_kwargs: Any,
+    ):
+        """
+        Initialize LanceDB memory store.
+
+        Args:
+            db_dir: Database directory path
+            collection_name: Collection name for storing memories
+            embedding_model: Optional BaseEmbedding instance or EmbeddingModel config
+            similarity_threshold: Cosine distance threshold for vector search (lower = more strict)
+            **embedding_kwargs: Additional arguments for embedding model
+        """
+        self._set_up(
+            db_dir,
+            collection_name,
+            embedding_model,
+            similarity_threshold,
+            embedding_kwargs,
+            ensure_table=True,
+        )
+        self._ensure_table_schema()
+
+    @classmethod
+    def open_admitted(
+        cls,
+        admitted: AdmittedLanceDBMemoryStore,
+        identity: EmbeddingIdentity,
+        *,
+        db_dir: str,
+        embedding_model: Optional[BaseEmbedding] = None,
+        similarity_threshold: float = 1.0,
+    ) -> "LanceDBMemoryStore":
+        """Open the table storage admission just certified, without changing it.
+
+        The constructor may create a placeholder table, reshape an empty one
+        and promote scope columns. None of that is safe here: it would run
+        after the admission lock is released, next to other workers, on a
+        table admission has already certified. So this path only opens the
+        table and checks that it is still the one admission certified: the
+        table exists, still carries the full-admission marker and still
+        classifies against ``identity`` the way admission classified it.
+        Anything else raises, and nothing is published.
+        """
+        store = cls.__new__(cls)
+        store._set_up(
+            db_dir,
+            admitted.handle.table_name,
+            embedding_model,
+            similarity_threshold,
+            {},
+            ensure_table=False,
+        )
+        store._verify_admitted_table(admitted, identity)
+        return store
+
+    def _verify_admitted_table(
+        self, admitted: AdmittedLanceDBMemoryStore, identity: EmbeddingIdentity
+    ) -> None:
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Admitted memory table {self._collection_name!r} is missing"
+            ) from exc
+        try:
+            if not _is_fully_admitted(table):
+                raise RuntimeError(
+                    f"Memory table {self._collection_name!r} lost its admission "
+                    "certificate after admission"
+                )
+            compatibility = classify_vector_compatibility(table.schema, identity)
+        finally:
+            _safe_close_table(table)
+        if compatibility is not admitted.vector_compatibility:
+            raise RuntimeError(
+                f"Memory table {self._collection_name!r} changed vector space "
+                "after admission"
+            )
+
+    def _set_up(
+        self,
+        db_dir: str,
+        collection_name: str,
+        embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]],
+        similarity_threshold: float,
+        embedding_kwargs: dict[str, Any],
+        *,
+        ensure_table: bool,
+    ) -> None:
+        self._collection_name = collection_name
+
+        # Handle different types of embedding_model input
+        if embedding_model is None:
+            # Try to create a default embedding model only if embedding_kwargs are provided
+            if embedding_kwargs:
+                try:
+                    self._embedding_model = DashScopeEmbedding(**embedding_kwargs)
+                except Exception:
+                    # If embedding model creation fails, set to None (will use fallback)
+                    self._embedding_model = None
+                    logger.warning(
+                        "Failed to create embedding model, will use fallback text search"
+                    )
+            else:
+                self._embedding_model = None
+                logger.info(
+                    "No embedding model provided, will use fallback text search"
+                )
+        elif isinstance(embedding_model, BaseEmbedding):
+            self._embedding_model = embedding_model
+        elif isinstance(embedding_model, EmbeddingModelConfig):
+            self._embedding_model = create_embedding_adapter(embedding_model)
+        else:
+            raise ValueError(
+                f"Unsupported embedding model type: {type(embedding_model)}"
+            )
+        self._similarity_threshold = similarity_threshold
+        self._vector_store = LanceDBVectorStore(
+            db_dir, collection_name, ensure_table=ensure_table
+        )
+        self._conn_manager = LanceDBConnectionManager()
+
+    def _ensure_table_schema(self) -> None:
+        """Ensure the table has the correct schema for memory storage.
+
+        If the table is missing a required column, migrate it in place
+        (preserving all rows) instead of dropping and recreating it. This path
+        runs on every store construction, so a wipe here would destroy data with
+        no write in flight. On any migration failure the original table is left
+        intact and the error propagates (out of ``__init__``); we never fall back
+        to a wipe. Note the migration branch may perform a batched re-embed when
+        a table is both missing a base column and vector-mismatched.
+        """
+        conn = self._vector_store.get_raw_connection()
+
+        # Determine whether the table already exists and read its columns.
+        table = None
+        try:
+            table = conn.open_table(self._collection_name)
+            column_names = set(table.schema.names)
+            row_count = table.count_rows()
+        except Exception:
+            # Table doesn't exist yet, create it with the basic schema.
+            logger.info(f"Creating table {self._collection_name} with basic schema")
+            self._create_empty_table()
+            return
+        finally:
+            _safe_close_table(table)
+
+        # The generic vector-store constructor bootstraps a new table with an
+        # empty three-dimensional placeholder. Resolve that empty-table schema
+        # here, before the store can be published or accept a write. Existing
+        # non-empty tables still enter this path only for missing required
+        # non-vector columns; vector-space changes there require explicit
+        # admission/maintenance and are never deferred to add().
+        if row_count == 0 or not {"id", "text", "metadata"} <= column_names:
+            logger.warning(
+                f"Table {self._collection_name} has incompatible schema, "
+                "migrating in place"
+            )
+            self._resolve_schema_mismatch(
+                conn, self._current_embedding_dim(), raise_when_compatible=False
+            )
+
+        # #822: promote user_id + scope_dims to real columns so scope filters
+        # can be pushed into a `where` prefilter (slice 001). Idempotent and
+        # data-preserving; runs after the base-schema resolution above so it sees
+        # a table that already has id/text/metadata.
+        self._ensure_scope_columns(conn)
+
+    def _create_empty_table(self) -> None:
+        """Create an empty table with the correct schema."""
+        conn = self._vector_store.get_raw_connection()
+
+        # Base row carries the derived scope columns (#822) so their types are
+        # fixed at creation: user_id -> int64, scope_dims -> list<string>.
+        # Concrete values are only for schema inference; the sample row is
+        # deleted below.
+        base_sample = {
+            "id": "sample",
+            "text": "sample",
+            "metadata": "{}",
+            USER_ID_COLUMN: 0,
+            SCOPE_DIMS_COLUMN: ["sample"],
+        }
+
+        # Check if we have an embedding model
+        if self._embedding_model:
+            # Create table with vector support
+            try:
+                # Generate a sample embedding to get dimension
+                sample_embedding = self._get_embedding("sample")
+                if sample_embedding:
+                    # Create sample data with vector
+                    sample_data = [{**base_sample, "vector": sample_embedding}]
+                else:
+                    # Fallback to non-vector schema
+                    sample_data = [base_sample]
+            except Exception:
+                # If embedding fails, use non-vector schema
+                sample_data = [base_sample]
+        else:
+            # No embedding model, create without vector column
+            sample_data = [base_sample]
+
+        # Create table with appropriate schema
+        table = conn.create_table(self._collection_name, data=sample_data)
+        # Remove sample data
+        table.delete("id = 'sample'")
+
+    def _get_embedding(self, text: str) -> Optional[list[float]]:
+        """Get embedding for text using the configured embedding model."""
+        if not self._embedding_model or not text.strip():
+            return None
+
+        try:
+            result = self._embedding_model.encode(text)
+            # encode should return list[float] for single text input
+            if isinstance(result, list):
+                if len(result) > 0 and isinstance(result[0], list):
+                    # Got list[list[float]], return the first embedding
+                    return result[0]
+                elif len(result) > 0 and isinstance(result[0], (int, float)):
+                    # Got list[float], return as is
+                    return result  # type: ignore[return-value]
+            logger.warning(f"Unexpected embedding result format: {type(result)}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for text '{text[:50]}...': {e}")
+            return None
+
+    def _current_embedding_dim(self) -> Optional[int]:
+        """Return the vector dimension the store currently produces, or None.
+
+        None means no embedding model is available and the store operates in
+        vector-less (text-search) mode.
+        """
+        if not self._embedding_model:
+            return None
+        try:
+            dim = self._embedding_model.get_dimension()
+            if dim:
+                return int(dim)
+        except Exception:
+            pass
+        sample = self._get_embedding("sample")
+        return len(sample) if sample else None
+
+    def _embed_texts_batch(
+        self, texts: list[str], target_dim: int
+    ) -> list[list[float]]:
+        """Re-embed all texts in a single batched encode call (all-or-nothing).
+
+        Raises if no model is available, the batch shape is unexpected, or any
+        row's embedding is missing or has the wrong dimension. The caller relies
+        on this raising so the migration aborts with the original table intact
+        (never a partially-vectorized table).
+        """
+        if not self._embedding_model:
+            raise RuntimeError(
+                "Cannot rebuild vector column without an embedding model"
+            )
+        if not texts:
+            return []
+        result = self._embedding_model.encode(texts)
+        if not isinstance(result, list) or len(result) != len(texts):
+            raise RuntimeError(
+                f"Embedding batch returned unexpected shape for {len(texts)} rows"
+            )
+        vectors: list[list[float]] = []
+        for index, vector in enumerate(result):
+            if not isinstance(vector, list) or len(vector) != target_dim:
+                raise RuntimeError(
+                    f"Re-embedding row {index} failed or produced the wrong "
+                    f"dimension (expected {target_dim})"
+                )
+            vectors.append([float(value) for value in vector])
+        return vectors
+
+    def _build_migrated_table(self, existing: Any, target_dim: Optional[int]) -> Any:
+        """Transform for the migration primitive: rebuild rows at the target schema.
+
+        Preserves every existing row's id/text/metadata. When ``target_dim`` is
+        set, re-embeds all rows into a fresh fixed-width vector column; when it
+        is None, produces a vector-less table (text-only search).
+        """
+        row_count = existing.num_rows
+        names = set(existing.schema.names)
+
+        def _string_column(name: str) -> Any:
+            # Stay in the Arrow format and let PyArrow cast natively instead of
+            # materializing Python lists per element.
+            if name in names:
+                return existing.column(name).cast(pa.string())
+            return pa.array([None] * row_count, pa.string())
+
+        columns: dict[str, Any] = {
+            "id": _string_column("id"),
+            "text": _string_column("text"),
+            "metadata": _string_column("metadata"),
+        }
+
+        if target_dim is not None:
+            # The batched embedding interface needs Python strings; reuse the
+            # already-cast text column so it is only materialized once.
+            texts = [text or "" for text in columns["text"].to_pylist()]
+            vectors = self._embed_texts_batch(texts, target_dim)
+            columns["vector"] = pa.array(vectors, pa.list_(pa.float32(), target_dim))
+
+        # #822: keep the derived scope columns present through a vector rebuild so
+        # every migration path produces the full schema.
+        user_ids, scope_dims = self._derive_scope_arrays(columns["metadata"])
+        columns[USER_ID_COLUMN] = user_ids
+        columns[SCOPE_DIMS_COLUMN] = scope_dims
+
+        return pa.table(columns)
+
+    def _derive_scope_arrays(self, metadata_column: Any) -> tuple[Any, Any]:
+        """Derive the (user_id, scope_dims) Arrow columns from a metadata column.
+
+        Shared by every migration transform so the write path and all rebuild
+        paths encode the columns identically.
+        """
+        user_ids: list[Optional[int]] = []
+        scope_dims: list[list[str]] = []
+        for metadata_json in metadata_column.to_pylist():
+            user_id, dims = derive_scope_columns(metadata_json)
+            user_ids.append(user_id)
+            scope_dims.append(dims)
+        return (
+            pa.array(user_ids, pa.int64()),
+            pa.array(scope_dims, pa.list_(pa.string())),
+        )
+
+    def _add_scope_columns(self, existing: Any) -> Any:
+        """Migration transform: add derived scope columns, preserve everything else.
+
+        Unlike the vector rebuild, this preserves the existing ``vector`` column
+        as-is (no re-embedding) — it only projects ``user_id`` / ``scope_dims``
+        out of each row's metadata JSON.
+        """
+        columns: dict[str, Any] = {
+            name: existing.column(name) for name in existing.schema.names
+        }
+        if "metadata" in columns:
+            metadata_column = columns["metadata"].cast(pa.string())
+        else:
+            metadata_column = pa.array([None] * existing.num_rows, pa.string())
+        user_ids, scope_dims = self._derive_scope_arrays(metadata_column)
+        columns[USER_ID_COLUMN] = user_ids
+        columns[SCOPE_DIMS_COLUMN] = scope_dims
+        return pa.table(columns)
+
+    def _ensure_scope_columns(self, conn: Any) -> None:
+        """Promote user_id + scope_dims to real columns on an existing table (#822).
+
+        Idempotent: does nothing when both columns already exist (fresh tables are
+        created with them). Otherwise rebuilds the table via transform-then-swap,
+        back-filling both columns from each row's metadata JSON and preserving all
+        other columns (including ``vector``). On failure the original table is left
+        intact and the error propagates — this never drops data.
+        """
+        table = conn.open_table(self._collection_name)
+        try:
+            names = set(table.schema.names)
+        finally:
+            _safe_close_table(table)
+
+        if {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= names:
+            return
+
+        logger.info(
+            "Promoting user_id/scope_dims to real columns on table '%s'",
+            self._collection_name,
+        )
+        migrate_table_swap(conn, self._collection_name, self._add_scope_columns)
+
+    def _backfill_missing_columns(self, conn: Any, columns: tuple[str, ...]) -> None:
+        """Add missing non-vector columns in place (no data loss, no rebuild)."""
+        table = conn.open_table(self._collection_name)
+        try:
+            for column in columns:
+                # All non-vector memory columns are strings.
+                table.add_columns({column: "cast(null as string)"})
+        finally:
+            _safe_close_table(table)
+
+    def _resolve_schema_mismatch(
+        self,
+        conn: Any,
+        expected_dim: Optional[int],
+        *,
+        raise_when_compatible: bool,
+        allow_vector_rebuild: bool = True,
+    ) -> None:
+        """Classify and safely resolve a schema mismatch (shared by add/init).
+
+        Missing non-vector columns are backfilled in place; a vector
+        dimension/presence change rebuilds the table via transform-then-swap.
+        On any failure the original table is left intact and the error
+        propagates; no path drops or empties the table.
+
+        When the schema is classified compatible, ``raise_when_compatible``
+        controls behavior: the ``add()`` path passes ``True`` (its insert failed,
+        so a compatible schema means an unexpected error to surface rather than
+        silently drop); the init path passes ``False`` (nothing to migrate).
+
+        ``allow_vector_rebuild=False`` makes ordinary writes schema-immutable:
+        the add-error path may backfill missing non-vector columns, but it may
+        never replace or re-embed an admitted table. Vector-space repair stays
+        an explicit, quiesced maintenance/admission operation.
+        """
+        table = conn.open_table(self._collection_name)
+        try:
+            schema = table.schema
+        finally:
+            _safe_close_table(table)
+
+        mismatch = classify_memory_schema_mismatch(schema, expected_dim)
+        if (
+            mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD
+            and not allow_vector_rebuild
+        ):
+            # Keep the live vector schema and rows; resolve only an additive
+            # non-vector backfill, if one is also needed.
+            if mismatch.missing_columns:
+                self._backfill_missing_columns(conn, mismatch.missing_columns)
+                return
+            raise RuntimeError(
+                "add() vector schema mismatch requires offline admission or repair"
+            )
+
+        if mismatch.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN:
+            self._backfill_missing_columns(conn, mismatch.missing_columns)
+        elif mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD:
+            target_dim = expected_dim
+            migrate_table_swap(
+                conn,
+                self._collection_name,
+                lambda existing: self._build_migrated_table(existing, target_dim),
+            )
+        elif raise_when_compatible:
+            # add() failed but the schema looks compatible: do NOT drop the
+            # table. Surface the original failure to the caller.
+            raise RuntimeError(
+                "add() failed but no resolvable schema mismatch was detected"
+            )
+
+    def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
+        """Resolve the schema mismatch that made an ``add()`` insert fail.
+
+        A failed insert is not proof of a schema mismatch: disk pressure, lock
+        contention or a backend hiccup fail it too. So this never drops the
+        vector column: a store that cannot produce vectors (no adapter, e.g.
+        TEXT_ONLY, or an embedding call that just failed) must not rewrite a
+        table whose vectors were written under another identity. An insert
+        failure with nothing resolvable is raised and reported as a failed
+        write, leaving the table untouched.
+        """
+        # The dimension we are trying to store now determines the target schema.
+        if record.get("vector"):
+            expected_dim: Optional[int] = len(record["vector"])
+        elif self._embedding_model:
+            expected_dim = self._current_embedding_dim()
+        else:
+            expected_dim = None
+
+        self._resolve_schema_mismatch(
+            conn,
+            expected_dim,
+            raise_when_compatible=True,
+            allow_vector_rebuild=False,
+        )
+
+    def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
+        """Insert a record, adapting it to the (possibly migrated) table schema."""
+        schema_names = set(table.schema.names)
+        if "vector" in record and "vector" not in schema_names:
+            record = {k: v for k, v in record.items() if k != "vector"}
+        table.add([record])
+
+    def _memory_note_to_dict(self, note: MemoryNote) -> dict[str, Any]:
+        """Convert MemoryNote to dictionary for storage."""
+        # Get embedding for the content
+        content_text = (
+            note.content.decode() if isinstance(note.content, bytes) else note.content
+        )
+        embedding = self._get_embedding(content_text)
+
+        # Prepare metadata
+        metadata = {
+            "content": note.content,
+            "keywords": note.keywords,
+            "tags": note.tags,
+            "category": note.category,
+            "timestamp": note.timestamp.isoformat(),
+            "mime_type": note.mime_type,
+            **note.metadata,
+        }
+
+        return {
+            "id": note.id,
+            "vector": embedding,
+            "text": note.content,
+            "metadata": json.dumps(metadata, ensure_ascii=False),
+            # #822: derived filter projections; the metadata JSON stays
+            # authoritative. Computed from the scope stamps the isolation layer
+            # writes onto note.metadata (user_id + execution_scope_* keys).
+            USER_ID_COLUMN: coerce_user_id(note.metadata.get("user_id")),
+            SCOPE_DIMS_COLUMN: encode_scope_dims(note.metadata),
+        }
+
+    def _dict_to_memory_note(self, data: dict[str, Any]) -> MemoryNote:
+        """Convert dictionary from storage to MemoryNote."""
+        try:
+            metadata = json.loads(data.get("metadata", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+
+        note_kwargs: dict[str, Any] = {
+            "id": data.get("id"),
+            "content": metadata.pop("content", data.get("text", "")),
+            "keywords": metadata.pop("keywords", []),
+            "tags": metadata.pop("tags", []),
+            "category": metadata.pop("category", "general"),
+            "mime_type": metadata.pop("mime_type", "text/plain"),
+            "metadata": metadata,
+        }
+        # #847: legacy rows may lack `timestamp`. MemoryNote.timestamp is a
+        # non-optional datetime with a default_factory, and pydantic only
+        # applies the factory when the field is omitted — an explicit None
+        # raises ValidationError.
+        timestamp = metadata.pop("timestamp", None)
+        if timestamp is not None:
+            note_kwargs["timestamp"] = timestamp
+
+        return MemoryNote(**note_kwargs)
+
+    # Filter matching (_matches_filters and friends) is inherited from the
+    # MemoryStore base so stores cannot drift apart on filter semantics (#916).
+    #
+    # On the vector path the dispatch receives the residual dict left by
+    # ``build_scope_where``: ``SCOPE_EXCLUSIVE_FILTER_KEY`` and the
+    # user_id/scope-dimension entries of the nested ``metadata`` filter were
+    # already pushed into the ``where`` prefilter, so those checks simply do
+    # not trigger there. The text fallback passes the full filters and relies
+    # on all the base checks.
+
+    def add(self, note: MemoryNote) -> MemoryResponse:
+        """Add a memory note to the store."""
+        try:
+            # Generate ID if not provided
+            if not note.id:
+                note.id = str(uuid4())
+
+            # Convert to storage format
+            data = self._memory_note_to_dict(note)
+
+            # Add to vector store - use a consistent approach
+            conn = self._vector_store.get_raw_connection()
+            table = None
+            try:
+                table = conn.open_table(self._collection_name)
+
+                # Prepare record for insertion
+                record = {
+                    "id": data["id"],
+                    "text": data["text"],
+                    "metadata": data["metadata"],
+                    USER_ID_COLUMN: data[USER_ID_COLUMN],
+                    SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
+                }
+
+                # Add vector if available
+                if data["vector"]:
+                    record["vector"] = data["vector"]
+
+                # Try to add the record. On a schema mismatch, migrate the
+                # existing table in place (preserving all rows) instead of
+                # dropping and recreating it.
+                try:
+                    table.add([record])
+                except Exception as add_error:
+                    logger.warning(
+                        f"add() failed on possible schema mismatch: {add_error}; "
+                        "attempting safe in-place migration"
+                    )
+                    _safe_close_table(table)
+                    table = None
+                    # Migrate safely; on any failure the original table is left
+                    # intact and we surface an error WITHOUT dropping data.
+                    try:
+                        self._migrate_schema_mismatch(conn, record)
+                    except Exception as migrate_error:
+                        logger.error(
+                            "Safe schema migration failed; table left intact: %s",
+                            migrate_error,
+                        )
+                        return MemoryResponse(
+                            success=False,
+                            error=f"Failed to add memory: {migrate_error}",
+                            memory_id=data["id"],
+                        )
+                    # Retry the insert against the migrated schema.
+                    table = conn.open_table(self._collection_name)
+                    self._insert_record(table, record)
+            finally:
+                _safe_close_table(table)
+
+            return MemoryResponse(success=True, memory_id=data["id"])
+
+        except Exception as e:
+            logger.error(f"Failed to add memory note {note.id}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to add memory: {str(e)}",
+                memory_id=note.id,
+            )
+
+    def get(self, note_id: str) -> MemoryResponse:
+        """Retrieve a memory note by its ID."""
+        table = None
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+
+            # Search by ID
+            results = (
+                table.search().where(f"id = {sql_string_literal(note_id)}").to_pandas()
+            )
+
+            if len(results) == 0:
+                return MemoryResponse(
+                    success=False,
+                    error="Memory not found",
+                    memory_id=note_id,
+                )
+
+            # Convert to MemoryNote
+            data = results.iloc[0].to_dict()
+            note = self._dict_to_memory_note(data)
+
+            return MemoryResponse(
+                success=True,
+                memory_id=note_id,
+                content=note,
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to get memory note {note_id}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to get memory: {str(e)}",
+                memory_id=note_id,
+            )
+        finally:
+            _safe_close_table(table)
+
+    def update(self, note: MemoryNote) -> MemoryResponse:
+        """Update an existing memory note."""
+        try:
+            # Check if memory exists
+            get_response = self.get(note.id)
+            if not get_response.success:
+                return MemoryResponse(
+                    success=False,
+                    error="Memory not found",
+                    memory_id=note.id,
+                )
+
+            # Delete old record
+            self.delete(note.id)
+
+            # Add updated record
+            return self.add(note)
+
+        except Exception as e:
+            logger.error(f"Failed to update memory note {note.id}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to update memory: {str(e)}",
+                memory_id=note.id,
+            )
+
+    def delete(self, note_id: str) -> MemoryResponse:
+        """Delete a memory note by its ID."""
+        try:
+            success = self._vector_store.delete_vectors([note_id])
+
+            if success:
+                return MemoryResponse(success=True, memory_id=note_id)
+            else:
+                return MemoryResponse(
+                    success=False,
+                    error="Failed to delete memory",
+                    memory_id=note_id,
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to delete memory note {note_id}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to delete memory: {str(e)}",
+                memory_id=note_id,
+            )
+
+    def delete_by_scope_dimension(self, dim_key: str, value: Any) -> MemoryResponse:
+        """Bulk-delete every note stamped with dimension ``dim_key=value``.
+
+        Pushes a single ``array_contains(scope_dims, 'key=value')`` predicate
+        into LanceDB instead of the base class's list-and-delete walk, so the
+        whole matching set goes in one table operation. Exact per-element
+        equality (see scope_columns), so similar values never collide.
+
+        ``deleted_count`` is best-effort under concurrent writers: LanceDB's
+        ``delete()`` reports only the new table version, not a row count, so
+        the count comes from a ``count_rows`` on the same predicate just
+        before the delete. The operation itself stays idempotent either way.
+        """
+        where = scope_dim_where_term(dim_key, value)
+        table = None
+        try:
+            # The table always exists after construction (the vector store
+            # creates it in __init__), so open directly like get()/search().
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            count = table.count_rows(where)
+            if count:
+                table.delete(where)
+            return MemoryResponse(success=True, metadata={"deleted_count": count})
+        except Exception as e:
+            logger.error(f"Failed to delete memories by scope dimension {dim_key}: {e}")
+            return MemoryResponse(
+                success=False,
+                error=f"Failed to delete memories by scope dimension: {str(e)}",
+                metadata={"deleted_count": 0},
+            )
+        finally:
+            _safe_close_table(table)
+
+    def list_scope_dimension_values(self, dim_key: str) -> set[str]:
+        """Distinct stamped values for one scope dimension, store-wide.
+
+        Projects only the ``scope_dims`` column (no vectors, no metadata JSON)
+        so the scan stays cheap on large tables. Raises on backend failure —
+        see the base class contract.
+        """
+        prefix = f"{dim_key}="
+        table = None
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            arrow_table = (
+                table.search().select([SCOPE_DIMS_COLUMN]).limit(None).to_arrow()
+            )
+            # Filter in Arrow: flatten the list<string> column (null rows drop
+            # out), keep only this dimension's elements, then dedupe — only the
+            # distinct values ever cross into Python.
+            flat = pc.list_flatten(arrow_table[SCOPE_DIMS_COLUMN])
+            matched = flat.filter(pc.starts_with(flat, pattern=prefix))
+            return {element[len(prefix) :] for element in matched.unique().to_pylist()}
+        finally:
+            _safe_close_table(table)
+
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list[MemoryNote]:
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=False,
+        )
+
+    def search_with_null_vector_fallback(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list[MemoryNote]:
+        """Dormant admission primitive that safely supplements ANN results."""
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=True,
+        )
+
+    def _residual_note_filter(
+        self, residual_filters: dict[str, Any]
+    ) -> Callable[[MemoryNote], bool]:
+        """Bind the shared filter dispatch to one residual filter set.
+
+        ``_flat_other_filters`` is note-independent, so it is computed once here
+        rather than per scanned row.
+        """
+        other_filters = self._flat_other_filters(residual_filters)
+        return lambda note: self._matches_filters(note, residual_filters, other_filters)
+
+    def _dormant_memory_handle(self) -> DormantLanceDBMemoryHandle:
+        """This collection as the layer B handle the streaming scan takes."""
+        return DormantLanceDBMemoryHandle(
+            self._vector_store.get_raw_connection(), self._collection_name
+        )
+
+    def _search(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+        *,
+        include_null_vector_fallback: bool,
+    ) -> list[MemoryNote]:
+        """Search memory notes by query text with optional filters.
+
+        Known limitation (#916): on the vector path, residual filters —
+        ``category``, ``tags``/``keywords``, ``date_from``/``date_to``, and
+        arbitrary metadata keys — are applied as a Python post-filter *after*
+        ANN top-k retrieval (``vector_query.limit(k)``). A note that matches
+        the filters but falls outside the ANN's top-k window will therefore
+        not surface, even though it exists in the store. Only user_id, the
+        scope dimensions, and the scope-exclusive directive
+        (``SCOPE_EXCLUSIVE_FILTER_KEY``, compiled to an empty-``scope_dims``
+        clause) are pushed into the ``where`` prefilter, because
+        cross-principal crowd-out is an isolation-recall problem (#822);
+        pushing more filter keys into the prefilter was considered and
+        deliberately deferred as a possible future recall improvement (#916).
+        Callers that need filter-complete results should use ``list_all()``
+        (full scan) or pass a large ``k`` (the web route uses k=1000).
+        """
+        table = None
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            results = []
+            ann_search_completed = False
+
+            # #822: push user_id + scope-dimension filters into a `where`
+            # prefilter so the ANN returns k already-scoped neighbours; the rest
+            # (category, tags/keywords/dates, arbitrary metadata keys) stays a
+            # Python post-filter.
+            where_sql, residual_filters = build_scope_where(filters)
+            residual_other_filters = self._flat_other_filters(residual_filters)
+
+            # Try vector search first
+            try:
+                query_embedding = self._get_embedding(query)
+                if query_embedding:
+                    # Check if vector column exists and has the right dimension
+                    sample_df = table.search().limit(1).to_pandas()
+                    if not sample_df.empty and "vector" in sample_df.columns:
+                        # Try vector search
+                        try:
+                            vector_query = table.search(
+                                query_embedding, vector_column_name="vector"
+                            )
+                            if where_sql:
+                                # Prefilter: scope BEFORE the top-k selection, so
+                                # crowd-out from other principals cannot collapse
+                                # recall.
+                                vector_query = vector_query.where(
+                                    where_sql, prefilter=True
+                                )
+                            vector_df = vector_query.limit(k).to_pandas()
+                            ann_search_completed = True
+
+                            for _, row in vector_df.iterrows():
+                                # Check similarity threshold
+                                threshold = (
+                                    similarity_threshold
+                                    if similarity_threshold is not None
+                                    else self._similarity_threshold
+                                )
+                                distance = row.get("_distance", float("inf"))
+                                if distance > threshold:
+                                    logger.info(
+                                        f"Skipping result with distance {distance} > threshold {threshold}"
+                                    )
+                                    continue
+
+                                logger.info(
+                                    f"Accepting result with distance {distance} <= threshold {threshold}"
+                                )
+
+                                note_data = {
+                                    "id": row.get("id", ""),
+                                    "text": row.get("text", ""),
+                                    "metadata": row.get("metadata", "{}"),
+                                }
+                                # #847: a malformed row must not abort the whole
+                                # vector branch — escaping to the outer except
+                                # after earlier appends would skip the text
+                                # fallback and silently truncate the results.
+                                try:
+                                    note = self._dict_to_memory_note(note_data)
+                                except Exception as row_error:
+                                    logger.warning(
+                                        "Skipping malformed memory row %r in "
+                                        "vector search results: %s",
+                                        note_data["id"],
+                                        row_error,
+                                    )
+                                    continue
+
+                                # user_id + scope dimensions were already applied
+                                # as a `where` prefilter; only residual filters
+                                # (category, tags/keywords/dates, arbitrary
+                                # metadata keys) remain.
+                                if residual_filters and not self._matches_filters(
+                                    note, residual_filters, residual_other_filters
+                                ):
+                                    continue
+
+                                results.append(note)
+                        except Exception as vector_error:
+                            if where_sql:
+                                # Distinguish a pushdown-specific failure: the
+                                # text fallback re-applies the full filters in
+                                # Python, so isolation is preserved, but the
+                                # population-independent recall pushdown (#822)
+                                # is silently bypassed until the query is fixed.
+                                logger.warning(
+                                    "Scoped vector search with where-prefilter "
+                                    "%r failed; falling back to text search "
+                                    "(isolation preserved via Python filtering, "
+                                    "but the recall pushdown is bypassed): %s",
+                                    where_sql,
+                                    vector_error,
+                                )
+                            else:
+                                logger.warning(
+                                    "Vector search failed, falling back to text "
+                                    "search: %s",
+                                    vector_error,
+                                )
+            except Exception as embedding_error:
+                logger.warning(
+                    f"Embedding generation failed, using text search: {embedding_error}"
+                )
+
+            if include_null_vector_fallback:
+                seen_ids: set[str] = set()
+                deduplicated: list[MemoryNote] = []
+                for note in results:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        deduplicated.append(note)
+                results = deduplicated
+                # Ranked streaming retrieval (#2346), reached only from the
+                # dormant admission primitive: bounded batches, the scope
+                # clause pushed into `where`, and a heap bounded at the
+                # outstanding quota. ANN ids are excluded at the source, so a
+                # duplicate cannot consume a lexical slot.
+                candidates = (
+                    stream_lexical_top_k(
+                        self._dormant_memory_handle(),
+                        query,
+                        k - len(results),
+                        row_to_note=self._dict_to_memory_note,
+                        note_filter_factory=self._residual_note_filter,
+                        filters=filters,
+                        exclude_ids=seen_ids,
+                        null_vectors_only=ann_search_completed,
+                    )
+                    if len(results) < k
+                    else []
+                )
+                for note in candidates:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        results.append(note)
+                    if len(results) >= k:
+                        break
+                return results[:k]
+
+            # Fallback to text search if no vector results or vector search
+            # failed: the first k substring matches in scan order, streamed in
+            # bounded batches with the scope clause pushed into `where` and the
+            # residual filters applied per batch, instead of materialising the
+            # whole table.
+            if not results:
+                results = stream_lexical_top_k(
+                    self._dormant_memory_handle(),
+                    query,
+                    k,
+                    row_to_note=self._dict_to_memory_note,
+                    note_filter_factory=self._residual_note_filter,
+                    filters=filters,
+                    null_vectors_only=False,
+                    batch_size=self._stream_batch_size,
+                    ranked=False,
+                )
+
+            return results[:k]
+
+        finally:
+            _safe_close_table(table)
+
+    def clear(self) -> None:
+        """Clear all memory notes from the store."""
+        try:
+            self._vector_store.clear()
+        except Exception as e:
+            logger.error(f"Failed to clear memory store: {e}")
+
+    def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
+        """List all memory notes with optional filtering.
+
+        Delegates all filtering to search(): its ``_matches_filters`` dispatch
+        is the single source of truth (category, nested ``{"metadata": {...}}``
+        isolation filters, tags/keywords/date ranges, flat metadata equality),
+        so list_all and search cannot diverge (#909). Results are sorted
+        newest-first to match InMemoryStore.list_all.
+        """
+        notes = self.search(query="", k=10000, filters=filters or None)
+        # Mirror InMemoryStore: newest first.
+        notes.sort(key=lambda n: n.timestamp, reverse=True)
+        return notes
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get statistics about the memory store."""
+        try:
+            # Get all memories to calculate stats
+            all_memories = self.list_all()
+
+            total_count = len(all_memories)
+            category_counts: dict[str, int] = {}
+            tag_counts: dict[str, int] = {}
+
+            for note in all_memories:
+                # Count by category
+                category_counts[note.category] = (
+                    category_counts.get(note.category, 0) + 1
+                )
+
+                # Count tags
+                for tag in note.tags:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+            return {
+                "total_count": total_count,
+                "category_counts": category_counts,
+                "tag_counts": tag_counts,
+                "memory_store_type": "lancedb",
+            }
+        except Exception as e:
+            logger.error(f"Failed to get memory stats: {e}")
+            return {
+                "total_count": 0,
+                "category_counts": {},
+                "tag_counts": {},
+                "memory_store_type": "lancedb",
+                "error": str(e),
+            }

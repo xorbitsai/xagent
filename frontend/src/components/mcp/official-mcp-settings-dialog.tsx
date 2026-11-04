@@ -1,0 +1,416 @@
+import React, { useRef } from "react"
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
+import { Button } from "@/components/ui/button"
+import { getApiUrl } from "@/lib/utils"
+import { Settings, Unlink, Plus, Users, UserMinus, Loader2, RefreshCw, AlertTriangle } from "lucide-react"
+import { apiRequest } from "@/lib/api-wrapper"
+import { toast } from "@/components/ui/sonner"
+import { useAuth } from "@/contexts/auth-context"
+import { useI18n } from "@/contexts/i18n-context"
+import { needsReconnect } from "@/lib/mcp-connection-status"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
+
+import type { AppIntegration } from "./types"
+import { GoogleDrivePickerButton } from "./google-drive-picker-button"
+import { useOAuthAccountStep } from "./oauth-account-dialog"
+
+export type { AppIntegration }
+
+interface OfficialMcpSettingsDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  app: AppIntegration | null
+  onSuccess?: () => void
+  onDisconnect?: (app: AppIntegration) => void
+  isGloballyConnected?: boolean
+  // Whether this viewer's Configure route would resolve — a backend fact
+  // (list_mcp_apps.can_configure), passed in like isGloballyConnected rather
+  // than read off `app`, because the call sites answer it differently: the
+  // connector picker reads the listing field, while the Tools page hands this
+  // dialog a hand-built entry that carries no listing fields at all. The agent
+  // builder's reconnect omits this prop and isGloballyConnected, so Configure
+  // stays hidden and the Connect button runs the login. Omitted means "use the
+  // connection state", which is exactly the gate this replaced.
+  canConfigure?: boolean
+  onConnectStart?: (app: AppIntegration) => void
+  onConfigure?: (app: AppIntegration) => void
+  onManageKey?: (app: AppIntegration) => void
+  onPickerOpenChange?: (open: boolean) => void
+  // True while the parent-owned connect request for this app is in flight
+  // (e.g. a keyless connect fired via onConnectStart). Disables the Connect
+  // trigger so rapid double-clicks can't fire overlapping POSTs, and gives
+  // the flow its only visible progress state — the catalog card spinner is
+  // occluded by this dialog.
+  isConnecting?: boolean
+}
+
+export function OfficialMcpSettingsDialog({
+  open,
+  onOpenChange,
+  app,
+  onSuccess,
+  onDisconnect,
+  isGloballyConnected = false,
+  canConfigure,
+  onConnectStart,
+  onConfigure,
+  onManageKey,
+  onPickerOpenChange,
+  isConnecting = false
+}: OfficialMcpSettingsDialogProps) {
+  const { inTeam } = useAuth()
+  const { t } = useI18n()
+  const { requestAccount, accountDialog } = useOAuthAccountStep()
+  // Mirrors the latest render for the popup poll below, whose closure outlives
+  // the render that started it.
+  const liveRef = useRef({ open, appId: app?.id })
+  liveRef.current = { open, appId: app?.id }
+
+  // Only reached without onConnectStart (the Tools page and the agent
+  // builder's reconnect): a provider hosted
+  // on the customer's own account needs the account label before the popup.
+  const requestAppAccount = (appToConnect: AppIntegration, retry = false) => {
+    if (!appToConnect.oauth_account_input) return
+    requestAccount(
+      {
+        key: appToConnect.id,
+        name: appToConnect.name,
+        icon: appToConnect.icon,
+        input: appToConnect.oauth_account_input,
+        onSubmit: (account) => handleConnectApp(appToConnect, account),
+      },
+      { retry },
+    )
+  }
+
+  const handleConnectApp = (appToConnect: AppIntegration, account?: string) => {
+    if (appToConnect.is_custom && onConnectStart) {
+      onConnectStart(appToConnect);
+      return;
+    } else if (!appToConnect.is_custom && onConnectStart) {
+      // If we provided onConnectStart for official apps, we might still want to call it
+      // But in our case we want to fall through to OAuth if it's official
+      // Let's just say if it's not custom, we only call onConnectStart if we explicitly want to bypass OAuth
+      // Actually, existing code:
+      if (onConnectStart && !appToConnect.is_custom) {
+        onConnectStart(appToConnect);
+        return;
+      }
+    }
+
+    if (appToConnect.oauth_account_input && account === undefined) {
+      requestAppAccount(appToConnect)
+      return
+    }
+
+    const provider = appToConnect.provider || "linkedin"
+
+    // Open OAuth in a popup window to handle the callback smoothly
+    const width = 600;
+    const height = 700;
+    const left = window.screenX + (window.outerWidth - width) / 2;
+    const top = window.screenY + (window.outerHeight - height) / 2;
+
+    const popup = openOAuthAuthorizationPopup({
+      provider, appId: appToConnect.id, account,
+      name: `${provider} OAuth`,
+      features: `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`,
+    });
+    if (!popup) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.");
+      return;
+    }
+
+    // Listen for the postMessage from the popup
+    const handleMessage = (event: MessageEvent) => {
+      if (isOAuthSuccessMessage(event, popup, appToConnect.id)) {
+        window.removeEventListener('message', handleMessage)
+        // Stop the closed-popup poll too, so a popup that closes itself after
+        // success is not read as a failed attempt below.
+        clearInterval(checkPopup)
+
+        if (onSuccess) onSuccess();
+        onOpenChange(false);
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+
+    // Fallback: check if popup was closed without success message
+    const checkPopup = setInterval(() => {
+      if (popup?.closed) {
+        clearInterval(checkPopup);
+        window.removeEventListener('message', handleMessage);
+        // Closed without connecting: the server's own error page, if any,
+        // was shown in the popup, so offer the account step again. The Tools
+        // page keeps this dialog mounted, so only reopen while it is still
+        // open for the same app.
+        if (
+          account !== undefined &&
+          liveRef.current.open &&
+          liveRef.current.appId === appToConnect.id
+        ) {
+          requestAppAccount(appToConnect, true)
+        }
+      }
+    }, 500);
+  }
+
+  // Toggle team-sharing for the connector. On unshare 403 (still referenced by
+  // a team agent) show the reason. server_id is the numeric connector id.
+  const handleToggleShare = async (appToShare: AppIntegration, share: boolean) => {
+    if (!Number.isInteger(appToShare.server_id)) return
+    const type = appToShare.transport === "custom_api" ? "custom_api" : "mcp"
+    const action = share ? "share" : "unshare"
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/connectors/${type}/${appToShare.server_id}/${action}`,
+        { method: "POST" },
+      )
+      if (response.ok) {
+        toast.success(share ? t('tools.mcp.sharing.shared') : t('tools.mcp.sharing.private'))
+        if (onSuccess) onSuccess()
+        onOpenChange(false)
+      } else if (!share && response.status === 403) {
+        toast.error(t('tools.mcp.sharing.stillUsedByAgent'))
+      } else if (share && response.status === 403) {
+        toast.error(t('tools.mcp.sharing.onlyOwnerOrAdmin'))
+      } else {
+        toast.error(t('tools.mcp.alerts.saveFailed'))
+      }
+    } catch (error) {
+      console.error("Failed to toggle connector sharing:", error)
+      toast.error(t('tools.mcp.alerts.saveFailed'))
+    }
+  }
+
+  const handleDisconnectApp = async (appToDisconnect: any) => {
+    try {
+      const serverId = appToDisconnect.server_id || appToDisconnect.id; // Use server_id if available
+      const isCustomApi = appToDisconnect.transport === 'custom_api';
+
+      const url = isCustomApi
+        ? `${getApiUrl()}/api/custom-apis/${serverId}`
+        : `${getApiUrl()}/api/mcp/servers/${serverId}`;
+
+      const response = await apiRequest(url, {
+        method: 'DELETE',
+      });
+
+      if (response.ok) {
+        if (appToDisconnect.is_custom) {
+          toast.success(t('tools.mcp.dialog.deleteSuccess', { name: appToDisconnect.name }))
+        } else {
+          toast.success(t('tools.mcp.dialog.disconnectSuccess', { name: appToDisconnect.name }))
+        }
+        if (onDisconnect) onDisconnect(appToDisconnect)
+        if (onSuccess) onSuccess()
+        onOpenChange(false)
+      } else {
+        if (appToDisconnect.is_custom) {
+          toast.error(t('tools.mcp.dialog.deleteFailed', { name: appToDisconnect.name }))
+        } else {
+          toast.error(t('tools.mcp.dialog.disconnectFailed', { name: appToDisconnect.name }))
+        }
+      }
+    } catch (error) {
+      console.error("Failed to disconnect app:", error)
+      toast.error(t('tools.mcp.dialog.errorDisconnecting', { name: appToDisconnect.name }))
+    }
+  }
+
+  if (!app) return null;
+
+  // configurable answers "would the edit route resolve for this viewer",
+  // independent of connection state: a connector whose tokens arrive through a
+  // deployment-installed resolver hook is never "connected" for its own
+  // creator, yet its owner holds the association the edit routes require.
+  // The `??` fallback exists only for the callers that omit the prop entirely
+  // (the Tools page's hand-built entry and the agent builder's reconnect) and
+  // reproduces the pre-field gate.
+  const configurable = Boolean(canConfigure ?? isGloballyConnected)
+  const isKeyBased = app.auth_type === "api_key"
+  // Keyless apps have no key and no editable config — once connected,
+  // disconnect is the only sensible action.
+  const isKeyless = app.auth_type === "keyless"
+  // Team tool the viewer doesn't own: they can use it, but the backend
+  // rejects edit/delete/unshare (403), so don't render those buttons.
+  const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
+  // A builtin OAuth row whose grant needs a reconnect (#2931). Connect and
+  // Configure keep their own gates and both already re-run the app's login;
+  // only their label changes, so the action reads as what it does.
+  const reconnectNeeded = app.auth_type === "builtin_oauth" && needsReconnect(app)
+  const reconnectButtonContent = <><RefreshCw className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.reconnect')}</>
+
+  return (
+    <>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md text-center p-0 overflow-hidden bg-white shadow-xl">
+        <div className="relative pt-12 pb-8 px-8 flex flex-col items-center">
+          <div className="absolute top-0 left-0 w-full h-24 bg-gradient-to-b from-slate-50 to-white -z-10" />
+
+          <div className="h-20 w-20 bg-white rounded-2xl shadow-sm border border-slate-100 flex items-center justify-center mb-6 overflow-hidden relative group">
+            {app.icon ? (
+              <img
+                src={app.icon}
+                alt={`${app.name} logo`}
+                className="w-12 h-12 object-contain group-hover:scale-110 transition-transform duration-300"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).src = `https://ui-avatars.com/api/?name=${encodeURIComponent(app.name)}&background=random&color=fff&size=128`
+                }}
+              />
+            ) : (
+              <div className="w-12 h-12 flex items-center justify-center bg-blue-50 text-blue-600 rounded-xl font-bold text-2xl shrink-0">
+                {app.name.charAt(0).toUpperCase()}
+              </div>
+            )}
+          </div>
+
+          <DialogTitle className="text-2xl font-bold text-slate-900 mb-3 tracking-tight">
+            {app.name}
+          </DialogTitle>
+
+          {isGloballyConnected && app.connected_account && (
+            <div className="mb-4 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 border border-blue-100 text-blue-700 text-sm font-medium">
+              <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
+              {app.connected_account}
+            </div>
+          )}
+
+          {reconnectNeeded && (
+            <div role="status" className="mb-4 flex w-full items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-left text-sm text-amber-800">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{t('tools.mcp.dialog.reconnectNotice', { name: app.name })}</span>
+            </div>
+          )}
+
+          {/* The ownership badge reports team-sharing status, which is not a
+              credential fact, so it does not gate on isGloballyConnected.
+              Number.isInteger(app.server_id) requires the entry to have a
+              sharing identity at all; without it an entry with no connector id
+              would render "Private" from a shared field nobody set.
+              typeof app.shared === "boolean" holds for a well-formed answer
+              from the sharing route -- the picker's merge and the Tools page's
+              own lookup both only ever write a sanitized triple -- or for a
+              shared field the /api/mcp/apps listing itself chose to supply
+              (sanitizeAppIntegrations does not strip unknown fields).
+              Number.isInteger(app.server_id) is what keeps that second case
+              from rendering a badge on an entry with no sharing identity at
+              all. The button gate below (isNonOwnedTeamTool) deliberately
+              keeps reading app.shared for truthiness rather than matching
+              this boolean check -- that gate only needs to know whether
+              sharing is active at all, not whether the field is well-formed,
+              so the mismatch with this badge condition is intentional. */}
+          {inTeam && Number.isInteger(app.server_id) && typeof app.shared === "boolean" && (
+            <div className={`mb-4 inline-flex items-center px-3 py-1 rounded-full text-sm font-medium border ${app.shared ? 'bg-blue-50 border-blue-100 text-blue-700' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
+              {!app.shared
+                ? t('tools.mcp.sharing.private')
+                : app.is_owner
+                  ? t('tools.mcp.sharing.shared')
+                  : t('tools.mcp.sharing.teamTool')}
+              {app.needs_config && ` · ${t('tools.mcp.sharing.needsConfig')}`}
+            </div>
+          )}
+
+          <p className="text-slate-500 mb-8 max-w-sm leading-relaxed">
+            {app.description}
+          </p>
+
+          <div className="flex flex-col items-center justify-center gap-3 w-full">
+            {/* The Picker authorizes with the grant's token, which a reconnect-needed grant no longer has. */}
+            {isGloballyConnected && !reconnectNeeded && app.id === "google-drive" && app.picker_configured !== false && (
+              <GoogleDrivePickerButton
+                connectedAccount={app.connected_account}
+                // Radix's modal focus trap/pointer lock can interfere with
+                // Picker's iframe, which is mounted outside DialogContent.
+                // Close this settings dialog before the browser Picker opens.
+                onBeforeOpen={() => onOpenChange(false)}
+                onPickerOpenChange={onPickerOpenChange}
+              />
+            )}
+            {!isGloballyConnected && (
+              <Button
+                className="w-full max-w-[200px] rounded-full h-11 font-medium bg-blue-600 text-white hover:bg-blue-700"
+                onClick={() => handleConnectApp(app)}
+                disabled={isConnecting}
+              >
+                {isConnecting ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> {t('tools.mcp.dialog.connecting')}</>
+                ) : reconnectNeeded ? (
+                  reconnectButtonContent
+                ) : (
+                  <><Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.connect')}</>
+                )}
+              </Button>
+            )}
+
+            {/* Configure / manage-my-key: gated on configurable, not on
+                isGloballyConnected. It is the one button here whose
+                availability answers a different question than the two below —
+                "does the edit route resolve for this viewer" rather than "is
+                this entry connected". */}
+            {configurable && !isNonOwnedTeamTool && !isKeyless && (
+              <Button
+                className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
+                onClick={() => {
+                  // Key-based apps: users only manage their own key, never the
+                  // shared server config. Route to the key dialog, not the form.
+                  if (isKeyBased && onManageKey) {
+                    onManageKey(app);
+                  } else if (app.is_custom && onConfigure) {
+                    onConfigure(app);
+                  } else {
+                    handleConnectApp(app);
+                  }
+                }}
+              >
+                {reconnectNeeded ? (
+                  reconnectButtonContent
+                ) : (
+                  <>
+                    <Settings className="h-4 w-4 mr-2" />
+                    {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
+                  </>
+                )}
+              </Button>
+            )}
+            {/* "Make team" / "Make personal": only the owner (or a team admin,
+                enforced server-side) can change ownership. Hidden on non-owned
+                team tools. Unlike Configure, this route lives entirely in the
+                overlay layer, whose precondition upstream cannot answer, so it
+                keeps reading isGloballyConnected. */}
+            {isGloballyConnected && inTeam && Number.isInteger(app.server_id) && !isNonOwnedTeamTool && (
+              <Button
+                variant="outline"
+                className="w-full max-w-[200px] rounded-full h-11 font-medium"
+                onClick={() => handleToggleShare(app, !app.shared)}
+              >
+                {app.shared ? (
+                  <><UserMinus className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.unshare')}</>
+                ) : (
+                  <><Users className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.share')}</>
+                )}
+              </Button>
+            )}
+            {/* Disconnect deletes the row outright (DELETE .../servers/{id} or
+                .../custom-apis/{id}), so it is meaningful even with zero
+                grants — unlike Configure it keeps its own is_connected-based
+                door, which is a separate, pre-existing gate mismatch tracked
+                on its own and not addressed here. */}
+            {isGloballyConnected && !isNonOwnedTeamTool && (
+              <Button
+                variant="outline"
+                className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+                onClick={() => handleDisconnectApp(app)}
+              >
+                <Unlink className="h-4 w-4 mr-2" /> {(app.is_custom && !isKeyBased) ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
+              </Button>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+    {accountDialog}
+    </>
+  )
+}

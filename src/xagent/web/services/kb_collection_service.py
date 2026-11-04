@@ -1,0 +1,670 @@
+"""Collection-level filesystem and UploadedFile coordination helpers."""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, List, Mapping, Optional, Set, Tuple
+
+from filelock import Timeout
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from ...config import get_uploads_dir
+from ..config import get_upload_path, sanitize_path_component
+from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
+from ..models.uploaded_file import UploadedFile
+from .kb_file_service import (
+    KB_RETAINED_DIR,
+    _delete_uploaded_file_if_orphaned_impl,
+    find_referenced_file_ids,
+)
+from .uploaded_file_store import UploadedFileStore, UploadedFileVersionConflict
+
+if TYPE_CHECKING:
+    from ...core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
+    from ...core.tools.core.RAG_tools.kb import KBFileCompatibilityFacade
+
+logger = logging.getLogger(__name__)
+
+
+def _get_file_compatibility_facade() -> "KBFileCompatibilityFacade":
+    from ...core.tools.core.RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().file_compatibility
+
+
+@dataclass(frozen=True)
+class CollectionPhysicalDeleteResult:
+    """Outcome of attempting to move a collection directory to trash."""
+
+    status: str
+    error: Optional[str] = None
+    collection_dir: Optional[Path] = None
+
+
+@dataclass(frozen=True)
+class CollectionPhysicalRenameResult:
+    """Outcome of attempting to rename a collection directory and file paths."""
+
+    status: str
+    error: Optional[str] = None
+    old_collection_dir: Optional[Path] = None
+    new_collection_dir: Optional[Path] = None
+
+
+@dataclass(frozen=True)
+class CollectionCleanupReport:
+    """What a collection delete reports once each owner's directory is handled.
+
+    Only owners in ``rows_deletable_owner_ids`` may lose their UploadedFile rows.
+    """
+
+    status: str
+    message: str
+    warnings: Tuple[str, ...]
+    rows_deletable_owner_ids: frozenset[int]
+
+
+def _path_belongs_to_collection_dir(
+    storage_path: str,
+    *,
+    owner_id: int,
+    collection_name: str,
+) -> bool:
+    """Return True when a stored path is under the owner's collection dir."""
+    try:
+        collection_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=collection_name,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        ).resolve()
+        file_path = Path(storage_path).resolve()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Skipping collection owner discovery for invalid path %s: %s",
+            storage_path,
+            exc,
+        )
+        return False
+    return file_path == collection_dir or collection_dir in file_path.parents
+
+
+def _list_collection_uploaded_file_owner_ids_impl(
+    db: Session,
+    *,
+    collection_name: str,
+) -> Set[int]:
+    """List UploadedFile owners with files under a collection directory."""
+    owner_ids: Set[int] = set()
+    try:
+        safe_collection = sanitize_path_component(collection_name, "collection")
+    except ValueError:
+        logger.debug("Invalid collection name for UploadedFile owner discovery")
+        return owner_ids
+
+    try:
+        candidates = (
+            db.query(UploadedFile.user_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id.isnot(None),
+                UploadedFile.storage_path.contains(safe_collection),
+            )
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to list UploadedFile owner candidates for %s: %s",
+            collection_name,
+            exc,
+        )
+        return owner_ids
+
+    for row in candidates:
+        raw_user_id = getattr(row, "user_id", None)
+        storage_path = getattr(row, "storage_path", None)
+        if raw_user_id is None or not storage_path:
+            continue
+        try:
+            owner_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            logger.debug("Skipping invalid UploadedFile user_id: %r", raw_user_id)
+            continue
+        if _path_belongs_to_collection_dir(
+            str(storage_path),
+            owner_id=owner_id,
+            collection_name=safe_collection,
+        ):
+            owner_ids.add(owner_id)
+    return owner_ids
+
+
+class _RetentionError(Exception):
+    """Carries a reason safe to return to API callers; the cause is only logged."""
+
+
+def _retain_referenced_files(db: Session, collection_dir: Path) -> None:
+    """Repoint referenced rows under ``collection_dir`` outside it, linking files."""
+    # Rows store the composed or the resolved spelling; the exact check below
+    # drops what SQLite's case-insensitive LIKE over-matches.
+    prefixes = (str(collection_dir) + os.sep, str(collection_dir.resolve()) + os.sep)
+    try:
+        candidates = (
+            db.query(UploadedFile)
+            .filter(
+                or_(
+                    *(
+                        UploadedFile.storage_path.startswith(p, autoescape=True)
+                        for p in prefixes
+                    )
+                )
+            )
+            .all()
+        )
+        rows = [row for row in candidates if str(row.storage_path).startswith(prefixes)]
+        referenced = (
+            find_referenced_file_ids(str(row.file_id) for row in rows)
+            if rows
+            else set()
+        )
+    except Exception as exc:
+        raise _RetentionError(
+            "Could not check which files other documents still reference."
+        ) from exc
+    kept = [row for row in rows if str(row.file_id) in referenced]
+    if not kept:
+        return
+    targets: List[tuple[UploadedFile, Path]] = []
+    copies: List[Path] = []
+    linked: List[Path] = []
+    try:
+        for row in kept:
+            source = Path(str(row.storage_path))
+            target = (
+                get_upload_path("", user_id=int(row.user_id))
+                / KB_RETAINED_DIR
+                / str(row.file_id)
+                / source.name
+            )
+            targets.append((row, target))
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                copies.append(target)
+                target.unlink(missing_ok=True)
+                try:
+                    os.link(source, target)
+                    linked.append(source)
+                except OSError:
+                    # Known ceiling: this copy blocks the event loop under the lock.
+                    shutil.copy2(source, target)
+    except Exception as exc:
+        for copy in copies:
+            copy.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                copy.parent.rmdir()
+        raise _RetentionError(
+            "Could not copy out files other documents still reference."
+        ) from exc
+    # Only after every copy, so a failed copy leaves the caller's session alone.
+    for row, target in targets:
+        row.storage_path = str(target)  # type: ignore[assignment]
+    try:
+        # Before the move, so a later rollback cannot point rows into the trash.
+        db.commit()
+    except Exception as exc:
+        # A failed commit may still have landed; its copies stay.
+        db.rollback()
+        raise _RetentionError("Could not commit before moving the directory.") from exc
+    # Old names go only now, so an ingest into a directory that then fails to
+    # move cannot write through them into the retained files.
+    for source in linked:
+        try:
+            source.unlink()
+        except OSError:
+            logger.warning("Kept a second name for %s", source, exc_info=True)
+
+
+def _delete_collection_physical_dir_impl(
+    db: Session,
+    *,
+    user_id: int,
+    collection_name: str,
+) -> CollectionPhysicalDeleteResult:
+    """Move a collection directory to trash, keeping files documents still use."""
+    collection_dir: Optional[Path] = None
+    try:
+        collection_dir = get_upload_path(
+            "", user_id=user_id, collection=collection_name
+        )
+        with collection_physical_lock(collection_dir):
+            try:
+                _retain_referenced_files(db, collection_dir)
+            except _RetentionError as exc:
+                logger.warning(
+                    "Kept collection directory %s: %s",
+                    collection_dir,
+                    exc,
+                    exc_info=True,
+                )
+                return CollectionPhysicalDeleteResult(
+                    status="failed",
+                    error=f"{exc} The directory was kept",
+                    collection_dir=collection_dir,
+                )
+            if not collection_dir.exists() or not collection_dir.is_dir():
+                logger.debug(
+                    "Collection directory does not exist (or is not a directory): %s. "
+                    "This is normal for collections without physical files.",
+                    collection_dir,
+                )
+                return CollectionPhysicalDeleteResult(
+                    status="not_found",
+                    collection_dir=collection_dir,
+                )
+            move_collection_dir_to_trash(
+                collection_dir,
+                get_uploads_dir(),
+                user_id,
+                collection_name,
+            )
+        logger.info("Collection directory moved to trash: %s", collection_dir)
+        return CollectionPhysicalDeleteResult(
+            status="success",
+            collection_dir=collection_dir,
+        )
+    except Timeout:
+        return CollectionPhysicalDeleteResult(
+            status="failed",
+            error="Another operation is in progress; please try again later.",
+            collection_dir=collection_dir,
+        )
+    except (PermissionError, OSError) as exc:
+        logger.error(
+            "Failed to move collection directory to trash for %s: %s",
+            collection_name,
+            exc,
+        )
+        return CollectionPhysicalDeleteResult(
+            status="failed",
+            error=str(exc),
+            collection_dir=collection_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Error determining collection directory path for %s: %s",
+            collection_name,
+            exc,
+        )
+        return CollectionPhysicalDeleteResult(
+            status="error",
+            error=f"Path resolution error: {exc}",
+            collection_dir=collection_dir,
+        )
+
+
+def _delete_collection_uploaded_files_impl(
+    db: Session,
+    *,
+    user_id: int,
+    collection_file_ids: Set[str],
+    remaining_file_ids: Set[str],
+    collection_dir: Optional[Path],
+    after_commit: List[tuple[str, Callable[[], None]]],
+) -> int:
+    """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
+    deleted_uploaded_files = 0
+    deleted_file_ids: Set[str] = set()
+
+    for current_file_id in collection_file_ids:
+        if _delete_uploaded_file_if_orphaned_impl(
+            db,
+            file_id=current_file_id,
+            user_id=user_id,
+            remaining_file_ids=remaining_file_ids,
+            after_commit=after_commit,
+        ):
+            deleted_uploaded_files += 1
+            deleted_file_ids.add(current_file_id)
+
+    if collection_dir is not None:
+        # Rows hold the composed or the resolved path; they differ behind a symlink.
+        dirs = {str(collection_dir), str(collection_dir.resolve())}
+        prefixes = tuple(d + os.sep for d in dirs)
+        query = db.query(UploadedFile).filter(
+            UploadedFile.user_id == user_id,
+            UploadedFile.storage_status != "compensating",
+            or_(
+                UploadedFile.storage_path.in_(dirs),
+                *(
+                    # PostgreSQL's LIKE would otherwise take a backslash as an escape.
+                    UploadedFile.storage_path.startswith(p, autoescape=True)
+                    for p in prefixes
+                ),
+            ),
+        )
+        # Exclude file_ids already deleted in the first pass to avoid double-count
+        if deleted_file_ids:
+            query = query.filter(UploadedFile.file_id.notin_(deleted_file_ids))
+        store = UploadedFileStore(db)
+        for file_record in query.all():
+            path = str(file_record.storage_path)
+            # SQLite's LIKE ignores ASCII case.
+            if path not in dirs and not path.startswith(prefixes):
+                continue
+            try:
+                store.delete(file_record, delete_local=False, after_commit=after_commit)
+            except UploadedFileVersionConflict:
+                # A cleanup claimant or replacement generation owns this row.
+                continue
+            deleted_uploaded_files += 1
+
+    return deleted_uploaded_files
+
+
+def _rename_collection_storage_impl(
+    db: Session,
+    *,
+    user_id: int,
+    old_collection_name: str,
+    new_collection_name: str,
+    collection_file_ids: Set[str],
+) -> CollectionPhysicalRenameResult:
+    """Rename collection directory and update UploadedFile storage paths."""
+    old_collection_dir: Optional[Path] = None
+    new_collection_dir: Optional[Path] = None
+
+    try:
+        old_collection_dir = get_upload_path(
+            "",
+            user_id=user_id,
+            collection=old_collection_name,
+            create_if_not_exists=False,
+        )
+        new_collection_dir = get_upload_path(
+            "",
+            user_id=user_id,
+            collection=new_collection_name,
+            create_if_not_exists=False,
+        )
+
+        if not old_collection_dir.exists() or not old_collection_dir.is_dir():
+            logger.debug(
+                "Collection directory does not exist (or is not a directory): %s. "
+                "This is normal for collections without physical files.",
+                old_collection_dir,
+            )
+            return CollectionPhysicalRenameResult(
+                status="not_found",
+                old_collection_dir=old_collection_dir,
+                new_collection_dir=new_collection_dir,
+            )
+
+        if new_collection_dir.exists():
+            return CollectionPhysicalRenameResult(
+                status="failed",
+                error=(
+                    "Cannot rename collection: target directory already exists. "
+                    f"A collection named '{new_collection_name}' already has physical files."
+                ),
+                old_collection_dir=old_collection_dir,
+                new_collection_dir=new_collection_dir,
+            )
+
+        with collection_physical_lock(old_collection_dir):
+            old_str = str(old_collection_dir)
+            new_str = str(new_collection_dir)
+            uploads_resolved = get_uploads_dir().resolve()
+            records_query = db.query(UploadedFile).filter(
+                UploadedFile.user_id == user_id
+            )
+            if collection_file_ids:
+                records_query = records_query.filter(
+                    or_(
+                        UploadedFile.file_id.in_(sorted(collection_file_ids)),
+                        UploadedFile.storage_path.startswith(old_str + os.sep),
+                    )
+                )
+            else:
+                records_query = records_query.filter(
+                    UploadedFile.storage_path.startswith(old_str + os.sep)
+                )
+            records = records_query.all()
+            previous_paths: dict[int, str] = {
+                int(getattr(rec, "id")): str(getattr(rec, "storage_path"))
+                for rec in records
+            }
+            for rec in records:
+                if not rec.storage_path.startswith(old_str + os.sep):
+                    continue
+                suffix = rec.storage_path[len(old_str) :]
+                if ".." in suffix:
+                    logger.warning(
+                        "Skipping storage_path update (invalid suffix): %s",
+                        suffix,
+                    )
+                    continue
+                new_path = new_str + suffix
+                try:
+                    Path(new_path).resolve().relative_to(uploads_resolved)
+                except ValueError:
+                    logger.warning(
+                        "Skipping storage_path update (path outside uploads directory): %s",
+                        new_path,
+                    )
+                    continue
+                rec.storage_path = new_path  # type: ignore[assignment]
+            db.commit()
+            if records:
+                logger.info(
+                    "Updated %d uploaded_files record(s) for renamed collection %s -> %s",
+                    len(records),
+                    old_collection_name,
+                    new_collection_name,
+                )
+
+            import shutil
+
+            try:
+                shutil.move(str(old_collection_dir), str(new_collection_dir))
+            except Exception as move_exc:  # noqa: BLE001
+                logger.error(
+                    "Physical collection move failed after DB update for %s -> %s: %s; rolling back DB paths",
+                    old_collection_name,
+                    new_collection_name,
+                    move_exc,
+                )
+                for rec in records:
+                    prior = previous_paths.get(int(getattr(rec, "id")), None)
+                    if prior is not None:
+                        rec.storage_path = prior  # type: ignore[assignment]
+                try:
+                    db.commit()
+                except Exception as rollback_exc:  # noqa: BLE001
+                    logger.exception(
+                        "Rollback DB paths failed for collection rename %s -> %s: %s",
+                        old_collection_name,
+                        new_collection_name,
+                        rollback_exc,
+                    )
+                raise
+
+        logger.info(
+            "Physically renamed collection directory: %s -> %s",
+            old_collection_dir,
+            new_collection_dir,
+        )
+        return CollectionPhysicalRenameResult(
+            status="success",
+            old_collection_dir=old_collection_dir,
+            new_collection_dir=new_collection_dir,
+        )
+    except Timeout:
+        return CollectionPhysicalRenameResult(
+            status="failed",
+            error="Another operation is in progress; please try again later.",
+            old_collection_dir=old_collection_dir,
+            new_collection_dir=new_collection_dir,
+        )
+    except (PermissionError, OSError) as exc:
+        logger.error(
+            "Failed to physically rename collection directory for %s: %s",
+            old_collection_name,
+            exc,
+        )
+        return CollectionPhysicalRenameResult(
+            status="failed",
+            error=str(exc),
+            old_collection_dir=old_collection_dir,
+            new_collection_dir=new_collection_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Error determining collection directory path for rename %s -> %s: %s",
+            old_collection_name,
+            new_collection_name,
+            exc,
+        )
+        return CollectionPhysicalRenameResult(
+            status="error",
+            error=f"Path resolution error: {exc}",
+            old_collection_dir=old_collection_dir,
+            new_collection_dir=new_collection_dir,
+        )
+
+
+def list_collection_uploaded_file_owner_ids(
+    db: Session,
+    *,
+    collection_name: str,
+) -> Set[int]:
+    """List UploadedFile owners with files under a collection directory."""
+    return _get_file_compatibility_facade().list_collection_uploaded_file_owner_ids(
+        db,
+        collection_name=collection_name,
+    )
+
+
+def delete_collection_physical_dir(
+    db: Session,
+    *,
+    user_id: int,
+    collection_name: str,
+) -> CollectionPhysicalDeleteResult:
+    """Move a collection directory to trash, keeping files documents still use.
+
+    Rows under it that a document references are repointed outside it, their
+    local files hard-linked or copied, and ``db`` committed before the move; if
+    that fails, nothing moves.
+    """
+    return _get_file_compatibility_facade().delete_collection_physical_dir(
+        db,
+        user_id=user_id,
+        collection_name=collection_name,
+    )
+
+
+def delete_collection_uploaded_files(
+    db: Session,
+    *,
+    user_id: int,
+    collection_file_ids: Set[str],
+    remaining_file_ids: Set[str],
+    collection_dir: Optional[Path],
+    after_commit: List[tuple[str, Callable[[], None]]],
+) -> int:
+    """Delete orphan UploadedFile rows for a collection, with legacy path fallback.
+
+    Never commits; the caller commits, then runs ``after_commit``.
+    """
+    return _get_file_compatibility_facade().delete_collection_uploaded_files(
+        db,
+        user_id=user_id,
+        collection_file_ids=collection_file_ids,
+        remaining_file_ids=remaining_file_ids,
+        collection_dir=collection_dir,
+        after_commit=after_commit,
+    )
+
+
+def classify_collection_physical_cleanup(
+    result: CollectionOperationResult,
+    physical_cleanup_by_owner: Mapping[int, CollectionPhysicalDeleteResult],
+    *,
+    collection_name: str,
+) -> CollectionCleanupReport:
+    """Report a collection delete after each owner's directory cleanup.
+
+    The caller returns ``error`` results itself; passing one raises ``ValueError``.
+    Notes follow ``physical_cleanup_by_owner`` order. A ``success`` result
+    becomes ``partial_success`` when an ``error`` or ``failed`` cleanup has an
+    error. Only owners whose cleanup is ``success``/``not_found`` may lose rows.
+    """
+    if result.status == "error":
+        raise ValueError("error results are returned by the caller, not classified")
+    notes: List[str] = []
+    rows_deletable_owner_ids: Set[int] = set()
+    has_issue = False
+    for owner_id, cleanup in physical_cleanup_by_owner.items():
+        if cleanup.status == "success":
+            rows_deletable_owner_ids.add(owner_id)
+            collection_dir = cleanup.collection_dir or get_upload_path(
+                "", user_id=owner_id, collection=collection_name
+            )
+            notes.append(
+                f"Physical directory moved to trash for user_{owner_id}: "
+                f"{collection_dir} "
+                "(trash cleanup requires external scheduler/cron)"
+            )
+        elif cleanup.status == "not_found":
+            rows_deletable_owner_ids.add(owner_id)
+            notes.append(
+                f"Physical directory cleanup for user_{owner_id}: "
+                "No physical directory found (collection had no files)"
+            )
+        elif cleanup.status == "error" and cleanup.error:
+            has_issue = True
+            notes.append(
+                f"Physical directory cleanup for user_{owner_id}: Warning - "
+                f"{cleanup.error}. Database deletion proceeded, but "
+                "physical file cleanup status is uncertain."
+            )
+        elif cleanup.status == "failed" and cleanup.error:
+            has_issue = True
+            notes.append(
+                f"Physical directory cleanup for user_{owner_id}: Failed - "
+                f"{cleanup.error}"
+            )
+
+    status = result.status
+    if status == "success" and has_issue:
+        status = "partial_success"
+    return CollectionCleanupReport(
+        status=status,
+        message=f"{result.message} {'; '.join(notes)}." if notes else result.message,
+        warnings=(*result.warnings, *notes),
+        rows_deletable_owner_ids=frozenset(rows_deletable_owner_ids),
+    )
+
+
+def rename_collection_storage(
+    db: Session,
+    *,
+    user_id: int,
+    old_collection_name: str,
+    new_collection_name: str,
+    collection_file_ids: Set[str],
+) -> CollectionPhysicalRenameResult:
+    """Rename collection directory and update UploadedFile storage paths."""
+    return _get_file_compatibility_facade().rename_collection_storage(
+        db,
+        user_id=user_id,
+        old_collection_name=old_collection_name,
+        new_collection_name=new_collection_name,
+        collection_file_ids=collection_file_ids,
+    )

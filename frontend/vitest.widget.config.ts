@@ -1,0 +1,271 @@
+import { defineConfig, mergeConfig } from "vitest/config"
+import baseConfig from "./vitest.config"
+
+const widgetConfig = mergeConfig(baseConfig, defineConfig({
+  test: {
+    coverage: {
+      provider: "istanbul",
+      include: [
+        "public/widget.js",
+        "src/app/widget/chat/[[]token[]]/page-client.tsx",
+        "src/components/chat/ChatInput.tsx",
+        "src/components/chat/ChatMessage.tsx",
+        "src/components/chat/ChatStartScreen.tsx",
+        "src/components/chat/clarification-form.tsx",
+        "src/components/chat/connector-runtime-dialog.tsx",
+        "src/components/chat/connector-runtime-dialog-state.ts",
+        "src/components/chat/TraceEventRenderer.tsx",
+        "src/components/file/file-preview-content.tsx",
+        "src/components/file/file-viewer.tsx",
+        "src/components/file/inline-file-preview.tsx",
+        "src/components/file/artifact-validation.tsx",
+        "src/components/file/pptx-preview-renderer.tsx",
+        "src/components/file/excel-preview-renderer.tsx",
+        "src/components/file/excel-sheet-preview.ts",
+        "src/components/task/task-conversation-panel.tsx",
+        "src/components/ui/markdown-renderer.tsx",
+        "src/components/widget/public-agent-chat-page.tsx",
+        "src/components/widget/session-agent-chat-page.tsx",
+        "src/components/widget/use-session-attachments.ts",
+        "src/components/widget/use-session-open-message.ts",
+        "src/components/widget/use-widget-session.ts",
+        "src/components/widget/widget-chrome-controls.tsx",
+        "src/contexts/app-context-chat.tsx",
+        "src/contexts/auth-context.tsx",
+        "src/contexts/connector-runtime-dialog-context.tsx",
+        "src/contexts/file-access-context.tsx",
+        "src/hooks/use-file-mention.ts",
+        "src/hooks/use-websocket.ts",
+        "src/hooks/use-widget-initial-message.ts",
+        "src/hooks/use-widget-open-message.ts",
+        "src/lib/api-wrapper.ts",
+        "src/lib/auth-cache.ts",
+        "src/lib/connector-runtime-api.ts",
+        "src/lib/files-disabled-presentation.ts",
+        "src/lib/remark-currency-safe-math.ts",
+        "src/lib/remark-preserve-table-content.ts",
+        "src/lib/send-failure-notice.ts",
+        "src/lib/widget-parent-message.ts",
+        "src/lib/widget-session-upload.ts",
+        "src/contexts/presentation-capabilities.tsx",
+        "src/app/settings/page.tsx",
+        "src/components/layout/sidebar.tsx",
+        "src/components/pages/login.tsx",
+        "src/components/pages/oidc-callback.tsx",
+      ],
+      reporter: ["text", "json-summary"],
+      reportsDirectory: "coverage/widget",
+      thresholds: {
+        // Every included owner has an explicit floor below. Vitest applies
+        // numeric top-level thresholds to every file when perFile is enabled,
+        // so keeping a global floor here would override the intentional floors
+        // for large shared owners.
+        perFile: true,
+
+        // The original widget surfaces retain their existing contract floors.
+        "public/widget.js": {
+          statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/components/widget/public-agent-chat-page.tsx": {
+          statements: 80, branches: 55, functions: 45, lines: 80,
+        },
+
+        // Dedicated Session and presentation owners have focused regression
+        // suites, so retain stronger per-file floors for those contracts.
+        "src/app/widget/chat/[[]token[]]/page-client.tsx": {
+          statements: 90, branches: 75, functions: 90, lines: 90,
+        },
+        "src/components/chat/connector-runtime-dialog.tsx": {
+          statements: 90, branches: 85, functions: 95, lines: 90,
+        },
+        "src/components/chat/connector-runtime-dialog-state.ts": {
+          statements: 95, branches: 85, functions: 95, lines: 95,
+        },
+        "src/components/widget/session-agent-chat-page.tsx": {
+          statements: 90, branches: 85, functions: 75, lines: 90,
+        },
+        "src/components/widget/use-session-attachments.ts": {
+          statements: 90, branches: 85, functions: 75, lines: 90,
+        },
+        "src/components/widget/use-session-open-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/components/widget/use-widget-session.ts": {
+          statements: 95, branches: 80, functions: 90, lines: 95,
+        },
+        "src/components/widget/widget-chrome-controls.tsx": {
+          statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/lib/widget-session-upload.ts": {
+          statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/lib/widget-parent-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/send-failure-notice.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/files-disabled-presentation.ts": {
+          statements: 85, branches: 80, functions: 90, lines: 85,
+        },
+        "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+        "src/lib/connector-runtime-api.ts": {
+          statements: 95, branches: 85, functions: 95, lines: 95,
+        },
+        "src/contexts/connector-runtime-dialog-context.tsx": {
+          statements: 95, branches: 85, functions: 75, lines: 95,
+        },
+        "src/lib/remark-currency-safe-math.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/lib/remark-preserve-table-content.ts": {
+          statements: 95, branches: 80, functions: 100, lines: 95,
+        },
+        "src/contexts/presentation-capabilities.tsx": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/contexts/file-access-context.tsx": {
+          statements: 85, branches: 75, functions: 85, lines: 85,
+        },
+
+        // Large shared owners have broad behavior outside this lane. Keep an
+        // explicit nonzero regression floor instead of weakening widget floors
+        // globally or excluding the owners from required CI.
+        "src/contexts/app-context-chat.tsx": {
+          statements: 40, branches: 60, functions: 60, lines: 40,
+        },
+        "src/hooks/use-widget-initial-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/hooks/use-widget-open-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/hooks/use-websocket.ts": { statements: 80, branches: 75, functions: 65, lines: 80 },
+        "src/lib/api-wrapper.ts": { statements: 75, branches: 65, functions: 60, lines: 75 },
+        "src/contexts/auth-context.tsx": { statements: 70, branches: 65, functions: 90, lines: 70 },
+        "src/app/settings/page.tsx": { statements: 75, branches: 50, functions: 50, lines: 75 },
+        "src/components/layout/sidebar.tsx": { statements: 35, branches: 40, functions: 10, lines: 35 },
+        "src/components/pages/login.tsx": { statements: 85, branches: 55, functions: 60, lines: 85 },
+        "src/components/pages/oidc-callback.tsx": { statements: 75, branches: 45, functions: 95, lines: 75 },
+        "src/components/chat/ChatInput.tsx": { statements: 60, branches: 60, functions: 40, lines: 60 },
+        "src/components/chat/ChatMessage.tsx": { statements: 50, branches: 50, functions: 40, lines: 50 },
+        "src/components/chat/ChatStartScreen.tsx": { statements: 100, branches: 95, functions: 90, lines: 100 },
+        "src/components/chat/clarification-form.tsx": {
+          statements: 76, branches: 68, functions: 62, lines: 76,
+        },
+        "src/components/chat/TraceEventRenderer.tsx": {
+          statements: 80, branches: 75, functions: 75, lines: 80,
+        },
+        "src/components/file/file-preview-content.tsx": {
+          statements: 70, branches: 50, functions: 55, lines: 70,
+        },
+        "src/components/file/file-viewer.tsx": {
+          statements: 70, branches: 55, functions: 80, lines: 70,
+        },
+        "src/components/file/inline-file-preview.tsx": {
+          statements: 70, branches: 55, functions: 60, lines: 70,
+        },
+        "src/components/file/artifact-validation.tsx": {
+          statements: 90, branches: 80, functions: 90, lines: 90,
+        },
+        "src/components/file/pptx-preview-renderer.tsx": {
+          statements: 45, branches: 35, functions: 30, lines: 45,
+        },
+        "src/components/file/excel-preview-renderer.tsx": {
+          statements: 85, branches: 75, functions: 90, lines: 85,
+        },
+        "src/components/file/excel-sheet-preview.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/components/task/task-conversation-panel.tsx": {
+          statements: 80, branches: 70, functions: 60, lines: 80,
+        },
+        "src/components/ui/markdown-renderer.tsx": { statements: 65, branches: 65, functions: 75, lines: 65 },
+        "src/hooks/use-file-mention.ts": { statements: 60, branches: 60, functions: 60, lines: 60 },
+      },
+    },
+  },
+}))
+
+export default defineConfig({
+  ...widgetConfig,
+  test: {
+    ...widgetConfig.test,
+    // Vite concatenates arrays during merge, so replace the base glob after
+    // merging to keep this required lane targeted to the production paths
+    // exercised by the widget, Session, and browser-auth contracts.
+    include: [
+      "src/app/layout.test.tsx",
+      "src/ci/browser-security.test.ts",
+      "src/app/widget/chat/[token]/page-client.test.tsx",
+      "src/app/settings/page.test.tsx",
+      "src/components/settings/settings-content.test.tsx",
+      "src/components/chat/ChatInput.test.tsx",
+      "src/components/chat/FileChip.test.tsx",
+      "src/components/chat/chat-input-public-file-access.test.tsx",
+      "src/components/chat/ChatMessage.test.tsx",
+      "src/components/chat/ChatStartScreen.test.tsx",
+      "src/components/chat/TraceEventRenderer.test.tsx",
+      "src/components/chat/trace-event-processing.test.ts",
+      "src/components/chat/clarification-form.test.tsx",
+      "src/components/chat/connector-runtime-dialog.test.tsx",
+      "src/components/chat/connector-runtime-dialog-state.test.ts",
+      "src/components/file/file-preview-content.test.tsx",
+      "src/components/file/file-viewer.test.tsx",
+      "src/components/file/inline-file-preview.test.tsx",
+      "src/components/file/artifact-validation.test.tsx",
+      "src/components/file/pptx-preview-renderer.test.tsx",
+      "src/components/file/excel-preview-renderer.test.tsx",
+      "src/components/layout/sidebar.test.tsx",
+      "src/components/pages/login.test.tsx",
+      "src/components/pages/oidc-callback.test.tsx",
+      "src/components/task/task-conversation-panel.test.tsx",
+      "src/components/chat/voice-conversation.test.tsx",
+      "src/contexts/task-voice-context.test.tsx",
+      "src/hooks/use-voice-models.test.tsx",
+      "src/hooks/use-voice-preferences.test.tsx",
+      "src/components/settings/voice-settings.test.tsx",
+      "src/components/settings/settings-dialog.test.tsx",
+      "src/components/chat/voice-mode-button.test.tsx",
+      "src/lib/voice-conversation.test.ts",
+      "src/lib/voice-audio.test.ts",
+      "src/lib/voice-vad.test.ts",
+      "src/components/ui/__tests__/markdown-renderer.test.tsx",
+      "src/components/ui/markdown-description.test.tsx",
+      "src/components/ui/multi-select.test.tsx",
+      "src/components/widget/widget-bootstrap.test.ts",
+      "src/components/widget/widget-session.test.ts",
+      "src/components/widget/widget-chrome.test.ts",
+      "src/components/widget/widget-chrome-controls.test.tsx",
+      "src/components/widget/widget-open.test.ts",
+      "src/components/widget/public-agent-chat-page.test.tsx",
+      "src/components/widget/session-agent-chat-page.test.tsx",
+      "src/components/widget/session-agent-chat-page.integration.test.tsx",
+      "src/components/widget/use-session-attachments.test.tsx",
+      "src/components/widget/use-session-open-message.test.tsx",
+      "src/components/widget/use-widget-session.test.tsx",
+      "src/contexts/app-context-chat.test.tsx",
+      "src/contexts/auth-context.test.tsx",
+      "src/contexts/connector-runtime-dialog-context.test.tsx",
+      "src/contexts/file-access-context.test.tsx",
+      "src/hooks/use-file-mention.test.tsx",
+      "src/hooks/use-websocket.test.ts",
+      "src/hooks/use-widget-initial-message.test.tsx",
+      "src/hooks/use-widget-open-message.test.tsx",
+      "src/lib/api-wrapper.test.ts",
+      "src/lib/auth-cache.test.ts",
+      "src/ci/dependency-security.test.ts",
+      "src/test-utils/widget-script.test.ts",
+      "src/lib/websocket-auth.test.ts",
+      "src/lib/connector-runtime-api.test.ts",
+      "src/lib/files-disabled-presentation.test.ts",
+      "src/lib/remark-currency-safe-math.test.ts",
+      "src/lib/prompt-context-fields.test.ts",
+      "src/components/build/agent-builder-prompt-context-fields.test.tsx",
+      "src/lib/widget-parent-message.test.ts",
+      "src/lib/widget-session-upload.test.ts",
+      "src/lib/client-errors.test.ts",
+      "src/lib/send-failure-notice.test.ts",
+    ],
+  },
+})

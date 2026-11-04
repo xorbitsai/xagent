@@ -1,0 +1,1001 @@
+Sale_ID,Date,Category,Product,Unit_Price,Quantity,Total_Amount,Discount_Percent,Discount_Amount,Final_Amount,Region,Sales_Channel,Customer_ID,Payment_Method,Month,Quarter,Day_of_Week
+SALE-0001,2023-11-24,Electronics,Laptop,811.63,3,1738.48,13.8,239.52,1498.96,East,Retail Store,CUST-0373,Debit Card,11,4,Friday
+SALE-0002,2023-03-13,Electronics,Smartwatch,1242.12,6,7753.84,29.8,2308.03,5445.8,North,Mobile App,CUST-0161,Credit Card,3,1,Monday
+SALE-0003,2023-01-16,Electronics,Smartphone,678.06,3,2229.32,29.5,657.58,1571.74,South,Online,CUST-0131,Debit Card,1,1,Monday
+SALE-0004,2023-11-29,Books,Biography,94.8,2,153.77,0.5,0.74,153.03,South,Mobile App,CUST-0386,Cash,11,4,Wednesday
+SALE-0005,2023-01-04,Clothing,Jacket,99.23,1,103.1,19.9,20.49,82.61,East,Phone,CUST-0002,Debit Card,1,1,Wednesday
+SALE-0006,2023-04-21,Home & Garden,Coffee Maker,176.79,2,426.77,27.8,118.64,308.13,North,Mobile App,CUST-0351,Credit Card,4,2,Friday
+SALE-0007,2023-07-03,Home & Garden,Mirror,70.86,2,122.37,17.6,21.54,100.83,East,Online,CUST-0217,PayPal,7,3,Monday
+SALE-0008,2023-10-02,Electronics,Headphones,633.78,7,3183.2,11.8,377.1,2806.1,North,Phone,CUST-0136,Cash,10,4,Monday
+SALE-0009,2023-10-23,Clothing,T-Shirt,166.78,5,722.51,19.5,141.12,581.39,North,Retail Store,CUST-0028,Cash,10,4,Monday
+SALE-0010,2023-02-10,Clothing,T-Shirt,132.19,8,1420.73,17.7,252.02,1168.71,West,Phone,CUST-0214,PayPal,2,1,Friday
+SALE-0011,2023-11-22,Home & Garden,Lamp,49.08,7,323.71,14.8,47.95,275.75,East,Phone,CUST-0393,Debit Card,11,4,Wednesday
+SALE-0012,2023-12-10,Home & Garden,Coffee Maker,140.21,1,129.8,15.3,19.8,110.0,Central,Retail Store,CUST-0222,Debit Card,12,4,Sunday
+SALE-0013,2023-03-25,Sports,Basketball,121.45,7,1012.28,4.8,48.96,963.32,East,Retail Store,CUST-0066,Cash,3,1,Saturday
+SALE-0014,2023-01-29,Clothing,T-Shirt,73.21,4,389.67,16.2,63.05,326.62,East,Mobile App,CUST-0348,Cash,1,1,Sunday
+SALE-0015,2023-02-03,Clothing,Shoes,183.23,9,1915.27,4.9,94.61,1820.67,East,Retail Store,CUST-0411,PayPal,2,1,Friday
+SALE-0016,2023-07-22,Sports,Yoga Mat,185.37,6,839.02,16.7,140.48,698.55,East,Retail Store,CUST-0180,Debit Card,7,3,Saturday
+SALE-0017,2023-10-15,Books,Cookbook,54.75,1,34.82,29.9,10.42,24.4,Central,Mobile App,CUST-0187,PayPal,10,4,Sunday
+SALE-0018,2023-07-05,Clothing,Jeans,110.48,3,302.09,15.9,48.12,253.98,Central,Mobile App,CUST-0218,Credit Card,7,3,Wednesday
+SALE-0019,2023-01-25,Electronics,Smartphone,1972.74,6,12891.99,19.0,2445.5,10446.49,South,Mobile App,CUST-0198,Credit Card,1,1,Wednesday
+SALE-0020,2023-07-17,Sports,Tennis Racket,96.59,3,255.26,20.3,51.89,203.37,West,Phone,CUST-0403,Credit Card,7,3,Monday
+SALE-0021,2023-12-15,Electronics,Smartwatch,1451.18,8,11083.5,28.1,3114.67,7968.82,East,Phone,CUST-0129,Credit Card,12,4,Friday
+SALE-0022,2023-05-31,Sports,Yoga Mat,282.19,7,2416.98,24.5,592.56,1824.42,West,Online,CUST-0060,Cash,5,2,Wednesday
+SALE-0023,2023-09-14,Clothing,Shoes,199.33,7,913.81,10.5,95.73,818.08,North,Phone,CUST-0304,Debit Card,9,3,Thursday
+SALE-0024,2023-03-20,Home & Garden,Lamp,130.28,1,146.45,27.0,39.48,106.97,Central,Online,CUST-0340,Cash,3,1,Monday
+SALE-0025,2023-09-08,Electronics,Laptop,1203.3,2,1674.93,13.5,225.32,1449.61,East,Phone,CUST-0445,Debit Card,9,3,Friday
+SALE-0026,2023-01-30,Clothing,Shoes,148.19,8,1553.82,19.7,306.54,1247.27,North,Online,CUST-0033,PayPal,1,1,Monday
+SALE-0027,2023-02-05,Books,Textbook,63.09,6,456.48,26.8,122.16,334.32,South,Mobile App,CUST-0283,Debit Card,2,1,Sunday
+SALE-0028,2023-05-16,Books,Magazine,87.78,3,311.55,23.1,71.83,239.71,West,Retail Store,CUST-0017,Debit Card,5,2,Tuesday
+SALE-0029,2023-06-09,Sports,Dumbbells,444.66,5,2604.21,12.8,334.52,2269.69,West,Mobile App,CUST-0181,Credit Card,6,2,Friday
+SALE-0030,2023-05-07,Clothing,T-Shirt,196.46,1,209.38,5.1,10.65,198.74,East,Online,CUST-0281,Debit Card,5,2,Sunday
+SALE-0031,2023-10-29,Clothing,T-Shirt,171.96,6,720.51,7.6,54.94,665.57,North,Online,CUST-0490,Debit Card,10,4,Sunday
+SALE-0032,2023-02-04,Electronics,Tablet,1767.01,7,15082.63,7.7,1159.28,13923.35,North,Retail Store,CUST-0408,Cash,2,1,Saturday
+SALE-0033,2023-12-09,Sports,Yoga Mat,404.19,3,1133.99,11.3,127.77,1006.22,Central,Retail Store,CUST-0322,PayPal,12,4,Saturday
+SALE-0034,2023-05-05,Sports,Basketball,98.64,6,705.38,0.9,6.45,698.92,South,Online,CUST-0180,Credit Card,5,2,Friday
+SALE-0035,2023-12-04,Sports,Dumbbells,180.16,5,885.4,25.3,223.66,661.74,West,Mobile App,CUST-0480,PayPal,12,4,Monday
+SALE-0036,2023-01-28,Electronics,Laptop,1109.57,3,4280.02,8.1,347.75,3932.27,West,Phone,CUST-0092,Credit Card,1,1,Saturday
+SALE-0037,2023-05-08,Clothing,Jeans,65.15,5,308.43,27.5,84.68,223.75,Central,Mobile App,CUST-0239,Debit Card,5,2,Monday
+SALE-0038,2023-08-05,Clothing,Dress,118.86,7,654.56,13.1,85.55,569.01,West,Retail Store,CUST-0349,Credit Card,8,3,Saturday
+SALE-0039,2023-08-15,Books,Fiction Novel,11.3,5,35.02,9.3,3.27,31.75,North,Online,CUST-0446,Credit Card,8,3,Tuesday
+SALE-0040,2023-05-02,Clothing,Jacket,105.35,1,119.44,19.5,23.28,96.16,West,Mobile App,CUST-0250,Debit Card,5,2,Tuesday
+SALE-0041,2023-07-25,Electronics,Smartphone,1270.12,1,1096.6,20.5,225.01,871.59,West,Online,CUST-0016,PayPal,7,3,Tuesday
+SALE-0042,2023-05-16,Sports,Dumbbells,303.24,8,2987.55,17.2,513.89,2473.66,West,Mobile App,CUST-0033,Debit Card,5,2,Tuesday
+SALE-0043,2023-04-08,Home & Garden,Lamp,283.32,2,582.21,18.5,107.99,474.22,North,Online,CUST-0215,Cash,4,2,Saturday
+SALE-0044,2023-01-30,Electronics,Smartwatch,235.26,9,2431.07,20.8,505.34,1925.73,West,Retail Store,CUST-0114,Credit Card,1,1,Monday
+SALE-0045,2023-09-18,Electronics,Smartphone,1294.99,5,4986.83,24.2,1207.06,3779.77,North,Online,CUST-0177,Debit Card,9,3,Monday
+SALE-0046,2023-07-26,Electronics,Smartwatch,1490.13,5,5670.86,20.4,1156.59,4514.27,South,Online,CUST-0279,Credit Card,7,3,Wednesday
+SALE-0047,2023-08-03,Books,Magazine,84.38,6,344.42,3.0,10.33,334.08,Central,Phone,CUST-0100,Cash,8,3,Thursday
+SALE-0048,2023-04-15,Home & Garden,Lamp,41.02,4,212.76,19.0,40.33,172.43,East,Mobile App,CUST-0373,Debit Card,4,2,Saturday
+SALE-0049,2023-12-10,Home & Garden,Cushion,172.81,9,1314.78,27.9,367.19,947.59,East,Online,CUST-0186,Credit Card,12,4,Sunday
+SALE-0050,2023-08-23,Books,Magazine,41.58,2,73.1,20.6,15.09,58.01,North,Online,CUST-0442,Debit Card,8,3,Wednesday
+SALE-0051,2023-09-17,Home & Garden,Lamp,38.97,2,63.11,4.4,2.78,60.34,East,Online,CUST-0029,Debit Card,9,3,Sunday
+SALE-0052,2023-07-09,Home & Garden,Lamp,121.67,7,864.65,22.6,195.42,669.23,West,Phone,CUST-0070,Credit Card,7,3,Sunday
+SALE-0053,2023-12-08,Books,Cookbook,32.39,3,82.05,14.8,12.13,69.92,North,Retail Store,CUST-0141,Cash,12,4,Friday
+SALE-0054,2023-03-01,Electronics,Smartwatch,869.88,7,8695.02,17.5,1521.72,7173.3,South,Phone,CUST-0190,Cash,3,1,Wednesday
+SALE-0055,2023-11-06,Clothing,Dress,105.99,5,368.18,27.7,102.13,266.05,South,Phone,CUST-0252,PayPal,11,4,Monday
+SALE-0056,2023-05-09,Electronics,Laptop,240.21,1,290.34,17.5,50.9,239.45,West,Phone,CUST-0144,Credit Card,5,2,Tuesday
+SALE-0057,2023-01-02,Home & Garden,Lamp,288.23,8,2779.14,8.3,231.26,2547.88,East,Retail Store,CUST-0348,PayPal,1,1,Monday
+SALE-0058,2023-10-10,Sports,Tennis Racket,151.32,4,535.16,20.9,112.09,423.07,North,Online,CUST-0145,Credit Card,10,4,Tuesday
+SALE-0059,2023-12-20,Clothing,Shoes,94.02,3,318.44,28.5,90.74,227.7,North,Phone,CUST-0256,Debit Card,12,4,Wednesday
+SALE-0060,2023-08-09,Clothing,T-Shirt,185.45,5,556.32,11.3,62.83,493.49,East,Phone,CUST-0065,Credit Card,8,3,Wednesday
+SALE-0061,2023-07-03,Clothing,Jeans,197.35,1,190.45,14.1,26.78,163.67,North,Phone,CUST-0099,PayPal,7,3,Monday
+SALE-0062,2023-11-14,Clothing,Jeans,22.46,5,114.42,16.7,19.07,95.36,South,Retail Store,CUST-0485,PayPal,11,4,Tuesday
+SALE-0063,2023-01-13,Clothing,Dress,156.27,1,212.36,18.2,38.62,173.74,West,Retail Store,CUST-0446,Cash,1,1,Friday
+SALE-0064,2023-03-23,Electronics,Headphones,1768.62,2,4554.65,24.9,1135.98,3418.67,North,Mobile App,CUST-0306,Debit Card,3,1,Thursday
+SALE-0065,2023-04-13,Sports,Dumbbells,441.41,7,4289.91,18.6,798.32,3491.59,East,Retail Store,CUST-0066,Debit Card,4,2,Thursday
+SALE-0066,2023-01-13,Clothing,Jacket,182.57,2,401.81,13.1,52.73,349.07,East,Phone,CUST-0447,Credit Card,1,1,Friday
+SALE-0067,2023-05-23,Home & Garden,Mirror,143.51,3,534.25,23.9,127.65,406.59,West,Phone,CUST-0138,Credit Card,5,2,Tuesday
+SALE-0068,2023-03-01,Home & Garden,Lamp,88.6,5,540.75,6.3,33.93,506.82,Central,Phone,CUST-0043,Credit Card,3,1,Wednesday
+SALE-0069,2023-02-25,Books,Biography,23.67,6,193.07,5.4,10.43,182.64,East,Phone,CUST-0388,PayPal,2,1,Saturday
+SALE-0070,2023-11-07,Books,Fiction Novel,25.51,3,53.1,5.1,2.69,50.41,West,Retail Store,CUST-0092,Cash,11,4,Tuesday
+SALE-0071,2023-01-23,Sports,Running Shoes,278.85,2,546.12,9.9,54.08,492.03,Central,Retail Store,CUST-0411,Cash,1,1,Monday
+SALE-0072,2023-08-09,Electronics,Tablet,174.69,1,117.77,24.2,28.48,89.28,Central,Phone,CUST-0113,Credit Card,8,3,Wednesday
+SALE-0073,2023-06-03,Books,Cookbook,31.25,7,221.49,21.6,47.88,173.61,West,Phone,CUST-0154,PayPal,6,2,Saturday
+SALE-0074,2023-12-23,Home & Garden,Mirror,218.3,2,427.43,16.0,68.3,359.13,South,Retail Store,CUST-0015,PayPal,12,4,Saturday
+SALE-0075,2023-12-07,Sports,Yoga Mat,292.88,6,1636.04,3.6,58.78,1577.26,Central,Phone,CUST-0145,PayPal,12,4,Thursday
+SALE-0076,2023-10-08,Electronics,Tablet,751.56,4,2258.23,17.6,397.57,1860.66,East,Retail Store,CUST-0264,PayPal,10,4,Sunday
+SALE-0077,2023-10-24,Books,Cookbook,90.97,2,120.9,14.9,18.07,102.83,West,Mobile App,CUST-0454,PayPal,10,4,Tuesday
+SALE-0078,2023-12-12,Clothing,Shoes,62.7,4,286.0,2.6,7.54,278.46,West,Retail Store,CUST-0350,Credit Card,12,4,Tuesday
+SALE-0079,2023-05-26,Books,Magazine,46.94,4,258.85,26.9,69.63,189.22,East,Online,CUST-0468,Debit Card,5,2,Friday
+SALE-0080,2023-12-11,Home & Garden,Lamp,247.87,3,839.03,21.6,180.84,658.19,South,Retail Store,CUST-0203,Credit Card,12,4,Monday
+SALE-0081,2023-01-24,Clothing,Jacket,70.4,3,213.68,22.1,47.2,166.48,Central,Online,CUST-0140,PayPal,1,1,Tuesday
+SALE-0082,2023-08-01,Books,Textbook,23.89,4,65.67,17.8,11.7,53.97,West,Mobile App,CUST-0390,PayPal,8,3,Tuesday
+SALE-0083,2023-05-05,Clothing,T-Shirt,44.19,2,84.89,4.2,3.54,81.36,North,Mobile App,CUST-0329,Debit Card,5,2,Friday
+SALE-0084,2023-04-01,Books,Biography,41.4,1,59.47,22.4,13.31,46.16,North,Retail Store,CUST-0434,Credit Card,4,2,Saturday
+SALE-0085,2023-08-22,Clothing,Jacket,151.56,8,976.99,1.4,14.1,962.9,Central,Phone,CUST-0349,PayPal,8,3,Tuesday
+SALE-0086,2023-11-10,Books,Biography,24.78,5,94.2,19.0,17.91,76.29,Central,Mobile App,CUST-0062,Debit Card,11,4,Friday
+SALE-0087,2023-09-01,Sports,Dumbbells,412.88,3,910.1,16.2,147.38,762.72,South,Phone,CUST-0063,PayPal,9,3,Friday
+SALE-0088,2023-11-17,Clothing,Dress,61.8,8,374.68,16.3,61.02,313.66,West,Online,CUST-0198,Cash,11,4,Friday
+SALE-0089,2023-05-01,Home & Garden,Plant Pot,110.45,1,128.72,26.8,34.52,94.2,East,Online,CUST-0420,Debit Card,5,2,Monday
+SALE-0090,2023-03-19,Clothing,Jacket,155.43,4,830.84,22.9,190.05,640.8,South,Retail Store,CUST-0123,Credit Card,3,1,Sunday
+SALE-0091,2023-08-01,Sports,Dumbbells,204.94,4,581.85,23.9,139.17,442.68,Central,Mobile App,CUST-0261,PayPal,8,3,Tuesday
+SALE-0092,2023-02-01,Clothing,Jacket,93.61,4,479.79,7.6,36.24,443.55,West,Online,CUST-0069,PayPal,2,1,Wednesday
+SALE-0093,2023-09-02,Electronics,Tablet,1670.92,8,9379.18,18.3,1720.48,7658.7,East,Mobile App,CUST-0111,PayPal,9,3,Saturday
+SALE-0094,2023-10-03,Books,Magazine,81.11,5,325.06,4.6,14.88,310.18,South,Mobile App,CUST-0092,Debit Card,10,4,Tuesday
+SALE-0095,2023-05-20,Sports,Basketball,74.52,7,509.36,7.1,36.05,473.31,North,Mobile App,CUST-0346,Cash,5,2,Saturday
+SALE-0096,2023-12-09,Sports,Yoga Mat,438.2,8,3656.9,11.4,416.12,3240.78,West,Retail Store,CUST-0309,Credit Card,12,4,Saturday
+SALE-0097,2023-07-21,Books,Magazine,45.84,9,401.62,27.7,111.21,290.42,North,Online,CUST-0391,PayPal,7,3,Friday
+SALE-0098,2023-03-11,Sports,Yoga Mat,131.69,3,461.86,17.3,80.04,381.82,North,Phone,CUST-0180,PayPal,3,1,Saturday
+SALE-0099,2023-06-17,Clothing,Jacket,184.67,2,393.51,5.3,21.02,372.49,East,Phone,CUST-0084,PayPal,6,2,Saturday
+SALE-0100,2023-05-23,Sports,Dumbbells,279.16,7,2332.96,2.0,46.95,2286.02,North,Mobile App,CUST-0215,Credit Card,5,2,Tuesday
+SALE-0101,2023-10-04,Electronics,Tablet,910.9,8,5582.61,8.8,492.46,5090.15,South,Online,CUST-0371,Credit Card,10,4,Wednesday
+SALE-0102,2023-01-16,Clothing,Jeans,114.39,4,459.25,25.9,118.73,340.52,North,Retail Store,CUST-0359,Debit Card,1,1,Monday
+SALE-0103,2023-03-06,Sports,Running Shoes,275.12,7,2159.29,21.5,463.8,1695.49,Central,Retail Store,CUST-0349,PayPal,3,1,Monday
+SALE-0104,2023-12-25,Home & Garden,Plant Pot,87.36,8,588.2,24.0,141.15,447.04,South,Online,CUST-0067,Debit Card,12,4,Monday
+SALE-0105,2023-06-09,Electronics,Smartwatch,1786.17,8,16043.28,28.9,4633.22,11410.06,North,Phone,CUST-0165,PayPal,6,2,Friday
+SALE-0106,2023-07-23,Clothing,T-Shirt,93.15,1,69.93,0.8,0.56,69.37,Central,Retail Store,CUST-0381,Credit Card,7,3,Sunday
+SALE-0107,2023-12-23,Home & Garden,Mirror,215.62,2,407.63,1.0,4.19,403.44,North,Online,CUST-0020,Cash,12,4,Saturday
+SALE-0108,2023-09-30,Sports,Dumbbells,232.16,4,773.44,23.4,180.93,592.51,North,Phone,CUST-0081,Credit Card,9,3,Saturday
+SALE-0109,2023-08-04,Sports,Running Shoes,404.93,3,903.66,22.3,201.07,702.59,West,Phone,CUST-0450,PayPal,8,3,Friday
+SALE-0110,2023-12-29,Clothing,Jacket,66.42,2,120.74,0.6,0.67,120.07,South,Phone,CUST-0146,PayPal,12,4,Friday
+SALE-0111,2023-08-27,Sports,Tennis Racket,56.91,6,286.07,6.2,17.72,268.36,East,Phone,CUST-0362,Debit Card,8,3,Sunday
+SALE-0112,2023-02-14,Home & Garden,Cushion,90.95,9,1028.88,17.2,176.95,851.92,South,Mobile App,CUST-0401,PayPal,2,1,Tuesday
+SALE-0113,2023-06-22,Electronics,Headphones,895.66,1,746.2,18.1,135.02,611.17,East,Retail Store,CUST-0282,PayPal,6,2,Thursday
+SALE-0114,2023-04-19,Home & Garden,Plant Pot,139.6,8,1444.33,14.3,206.27,1238.05,East,Phone,CUST-0111,Cash,4,2,Wednesday
+SALE-0115,2023-10-12,Electronics,Smartwatch,1912.77,3,4408.98,1.5,68.02,4340.96,South,Online,CUST-0446,Debit Card,10,4,Thursday
+SALE-0116,2023-07-28,Sports,Tennis Racket,250.26,8,1857.12,14.9,276.06,1581.06,South,Mobile App,CUST-0427,PayPal,7,3,Friday
+SALE-0117,2023-08-18,Electronics,Laptop,1236.74,3,2495.98,17.7,441.96,2054.02,East,Retail Store,CUST-0275,PayPal,8,3,Friday
+SALE-0118,2023-12-21,Clothing,Dress,165.34,1,144.51,16.3,23.49,121.02,Central,Phone,CUST-0216,PayPal,12,4,Thursday
+SALE-0119,2023-10-11,Books,Cookbook,67.35,8,358.89,14.7,52.69,306.19,West,Phone,CUST-0143,Cash,10,4,Wednesday
+SALE-0120,2023-12-26,Sports,Dumbbells,45.98,1,40.1,17.0,6.83,33.27,East,Phone,CUST-0250,Debit Card,12,4,Tuesday
+SALE-0121,2023-03-03,Clothing,Dress,41.69,7,424.24,22.4,94.83,329.41,North,Retail Store,CUST-0372,Debit Card,3,1,Friday
+SALE-0122,2023-04-21,Sports,Dumbbells,42.58,3,164.83,14.4,23.79,141.04,Central,Phone,CUST-0131,Credit Card,4,2,Friday
+SALE-0123,2023-04-10,Home & Garden,Lamp,221.56,1,283.41,19.8,56.26,227.15,East,Retail Store,CUST-0397,Cash,4,2,Monday
+SALE-0124,2023-01-08,Books,Textbook,12.2,2,22.68,26.2,5.95,16.73,East,Online,CUST-0141,Credit Card,1,1,Sunday
+SALE-0125,2023-10-11,Home & Garden,Lamp,34.96,1,24.86,14.4,3.58,21.28,West,Online,CUST-0185,Credit Card,10,4,Wednesday
+SALE-0126,2023-10-21,Home & Garden,Cushion,128.51,4,416.65,7.2,29.85,386.81,West,Mobile App,CUST-0003,Cash,10,4,Saturday
+SALE-0127,2023-04-05,Electronics,Tablet,987.89,1,1448.83,1.4,19.6,1429.22,West,Online,CUST-0399,Credit Card,4,2,Wednesday
+SALE-0128,2023-07-25,Sports,Running Shoes,476.23,6,2897.37,26.5,768.56,2128.82,Central,Online,CUST-0344,Debit Card,7,3,Tuesday
+SALE-0129,2023-03-18,Books,Cookbook,30.85,4,182.1,6.9,12.6,169.5,North,Retail Store,CUST-0243,Credit Card,3,1,Saturday
+SALE-0130,2023-10-13,Sports,Tennis Racket,129.73,3,325.67,24.0,78.24,247.43,Central,Retail Store,CUST-0054,PayPal,10,4,Friday
+SALE-0131,2023-08-19,Sports,Dumbbells,497.58,3,1219.05,20.9,254.55,964.51,Central,Mobile App,CUST-0216,Cash,8,3,Saturday
+SALE-0132,2023-10-19,Books,Fiction Novel,13.14,4,40.14,2.7,1.1,39.04,Central,Online,CUST-0105,Debit Card,10,4,Thursday
+SALE-0133,2023-11-17,Clothing,Dress,69.13,9,492.7,27.9,137.7,355.0,North,Retail Store,CUST-0395,Debit Card,11,4,Friday
+SALE-0134,2023-03-30,Books,Fiction Novel,75.11,2,162.55,6.6,10.74,151.82,South,Online,CUST-0461,PayPal,3,1,Thursday
+SALE-0135,2023-08-19,Books,Biography,56.45,3,141.62,10.4,14.78,126.85,East,Online,CUST-0354,Debit Card,8,3,Saturday
+SALE-0136,2023-05-28,Home & Garden,Cushion,224.16,1,222.46,4.8,10.7,211.75,North,Retail Store,CUST-0269,Cash,5,2,Sunday
+SALE-0137,2023-11-17,Books,Textbook,77.74,7,533.19,28.8,153.77,379.42,West,Online,CUST-0249,Debit Card,11,4,Friday
+SALE-0138,2023-11-28,Clothing,Dress,168.65,2,323.16,25.0,80.67,242.49,South,Online,CUST-0477,Credit Card,11,4,Tuesday
+SALE-0139,2023-03-26,Home & Garden,Mirror,38.97,8,366.33,19.0,69.68,296.65,Central,Phone,CUST-0344,PayPal,3,1,Sunday
+SALE-0140,2023-03-05,Sports,Dumbbells,33.75,2,82.21,19.0,15.6,66.61,West,Phone,CUST-0222,PayPal,3,1,Sunday
+SALE-0141,2023-08-13,Electronics,Smartwatch,1532.03,1,1256.91,21.3,267.18,989.73,North,Mobile App,CUST-0374,Cash,8,3,Sunday
+SALE-0142,2023-11-06,Home & Garden,Coffee Maker,28.04,4,100.95,17.8,18.0,82.95,North,Retail Store,CUST-0460,Credit Card,11,4,Monday
+SALE-0143,2023-12-11,Home & Garden,Mirror,107.23,7,734.36,8.2,60.28,674.08,North,Retail Store,CUST-0285,PayPal,12,4,Monday
+SALE-0144,2023-09-23,Sports,Dumbbells,275.34,4,875.77,23.2,203.05,672.73,South,Mobile App,CUST-0084,PayPal,9,3,Saturday
+SALE-0145,2023-02-16,Sports,Dumbbells,96.75,5,709.28,25.7,182.43,526.85,West,Phone,CUST-0084,Cash,2,1,Thursday
+SALE-0146,2023-12-10,Electronics,Smartphone,855.43,2,1514.52,0.9,14.15,1500.38,East,Mobile App,CUST-0281,PayPal,12,4,Sunday
+SALE-0147,2023-05-28,Sports,Tennis Racket,283.04,9,3361.36,23.3,783.13,2578.23,North,Mobile App,CUST-0079,Credit Card,5,2,Sunday
+SALE-0148,2023-06-11,Home & Garden,Plant Pot,20.09,8,187.78,18.5,34.74,153.04,North,Mobile App,CUST-0046,Credit Card,6,2,Sunday
+SALE-0149,2023-12-03,Books,Biography,32.28,9,255.71,14.7,37.71,218.0,West,Online,CUST-0319,Debit Card,12,4,Sunday
+SALE-0150,2023-09-23,Home & Garden,Mirror,183.23,1,103.2,2.2,2.24,100.96,West,Mobile App,CUST-0320,Credit Card,9,3,Saturday
+SALE-0151,2023-04-15,Home & Garden,Mirror,220.74,6,1940.71,21.7,421.69,1519.02,South,Phone,CUST-0179,PayPal,4,2,Saturday
+SALE-0152,2023-12-24,Sports,Running Shoes,92.69,6,491.68,10.4,51.04,440.64,North,Retail Store,CUST-0424,Debit Card,12,4,Sunday
+SALE-0153,2023-06-09,Books,Fiction Novel,41.56,1,46.95,10.7,5.04,41.91,Central,Mobile App,CUST-0103,Credit Card,6,2,Friday
+SALE-0154,2023-04-26,Electronics,Headphones,352.16,7,3317.23,28.5,946.95,2370.28,North,Retail Store,CUST-0317,PayPal,4,2,Wednesday
+SALE-0155,2023-05-30,Books,Cookbook,58.72,2,158.56,28.4,45.06,113.49,West,Mobile App,CUST-0348,PayPal,5,2,Tuesday
+SALE-0156,2023-05-05,Sports,Tennis Racket,63.05,4,301.36,23.5,70.86,230.5,South,Mobile App,CUST-0383,Debit Card,5,2,Friday
+SALE-0157,2023-11-03,Books,Textbook,15.43,7,97.34,14.4,14.0,83.34,North,Phone,CUST-0243,PayPal,11,4,Friday
+SALE-0158,2023-06-24,Books,Cookbook,81.07,7,463.92,4.9,22.5,441.42,North,Phone,CUST-0454,Cash,6,2,Saturday
+SALE-0159,2023-10-28,Books,Biography,68.53,3,163.15,2.2,3.53,159.61,South,Mobile App,CUST-0447,PayPal,10,4,Saturday
+SALE-0160,2023-06-26,Home & Garden,Mirror,64.65,8,501.75,10.4,52.07,449.68,Central,Mobile App,CUST-0364,PayPal,6,2,Monday
+SALE-0161,2023-06-14,Clothing,Jeans,110.87,5,531.19,18.2,96.6,434.59,Central,Mobile App,CUST-0335,Debit Card,6,2,Wednesday
+SALE-0162,2023-07-30,Electronics,Tablet,1811.33,3,4846.09,18.9,918.18,3927.91,West,Mobile App,CUST-0399,PayPal,7,3,Sunday
+SALE-0163,2023-12-06,Clothing,Jacket,159.68,2,278.61,25.6,71.41,207.2,North,Retail Store,CUST-0493,Cash,12,4,Wednesday
+SALE-0164,2023-02-21,Sports,Running Shoes,306.64,4,1602.66,4.9,78.62,1524.04,Central,Mobile App,CUST-0379,Credit Card,2,1,Tuesday
+SALE-0165,2023-03-15,Sports,Yoga Mat,29.29,8,292.02,7.1,20.76,271.25,North,Mobile App,CUST-0287,Cash,3,1,Wednesday
+SALE-0166,2023-06-23,Books,Biography,40.33,9,352.94,7.5,26.33,326.6,North,Phone,CUST-0171,PayPal,6,2,Friday
+SALE-0167,2023-06-12,Sports,Tennis Racket,205.2,5,1039.73,23.5,243.86,795.87,North,Online,CUST-0120,Debit Card,6,2,Monday
+SALE-0168,2023-11-20,Home & Garden,Lamp,262.46,2,533.04,3.7,19.66,513.37,North,Mobile App,CUST-0293,Credit Card,11,4,Monday
+SALE-0169,2023-11-21,Electronics,Headphones,1879.55,5,6720.57,17.5,1178.8,5541.77,South,Phone,CUST-0012,Credit Card,11,4,Tuesday
+SALE-0170,2023-01-24,Home & Garden,Coffee Maker,290.06,2,793.38,17.4,138.08,655.31,East,Phone,CUST-0184,Cash,1,1,Tuesday
+SALE-0171,2023-08-09,Clothing,Jeans,107.99,4,345.92,6.1,20.95,324.97,Central,Mobile App,CUST-0375,Debit Card,8,3,Wednesday
+SALE-0172,2023-03-29,Clothing,T-Shirt,53.9,6,379.29,19.8,75.29,304.01,Central,Mobile App,CUST-0119,Debit Card,3,1,Wednesday
+SALE-0173,2023-09-12,Books,Textbook,88.2,8,546.98,3.4,18.56,528.42,South,Mobile App,CUST-0345,Cash,9,3,Tuesday
+SALE-0174,2023-08-24,Home & Garden,Coffee Maker,76.47,5,291.74,10.5,30.51,261.23,West,Phone,CUST-0450,Debit Card,8,3,Thursday
+SALE-0175,2023-02-07,Sports,Dumbbells,218.28,9,2069.52,8.7,179.23,1890.29,Central,Phone,CUST-0459,PayPal,2,1,Tuesday
+SALE-0176,2023-12-20,Home & Garden,Cushion,108.2,2,249.12,9.5,23.71,225.41,East,Retail Store,CUST-0365,PayPal,12,4,Wednesday
+SALE-0177,2023-09-05,Electronics,Smartphone,1653.89,7,8309.68,11.4,948.35,7361.33,West,Phone,CUST-0093,Cash,9,3,Tuesday
+SALE-0178,2023-12-25,Home & Garden,Coffee Maker,121.38,3,315.84,19.3,60.89,254.95,West,Phone,CUST-0450,Credit Card,12,4,Monday
+SALE-0179,2023-10-17,Electronics,Smartwatch,980.64,5,4084.81,3.3,133.47,3951.33,West,Phone,CUST-0133,Debit Card,10,4,Tuesday
+SALE-0180,2023-11-07,Home & Garden,Lamp,167.08,6,936.24,21.5,200.96,735.28,South,Phone,CUST-0427,Debit Card,11,4,Tuesday
+SALE-0181,2023-11-18,Electronics,Laptop,134.64,9,1093.74,11.4,124.71,969.03,East,Mobile App,CUST-0324,Credit Card,11,4,Saturday
+SALE-0182,2023-10-24,Home & Garden,Lamp,43.9,4,138.84,27.9,38.72,100.12,North,Phone,CUST-0156,Cash,10,4,Tuesday
+SALE-0183,2023-08-01,Clothing,Jeans,76.04,4,254.22,15.7,39.85,214.38,South,Phone,CUST-0263,Cash,8,3,Tuesday
+SALE-0184,2023-03-26,Home & Garden,Cushion,164.67,8,2029.7,14.5,294.44,1735.27,East,Phone,CUST-0263,Credit Card,3,1,Sunday
+SALE-0185,2023-08-28,Electronics,Smartphone,1649.92,6,8263.11,26.5,2191.89,6071.22,South,Mobile App,CUST-0393,Cash,8,3,Monday
+SALE-0186,2023-02-16,Sports,Running Shoes,196.37,8,1863.04,7.1,132.39,1730.65,East,Online,CUST-0293,PayPal,2,1,Thursday
+SALE-0187,2023-07-08,Home & Garden,Mirror,257.58,3,689.38,13.6,93.43,595.95,West,Phone,CUST-0242,Credit Card,7,3,Saturday
+SALE-0188,2023-12-12,Clothing,Jacket,62.34,6,302.78,19.3,58.31,244.47,North,Phone,CUST-0476,Debit Card,12,4,Tuesday
+SALE-0189,2023-11-28,Electronics,Headphones,491.75,9,4495.92,4.1,184.03,4311.89,East,Mobile App,CUST-0085,Credit Card,11,4,Tuesday
+SALE-0190,2023-03-13,Electronics,Laptop,1384.1,8,12254.97,3.1,382.76,11872.22,East,Mobile App,CUST-0218,Credit Card,3,1,Monday
+SALE-0191,2023-02-19,Clothing,Shoes,182.99,4,808.49,9.7,78.43,730.06,South,Mobile App,CUST-0379,PayPal,2,1,Sunday
+SALE-0192,2023-07-09,Books,Biography,70.26,5,271.29,17.8,48.25,223.04,Central,Retail Store,CUST-0067,PayPal,7,3,Sunday
+SALE-0193,2023-12-02,Electronics,Headphones,1112.62,2,2103.25,29.9,628.12,1475.12,Central,Mobile App,CUST-0471,Cash,12,4,Saturday
+SALE-0194,2023-01-17,Home & Garden,Lamp,175.25,9,1574.8,12.3,193.45,1381.35,West,Mobile App,CUST-0158,Debit Card,1,1,Tuesday
+SALE-0195,2023-07-05,Electronics,Tablet,955.7,7,5457.43,4.6,249.54,5207.89,Central,Phone,CUST-0005,Credit Card,7,3,Wednesday
+SALE-0196,2023-07-23,Home & Garden,Lamp,84.44,6,359.88,22.7,81.54,278.34,North,Mobile App,CUST-0161,Credit Card,7,3,Sunday
+SALE-0197,2023-12-06,Clothing,Shoes,111.23,7,704.84,10.8,76.15,628.69,North,Online,CUST-0341,Cash,12,4,Wednesday
+SALE-0198,2023-05-05,Clothing,Shoes,63.03,4,333.24,4.9,16.17,317.06,South,Online,CUST-0406,Debit Card,5,2,Friday
+SALE-0199,2023-10-28,Clothing,Jeans,198.59,6,993.95,11.4,113.5,880.46,East,Retail Store,CUST-0216,Credit Card,10,4,Saturday
+SALE-0200,2023-05-22,Clothing,Jeans,149.86,5,697.23,4.6,32.17,665.06,Central,Phone,CUST-0419,Debit Card,5,2,Monday
+SALE-0201,2023-02-26,Electronics,Smartphone,757.59,6,5299.83,18.2,964.1,4335.73,North,Phone,CUST-0321,Debit Card,2,1,Sunday
+SALE-0202,2023-10-29,Home & Garden,Coffee Maker,64.83,9,460.6,3.7,16.83,443.78,South,Phone,CUST-0405,Credit Card,10,4,Sunday
+SALE-0203,2023-03-06,Sports,Tennis Racket,286.03,4,1451.35,3.2,46.01,1405.34,North,Online,CUST-0390,PayPal,3,1,Monday
+SALE-0204,2023-08-18,Home & Garden,Mirror,186.73,5,768.68,13.8,106.03,662.65,Central,Online,CUST-0130,PayPal,8,3,Friday
+SALE-0205,2023-09-15,Clothing,Shoes,155.77,9,840.9,3.6,30.62,810.27,North,Phone,CUST-0190,PayPal,9,3,Friday
+SALE-0206,2023-11-26,Electronics,Laptop,604.24,8,4624.82,18.5,853.58,3771.24,West,Mobile App,CUST-0308,PayPal,11,4,Sunday
+SALE-0207,2023-12-18,Electronics,Headphones,430.13,3,1222.13,12.4,151.84,1070.3,West,Online,CUST-0014,Credit Card,12,4,Monday
+SALE-0208,2023-06-14,Books,Textbook,22.04,5,89.02,7.8,6.94,82.08,North,Retail Store,CUST-0138,Cash,6,2,Wednesday
+SALE-0209,2023-11-16,Books,Magazine,85.09,5,318.06,1.9,6.17,311.9,East,Mobile App,CUST-0160,Cash,11,4,Thursday
+SALE-0210,2023-08-21,Books,Magazine,85.99,7,383.04,3.8,14.62,368.42,West,Online,CUST-0034,Credit Card,8,3,Monday
+SALE-0211,2023-12-02,Books,Textbook,45.5,6,261.27,28.7,74.95,186.32,West,Mobile App,CUST-0113,Debit Card,12,4,Saturday
+SALE-0212,2023-07-31,Home & Garden,Cushion,104.89,1,101.31,1.2,1.17,100.15,West,Mobile App,CUST-0444,Credit Card,7,3,Monday
+SALE-0213,2023-06-10,Sports,Dumbbells,208.52,1,218.02,2.0,4.36,213.66,East,Phone,CUST-0344,Debit Card,6,2,Saturday
+SALE-0214,2023-12-18,Sports,Running Shoes,235.55,8,1571.46,21.5,337.7,1233.76,North,Online,CUST-0109,Credit Card,12,4,Monday
+SALE-0215,2023-08-10,Electronics,Tablet,1624.05,4,4519.36,23.2,1050.28,3469.07,South,Online,CUST-0391,Cash,8,3,Thursday
+SALE-0216,2023-12-10,Electronics,Headphones,1589.3,8,11519.49,0.6,72.38,11447.11,East,Mobile App,CUST-0480,Credit Card,12,4,Sunday
+SALE-0217,2023-05-28,Books,Cookbook,97.84,2,180.96,7.7,13.87,167.1,East,Online,CUST-0324,Debit Card,5,2,Sunday
+SALE-0218,2023-03-21,Sports,Yoga Mat,44.93,5,248.25,14.2,35.33,212.92,North,Phone,CUST-0258,Cash,3,1,Tuesday
+SALE-0219,2023-02-28,Home & Garden,Mirror,228.2,1,336.72,6.7,22.69,314.03,South,Mobile App,CUST-0153,Credit Card,2,1,Tuesday
+SALE-0220,2023-11-08,Home & Garden,Coffee Maker,125.77,4,362.87,5.9,21.5,341.37,South,Phone,CUST-0174,Cash,11,4,Wednesday
+SALE-0221,2023-06-23,Home & Garden,Coffee Maker,206.36,9,1889.98,19.1,360.65,1529.33,South,Retail Store,CUST-0149,PayPal,6,2,Friday
+SALE-0222,2023-02-05,Clothing,T-Shirt,154.67,6,1287.57,8.1,104.03,1183.53,North,Retail Store,CUST-0348,PayPal,2,1,Sunday
+SALE-0223,2023-08-03,Sports,Dumbbells,369.84,3,706.51,10.3,72.57,633.94,South,Phone,CUST-0278,Cash,8,3,Thursday
+SALE-0224,2023-06-16,Books,Magazine,60.85,7,439.11,26.3,115.55,323.56,North,Online,CUST-0229,Debit Card,6,2,Friday
+SALE-0225,2023-03-22,Books,Fiction Novel,75.38,1,89.29,5.8,5.2,84.09,North,Phone,CUST-0320,PayPal,3,1,Wednesday
+SALE-0226,2023-12-05,Sports,Basketball,373.21,2,703.24,23.5,165.36,537.88,Central,Mobile App,CUST-0420,PayPal,12,4,Tuesday
+SALE-0227,2023-05-20,Clothing,Shoes,156.98,2,398.41,20.4,81.08,317.33,North,Phone,CUST-0400,PayPal,5,2,Saturday
+SALE-0228,2023-02-26,Home & Garden,Mirror,264.85,4,1453.17,26.6,386.34,1066.83,West,Phone,CUST-0227,Credit Card,2,1,Sunday
+SALE-0229,2023-04-23,Sports,Tennis Racket,109.73,4,482.46,11.6,56.11,426.34,North,Online,CUST-0273,Debit Card,4,2,Sunday
+SALE-0230,2023-06-04,Clothing,Jeans,106.58,7,806.59,1.6,12.78,793.81,East,Phone,CUST-0024,Cash,6,2,Sunday
+SALE-0231,2023-03-03,Electronics,Headphones,1385.29,3,4448.63,10.0,446.07,4002.56,West,Retail Store,CUST-0030,Debit Card,3,1,Friday
+SALE-0232,2023-07-14,Books,Textbook,43.61,7,283.93,7.1,20.09,263.84,Central,Phone,CUST-0319,Credit Card,7,3,Friday
+SALE-0233,2023-07-23,Electronics,Headphones,519.16,1,427.39,19.1,81.57,345.82,North,Mobile App,CUST-0240,Credit Card,7,3,Sunday
+SALE-0234,2023-06-10,Books,Biography,76.6,5,334.66,10.9,36.37,298.29,Central,Mobile App,CUST-0050,PayPal,6,2,Saturday
+SALE-0235,2023-05-29,Electronics,Headphones,414.06,3,1680.31,7.8,130.71,1549.6,North,Phone,CUST-0302,Debit Card,5,2,Monday
+SALE-0236,2023-11-13,Sports,Dumbbells,253.43,5,1165.84,18.9,220.75,945.09,North,Mobile App,CUST-0126,Credit Card,11,4,Monday
+SALE-0237,2023-05-05,Sports,Tennis Racket,371.52,6,2281.71,3.9,89.91,2191.8,West,Online,CUST-0057,PayPal,5,2,Friday
+SALE-0238,2023-06-08,Home & Garden,Lamp,287.64,6,1561.31,7.4,115.68,1445.63,East,Retail Store,CUST-0220,Credit Card,6,2,Thursday
+SALE-0239,2023-09-19,Electronics,Smartwatch,1595.54,6,5536.23,14.6,809.79,4726.44,Central,Retail Store,CUST-0184,Cash,9,3,Tuesday
+SALE-0240,2023-06-29,Clothing,Jeans,131.55,7,768.49,7.1,54.59,713.9,North,Retail Store,CUST-0160,Cash,6,2,Thursday
+SALE-0241,2023-04-12,Clothing,Shoes,193.41,8,1762.28,21.9,386.37,1375.9,South,Online,CUST-0314,Debit Card,4,2,Wednesday
+SALE-0242,2023-11-18,Sports,Basketball,115.82,3,351.09,18.3,64.09,286.99,Central,Mobile App,CUST-0445,Cash,11,4,Saturday
+SALE-0243,2023-11-18,Home & Garden,Lamp,79.22,7,479.84,29.4,141.15,338.69,West,Online,CUST-0061,PayPal,11,4,Saturday
+SALE-0244,2023-08-15,Home & Garden,Plant Pot,34.29,6,135.59,25.4,34.45,101.14,Central,Online,CUST-0330,Cash,8,3,Tuesday
+SALE-0245,2023-09-17,Electronics,Tablet,414.97,3,924.07,16.4,151.2,772.86,West,Mobile App,CUST-0344,Credit Card,9,3,Sunday
+SALE-0246,2023-01-30,Home & Garden,Plant Pot,116.45,1,117.92,7.8,9.15,108.77,North,Online,CUST-0020,PayPal,1,1,Monday
+SALE-0247,2023-08-25,Books,Magazine,21.36,6,82.03,7.7,6.29,75.75,North,Mobile App,CUST-0381,Debit Card,8,3,Friday
+SALE-0248,2023-06-14,Books,Biography,15.87,3,55.4,16.2,8.95,46.44,Central,Retail Store,CUST-0227,Credit Card,6,2,Wednesday
+SALE-0249,2023-08-19,Electronics,Tablet,300.4,3,585.84,5.6,32.82,553.03,North,Retail Store,CUST-0008,Credit Card,8,3,Saturday
+SALE-0250,2023-05-07,Sports,Basketball,326.43,8,3027.38,13.4,406.52,2620.86,Central,Retail Store,CUST-0454,Cash,5,2,Sunday
+SALE-0251,2023-07-10,Home & Garden,Cushion,259.3,8,1768.19,17.9,317.27,1450.91,West,Phone,CUST-0008,Credit Card,7,3,Monday
+SALE-0252,2023-11-20,Home & Garden,Coffee Maker,58.35,6,340.06,3.5,12.0,328.06,East,Online,CUST-0395,PayPal,11,4,Monday
+SALE-0253,2023-05-26,Home & Garden,Mirror,134.06,2,267.14,26.5,70.68,196.46,South,Phone,CUST-0223,Credit Card,5,2,Friday
+SALE-0254,2023-10-26,Clothing,Dress,43.37,4,148.45,2.4,3.54,144.91,East,Mobile App,CUST-0133,Debit Card,10,4,Thursday
+SALE-0255,2023-11-01,Electronics,Tablet,1949.57,9,14742.2,24.6,3633.82,11108.38,Central,Mobile App,CUST-0364,Cash,11,4,Wednesday
+SALE-0256,2023-03-07,Books,Fiction Novel,57.29,5,314.73,2.6,8.23,306.5,West,Phone,CUST-0417,Credit Card,3,1,Tuesday
+SALE-0257,2023-07-05,Home & Garden,Lamp,114.16,9,850.82,17.3,147.34,703.48,South,Phone,CUST-0273,PayPal,7,3,Wednesday
+SALE-0258,2023-04-09,Clothing,Jeans,104.83,2,245.66,20.6,50.58,195.08,South,Online,CUST-0156,Cash,4,2,Sunday
+SALE-0259,2023-02-21,Books,Magazine,16.54,3,67.37,15.4,10.36,57.01,Central,Online,CUST-0294,Cash,2,1,Tuesday
+SALE-0260,2023-11-13,Clothing,Shoes,32.33,4,126.25,23.0,29.01,97.23,West,Retail Store,CUST-0355,Debit Card,11,4,Monday
+SALE-0261,2023-04-03,Books,Textbook,10.02,2,24.7,13.8,3.41,21.29,West,Online,CUST-0100,PayPal,4,2,Monday
+SALE-0262,2023-07-06,Clothing,Jacket,43.19,1,29.99,22.2,6.66,23.33,Central,Phone,CUST-0154,PayPal,7,3,Thursday
+SALE-0263,2023-04-30,Books,Textbook,84.34,3,357.65,0.5,1.93,355.72,East,Mobile App,CUST-0327,Debit Card,4,2,Sunday
+SALE-0264,2023-07-08,Books,Biography,67.16,4,192.95,21.1,40.73,152.22,West,Phone,CUST-0317,PayPal,7,3,Saturday
+SALE-0265,2023-09-15,Books,Biography,35.54,5,114.32,9.0,10.29,104.03,South,Retail Store,CUST-0222,Debit Card,9,3,Friday
+SALE-0266,2023-05-09,Electronics,Headphones,1237.74,6,9880.54,5.6,549.35,9331.19,East,Online,CUST-0183,Credit Card,5,2,Tuesday
+SALE-0267,2023-05-26,Electronics,Smartphone,1109.5,2,2626.72,19.8,519.17,2107.56,East,Mobile App,CUST-0304,Debit Card,5,2,Friday
+SALE-0268,2023-08-12,Electronics,Smartphone,1679.61,4,5706.05,1.9,110.73,5595.32,West,Phone,CUST-0480,Credit Card,8,3,Saturday
+SALE-0269,2023-08-01,Electronics,Headphones,1186.37,9,7400.03,4.9,365.91,7034.12,Central,Phone,CUST-0406,Debit Card,8,3,Tuesday
+SALE-0270,2023-07-17,Electronics,Tablet,1253.47,7,6359.39,7.0,446.78,5912.61,South,Online,CUST-0076,Cash,7,3,Monday
+SALE-0271,2023-02-20,Home & Garden,Lamp,285.9,1,326.89,12.2,39.91,286.98,South,Online,CUST-0214,Cash,2,1,Monday
+SALE-0272,2023-08-30,Clothing,Jacket,85.13,1,61.77,14.2,8.76,53.0,West,Online,CUST-0355,Credit Card,8,3,Wednesday
+SALE-0273,2023-01-10,Home & Garden,Lamp,94.99,6,748.31,1.5,11.11,737.2,South,Mobile App,CUST-0136,Credit Card,1,1,Tuesday
+SALE-0274,2023-05-28,Clothing,Dress,39.44,6,319.17,11.9,38.01,281.16,North,Online,CUST-0037,Debit Card,5,2,Sunday
+SALE-0275,2023-08-03,Books,Biography,61.73,7,319.02,21.1,67.21,251.81,North,Online,CUST-0147,PayPal,8,3,Thursday
+SALE-0276,2023-11-02,Books,Fiction Novel,75.69,8,598.59,21.4,128.22,470.37,Central,Retail Store,CUST-0268,Debit Card,11,4,Thursday
+SALE-0277,2023-05-30,Sports,Running Shoes,478.17,9,5219.04,1.5,80.06,5138.97,Central,Phone,CUST-0493,Debit Card,5,2,Tuesday
+SALE-0278,2023-10-20,Sports,Yoga Mat,146.93,1,106.85,11.1,11.83,95.02,North,Phone,CUST-0147,Credit Card,10,4,Friday
+SALE-0279,2023-09-27,Books,Magazine,38.9,9,288.35,20.1,57.84,230.52,Central,Online,CUST-0105,PayPal,9,3,Wednesday
+SALE-0280,2023-08-29,Electronics,Headphones,1328.26,9,9246.92,26.2,2423.71,6823.21,East,Phone,CUST-0084,Credit Card,8,3,Tuesday
+SALE-0281,2023-07-02,Electronics,Tablet,1311.97,2,1794.72,12.7,227.23,1567.49,South,Online,CUST-0419,Cash,7,3,Sunday
+SALE-0282,2023-03-10,Electronics,Tablet,952.82,9,12169.93,19.6,2381.5,9788.43,Central,Phone,CUST-0284,Debit Card,3,1,Friday
+SALE-0283,2023-12-17,Sports,Basketball,61.87,6,414.11,13.4,55.46,358.65,South,Retail Store,CUST-0354,Credit Card,12,4,Sunday
+SALE-0284,2023-08-23,Electronics,Tablet,830.06,9,4484.33,11.8,528.67,3955.67,South,Online,CUST-0408,Debit Card,8,3,Wednesday
+SALE-0285,2023-01-22,Home & Garden,Plant Pot,137.7,1,186.65,10.2,19.03,167.62,Central,Mobile App,CUST-0202,PayPal,1,1,Sunday
+SALE-0286,2023-05-10,Electronics,Smartphone,1327.06,1,1282.71,25.4,325.99,956.72,East,Phone,CUST-0392,Credit Card,5,2,Wednesday
+SALE-0287,2023-12-02,Home & Garden,Plant Pot,296.59,2,589.76,0.8,4.87,584.89,North,Phone,CUST-0443,PayPal,12,4,Saturday
+SALE-0288,2023-07-24,Sports,Basketball,124.21,3,256.35,22.7,58.16,198.19,East,Retail Store,CUST-0399,PayPal,7,3,Monday
+SALE-0289,2023-12-21,Sports,Dumbbells,200.94,3,696.47,18.1,125.98,570.49,Central,Phone,CUST-0201,Credit Card,12,4,Thursday
+SALE-0290,2023-08-06,Electronics,Headphones,1969.63,6,8892.29,4.6,411.21,8481.08,Central,Retail Store,CUST-0305,Cash,8,3,Sunday
+SALE-0291,2023-06-14,Electronics,Laptop,1111.29,2,2008.62,5.8,117.28,1891.34,East,Phone,CUST-0497,Cash,6,2,Wednesday
+SALE-0292,2023-08-17,Books,Biography,59.03,1,45.1,4.2,1.88,43.22,South,Mobile App,CUST-0483,Cash,8,3,Thursday
+SALE-0293,2023-08-17,Electronics,Tablet,385.99,2,599.62,17.1,102.42,497.2,Central,Mobile App,CUST-0250,Cash,8,3,Thursday
+SALE-0294,2023-11-24,Electronics,Laptop,976.75,6,4438.93,28.9,1283.78,3155.15,West,Phone,CUST-0117,Debit Card,11,4,Friday
+SALE-0295,2023-01-16,Clothing,Shoes,83.62,7,572.14,23.8,136.32,435.82,West,Online,CUST-0020,Debit Card,1,1,Monday
+SALE-0296,2023-02-04,Clothing,Dress,26.2,4,151.24,17.7,26.71,124.53,East,Mobile App,CUST-0250,Credit Card,2,1,Saturday
+SALE-0297,2023-11-06,Clothing,Jacket,114.04,9,824.34,21.8,179.47,644.87,East,Phone,CUST-0437,PayPal,11,4,Monday
+SALE-0298,2023-02-09,Books,Textbook,61.62,3,204.98,3.3,6.72,198.26,Central,Phone,CUST-0116,PayPal,2,1,Thursday
+SALE-0299,2023-06-10,Home & Garden,Lamp,100.05,3,293.96,15.3,45.01,248.94,North,Online,CUST-0494,Debit Card,6,2,Saturday
+SALE-0300,2023-09-13,Books,Biography,12.75,3,28.84,4.0,1.16,27.67,Central,Online,CUST-0126,Cash,9,3,Wednesday
+SALE-0301,2023-05-14,Sports,Yoga Mat,373.2,3,1543.92,20.3,313.49,1230.43,Central,Phone,CUST-0113,PayPal,5,2,Sunday
+SALE-0302,2023-04-13,Electronics,Smartphone,270.64,5,1367.7,28.1,384.5,983.2,North,Mobile App,CUST-0188,Debit Card,4,2,Thursday
+SALE-0303,2023-08-16,Electronics,Tablet,1351.23,9,9804.98,8.4,824.6,8980.38,East,Online,CUST-0260,Cash,8,3,Wednesday
+SALE-0304,2023-06-03,Clothing,Jeans,31.88,2,51.17,3.0,1.55,49.62,East,Retail Store,CUST-0358,Credit Card,6,2,Saturday
+SALE-0305,2023-04-13,Clothing,Jeans,33.84,2,70.69,12.1,8.54,62.14,West,Online,CUST-0111,Cash,4,2,Thursday
+SALE-0306,2023-10-11,Books,Cookbook,23.71,7,142.8,9.6,13.77,129.03,West,Retail Store,CUST-0053,Credit Card,10,4,Wednesday
+SALE-0307,2023-02-03,Home & Garden,Cushion,77.49,3,310.2,3.7,11.44,298.76,West,Mobile App,CUST-0337,PayPal,2,1,Friday
+SALE-0308,2023-10-22,Electronics,Smartphone,1467.6,4,4662.64,7.3,338.41,4324.23,East,Online,CUST-0412,PayPal,10,4,Sunday
+SALE-0309,2023-08-27,Books,Cookbook,20.8,7,117.26,12.0,14.12,103.14,South,Retail Store,CUST-0415,Debit Card,8,3,Sunday
+SALE-0310,2023-08-10,Books,Fiction Novel,77.38,9,412.41,15.3,63.24,349.17,North,Retail Store,CUST-0154,Cash,8,3,Thursday
+SALE-0311,2023-03-26,Clothing,Dress,126.83,6,889.07,22.2,197.62,691.46,South,Phone,CUST-0157,Cash,3,1,Sunday
+SALE-0312,2023-02-10,Home & Garden,Lamp,52.03,4,292.49,26.8,78.26,214.23,Central,Phone,CUST-0141,Debit Card,2,1,Friday
+SALE-0313,2023-11-17,Home & Garden,Mirror,281.85,7,1672.87,11.6,194.55,1478.32,Central,Online,CUST-0475,Debit Card,11,4,Friday
+SALE-0314,2023-10-31,Books,Textbook,88.8,5,389.89,22.8,89.02,300.88,South,Phone,CUST-0273,Credit Card,10,4,Tuesday
+SALE-0315,2023-01-15,Electronics,Laptop,1384.61,5,6522.64,10.8,704.54,5818.1,Central,Phone,CUST-0304,Debit Card,1,1,Sunday
+SALE-0316,2023-10-20,Sports,Tennis Racket,77.71,3,163.58,1.6,2.57,161.01,North,Mobile App,CUST-0489,Cash,10,4,Friday
+SALE-0317,2023-11-25,Home & Garden,Cushion,133.5,6,673.31,26.4,177.79,495.53,South,Mobile App,CUST-0481,Cash,11,4,Saturday
+SALE-0318,2023-08-21,Electronics,Laptop,1612.86,4,5231.05,9.5,495.32,4735.73,South,Mobile App,CUST-0492,PayPal,8,3,Monday
+SALE-0319,2023-09-05,Sports,Yoga Mat,300.11,3,672.29,24.7,166.05,506.24,East,Retail Store,CUST-0054,Cash,9,3,Tuesday
+SALE-0320,2023-06-13,Home & Garden,Cushion,253.11,8,2298.88,21.3,489.23,1809.64,South,Phone,CUST-0398,Credit Card,6,2,Tuesday
+SALE-0321,2023-06-13,Clothing,Jacket,108.72,8,947.95,26.3,249.59,698.36,North,Phone,CUST-0378,PayPal,6,2,Tuesday
+SALE-0322,2023-05-07,Clothing,T-Shirt,141.96,8,1113.51,25.7,286.33,827.19,North,Phone,CUST-0181,PayPal,5,2,Sunday
+SALE-0323,2023-11-12,Sports,Yoga Mat,111.33,5,443.2,22.2,98.26,344.94,South,Phone,CUST-0007,Cash,11,4,Sunday
+SALE-0324,2023-04-08,Clothing,Jacket,86.91,7,882.73,20.3,178.91,703.82,Central,Mobile App,CUST-0160,PayPal,4,2,Saturday
+SALE-0325,2023-06-07,Sports,Running Shoes,242.55,4,1125.21,21.3,239.72,885.5,North,Mobile App,CUST-0157,PayPal,6,2,Wednesday
+SALE-0326,2023-05-04,Clothing,Shoes,107.13,8,1160.18,23.6,273.29,886.89,East,Online,CUST-0096,Credit Card,5,2,Thursday
+SALE-0327,2023-05-25,Sports,Tennis Racket,394.04,7,2716.28,18.7,507.19,2209.08,West,Phone,CUST-0394,Credit Card,5,2,Thursday
+SALE-0328,2023-02-25,Sports,Yoga Mat,275.45,1,325.53,27.5,89.6,235.93,East,Phone,CUST-0216,PayPal,2,1,Saturday
+SALE-0329,2023-07-07,Electronics,Headphones,1477.46,2,2017.23,18.9,381.81,1635.42,North,Retail Store,CUST-0459,Cash,7,3,Friday
+SALE-0330,2023-10-11,Home & Garden,Coffee Maker,101.05,5,443.12,18.6,82.54,360.58,West,Mobile App,CUST-0062,Cash,10,4,Wednesday
+SALE-0331,2023-11-16,Books,Fiction Novel,13.95,6,69.6,6.3,4.37,65.23,South,Online,CUST-0235,PayPal,11,4,Thursday
+SALE-0332,2023-07-11,Home & Garden,Mirror,298.57,6,1284.49,19.1,245.29,1039.2,East,Retail Store,CUST-0252,Debit Card,7,3,Tuesday
+SALE-0333,2023-11-05,Books,Biography,33.36,9,298.0,5.3,15.74,282.26,Central,Online,CUST-0358,Credit Card,11,4,Sunday
+SALE-0334,2023-01-20,Clothing,Dress,196.61,2,488.08,11.9,57.87,430.21,West,Mobile App,CUST-0336,Debit Card,1,1,Friday
+SALE-0335,2023-11-07,Books,Textbook,74.65,1,62.39,23.4,14.63,47.77,East,Phone,CUST-0084,Debit Card,11,4,Tuesday
+SALE-0336,2023-07-21,Books,Cookbook,10.81,5,43.7,16.6,7.24,36.46,Central,Phone,CUST-0255,PayPal,7,3,Friday
+SALE-0337,2023-12-29,Books,Cookbook,75.6,6,440.65,0.9,3.86,436.79,West,Online,CUST-0451,Cash,12,4,Friday
+SALE-0338,2023-06-19,Electronics,Headphones,1799.82,2,4309.86,1.3,58.07,4251.79,Central,Phone,CUST-0093,Credit Card,6,2,Monday
+SALE-0339,2023-11-02,Sports,Dumbbells,40.49,7,248.37,10.7,26.61,221.76,Central,Retail Store,CUST-0274,Credit Card,11,4,Thursday
+SALE-0340,2023-10-26,Sports,Yoga Mat,222.41,1,144.32,27.5,39.76,104.56,Central,Mobile App,CUST-0116,Debit Card,10,4,Thursday
+SALE-0341,2023-12-15,Clothing,T-Shirt,171.17,6,1177.67,8.5,99.8,1077.87,Central,Online,CUST-0221,Debit Card,12,4,Friday
+SALE-0342,2023-01-10,Sports,Dumbbells,228.06,3,718.36,10.6,76.09,642.28,West,Retail Store,CUST-0303,PayPal,1,1,Tuesday
+SALE-0343,2023-12-20,Clothing,Jacket,172.25,4,688.33,6.1,42.27,646.07,Central,Mobile App,CUST-0221,Credit Card,12,4,Wednesday
+SALE-0344,2023-12-28,Clothing,Shoes,73.23,4,268.91,26.4,70.95,197.96,South,Phone,CUST-0385,PayPal,12,4,Thursday
+SALE-0345,2023-09-27,Sports,Dumbbells,182.79,8,963.28,24.7,238.35,724.93,South,Mobile App,CUST-0290,Cash,9,3,Wednesday
+SALE-0346,2023-10-07,Home & Garden,Plant Pot,95.5,5,391.0,0.0,0.0,391.0,Central,Mobile App,CUST-0249,Debit Card,10,4,Saturday
+SALE-0347,2023-05-07,Home & Garden,Mirror,221.09,5,1171.58,6.9,80.99,1090.59,East,Retail Store,CUST-0179,Cash,5,2,Sunday
+SALE-0348,2023-05-28,Clothing,Jacket,54.4,9,641.53,12.7,81.34,560.19,East,Mobile App,CUST-0306,Cash,5,2,Sunday
+SALE-0349,2023-10-14,Home & Garden,Plant Pot,87.05,6,372.04,6.6,24.61,347.43,North,Mobile App,CUST-0022,PayPal,10,4,Saturday
+SALE-0350,2023-06-26,Clothing,Dress,126.31,2,280.99,17.5,49.21,231.78,North,Phone,CUST-0139,Credit Card,6,2,Monday
+SALE-0351,2023-06-27,Sports,Dumbbells,475.87,5,2436.56,23.4,570.69,1865.87,West,Retail Store,CUST-0191,Debit Card,6,2,Tuesday
+SALE-0352,2023-10-03,Home & Garden,Mirror,280.88,7,1433.07,27.6,395.95,1037.11,East,Retail Store,CUST-0407,Credit Card,10,4,Tuesday
+SALE-0353,2023-11-12,Books,Textbook,14.67,9,105.29,10.1,10.6,94.69,South,Online,CUST-0308,Debit Card,11,4,Sunday
+SALE-0354,2023-11-23,Clothing,T-Shirt,41.4,1,32.54,14.5,4.71,27.83,North,Mobile App,CUST-0100,Cash,11,4,Thursday
+SALE-0355,2023-08-30,Electronics,Smartphone,1593.79,8,10560.96,18.5,1951.39,8609.57,North,Retail Store,CUST-0162,PayPal,8,3,Wednesday
+SALE-0356,2023-12-01,Sports,Basketball,413.14,1,419.87,12.9,54.11,365.76,South,Phone,CUST-0453,Cash,12,4,Friday
+SALE-0357,2023-05-27,Electronics,Laptop,1465.06,9,13084.64,9.3,1216.04,11868.6,Central,Retail Store,CUST-0151,Credit Card,5,2,Saturday
+SALE-0358,2023-03-31,Sports,Yoga Mat,58.67,7,549.25,25.0,137.23,412.02,North,Mobile App,CUST-0083,PayPal,3,1,Friday
+SALE-0359,2023-04-06,Home & Garden,Coffee Maker,61.4,5,356.88,10.6,37.79,319.09,North,Phone,CUST-0401,Credit Card,4,2,Thursday
+SALE-0360,2023-06-21,Home & Garden,Cushion,265.23,1,242.5,13.0,31.48,211.01,Central,Mobile App,CUST-0019,Debit Card,6,2,Wednesday
+SALE-0361,2023-09-16,Sports,Dumbbells,206.18,4,616.92,19.0,117.02,499.9,South,Online,CUST-0014,Cash,9,3,Saturday
+SALE-0362,2023-03-25,Sports,Dumbbells,495.42,9,6910.21,2.0,139.94,6770.27,South,Online,CUST-0157,Cash,3,1,Saturday
+SALE-0363,2023-06-01,Books,Textbook,59.99,2,129.81,12.7,16.46,113.34,South,Mobile App,CUST-0219,PayPal,6,2,Thursday
+SALE-0364,2023-09-21,Home & Garden,Coffee Maker,187.56,2,240.26,19.7,47.34,192.93,West,Online,CUST-0022,Debit Card,9,3,Thursday
+SALE-0365,2023-03-13,Sports,Dumbbells,464.62,9,4549.07,18.0,817.53,3731.54,South,Online,CUST-0084,Cash,3,1,Monday
+SALE-0366,2023-07-16,Clothing,Jacket,119.61,9,990.63,18.3,181.29,809.34,East,Phone,CUST-0233,Cash,7,3,Sunday
+SALE-0367,2023-10-26,Books,Fiction Novel,20.54,9,117.92,28.3,33.42,84.5,East,Phone,CUST-0150,Debit Card,10,4,Thursday
+SALE-0368,2023-02-01,Electronics,Headphones,1884.21,1,1913.61,17.5,334.65,1578.96,East,Retail Store,CUST-0305,PayPal,2,1,Wednesday
+SALE-0369,2023-12-18,Books,Cookbook,65.55,6,468.36,3.1,14.32,454.04,North,Phone,CUST-0370,Cash,12,4,Monday
+SALE-0370,2023-11-11,Clothing,Jeans,78.87,4,261.12,21.7,56.67,204.44,South,Mobile App,CUST-0410,Debit Card,11,4,Saturday
+SALE-0371,2023-08-21,Books,Cookbook,73.08,8,459.39,24.6,112.79,346.6,West,Mobile App,CUST-0111,Debit Card,8,3,Monday
+SALE-0372,2023-05-07,Books,Fiction Novel,34.37,2,65.22,13.8,8.98,56.24,Central,Mobile App,CUST-0451,Cash,5,2,Sunday
+SALE-0373,2023-02-09,Books,Fiction Novel,39.97,2,113.01,24.7,27.9,85.11,North,Retail Store,CUST-0443,Debit Card,2,1,Thursday
+SALE-0374,2023-03-26,Home & Garden,Mirror,128.27,8,1103.76,11.1,122.89,980.87,West,Online,CUST-0073,Debit Card,3,1,Sunday
+SALE-0375,2023-10-26,Sports,Running Shoes,435.97,5,1720.93,23.6,406.51,1314.42,Central,Mobile App,CUST-0341,Credit Card,10,4,Thursday
+SALE-0376,2023-08-21,Clothing,Shoes,177.27,2,278.1,28.1,78.11,199.99,West,Mobile App,CUST-0092,Credit Card,8,3,Monday
+SALE-0377,2023-10-14,Sports,Dumbbells,309.45,6,1375.77,1.7,23.19,1352.58,North,Mobile App,CUST-0310,Cash,10,4,Saturday
+SALE-0378,2023-01-02,Clothing,Shoes,57.81,9,540.91,4.8,25.88,515.02,North,Online,CUST-0496,PayPal,1,1,Monday
+SALE-0379,2023-06-26,Electronics,Smartwatch,1081.21,4,4231.76,24.2,1023.04,3208.72,North,Online,CUST-0129,PayPal,6,2,Monday
+SALE-0380,2023-01-17,Home & Garden,Cushion,161.78,4,855.09,24.8,212.44,642.66,South,Retail Store,CUST-0302,PayPal,1,1,Tuesday
+SALE-0381,2023-07-11,Sports,Basketball,193.35,7,1027.02,9.6,98.16,928.85,West,Mobile App,CUST-0317,Credit Card,7,3,Tuesday
+SALE-0382,2023-12-16,Books,Textbook,87.29,7,693.65,25.8,178.7,514.94,East,Online,CUST-0451,Debit Card,12,4,Saturday
+SALE-0383,2023-10-03,Sports,Tennis Racket,243.11,4,641.95,3.5,22.64,619.31,South,Retail Store,CUST-0401,Credit Card,10,4,Tuesday
+SALE-0384,2023-01-12,Home & Garden,Cushion,166.59,6,957.98,0.6,5.5,952.49,Central,Mobile App,CUST-0235,PayPal,1,1,Thursday
+SALE-0385,2023-04-28,Clothing,Jacket,178.7,2,453.72,18.2,82.72,370.99,East,Retail Store,CUST-0206,Cash,4,2,Friday
+SALE-0386,2023-04-07,Electronics,Laptop,417.17,8,4400.01,16.7,735.08,3664.93,West,Online,CUST-0175,Debit Card,4,2,Friday
+SALE-0387,2023-04-16,Electronics,Laptop,1532.34,2,3594.59,16.4,589.53,3005.06,Central,Online,CUST-0385,PayPal,4,2,Sunday
+SALE-0388,2023-11-03,Electronics,Smartphone,1299.7,7,6628.4,20.8,1376.2,5252.2,North,Mobile App,CUST-0071,PayPal,11,4,Friday
+SALE-0389,2023-04-30,Books,Textbook,95.63,1,97.25,23.8,23.13,74.12,North,Retail Store,CUST-0025,Cash,4,2,Sunday
+SALE-0390,2023-04-30,Books,Cookbook,74.32,9,920.6,20.9,192.57,728.03,Central,Phone,CUST-0312,Debit Card,4,2,Sunday
+SALE-0391,2023-06-04,Clothing,Shoes,167.85,9,1529.73,15.3,234.31,1295.42,South,Mobile App,CUST-0147,Cash,6,2,Sunday
+SALE-0392,2023-05-21,Electronics,Smartwatch,1724.45,8,12790.37,8.4,1077.78,11712.6,Central,Retail Store,CUST-0194,PayPal,5,2,Sunday
+SALE-0393,2023-10-12,Sports,Running Shoes,282.34,4,885.53,2.2,19.69,865.84,East,Mobile App,CUST-0322,Cash,10,4,Thursday
+SALE-0394,2023-12-23,Sports,Basketball,472.71,3,1259.36,10.5,132.43,1126.93,South,Phone,CUST-0320,PayPal,12,4,Saturday
+SALE-0395,2023-04-05,Books,Biography,14.08,2,37.77,14.5,5.48,32.28,South,Retail Store,CUST-0348,Cash,4,2,Wednesday
+SALE-0396,2023-12-29,Clothing,Jacket,37.17,9,345.7,23.5,81.1,264.61,North,Mobile App,CUST-0429,PayPal,12,4,Friday
+SALE-0397,2023-10-13,Books,Textbook,28.65,7,158.1,10.4,16.46,141.65,West,Retail Store,CUST-0390,Cash,10,4,Friday
+SALE-0398,2023-04-15,Home & Garden,Coffee Maker,231.23,4,1329.58,16.2,216.05,1113.53,West,Phone,CUST-0062,Credit Card,4,2,Saturday
+SALE-0399,2023-10-02,Clothing,T-Shirt,105.31,9,628.98,6.4,40.55,588.43,East,Mobile App,CUST-0094,Credit Card,10,4,Monday
+SALE-0400,2023-02-07,Clothing,Shoes,150.38,2,361.14,24.7,89.04,272.1,Central,Retail Store,CUST-0146,PayPal,2,1,Tuesday
+SALE-0401,2023-04-17,Home & Garden,Plant Pot,171.56,3,683.78,9.7,66.57,617.21,North,Retail Store,CUST-0173,Debit Card,4,2,Monday
+SALE-0402,2023-03-02,Sports,Yoga Mat,335.99,7,3395.99,24.6,837.09,2558.9,Central,Retail Store,CUST-0480,PayPal,3,1,Thursday
+SALE-0403,2023-05-03,Books,Cookbook,43.15,8,322.54,7.8,25.12,297.42,East,Mobile App,CUST-0070,PayPal,5,2,Wednesday
+SALE-0404,2023-10-01,Home & Garden,Plant Pot,249.93,6,1078.46,6.0,65.05,1013.41,East,Phone,CUST-0232,PayPal,10,4,Sunday
+SALE-0405,2023-08-27,Electronics,Headphones,1498.83,1,1143.46,2.0,23.07,1120.39,East,Retail Store,CUST-0176,Cash,8,3,Sunday
+SALE-0406,2023-06-10,Sports,Running Shoes,405.64,3,1459.15,7.2,105.71,1353.44,Central,Retail Store,CUST-0143,Debit Card,6,2,Saturday
+SALE-0407,2023-01-09,Home & Garden,Mirror,288.93,6,2046.4,9.4,192.02,1854.38,Central,Mobile App,CUST-0304,Cash,1,1,Monday
+SALE-0408,2023-03-20,Clothing,Dress,22.83,4,96.84,25.1,24.32,72.52,South,Mobile App,CUST-0235,Debit Card,3,1,Monday
+SALE-0409,2023-09-13,Books,Cookbook,45.15,4,151.24,22.7,34.34,116.91,East,Mobile App,CUST-0171,PayPal,9,3,Wednesday
+SALE-0410,2023-08-24,Clothing,Dress,44.92,2,62.29,15.8,9.86,52.43,South,Retail Store,CUST-0315,PayPal,8,3,Thursday
+SALE-0411,2023-04-05,Books,Fiction Novel,51.51,6,403.83,1.6,6.46,397.36,Central,Online,CUST-0395,Credit Card,4,2,Wednesday
+SALE-0412,2023-12-09,Electronics,Laptop,1682.38,5,6912.53,19.3,1336.03,5576.5,West,Retail Store,CUST-0345,Debit Card,12,4,Saturday
+SALE-0413,2023-02-04,Clothing,T-Shirt,69.55,8,758.49,13.7,103.57,654.92,South,Mobile App,CUST-0431,Cash,2,1,Saturday
+SALE-0414,2023-01-31,Books,Magazine,12.25,8,126.32,28.8,36.41,89.9,West,Mobile App,CUST-0131,Credit Card,1,1,Tuesday
+SALE-0415,2023-01-04,Books,Magazine,85.04,2,228.56,17.5,39.99,188.57,West,Online,CUST-0456,Credit Card,1,1,Wednesday
+SALE-0416,2023-09-29,Home & Garden,Mirror,215.25,1,157.12,26.4,41.52,115.59,East,Online,CUST-0144,PayPal,9,3,Friday
+SALE-0417,2023-04-02,Electronics,Laptop,1412.29,5,9963.87,26.5,2644.16,7319.71,Central,Retail Store,CUST-0073,Debit Card,4,2,Sunday
+SALE-0418,2023-04-09,Books,Magazine,97.6,8,1157.14,23.3,269.35,887.79,East,Phone,CUST-0366,Cash,4,2,Sunday
+SALE-0419,2023-07-23,Electronics,Tablet,737.03,3,1918.43,23.7,454.33,1464.1,West,Mobile App,CUST-0071,Debit Card,7,3,Sunday
+SALE-0420,2023-12-23,Clothing,Dress,61.29,4,239.11,15.9,38.01,201.1,North,Online,CUST-0293,Credit Card,12,4,Saturday
+SALE-0421,2023-07-27,Sports,Basketball,157.23,8,949.26,0.6,5.84,943.42,Central,Mobile App,CUST-0138,Credit Card,7,3,Thursday
+SALE-0422,2023-11-23,Electronics,Smartphone,587.28,6,3472.24,23.3,809.17,2663.06,North,Mobile App,CUST-0166,PayPal,11,4,Thursday
+SALE-0423,2023-11-27,Home & Garden,Mirror,38.58,5,162.55,23.4,38.06,124.49,North,Online,CUST-0128,Debit Card,11,4,Monday
+SALE-0424,2023-04-19,Books,Biography,17.4,7,183.21,11.9,21.75,161.46,East,Online,CUST-0439,Credit Card,4,2,Wednesday
+SALE-0425,2023-12-17,Home & Garden,Mirror,145.65,3,522.91,19.9,104.2,418.72,Central,Online,CUST-0106,Debit Card,12,4,Sunday
+SALE-0426,2023-06-11,Electronics,Smartphone,696.36,4,2245.99,15.7,352.23,1893.76,Central,Retail Store,CUST-0333,PayPal,6,2,Sunday
+SALE-0427,2023-02-09,Home & Garden,Lamp,152.71,3,646.33,3.7,23.89,622.44,Central,Retail Store,CUST-0295,PayPal,2,1,Thursday
+SALE-0428,2023-12-13,Books,Cookbook,95.63,5,480.09,22.1,106.04,374.05,West,Retail Store,CUST-0188,Credit Card,12,4,Wednesday
+SALE-0429,2023-09-14,Home & Garden,Coffee Maker,80.5,6,288.29,25.6,73.92,214.37,North,Mobile App,CUST-0053,Debit Card,9,3,Thursday
+SALE-0430,2023-02-08,Home & Garden,Mirror,67.11,6,602.62,17.1,103.28,499.34,Central,Mobile App,CUST-0185,Cash,2,1,Wednesday
+SALE-0431,2023-01-16,Home & Garden,Cushion,282.59,5,1413.71,20.2,285.33,1128.38,West,Retail Store,CUST-0425,Cash,1,1,Monday
+SALE-0432,2023-10-11,Sports,Basketball,304.74,2,370.57,11.3,41.86,328.71,South,Mobile App,CUST-0337,Credit Card,10,4,Wednesday
+SALE-0433,2023-11-13,Home & Garden,Lamp,115.1,2,230.77,28.3,65.4,165.37,North,Online,CUST-0328,Cash,11,4,Monday
+SALE-0434,2023-03-20,Sports,Yoga Mat,247.33,9,3128.18,18.5,577.39,2550.79,West,Phone,CUST-0246,Cash,3,1,Monday
+SALE-0435,2023-02-24,Electronics,Laptop,916.97,2,2006.1,0.9,18.33,1987.76,East,Mobile App,CUST-0149,Cash,2,1,Friday
+SALE-0436,2023-05-19,Electronics,Smartphone,186.36,5,878.79,1.0,9.2,869.59,North,Retail Store,CUST-0417,PayPal,5,2,Friday
+SALE-0437,2023-08-18,Books,Magazine,77.84,9,484.51,14.0,67.69,416.82,Central,Mobile App,CUST-0237,Credit Card,8,3,Friday
+SALE-0438,2023-01-14,Electronics,Tablet,312.03,8,2525.99,1.7,42.08,2483.91,Central,Online,CUST-0103,Cash,1,1,Saturday
+SALE-0439,2023-07-17,Electronics,Tablet,338.42,7,2357.84,11.0,258.81,2099.03,West,Mobile App,CUST-0102,Credit Card,7,3,Monday
+SALE-0440,2023-10-14,Clothing,Shoes,168.83,8,811.85,28.8,234.18,577.67,Central,Retail Store,CUST-0063,PayPal,10,4,Saturday
+SALE-0441,2023-03-28,Clothing,Dress,134.68,2,366.91,18.0,66.0,300.91,East,Phone,CUST-0244,PayPal,3,1,Tuesday
+SALE-0442,2023-03-16,Electronics,Smartphone,1504.23,1,2116.82,18.7,395.44,1721.38,West,Phone,CUST-0494,PayPal,3,1,Thursday
+SALE-0443,2023-06-03,Sports,Running Shoes,173.75,2,415.85,16.2,67.49,348.36,East,Phone,CUST-0460,Debit Card,6,2,Saturday
+SALE-0444,2023-11-17,Sports,Tennis Racket,54.36,8,383.72,4.5,17.32,366.4,Central,Retail Store,CUST-0142,PayPal,11,4,Friday
+SALE-0445,2023-02-24,Clothing,Dress,184.38,9,2300.61,22.6,520.31,1780.31,North,Mobile App,CUST-0010,Cash,2,1,Friday
+SALE-0446,2023-11-14,Sports,Dumbbells,472.23,3,1065.68,19.9,212.13,853.55,West,Phone,CUST-0282,PayPal,11,4,Tuesday
+SALE-0447,2023-11-30,Books,Textbook,36.56,7,183.32,13.2,24.2,159.12,East,Phone,CUST-0066,Debit Card,11,4,Thursday
+SALE-0448,2023-09-03,Home & Garden,Lamp,137.54,1,81.52,20.5,16.68,64.84,West,Phone,CUST-0250,Cash,9,3,Sunday
+SALE-0449,2023-12-22,Sports,Tennis Racket,302.21,6,2105.15,10.3,217.22,1887.92,South,Phone,CUST-0303,PayPal,12,4,Friday
+SALE-0450,2023-05-24,Sports,Dumbbells,439.68,3,1462.82,16.8,246.01,1216.81,North,Retail Store,CUST-0180,Debit Card,5,2,Wednesday
+SALE-0451,2023-12-16,Books,Fiction Novel,61.92,7,409.42,2.8,11.32,398.1,West,Retail Store,CUST-0358,PayPal,12,4,Saturday
+SALE-0452,2023-05-30,Electronics,Headphones,507.92,7,3553.18,17.0,605.44,2947.75,West,Retail Store,CUST-0447,Cash,5,2,Tuesday
+SALE-0453,2023-05-04,Home & Garden,Lamp,135.71,5,699.21,4.3,30.27,668.94,West,Mobile App,CUST-0031,Credit Card,5,2,Thursday
+SALE-0454,2023-08-18,Books,Biography,65.26,1,41.31,20.7,8.54,32.77,Central,Mobile App,CUST-0426,PayPal,8,3,Friday
+SALE-0455,2023-10-06,Electronics,Tablet,1664.75,1,1147.55,6.3,71.97,1075.57,Central,Online,CUST-0145,Credit Card,10,4,Friday
+SALE-0456,2023-05-08,Home & Garden,Lamp,275.17,8,2843.91,24.7,702.69,2141.22,Central,Online,CUST-0283,PayPal,5,2,Monday
+SALE-0457,2023-06-19,Sports,Running Shoes,32.96,1,31.91,18.1,5.76,26.15,North,Online,CUST-0303,Cash,6,2,Monday
+SALE-0458,2023-04-24,Books,Magazine,97.4,1,143.72,25.3,36.43,107.29,Central,Retail Store,CUST-0391,PayPal,4,2,Monday
+SALE-0459,2023-07-11,Sports,Basketball,470.78,1,423.89,6.9,29.44,394.45,Central,Retail Store,CUST-0163,Cash,7,3,Tuesday
+SALE-0460,2023-01-13,Sports,Running Shoes,315.62,2,611.48,10.6,65.1,546.38,East,Mobile App,CUST-0141,Credit Card,1,1,Friday
+SALE-0461,2023-03-01,Clothing,Dress,116.8,8,1047.98,24.8,260.1,787.88,East,Phone,CUST-0190,PayPal,3,1,Wednesday
+SALE-0462,2023-04-16,Books,Biography,18.62,8,187.8,21.9,41.21,146.59,East,Mobile App,CUST-0201,Credit Card,4,2,Sunday
+SALE-0463,2023-08-13,Sports,Dumbbells,245.69,9,1496.43,2.7,41.02,1455.41,North,Phone,CUST-0230,Credit Card,8,3,Sunday
+SALE-0464,2023-12-30,Electronics,Laptop,1109.46,7,8800.45,16.2,1426.46,7374.0,East,Online,CUST-0122,Debit Card,12,4,Saturday
+SALE-0465,2023-05-05,Books,Textbook,49.04,8,459.73,8.2,37.84,421.89,Central,Retail Store,CUST-0202,Cash,5,2,Friday
+SALE-0466,2023-10-14,Sports,Basketball,154.2,1,123.12,9.7,11.98,111.14,South,Mobile App,CUST-0337,Debit Card,10,4,Saturday
+SALE-0467,2023-04-06,Sports,Basketball,407.58,4,1957.15,18.6,363.64,1593.51,North,Retail Store,CUST-0461,PayPal,4,2,Thursday
+SALE-0468,2023-10-31,Sports,Basketball,338.27,1,230.8,5.9,13.72,217.08,North,Retail Store,CUST-0202,Debit Card,10,4,Tuesday
+SALE-0469,2023-05-23,Electronics,Smartwatch,1283.23,2,2562.95,12.5,321.51,2241.44,North,Retail Store,CUST-0025,Cash,5,2,Tuesday
+SALE-0470,2023-06-16,Clothing,Jacket,150.36,9,1440.8,18.1,260.4,1180.39,North,Phone,CUST-0226,PayPal,6,2,Friday
+SALE-0471,2023-09-28,Home & Garden,Mirror,251.59,1,157.2,26.1,40.95,116.24,West,Mobile App,CUST-0332,Credit Card,9,3,Thursday
+SALE-0472,2023-06-28,Home & Garden,Cushion,75.9,3,184.78,17.5,32.33,152.45,Central,Retail Store,CUST-0262,Cash,6,2,Wednesday
+SALE-0473,2023-11-11,Books,Fiction Novel,42.77,4,172.98,16.3,28.24,144.74,South,Phone,CUST-0315,Credit Card,11,4,Saturday
+SALE-0474,2023-05-03,Home & Garden,Coffee Maker,229.16,8,1765.24,12.3,217.39,1547.85,South,Phone,CUST-0043,Debit Card,5,2,Wednesday
+SALE-0475,2023-09-19,Sports,Basketball,413.22,4,1133.9,10.1,114.79,1019.11,Central,Retail Store,CUST-0076,PayPal,9,3,Tuesday
+SALE-0476,2023-08-05,Clothing,Jacket,70.35,5,284.08,14.5,41.28,242.79,Central,Retail Store,CUST-0431,Debit Card,8,3,Saturday
+SALE-0477,2023-09-08,Home & Garden,Lamp,178.02,4,507.91,22.0,111.83,396.08,South,Phone,CUST-0319,PayPal,9,3,Friday
+SALE-0478,2023-11-14,Electronics,Tablet,786.04,3,2162.49,5.8,125.49,2037.0,North,Mobile App,CUST-0318,Debit Card,11,4,Tuesday
+SALE-0479,2023-04-10,Sports,Tennis Racket,173.16,3,631.22,7.2,45.55,585.67,Central,Mobile App,CUST-0239,PayPal,4,2,Monday
+SALE-0480,2023-12-17,Sports,Basketball,75.16,7,576.17,10.8,62.31,513.86,West,Mobile App,CUST-0442,Debit Card,12,4,Sunday
+SALE-0481,2023-02-12,Books,Fiction Novel,55.42,4,332.57,23.8,79.2,253.37,South,Phone,CUST-0384,Credit Card,2,1,Sunday
+SALE-0482,2023-05-21,Clothing,Shoes,111.27,4,500.9,18.6,92.98,407.92,East,Retail Store,CUST-0472,PayPal,5,2,Sunday
+SALE-0483,2023-10-17,Sports,Tennis Racket,468.86,1,295.57,3.0,8.83,286.74,Central,Online,CUST-0327,Credit Card,10,4,Tuesday
+SALE-0484,2023-05-18,Books,Cookbook,99.28,1,121.11,23.4,28.37,92.74,Central,Online,CUST-0199,PayPal,5,2,Thursday
+SALE-0485,2023-10-07,Clothing,Jacket,175.8,3,362.95,20.3,73.66,289.29,North,Retail Store,CUST-0369,Cash,10,4,Saturday
+SALE-0486,2023-01-17,Sports,Dumbbells,25.64,9,214.25,13.9,29.83,184.42,East,Online,CUST-0298,PayPal,1,1,Tuesday
+SALE-0487,2023-03-02,Clothing,Jeans,132.56,6,877.63,21.0,184.67,692.96,Central,Phone,CUST-0283,PayPal,3,1,Thursday
+SALE-0488,2023-03-26,Books,Textbook,39.88,9,489.47,24.2,118.47,371.01,South,Retail Store,CUST-0176,Credit Card,3,1,Sunday
+SALE-0489,2023-10-19,Home & Garden,Mirror,136.52,2,215.35,29.0,62.36,152.99,East,Retail Store,CUST-0285,Cash,10,4,Thursday
+SALE-0490,2023-12-27,Home & Garden,Plant Pot,62.28,5,323.98,10.2,33.14,290.84,Central,Phone,CUST-0128,Credit Card,12,4,Wednesday
+SALE-0491,2023-03-11,Sports,Running Shoes,495.94,4,2687.7,9.2,248.25,2439.45,East,Retail Store,CUST-0429,Debit Card,3,1,Saturday
+SALE-0492,2023-05-08,Clothing,Dress,190.27,5,1164.85,19.0,221.45,943.4,South,Mobile App,CUST-0462,PayPal,5,2,Monday
+SALE-0493,2023-03-14,Books,Cookbook,85.35,7,660.61,24.4,161.21,499.4,West,Mobile App,CUST-0401,PayPal,3,1,Tuesday
+SALE-0494,2023-02-08,Electronics,Headphones,1679.88,8,15496.64,9.0,1389.04,14107.6,Central,Phone,CUST-0043,Cash,2,1,Wednesday
+SALE-0495,2023-08-21,Sports,Dumbbells,145.88,7,851.17,26.8,228.39,622.78,Central,Online,CUST-0212,Credit Card,8,3,Monday
+SALE-0496,2023-08-23,Home & Garden,Coffee Maker,39.24,5,138.77,7.2,10.0,128.76,Central,Mobile App,CUST-0247,Debit Card,8,3,Wednesday
+SALE-0497,2023-08-08,Clothing,Jacket,44.84,6,228.92,29.9,68.37,160.55,East,Phone,CUST-0046,Cash,8,3,Tuesday
+SALE-0498,2023-06-22,Books,Magazine,54.01,4,231.8,9.5,21.92,209.88,South,Mobile App,CUST-0435,Cash,6,2,Thursday
+SALE-0499,2023-12-16,Electronics,Laptop,792.87,4,3493.05,26.2,914.68,2578.37,North,Mobile App,CUST-0275,Credit Card,12,4,Saturday
+SALE-0500,2023-03-05,Clothing,Jacket,131.45,4,681.37,23.9,162.82,518.56,West,Online,CUST-0043,PayPal,3,1,Sunday
+SALE-0501,2023-04-14,Clothing,Dress,42.6,9,403.02,1.7,6.89,396.13,South,Phone,CUST-0039,Credit Card,4,2,Friday
+SALE-0502,2023-12-02,Home & Garden,Plant Pot,34.01,6,205.94,8.2,16.79,189.15,North,Phone,CUST-0390,Debit Card,12,4,Saturday
+SALE-0503,2023-01-27,Sports,Dumbbells,451.52,4,2268.26,10.9,248.25,2020.0,South,Mobile App,CUST-0267,Credit Card,1,1,Friday
+SALE-0504,2023-12-27,Electronics,Laptop,1824.7,3,6374.78,0.6,40.04,6334.74,South,Mobile App,CUST-0088,Credit Card,12,4,Wednesday
+SALE-0505,2023-03-09,Books,Textbook,96.99,4,483.35,22.7,109.66,373.69,Central,Mobile App,CUST-0366,Credit Card,3,1,Thursday
+SALE-0506,2023-01-05,Home & Garden,Coffee Maker,171.88,9,1692.07,1.9,31.49,1660.58,West,Retail Store,CUST-0467,PayPal,1,1,Thursday
+SALE-0507,2023-02-06,Clothing,Jacket,49.89,4,241.42,3.5,8.34,233.08,North,Online,CUST-0217,Credit Card,2,1,Monday
+SALE-0508,2023-06-10,Home & Garden,Plant Pot,203.01,6,1196.33,12.4,148.93,1047.4,South,Mobile App,CUST-0007,Debit Card,6,2,Saturday
+SALE-0509,2023-11-25,Clothing,T-Shirt,191.82,2,313.24,10.1,31.77,281.47,Central,Online,CUST-0001,Debit Card,11,4,Saturday
+SALE-0510,2023-08-14,Home & Garden,Lamp,25.85,4,78.15,17.9,13.96,64.2,South,Mobile App,CUST-0457,PayPal,8,3,Monday
+SALE-0511,2023-04-22,Electronics,Laptop,287.33,9,3122.7,8.9,277.6,2845.1,South,Online,CUST-0016,PayPal,4,2,Saturday
+SALE-0512,2023-06-29,Sports,Dumbbells,316.84,7,2220.09,6.0,133.72,2086.37,South,Retail Store,CUST-0278,Cash,6,2,Thursday
+SALE-0513,2023-11-27,Electronics,Smartphone,1005.99,7,6413.02,9.7,621.61,5791.41,Central,Phone,CUST-0346,Credit Card,11,4,Monday
+SALE-0514,2023-12-04,Home & Garden,Lamp,220.79,5,1069.79,29.9,319.54,750.25,Central,Retail Store,CUST-0030,PayPal,12,4,Monday
+SALE-0515,2023-06-01,Electronics,Smartphone,1377.28,9,14249.23,0.4,55.18,14194.06,West,Mobile App,CUST-0029,Credit Card,6,2,Thursday
+SALE-0516,2023-05-04,Sports,Tennis Racket,330.88,6,1942.52,5.7,110.31,1832.22,North,Online,CUST-0210,Cash,5,2,Thursday
+SALE-0517,2023-06-12,Clothing,Jacket,58.94,4,207.41,7.9,16.46,190.96,Central,Mobile App,CUST-0098,Cash,6,2,Monday
+SALE-0518,2023-10-07,Clothing,Jacket,119.84,9,643.35,7.4,47.75,595.6,North,Online,CUST-0351,Credit Card,10,4,Saturday
+SALE-0519,2023-01-08,Home & Garden,Lamp,77.84,6,442.47,18.1,80.22,362.25,North,Online,CUST-0042,PayPal,1,1,Sunday
+SALE-0520,2023-09-17,Home & Garden,Mirror,169.75,3,311.49,6.1,18.9,292.59,West,Mobile App,CUST-0463,PayPal,9,3,Sunday
+SALE-0521,2023-02-12,Books,Magazine,89.52,8,1024.63,4.4,44.67,979.96,Central,Retail Store,CUST-0388,Cash,2,1,Sunday
+SALE-0522,2023-02-12,Home & Garden,Coffee Maker,172.69,9,2003.31,28.8,576.83,1426.48,Central,Retail Store,CUST-0327,Debit Card,2,1,Sunday
+SALE-0523,2023-10-02,Home & Garden,Cushion,67.8,1,46.78,17.7,8.27,38.51,Central,Online,CUST-0200,Cash,10,4,Monday
+SALE-0524,2023-12-24,Sports,Yoga Mat,85.3,9,665.15,1.8,11.79,653.35,North,Retail Store,CUST-0134,Credit Card,12,4,Sunday
+SALE-0525,2023-08-11,Electronics,Headphones,1400.2,2,2215.76,5.1,112.92,2102.85,Central,Online,CUST-0092,Cash,8,3,Friday
+SALE-0526,2023-12-08,Clothing,T-Shirt,93.94,1,75.99,29.7,22.54,53.45,North,Retail Store,CUST-0496,Credit Card,12,4,Friday
+SALE-0527,2023-03-25,Sports,Dumbbells,174.8,5,953.02,5.4,51.19,901.83,Central,Phone,CUST-0367,Debit Card,3,1,Saturday
+SALE-0528,2023-07-10,Clothing,Dress,125.79,2,224.76,19.4,43.66,181.1,North,Online,CUST-0147,Cash,7,3,Monday
+SALE-0529,2023-08-08,Home & Garden,Mirror,264.18,9,1851.9,22.2,410.95,1440.95,North,Phone,CUST-0214,Credit Card,8,3,Tuesday
+SALE-0530,2023-09-12,Sports,Tennis Racket,372.16,1,295.17,24.1,71.21,223.96,East,Online,CUST-0253,PayPal,9,3,Tuesday
+SALE-0531,2023-10-18,Clothing,Dress,192.3,6,820.79,15.6,127.95,692.84,South,Phone,CUST-0310,Credit Card,10,4,Wednesday
+SALE-0532,2023-10-21,Electronics,Smartphone,212.44,7,1298.51,26.4,342.65,955.86,Central,Online,CUST-0232,Credit Card,10,4,Saturday
+SALE-0533,2023-01-07,Clothing,T-Shirt,93.64,7,780.6,28.2,219.82,560.79,West,Phone,CUST-0146,PayPal,1,1,Saturday
+SALE-0534,2023-03-18,Clothing,T-Shirt,49.06,2,105.58,24.8,26.21,79.37,Central,Mobile App,CUST-0435,Debit Card,3,1,Saturday
+SALE-0535,2023-06-14,Clothing,Jacket,160.44,9,1615.05,22.1,356.13,1258.92,East,Phone,CUST-0112,Credit Card,6,2,Wednesday
+SALE-0536,2023-10-20,Home & Garden,Coffee Maker,105.43,9,613.23,9.6,58.69,554.54,Central,Online,CUST-0297,Debit Card,10,4,Friday
+SALE-0537,2023-04-25,Books,Fiction Novel,62.63,8,537.48,17.2,92.53,444.95,West,Online,CUST-0225,PayPal,4,2,Tuesday
+SALE-0538,2023-05-25,Home & Garden,Plant Pot,171.9,1,173.67,0.7,1.18,172.5,North,Mobile App,CUST-0126,Credit Card,5,2,Thursday
+SALE-0539,2023-07-08,Clothing,Dress,180.32,6,1071.56,17.2,183.92,887.64,Central,Phone,CUST-0403,Debit Card,7,3,Saturday
+SALE-0540,2023-08-26,Home & Garden,Mirror,240.35,6,1105.7,2.0,22.35,1083.35,West,Retail Store,CUST-0361,Debit Card,8,3,Saturday
+SALE-0541,2023-03-19,Electronics,Headphones,254.99,8,2546.18,24.4,620.15,1926.03,North,Retail Store,CUST-0015,Cash,3,1,Sunday
+SALE-0542,2023-11-22,Electronics,Tablet,836.16,3,2181.16,21.2,462.63,1718.53,North,Mobile App,CUST-0261,Cash,11,4,Wednesday
+SALE-0543,2023-02-23,Clothing,Shoes,139.34,9,1819.92,1.5,26.87,1793.05,South,Mobile App,CUST-0366,PayPal,2,1,Thursday
+SALE-0544,2023-01-31,Clothing,Dress,44.77,4,205.96,20.2,41.7,164.26,North,Online,CUST-0074,Debit Card,1,1,Tuesday
+SALE-0545,2023-09-24,Sports,Dumbbells,348.23,7,2031.58,19.4,393.48,1638.1,West,Online,CUST-0151,Credit Card,9,3,Sunday
+SALE-0546,2023-09-16,Clothing,Jacket,87.31,4,234.06,3.9,9.18,224.88,North,Online,CUST-0130,PayPal,9,3,Saturday
+SALE-0547,2023-12-06,Clothing,Jeans,97.07,3,282.77,19.4,54.73,228.04,East,Phone,CUST-0192,Cash,12,4,Wednesday
+SALE-0548,2023-07-21,Home & Garden,Plant Pot,16.94,8,130.19,23.9,31.05,99.14,West,Phone,CUST-0492,Debit Card,7,3,Friday
+SALE-0549,2023-02-08,Clothing,Jeans,172.3,3,726.21,27.1,196.79,529.43,Central,Online,CUST-0232,Debit Card,2,1,Wednesday
+SALE-0550,2023-02-24,Clothing,Jacket,34.83,7,351.07,22.9,80.53,270.54,West,Phone,CUST-0409,PayPal,2,1,Friday
+SALE-0551,2023-03-03,Books,Cookbook,14.84,8,137.74,7.3,10.07,127.68,South,Mobile App,CUST-0382,Cash,3,1,Friday
+SALE-0552,2023-08-26,Home & Garden,Coffee Maker,260.5,5,1034.56,7.1,73.13,961.43,North,Retail Store,CUST-0315,Cash,8,3,Saturday
+SALE-0553,2023-12-27,Books,Fiction Novel,21.85,1,22.71,2.5,0.56,22.15,South,Phone,CUST-0196,Debit Card,12,4,Wednesday
+SALE-0554,2023-02-16,Clothing,Dress,134.9,6,851.73,5.8,49.71,802.02,West,Online,CUST-0123,Cash,2,1,Thursday
+SALE-0555,2023-05-14,Clothing,T-Shirt,118.8,1,134.49,24.9,33.44,101.05,West,Mobile App,CUST-0224,Debit Card,5,2,Sunday
+SALE-0556,2023-02-18,Sports,Running Shoes,247.68,1,287.59,4.2,12.01,275.58,South,Online,CUST-0338,Credit Card,2,1,Saturday
+SALE-0557,2023-02-01,Clothing,Jeans,179.55,4,808.18,20.9,168.55,639.63,South,Mobile App,CUST-0190,Cash,2,1,Wednesday
+SALE-0558,2023-12-18,Electronics,Smartwatch,1889.91,4,7693.47,29.3,2252.14,5441.33,Central,Phone,CUST-0446,Credit Card,12,4,Monday
+SALE-0559,2023-01-12,Electronics,Smartphone,585.71,7,4725.41,15.2,719.81,4005.6,West,Retail Store,CUST-0038,Credit Card,1,1,Thursday
+SALE-0560,2023-06-19,Electronics,Laptop,219.95,4,852.41,23.6,200.76,651.65,West,Online,CUST-0291,Debit Card,6,2,Monday
+SALE-0561,2023-10-21,Sports,Basketball,90.25,7,514.76,15.4,79.2,435.55,West,Online,CUST-0482,PayPal,10,4,Saturday
+SALE-0562,2023-12-16,Sports,Yoga Mat,148.31,3,365.69,6.1,22.41,343.28,East,Retail Store,CUST-0197,Debit Card,12,4,Saturday
+SALE-0563,2023-05-21,Home & Garden,Cushion,172.84,2,344.71,3.6,12.45,332.26,South,Online,CUST-0366,Debit Card,5,2,Sunday
+SALE-0564,2023-11-28,Home & Garden,Cushion,81.07,2,114.29,22.3,25.51,88.78,West,Mobile App,CUST-0161,Credit Card,11,4,Tuesday
+SALE-0565,2023-02-14,Home & Garden,Cushion,25.14,7,243.93,8.2,20.09,223.84,South,Mobile App,CUST-0113,Debit Card,2,1,Tuesday
+SALE-0566,2023-11-26,Books,Textbook,70.8,1,68.88,26.0,17.9,50.99,Central,Online,CUST-0499,PayPal,11,4,Sunday
+SALE-0567,2023-07-03,Sports,Tennis Racket,408.83,7,2680.25,7.5,199.9,2480.36,West,Phone,CUST-0193,Cash,7,3,Monday
+SALE-0568,2023-07-18,Home & Garden,Lamp,260.93,9,1602.48,12.1,193.97,1408.51,North,Phone,CUST-0435,Debit Card,7,3,Tuesday
+SALE-0569,2023-01-16,Home & Garden,Coffee Maker,272.68,6,1686.68,7.0,118.19,1568.5,West,Phone,CUST-0431,Debit Card,1,1,Monday
+SALE-0570,2023-03-23,Electronics,Smartphone,451.35,6,4192.93,24.2,1016.2,3176.73,South,Phone,CUST-0499,Credit Card,3,1,Thursday
+SALE-0571,2023-04-23,Books,Biography,36.79,1,42.91,20.2,8.68,34.23,East,Retail Store,CUST-0207,Debit Card,4,2,Sunday
+SALE-0572,2023-05-02,Books,Cookbook,16.35,3,62.29,1.3,0.8,61.49,East,Online,CUST-0341,Cash,5,2,Tuesday
+SALE-0573,2023-10-18,Books,Textbook,87.37,6,312.47,15.4,47.97,264.49,Central,Retail Store,CUST-0065,PayPal,10,4,Wednesday
+SALE-0574,2023-10-05,Home & Garden,Lamp,19.1,5,64.58,8.7,5.6,58.98,West,Online,CUST-0302,Credit Card,10,4,Thursday
+SALE-0575,2023-01-29,Clothing,Shoes,155.82,2,331.19,15.1,50.01,281.18,South,Online,CUST-0326,PayPal,1,1,Sunday
+SALE-0576,2023-01-01,Home & Garden,Mirror,204.06,3,669.47,12.4,83.05,586.42,South,Retail Store,CUST-0279,Cash,1,1,Sunday
+SALE-0577,2023-04-01,Home & Garden,Coffee Maker,89.36,4,392.51,11.8,46.18,346.33,North,Retail Store,CUST-0185,Debit Card,4,2,Saturday
+SALE-0578,2023-02-26,Books,Cookbook,65.82,3,261.47,5.8,15.06,246.41,North,Phone,CUST-0034,PayPal,2,1,Sunday
+SALE-0579,2023-10-28,Electronics,Tablet,955.54,7,5585.33,16.9,941.46,4643.87,East,Phone,CUST-0180,Debit Card,10,4,Saturday
+SALE-0580,2023-03-22,Sports,Basketball,308.32,1,388.95,29.0,112.92,276.03,East,Retail Store,CUST-0495,Cash,3,1,Wednesday
+SALE-0581,2023-04-25,Books,Textbook,42.63,1,47.11,14.1,6.66,40.45,West,Phone,CUST-0442,Cash,4,2,Tuesday
+SALE-0582,2023-03-07,Clothing,T-Shirt,39.78,6,257.17,17.3,44.42,212.75,Central,Mobile App,CUST-0203,Credit Card,3,1,Tuesday
+SALE-0583,2023-04-04,Books,Cookbook,17.25,8,153.5,16.3,25.05,128.45,Central,Retail Store,CUST-0216,Credit Card,4,2,Tuesday
+SALE-0584,2023-09-12,Clothing,Dress,21.09,1,12.47,17.1,2.13,10.33,North,Retail Store,CUST-0094,Cash,9,3,Tuesday
+SALE-0585,2023-06-13,Clothing,T-Shirt,153.48,1,134.79,5.0,6.72,128.06,East,Mobile App,CUST-0101,Credit Card,6,2,Tuesday
+SALE-0586,2023-05-16,Clothing,Jeans,56.23,4,267.25,17.4,46.42,220.83,North,Phone,CUST-0108,Cash,5,2,Tuesday
+SALE-0587,2023-02-25,Electronics,Laptop,194.25,4,973.94,20.7,202.02,771.92,West,Mobile App,CUST-0174,PayPal,2,1,Saturday
+SALE-0588,2023-03-27,Sports,Basketball,192.03,1,229.6,12.9,29.68,199.92,West,Phone,CUST-0184,PayPal,3,1,Monday
+SALE-0589,2023-02-21,Sports,Tennis Racket,197.55,5,1294.81,10.2,131.77,1163.05,South,Retail Store,CUST-0356,PayPal,2,1,Tuesday
+SALE-0590,2023-02-07,Electronics,Tablet,1629.68,8,18060.38,10.7,1934.17,16126.2,North,Phone,CUST-0400,Cash,2,1,Tuesday
+SALE-0591,2023-02-23,Electronics,Tablet,1012.56,1,1402.48,14.5,203.05,1199.43,South,Mobile App,CUST-0063,Debit Card,2,1,Thursday
+SALE-0592,2023-02-08,Books,Fiction Novel,82.5,1,120.48,15.8,18.98,101.51,East,Mobile App,CUST-0269,Credit Card,2,1,Wednesday
+SALE-0593,2023-08-09,Clothing,Shoes,142.52,8,688.41,29.3,201.83,486.58,West,Retail Store,CUST-0079,Credit Card,8,3,Wednesday
+SALE-0594,2023-02-21,Home & Garden,Lamp,54.43,3,205.1,21.0,43.13,161.98,South,Mobile App,CUST-0100,Cash,2,1,Tuesday
+SALE-0595,2023-12-05,Home & Garden,Plant Pot,281.97,4,956.15,9.8,94.04,862.11,South,Online,CUST-0123,Credit Card,12,4,Tuesday
+SALE-0596,2023-07-21,Books,Magazine,62.55,4,244.13,2.6,6.45,237.67,West,Retail Store,CUST-0304,Credit Card,7,3,Friday
+SALE-0597,2023-07-04,Electronics,Headphones,776.58,5,3347.12,19.1,637.95,2709.17,North,Phone,CUST-0093,PayPal,7,3,Tuesday
+SALE-0598,2023-04-13,Electronics,Laptop,644.3,8,7113.67,9.2,653.61,6460.06,South,Retail Store,CUST-0014,Cash,4,2,Thursday
+SALE-0599,2023-02-11,Sports,Running Shoes,277.81,1,296.97,9.1,26.97,269.99,East,Mobile App,CUST-0371,PayPal,2,1,Saturday
+SALE-0600,2023-09-08,Home & Garden,Coffee Maker,64.76,9,484.65,21.8,105.79,378.85,Central,Mobile App,CUST-0130,Debit Card,9,3,Friday
+SALE-0601,2023-07-09,Sports,Dumbbells,180.98,9,1441.27,14.7,211.77,1229.5,South,Mobile App,CUST-0008,Credit Card,7,3,Sunday
+SALE-0602,2023-05-15,Sports,Basketball,411.25,4,1577.68,13.1,206.48,1371.2,East,Retail Store,CUST-0014,Cash,5,2,Monday
+SALE-0603,2023-10-16,Electronics,Smartphone,1726.4,4,5975.62,15.1,900.59,5075.02,North,Online,CUST-0129,Cash,10,4,Monday
+SALE-0604,2023-10-05,Sports,Tennis Racket,175.1,6,794.07,22.2,176.44,617.63,South,Online,CUST-0408,PayPal,10,4,Thursday
+SALE-0605,2023-09-25,Sports,Tennis Racket,110.31,7,536.95,12.9,69.13,467.82,West,Retail Store,CUST-0440,PayPal,9,3,Monday
+SALE-0606,2023-06-03,Electronics,Headphones,1525.29,9,15203.32,1.9,282.54,14920.79,North,Retail Store,CUST-0282,Credit Card,6,2,Saturday
+SALE-0607,2023-08-18,Clothing,Jeans,162.55,7,821.3,25.3,207.95,613.35,South,Retail Store,CUST-0018,Debit Card,8,3,Friday
+SALE-0608,2023-01-22,Sports,Running Shoes,433.88,2,931.03,9.5,88.13,842.9,West,Retail Store,CUST-0381,Debit Card,1,1,Sunday
+SALE-0609,2023-11-01,Home & Garden,Plant Pot,130.21,4,445.65,8.5,38.05,407.6,North,Online,CUST-0089,PayPal,11,4,Wednesday
+SALE-0610,2023-10-12,Sports,Tennis Racket,253.96,6,978.88,2.9,28.09,950.79,East,Phone,CUST-0034,PayPal,10,4,Thursday
+SALE-0611,2023-01-07,Books,Magazine,59.18,3,191.36,25.6,48.91,142.45,Central,Mobile App,CUST-0379,Credit Card,1,1,Saturday
+SALE-0612,2023-08-01,Clothing,Jeans,155.32,5,598.56,2.4,14.31,584.25,Central,Online,CUST-0485,Credit Card,8,3,Tuesday
+SALE-0613,2023-10-16,Electronics,Tablet,848.77,9,5442.63,26.4,1436.59,4006.04,Central,Phone,CUST-0005,PayPal,10,4,Monday
+SALE-0614,2023-05-16,Sports,Basketball,175.2,8,1875.45,22.8,427.83,1447.62,Central,Mobile App,CUST-0416,Credit Card,5,2,Tuesday
+SALE-0615,2023-03-30,Home & Garden,Cushion,59.13,5,460.56,13.5,62.21,398.34,South,Mobile App,CUST-0237,Credit Card,3,1,Thursday
+SALE-0616,2023-07-22,Home & Garden,Lamp,74.59,4,287.97,24.3,69.85,218.11,North,Mobile App,CUST-0362,Cash,7,3,Saturday
+SALE-0617,2023-07-10,Electronics,Tablet,165.42,5,819.24,11.6,95.35,723.89,East,Phone,CUST-0312,Cash,7,3,Monday
+SALE-0618,2023-09-09,Electronics,Smartphone,329.42,6,1259.35,10.0,125.5,1133.85,South,Phone,CUST-0056,PayPal,9,3,Saturday
+SALE-0619,2023-06-14,Home & Garden,Cushion,299.29,5,1436.08,7.3,104.37,1331.71,Central,Online,CUST-0010,Debit Card,6,2,Wednesday
+SALE-0620,2023-08-15,Clothing,Jacket,196.93,2,326.73,13.0,42.59,284.14,West,Phone,CUST-0061,Credit Card,8,3,Tuesday
+SALE-0621,2023-09-21,Clothing,T-Shirt,153.36,4,427.55,4.0,17.1,410.44,East,Mobile App,CUST-0434,Debit Card,9,3,Thursday
+SALE-0622,2023-09-26,Books,Fiction Novel,52.69,7,275.08,3.5,9.76,265.32,South,Retail Store,CUST-0251,Debit Card,9,3,Tuesday
+SALE-0623,2023-01-30,Clothing,T-Shirt,125.0,6,964.47,2.3,22.42,942.05,West,Online,CUST-0059,Cash,1,1,Monday
+SALE-0624,2023-12-27,Clothing,Dress,110.83,8,819.54,15.4,126.49,693.05,East,Mobile App,CUST-0439,PayPal,12,4,Wednesday
+SALE-0625,2023-11-22,Electronics,Laptop,1828.87,4,7309.75,8.8,646.79,6662.96,South,Phone,CUST-0414,PayPal,11,4,Wednesday
+SALE-0626,2023-11-01,Sports,Yoga Mat,434.91,1,312.17,0.9,2.85,309.32,West,Phone,CUST-0196,Cash,11,4,Wednesday
+SALE-0627,2023-03-25,Home & Garden,Coffee Maker,250.54,5,1564.49,15.1,235.96,1328.53,East,Online,CUST-0037,PayPal,3,1,Saturday
+SALE-0628,2023-01-26,Clothing,Shoes,74.88,4,409.67,6.0,24.75,384.91,South,Retail Store,CUST-0249,Debit Card,1,1,Thursday
+SALE-0629,2023-12-13,Clothing,Dress,79.89,9,626.75,26.7,167.56,459.19,West,Online,CUST-0394,Credit Card,12,4,Wednesday
+SALE-0630,2023-08-31,Clothing,Jeans,83.34,1,56.3,5.5,3.11,53.19,Central,Online,CUST-0213,Debit Card,8,3,Thursday
+SALE-0631,2023-05-10,Books,Cookbook,47.3,8,422.66,0.8,3.44,419.22,East,Mobile App,CUST-0484,PayPal,5,2,Wednesday
+SALE-0632,2023-06-28,Sports,Dumbbells,295.01,4,1169.16,11.7,136.51,1032.64,South,Mobile App,CUST-0262,Cash,6,2,Wednesday
+SALE-0633,2023-12-13,Books,Magazine,15.15,7,86.99,16.4,14.28,72.71,West,Online,CUST-0025,Credit Card,12,4,Wednesday
+SALE-0634,2023-09-19,Home & Garden,Mirror,180.25,1,151.35,1.6,2.5,148.85,Central,Phone,CUST-0277,Cash,9,3,Tuesday
+SALE-0635,2023-12-17,Electronics,Headphones,845.31,4,3132.99,2.6,81.74,3051.25,North,Phone,CUST-0469,Cash,12,4,Sunday
+SALE-0636,2023-11-24,Home & Garden,Plant Pot,126.98,9,779.52,24.3,189.58,589.93,East,Phone,CUST-0211,Debit Card,11,4,Friday
+SALE-0637,2023-03-18,Books,Textbook,80.94,2,206.23,20.8,42.87,163.36,North,Mobile App,CUST-0017,Cash,3,1,Saturday
+SALE-0638,2023-12-15,Clothing,T-Shirt,176.09,8,1222.31,29.3,358.43,863.88,West,Phone,CUST-0197,Cash,12,4,Friday
+SALE-0639,2023-08-03,Sports,Basketball,154.04,5,573.56,29.7,170.4,403.16,North,Retail Store,CUST-0268,Cash,8,3,Thursday
+SALE-0640,2023-04-24,Books,Biography,90.62,9,1143.22,14.5,166.06,977.17,East,Phone,CUST-0419,Debit Card,4,2,Monday
+SALE-0641,2023-12-03,Books,Textbook,30.19,1,27.01,4.3,1.16,25.84,East,Online,CUST-0096,PayPal,12,4,Sunday
+SALE-0642,2023-03-07,Home & Garden,Mirror,141.97,2,391.92,26.2,102.59,289.33,South,Phone,CUST-0082,Credit Card,3,1,Tuesday
+SALE-0643,2023-04-24,Home & Garden,Lamp,219.63,6,1502.45,17.4,261.97,1240.48,East,Mobile App,CUST-0201,Cash,4,2,Monday
+SALE-0644,2023-07-10,Home & Garden,Mirror,288.07,4,1111.64,9.7,107.71,1003.93,East,Mobile App,CUST-0412,Credit Card,7,3,Monday
+SALE-0645,2023-08-29,Electronics,Smartwatch,709.89,6,2656.4,24.7,654.87,2001.53,Central,Online,CUST-0217,PayPal,8,3,Tuesday
+SALE-0646,2023-04-10,Books,Fiction Novel,27.3,6,228.16,15.4,35.19,192.97,West,Phone,CUST-0450,PayPal,4,2,Monday
+SALE-0647,2023-01-28,Clothing,Jeans,123.78,3,445.37,2.7,11.83,433.53,South,Phone,CUST-0119,PayPal,1,1,Saturday
+SALE-0648,2023-10-19,Sports,Yoga Mat,157.18,6,794.05,13.8,109.66,684.39,East,Retail Store,CUST-0451,Credit Card,10,4,Thursday
+SALE-0649,2023-09-07,Home & Garden,Lamp,48.92,1,35.89,16.3,5.87,30.03,East,Online,CUST-0004,Credit Card,9,3,Thursday
+SALE-0650,2023-08-20,Home & Garden,Lamp,92.28,9,545.24,11.0,59.98,485.26,South,Retail Store,CUST-0024,PayPal,8,3,Sunday
+SALE-0651,2023-02-15,Clothing,Shoes,176.89,6,1261.46,8.0,101.34,1160.12,West,Mobile App,CUST-0473,PayPal,2,1,Wednesday
+SALE-0652,2023-08-08,Sports,Basketball,195.85,8,1035.58,19.1,197.47,838.1,North,Online,CUST-0258,Debit Card,8,3,Tuesday
+SALE-0653,2023-07-11,Electronics,Tablet,118.67,7,808.4,24.5,197.92,610.48,Central,Retail Store,CUST-0396,Credit Card,7,3,Tuesday
+SALE-0654,2023-12-13,Electronics,Smartphone,1481.34,8,11651.42,11.9,1386.95,10264.47,South,Phone,CUST-0374,Cash,12,4,Wednesday
+SALE-0655,2023-03-08,Electronics,Headphones,1179.71,7,9336.15,16.4,1531.73,7804.42,Central,Phone,CUST-0116,Debit Card,3,1,Wednesday
+SALE-0656,2023-02-03,Electronics,Tablet,1085.62,9,10460.8,19.6,2047.63,8413.17,East,Mobile App,CUST-0226,Cash,2,1,Friday
+SALE-0657,2023-08-11,Clothing,Dress,103.52,7,451.88,23.3,105.18,346.7,West,Phone,CUST-0130,Debit Card,8,3,Friday
+SALE-0658,2023-03-26,Sports,Running Shoes,43.41,1,59.74,13.8,8.21,51.52,South,Retail Store,CUST-0239,Debit Card,3,1,Sunday
+SALE-0659,2023-04-19,Electronics,Smartwatch,578.43,2,1294.39,3.1,40.08,1254.31,Central,Retail Store,CUST-0358,Credit Card,4,2,Wednesday
+SALE-0660,2023-07-07,Electronics,Headphones,376.48,7,2182.41,3.9,84.52,2097.9,East,Online,CUST-0148,Credit Card,7,3,Friday
+SALE-0661,2023-12-05,Electronics,Laptop,1289.5,5,5502.4,11.6,638.33,4864.07,North,Online,CUST-0476,PayPal,12,4,Tuesday
+SALE-0662,2023-08-16,Sports,Running Shoes,78.44,6,367.74,10.2,37.62,330.13,Central,Phone,CUST-0260,PayPal,8,3,Wednesday
+SALE-0663,2023-12-26,Clothing,Jeans,162.04,1,183.84,29.2,53.74,130.1,North,Phone,CUST-0046,PayPal,12,4,Tuesday
+SALE-0664,2023-12-05,Electronics,Smartwatch,141.13,3,448.81,29.5,132.29,316.53,East,Retail Store,CUST-0281,PayPal,12,4,Tuesday
+SALE-0665,2023-02-23,Books,Magazine,15.78,5,113.66,13.9,15.81,97.85,North,Phone,CUST-0230,Credit Card,2,1,Thursday
+SALE-0666,2023-02-24,Sports,Yoga Mat,274.53,6,2418.64,29.4,711.84,1706.8,Central,Retail Store,CUST-0389,Cash,2,1,Friday
+SALE-0667,2023-09-25,Clothing,Dress,142.85,8,749.75,20.0,150.01,599.74,West,Phone,CUST-0144,Debit Card,9,3,Monday
+SALE-0668,2023-01-21,Books,Biography,50.41,7,404.85,26.1,105.59,299.26,South,Mobile App,CUST-0155,Cash,1,1,Saturday
+SALE-0669,2023-05-01,Electronics,Laptop,1660.39,8,14946.57,20.1,3011.71,11934.87,North,Online,CUST-0486,PayPal,5,2,Monday
+SALE-0670,2023-03-18,Electronics,Smartwatch,293.57,2,715.16,16.4,117.25,597.92,North,Online,CUST-0271,Cash,3,1,Saturday
+SALE-0671,2023-11-26,Clothing,Jacket,155.56,5,543.98,17.6,95.93,448.06,East,Phone,CUST-0232,PayPal,11,4,Sunday
+SALE-0672,2023-01-26,Electronics,Smartphone,337.25,9,3280.6,17.9,586.91,2693.69,North,Phone,CUST-0216,Cash,1,1,Thursday
+SALE-0673,2023-12-13,Home & Garden,Cushion,89.21,5,516.22,20.7,106.77,409.45,North,Online,CUST-0361,Credit Card,12,4,Wednesday
+SALE-0674,2023-01-05,Clothing,Jeans,43.37,4,187.02,9.9,18.43,168.58,East,Phone,CUST-0006,PayPal,1,1,Thursday
+SALE-0675,2023-11-15,Home & Garden,Coffee Maker,237.72,6,1332.39,25.5,340.1,992.29,East,Phone,CUST-0368,Debit Card,11,4,Wednesday
+SALE-0676,2023-02-28,Sports,Basketball,40.68,9,399.72,21.4,85.41,314.31,West,Phone,CUST-0331,PayPal,2,1,Tuesday
+SALE-0677,2023-12-20,Sports,Basketball,254.7,3,909.6,6.7,60.66,848.95,South,Online,CUST-0488,Debit Card,12,4,Wednesday
+SALE-0678,2023-12-23,Electronics,Smartphone,378.57,1,417.16,9.3,38.73,378.43,North,Mobile App,CUST-0299,PayPal,12,4,Saturday
+SALE-0679,2023-10-19,Sports,Yoga Mat,492.37,2,747.73,7.6,56.6,691.13,Central,Mobile App,CUST-0259,Cash,10,4,Thursday
+SALE-0680,2023-11-10,Electronics,Smartphone,592.03,7,3132.38,16.4,512.77,2619.61,West,Mobile App,CUST-0117,Credit Card,11,4,Friday
+SALE-0681,2023-07-30,Sports,Running Shoes,114.44,6,545.3,17.2,94.0,451.3,North,Phone,CUST-0080,Cash,7,3,Sunday
+SALE-0682,2023-01-07,Books,Magazine,67.91,4,354.87,16.3,58.02,296.85,Central,Retail Store,CUST-0068,Cash,1,1,Saturday
+SALE-0683,2023-09-23,Books,Magazine,58.35,5,181.23,1.6,2.97,178.25,North,Mobile App,CUST-0047,Debit Card,9,3,Saturday
+SALE-0684,2023-09-04,Home & Garden,Cushion,144.84,9,885.02,10.3,90.74,794.28,South,Online,CUST-0002,Credit Card,9,3,Monday
+SALE-0685,2023-11-26,Clothing,Shoes,141.37,3,403.55,3.2,12.96,390.6,West,Mobile App,CUST-0211,Debit Card,11,4,Sunday
+SALE-0686,2023-02-08,Sports,Dumbbells,257.39,3,1001.35,3.0,29.54,971.81,South,Phone,CUST-0032,Cash,2,1,Wednesday
+SALE-0687,2023-01-26,Books,Textbook,32.76,4,173.32,8.1,14.11,159.2,Central,Mobile App,CUST-0029,PayPal,1,1,Thursday
+SALE-0688,2023-05-01,Electronics,Headphones,1303.04,4,6297.88,4.4,276.03,6021.85,West,Mobile App,CUST-0172,Credit Card,5,2,Monday
+SALE-0689,2023-09-13,Sports,Dumbbells,437.56,6,1482.64,27.3,404.57,1078.08,North,Mobile App,CUST-0255,Credit Card,9,3,Wednesday
+SALE-0690,2023-02-22,Sports,Basketball,61.48,1,91.87,27.5,25.24,66.63,North,Online,CUST-0300,Credit Card,2,1,Wednesday
+SALE-0691,2023-11-06,Books,Cookbook,15.56,1,12.16,3.0,0.37,11.8,Central,Retail Store,CUST-0204,PayPal,11,4,Monday
+SALE-0692,2023-06-24,Home & Garden,Coffee Maker,89.29,3,281.76,12.5,35.18,246.58,South,Mobile App,CUST-0141,Cash,6,2,Saturday
+SALE-0693,2023-10-14,Books,Magazine,22.93,2,30.46,9.2,2.8,27.66,West,Phone,CUST-0069,PayPal,10,4,Saturday
+SALE-0694,2023-02-28,Electronics,Smartphone,947.18,5,5966.43,3.8,228.77,5737.66,North,Phone,CUST-0374,Cash,2,1,Tuesday
+SALE-0695,2023-11-21,Home & Garden,Mirror,150.24,1,147.45,12.3,18.18,129.28,Central,Phone,CUST-0450,Credit Card,11,4,Tuesday
+SALE-0696,2023-01-24,Clothing,Jacket,183.84,6,1155.41,13.5,155.87,999.54,South,Mobile App,CUST-0491,Credit Card,1,1,Tuesday
+SALE-0697,2023-05-11,Books,Textbook,96.38,4,481.88,19.9,96.04,385.84,South,Online,CUST-0331,PayPal,5,2,Thursday
+SALE-0698,2023-04-21,Sports,Yoga Mat,34.49,3,131.28,0.2,0.29,130.99,East,Online,CUST-0167,PayPal,4,2,Friday
+SALE-0699,2023-01-24,Books,Fiction Novel,98.4,7,820.16,6.3,51.86,768.31,West,Mobile App,CUST-0133,Debit Card,1,1,Tuesday
+SALE-0700,2023-09-13,Electronics,Smartwatch,936.34,1,666.25,1.6,10.57,655.68,North,Mobile App,CUST-0018,PayPal,9,3,Wednesday
+SALE-0701,2023-09-18,Clothing,Shoes,132.82,1,79.24,8.7,6.92,72.32,South,Retail Store,CUST-0134,Credit Card,9,3,Monday
+SALE-0702,2023-07-18,Books,Magazine,54.31,1,45.5,7.4,3.36,42.14,East,Mobile App,CUST-0070,PayPal,7,3,Tuesday
+SALE-0703,2023-11-08,Clothing,Dress,103.38,3,224.53,11.3,25.31,199.21,West,Phone,CUST-0434,Cash,11,4,Wednesday
+SALE-0704,2023-08-20,Clothing,Jeans,102.57,4,292.3,27.8,81.25,211.05,West,Phone,CUST-0051,Cash,8,3,Sunday
+SALE-0705,2023-12-31,Books,Textbook,86.96,7,556.5,17.6,97.8,458.7,South,Retail Store,CUST-0323,Cash,12,4,Sunday
+SALE-0706,2023-12-18,Home & Garden,Lamp,289.23,4,1285.03,20.2,259.61,1025.42,South,Phone,CUST-0063,Credit Card,12,4,Monday
+SALE-0707,2023-06-30,Books,Biography,46.62,8,356.47,22.0,78.35,278.12,Central,Mobile App,CUST-0314,Cash,6,2,Friday
+SALE-0708,2023-08-05,Electronics,Smartwatch,502.95,1,441.62,10.2,45.25,396.37,North,Online,CUST-0258,PayPal,8,3,Saturday
+SALE-0709,2023-03-16,Electronics,Laptop,610.83,9,5807.44,3.6,211.86,5595.57,South,Phone,CUST-0346,Debit Card,3,1,Thursday
+SALE-0710,2023-05-27,Home & Garden,Lamp,53.2,6,370.03,1.1,4.12,365.91,North,Phone,CUST-0028,Debit Card,5,2,Saturday
+SALE-0711,2023-10-05,Electronics,Tablet,1805.31,2,2352.82,24.2,568.29,1784.53,West,Online,CUST-0158,Debit Card,10,4,Thursday
+SALE-0712,2023-11-28,Books,Biography,43.93,1,33.96,12.0,4.07,29.89,South,Phone,CUST-0115,Credit Card,11,4,Tuesday
+SALE-0713,2023-07-15,Sports,Basketball,31.66,3,66.18,18.0,11.9,54.28,East,Online,CUST-0058,Credit Card,7,3,Saturday
+SALE-0714,2023-05-09,Clothing,Shoes,117.56,2,229.9,23.0,52.8,177.1,West,Retail Store,CUST-0026,Cash,5,2,Tuesday
+SALE-0715,2023-10-29,Books,Magazine,88.52,9,491.5,19.3,94.82,396.68,South,Retail Store,CUST-0094,Cash,10,4,Sunday
+SALE-0716,2023-08-18,Clothing,T-Shirt,132.83,5,577.02,6.2,35.75,541.27,South,Retail Store,CUST-0104,Credit Card,8,3,Friday
+SALE-0717,2023-07-13,Electronics,Headphones,1531.6,7,10801.12,27.5,2973.15,7827.97,East,Phone,CUST-0254,Debit Card,7,3,Thursday
+SALE-0718,2023-03-24,Books,Cookbook,19.1,2,53.58,2.9,1.55,52.03,North,Phone,CUST-0325,PayPal,3,1,Friday
+SALE-0719,2023-12-30,Clothing,T-Shirt,148.46,5,631.58,12.8,81.01,550.57,South,Phone,CUST-0474,Credit Card,12,4,Saturday
+SALE-0720,2023-11-17,Books,Cookbook,83.32,1,70.1,10.8,7.6,62.5,West,Phone,CUST-0186,Credit Card,11,4,Friday
+SALE-0721,2023-12-29,Home & Garden,Mirror,256.74,7,1681.15,1.7,27.96,1653.19,South,Retail Store,CUST-0488,Credit Card,12,4,Friday
+SALE-0722,2023-09-16,Clothing,Jacket,79.99,3,175.01,15.8,27.71,147.3,Central,Mobile App,CUST-0409,Credit Card,9,3,Saturday
+SALE-0723,2023-06-28,Clothing,Jeans,62.99,1,51.28,9.7,4.97,46.31,East,Phone,CUST-0016,Cash,6,2,Wednesday
+SALE-0724,2023-05-31,Clothing,Shoes,84.18,1,84.59,14.9,12.63,71.96,Central,Mobile App,CUST-0283,Credit Card,5,2,Wednesday
+SALE-0725,2023-02-28,Home & Garden,Cushion,217.15,6,1500.95,21.7,325.45,1175.5,South,Retail Store,CUST-0101,Credit Card,2,1,Tuesday
+SALE-0726,2023-12-16,Home & Garden,Cushion,29.9,6,156.69,24.6,38.59,118.1,North,Mobile App,CUST-0031,Cash,12,4,Saturday
+SALE-0727,2023-10-04,Home & Garden,Coffee Maker,51.09,8,356.24,29.3,104.36,251.88,Central,Phone,CUST-0025,PayPal,10,4,Wednesday
+SALE-0728,2023-09-07,Electronics,Tablet,710.91,3,1785.01,8.0,141.93,1643.07,South,Phone,CUST-0362,Credit Card,9,3,Thursday
+SALE-0729,2023-02-19,Clothing,Shoes,56.37,1,79.17,15.3,12.11,67.06,Central,Online,CUST-0087,Credit Card,2,1,Sunday
+SALE-0730,2023-04-18,Clothing,Jacket,125.86,2,332.42,19.2,63.66,268.76,North,Retail Store,CUST-0214,PayPal,4,2,Tuesday
+SALE-0731,2023-11-28,Electronics,Smartphone,1873.07,8,14652.13,23.5,3442.49,11209.64,North,Mobile App,CUST-0439,Cash,11,4,Tuesday
+SALE-0732,2023-01-20,Electronics,Laptop,280.97,3,795.0,1.9,15.0,779.99,North,Retail Store,CUST-0412,Cash,1,1,Friday
+SALE-0733,2023-10-13,Electronics,Smartwatch,1391.95,5,4440.19,9.0,401.18,4039.0,South,Phone,CUST-0306,PayPal,10,4,Friday
+SALE-0734,2023-07-18,Sports,Basketball,238.78,3,500.73,4.3,21.36,479.37,West,Phone,CUST-0353,Credit Card,7,3,Tuesday
+SALE-0735,2023-07-19,Electronics,Smartwatch,973.97,3,2863.51,17.2,491.1,2372.41,North,Online,CUST-0322,Credit Card,7,3,Wednesday
+SALE-0736,2023-12-25,Electronics,Tablet,705.75,1,569.03,10.8,61.47,507.56,Central,Online,CUST-0344,Cash,12,4,Monday
+SALE-0737,2023-12-18,Home & Garden,Mirror,213.77,6,1106.05,7.3,80.78,1025.27,North,Phone,CUST-0044,PayPal,12,4,Monday
+SALE-0738,2023-07-15,Sports,Running Shoes,25.6,6,118.18,23.0,27.2,90.97,West,Retail Store,CUST-0042,Debit Card,7,3,Saturday
+SALE-0739,2023-03-11,Sports,Tennis Racket,49.33,5,307.95,10.5,32.4,275.55,East,Retail Store,CUST-0261,Cash,3,1,Saturday
+SALE-0740,2023-12-13,Home & Garden,Coffee Maker,163.26,5,913.73,21.2,193.86,719.86,Central,Retail Store,CUST-0092,Credit Card,12,4,Wednesday
+SALE-0741,2023-01-22,Electronics,Smartwatch,1637.8,2,3548.36,15.1,535.64,3012.72,Central,Mobile App,CUST-0230,Credit Card,1,1,Sunday
+SALE-0742,2023-06-06,Clothing,Dress,119.74,8,1098.45,26.8,294.6,803.86,South,Mobile App,CUST-0189,Debit Card,6,2,Tuesday
+SALE-0743,2023-03-24,Clothing,Jeans,59.79,9,606.33,23.9,145.05,461.28,Central,Phone,CUST-0372,Debit Card,3,1,Friday
+SALE-0744,2023-02-28,Clothing,Shoes,120.23,4,617.96,18.6,114.86,503.1,North,Mobile App,CUST-0213,Credit Card,2,1,Tuesday
+SALE-0745,2023-05-29,Electronics,Tablet,1378.91,5,9434.44,25.3,2384.66,7049.78,North,Retail Store,CUST-0258,PayPal,5,2,Monday
+SALE-0746,2023-06-19,Home & Garden,Lamp,112.17,2,262.78,2.0,5.17,257.61,South,Online,CUST-0225,Cash,6,2,Monday
+SALE-0747,2023-11-14,Electronics,Smartphone,1687.53,6,7556.21,24.8,1874.4,5681.81,East,Mobile App,CUST-0403,PayPal,11,4,Tuesday
+SALE-0748,2023-06-18,Books,Cookbook,22.75,1,22.13,29.0,6.42,15.71,Central,Retail Store,CUST-0098,Cash,6,2,Sunday
+SALE-0749,2023-06-11,Sports,Yoga Mat,365.99,2,843.6,10.5,88.63,754.98,North,Phone,CUST-0439,Debit Card,6,2,Sunday
+SALE-0750,2023-04-24,Sports,Dumbbells,359.02,3,1507.72,11.5,172.95,1334.78,East,Retail Store,CUST-0310,Cash,4,2,Monday
+SALE-0751,2023-09-03,Sports,Basketball,310.52,1,219.47,20.1,44.16,175.31,East,Phone,CUST-0464,PayPal,9,3,Sunday
+SALE-0752,2023-10-10,Electronics,Smartphone,701.26,5,2106.7,18.5,390.65,1716.05,Central,Online,CUST-0121,Cash,10,4,Tuesday
+SALE-0753,2023-03-13,Books,Textbook,70.18,9,791.12,14.0,110.76,680.36,East,Online,CUST-0409,Credit Card,3,1,Monday
+SALE-0754,2023-01-10,Books,Fiction Novel,47.94,7,328.11,12.4,40.79,287.32,Central,Mobile App,CUST-0118,Debit Card,1,1,Tuesday
+SALE-0755,2023-01-19,Books,Cookbook,68.59,7,533.95,2.2,11.71,522.25,Central,Mobile App,CUST-0022,Debit Card,1,1,Thursday
+SALE-0756,2023-07-07,Sports,Yoga Mat,499.68,7,2423.13,17.1,413.8,2009.33,Central,Phone,CUST-0362,Debit Card,7,3,Friday
+SALE-0757,2023-08-26,Books,Magazine,38.01,7,162.66,14.0,22.73,139.93,North,Mobile App,CUST-0145,Cash,8,3,Saturday
+SALE-0758,2023-09-15,Electronics,Smartphone,1129.03,8,6332.0,24.9,1577.05,4754.94,Central,Retail Store,CUST-0140,Debit Card,9,3,Friday
+SALE-0759,2023-08-17,Clothing,Jeans,54.68,7,310.69,24.8,77.14,233.55,Central,Retail Store,CUST-0240,PayPal,8,3,Thursday
+SALE-0760,2023-07-03,Electronics,Smartphone,202.02,7,1314.02,15.3,200.4,1113.62,West,Retail Store,CUST-0062,Credit Card,7,3,Monday
+SALE-0761,2023-05-16,Home & Garden,Lamp,176.01,1,218.07,29.7,64.81,153.26,North,Retail Store,CUST-0368,Cash,5,2,Tuesday
+SALE-0762,2023-07-18,Sports,Basketball,461.4,2,901.53,1.8,16.16,885.37,North,Online,CUST-0019,Cash,7,3,Tuesday
+SALE-0763,2023-02-22,Books,Cookbook,77.33,7,653.59,6.0,39.05,614.54,East,Retail Store,CUST-0426,PayPal,2,1,Wednesday
+SALE-0764,2023-12-01,Sports,Dumbbells,403.73,4,1329.57,7.9,104.61,1224.96,Central,Online,CUST-0182,Cash,12,4,Friday
+SALE-0765,2023-07-12,Clothing,Shoes,151.42,4,560.44,28.2,158.26,402.18,West,Phone,CUST-0184,Cash,7,3,Wednesday
+SALE-0766,2023-09-07,Sports,Tennis Racket,341.28,6,1300.86,0.6,8.21,1292.65,North,Retail Store,CUST-0379,PayPal,9,3,Thursday
+SALE-0767,2023-03-26,Clothing,T-Shirt,55.68,1,59.75,16.6,9.89,49.86,Central,Phone,CUST-0034,Debit Card,3,1,Sunday
+SALE-0768,2023-03-18,Clothing,Jeans,37.04,6,302.27,12.2,36.79,265.48,East,Online,CUST-0422,Debit Card,3,1,Saturday
+SALE-0769,2023-08-01,Home & Garden,Coffee Maker,211.97,3,529.33,1.7,8.79,520.53,West,Mobile App,CUST-0108,PayPal,8,3,Tuesday
+SALE-0770,2023-04-18,Books,Textbook,29.77,6,251.72,16.4,41.31,210.41,West,Online,CUST-0175,Debit Card,4,2,Tuesday
+SALE-0771,2023-01-23,Clothing,Shoes,113.08,3,410.41,10.8,44.3,366.11,Central,Retail Store,CUST-0320,Debit Card,1,1,Monday
+SALE-0772,2023-11-19,Books,Fiction Novel,44.52,7,229.28,8.3,19.05,210.23,Central,Retail Store,CUST-0237,Credit Card,11,4,Sunday
+SALE-0773,2023-03-27,Home & Garden,Lamp,77.04,8,772.84,4.4,33.67,739.17,Central,Mobile App,CUST-0234,Credit Card,3,1,Monday
+SALE-0774,2023-12-05,Home & Garden,Coffee Maker,37.82,3,127.41,23.1,29.49,97.93,South,Mobile App,CUST-0441,PayPal,12,4,Tuesday
+SALE-0775,2023-09-04,Clothing,Jeans,82.8,2,129.78,15.3,19.8,109.99,West,Retail Store,CUST-0128,Debit Card,9,3,Monday
+SALE-0776,2023-11-16,Books,Cookbook,76.35,4,229.66,23.8,54.61,175.06,South,Phone,CUST-0016,PayPal,11,4,Thursday
+SALE-0777,2023-11-02,Books,Fiction Novel,17.2,8,132.95,16.6,22.12,110.83,South,Mobile App,CUST-0203,PayPal,11,4,Thursday
+SALE-0778,2023-03-09,Electronics,Laptop,1859.77,7,18376.37,18.7,3436.81,14939.55,South,Mobile App,CUST-0326,Debit Card,3,1,Thursday
+SALE-0779,2023-11-07,Electronics,Smartphone,1629.44,1,1386.56,4.3,60.08,1326.48,West,Online,CUST-0092,Credit Card,11,4,Tuesday
+SALE-0780,2023-02-17,Sports,Yoga Mat,164.94,9,2029.44,11.0,223.01,1806.43,Central,Online,CUST-0439,PayPal,2,1,Friday
+SALE-0781,2023-09-25,Sports,Dumbbells,306.98,2,443.0,4.6,20.58,422.42,North,Mobile App,CUST-0164,Debit Card,9,3,Monday
+SALE-0782,2023-09-04,Sports,Dumbbells,187.05,7,735.37,2.4,17.32,718.05,Central,Online,CUST-0228,PayPal,9,3,Monday
+SALE-0783,2023-03-10,Home & Garden,Cushion,250.3,8,2674.85,26.5,707.53,1967.32,South,Online,CUST-0353,Cash,3,1,Friday
+SALE-0784,2023-11-03,Books,Biography,40.57,1,31.55,7.5,2.37,29.18,East,Retail Store,CUST-0377,Credit Card,11,4,Friday
+SALE-0785,2023-12-30,Electronics,Smartwatch,962.52,1,941.87,16.5,155.6,786.26,Central,Online,CUST-0343,Credit Card,12,4,Saturday
+SALE-0786,2023-07-12,Clothing,Dress,165.28,6,977.66,23.5,229.34,748.32,West,Phone,CUST-0375,Credit Card,7,3,Wednesday
+SALE-0787,2023-03-21,Sports,Tennis Racket,42.26,6,351.11,17.7,62.16,288.94,East,Phone,CUST-0079,PayPal,3,1,Tuesday
+SALE-0788,2023-10-17,Home & Garden,Mirror,47.27,1,39.45,5.2,2.03,37.41,East,Mobile App,CUST-0204,Debit Card,10,4,Tuesday
+SALE-0789,2023-07-31,Books,Magazine,83.6,1,83.28,28.4,23.68,59.6,West,Retail Store,CUST-0184,Cash,7,3,Monday
+SALE-0790,2023-10-14,Books,Biography,50.48,6,199.69,18.1,36.06,163.63,East,Phone,CUST-0198,Cash,10,4,Saturday
+SALE-0791,2023-12-28,Sports,Yoga Mat,451.83,9,4650.42,2.7,123.85,4526.57,North,Retail Store,CUST-0402,PayPal,12,4,Thursday
+SALE-0792,2023-12-25,Clothing,T-Shirt,93.57,7,608.0,4.0,24.62,583.38,South,Mobile App,CUST-0395,Cash,12,4,Monday
+SALE-0793,2023-10-09,Books,Fiction Novel,81.64,5,333.17,10.0,33.18,299.99,South,Mobile App,CUST-0278,Credit Card,10,4,Monday
+SALE-0794,2023-02-16,Clothing,Jacket,162.68,8,1856.46,17.1,318.2,1538.26,Central,Mobile App,CUST-0208,Credit Card,2,1,Thursday
+SALE-0795,2023-02-02,Home & Garden,Lamp,173.26,1,240.31,0.5,1.27,239.03,East,Online,CUST-0029,Credit Card,2,1,Thursday
+SALE-0796,2023-07-16,Sports,Tennis Racket,192.06,4,731.1,24.1,176.13,554.97,Central,Phone,CUST-0204,Credit Card,7,3,Sunday
+SALE-0797,2023-03-31,Sports,Basketball,376.92,8,4092.51,11.5,469.6,3622.91,North,Retail Store,CUST-0337,Cash,3,1,Friday
+SALE-0798,2023-04-10,Electronics,Smartwatch,1185.3,1,1671.54,8.0,133.97,1537.57,Central,Retail Store,CUST-0467,Debit Card,4,2,Monday
+SALE-0799,2023-12-12,Electronics,Tablet,1356.79,7,9174.99,2.7,245.91,8929.08,South,Online,CUST-0126,Debit Card,12,4,Tuesday
+SALE-0800,2023-02-14,Home & Garden,Cushion,183.52,6,1347.07,17.9,240.88,1106.19,East,Mobile App,CUST-0218,PayPal,2,1,Tuesday
+SALE-0801,2023-10-28,Clothing,Shoes,23.11,2,27.52,12.5,3.44,24.08,North,Online,CUST-0132,Credit Card,10,4,Saturday
+SALE-0802,2023-10-09,Home & Garden,Mirror,65.7,1,53.77,23.7,12.74,41.02,Central,Phone,CUST-0035,Cash,10,4,Monday
+SALE-0803,2023-05-22,Clothing,Shoes,105.88,3,351.83,8.6,30.33,321.49,South,Mobile App,CUST-0406,PayPal,5,2,Monday
+SALE-0804,2023-10-22,Electronics,Tablet,1084.81,6,4957.15,30.0,1485.97,3471.18,South,Mobile App,CUST-0060,Credit Card,10,4,Sunday
+SALE-0805,2023-10-14,Electronics,Smartwatch,220.06,4,581.77,26.4,153.81,427.96,East,Phone,CUST-0154,Credit Card,10,4,Saturday
+SALE-0806,2023-09-20,Home & Garden,Mirror,244.91,3,470.54,22.1,104.01,366.53,Central,Phone,CUST-0029,PayPal,9,3,Wednesday
+SALE-0807,2023-07-13,Books,Biography,59.71,4,184.69,12.0,22.16,162.53,South,Phone,CUST-0343,PayPal,7,3,Thursday
+SALE-0808,2023-12-15,Sports,Tennis Racket,286.51,6,1461.17,3.2,46.71,1414.46,North,Mobile App,CUST-0133,Credit Card,12,4,Friday
+SALE-0809,2023-05-13,Electronics,Headphones,988.04,1,953.85,17.4,165.91,787.93,South,Retail Store,CUST-0284,Cash,5,2,Saturday
+SALE-0810,2023-07-31,Home & Garden,Mirror,138.48,8,879.0,9.5,83.45,795.55,Central,Online,CUST-0197,Cash,7,3,Monday
+SALE-0811,2023-05-08,Home & Garden,Coffee Maker,204.96,1,210.77,28.0,58.96,151.81,West,Phone,CUST-0281,Credit Card,5,2,Monday
+SALE-0812,2023-10-11,Clothing,Jacket,165.7,6,652.07,24.3,158.67,493.4,East,Phone,CUST-0194,Debit Card,10,4,Wednesday
+SALE-0813,2023-10-21,Home & Garden,Lamp,289.23,5,994.71,28.1,279.06,715.65,South,Mobile App,CUST-0325,Debit Card,10,4,Saturday
+SALE-0814,2023-05-01,Clothing,Dress,85.99,5,512.54,21.6,110.59,401.95,South,Retail Store,CUST-0354,Debit Card,5,2,Monday
+SALE-0815,2023-05-08,Books,Cookbook,50.4,6,288.17,6.8,19.6,268.56,South,Online,CUST-0368,Credit Card,5,2,Monday
+SALE-0816,2023-02-10,Sports,Tennis Racket,75.94,9,1002.12,19.0,190.57,811.55,North,Online,CUST-0154,PayPal,2,1,Friday
+SALE-0817,2023-07-10,Books,Cookbook,28.06,9,187.13,17.3,32.45,154.68,West,Phone,CUST-0156,PayPal,7,3,Monday
+SALE-0818,2023-04-04,Books,Cookbook,39.57,9,444.81,5.4,24.1,420.7,West,Retail Store,CUST-0438,Debit Card,4,2,Tuesday
+SALE-0819,2023-01-28,Books,Biography,38.95,3,153.44,0.1,0.22,153.21,West,Online,CUST-0270,Cash,1,1,Saturday
+SALE-0820,2023-07-21,Clothing,Jacket,84.48,3,213.44,25.0,53.46,159.98,North,Mobile App,CUST-0270,Cash,7,3,Friday
+SALE-0821,2023-12-19,Electronics,Laptop,1034.3,9,8302.32,6.0,497.07,7805.25,South,Mobile App,CUST-0220,Credit Card,12,4,Tuesday
+SALE-0822,2023-06-16,Home & Garden,Mirror,233.1,3,664.95,27.1,180.2,484.75,East,Retail Store,CUST-0460,Cash,6,2,Friday
+SALE-0823,2023-05-02,Home & Garden,Cushion,76.38,8,751.11,15.9,119.7,631.41,Central,Phone,CUST-0358,Cash,5,2,Tuesday
+SALE-0824,2023-04-05,Sports,Basketball,124.88,4,641.75,19.7,126.33,515.42,South,Mobile App,CUST-0004,Cash,4,2,Wednesday
+SALE-0825,2023-07-06,Sports,Dumbbells,177.27,3,371.29,13.4,49.64,321.65,West,Retail Store,CUST-0077,Debit Card,7,3,Thursday
+SALE-0826,2023-10-22,Clothing,T-Shirt,157.93,1,118.66,0.1,0.17,118.5,East,Retail Store,CUST-0143,PayPal,10,4,Sunday
+SALE-0827,2023-07-15,Clothing,Jeans,157.39,2,240.06,27.3,65.42,174.64,South,Mobile App,CUST-0244,Credit Card,7,3,Saturday
+SALE-0828,2023-04-01,Sports,Basketball,281.86,1,359.55,12.0,43.12,316.43,South,Phone,CUST-0443,PayPal,4,2,Saturday
+SALE-0829,2023-06-03,Home & Garden,Mirror,135.22,7,799.79,2.3,18.15,781.65,Central,Online,CUST-0064,PayPal,6,2,Saturday
+SALE-0830,2023-02-20,Clothing,T-Shirt,94.4,9,1007.66,4.0,40.05,967.62,South,Phone,CUST-0339,PayPal,2,1,Monday
+SALE-0831,2023-11-19,Electronics,Headphones,468.84,7,3210.76,1.2,38.8,3171.96,East,Phone,CUST-0008,Cash,11,4,Sunday
+SALE-0832,2023-07-04,Books,Magazine,31.6,6,139.2,26.9,37.43,101.77,East,Phone,CUST-0495,Credit Card,7,3,Tuesday
+SALE-0833,2023-07-30,Electronics,Tablet,1367.37,1,1101.22,20.7,227.96,873.26,Central,Retail Store,CUST-0376,Debit Card,7,3,Sunday
+SALE-0834,2023-05-26,Home & Garden,Plant Pot,15.07,3,41.91,5.0,2.1,39.82,Central,Mobile App,CUST-0410,PayPal,5,2,Friday
+SALE-0835,2023-02-10,Sports,Tennis Racket,139.64,3,610.98,6.8,41.82,569.16,East,Mobile App,CUST-0100,Debit Card,2,1,Friday
+SALE-0836,2023-03-27,Home & Garden,Cushion,240.91,4,1194.34,4.6,54.54,1139.8,Central,Mobile App,CUST-0128,Credit Card,3,1,Monday
+SALE-0837,2023-02-10,Clothing,Dress,66.69,2,201.43,4.6,9.29,192.14,South,Phone,CUST-0063,Cash,2,1,Friday
+SALE-0838,2023-12-01,Home & Garden,Plant Pot,127.52,9,1234.09,23.6,290.63,943.46,Central,Mobile App,CUST-0014,Cash,12,4,Friday
+SALE-0839,2023-08-16,Home & Garden,Mirror,265.3,7,1249.69,13.9,173.79,1075.9,Central,Mobile App,CUST-0144,PayPal,8,3,Wednesday
+SALE-0840,2023-03-27,Clothing,T-Shirt,64.45,8,656.93,10.1,66.58,590.35,South,Retail Store,CUST-0072,Cash,3,1,Monday
+SALE-0841,2023-12-25,Electronics,Smartphone,1045.38,4,4972.58,6.6,330.35,4642.22,South,Mobile App,CUST-0093,Credit Card,12,4,Monday
+SALE-0842,2023-02-18,Electronics,Headphones,446.99,7,3559.96,12.2,434.48,3125.48,Central,Online,CUST-0269,Credit Card,2,1,Saturday
+SALE-0843,2023-07-23,Books,Fiction Novel,65.67,9,601.79,14.5,87.02,514.77,North,Phone,CUST-0128,Debit Card,7,3,Sunday
+SALE-0844,2023-02-13,Sports,Dumbbells,306.43,2,819.72,8.3,67.73,751.98,South,Retail Store,CUST-0070,Cash,2,1,Monday
+SALE-0845,2023-08-15,Clothing,Jeans,56.25,7,236.45,7.3,17.36,219.09,Central,Retail Store,CUST-0496,Credit Card,8,3,Tuesday
+SALE-0846,2023-01-18,Home & Garden,Plant Pot,75.43,5,436.71,27.2,118.97,317.74,West,Mobile App,CUST-0324,Cash,1,1,Wednesday
+SALE-0847,2023-10-08,Sports,Yoga Mat,78.8,8,472.99,26.4,124.79,348.2,Central,Retail Store,CUST-0442,PayPal,10,4,Sunday
+SALE-0848,2023-11-20,Books,Biography,25.51,2,39.6,13.8,5.48,34.12,Central,Phone,CUST-0326,Cash,11,4,Monday
+SALE-0849,2023-09-04,Books,Textbook,27.77,7,148.93,23.2,34.59,114.34,North,Mobile App,CUST-0291,Cash,9,3,Monday
+SALE-0850,2023-07-07,Sports,Dumbbells,468.46,8,3683.97,15.2,558.85,3125.13,South,Phone,CUST-0469,Credit Card,7,3,Friday
+SALE-0851,2023-01-01,Books,Textbook,90.12,3,313.19,13.9,43.39,269.8,East,Phone,CUST-0244,PayPal,1,1,Sunday
+SALE-0852,2023-10-01,Electronics,Headphones,646.67,3,1557.24,1.6,24.28,1532.96,West,Phone,CUST-0184,Credit Card,10,4,Sunday
+SALE-0853,2023-08-09,Home & Garden,Mirror,93.64,3,197.82,22.5,44.49,153.32,South,Online,CUST-0211,Cash,8,3,Wednesday
+SALE-0854,2023-04-07,Sports,Tennis Racket,241.65,1,363.06,4.0,14.68,348.38,West,Mobile App,CUST-0123,Debit Card,4,2,Friday
+SALE-0855,2023-03-25,Sports,Basketball,306.47,1,359.33,27.4,98.58,260.74,South,Phone,CUST-0027,Credit Card,3,1,Saturday
+SALE-0856,2023-08-05,Clothing,Shoes,110.89,9,657.32,14.0,91.8,565.52,Central,Phone,CUST-0038,Cash,8,3,Saturday
+SALE-0857,2023-11-29,Books,Cookbook,20.13,9,141.3,14.7,20.8,120.5,West,Retail Store,CUST-0223,Credit Card,11,4,Wednesday
+SALE-0858,2023-04-04,Clothing,Dress,88.97,8,1023.74,23.4,240.06,783.68,North,Mobile App,CUST-0283,PayPal,4,2,Tuesday
+SALE-0859,2023-05-20,Books,Biography,95.15,6,592.22,25.8,152.52,439.7,South,Phone,CUST-0234,Credit Card,5,2,Saturday
+SALE-0860,2023-03-19,Electronics,Smartwatch,309.03,9,4176.28,11.0,460.87,3715.41,North,Retail Store,CUST-0249,Credit Card,3,1,Sunday
+SALE-0861,2023-05-25,Home & Garden,Lamp,203.64,7,1704.82,20.9,355.66,1349.15,West,Online,CUST-0165,Debit Card,5,2,Thursday
+SALE-0862,2023-02-16,Clothing,T-Shirt,140.34,9,1854.91,8.0,147.62,1707.29,West,Retail Store,CUST-0470,Cash,2,1,Thursday
+SALE-0863,2023-08-04,Home & Garden,Cushion,87.4,5,316.28,7.7,24.32,291.96,East,Mobile App,CUST-0070,Credit Card,8,3,Friday
+SALE-0864,2023-06-19,Electronics,Smartphone,1652.3,2,3235.8,13.4,432.6,2803.2,North,Phone,CUST-0378,PayPal,6,2,Monday
+SALE-0865,2023-02-06,Books,Biography,48.72,2,130.59,12.9,16.91,113.69,South,Retail Store,CUST-0397,Cash,2,1,Monday
+SALE-0866,2023-07-15,Electronics,Laptop,1540.93,1,1324.2,24.7,327.67,996.52,South,Mobile App,CUST-0057,PayPal,7,3,Saturday
+SALE-0867,2023-05-07,Electronics,Smartphone,1135.28,6,6599.26,14.8,975.6,5623.66,West,Online,CUST-0160,Debit Card,5,2,Sunday
+SALE-0868,2023-08-31,Sports,Dumbbells,190.8,9,1082.45,12.9,139.74,942.71,East,Retail Store,CUST-0420,Credit Card,8,3,Thursday
+SALE-0869,2023-10-09,Books,Fiction Novel,74.25,2,122.64,0.9,1.15,121.49,East,Mobile App,CUST-0046,Cash,10,4,Monday
+SALE-0870,2023-04-12,Home & Garden,Coffee Maker,90.24,6,711.29,3.6,25.59,685.7,South,Online,CUST-0088,Debit Card,4,2,Wednesday
+SALE-0871,2023-11-21,Sports,Dumbbells,254.12,3,568.63,6.4,36.6,532.03,North,Retail Store,CUST-0186,Cash,11,4,Tuesday
+SALE-0872,2023-10-27,Electronics,Headphones,549.04,3,1228.2,10.6,129.81,1098.39,South,Online,CUST-0458,Credit Card,10,4,Friday
+SALE-0873,2023-10-25,Sports,Tennis Racket,481.27,4,1365.81,20.8,284.31,1081.5,South,Phone,CUST-0383,Credit Card,10,4,Wednesday
+SALE-0874,2023-05-08,Clothing,Jacket,43.07,3,151.97,19.4,29.44,122.53,North,Phone,CUST-0035,Credit Card,5,2,Monday
+SALE-0875,2023-01-31,Home & Garden,Lamp,63.01,6,470.56,7.0,33.06,437.5,Central,Online,CUST-0156,Debit Card,1,1,Tuesday
+SALE-0876,2023-09-07,Clothing,Dress,117.31,9,762.45,5.7,43.25,719.2,Central,Phone,CUST-0400,PayPal,9,3,Thursday
+SALE-0877,2023-04-09,Electronics,Headphones,1418.74,1,1486.13,15.8,235.1,1251.04,East,Retail Store,CUST-0141,Cash,4,2,Sunday
+SALE-0878,2023-01-21,Sports,Basketball,108.02,7,897.34,18.6,166.62,730.72,Central,Phone,CUST-0031,PayPal,1,1,Saturday
+SALE-0879,2023-04-08,Books,Textbook,68.49,5,355.76,4.9,17.34,338.41,Central,Phone,CUST-0123,Cash,4,2,Saturday
+SALE-0880,2023-08-28,Home & Garden,Mirror,100.9,6,430.98,10.9,47.01,383.97,Central,Retail Store,CUST-0484,Credit Card,8,3,Monday
+SALE-0881,2023-09-29,Clothing,Jacket,109.22,4,299.31,7.6,22.82,276.49,East,Phone,CUST-0021,Cash,9,3,Friday
+SALE-0882,2023-08-21,Electronics,Smartwatch,679.19,8,3931.54,5.6,221.76,3709.79,West,Retail Store,CUST-0028,Credit Card,8,3,Monday
+SALE-0883,2023-11-14,Home & Garden,Mirror,119.8,8,880.76,6.5,57.11,823.66,South,Phone,CUST-0320,Credit Card,11,4,Tuesday
+SALE-0884,2023-12-04,Books,Biography,28.96,9,237.69,3.8,9.09,228.61,South,Mobile App,CUST-0378,Debit Card,12,4,Monday
+SALE-0885,2023-11-10,Home & Garden,Plant Pot,229.78,7,1398.59,7.7,107.42,1291.17,West,Phone,CUST-0277,Credit Card,11,4,Friday
+SALE-0886,2023-02-19,Books,Fiction Novel,70.93,9,673.59,8.7,58.75,614.85,North,Retail Store,CUST-0451,Debit Card,2,1,Sunday
+SALE-0887,2023-01-17,Clothing,T-Shirt,60.54,9,511.3,27.0,138.27,373.03,West,Retail Store,CUST-0353,Credit Card,1,1,Tuesday
+SALE-0888,2023-01-17,Books,Biography,40.07,5,187.87,26.1,49.08,138.79,West,Phone,CUST-0473,Credit Card,1,1,Tuesday
+SALE-0889,2023-07-07,Clothing,Shoes,145.79,3,311.55,1.6,5.07,306.49,North,Online,CUST-0433,Debit Card,7,3,Friday
+SALE-0890,2023-12-02,Sports,Running Shoes,347.36,5,2054.88,26.5,544.81,1510.08,West,Online,CUST-0327,Cash,12,4,Saturday
+SALE-0891,2023-10-13,Sports,Dumbbells,295.5,8,1822.34,15.1,275.33,1547.01,North,Phone,CUST-0113,Credit Card,10,4,Friday
+SALE-0892,2023-02-06,Home & Garden,Coffee Maker,169.72,5,1194.11,6.8,80.69,1113.42,South,Online,CUST-0385,Credit Card,2,1,Monday
+SALE-0893,2023-04-29,Books,Biography,85.32,5,536.13,28.8,154.66,381.47,South,Retail Store,CUST-0218,Debit Card,4,2,Saturday
+SALE-0894,2023-10-19,Clothing,Shoes,167.7,3,346.27,21.6,74.92,271.36,Central,Mobile App,CUST-0106,Credit Card,10,4,Thursday
+SALE-0895,2023-11-23,Books,Cookbook,62.68,8,485.24,12.8,62.23,423.0,West,Mobile App,CUST-0112,Credit Card,11,4,Thursday
+SALE-0896,2023-03-27,Clothing,Shoes,41.47,5,300.71,10.5,31.66,269.05,West,Phone,CUST-0298,Debit Card,3,1,Monday
+SALE-0897,2023-10-01,Books,Biography,47.61,9,274.91,1.4,3.85,271.06,East,Phone,CUST-0380,Cash,10,4,Sunday
+SALE-0898,2023-07-10,Sports,Basketball,75.0,8,543.05,13.9,75.73,467.32,East,Retail Store,CUST-0223,Debit Card,7,3,Monday
+SALE-0899,2023-07-12,Books,Cookbook,61.63,8,340.04,18.9,64.35,275.68,East,Mobile App,CUST-0071,PayPal,7,3,Wednesday
+SALE-0900,2023-07-23,Electronics,Laptop,1469.17,6,8191.56,2.8,231.15,7960.41,East,Online,CUST-0116,Debit Card,7,3,Sunday
+SALE-0901,2023-06-04,Electronics,Tablet,1130.37,4,4945.18,11.1,550.56,4394.63,South,Retail Store,CUST-0278,Cash,6,2,Sunday
+SALE-0902,2023-01-12,Home & Garden,Mirror,167.35,2,434.88,18.3,79.37,355.51,Central,Retail Store,CUST-0204,Credit Card,1,1,Thursday
+SALE-0903,2023-01-20,Sports,Dumbbells,450.01,3,1745.33,11.2,195.99,1549.34,South,Retail Store,CUST-0025,Cash,1,1,Friday
+SALE-0904,2023-07-07,Books,Textbook,38.13,2,73.65,25.4,18.73,54.92,South,Phone,CUST-0336,Cash,7,3,Friday
+SALE-0905,2023-02-17,Books,Biography,89.94,6,672.46,1.2,7.88,664.58,Central,Retail Store,CUST-0029,Credit Card,2,1,Friday
+SALE-0906,2023-06-16,Sports,Yoga Mat,233.07,5,975.27,21.9,213.44,761.83,West,Online,CUST-0033,Cash,6,2,Friday
+SALE-0907,2023-01-20,Books,Biography,91.11,7,755.96,1.2,9.29,746.67,North,Online,CUST-0056,Cash,1,1,Friday
+SALE-0908,2023-06-28,Sports,Basketball,45.83,7,328.11,26.8,88.0,240.11,North,Retail Store,CUST-0333,Credit Card,6,2,Wednesday
+SALE-0909,2023-11-21,Sports,Running Shoes,103.24,7,520.88,14.5,75.56,445.33,East,Online,CUST-0436,Cash,11,4,Tuesday
+SALE-0910,2023-10-04,Books,Textbook,83.11,1,67.75,21.5,14.56,53.19,East,Retail Store,CUST-0461,Debit Card,10,4,Wednesday
+SALE-0911,2023-01-26,Sports,Basketball,369.94,5,2127.46,10.7,228.18,1899.28,Central,Online,CUST-0089,Debit Card,1,1,Thursday
+SALE-0912,2023-08-10,Home & Garden,Cushion,253.2,8,1516.0,15.5,235.42,1280.58,South,Retail Store,CUST-0154,Cash,8,3,Thursday
+SALE-0913,2023-02-12,Sports,Tennis Racket,151.78,3,580.49,18.4,107.08,473.4,North,Mobile App,CUST-0232,Cash,2,1,Sunday
+SALE-0914,2023-02-13,Sports,Tennis Racket,105.46,8,1206.55,2.2,26.19,1180.36,West,Retail Store,CUST-0377,Debit Card,2,1,Monday
+SALE-0915,2023-09-04,Books,Textbook,51.57,4,130.81,21.3,27.91,102.9,West,Mobile App,CUST-0005,Debit Card,9,3,Monday
+SALE-0916,2023-10-15,Books,Magazine,12.8,6,62.78,16.1,10.12,52.66,South,Retail Store,CUST-0223,Credit Card,10,4,Sunday
+SALE-0917,2023-05-17,Sports,Dumbbells,157.75,5,778.1,20.9,162.29,615.8,Central,Online,CUST-0450,Credit Card,5,2,Wednesday
+SALE-0918,2023-12-10,Sports,Basketball,467.15,6,2878.03,27.9,801.53,2076.49,East,Phone,CUST-0038,Debit Card,12,4,Sunday
+SALE-0919,2023-06-14,Home & Garden,Mirror,281.1,4,1331.1,11.6,153.81,1177.29,North,Phone,CUST-0386,Debit Card,6,2,Wednesday
+SALE-0920,2023-06-29,Books,Biography,69.87,8,582.2,4.9,28.63,553.56,Central,Retail Store,CUST-0474,PayPal,6,2,Thursday
+SALE-0921,2023-01-23,Clothing,Jeans,198.15,2,532.58,3.9,20.55,512.03,East,Retail Store,CUST-0076,Credit Card,1,1,Monday
+SALE-0922,2023-02-27,Electronics,Smartphone,1407.42,6,12601.86,18.1,2278.43,10323.43,Central,Retail Store,CUST-0338,Cash,2,1,Monday
+SALE-0923,2023-01-08,Home & Garden,Coffee Maker,40.0,9,493.91,15.8,78.21,415.7,East,Mobile App,CUST-0406,PayPal,1,1,Sunday
+SALE-0924,2023-01-12,Home & Garden,Lamp,219.92,1,232.53,27.7,64.44,168.09,Central,Retail Store,CUST-0163,Debit Card,1,1,Thursday
+SALE-0925,2023-10-07,Books,Cookbook,56.64,2,88.29,8.6,7.64,80.66,Central,Mobile App,CUST-0172,Debit Card,10,4,Saturday
+SALE-0926,2023-12-22,Electronics,Headphones,124.72,5,643.91,16.5,106.04,537.87,Central,Online,CUST-0444,Cash,12,4,Friday
+SALE-0927,2023-03-29,Electronics,Tablet,1913.82,6,12924.61,7.0,905.68,12018.93,South,Phone,CUST-0254,Credit Card,3,1,Wednesday
+SALE-0928,2023-08-27,Electronics,Laptop,611.78,5,1908.25,21.6,411.87,1496.38,West,Phone,CUST-0286,Cash,8,3,Sunday
+SALE-0929,2023-02-25,Electronics,Tablet,1062.27,2,2603.18,6.9,179.56,2423.62,West,Retail Store,CUST-0357,PayPal,2,1,Saturday
+SALE-0930,2023-09-18,Electronics,Tablet,1214.63,2,1619.64,12.4,200.12,1419.52,West,Online,CUST-0362,Debit Card,9,3,Monday
+SALE-0931,2023-04-12,Books,Biography,49.32,4,208.27,6.0,12.53,195.74,Central,Online,CUST-0114,Credit Card,4,2,Wednesday
+SALE-0932,2023-05-07,Books,Cookbook,28.67,6,213.02,11.5,24.48,188.54,East,Mobile App,CUST-0206,PayPal,5,2,Sunday
+SALE-0933,2023-03-22,Electronics,Tablet,881.18,3,3940.32,1.0,39.39,3900.93,East,Phone,CUST-0301,Cash,3,1,Wednesday
+SALE-0934,2023-05-01,Books,Cookbook,36.62,5,203.91,12.3,25.11,178.8,North,Phone,CUST-0333,PayPal,5,2,Monday
+SALE-0935,2023-01-16,Books,Cookbook,11.31,8,109.31,9.5,10.38,98.94,South,Retail Store,CUST-0288,Cash,1,1,Monday
+SALE-0936,2023-07-21,Clothing,T-Shirt,97.41,7,681.64,26.8,182.42,499.22,West,Retail Store,CUST-0194,PayPal,7,3,Friday
+SALE-0937,2023-05-04,Books,Textbook,44.98,6,254.98,13.7,34.98,220.01,West,Phone,CUST-0017,Cash,5,2,Thursday
+SALE-0938,2023-08-18,Books,Textbook,44.54,2,61.1,12.0,7.33,53.77,South,Retail Store,CUST-0368,Debit Card,8,3,Friday
+SALE-0939,2023-03-12,Home & Garden,Mirror,36.43,7,358.86,14.7,52.8,306.06,South,Mobile App,CUST-0399,Debit Card,3,1,Sunday
+SALE-0940,2023-12-02,Books,Textbook,78.31,1,93.72,3.9,3.67,90.06,East,Online,CUST-0409,Credit Card,12,4,Saturday
+SALE-0941,2023-04-05,Home & Garden,Lamp,244.62,1,330.33,18.3,60.35,269.97,North,Phone,CUST-0201,PayPal,4,2,Wednesday
+SALE-0942,2023-07-30,Home & Garden,Cushion,47.42,6,201.18,28.2,56.76,144.42,East,Retail Store,CUST-0036,Debit Card,7,3,Sunday
+SALE-0943,2023-02-24,Clothing,Jeans,39.04,4,217.94,17.9,39.02,178.93,North,Phone,CUST-0376,Debit Card,2,1,Friday
+SALE-0944,2023-11-02,Clothing,Jeans,100.12,8,643.64,19.2,123.77,519.87,North,Phone,CUST-0105,Credit Card,11,4,Thursday
+SALE-0945,2023-12-19,Sports,Yoga Mat,485.19,7,3618.44,10.4,375.3,3243.14,Central,Mobile App,CUST-0147,Cash,12,4,Tuesday
+SALE-0946,2023-04-05,Sports,Basketball,449.54,2,1304.81,30.0,391.34,913.47,West,Retail Store,CUST-0171,Debit Card,4,2,Wednesday
+SALE-0947,2023-04-09,Clothing,T-Shirt,178.2,5,909.73,20.6,187.86,721.87,West,Online,CUST-0029,Cash,4,2,Sunday
+SALE-0948,2023-07-31,Clothing,Jeans,181.12,7,928.4,27.7,256.72,671.68,South,Online,CUST-0297,Debit Card,7,3,Monday
+SALE-0949,2023-08-13,Books,Biography,71.95,8,393.61,14.5,57.01,336.6,East,Mobile App,CUST-0269,Debit Card,8,3,Sunday
+SALE-0950,2023-08-07,Sports,Running Shoes,423.35,6,2190.97,18.3,400.02,1790.95,Central,Mobile App,CUST-0178,Cash,8,3,Monday
+SALE-0951,2023-07-21,Books,Magazine,91.76,4,341.36,9.1,31.08,310.28,Central,Online,CUST-0139,Credit Card,7,3,Friday
+SALE-0952,2023-08-20,Sports,Running Shoes,197.77,2,315.44,1.2,3.76,311.68,South,Mobile App,CUST-0078,Credit Card,8,3,Sunday
+SALE-0953,2023-10-13,Sports,Tennis Racket,346.61,2,575.36,8.2,46.95,528.41,North,Retail Store,CUST-0492,Cash,10,4,Friday
+SALE-0954,2023-08-14,Sports,Dumbbells,405.64,4,1318.78,6.4,84.49,1234.29,East,Mobile App,CUST-0340,Debit Card,8,3,Monday
+SALE-0955,2023-08-05,Home & Garden,Mirror,244.74,9,1375.57,23.8,327.82,1047.75,North,Retail Store,CUST-0494,PayPal,8,3,Saturday
+SALE-0956,2023-11-27,Sports,Running Shoes,278.4,1,214.71,1.2,2.64,212.07,Central,Online,CUST-0271,Debit Card,11,4,Monday
+SALE-0957,2023-10-27,Books,Textbook,52.44,6,198.19,5.3,10.45,187.75,West,Mobile App,CUST-0032,Cash,10,4,Friday
+SALE-0958,2023-08-19,Electronics,Smartphone,1832.11,5,6728.1,16.6,1113.83,5614.27,West,Retail Store,CUST-0279,PayPal,8,3,Saturday
+SALE-0959,2023-02-16,Home & Garden,Plant Pot,128.07,2,320.24,10.0,32.03,288.22,South,Online,CUST-0145,Credit Card,2,1,Thursday
+SALE-0960,2023-02-28,Sports,Dumbbells,364.83,7,2937.42,16.7,489.22,2448.2,North,Mobile App,CUST-0380,Debit Card,2,1,Tuesday
+SALE-0961,2023-07-13,Books,Biography,22.77,9,190.8,26.8,51.11,139.68,North,Retail Store,CUST-0292,Cash,7,3,Thursday
+SALE-0962,2023-10-17,Clothing,Jeans,191.11,6,805.49,6.9,55.66,749.83,South,Retail Store,CUST-0221,Credit Card,10,4,Tuesday
+SALE-0963,2023-08-03,Home & Garden,Plant Pot,273.02,1,181.68,24.2,44.0,137.68,West,Phone,CUST-0332,Debit Card,8,3,Thursday
+SALE-0964,2023-03-02,Clothing,Jeans,28.53,4,162.76,23.1,37.62,125.14,North,Phone,CUST-0014,Credit Card,3,1,Thursday
+SALE-0965,2023-08-23,Sports,Basketball,254.3,2,411.26,7.3,29.88,381.38,Central,Online,CUST-0400,PayPal,8,3,Wednesday
+SALE-0966,2023-05-02,Clothing,Shoes,162.9,4,684.39,0.0,0.05,684.34,West,Mobile App,CUST-0429,PayPal,5,2,Tuesday
+SALE-0967,2023-08-15,Electronics,Smartwatch,598.38,6,3158.07,11.2,353.96,2804.1,Central,Online,CUST-0342,Debit Card,8,3,Tuesday
+SALE-0968,2023-10-08,Home & Garden,Mirror,289.69,3,523.94,16.5,86.63,437.31,Central,Retail Store,CUST-0389,Credit Card,10,4,Sunday
+SALE-0969,2023-04-05,Clothing,T-Shirt,74.67,3,301.65,5.9,17.81,283.84,East,Online,CUST-0123,Debit Card,4,2,Wednesday
+SALE-0970,2023-01-17,Books,Magazine,44.65,5,254.67,14.7,37.54,217.13,East,Phone,CUST-0369,Credit Card,1,1,Tuesday
+SALE-0971,2023-01-26,Electronics,Headphones,1013.79,3,4178.48,18.6,776.38,3402.1,South,Retail Store,CUST-0028,Cash,1,1,Thursday
+SALE-0972,2023-11-09,Books,Magazine,35.93,8,214.83,4.0,8.64,206.19,Central,Retail Store,CUST-0472,PayPal,11,4,Thursday
+SALE-0973,2023-10-24,Home & Garden,Coffee Maker,58.59,8,415.07,15.7,65.19,349.88,North,Phone,CUST-0017,Cash,10,4,Tuesday
+SALE-0974,2023-07-08,Sports,Running Shoes,439.86,5,1585.45,6.9,109.75,1475.7,West,Online,CUST-0374,Cash,7,3,Saturday
+SALE-0975,2023-08-30,Clothing,T-Shirt,141.91,6,504.93,27.9,141.01,363.92,East,Phone,CUST-0165,PayPal,8,3,Wednesday
+SALE-0976,2023-09-26,Clothing,Jeans,139.53,2,224.64,24.3,54.64,170.0,Central,Online,CUST-0263,Credit Card,9,3,Tuesday
+SALE-0977,2023-10-20,Books,Fiction Novel,55.59,3,114.23,8.9,10.11,104.11,West,Phone,CUST-0298,PayPal,10,4,Friday
+SALE-0978,2023-11-08,Home & Garden,Plant Pot,61.49,3,161.91,29.3,47.38,114.53,Central,Phone,CUST-0335,Debit Card,11,4,Wednesday
+SALE-0979,2023-11-11,Books,Biography,81.73,5,375.5,23.8,89.3,286.2,Central,Mobile App,CUST-0388,PayPal,11,4,Saturday
+SALE-0980,2023-04-03,Books,Textbook,75.74,6,614.7,10.8,66.37,548.32,East,Retail Store,CUST-0293,Credit Card,4,2,Monday
+SALE-0981,2023-03-02,Electronics,Headphones,1222.66,2,2802.83,7.4,207.86,2594.97,North,Retail Store,CUST-0448,PayPal,3,1,Thursday
+SALE-0982,2023-07-31,Electronics,Tablet,1733.72,8,11778.42,14.3,1682.03,10096.39,East,Retail Store,CUST-0140,Credit Card,7,3,Monday
+SALE-0983,2023-11-24,Clothing,Dress,167.04,9,1378.04,10.3,141.58,1236.46,East,Online,CUST-0334,Cash,11,4,Friday
+SALE-0984,2023-06-03,Books,Magazine,24.72,8,191.62,11.9,22.88,168.73,East,Online,CUST-0353,Credit Card,6,2,Saturday
+SALE-0985,2023-12-18,Home & Garden,Plant Pot,22.16,3,75.73,13.2,10.03,65.71,West,Online,CUST-0250,Debit Card,12,4,Monday
+SALE-0986,2023-04-10,Home & Garden,Plant Pot,142.44,8,1257.2,23.1,290.91,966.29,West,Mobile App,CUST-0140,Credit Card,4,2,Monday
+SALE-0987,2023-11-27,Clothing,Jacket,192.1,9,1477.65,7.2,106.51,1371.14,South,Mobile App,CUST-0005,Cash,11,4,Monday
+SALE-0988,2023-08-25,Sports,Running Shoes,185.43,3,430.94,29.6,127.46,303.48,Central,Phone,CUST-0154,Cash,8,3,Friday
+SALE-0989,2023-10-12,Books,Fiction Novel,88.02,4,222.15,20.9,46.4,175.75,South,Phone,CUST-0072,Cash,10,4,Thursday
+SALE-0990,2023-02-03,Clothing,Dress,148.1,5,1068.82,13.9,148.97,919.86,North,Phone,CUST-0062,PayPal,2,1,Friday
+SALE-0991,2023-11-17,Books,Textbook,45.86,4,183.41,14.6,26.76,156.65,Central,Mobile App,CUST-0370,Debit Card,11,4,Friday
+SALE-0992,2023-11-01,Electronics,Tablet,1255.12,5,6144.68,1.4,83.12,6061.56,East,Online,CUST-0134,Cash,11,4,Wednesday
+SALE-0993,2023-07-31,Electronics,Headphones,162.37,9,1237.0,22.9,282.99,954.01,South,Phone,CUST-0128,PayPal,7,3,Monday
+SALE-0994,2023-06-04,Clothing,Shoes,70.75,8,482.8,7.0,33.81,449.0,East,Retail Store,CUST-0134,Credit Card,6,2,Sunday
+SALE-0995,2023-07-11,Electronics,Smartphone,1289.73,7,6486.28,4.7,304.2,6182.08,North,Mobile App,CUST-0308,Credit Card,7,3,Tuesday
+SALE-0996,2023-09-05,Books,Textbook,36.44,8,210.22,12.7,26.7,183.51,South,Phone,CUST-0018,PayPal,9,3,Tuesday
+SALE-0997,2023-09-26,Home & Garden,Plant Pot,34.0,6,169.98,10.0,16.99,152.99,South,Online,CUST-0281,Debit Card,9,3,Tuesday
+SALE-0998,2023-04-16,Electronics,Headphones,993.71,3,4188.52,21.1,884.75,3303.78,West,Online,CUST-0358,Credit Card,4,2,Sunday
+SALE-0999,2023-06-09,Electronics,Smartwatch,779.85,7,5640.88,16.2,911.09,4729.79,North,Phone,CUST-0231,PayPal,6,2,Friday
+SALE-1000,2023-01-24,Electronics,Smartwatch,1681.75,1,1813.39,29.9,542.46,1270.93,East,Online,CUST-0035,Cash,1,1,Tuesday

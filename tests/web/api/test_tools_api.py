@@ -1,0 +1,1765 @@
+"""
+Tests for Tools API endpoints.
+
+This module tests the /api/tools endpoints, including the /available endpoint
+which lists all tools that can be used by agents.
+"""
+
+import logging
+import tempfile
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from tests.shared.auth_database import auth_db_override
+from xagent.core.tools.adapters.vibe.config import (
+    ToolFactoryRuntimeSessionBoundaryError,
+)
+from xagent.web.api.auth import auth_router
+from xagent.web.api.tools import _create_tool_info, tools_router
+from xagent.web.models.auth_database import get_auth_db
+from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.tool_config import ToolConfig
+from xagent.web.models.user import User
+
+
+def override_get_db():
+    db = None
+    try:
+        db = next(get_db())
+        yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
+# Create test app without startup events
+test_app = FastAPI()
+test_app.include_router(auth_router)
+test_app.include_router(tools_router)
+test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
+
+# Create test client
+client = TestClient(test_app)
+
+
+def test_sound_effect_tool_requires_sound_effect_model() -> None:
+    class Tool:
+        name = "generate_sound_effect"
+        description = ""
+
+    unavailable = _create_tool_info(
+        Tool(),
+        "audio",
+    )
+    available = _create_tool_info(
+        Tool(),
+        "audio",
+        sound_effect_models={"sfx": object()},
+    )
+
+    assert unavailable["enabled"] is False
+    assert unavailable["status"] == "missing_model"
+    assert available["enabled"] is True
+    assert available["status"] == "available"
+
+
+def test_withheld_edit_image_keeps_its_admin_row() -> None:
+    from xagent.web.api.tools import _withheld_edit_image_row
+
+    generate_only = {"img": SimpleNamespace(abilities=["generate"])}
+    edit_capable = {"img": SimpleNamespace(abilities=["generate", "edit"])}
+
+    row = _withheld_edit_image_row([], generate_only)
+
+    assert row is not None
+    assert row["name"] == "edit_image"
+    assert row["enabled"] is False
+    assert row["status"] == "missing_capability"
+    assert "editing support" in row["status_reason"]
+
+    # Nothing to explain when the tool is present, or when no model is configured.
+    assert _withheld_edit_image_row([{"name": "edit_image"}], generate_only) is None
+    assert _withheld_edit_image_row([], {}) is None
+    # An edit-capable deployment must never grow a synthetic row.
+    assert _withheld_edit_image_row([], edit_capable) is None
+
+
+def test_music_tool_requires_music_model() -> None:
+    class Tool:
+        name = "generate_music"
+        description = ""
+
+    unavailable = _create_tool_info(Tool(), "audio")
+    available = _create_tool_info(
+        Tool(),
+        "audio",
+        music_models={"music": object()},
+    )
+
+    assert unavailable["enabled"] is False
+    assert unavailable["status"] == "missing_model"
+    assert available["enabled"] is True
+    assert available["status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_available_tools_route_surfaces_the_withheld_edit_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The helper's unit test cannot catch the wiring being dropped, and every
+    # other route test configures zero image models, which short-circuits it.
+    from xagent.web.api.tools import get_available_tools
+
+    class Config:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def get_vision_model(self):
+            return None
+
+        def get_image_models(self):
+            return {"img": SimpleNamespace(abilities=["generate"])}
+
+        def get_video_models(self):
+            return {}
+
+        def get_asr_models(self):
+            return {}
+
+        def get_tts_models(self):
+            return {}
+
+        def get_sound_effect_models(self):
+            return {}
+
+        def get_music_models(self):
+            return {}
+
+        def get_user_tool_overrides(self):
+            return {}
+
+        def close(self) -> None:
+            return None
+
+    async def create_all_tools(_config, apply_user_override_filter: bool = True):
+        # Capability gating already withheld edit_image.
+        return []
+
+    class Query:
+        def all(self) -> list[object]:
+            return []
+
+    class Database:
+        def query(self, _model: object) -> Query:
+            return Query()
+
+    monkeypatch.setattr("xagent.web.api.tools.WebToolConfig", Config)
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
+    monkeypatch.setattr("xagent.web.api.tools.get_default_tool_configs", lambda: [])
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=Database(),
+    )
+
+    rows = {item["name"]: item for item in response["tools"]}
+    assert rows["edit_image"]["enabled"] is False
+    assert rows["edit_image"]["status"] == "missing_capability"
+    assert "editing support" in rows["edit_image"]["status_reason"]
+
+
+class _AvailableToolsRouteHarness:
+    def __init__(
+        self,
+        *,
+        cleanup_error: BaseException | None = None,
+        primary_error: BaseException | None = None,
+        usage_counts: dict[str, int] | None = None,
+    ) -> None:
+        self.cleanup_error = cleanup_error
+        self.primary_error = primary_error
+        self.usage_counts = usage_counts or {}
+        self.usage_user_ids: list[int | None] = []
+        self.events: list[str] = []
+        self.close_calls = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> object:
+        harness = self
+
+        class Config:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+            def get_vision_model(self):
+                harness.events.append("vision")
+                return None
+
+            def get_image_models(self):
+                harness.events.append("image")
+                return {}
+
+            def get_video_models(self):
+                harness.events.append("video")
+                return {}
+
+            def get_asr_models(self):
+                harness.events.append("asr")
+                return {}
+
+            def get_tts_models(self):
+                harness.events.append("tts")
+                return {}
+
+            def get_sound_effect_models(self):
+                harness.events.append("sound_effect")
+                return {}
+
+            def get_music_models(self):
+                harness.events.append("music")
+                return {}
+
+            def get_user_tool_overrides(self):
+                harness.events.append("user_overrides")
+                return {}
+
+            def close(self) -> None:
+                harness.events.append("close")
+                harness.close_calls += 1
+                if harness.cleanup_error is not None:
+                    raise harness.cleanup_error
+
+        class Query:
+            def __init__(self, model: object) -> None:
+                self.model = model
+
+            def all(self) -> list[object]:
+                model_name = getattr(self.model, "__name__", str(self.model))
+                harness.events.append(model_name)
+                if self.model is ToolConfig and harness.primary_error is not None:
+                    raise harness.primary_error
+                return []
+
+        class Database:
+            def query(self, model: object) -> Query:
+                return Query(model)
+
+        def load_tool_usage_counts(
+            _db: object, _usage_user_id: int | None
+        ) -> dict[str, int]:
+            harness.events.append("tool_usage")
+            harness.usage_user_ids.append(_usage_user_id)
+            return harness.usage_counts
+
+        monkeypatch.setattr(
+            "xagent.web.api.tools._load_tool_usage_counts", load_tool_usage_counts
+        )
+
+        class SandboxManager:
+            async def get_or_create_lease_provider(
+                self, _scope: str, _user_id: str
+            ) -> object:
+                harness.events.append("sandbox_get")
+                return object()
+
+            async def attach_provider(
+                self, _scope: str, _user_id: str, _provider: object
+            ) -> bool:
+                # The route holds the provider it just obtained, so it
+                # attaches that object by identity rather than asking whether
+                # some provider exists for the key.
+                harness.events.append("sandbox_attach")
+                return True
+
+            async def release(self, _scope: str, _user_id: str) -> None:
+                harness.events.append("sandbox_release")
+
+        category = SimpleNamespace(value="basic")
+        tool = SimpleNamespace(
+            name="test_tool",
+            description="",
+            metadata=SimpleNamespace(category=category),
+        )
+
+        async def create_all_tools(
+            _config, apply_user_override_filter: bool = True
+        ) -> list[object]:
+            assert apply_user_override_filter is False
+            harness.events.append("factory")
+            return [tool]
+
+        def create_tool_info(*_args, **_kwargs) -> dict[str, object]:
+            harness.events.append("response_shape")
+            return {
+                "name": "test_tool",
+                "category": "basic",
+                "enabled": True,
+                "status": "available",
+            }
+
+        monkeypatch.setattr("xagent.web.api.tools.WebToolConfig", Config)
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            create_all_tools,
+        )
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: SandboxManager(),
+        )
+        monkeypatch.setattr("xagent.web.api.tools._create_tool_info", create_tool_info)
+        monkeypatch.setattr(
+            "xagent.web.api.tools.get_default_tool_configs",
+            lambda: [],
+        )
+        return Database()
+
+
+@pytest.mark.asyncio
+async def test_available_tools_cleanup_failure_follows_complete_route_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    cleanup_error = RuntimeError("close failed")
+    harness = _AvailableToolsRouteHarness(cleanup_error=cleanup_error)
+    db = harness.install(monkeypatch)
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError) as exc_info:
+        await get_available_tools(
+            current_user=SimpleNamespace(id=7, is_admin=False),
+            db=db,
+        )
+
+    assert exc_info.value.__cause__ is cleanup_error
+    assert str(exc_info.value) == "Tool runtime cleanup could not be completed."
+    assert harness.close_calls == 1
+    assert harness.events == [
+        "sandbox_get",
+        "sandbox_attach",
+        "factory",
+        "sandbox_release",
+        "vision",
+        "image",
+        "video",
+        "asr",
+        "tts",
+        "sound_effect",
+        "music",
+        "response_shape",
+        "tool_usage",
+        ToolConfig.__name__,
+        "user_overrides",
+        "close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_available_tools_reports_usage_counts_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 4})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=db,
+    )
+
+    assert response["tools"][0]["usage_count"] == 4
+    assert "tool_usage" in harness.events
+    assert harness.usage_user_ids == [7]
+
+
+@pytest.mark.asyncio
+async def test_available_tools_admin_usage_is_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 9})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=1, is_admin=True),
+        db=db,
+    )
+
+    assert response["tools"][0]["usage_count"] == 9
+    assert harness.usage_user_ids == [None]
+
+
+@pytest.mark.asyncio
+async def test_available_tools_can_skip_usage_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The agent builder never reads usage_count, so it must not pay for the
+    # aggregation (#3007).
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 4})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=db,
+        include_usage=False,
+    )
+
+    assert [tool["name"] for tool in response["tools"]] == ["test_tool"]
+    assert "usage_count" not in response["tools"][0]
+    assert "tool_usage" not in harness.events
+    assert ToolConfig.__name__ in harness.events
+
+
+class _RoutePrimaryFailure(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_available_tools_primary_failure_wins_over_terminal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    primary_error = _RoutePrimaryFailure("route failed")
+    cleanup_error = RuntimeError("close failed")
+    harness = _AvailableToolsRouteHarness(
+        cleanup_error=cleanup_error,
+        primary_error=primary_error,
+    )
+    db = harness.install(monkeypatch)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="xagent.web.api.tools"),
+        pytest.raises(_RoutePrimaryFailure) as exc_info,
+    ):
+        await get_available_tools(
+            current_user=SimpleNamespace(id=7, is_admin=False),
+            db=db,
+        )
+
+    assert exc_info.value is primary_error
+    assert harness.close_calls == 1
+    cleanup_records = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "Failed to close tool listing runtime after route failure"
+    ]
+    assert len(cleanup_records) == 1
+    assert cleanup_records[0].exc_info is not None
+
+
+def ensure_system_initialized() -> None:
+    status_response = client.get("/api/auth/setup-status")
+    assert status_response.status_code == 200
+    status_data = status_response.json()
+
+    if status_data.get("needs_setup", True):
+        setup_response = client.post(
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
+        )
+        assert setup_response.status_code == 200
+        assert setup_response.json().get("success") is True
+
+
+@pytest.fixture(scope="function")
+def test_db():
+    """Create test database"""
+    import os
+    import shutil
+
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    SQLALCHEMY_DATABASE_URL = f"sqlite:///{temp_db_path}"
+
+    init_db(db_url=SQLALCHEMY_DATABASE_URL)
+
+    engine = get_engine()
+
+    yield temp_dir
+
+    Base.metadata.drop_all(bind=engine)
+    shutil.rmtree(temp_dir)
+
+
+class TestToolsAvailableAPI:
+    """Test /api/tools/available endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, test_db):
+        """Setup system initialization before each test."""
+        ensure_system_initialized()
+        yield
+
+    def test_get_available_tools_without_workspace(self, monkeypatch):
+        """Test that /api/tools/available works without a real workspace.
+
+        This endpoint is used to list available tools for the UI.
+        It should work even when there's no active task/workspace.
+        """
+        from xagent.web.api import tools as tools_api
+
+        real_config_type = tools_api.WebToolConfig
+        created_configs = []
+        closed_configs = []
+
+        def capture_config(*args, **kwargs):
+            config = real_config_type(*args, **kwargs)
+            real_close = config.close
+
+            def close() -> None:
+                closed_configs.append(config)
+                real_close()
+
+            config.close = close
+            created_configs.append(config)
+            return config
+
+        monkeypatch.setattr(tools_api, "WebToolConfig", capture_config)
+
+        # Login to get token
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        # Make request to /api/tools/available
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        # Should succeed without errors
+        assert response.status_code == 200
+
+        data = response.json()
+        assert "tools" in data
+        assert "count" in data
+
+        tools = data["tools"]
+        assert isinstance(tools, list)
+
+        # Check that basic tool categories are present
+        tool_names = [t["name"] for t in tools]
+
+        # Should always have these knowledge tools
+        assert "knowledge_search" in tool_names
+        assert "list_knowledge_bases" in tool_names
+
+        # Should have PPTX tools (don't require workspace)
+        assert "read_pptx" in tool_names
+        assert "unpack_pptx" in tool_names
+        assert "pack_pptx" in tool_names
+        assert "clean_pptx" in tool_names
+
+        # Should have browser tools (when enabled)
+        assert "browser_navigate" in tool_names
+        assert "browser_click" in tool_names
+
+        # Basic tools - web search depends on API keys being set
+        has_web_search = "web_search" in tool_names or "zhipu_web_search" in tool_names
+        if has_web_search:
+            # At least one web search tool is present (if API keys configured)
+            pass
+
+        # Code execution tools should now be present (workspace is created)
+        assert "execute_python_code" in tool_names, "Should have python executor"
+        assert "execute_javascript_code" in tool_names, (
+            "Should have javascript executor"
+        )
+
+        # File tools should also be present (workspace is created)
+        assert "read_file" in tool_names, "Should have read_file tool"
+        assert "write_file" in tool_names, "Should have write_file tool"
+
+        # Skill file access tools should be present
+        assert "read_skill_doc" in tool_names, "Should have read_skill_doc tool"
+        assert "list_skill_docs" in tool_names, "Should have list_skill_docs tool"
+        assert "fetch_skill_file" in tool_names, "Should have fetch_skill_file tool"
+        assert closed_configs == created_configs
+
+    def test_skill_category_in_available_tools(self):
+        """Test that skill tools appear with correct category."""
+        # Login to get token
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check for skill tools
+        skill_tools = [
+            tool for tool in data["tools"] if tool.get("category") == "skill"
+        ]
+
+        # Should have read_skill_doc and list_skill_docs
+        skill_tool_names = {tool["name"] for tool in skill_tools}
+        assert "read_skill_doc" in skill_tool_names
+        assert "list_skill_docs" in skill_tool_names
+        assert "fetch_skill_file" in skill_tool_names
+
+        # Verify tool type and display category
+        for tool in skill_tools:
+            assert tool["type"] == "skill"
+            assert tool["display_category"] == "Skill"
+
+    def test_get_available_tools_includes_usage_count(self):
+        """Test that /api/tools/available includes usage statistics."""
+        # Login to get token
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+
+        data = response.json()
+        tools = data["tools"]
+
+        counted_tool = tools[0]["name"]
+        with next(get_db()) as db:
+            user = db.query(User).filter(User.username == "admin").one()
+            task = Task(user_id=user.id, title="Tool usage")
+            db.add(task)
+            db.flush()
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id="tool-usage-list-event",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": counted_tool, "success": True},
+                )
+            )
+            db.commit()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert (
+            next(tool for tool in tools if tool["name"] == counted_tool)["usage_count"]
+            == 1
+        )
+
+        # Each tool should have usage_count field
+        for tool in tools:
+            assert "usage_count" in tool
+            assert isinstance(tool["usage_count"], int)
+            assert "requires_configuration" in tool
+            assert isinstance(tool["requires_configuration"], bool)
+
+        sql_tools = [tool for tool in tools if tool["category"] == "database"]
+        assert sql_tools
+        assert all(tool["requires_configuration"] is True for tool in sql_tools)
+
+    def test_get_available_tools_include_usage_false_omits_usage_count(self):
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available?include_usage=false",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert tools
+        assert all("usage_count" not in tool for tool in tools)
+
+    def test_get_available_tools_tool_categories(self):
+        """Test that tools have correct category information."""
+        # Login to get token
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+
+        data = response.json()
+        tools = data["tools"]
+
+        # Build a map of tool names to categories
+        tool_categories = {t["name"]: t["category"] for t in tools}
+        tool_display_categories = {t["name"]: t["display_category"] for t in tools}
+
+        # Verify categories
+        assert tool_categories.get("knowledge_search") == "knowledge"
+        assert tool_display_categories.get("knowledge_search") == "Knowledge"
+
+        # PPT display name should be "PPT" not "Ppt"
+        assert tool_display_categories.get("read_pptx") == "PPT"
+        assert tool_categories.get("read_pptx") == "ppt"
+
+        assert tool_display_categories.get("browser_navigate") == "Browser"
+        assert tool_categories.get("browser_navigate") == "browser"
+
+        assert tool_display_categories.get("fetch_web_content") == "Web Search"
+        assert tool_categories.get("fetch_web_content") == "web_search"
+
+    def test_get_available_tools_marks_always_available_tools(self) -> None:
+        from xagent.core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
+        from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
+
+        response = client.get(
+            "/api/tools/available",
+            headers={"Authorization": f"Bearer {self._login_admin()}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        marked = {t["name"] for t in data["tools"] if t["always_available"]}
+        assert marked == INTRINSIC_TOOL_NAMES
+        assert data["skill_loader_tool"] == LOAD_SKILL_TOOL_NAME
+
+    def test_get_available_tools_requires_auth(self):
+        """Test that /api/tools/available requires authentication."""
+        response = client.get("/api/tools/available")
+
+        # Missing credentials require the standard Bearer challenge.
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
+
+    def test_get_available_tools_falls_back_to_other_when_metadata_missing(
+        self, monkeypatch
+    ):
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        class _Category:
+            value = "basic"
+
+        class _Metadata:
+            category = _Category()
+
+        class _ToolWithoutMetadata:
+            name = "tool_without_metadata"
+            description = ""
+
+        class _ToolWithMetadata:
+            name = "tool_with_metadata"
+            description = ""
+            metadata = _Metadata()
+
+        # Mock async create_all_tools to return test tools
+        async def mock_create_all_tools(config, apply_user_override_filter=True):
+            return [_ToolWithoutMetadata(), _ToolWithMetadata()]
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            mock_create_all_tools,
+        )
+
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        categories = {item["name"]: item["category"] for item in payload["tools"]}
+        assert categories["tool_without_metadata"] == "other"
+        assert categories["tool_with_metadata"] == "basic"
+
+    def test_get_available_tools_applies_user_override(self):
+        """Test that user tool override hook marks disabled tools in /available."""
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+        set_user_tool_overrides_hook(
+            lambda db, user: {"browser_navigate": {"enabled": False}}
+        )
+        try:
+            login_response = client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin123"},
+            )
+            assert login_response.status_code == 200
+            token = login_response.json()["access_token"]
+
+            response = client.get(
+                "/api/tools/available",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status_code == 200
+            payload = response.json()
+
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            # In the display layer the tool remains visible but is marked disabled.
+            assert "browser_navigate" in tool_map
+            assert tool_map["browser_navigate"]["enabled"] is False
+            assert tool_map["browser_navigate"]["status"] == "disabled"
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def test_get_available_tools_override_does_not_mask_missing_model(
+        self, monkeypatch
+    ):
+        """Test that enabled=True override cannot mask resource-missing states."""
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+        class _Category:
+            value = "vision"
+
+        class _Metadata:
+            category = _Category()
+
+        class _VisionTool:
+            name = "vision_test_tool"
+            description = ""
+            metadata = _Metadata()
+
+        async def mock_create_all_tools(config, apply_user_override_filter=True):
+            return [_VisionTool()]
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            mock_create_all_tools,
+        )
+        monkeypatch.setattr(
+            "xagent.web.tools.config.WebToolConfig.get_vision_model",
+            lambda self: None,
+        )
+
+        set_user_tool_overrides_hook(
+            lambda db, user: {"vision_test_tool": {"enabled": True}}
+        )
+        try:
+            login_response = client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "admin123"},
+            )
+            assert login_response.status_code == 200
+            token = login_response.json()["access_token"]
+
+            response = client.get(
+                "/api/tools/available",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status_code == 200
+            payload = response.json()
+
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            assert "vision_test_tool" in tool_map
+            assert tool_map["vision_test_tool"]["status"] == "missing_model"
+            assert tool_map["vision_test_tool"]["enabled"] is False
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def test_get_available_tools_override_enables_globally_disabled_tool(self):
+        """Test that enabled=True override can re-enable a globally disabled tool."""
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+        # Step 1: globally disable browser_navigate via admin API
+        headers = {"Authorization": f"Bearer {self._login_admin()}"}
+        put_resp = client.put(
+            "/api/tools/browser_navigate/enabled",
+            headers=headers,
+            json={"enabled": False},
+        )
+        assert put_resp.status_code == 200
+
+        # Step 2: set hook to re-enable it
+        set_user_tool_overrides_hook(
+            lambda db, user: {"browser_navigate": {"enabled": True}}
+        )
+        try:
+            response = client.get(
+                "/api/tools/available",
+                headers=headers,
+            )
+            assert response.status_code == 200
+            payload = response.json()
+
+            tool_map = {item["name"]: item for item in payload["tools"]}
+            assert "browser_navigate" in tool_map
+            assert tool_map["browser_navigate"]["enabled"] is True
+            assert tool_map["browser_navigate"]["status"] == "available"
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def _login_admin(self) -> str:
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        return login_response.json()["access_token"]
+
+
+class TestToolsGovernanceAPI:
+    @pytest.fixture(autouse=True)
+    def setup(self, test_db):
+        ensure_system_initialized()
+        yield
+
+    def _admin_headers(self) -> dict[str, str]:
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    def _user_headers(self, username: str) -> dict[str, str]:
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": username,
+                "email": f"{username}@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+
+        login_response = client.post(
+            "/api/auth/login", json={"username": username, "password": "password123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_enable_unknown_tool_creates_policy_record(self):
+        headers = self._admin_headers()
+
+        response = client.put(
+            "/api/tools/custom_runtime_tool/enabled",
+            headers=headers,
+            json={"enabled": False},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["tool_name"] == "custom_runtime_tool"
+        assert data["enabled"] is False
+
+    def test_configurable_credentials_put_and_get_masked(self):
+        headers = self._admin_headers()
+
+        put_resp = client.put(
+            "/api/tools/zhipu_web_search/credentials",
+            headers=headers,
+            json={
+                "credentials": {
+                    "api_key": {"value": "test-secret-zhipu-key-1234"},
+                    "base_url": {"value": "https://open.bigmodel.cn"},
+                }
+            },
+        )
+        assert put_resp.status_code == 200
+
+        get_resp = client.get(
+            "/api/tools/zhipu_web_search/credentials",
+            headers=headers,
+        )
+        assert get_resp.status_code == 200
+        payload = get_resp.json()
+
+        assert payload["tool_name"] == "zhipu_web_search"
+        assert payload["configured"] is True
+        assert payload["fields"]["api_key"]["source"] == "db"
+        assert payload["fields"]["api_key"]["is_configured"] is True
+        assert "1234" in payload["fields"]["api_key"]["masked"]
+        assert (
+            "test-secret-zhipu-key-1234" not in payload["fields"]["api_key"]["masked"]
+        )
+
+    def test_configurable_credentials_env_source_when_not_stored(self, monkeypatch):
+        headers = self._admin_headers()
+        monkeypatch.setenv("TAVILY_API_KEY", "env-only-tavily-key-5678")
+
+        resp = client.get("/api/tools/tavily_web_search/credentials", headers=headers)
+        assert resp.status_code == 200
+        payload = resp.json()
+
+        assert payload["fields"]["api_key"]["source"] == "env"
+        assert payload["fields"]["api_key"]["is_configured"] is True
+        assert "5678" in payload["fields"]["api_key"]["masked"]
+
+    def test_unreadable_credential_remains_visible_and_can_be_replaced(
+        self, monkeypatch
+    ):
+        from xagent.web.models.database import get_session_local
+        from xagent.web.services.tool_credentials import (
+            ToolCredentialUnreadableError,
+            resolve_tool_credential,
+        )
+
+        headers = self._admin_headers()
+        path = "/api/tools/tavily_web_search/credentials"
+        assert (
+            client.put(
+                path,
+                headers=headers,
+                json={
+                    "credentials": {"api_key": {"value": "original-private-tool-key"}}
+                },
+            ).status_code
+            == 200
+        )
+        with get_session_local()() as db:
+            row = db.query(ToolConfig).filter_by(tool_name="tavily_web_search").one()
+            row.config = {
+                "credentials": {
+                    "api_key": {
+                        "secret": True,
+                        "ciphertext": "corrupt-token",
+                        "masked": "***",
+                    }
+                }
+            }
+            db.commit()
+        monkeypatch.setenv("TAVILY_API_KEY", "do-not-fallback-to-this")
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+        field = response.json()["fields"]["api_key"]
+        assert field["error"] == "unreadable"
+        assert field["source"] == "db" and field["is_configured"] is False
+        assert response.json()["configured"] is False
+        assert "corrupt-token" not in response.text
+        assert "do-not-fallback-to-this" not in response.text
+        with get_session_local()() as db:
+            with pytest.raises(ToolCredentialUnreadableError):
+                resolve_tool_credential(db, "tavily_web_search", "api_key")
+        repaired = client.put(
+            path,
+            headers=headers,
+            json={
+                "credentials": {"api_key": {"value": "replacement-private-tool-key"}}
+            },
+        )
+        assert repaired.status_code == 200
+        assert repaired.json()["fields"]["api_key"]["error"] is None
+        assert repaired.json()["configured"] is True
+
+    def test_sql_connections_crud_and_db_priority_over_env(self, monkeypatch):
+        headers = self._admin_headers()
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_ANALYTICS",
+            "postgresql://env_user:env_pass@localhost:5432/env_db",
+        )
+
+        initial = client.get("/api/tools/sql-connections", headers=headers)
+        assert initial.status_code == 200
+        initial_items = {item["name"]: item for item in initial.json()["connections"]}
+        assert initial_items["ANALYTICS"]["source"] == "env"
+
+        upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=headers,
+            json={
+                "connection_url": "postgresql://db_user:db_pass@localhost:5432/db_db"
+            },
+        )
+        assert upsert.status_code == 200
+
+        after_upsert = client.get("/api/tools/sql-connections", headers=headers)
+        assert after_upsert.status_code == 200
+        upsert_items = {
+            item["name"]: item for item in after_upsert.json()["connections"]
+        }
+        assert upsert_items["ANALYTICS"]["source"] == "db"
+        assert "db_pass" not in upsert_items["ANALYTICS"]["masked"]
+
+        delete_resp = client.delete(
+            "/api/tools/sql-connections/analytics", headers=headers
+        )
+        assert delete_resp.status_code == 200
+
+        after_delete = client.get("/api/tools/sql-connections", headers=headers)
+        assert after_delete.status_code == 200
+        delete_items = {
+            item["name"]: item for item in after_delete.json()["connections"]
+        }
+        assert delete_items["ANALYTICS"]["source"] == "env"
+
+    def test_sql_connection_rejects_unsupported_scheme(self):
+        headers = self._admin_headers()
+
+        upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=headers,
+            json={"connection_url": "redis://localhost:6379/0"},
+        )
+
+        assert upsert.status_code == 400
+        assert "Unsupported SQLAlchemy URL scheme" in upsert.json()["detail"]
+
+    def test_sql_connection_put_rejects_platform_database(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres:5432/xagent")
+        response = client.put(
+            "/api/tools/sql-connections/platform-copy",
+            headers=self._admin_headers(),
+            json={
+                "connection_url": (
+                    "postgresql+psycopg://other@public.example/other"
+                    "?host=postgres&dbname=xagent"
+                )
+            },
+        )
+
+        assert response.status_code == 400
+        assert "platform database" in response.json()["detail"]
+
+    def test_sql_connections_are_user_scoped(self):
+        user1_headers = self._user_headers("user1")
+        user2_headers = self._user_headers("user2")
+
+        user1_upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=user1_headers,
+            json={"connection_url": "postgresql://user1:pass1@localhost:5432/user1_db"},
+        )
+        assert user1_upsert.status_code == 200
+
+        user2_initial = client.get("/api/tools/sql-connections", headers=user2_headers)
+        assert user2_initial.status_code == 200
+        assert user2_initial.json()["connections"] == []
+
+        user2_upsert = client.put(
+            "/api/tools/sql-connections/analytics",
+            headers=user2_headers,
+            json={"connection_url": "postgresql://user2:pass2@localhost:5432/user2_db"},
+        )
+        assert user2_upsert.status_code == 200
+
+        user1_items = {
+            item["name"]: item
+            for item in client.get(
+                "/api/tools/sql-connections", headers=user1_headers
+            ).json()["connections"]
+        }
+        user2_items = {
+            item["name"]: item
+            for item in client.get(
+                "/api/tools/sql-connections", headers=user2_headers
+            ).json()["connections"]
+        }
+
+        assert user1_items["ANALYTICS"]["source"] == "db"
+        assert user2_items["ANALYTICS"]["source"] == "db"
+        assert user1_items["ANALYTICS"]["masked"] != user2_items["ANALYTICS"]["masked"]
+
+        user1_delete = client.delete(
+            "/api/tools/sql-connections/analytics", headers=user1_headers
+        )
+        assert user1_delete.status_code == 200
+
+        user1_after_delete = client.get(
+            "/api/tools/sql-connections", headers=user1_headers
+        )
+        user2_after_delete = client.get(
+            "/api/tools/sql-connections", headers=user2_headers
+        )
+        assert user1_after_delete.status_code == 200
+        assert user2_after_delete.status_code == 200
+        assert user1_after_delete.json()["connections"] == []
+        remaining_user2 = {
+            item["name"]: item for item in user2_after_delete.json()["connections"]
+        }
+        assert remaining_user2["ANALYTICS"]["source"] == "db"
+
+    def test_non_admin_cannot_access_global_credentials(self):
+        user_headers = self._user_headers("nonadmin")
+
+        configurable_resp = client.get("/api/tools/configurable", headers=user_headers)
+        credential_resp = client.get(
+            "/api/tools/zhipu_web_search/credentials", headers=user_headers
+        )
+
+        assert configurable_resp.status_code == 403
+        assert credential_resp.status_code == 403
+
+
+def test_user_tool_overrides_hook_noop_by_default():
+    """Without a hook set, get_user_tool_overrides returns an empty dict."""
+    from xagent.web.services.tool_credentials import get_user_tool_overrides
+
+    result = get_user_tool_overrides(db=None, user=None)
+    assert result == {}
+
+
+def test_user_tool_overrides_hook_returns_injected_data():
+    """When a hook is set, it returns the hook's result."""
+    from xagent.web.services.tool_credentials import (
+        get_user_tool_overrides,
+        set_user_tool_overrides_hook,
+    )
+
+    def my_hook(db, user):
+        return {
+            "calculator": {"enabled": False},
+            "web_search": {"config": {"api_key": "x"}},
+        }
+
+    set_user_tool_overrides_hook(my_hook)
+    try:
+        result = get_user_tool_overrides(db=None, user=None)
+        assert result["calculator"]["enabled"] is False
+        assert result["web_search"]["config"] == {"api_key": "x"}
+        assert "nonexistent" not in result
+    finally:
+        set_user_tool_overrides_hook(None)
+
+
+def test_user_tool_overrides_hook_reset_to_none():
+    """Setting hook to None restores default empty behavior."""
+    from xagent.web.services.tool_credentials import (
+        get_user_tool_overrides,
+        set_user_tool_overrides_hook,
+    )
+
+    set_user_tool_overrides_hook(lambda db, user: {"test": {"enabled": True}})
+    set_user_tool_overrides_hook(None)
+    result = get_user_tool_overrides(db=None, user=None)
+    assert result == {}
+
+
+class TestWebToolConfigUserOverride:
+    """Verify WebToolConfig.get_user_tool_overrides() resolves user correctly."""
+
+    def test_explicit_user_param_takes_priority(self):
+        """When user keyword arg is passed, it is used even when request has no .user."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            # Simulate TaskCreateRequest: no .user attribute
+            request_without_user = MagicMock()
+            del request_without_user.user
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request_without_user,
+                user_id=42,
+                user=MagicMock(id=42),  # explicit user
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+            assert cfg.get_user_tool_overrides() == {
+                "browser_navigate": {"enabled": False}
+            }
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def test_falls_back_to_request_user_when_explicit_not_given(self):
+        """Without explicit user, request.user is used (existing behavior)."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            mock_user = MagicMock(id=42)
+            request = MagicMock(user=mock_user)
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request,
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+            assert cfg.get_user_tool_overrides() == {
+                "browser_navigate": {"enabled": False}
+            }
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    def test_returns_empty_when_no_user_at_all(self):
+        """When neither explicit user nor request.user is available, returns {}."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            request_without_user = MagicMock()
+            del request_without_user.user
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request_without_user,
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+            assert cfg.get_user_tool_overrides() == {}
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_filters_disabled_when_user_is_explicit(self):
+        """End-to-end: ToolFactory filters tools disabled by per-user hook
+        even when request has no .user but explicit user is provided."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            # Simulate TaskCreateRequest: no .user
+            request_without_user = MagicMock()
+            del request_without_user.user
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request_without_user,
+                user=MagicMock(id=42),  # explicit user
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+
+            # Create mock tools with string .name attributes
+            tool_browser = MagicMock()
+            tool_browser.name = "browser_navigate"
+            tool_calc = MagicMock()
+            tool_calc.name = "calculator"
+
+            with patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+                AsyncMock(return_value=[tool_browser, tool_calc]),
+            ):
+                result = await ToolFactory.create_all_tools(cfg)
+
+            tool_names = [t.name for t in result]
+            assert "browser_navigate" not in tool_names, (
+                "Disabled tool was NOT filtered from create_all_tools"
+            )
+            assert "calculator" in tool_names, "Non-disabled tool should remain"
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_denies_every_tool_when_no_user_at_all(self):
+        """When a policy hook is registered but neither explicit user nor
+        request.user is set, the hook never runs. That is "policy unavailable",
+        not "no policy": the turn must get no tools rather than the full set,
+        which would include the very tool the policy disables."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            request_without_user = MagicMock()
+            del request_without_user.user
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request_without_user,
+                user_id=42,
+                # No explicit user passed — the unresolvable-policy path.
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+
+            tool_browser = MagicMock()
+            tool_browser.name = "browser_navigate"
+            tool_calc = MagicMock()
+            tool_calc.name = "calculator"
+
+            with patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+                AsyncMock(return_value=[tool_browser, tool_calc]),
+            ):
+                result = await ToolFactory.create_all_tools(cfg)
+
+            tool_names = [t.name for t in result]
+            assert "browser_navigate" not in tool_names, (
+                "an unresolved policy must not hand back a tool the policy disables"
+            )
+            # Fail closed all the way: an unresolved policy cannot be narrowed
+            # to just the disabled names, because the hook never told us any.
+            assert tool_names == []
+        finally:
+            set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_keeps_every_tool_when_no_hook_registered(self):
+        """Standalone xagent registers no policy hook, so a config without a
+        runtime user has no policy to lose and keeps its unrestricted default."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.tools.config import WebToolConfig
+
+        request_without_user = MagicMock()
+        del request_without_user.user
+
+        cfg = WebToolConfig(
+            db=MagicMock(),
+            request=request_without_user,
+            user_id=42,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+
+        tool_browser = MagicMock()
+        tool_browser.name = "browser_navigate"
+        tool_calc = MagicMock()
+        tool_calc.name = "calculator"
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+            AsyncMock(return_value=[tool_browser, tool_calc]),
+        ):
+            result = await ToolFactory.create_all_tools(cfg)
+
+        assert sorted(t.name for t in result) == ["browser_navigate", "calculator"]
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_keeps_disabled_when_filter_false(self):
+        """When apply_user_override_filter=False, disabled tools remain in the list.
+
+        This is the display-layer path: tools are visible so they can be
+        shown as ``enabled=False`` in the UI.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+        from xagent.web.tools.config import WebToolConfig
+
+        def _hook(db, user):
+            return {"browser_navigate": {"enabled": False}}
+
+        set_user_tool_overrides_hook(_hook)
+        try:
+            request_without_user = MagicMock()
+            del request_without_user.user
+
+            cfg = WebToolConfig(
+                db=MagicMock(),
+                request=request_without_user,
+                user=MagicMock(id=42),
+                user_id=42,
+                workspace_config={"base_dir": "/tmp", "task_id": "test"},
+            )
+
+            tool_browser = MagicMock()
+            tool_browser.name = "browser_navigate"
+            tool_calc = MagicMock()
+            tool_calc.name = "calculator"
+
+            with patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+                AsyncMock(return_value=[tool_browser, tool_calc]),
+            ):
+                result = await ToolFactory.create_all_tools(
+                    cfg, apply_user_override_filter=False
+                )
+
+            tool_names = [t.name for t in result]
+            assert "browser_navigate" in tool_names, (
+                "Disabled tool should remain when apply_user_override_filter=False"
+            )
+            assert "calculator" in tool_names
+        finally:
+            set_user_tool_overrides_hook(None)
+
+
+class TestWebToolConfigCustomApi:
+    """Verify WebToolConfig.get_custom_api_configs() exposes the body field
+    so that POST custom-api tools actually send their configured payload."""
+
+    def test_get_custom_api_configs_includes_body(self):
+        """Regression test for production bug (Task 898 / Agent 170):
+
+        A user had a Custom API entry with method=POST and a JSON body
+        template, but their POST requests went out with empty bodies.
+        Root cause: WebToolConfig.get_custom_api_configs() built its
+        config dict without the `body` field, so by the time the tool
+        was constructed the body template was already gone.
+
+        This test mirrors the actual production record (Post_HelloAPI)
+        and asserts the body field survives the DB -> dict translation.
+        """
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        # Mirror of production custom_apis row (id=5, name=Post_HelloAPI)
+        api = MagicMock()
+        api.id = 5
+        api.name = "Post_HelloAPI"
+        api.description = None
+        api.url = "https://helloapi-u6nc.onrender.com/"
+        api.method = "POST"
+        api.headers = {}
+        api.body = '{\n  "message": "example message"\n}'
+        api.env = None
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            api
+        ]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=33,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = cfg.get_custom_api_configs()
+
+        assert len(configs) == 1
+        config = configs[0]
+        assert config["name"] == "Post_HelloAPI"
+        assert config["method"] == "POST"
+        # The crucial assertion: body must propagate
+        assert config["body"] == '{\n  "message": "example message"\n}'
+
+    def test_get_custom_api_configs_body_optional(self):
+        """When the user has not configured a body (e.g. GET-only tools),
+        the body field should still be present in the config but None,
+        so downstream code can rely on the key existing."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        api = MagicMock()
+        api.id = 6
+        api.name = "Get_HiAPI"
+        api.description = None
+        api.url = "https://helloapi-u6nc.onrender.com/"
+        api.method = "GET"
+        api.headers = {"message": ""}
+        api.body = None
+        api.env = None
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            api
+        ]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=33,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = cfg.get_custom_api_configs()
+
+        assert len(configs) == 1
+        assert "body" in configs[0]
+        assert configs[0]["body"] is None
+
+
+class TestWebToolConfigMCPAuth:
+    @pytest.mark.asyncio
+    async def test_get_mcp_server_configs_includes_concurrency_config(self):
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        server = MagicMock()
+        server.name = "local"
+        server.transport = "stdio"
+        server.description = "Local MCP"
+        server.command = "npx"
+        server.args = ["-y", "@modelcontextprotocol/server-everything"]
+        server.env = None
+        server.cwd = None
+        server.managed = "external"
+        server.concurrency_safe = True
+        server.concurrent_tools = ["echo", "get_sum"]
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            server
+        ]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=1,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = await cfg.get_mcp_server_configs()
+
+        assert len(configs) == 1
+        assert configs[0]["name"] == "local"
+        assert configs[0]["config"]["concurrency_safe"] is True
+        assert configs[0]["config"]["concurrent_tools"] == ["echo", "get_sum"]
+
+    @pytest.mark.asyncio
+    async def test_get_mcp_server_configs_maps_bearer_auth_to_headers(self):
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        server = MagicMock()
+        server.name = "local"
+        server.transport = "streamable_http"
+        server.description = "Local MCP"
+        server.url = "http://127.0.0.1:18000/mcp"
+        server.headers = {"X-Test": "true"}
+        server.auth = {"type": "bearer", "bearer_token": "test-token-123"}
+        server.managed = "external"
+        # A real row without upload settings reads None; an unset MagicMock
+        # attribute would read as stored settings and fail closed.
+        server.signed_uploads = None
+        server._decrypt_auth_config.side_effect = lambda auth: auth
+        server._merge_auth_headers.side_effect = lambda headers, auth: {
+            **(headers or {}),
+            "Authorization": f"Bearer {auth['bearer_token']}",
+        }
+        server.to_connection_dict.side_effect = lambda: {
+            "name": server.name,
+            "transport": server.transport,
+            "url": server.url,
+            "headers": server._merge_auth_headers(
+                server.headers,
+                server._decrypt_auth_config(server.auth),
+            ),
+        }
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            server
+        ]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=1,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = await cfg.get_mcp_server_configs()
+
+        assert len(configs) == 1
+        assert configs[0]["name"] == "local"
+        assert configs[0]["config"]["url"] == "http://127.0.0.1:18000/mcp"
+        assert configs[0]["config"]["headers"]["X-Test"] == "true"
+        assert (
+            configs[0]["config"]["headers"]["Authorization"] == "Bearer test-token-123"
+        )
+
+
+class TestAvailableToolsSandboxLifecycle:
+    """Sandbox lifecycle handling in /api/tools/available."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, test_db):
+        ensure_system_initialized()
+        yield
+
+    def _login(self) -> str:
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        return login_response.json()["access_token"]
+
+    def test_reclaimed_provider_before_attach_lists_without_sandbox(
+        self, monkeypatch
+    ) -> None:
+        """attach_provider() returning False (provider reclaimed between
+        creation and attach) must drop the stale reference and still serve
+        the listing, without releasing what was never attached."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        sandbox_manager = MagicMock()
+        sandbox_manager.get_or_create_lease_provider = AsyncMock(
+            return_value=MagicMock()
+        )
+        sandbox_manager.attach_provider = AsyncMock(return_value=False)
+        sandbox_manager.release = AsyncMock()
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: sandbox_manager,
+        )
+
+        token = self._login()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["count"] > 0
+        sandbox_manager.attach_provider.assert_awaited_once()
+        sandbox_manager.release.assert_not_awaited()
+
+    def test_attached_sandbox_is_released_after_listing(self, monkeypatch) -> None:
+        """A successfully attached sandbox is released exactly once."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        provider = MagicMock()
+        provider.exec = AsyncMock()
+        provider.primary_sandbox.exec = AsyncMock()
+        sandbox_manager = MagicMock()
+        sandbox_manager.get_or_create_lease_provider = AsyncMock(return_value=provider)
+        sandbox_manager.attach_provider = AsyncMock(return_value=True)
+        sandbox_manager.release = AsyncMock()
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: sandbox_manager,
+        )
+
+        token = self._login()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+        sandbox_manager.release.assert_awaited_once()
+        release_args = sandbox_manager.release.await_args.args
+        assert release_args[0] == "tools"

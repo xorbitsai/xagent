@@ -1,0 +1,1531 @@
+import json
+import logging
+import os
+import re
+from collections.abc import Iterator
+from typing import Annotated, Any
+from urllib.parse import quote, unquote, urlsplit
+
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
+from .utils import success_with_capped_dict, url_path_id
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("excel-mcp")
+
+
+mcp = FastMCP("excel-mcp")
+
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_COLLECTION_PAGE_SIZE = 20
+MAX_COLLECTION_PAGE_SIZE = 100
+DEFAULT_SCAN_CHUNK_ROWS = 100
+MAX_QUERY_MATCHES = 100
+MAX_QUERY_ROWS = 10_000
+MAX_QUERY_REQUESTS = 100
+_EXCEL_MAX_ROW_NUMBER = 1_048_576  # the last row in an Excel worksheet
+
+StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+StrictPageSize = Annotated[int, Field(strict=True, ge=1, le=MAX_COLLECTION_PAGE_SIZE)]
+StrictQueryMaxMatches = Annotated[int, Field(strict=True, ge=1, le=MAX_QUERY_MATCHES)]
+StrictRowNumber = Annotated[int, Field(strict=True, ge=1, le=_EXCEL_MAX_ROW_NUMBER)]
+
+_VALID_CLEAR_APPLY_TO = frozenset({"All", "Formats", "Contents"})
+_EXCEL_MAX_COLUMN_NUMBER = 16_384  # XFD, the last column in an Excel worksheet
+_EXCEL_COLUMN_RE = re.compile(r"^[A-Za-z]{1,3}$")
+
+
+class _GraphRequestError(RuntimeError):
+    """Graph HTTP failure with the stable fields needed for classification."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        graph_error_code: str | None = None,
+        request_path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.graph_error_code = graph_error_code
+        self.request_path = request_path
+
+
+class _GraphMutationIndeterminateError(RuntimeError):
+    """A mutation may have committed even though no response was received."""
+
+
+class _GraphResponseTooLargeError(RuntimeError):
+    """Graph confirmed the request but its response exceeded the ingress cap."""
+
+
+def _success(**payload: Any) -> str:
+    return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+
+
+def _success_with_bounded_collection(
+    field_name: str,
+    values: list[Any],
+    *,
+    next_link: str | None,
+    extra_fields: dict[str, Any] | None = None,
+    oversized_message: str | None = None,
+) -> str:
+    """Return a complete Graph page or fail without advancing its cursor.
+
+    A Graph nextLink resumes after the complete server page. Locally dropping
+    values while retaining that cursor would make the dropped values
+    unreachable, so collection pages are never truncated here. Callers can
+    request a smaller server page instead.
+    """
+    extras = extra_fields or {}
+    response = json.dumps(
+        {
+            "status": "success",
+            field_name: values,
+            "next_link": next_link,
+            "truncated": False,
+            **extras,
+        },
+        ensure_ascii=False,
+    )
+    if len(response) <= get_tool_max_output_length():
+        return response
+    return _error(
+        oversized_message
+        or (
+            "The Graph page exceeds the tool output limit; retry the collection "
+            "from the beginning with a smaller page_size."
+        )
+    )
+
+
+def _error(
+    message: str, *, details: Any = None, failure_code: str | None = None
+) -> str:
+    payload: dict[str, Any] = {"status": "error", "message": message}
+    if details is not None:
+        payload["details"] = details
+    if failure_code is not None:
+        payload["failure_code"] = failure_code
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _graph_error_code(response_text: str) -> str | None:
+    try:
+        payload = json.loads(response_text)
+    except (TypeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _is_workbook_resolution_path(path: str | None) -> bool:
+    if not isinstance(path, str):
+        return False
+    path_only = urlsplit(path).path.rstrip("/")
+    return path_only.endswith("/workbook/worksheets") or path_only.endswith(
+        "/workbook/tables"
+    )
+
+
+def _excel_failure_code(exc: BaseException) -> str | None:
+    """Classify only stable Graph failures safe for client localization."""
+    if not isinstance(exc, _GraphRequestError):
+        return None
+    graph_code = (exc.graph_error_code or "").lower()
+    if graph_code == "accessdenied" and exc.status_code == 403:
+        return "excel_workbook_access_denied"
+    if graph_code == "itemnotfound" and _is_workbook_resolution_path(exc.request_path):
+        return "excel_site_not_found"
+    if graph_code in {"resourcelocked", "itemlocked"} and exc.status_code in {
+        409,
+        423,
+    }:
+        return "excel_workbook_locked"
+    return None
+
+
+def _error_from_exception(exc: BaseException) -> str:
+    return _error(str(exc), failure_code=_excel_failure_code(exc))
+
+
+def _indeterminate(message: str) -> str:
+    return json.dumps(
+        {
+            "status": "indeterminate",
+            "message": message,
+            "retry_safe": False,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    token = os.environ.get("AUTH_TOKEN")
+    if not token:
+        raise ValueError("AUTH_TOKEN environment variable is missing")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+def _graph_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    body: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_response_bytes: int | None = None,
+) -> Any:
+    response = requests.request(
+        method=method,
+        url=f"{GRAPH_BASE_URL}{path}",
+        headers=_graph_headers(extra_headers),
+        params=params,
+        json=body,
+        timeout=timeout,
+        stream=max_response_bytes is not None,
+    )
+    if max_response_bytes is not None:
+        chunks: list[bytes] = []
+        size = 0
+        oversized = False
+        try:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > max_response_bytes:
+                    oversized = True
+                    break
+                chunks.append(chunk)
+        finally:
+            response.close()
+        raw = b"".join(chunks)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            response_text = raw.decode("utf-8", errors="replace").strip()
+            message = str(exc)
+            if response_text:
+                message = f"{message} - {response_text}"
+            if oversized:
+                message = f"{message} - response body truncated at ingress limit"
+            raise _GraphRequestError(
+                message,
+                status_code=response.status_code,
+                graph_error_code=_graph_error_code(response_text),
+                request_path=path,
+            ) from exc
+        if oversized:
+            raise _GraphResponseTooLargeError(
+                "Graph response exceeded the Excel tool ingress limit"
+            )
+        if response.status_code == 204:
+            return {}
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = response.text.strip()
+        message = str(exc)
+        if response_text:
+            message = f"{message} - {response_text}"
+        raise _GraphRequestError(
+            message,
+            status_code=response.status_code,
+            graph_error_code=_graph_error_code(response_text),
+            request_path=path,
+        ) from exc
+    if response.status_code == 204:
+        return {}
+    if not response.content:
+        return {}
+    return response.json()
+
+
+def _graph_mutation_request(
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any] | None = None,
+    max_response_bytes: int | None = None,
+) -> Any:
+    """Send a non-idempotent mutation without masking unknown outcomes."""
+    try:
+        return _graph_request(
+            method,
+            path,
+            body=body,
+            max_response_bytes=max_response_bytes,
+        )
+    except _GraphRequestError as exc:
+        if exc.status_code >= 500:
+            raise _GraphMutationIndeterminateError(
+                f"Graph returned HTTP {exc.status_code} after a non-idempotent "
+                "request. The mutation may already have been applied; inspect "
+                "the workbook before retrying."
+            ) from exc
+        raise
+    except (requests.RequestException, json.JSONDecodeError) as exc:
+        raise _GraphMutationIndeterminateError(
+            "Graph did not provide a complete, parseable confirmation for this "
+            "non-idempotent request. The mutation may already have been applied; "
+            "inspect the workbook before retrying."
+        ) from exc
+
+
+def _validated_column(column: str) -> tuple[str, int]:
+    """Return an ASCII Excel column label and its one-based number."""
+    if not isinstance(column, str):
+        raise TypeError("column must be a string")
+    label = column.strip()
+    if not _EXCEL_COLUMN_RE.fullmatch(label):
+        raise ValueError("column must be an Excel column label from A through XFD")
+    normalized = label.upper()
+    number = 0
+    for char in normalized:
+        number = number * 26 + ord(char) - ord("A") + 1
+    if number > _EXCEL_MAX_COLUMN_NUMBER:
+        raise ValueError("column must be an Excel column label from A through XFD")
+    return normalized, number
+
+
+def _column_number(column: str) -> int:
+    """Return an Excel column's one-based number after strict validation."""
+    return _validated_column(column)[1]
+
+
+def _normalize_column_range(start_column: str, end_column: str) -> str:
+    """Build a canonical full-column range and reject reversed ranges."""
+    start, start_number = _validated_column(start_column)
+    end, end_number = _validated_column(end_column)
+    if start_number > end_number:
+        raise ValueError("start_column must not be after end_column")
+    return f"{start}:{end}"
+
+
+def _validated_row(row: int, field_name: str) -> int:
+    """Return a one-based Excel row number after strict validation."""
+    if not isinstance(row, int) or isinstance(row, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    if not 1 <= row <= _EXCEL_MAX_ROW_NUMBER:
+        raise ValueError(f"{field_name} must be between 1 and {_EXCEL_MAX_ROW_NUMBER}")
+    return row
+
+
+def _normalize_row_range(start_row: int, end_row: int) -> str:
+    """Build a canonical full-row range and reject reversed ranges."""
+    start = _validated_row(start_row, "start_row")
+    end = _validated_row(end_row, "end_row")
+    if start > end:
+        raise ValueError("start_row must not be after end_row")
+    return f"{start}:{end}"
+
+
+def _validate_page_size(page_size: int) -> int:
+    if not isinstance(page_size, int) or isinstance(page_size, bool):
+        raise TypeError("page_size must be an integer")
+    if not 1 <= page_size <= MAX_COLLECTION_PAGE_SIZE:
+        raise ValueError(f"page_size must be between 1 and {MAX_COLLECTION_PAGE_SIZE}")
+    return page_size
+
+
+def _validate_non_negative_int(value: int, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{field_name} must be zero or a positive integer")
+    return value
+
+
+def _parse_a1_cell(cell: str) -> tuple[int, int]:
+    """Return one-based ``(column, row)`` coordinates from an A1 cell."""
+    match = re.fullmatch(r"\$?([A-Za-z]+)\$?(\d+)", cell.strip())
+    if match is None:
+        raise ValueError(f"Graph returned an invalid used-range cell: {cell!r}")
+    letters, row_text = match.groups()
+    column = 0
+    for letter in letters.upper():
+        column = column * 26 + ord(letter) - ord("A") + 1
+    row = int(row_text)
+    if row < 1:
+        raise ValueError(f"Graph returned an invalid used-range row: {cell!r}")
+    return column, row
+
+
+def _column_name(column: int) -> str:
+    if not isinstance(column, int) or column < 1:
+        raise ValueError("column must be a positive integer")
+    letters: list[str] = []
+    while column:
+        column, remainder = divmod(column - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
+def _parse_used_range_address(address: Any) -> tuple[int, int, int, int]:
+    if not isinstance(address, str) or not address.strip():
+        raise ValueError("Graph did not return a used-range address")
+    cells = address.rsplit("!", 1)[-1].split(":")
+    if len(cells) == 1:
+        cells = [cells[0], cells[0]]
+    if len(cells) != 2:
+        raise ValueError(f"Graph returned an invalid used-range address: {address!r}")
+    start_column, start_row = _parse_a1_cell(cells[0])
+    end_column, end_row = _parse_a1_cell(cells[1])
+    if end_column < start_column or end_row < start_row:
+        raise ValueError(f"Graph returned an inverted used-range address: {address!r}")
+    return start_column, start_row, end_column, end_row
+
+
+def _used_range_bounds(
+    file_path: str, worksheet: str, site_id: str | None, drive_id: str | None
+) -> tuple[int, int, int, int]:
+    """Fetch only used-range metadata so large matrices never cross the tool boundary."""
+    base = _workbook_base(file_path, site_id, drive_id)
+    segment = _odata_key_segment("worksheets", worksheet)
+    result = _graph_request(
+        "GET",
+        f"{base}/{segment}/usedRange(valuesOnly=true)",
+        params={"$select": "address"},
+        max_response_bytes=min(get_tool_max_output_length(), 16 * 1024),
+    )
+    return _parse_used_range_address(result.get("address"))
+
+
+def _resolve_query_rows(
+    used_bounds: tuple[int, int, int, int],
+    start_row: int | None,
+    end_row: int | None,
+) -> tuple[int, int]:
+    """Validate and clamp an optional query row window to the used range."""
+    used_start = used_bounds[1]
+    used_end = used_bounds[3]
+    for name, value in (("start_row", start_row), ("end_row", end_row)):
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+    requested_start = used_start if start_row is None else start_row
+    requested_end = used_end if end_row is None else end_row
+    scan_start = max(used_start, requested_start)
+    scan_end = min(used_end, requested_end)
+    if scan_start > scan_end:
+        raise ValueError("the requested row range does not overlap the used range")
+    row_count = scan_end - scan_start + 1
+    if row_count > MAX_QUERY_ROWS:
+        raise ValueError(
+            f"Excel query covers {row_count} rows; narrow the range with "
+            f"start_row/end_row (maximum {MAX_QUERY_ROWS} rows)"
+        )
+    return scan_start, scan_end
+
+
+def _iter_used_range_rows(
+    file_path: str,
+    worksheet: str,
+    *,
+    start_column: int,
+    start_row: int,
+    end_column: int,
+    end_row: int,
+    site_id: str | None,
+    drive_id: str | None,
+) -> Iterator[tuple[int, list[Any], list[Any]]]:
+    """Yield ``(row_number, values, displayed_text)`` in bounded chunks."""
+    base = _workbook_base(file_path, site_id, drive_id)
+    segment = _odata_key_segment("worksheets", worksheet)
+    chunk_rows = min(DEFAULT_SCAN_CHUNK_ROWS, end_row - start_row + 1)
+    row_number = start_row
+    request_count = 0
+    while row_number <= end_row:
+        requested_end = min(row_number + chunk_rows - 1, end_row)
+        address = (
+            f"{_column_name(start_column)}{row_number}:"
+            f"{_column_name(end_column)}{requested_end}"
+        )
+        if request_count >= MAX_QUERY_REQUESTS:
+            raise ValueError(
+                "Excel query exceeded the request limit; narrow the range with "
+                "start_row/end_row"
+            )
+        request_count += 1
+        try:
+            result = _graph_request(
+                "GET",
+                f"{base}/{segment}/range(address='{_odata_string_literal(address)}')",
+                params={"$select": "rowCount,columnCount,values,text"},
+                max_response_bytes=get_tool_max_output_length(),
+            )
+        except _GraphResponseTooLargeError:
+            if chunk_rows == 1:
+                raise ValueError(
+                    f"A single-row Excel range still exceeds the ingress limit at "
+                    f"{address}; narrow the workbook before querying it."
+                ) from None
+            chunk_rows = max(1, chunk_rows // 2)
+            continue
+        except _GraphRequestError as exc:
+            if exc.status_code == 429:
+                raise ValueError(
+                    "Excel query was rate limited by Graph (HTTP 429); narrow "
+                    "the range and retry"
+                ) from None
+            raise
+
+        values = result.get("values", [])
+        text = result.get("text", values)
+        requested_rows = requested_end - row_number + 1
+        requested_columns = end_column - start_column + 1
+        if (
+            result.get("rowCount") != requested_rows
+            or result.get("columnCount") != requested_columns
+        ):
+            raise ValueError(
+                f"Graph returned an incomplete range for {address}; narrow the "
+                "range and retry"
+            )
+        for name, matrix in (("values", values), ("text", text)):
+            if (
+                not isinstance(matrix, list)
+                or len(matrix) != requested_rows
+                or any(
+                    not isinstance(row, list) or len(row) != requested_columns
+                    for row in matrix
+                )
+            ):
+                raise ValueError(f"Graph returned invalid {name} for range {address}")
+        for offset, (row_values, row_text) in enumerate(zip(values, text, strict=True)):
+            if row_number + offset > requested_end:
+                break
+            yield row_number + offset, row_values, row_text
+        row_number = requested_end + 1
+
+
+def _success_with_bounded_range(result: dict[str, Any]) -> str:
+    """Return a complete range or omit every aligned matrix together.
+
+    Graph range matrices (values, formulas, text, formats, and value types)
+    describe the same rectangle. Independently trimming top-level fields would
+    corrupt that relationship, so an oversized parsed response retains only
+    scalar range metadata and explicitly reports that all matrices were
+    omitted.
+    """
+    response = _success(range=result, truncated=False)
+    if len(response) <= get_tool_max_output_length():
+        return response
+    metadata = {
+        key: result[key]
+        for key in ("address", "addressLocal", "rowCount", "columnCount", "cellCount")
+        if isinstance(result.get(key), (str, int, float, bool))
+    }
+    bounded = _success(
+        range=metadata,
+        truncated=True,
+        message=(
+            "The aligned range matrices were omitted because the response exceeds "
+            "the tool output limit; request a smaller address."
+        ),
+    )
+    if len(bounded) <= get_tool_max_output_length():
+        return bounded
+    return _error("The Graph range response exceeds the tool output limit")
+
+
+def _site_segment(site_id: str) -> str:
+    """Percent-encode a caller-supplied Graph site identifier for
+    interpolation into a URL path segment.
+
+    A Graph site id is one of: the literal "root", a composite id
+    ("hostname,spSiteId,spWebId"), or a "hostname:/server-relative-path"
+    form. ':' and '/' stay unescaped because they're structural to the
+    third shape, while a '.'/'..' segment is rejected outright -- standard
+    HTTP client URL normalization (verified against requests/urllib3's own
+    dot-segment collapsing) could otherwise walk the request off
+    "/sites/{id}/..." and onto a different Graph endpoint under the same
+    OAuth token.
+    """
+    if not isinstance(site_id, str):
+        raise TypeError("site_id must be a string")
+    if not site_id:
+        raise ValueError("site_id is required")
+    if site_id != site_id.strip():
+        raise ValueError("site_id must not have leading or trailing whitespace")
+    value = site_id
+    if ":/" not in value:
+        if value in {".", ".."}:
+            raise ValueError("site_id must not be '.' or '..'")
+        if "/" in value or ":" in value:
+            raise ValueError(
+                "site_id must be 'root', a composite id, or a hostname:/server-relative-path value"
+            )
+        return quote(value, safe=",")
+
+    if value.count(":/") != 1:
+        raise ValueError("site_id contains more than one hostname/path separator")
+    hostname, relative_path = value.split(":/", 1)
+    terminated = relative_path.endswith(":")
+    if terminated:
+        relative_path = relative_path[:-1]
+    if not hostname or not relative_path or ":" in hostname or ":" in relative_path:
+        raise ValueError("site_id has an invalid hostname/path form")
+    segments = relative_path.split("/")
+    if any(segment in (".", "..", "") for segment in segments):
+        raise ValueError(
+            f"site_id must not contain '.', '..', or empty segments: {site_id!r}"
+        )
+    encoded_path = "/".join(quote(segment, safe="") for segment in segments)
+    suffix = ":" if terminated else ""
+    return f"{quote(hostname, safe='')}:/{encoded_path}{suffix}"
+
+
+def _normalize_relative_path(path: str) -> str:
+    """Normalize a drive-relative file path for a root:/{path}: request URL,
+    rejecting '.'/'..' segments, an empty segment (consecutive slashes), a
+    trailing folder separator, and any segment with a trailing period or
+    leading/trailing whitespace.
+
+    An empty segment (e.g. "Reports//Q1.xlsx") is rejected rather than
+    collapsed: unlike a ".." segment, which requests' own PreparedRequest
+    normalizes away before the request is even sent (verified directly --
+    see the '.'/'..' check below), a doubled slash is sent to Graph
+    exactly as given, and there's no well-defined "collapse to a single
+    slash" semantic to fall back on here that wouldn't risk silently
+    addressing a different path than the caller wrote.
+
+    The trailing-period and leading/trailing-whitespace checks matter even
+    though this module never writes arbitrary file content (unlike
+    onedrive.py/sharepoint.py's upload tools): Graph/SharePoint's backing
+    storage rejects or silently normalizes a folder/file name with a
+    trailing dot or leading/trailing spaces (confirmed against Microsoft's
+    own OneDrive/SharePoint restrictions doc: "Leading and trailing spaces
+    in file or folder names also aren't allowed"), so e.g. "Reports./Q1.xlsx"
+    or "Reports /Q1.xlsx" could silently resolve to a different path than
+    the caller intended to address. This is checked on every segment, not
+    just the filename, since an intermediate folder segment is exposed to
+    the same hazard.
+    """
+    if not isinstance(path, str):
+        raise TypeError("file_path must be a string")
+    if not path.strip():
+        raise ValueError("file_path is required")
+    if path.startswith("/"):
+        raise ValueError("file_path must be relative and must not start with '/'")
+    if path.endswith("/"):
+        raise ValueError(
+            "file_path must include a filename, not end with a folder separator"
+        )
+    value = path
+    if "\\" in value:
+        raise ValueError("file_path must use '/' separators and must not contain '\\'")
+    segments = value.split("/")
+    if any(segment in (".", "..", "") for segment in segments):
+        raise ValueError(
+            f"file_path must not contain '.', '..', or empty segments: {path!r}"
+        )
+    for segment in segments:
+        if segment != segment.strip():
+            raise ValueError(
+                f"file_path segments must not have leading or trailing whitespace: {path!r}"
+            )
+        if segment.endswith("."):
+            raise ValueError(f"file_path segments must not end with a period: {path!r}")
+    return value
+
+
+def _odata_key_segment(collection: str, value: str) -> str:
+    """Build a "{collection}('{value}')" OData alternate-key path segment,
+    escaping a literal single quote by doubling it (the standard OData
+    string-literal escaping convention) before percent encoding. Used for a
+    worksheet or table addressed by either its Graph id or its display name
+    -- Graph accepts both interchangeably in this form.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"{collection} identifier must be a string")
+    if not value.strip():
+        raise ValueError(f"{collection} identifier is required")
+    escaped = value.replace("'", "''")
+    return f"{collection}('{quote(escaped, safe='')}')"
+
+
+def _next_page_path(next_link: str, expected_path: str) -> str:
+    """Validate an Excel collection continuation before reusing its token."""
+    if not isinstance(next_link, str):
+        raise TypeError("next_link must be a string")
+    parsed = urlsplit(next_link)
+    expected = urlsplit(f"{GRAPH_BASE_URL}{expected_path}")
+    graph_base_path = urlsplit(GRAPH_BASE_URL).path
+    if (
+        parsed.scheme != expected.scheme
+        or parsed.netloc != expected.netloc
+        or not parsed.path.startswith(f"{graph_base_path}/")
+        or unquote(parsed.path) != unquote(expected.path)
+        or parsed.fragment
+        or not parsed.query
+    ):
+        raise ValueError("next_link is not valid for this Excel collection")
+    if any(segment in {".", ".."} for segment in unquote(parsed.path).split("/")):
+        raise ValueError("next_link is not valid for this Excel collection")
+    return f"{parsed.path[len(graph_base_path) :]}?{parsed.query}"
+
+
+def _odata_string_literal(value: str) -> str:
+    """Escape and percent-encode a string for use inside a Graph OData
+    function call argument, e.g. range(address='...')."""
+    if not isinstance(value, str):
+        raise TypeError("address must be a string")
+    if not value:
+        raise ValueError("address is required")
+    escaped = value.replace("'", "''")
+    return quote(escaped, safe="")
+
+
+def _workbook_base(file_path: str, site_id: str | None, drive_id: str | None) -> str:
+    """Build the "/.../root:/{path}:/workbook" base path for a workbook
+    (.xlsx) driveItem, addressed either in the caller's own OneDrive
+    (default), a specific drive (drive_id only), or a SharePoint site's
+    document library (site_id for its default library, or drive_id for a
+    specific library). A drive id is globally addressable in Graph, so it
+    takes precedence when both identifiers are supplied.
+    """
+    normalized = _normalize_relative_path(file_path)
+    site_segment = _site_segment(site_id) if site_id is not None else None
+    if drive_id is not None:
+        drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
+    elif site_segment is not None:
+        if ":/" in site_segment and not site_segment.endswith(":"):
+            site_segment += ":"
+        drive_base = f"/sites/{site_segment}/drive"
+    else:
+        drive_base = "/me/drive"
+    return f"{drive_base}/root:/{quote(normalized, safe='/')}:/workbook"
+
+
+def _parse_values_json(values_json: str) -> list:
+    """Parse a 2-D array of cell values from a JSON array-of-arrays string.
+
+    Taking a JSON string (rather than a raw list parameter) matches
+    google_slides_batch_update's precedent for an open-ended payload -- a
+    range/table row's cell values are a caller-defined mix of strings,
+    numbers, booleans, and nulls that an MCP tool schema can't usefully
+    constrain further.
+    """
+    if not isinstance(values_json, str):
+        raise TypeError("values_json must be a string")
+
+    def _reject_non_json_number(value: str) -> None:
+        raise ValueError(f"values_json contains non-JSON numeric value {value}")
+
+    try:
+        parsed = json.loads(values_json, parse_constant=_reject_non_json_number)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"values_json is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, list) or not all(isinstance(row, list) for row in parsed):
+        raise ValueError("values_json must decode to a JSON array of arrays (rows)")
+    return parsed
+
+
+@mcp.tool()
+def excel_list_worksheets(
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    next_link: str | None = None,
+    page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
+) -> str:
+    """List the worksheets in an Excel workbook (.xlsx file).
+
+    file_path is the workbook's path in the document library/drive. By
+    default this addresses the caller's own OneDrive; pass site_id (a Graph
+    site id -- "root" for the tenant's root site, or a site's own id/path)
+    to address a SharePoint site's default document library. Pass drive_id
+    to address a specific drive directly; it takes precedence over site_id
+    when both are supplied. Pass a returned next_link to retrieve the next
+    page. page_size bounds each server page and applies when starting a
+    listing."""
+    try:
+        validated_page_size = _validate_page_size(page_size)
+        base = _workbook_base(file_path, site_id, drive_id)
+        collection_path = f"{base}/worksheets"
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
+        result = _graph_request(
+            "GET",
+            path,
+            params={"$top": validated_page_size} if next_link is None else None,
+            max_response_bytes=get_tool_max_output_length(),
+        )
+        return _success_with_bounded_collection(
+            "worksheets",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+        )
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph worksheet page exceeds the tool ingress limit; restart "
+            "the listing with a smaller page_size."
+        )
+    except Exception as e:
+        logger.error("Error listing worksheets for %s: %s", file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_add_worksheet(
+    file_path: str,
+    name: str | None = None,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Add a new worksheet to an Excel workbook, added at the end of the
+    existing worksheets. name is optional; if omitted, Excel assigns one."""
+    try:
+        base = _workbook_base(file_path, site_id, drive_id)
+        if name is None:
+            body = {}
+        else:
+            if not isinstance(name, str):
+                raise TypeError("name must be a string")
+            if not name.strip():
+                raise ValueError("name must not be empty or whitespace")
+            body = {"name": name}
+        result = _graph_mutation_request("POST", f"{base}/worksheets/add", body=body)
+        return _success(worksheet=result)
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Worksheet creation outcome is indeterminate for %s: %s", file_path, e
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error("Error adding worksheet to %s: %s", file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_delete_worksheet(
+    file_path: str,
+    worksheet: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Delete a worksheet from an Excel workbook. worksheet is either the
+    worksheet's Graph id or its display name."""
+    try:
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        _graph_mutation_request("DELETE", f"{base}/{segment}")
+        return _success(message="Worksheet deleted successfully")
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Worksheet deletion outcome is indeterminate for %s in %s: %s",
+            worksheet,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error("Error deleting worksheet %s from %s: %s", worksheet, file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_get_range(
+    file_path: str,
+    worksheet: str,
+    address: str | None = None,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Get a cell range's values, formulas, and formatting from a worksheet.
+
+    address is an A1-style range (e.g. "A1:C10"); if omitted, the entire
+    worksheet range is returned."""
+    try:
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        path = f"{base}/{segment}/range"
+        if address is not None:
+            path += f"(address='{_odata_string_literal(address)}')"
+        result = _graph_request(
+            "GET", path, max_response_bytes=get_tool_max_output_length()
+        )
+        return _success_with_bounded_range(result)
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph range response exceeds the ingress limit; request a smaller address."
+        )
+    except Exception as e:
+        logger.error(
+            "Error getting range %s on worksheet %s in %s: %s",
+            address,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_update_range(
+    file_path: str,
+    worksheet: str,
+    address: str,
+    values_json: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Write values into a cell range on a worksheet.
+
+    address is an A1-style range (e.g. "A1:C2"). values_json is a JSON
+    array-of-arrays of cell values matching the range's shape, e.g.
+    '[["Name", "Score"], ["Ada", 98]]'. A single-cell values_json is
+    broadcast across the whole range (matches Excel's own CTRL+Enter fill
+    behavior) when the target range is larger than one cell.
+
+    This overwrites cells in place. To remove rows or columns use
+    excel_delete_rows or excel_delete_columns; rewriting cells to shift data
+    up or left misaligns the sheet and breaks formulas."""
+    try:
+        values = _parse_values_json(values_json)
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')"
+        result = _graph_request(
+            "PATCH",
+            path,
+            body={"values": values},
+            max_response_bytes=get_tool_max_output_length(),
+        )
+        return _success_with_bounded_range(result)
+    except _GraphResponseTooLargeError:
+        return _success(
+            message=(
+                "Range updated successfully, but Graph's response was omitted "
+                "because it exceeded the ingress limit."
+            ),
+            response_omitted=True,
+        )
+    except Exception as e:
+        logger.error(
+            "Error updating range %s on worksheet %s in %s: %s",
+            address,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+def _delete_worksheet_range(
+    file_path: str,
+    worksheet: str,
+    address: str,
+    shift: str,
+    message: str,
+    site_id: str | None,
+    drive_id: str | None,
+) -> str:
+    base = _workbook_base(file_path, site_id, drive_id)
+    segment = _odata_key_segment("worksheets", worksheet)
+    path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
+    _graph_mutation_request("POST", path, body={"shift": shift})
+    return _success(message=message, worksheet=worksheet, deleted_range=address)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
+def excel_delete_columns(
+    file_path: str,
+    worksheet: str,
+    start_column: str,
+    end_column: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Delete one or more complete worksheet columns and shift later columns left.
+
+    start_column and end_column are Excel column labels such as ``L`` and ``M``.
+    The operation is irreversible: formulas that reference deleted columns may
+    become ``#REF!``. It removes the columns structurally, so formulas and
+    formatting move with the remaining cells. Pass the same label twice to
+    delete a single column, for example ``L`` and ``L``.
+    """
+    try:
+        address = _normalize_column_range(start_column, end_column)
+        return _delete_worksheet_range(
+            file_path,
+            worksheet,
+            address,
+            shift="Left",
+            message="Columns deleted successfully",
+            site_id=site_id,
+            drive_id=drive_id,
+        )
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Column deletion outcome is indeterminate for %s on worksheet %s in %s: %s",
+            address,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error(
+            "Error deleting columns %s:%s on worksheet %s in %s: %s",
+            start_column,
+            end_column,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
+def excel_delete_rows(
+    file_path: str,
+    worksheet: str,
+    start_row: StrictRowNumber,
+    end_row: StrictRowNumber,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Delete one or more complete worksheet rows and shift later rows up.
+
+    start_row and end_row are one-based sheet row numbers such as ``5`` and
+    ``7``: the numbers in an A1 address or in excel_find_rows row_number, not
+    the zero-based rowIndex Graph reports for a range. The operation is
+    irreversible: formulas that reference deleted rows may become ``#REF!``. It
+    removes whole rows structurally, so every column stays aligned and formulas
+    and formatting move with the remaining cells. Pass the same number twice to
+    delete a single row, for example ``5`` and ``5``, and pass the whole range
+    in one call to delete adjacent rows. Rows below end_row move up, so their
+    numbers change: when deleting several separate rows, delete them from the
+    bottom up (highest row number first), using the row numbers from a single
+    read. To delete a row of an Excel table instead, use excel_delete_table_row.
+    """
+    try:
+        address = _normalize_row_range(start_row, end_row)
+        return _delete_worksheet_range(
+            file_path,
+            worksheet,
+            address,
+            shift="Up",
+            message="Rows deleted successfully",
+            site_id=site_id,
+            drive_id=drive_id,
+        )
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Row deletion outcome is indeterminate for %s:%s on worksheet %s in %s: %s",
+            start_row,
+            end_row,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error(
+            "Error deleting rows %s:%s on worksheet %s in %s: %s",
+            start_row,
+            end_row,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_clear_range(
+    file_path: str,
+    worksheet: str,
+    address: str,
+    apply_to: str = "Contents",
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Clear a cell range on a worksheet. apply_to is one of "All",
+    "Formats", or "Contents" (default: clears cell values only, keeping
+    formatting)."""
+    try:
+        if not isinstance(apply_to, str):
+            raise TypeError("apply_to must be a string")
+        if apply_to not in _VALID_CLEAR_APPLY_TO:
+            raise ValueError(
+                f"apply_to must be one of {sorted(_VALID_CLEAR_APPLY_TO)}, got {apply_to!r}"
+            )
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        path = (
+            f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/clear"
+        )
+        _graph_request("POST", path, body={"applyTo": apply_to})
+        return _success(message="Range cleared successfully")
+    except Exception as e:
+        logger.error(
+            "Error clearing range %s on worksheet %s in %s: %s",
+            address,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_get_used_range(
+    file_path: str,
+    worksheet: str,
+    values_only: bool = False,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Get the smallest range on a worksheet that encompasses every cell
+    with a value or formatting. values_only=True considers only cells with
+    values (ignoring formatting-only cells)."""
+    try:
+        if not isinstance(values_only, bool):
+            raise TypeError("values_only must be a boolean")
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        path = f"{base}/{segment}/usedRange"
+        if values_only:
+            path += "(valuesOnly=true)"
+        result = _graph_request(
+            "GET", path, max_response_bytes=get_tool_max_output_length()
+        )
+        return _success_with_bounded_range(result)
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph used-range response exceeds the ingress limit; request "
+            "smaller explicit addresses with excel_get_range."
+        )
+    except Exception as e:
+        logger.error(
+            "Error getting used range for worksheet %s in %s: %s",
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+def _bounded_query_rows(
+    rows: list[dict[str, Any]],
+    matched_count: int,
+    *,
+    query: str,
+    scanned_range: str,
+) -> str:
+    """Keep exact counts while bounding the optional sample rows."""
+    shown_rows = list(rows)
+    output_truncated = False
+    while True:
+        match_limit_truncated = len(shown_rows) < matched_count
+        if output_truncated and match_limit_truncated:
+            truncation_reason = "max_matches_and_tool_output_limit"
+        elif output_truncated:
+            truncation_reason = "tool_output_limit"
+        elif match_limit_truncated:
+            truncation_reason = "max_matches"
+        else:
+            truncation_reason = None
+        response = _success(
+            rows=shown_rows,
+            matched_count=matched_count,
+            rows_returned=len(shown_rows),
+            rows_truncated=match_limit_truncated or output_truncated,
+            rows_truncated_reason=truncation_reason,
+            query=query,
+            scanned_range=scanned_range,
+            complete=True,
+        )
+        if len(response) <= get_tool_max_output_length() or not shown_rows:
+            return response
+        shown_rows.pop()
+        output_truncated = True
+
+
+@mcp.tool()
+def excel_count_values(
+    file_path: str,
+    worksheet: str,
+    column: str,
+    value: str,
+    case_sensitive: bool = False,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> str:
+    """Count exact displayed cell values in a used-range column.
+
+    Matching is trimmed and case-insensitive by default. The connector scans
+    bounded ranges internally and only returns the complete count. ``start_row``
+    and ``end_row`` can narrow the scan (for example, to exclude a header row).
+    """
+    try:
+        if not isinstance(value, str):
+            raise TypeError("value must be a string")
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        if not isinstance(case_sensitive, bool):
+            raise TypeError("case_sensitive must be a boolean")
+        column_number = _column_number(column)
+        used_bounds = _used_range_bounds(file_path, worksheet, site_id, drive_id)
+        start_column, _, end_column, _ = used_bounds
+        scan_start, scan_end = _resolve_query_rows(used_bounds, start_row, end_row)
+        if column_number < start_column or column_number > end_column:
+            raise ValueError(
+                f"column {column.strip().upper()} is outside the used range "
+                f"{_column_name(start_column)}:{_column_name(end_column)}"
+            )
+        expected = value.strip() if case_sensitive else value.strip().casefold()
+        count = 0
+        for _, row_values, row_text in _iter_used_range_rows(
+            file_path,
+            worksheet,
+            start_column=column_number,
+            start_row=scan_start,
+            end_column=column_number,
+            end_row=scan_end,
+            site_id=site_id,
+            drive_id=drive_id,
+        ):
+            cell = row_text[0] if row_text else None
+            actual = "" if cell is None else str(cell).strip()
+            if not case_sensitive:
+                actual = actual.casefold()
+            if actual == expected:
+                count += 1
+        return _success(
+            column=column.strip().upper(),
+            value=value,
+            count=count,
+            scanned_range=(
+                f"{_column_name(column_number)}{scan_start}:"
+                f"{_column_name(column_number)}{scan_end}"
+            ),
+            complete=True,
+        )
+    except Exception as e:
+        logger.error(
+            "Error counting %r in column %s on worksheet %s in %s: %s",
+            value,
+            column,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_find_rows(
+    file_path: str,
+    worksheet: str,
+    query: str,
+    case_sensitive: bool = False,
+    max_matches: StrictQueryMaxMatches = 20,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> str:
+    """Find rows containing a query across the used range.
+
+    All rows are scanned in the connector, while only a bounded sample of
+    matching rows is returned. ``matched_count`` therefore remains exact even
+    when the workbook contains more matches than can fit in the tool output.
+    ``start_row`` and ``end_row`` can narrow the scan (for example, to exclude
+    a header row).
+    """
+    try:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query is required")
+        if not isinstance(case_sensitive, bool):
+            raise TypeError("case_sensitive must be a boolean")
+        if not isinstance(max_matches, int) or isinstance(max_matches, bool):
+            raise TypeError("max_matches must be an integer")
+        if not 1 <= max_matches <= MAX_QUERY_MATCHES:
+            raise ValueError(f"max_matches must be between 1 and {MAX_QUERY_MATCHES}")
+        used_bounds = _used_range_bounds(file_path, worksheet, site_id, drive_id)
+        start_column, _, end_column, _ = used_bounds
+        scan_start, scan_end = _resolve_query_rows(used_bounds, start_row, end_row)
+        needle = query.strip() if case_sensitive else query.strip().casefold()
+        rows: list[dict[str, Any]] = []
+        matched_count = 0
+        scanned_range = (
+            f"{_column_name(start_column)}{scan_start}:"
+            f"{_column_name(end_column)}{scan_end}"
+        )
+        for row_number, row_values, row_text in _iter_used_range_rows(
+            file_path,
+            worksheet,
+            start_column=start_column,
+            start_row=scan_start,
+            end_column=end_column,
+            end_row=scan_end,
+            site_id=site_id,
+            drive_id=drive_id,
+        ):
+            haystack = "\t".join("" if cell is None else str(cell) for cell in row_text)
+            comparable = haystack if case_sensitive else haystack.casefold()
+            if needle in comparable:
+                matched_count += 1
+                if len(rows) < max_matches:
+                    rows.append({"row_number": row_number, "values": row_values})
+        return _bounded_query_rows(
+            rows,
+            matched_count,
+            query=query,
+            scanned_range=scanned_range,
+        )
+    except Exception as e:
+        logger.error(
+            "Error finding %r on worksheet %s in %s: %s", query, worksheet, file_path, e
+        )
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_list_tables(
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    next_link: str | None = None,
+    page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
+) -> str:
+    """List the tables (structured ranges) defined in an Excel workbook.
+
+    Pass a returned next_link to retrieve the next page. page_size bounds
+    each server page and applies when starting a listing."""
+    try:
+        validated_page_size = _validate_page_size(page_size)
+        base = _workbook_base(file_path, site_id, drive_id)
+        collection_path = f"{base}/tables"
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
+        result = _graph_request(
+            "GET",
+            path,
+            params={"$top": validated_page_size} if next_link is None else None,
+            max_response_bytes=get_tool_max_output_length(),
+        )
+        return _success_with_bounded_collection(
+            "tables",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+        )
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph table page exceeds the tool ingress limit; restart the "
+            "listing with a smaller page_size."
+        )
+    except Exception as e:
+        logger.error("Error listing tables in %s: %s", file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_add_table(
+    file_path: str,
+    address: str,
+    has_headers: bool = True,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Create a table from an existing cell range. address must include the
+    worksheet name, e.g. "Sheet1!A1:D5". has_headers indicates whether the
+    range's first row already contains column headers."""
+    try:
+        if not isinstance(has_headers, bool):
+            raise TypeError("has_headers must be a boolean")
+        base = _workbook_base(file_path, site_id, drive_id)
+        body = {"address": address, "hasHeaders": has_headers}
+        result = _graph_mutation_request("POST", f"{base}/tables/add", body=body)
+        return _success(table=result)
+    except _GraphMutationIndeterminateError as e:
+        logger.error("Table creation outcome is indeterminate for %s: %s", file_path, e)
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error("Error adding table %s in %s: %s", address, file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_list_table_rows(
+    file_path: str,
+    table: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    next_link: str | None = None,
+    page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
+    skip: StrictNonNegativeInt = 0,
+) -> str:
+    """List the rows in an Excel table. table is either the table's Graph
+    id or its display name. Pass a returned next_link to retrieve the next
+    page of a large table. page_size bounds each server page. Use the returned
+    next_skip as skip to retrieve the next offset page when Graph omits a
+    next_link."""
+    try:
+        validated_page_size = _validate_page_size(page_size)
+        validated_skip = _validate_non_negative_int(skip, "skip")
+        if next_link is not None and validated_skip != 0:
+            raise ValueError("skip must be 0 when next_link is provided")
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("tables", table)
+        collection_path = f"{base}/{segment}/rows"
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
+        result = _graph_request(
+            "GET",
+            path,
+            params=(
+                {"$top": validated_page_size, "$skip": validated_skip}
+                if next_link is None
+                else None
+            ),
+            max_response_bytes=get_tool_max_output_length(),
+        )
+        rows = result.get("value", [])
+        graph_next_link = result.get("@odata.nextLink")
+        next_skip = (
+            validated_skip + len(rows)
+            if next_link is None and graph_next_link is None and rows
+            else None
+        )
+        return _success_with_bounded_collection(
+            "rows",
+            rows,
+            next_link=graph_next_link,
+            extra_fields={"next_skip": next_skip},
+            oversized_message=(
+                "The Graph row page exceeds the tool output limit; retry the same "
+                "skip with a smaller page_size."
+            ),
+        )
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph row page exceeds the tool ingress limit; retry the same "
+            "skip with a smaller page_size."
+        )
+    except Exception as e:
+        logger.error("Error listing rows for table %s in %s: %s", table, file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_add_table_rows(
+    file_path: str,
+    table: str,
+    values_json: str,
+    index: StrictNonNegativeInt | None = None,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Add one or more rows to an Excel table.
+
+    values_json is a JSON array-of-arrays, one inner array per row, e.g.
+    '[["Ada", 98], ["Grace", 95]]'. index is the zero-based position to
+    insert at; omit it to append at the end. Prefer batching multiple rows
+    into one call over calling this repeatedly for single rows."""
+    try:
+        values = _parse_values_json(values_json)
+        if index is not None:
+            _validate_non_negative_int(index, "index")
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("tables", table)
+        body: dict[str, Any] = {"values": values}
+        if index is not None:
+            body["index"] = index
+        result = _graph_mutation_request(
+            "POST",
+            f"{base}/{segment}/rows",
+            body=body,
+            max_response_bytes=get_tool_max_output_length(),
+        )
+        return success_with_capped_dict("row", result)
+    except _GraphResponseTooLargeError:
+        return _success(response_omitted=True)
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Table row insertion outcome is indeterminate for %s in %s: %s",
+            table,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error("Error adding rows to table %s in %s: %s", table, file_path, e)
+        return _error_from_exception(e)
+
+
+@mcp.tool()
+def excel_delete_table_row(
+    file_path: str,
+    table: str,
+    row_index: StrictNonNegativeInt,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Delete a row from an Excel table by its zero-based row index."""
+    try:
+        _validate_non_negative_int(row_index, "row_index")
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("tables", table)
+        _graph_mutation_request("DELETE", f"{base}/{segment}/rows/{row_index}")
+        return _success(message="Table row deleted successfully")
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Table row deletion outcome is indeterminate for %s in %s: %s",
+            table,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error(
+            "Error deleting row %s from table %s in %s: %s",
+            row_index,
+            table,
+            file_path,
+            e,
+        )
+        return _error_from_exception(e)
+
+
+if __name__ == "__main__":
+    mcp.run()

@@ -1,0 +1,754 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from anyio import BrokenResourceError, ClosedResourceError
+
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+from xagent.web.api import public_chat_access
+from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import (
+    ConnectionManager,
+    _with_current_task_control_state,
+)
+from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.user import User
+
+
+class _BlockingWebSocket:
+    query_params = SimpleNamespace(getlist=lambda key: [])
+
+    def __init__(self) -> None:
+        self.receive_started = asyncio.Event()
+        self.accepted = False
+        self.closed: tuple[int, str] | None = None
+        self.messages: list[str] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def close(self, *, code: int, reason: str) -> None:
+        self.closed = (code, reason)
+
+    async def send_text(self, message: str) -> None:
+        self.messages.append(message)
+
+    async def receive_text(self) -> str:
+        self.receive_started.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+class _ClosedWebSocket:
+    def __init__(self, error_type: type[Exception]) -> None:
+        self._error_type = error_type
+
+    async def send_text(self, message: str) -> None:
+        raise self._error_type
+
+
+class _RejectIfReceivedWebSocket(_BlockingWebSocket):
+    async def receive_text(self) -> str:
+        self.receive_started.set()
+        raise AssertionError("foreign task socket entered the receive loop")
+
+
+class _RecordingWebSocket:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send_text(self, message: str) -> None:
+        self.messages.append(message)
+
+
+class _BlockingSendWebSocket(_RecordingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.release_send = asyncio.Event()
+
+    async def send_text(self, message: str) -> None:
+        self.send_started.set()
+        await self.release_send.wait()
+        await super().send_text(message)
+
+
+@pytest.fixture()
+def current_task(tmp_path) -> Task:
+    init_db(db_url=f"sqlite:///{tmp_path / 'task-state-events.db'}")
+    db = next(get_db())
+    try:
+        user = User(username="event-user", password_hash="hash", is_admin=False)
+        db.add(user)
+        db.commit()
+        task = Task(
+            user_id=user.id,
+            title="Event state",
+            description="Event state",
+            status=TaskStatus.RUNNING,
+            execution_mode="auto",
+            run_id="run-current",
+            state_version=7,
+            control_state="running",
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        db.expunge(task)
+        yield task
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+
+
+@pytest.mark.asyncio
+async def test_late_state_event_is_rewritten_to_current_snapshot(current_task) -> None:
+    event = await _with_current_task_control_state(
+        {
+            "type": "task_paused",
+            "task_id": int(current_task.id),
+            "status": "paused",
+        }
+    )
+
+    assert event["type"] == "task_paused"
+    assert event["run_id"] == "run-current"
+    assert event["state_version"] == 7
+    assert event["control_state"] == "running"
+    assert event["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_task_info_trace_gets_versioned_state_tuple(current_task) -> None:
+    event = await _with_current_task_control_state(
+        {
+            "type": "trace_event",
+            "event_type": "task_info",
+            "task_id": int(current_task.id),
+            "data": {"id": int(current_task.id), "status": "paused"},
+        }
+    )
+
+    assert event["state_version"] == 7
+    assert event["data"] == {
+        "id": int(current_task.id),
+        "status": "running",
+        "run_id": "run-current",
+        "state_version": 7,
+        "control_state": "running",
+    }
+
+
+@pytest.mark.asyncio
+async def test_producer_snapshot_is_not_relabelled_as_a_newer_run(current_task) -> None:
+    event = await _with_current_task_control_state(
+        {
+            "type": "task_completed",
+            "task_id": int(current_task.id),
+            "run_id": "run-old",
+            "state_version": 5,
+            "control_state": "completed",
+            "status": "completed",
+            "result": "old result",
+        }
+    )
+
+    assert event["run_id"] == "run-old"
+    assert event["state_version"] == 5
+    assert event["control_state"] == "completed"
+    assert event["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_boolean_state_version_is_replaced_with_current_snapshot(
+    current_task,
+) -> None:
+    event = await _with_current_task_control_state(
+        {
+            "type": "task_completed",
+            "task_id": int(current_task.id),
+            "run_id": "run-old",
+            "state_version": True,
+            "control_state": "completed",
+            "status": "completed",
+        }
+    )
+
+    assert event["run_id"] == "run-current"
+    assert event["state_version"] == 7
+    assert event["control_state"] == "running"
+    assert event["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_websocket_endpoint_disconnects_when_cancelled(
+    current_task: Task,
+    monkeypatch,
+) -> None:
+    db = next(get_db())
+    task = db.query(Task).filter(Task.id == int(current_task.id)).one()
+    task_id = int(current_task.id)
+    owner_id = int(task.user_id)
+    db.close()
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=SimpleNamespace(id=owner_id, is_admin=False)),
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+
+    endpoint = asyncio.create_task(
+        websocket_api.websocket_chat_endpoint(websocket, task_id, "token")
+    )
+    await websocket.receive_started.wait()
+
+    assert connection_manager.active_connections[task_id] == [websocket]
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+    assert task_id not in connection_manager.active_connections
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor_kind", ["owner", "admin"])
+async def test_private_websocket_registers_only_authorized_task_audiences(
+    current_task: Task,
+    monkeypatch,
+    actor_kind: str,
+) -> None:
+    db = next(get_db())
+    task = db.query(Task).filter(Task.id == int(current_task.id)).one()
+    if actor_kind == "admin":
+        actor = User(username="endpoint-admin", password_hash="hash", is_admin=True)
+        db.add(actor)
+        db.commit()
+        actor_id = int(actor.id)
+    else:
+        actor_id = int(task.user_id)
+    db.close()
+
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=actor_id,
+                is_admin=actor_kind == "admin",
+            )
+        ),
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+
+    endpoint = asyncio.create_task(
+        websocket_api.websocket_chat_endpoint(websocket, int(current_task.id), "token")
+    )
+    await websocket.receive_started.wait()
+
+    assert websocket.accepted is True
+    assert websocket.closed is None
+    assert connection_manager.connections_for_task(int(current_task.id)) == [websocket]
+    await connection_manager.broadcast_to_task(
+        {"type": "authorized-private-event"},
+        int(current_task.id),
+    )
+    assert json.loads(websocket.messages[-1])["type"] == "authorized-private-event"
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+
+@pytest.mark.asyncio
+async def test_private_websocket_rejects_foreign_task_before_registration_or_receive(
+    current_task: Task,
+    monkeypatch,
+) -> None:
+    db = next(get_db())
+    intruder = User(username="endpoint-intruder", password_hash="hash", is_admin=False)
+    db.add(intruder)
+    db.commit()
+    intruder_id = int(intruder.id)
+    db.close()
+
+    websocket = _RejectIfReceivedWebSocket()
+    connection_manager = ConnectionManager()
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=SimpleNamespace(id=intruder_id, is_admin=False)),
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(websocket_api, "handle_status_request", status)
+
+    await websocket_api.websocket_chat_endpoint(
+        websocket,
+        int(current_task.id),
+        "token",
+    )
+
+    assert websocket.accepted is True
+    assert websocket.closed == (4003, "Task is no longer available.")
+    assert websocket.receive_started.is_set() is False
+    assert connection_manager.active_connections == {}
+    status.assert_not_awaited()
+    await connection_manager.broadcast_to_task(
+        {"type": "must-not-reach-foreign"},
+        int(current_task.id),
+    )
+    assert websocket.messages == []
+
+
+@pytest.mark.asyncio
+async def test_missing_private_task_stays_unregistered_until_recovery_moves_connection(
+    current_task: Task,
+    monkeypatch,
+) -> None:
+    missing_task_id = int(current_task.id) + 424242
+    replacement_task_id = int(current_task.id)
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+
+    async def recover_missing_task(_websocket, task_id, _message_data) -> None:
+        assert task_id == missing_task_id
+        assert connection_manager.active_connections == {}
+        connection_manager.move_connection(websocket, replacement_task_id)
+        await connection_manager.broadcast_to_task(
+            {"type": "replacement-task-event"},
+            replacement_task_id,
+        )
+        assert json.loads(websocket.messages[-1])["type"] == "replacement-task-event"
+
+    websocket.receive_text = AsyncMock(
+        side_effect=[json.dumps({"type": "chat"}), asyncio.CancelledError()]
+    )
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(
+            return_value=SimpleNamespace(id=int(current_task.user_id), is_admin=False)
+        ),
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+    monkeypatch.setattr(websocket_api, "handle_chat_message", recover_missing_task)
+
+    with pytest.raises(asyncio.CancelledError):
+        await websocket_api.websocket_chat_endpoint(websocket, missing_task_id, "token")
+
+    assert websocket.accepted is True
+    assert connection_manager.active_connections == {}
+
+
+@pytest.mark.asyncio
+async def test_websocket_endpoint_disconnects_moved_connection_when_cancelled(
+    current_task: Task,
+    monkeypatch,
+) -> None:
+    initial_task_id = int(current_task.id) + 424242
+    moved_task_id = int(current_task.id)
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+
+    async def move_connection_during_initial_status(*args) -> None:
+        connection_manager.move_connection(websocket, moved_task_id)
+
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=int(current_task.user_id),
+                is_admin=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        websocket_api,
+        "handle_status_request",
+        AsyncMock(side_effect=move_connection_during_initial_status),
+    )
+
+    endpoint = asyncio.create_task(
+        websocket_api.websocket_chat_endpoint(websocket, initial_task_id, "token")
+    )
+    await websocket.receive_started.wait()
+
+    assert connection_manager.active_connections == {moved_task_id: [websocket]}
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+    assert connection_manager.active_connections == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_kind", ["public", "share"])
+async def test_public_websocket_endpoint_disconnects_reassigned_connection_when_cancelled(
+    monkeypatch,
+    endpoint_kind: str,
+) -> None:
+    initial_task_id = 42
+    moved_task_id = 99
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+    principal = websocket_api.WebSocketPrincipal(id=7, is_admin=False)
+
+    async def reassign_during_initial_status(*args) -> None:
+        connection_manager.register_connection(websocket, moved_task_id)
+
+    monkeypatch.setattr(public_chat_access, "manager", connection_manager)
+    monkeypatch.setattr(
+        public_chat_access,
+        "_authorize_public_chat_websocket",
+        AsyncMock(return_value=principal),
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "_authorize_share_chat_websocket",
+        AsyncMock(return_value=principal),
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "handle_status_request",
+        AsyncMock(side_effect=reassign_during_initial_status),
+    )
+
+    if endpoint_kind == "public":
+        endpoint = asyncio.create_task(
+            public_chat_access.public_chat_websocket_endpoint(
+                websocket=websocket,
+                task_id=initial_task_id,
+                token="token",
+                expected_auth_mode="widget",
+            )
+        )
+    else:
+        endpoint = asyncio.create_task(
+            public_chat_access.share_chat_websocket_endpoint(
+                websocket=websocket,
+                task_id=initial_task_id,
+                token="token",
+            )
+        )
+
+    await websocket.receive_started.wait()
+
+    assert connection_manager.active_connections == {moved_task_id: [websocket]}
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+    assert connection_manager.active_connections == {}
+    assert connection_manager._connection_task_ids == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [ClosedResourceError, BrokenResourceError],
+)
+async def test_broadcast_skips_closed_connection_and_reaches_live_connection(
+    error_type: type[Exception],
+) -> None:
+    task_id = 42
+    closed_websocket = _ClosedWebSocket(error_type)
+    live_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(closed_websocket, task_id)
+    connection_manager.register_connection(live_websocket, task_id)
+
+    message = {"type": "diagnostic", "message": "still live"}
+    await connection_manager.broadcast_to_task(message, task_id)
+
+    assert live_websocket.messages == [json.dumps(message)]
+    assert connection_manager.active_connections[task_id] == [live_websocket]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_serializes_shared_payload_once(monkeypatch) -> None:
+    task_id = 42
+    first_websocket = _RecordingWebSocket()
+    second_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(first_websocket, task_id)
+    connection_manager.register_connection(second_websocket, task_id)
+    original_dumps = json.dumps
+    serialized_values: list[dict] = []
+
+    def counted_dumps(value, *args, **kwargs):
+        serialized_values.append(value)
+        return original_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(websocket_api.json, "dumps", counted_dumps)
+
+    message = {"type": "diagnostic", "message": "shared"}
+    await connection_manager.broadcast_to_task(message, task_id)
+
+    encoded_message = original_dumps(message)
+    assert serialized_values == [message]
+    assert first_websocket.messages == [encoded_message]
+    assert second_websocket.messages == [encoded_message]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_reraises_unexpected_connection_error() -> None:
+    task_id = 42
+    failed_websocket = _ClosedWebSocket(ValueError)
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(failed_websocket, task_id)
+
+    with pytest.raises(ValueError):
+        await connection_manager.broadcast_to_task({"type": "diagnostic"}, task_id)
+
+    assert task_id not in connection_manager.active_connections
+
+
+@pytest.mark.asyncio
+async def test_broadcast_rechecks_membership_after_message_enrichment(
+    monkeypatch,
+) -> None:
+    task_id = 42
+    websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(websocket, task_id)
+
+    async def detach_during_enrichment(message, **kwargs):
+        connection_manager.detach_task_connections(task_id)
+        return message
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_with_current_task_control_state",
+        detach_during_enrichment,
+    )
+
+    await connection_manager.broadcast_to_task({"type": "diagnostic"}, task_id)
+
+    assert websocket.messages == []
+    assert connection_manager.active_connections == {}
+
+
+@pytest.mark.asyncio
+async def test_broadcast_includes_connection_registered_during_enrichment(
+    monkeypatch,
+) -> None:
+    task_id = 42
+    existing_websocket = _RecordingWebSocket()
+    new_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(existing_websocket, task_id)
+
+    async def connect_during_enrichment(message, **kwargs):
+        connection_manager.register_connection(new_websocket, task_id)
+        return message
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_with_current_task_control_state",
+        connect_during_enrichment,
+    )
+
+    message = {"type": "diagnostic"}
+    await connection_manager.broadcast_to_task(message, task_id)
+
+    encoded_message = json.dumps(message)
+    assert existing_websocket.messages == [encoded_message]
+    assert new_websocket.messages == [encoded_message]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_skips_connection_moved_during_fanout() -> None:
+    task_id = 42
+    moved_task_id = 99
+    blocking_websocket = _BlockingSendWebSocket()
+    moved_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(blocking_websocket, task_id)
+    connection_manager.register_connection(moved_websocket, task_id)
+
+    broadcast = asyncio.create_task(
+        connection_manager.broadcast_to_task({"type": "diagnostic"}, task_id)
+    )
+    await blocking_websocket.send_started.wait()
+    connection_manager.move_connection(moved_websocket, moved_task_id)
+    blocking_websocket.release_send.set()
+    await broadcast
+
+    assert moved_websocket.messages == []
+    assert connection_manager.active_connections == {
+        task_id: [blocking_websocket],
+        moved_task_id: [moved_websocket],
+    }
+
+
+def test_detach_task_connections_removes_forward_and_reverse_membership() -> None:
+    task_id = 42
+    other_task_id = 99
+    first_websocket = _RecordingWebSocket()
+    second_websocket = _RecordingWebSocket()
+    other_websocket = _RecordingWebSocket()
+    connection_manager = ConnectionManager()
+    connection_manager.register_connection(first_websocket, task_id)
+    connection_manager.register_connection(second_websocket, task_id)
+    connection_manager.register_connection(other_websocket, other_task_id)
+
+    detached = connection_manager.detach_task_connections(task_id)
+
+    assert detached == [first_websocket, second_websocket]
+    assert connection_manager.active_connections == {other_task_id: [other_websocket]}
+    assert connection_manager._connection_task_ids == {other_websocket: other_task_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [TaskStatus.RUNNING, TaskStatus.COMPLETED, TaskStatus.WAITING_FOR_USER]
+)
+async def test_shared_reconciliation_reads_persisted_state_and_stops(
+    current_task, monkeypatch, status
+):
+    import threading
+
+    from xagent.web.models.database import get_session_local
+    from xagent.web.services import task_event_bridge, task_stream_snapshot
+
+    with get_session_local()() as db:
+        task = db.get(Task, current_task.id)
+        task.status = status
+        task.control_state = status.value
+        task.output = "complete durable result"
+        task.lease_attempt_id = "attempt-current"
+        db.commit()
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(
+        task_event_bridge, "_bridge", SimpleNamespace(discard_recipient=lambda ws: None)
+    )
+    loop_thread = threading.get_ident()
+    read_threads = []
+    load = task_stream_snapshot.load_task_stream_snapshots
+
+    def load_off_loop(task_ids):
+        read_threads.append(threading.get_ident())
+        return load(task_ids)
+
+    monkeypatch.setattr(
+        task_stream_snapshot, "load_task_stream_snapshots", load_off_loop
+    )
+    received = asyncio.Event()
+
+    class Socket(_RecordingWebSocket):
+        async def send_text(self, message):
+            await super().send_text(message)
+            received.set()
+
+    socket = Socket()
+    manager = ConnectionManager()
+    manager.register_connection(socket, current_task.id)
+    writer = manager._writers[socket]
+    manager.start_stream_reconciliation()
+    reconciler = manager._stream_reconciler
+    try:
+        await asyncio.wait_for(received.wait(), timeout=DB_PROGRESS_TIMEOUT)
+        frame = json.loads(socket.messages[0])
+        assert frame["type"] == "task_stream_snapshot"
+        assert frame["task_id"] == current_task.id
+        assert frame["run_id"] == "run-current"
+        assert frame["state_version"] == 7
+        assert frame["status"] == status.value
+        assert frame["lease_attempt_id"] == "attempt-current"
+        assert frame["output"] == (
+            "complete durable result" if status == TaskStatus.COMPLETED else None
+        )
+        if status == TaskStatus.WAITING_FOR_USER:
+            assert "question" in frame and "interactions" in frame
+        assert read_threads and loop_thread not in read_threads
+    finally:
+        await asyncio.wait_for(
+            manager.stop_stream_reconciliation(), timeout=DB_PROGRESS_TIMEOUT
+        )
+        manager.disconnect(socket)
+        await asyncio.wait_for(
+            asyncio.gather(writer.task, return_exceptions=True), timeout=2
+        )
+    assert reconciler.done()
+    assert manager._stream_reconciler is None
+    assert not manager.active_connections
+
+
+@pytest.mark.asyncio
+async def test_shared_delivery_logs_connection_without_writer(monkeypatch, caplog):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    manager = ConnectionManager()
+    socket = _RecordingWebSocket()
+    manager.register_connection(socket, 42)
+    await manager.deliver_shared_event(
+        {"type": "diagnostic", "content": "private content"}, 42
+    )
+    assert "connection has no writer task_id=42" in caplog.text
+    assert "private content" not in caplog.text
+    manager.disconnect(socket)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_manager_disconnect_reentry_cleans_writer_and_both_origin_registries(
+    monkeypatch, started
+):
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    bridge = task_event_bridge.TaskEventBridge()
+    bridge.ready.set()
+    monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
+    origins = websocket_api._CommandOriginRegistry()
+    monkeypatch.setattr(websocket_api, "_command_origins", origins)
+    manager = ConnectionManager()
+    disconnect = Mock(wraps=manager.disconnect)
+    monkeypatch.setattr(manager, "disconnect", disconnect)
+    socket = _BlockingSendWebSocket()
+    manager.register_connection(socket, 42)
+    writer = manager._writers[socket]
+    origins.register("command-1", socket, 42)
+    origin = bridge.register_origin(42, "command-1", AsyncMock(), recipient=socket)
+    acknowledgement = writer.enqueue("pending", acknowledge=True)
+    try:
+        if started:
+            await asyncio.wait_for(socket.send_started.wait(), timeout=1)
+        manager.disconnect(socket)
+        await asyncio.wait_for(
+            asyncio.gather(writer.task, return_exceptions=True), timeout=2
+        )
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(acknowledgement, timeout=1)
+        # stop() re-enters the real manager once; the writer has already been
+        # popped, so this must terminate and leave both origin registries clean.
+        assert disconnect.call_count == 2
+        assert writer.closed and writer.queue.empty()
+        assert not manager._writers
+        assert not manager._connection_task_ids
+        assert not manager.active_connections
+        assert not origins.has("command-1", 42)
+        assert origin not in bridge._origins
+        manager.disconnect(socket)
+        assert disconnect.call_count == 3
+    finally:
+        manager.disconnect(socket)
+        await asyncio.gather(writer.task, return_exceptions=True)
+        await bridge.close()

@@ -1,0 +1,1039 @@
+# Xagent Docker Deployment
+
+This directory contains Docker configuration files for deploying Xagent with Docker Compose.
+Note: the base `docker-compose.yml` is located in the project root directory. Advanced
+Compose overlays, including sandbox runtime options, live in this directory.
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Frontend      │     │    Backend      │     │   PostgreSQL   │
+│  (Next.js)      │────│   (FastAPI)     │────│   Database      │
+│  Port: 80       │ API │  Port: 8000      │     │                 │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+### Services
+
+- **Frontend**: Next.js standalone build served by nginx
+- **Backend**: FastAPI with Python 3.11, Node.js 22, Playwright, LibreOffice
+- **PostgreSQL**: PostgreSQL 17 database; the image tag is overridable via `POSTGRES_IMAGE_TAG`
+
+> **Required action on upgrade:** A `postgres_data` volume initialized by PostgreSQL 16 cannot be switched to 17 in place. PostgreSQL 17 refuses to open it and exits, so `postgres` restart-loops and `backend`, `worker`, and `scheduler` never start. Pin `POSTGRES_IMAGE_TAG="16-bookworm"` to defer, then migrate with [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17). Fresh installations are unaffected.
+
+## Quick Start
+
+Browser sign-in requires local browser storage and the Web Locks API for safe
+cross-tab session coordination. Use HTTPS for non-local deployments. The
+`localhost`, `127.0.0.1`, and `::1` loopback forms are suitable secure contexts
+for local development. The bundled HTTP Compose endpoint is a local-development
+reference; production deployments must terminate TLS and use a browser that
+supports Web Locks.
+
+### 1. Configure Environment
+
+Copy and edit the environment file:
+
+```bash
+cp example.env .env
+# Edit .env with your API keys
+```
+
+Required environment variables:
+
+```bash
+# LLM API Keys (at least one required)
+OPENAI_API_KEY="your-openai-api-key"
+DEEPSEEK_API_KEY="your-deepseek-api-key"
+
+# Database Password (auto-generated if using docker-compose)
+POSTGRES_PASSWORD="xagent_password"
+```
+
+Backend images built from the current source start one web process and two Agent
+workers. If `ENCRYPTION_KEY` is empty, the image creates one in the persistent
+`xagent_secrets` volume; keep that volume with database backups. The checked-in
+Compose file uses fixed release image tags, so this behavior begins when those
+tags are bumped to a release containing the worker-pool default. To run that
+image as a local single-process backend instead, set `XAGENT_WORKER_COUNT=` and
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` in `.env`.
+
+Production also requires a separate tool-credential key. The image persists it
+in `xagent_secrets/tool-credentials.secret` unless an explicit
+`XAGENT_SECRET_ENCRYPTION_KEY` or legacy `SECRET_KEY` is supplied. Existing
+default/short-key deployments must follow the offline
+[key upgrade procedure](../docs/tool-credential-key-upgrade.md) before restart.
+
+Optional Gmail incoming-email trigger provisioning:
+
+```bash
+# Canonical public backend URL used by browser-facing API and MCP OAuth flows.
+# This is not the frontend XAGENT_APP_BASE_URL.
+XAGENT_PUBLIC_API_BASE_URL="https://api.example.com"
+
+# Optional server-to-server backend URL advertised to Gmail Pub/Sub and A2A
+# clients, and used to build the purpose-bound media URLs that external
+# providers such as Instagram fetch. Regional deployments should use their
+# direct regional origin. The ingress behind this URL must let public providers
+# GET and HEAD /api/files/external-media/{file_id}.
+# When unset, this falls back to XAGENT_PUBLIC_API_BASE_URL.
+XAGENT_S2S_API_BASE_URL="https://region-origin.example.com"
+
+# Deprecated Gmail-only fallback used only when XAGENT_S2S_API_BASE_URL is
+# unset. A2A never advertises this legacy URL.
+XAGENT_TRIGGER_CALLBACK_BASE_URL="https://legacy-callback.example.com"
+
+# Google Cloud project and deterministic per-mailbox resource prefixes.
+XAGENT_GMAIL_PUBSUB_PROJECT_ID="your-gcp-project"
+XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX="xagent-gmail"
+XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX="xagent-gmail-push"
+
+# Service account used by Pub/Sub push OIDC tokens.
+XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT="pubsub-push@your-gcp-project.iam.gserviceaccount.com"
+
+# Local/container credential file path when not running on GCP with ADC.
+GOOGLE_APPLICATION_CREDENTIALS="/run/secrets/google-application-credentials.json"
+```
+
+The backend uses Google Application Default Credentials. Grant the backend
+service account `roles/pubsub.editor` on `XAGENT_GMAIL_PUBSUB_PROJECT_ID`
+(create/delete topics and subscriptions, and update subscription push config);
+provisioning also reads subscription config to skip redundant updates, but
+degrades to re-applying it when that read is unavailable. Allow
+`gmail-api-push@system.gserviceaccount.com` to publish to each per-mailbox
+topic. Xagent grants the Gmail publisher IAM binding during provisioning when
+the credentials have permission to update topic IAM policy.
+
+Backend startup applies the
+`20260729_add_gmail_audience_grace` Alembic migration before serving requests.
+It adds two nullable audience-grace columns to `gmail_watch_states`; no data
+backfill or separate migration command is required. Complete that backend
+startup before running the endpoint reconciler below.
+
+When introducing or changing `XAGENT_S2S_API_BASE_URL`, deploy and verify its
+direct-origin ingress before changing the backend environment. Existing Gmail
+subscriptions persist their push endpoint and OIDC audience in Pub/Sub, so
+reconcile them after the backend deployment:
+
+```bash
+# Read-only audit: inspects the existing database and Pub/Sub configuration
+# without running database initialization or changing either system.
+python -m xagent.web.reconcile_gmail_push_endpoints
+
+# Apply each reported Pub/Sub and stored-audience change independently.
+# Execute mode performs the normal database initialization before reconciling.
+python -m xagent.web.reconcile_gmail_push_endpoints --execute
+
+# Verify convergence. A successful rerun reports changed=0 and failed=0.
+python -m xagent.web.reconcile_gmail_push_endpoints
+```
+
+Run these commands in the backend container or an equivalent environment with
+the production database configuration, Google credentials, and Gmail
+environment variables. The command emits a JSON summary and exits nonzero when
+any watch fails. It preserves each Gmail callback identifier, history cursor,
+watch expiration, and existing `users.watch` registration.
+
+To roll back the callback URL, restore the previous
+`XAGENT_S2S_API_BASE_URL` (or unset it to use
+the deprecated `XAGENT_TRIGGER_CALLBACK_BASE_URL`, then
+`XAGENT_PUBLIC_API_BASE_URL`), redeploy the backend, and run the same audit
+and `--execute` sequence. Keep both origins routable until the final audit
+reports no failed or changed watches.
+
+## 2026-07-30 — Owner deployment target discovery
+
+### Deployment impact
+
+The owner frontend now loads `GET /api/deployment-config` before generating
+Agent or Workforce API, SDK, widget, and share artifacts. Standalone XAgent
+preserves the existing API-config, browser-origin, and
+`XAGENT_APP_BASE_URL` behavior. Hosting layers may replace this route to
+advertise a shared external ingress and a region bootstrap.
+
+### Prerequisites and configuration
+
+No new standalone environment variable is required. Existing reverse proxies
+must continue forwarding `/api/*` to the backend. The Gmail audience-grace
+migration described above is part of the same backend release, but the owner
+deployment-target route itself does not require a data backfill.
+
+### Deployment and migration steps
+
+Deploy the backend containing `/api/deployment-config` before the matching
+frontend. If a new frontend temporarily reaches an older backend, it uses the
+browser origin and keeps a warning with a retry action visible. That fallback
+preserves standalone behavior, but it can be the wrong external target for a
+regional deployment; finish the backend rollout and retry before copying an
+artifact there.
+
+### Verification and monitoring
+
+Verify that `/api/deployment-config` returns the expected `app_origin`, with
+`deployment_origin` and `region` unset for standalone XAgent. In the owner UI,
+verify one Agent or Workforce API snippet, widget snippet, and public share
+link against the deployment's existing external origins. Also verify that a
+failed configuration request shows the persistent fallback warning and that
+Retry clears it after the route becomes available.
+
+### Rollback
+
+No persistent state is changed. Roll back the frontend and backend together;
+the previous clients resume deriving their targets directly from runtime and
+browser configuration.
+
+## 2026-10-30 — External media URLs use the server-to-server base
+
+### Deployment impact
+
+Purpose-bound media URLs that external providers fetch, such as the image URLs
+sent to Instagram when publishing from a stored file, are now built from
+`XAGENT_S2S_API_BASE_URL`. When it is unset they still use
+`XAGENT_PUBLIC_API_BASE_URL`. Previously they always used
+`XAGENT_PUBLIC_API_BASE_URL`.
+
+If `XAGENT_S2S_API_BASE_URL` is set to an `http://` URL, Instagram publishing
+from stored files now reports that external media delivery is unavailable,
+even when `XAGENT_PUBLIC_API_BASE_URL` is HTTPS. The base used for these URLs
+must be HTTPS.
+
+The ingress behind `XAGENT_S2S_API_BASE_URL` must allow anonymous `GET` and
+`HEAD` requests from public providers to
+`/api/files/external-media/{file_id}`. The URL carries a short-lived signed
+ticket, so no other credential is needed. If the ingress only forwards a narrow
+set of paths, add this route before upgrading.
+
+### Verification and monitoring
+
+Request the route through the configured base with any UUID as the file ID,
+for example
+`GET https://region-origin.example.com/api/files/external-media/00000000-0000-0000-0000-000000000000?ticket=invalid`.
+A `401` from the backend means the route is reachable. Any other status from
+the ingress, such as `404`, means it is not yet allowed.
+
+### Rollback
+
+No persistent state is changed. Redeploy the previous backend release; no
+environment variable needs to change.
+
+### 2. Start Services
+
+From the project root directory:
+
+```bash
+docker compose up -d
+```
+
+This will start all services in the background.
+
+### 3. Access Services
+
+- **Frontend**: http://localhost:80
+- **Backend API**: http://localhost:8000
+- **API Docs**: http://localhost:8000/docs
+
+### 4. View Logs
+
+```bash
+# All services
+docker compose logs -f
+
+# Specific service
+docker compose logs -f backend
+docker compose logs -f frontend
+docker compose logs -f postgres
+```
+
+### 5. Stop Services
+
+```bash
+docker compose down
+```
+
+## Advanced Usage
+
+### Custom Port
+
+By default, the frontend runs on port 80. To use a different port (e.g., 8080):
+
+```bash
+# In .env file
+NGINX_PORT="8080"
+
+# Then start
+docker compose up -d
+```
+
+### Sandbox Runtime Overlays
+
+Sandbox deployment is an advanced option. Use one sandbox overlay at a time, from
+the project root.
+
+Boxlite/KVM sandbox:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.sandbox.boxlite.yml \
+  up -d
+```
+
+This requires Linux or WSL2 with KVM support and grants the backend container
+KVM access.
+
+Docker sibling sandbox:
+
+```bash
+export COMPOSE_PROJECT_NAME=xagent
+export XAGENT_SANDBOX_NETWORK="${COMPOSE_PROJECT_NAME}_sandbox-egress"
+docker network inspect "$XAGENT_SANDBOX_NETWORK" >/dev/null 2>&1 || \
+  docker network create --driver bridge \
+    --label xagent.sandbox.network=v1 \
+    -o com.docker.network.bridge.enable_icc=false \
+    "$XAGENT_SANDBOX_NETWORK"
+
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.sandbox.docker.yml \
+  up -d
+```
+
+This mounts the host Docker socket into the backend container so Xagent can
+create sibling sandbox containers through the host Docker daemon. Treat this as
+a privileged deployment mode: Docker socket access is effectively host-level
+container control.
+
+When `DOCKER_HOST` points at a restricted Docker socket proxy instead, the
+proxy must permit daemon inspection through both `GET /info` and
+`GET /networks/{name}`. For Tecnativa/docker-socket-proxy, set `INFO=1` and
+`NETWORKS=1`; readiness fails closed if Xagent cannot verify the daemon's
+security mode and the dedicated sandbox bridge configuration.
+
+The backend process itself must run as effective uid 0, and the Docker daemon
+must be rootful with user-namespace remapping disabled. Xagent uses that host
+privilege only to prepare managed writable bind directories for sandbox uid
+1100/gid 1010; rootless Docker/Podman and non-root backend processes are not
+supported by this overlay. Existing deployments must satisfy these conditions
+before upgrading or readiness will fail before traffic is accepted.
+
+Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
+overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
+and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent` in
+`backend`, `worker`, `scheduler` and `nginx` (read-only), so they all see the
+same uploads and data. The host directory stays authoritative for a
+deployment that ran this overlay before: the backend always wrote its uploads,
+LanceDB ledger and `.kb-engine` there. See "Upgrading an existing
+sandbox.docker deployment" below.
+
+The overlay also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
+workspace mounts under `/root/.xagent` are translated back to the host storage
+path before they reach the host Docker daemon. When set,
+`XAGENT_SANDBOX_HOST_STORAGE_ROOT` must be an absolute Docker-host path;
+relative paths and `~` are not supported. Override these values when the host
+checkout or storage directory lives elsewhere:
+
+```bash
+XAGENT_SANDBOX_HOST_PROJECT_ROOT="$PWD" \
+XAGENT_HOST_STORAGE_ROOT="$HOME/.xagent" \
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.sandbox.docker.yml \
+  up -d
+```
+
+In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
+absolute host paths; relative paths and `~` are rejected instead of being
+expanded inside the backend container. A custom writable source must not equal
+or contain the managed uploads source, because that would let sandbox code
+replace an uploads path before the backend's privileged permission grant. This
+check is based on host sources, not guest destinations.
+
+Xagent changes ownership and mode only for the per-user/per-scope directories
+it manages below uploads. It does not change `XAGENT_EXTERNAL_UPLOAD_DIRS` or
+custom `SANDBOX_VOLUMES` sources. Before startup, operators must make every
+writable external source accessible to uid 1100/gid 1010 (normally group 1010,
+group `rwx`, and setgid on directories); otherwise tools fail when they first
+write there.
+
+`SANDBOX_PIDS_LIMIT` defaults to 1024 and accepts enabled values of 64 or more.
+Set it to `0` only on a Docker host without a pids cgroup controller to omit the
+limit; values from 1 through 63 and non-integers fall back to 1024.
+
+Managed user roots are group-traversable but not group-writable; only the task
+`input/`, `output/`, and `temp/` directories are writable by the sandbox
+identity. The Docker sibling overlay starts nginx workers with gid 1010 as
+their primary group so authorized X-Accel delivery can traverse these roots.
+Deployments that replace nginx must provide the same worker-group membership.
+
+Sandbox workspace guest paths are reserved below
+`<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
+`XAGENT_EXTERNAL_UPLOAD_DIRS` mount at that directory or any descendant now
+fails backend readiness, because Docker would let the more-specific bind hide
+the managed workspace. Move shared mounts elsewhere under the uploads root
+(for example `<uploads>/shared`) or mount a suitable ancestor before upgrading.
+
+External-upload symlink aliases authorize the physical directory they resolve
+to. Ordinary aliases are supported, but ambiguous spellings such as
+`symlink/..` are rejected; configure the intended directory directly.
+Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
+directory; replacing one with a symlink or changing that topology while the
+service is running is unsupported.
+
+Docker does not filter private, metadata, or host-gateway destinations when
+networking is enabled; enforce public-only Docker egress in the host or network
+firewall.
+
+On first use after upgrading, each pre-existing task workspace is migrated once
+with a descriptor-safe walk: regular files and directories below `input/`,
+`output/`, and `temp/` are reassigned to gid 1010 and receive group permissions
+matching their owner permissions. Symlinks and special files are skipped. A
+regular file with more than one hard link is also skipped so migration cannot
+change a shared inode; replace such a legacy entry with a separately managed
+copy if the sandbox must read it. A private marker prevents repeating this
+potentially expensive task-local walk, and newly registered host-created
+deliverables are repaired individually.
+
+> **Required action on upgrade:** Every existing deployment with
+> `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
+> `XAGENT_SANDBOX_NAMESPACE` and `XAGENT_SANDBOX_NETWORK` before upgrading.
+> The network must already exist, use the bridge driver, and have the
+> deployment's egress firewall policy applied. The Compose overlay below sets
+> the namespace automatically and requires the network name from the deployment
+> environment; pip/systemd deployments must set both values explicitly (see
+> `example.env`). The backend must also run with
+> effective uid 0 against a rootful Docker daemon with user-namespace
+> remapping disabled; a Docker socket proxy must permit `GET /info` and
+> `GET /networks/*` (`INFO=1` and `NETWORKS=1` for
+> Tecnativa/docker-socket-proxy). Missing or incompatible
+> settings stop backend startup rather than falling back to unsafe ownership
+> or an unverifiable daemon mode.
+
+Create the network before starting Xagent. The label is a readiness contract
+that prevents accidentally reusing the application bridge, and ICC is disabled
+so sandboxes on the same bridge cannot address one another directly:
+
+```bash
+docker network create --driver bridge \
+  --label xagent.sandbox.network=v1 \
+  -o com.docker.network.bridge.enable_icc=false \
+  "$XAGENT_SANDBOX_NETWORK"
+```
+
+The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
+`scheduler` from the resolved `${COMPOSE_PROJECT_NAME}` and requires an exact
+`XAGENT_SANDBOX_NETWORK` name. Docker sibling mode
+treats that Compose project name as authoritative and overrides any namespace
+from `example.env`; a missing value fails during Compose interpolation. Every
+sandbox container a deployment creates is scoped to that namespace (physical
+name and owner labels), so multiple deployments sharing one Docker daemon
+never discover or manage each other's sandboxes. Co-located stacks must use
+distinct Compose project names and distinct `XAGENT_HOST_STORAGE_ROOT` paths.
+Every network-enabled sandbox is attached only to the configured network;
+network-isolated sandboxes use Docker's `none` network mode. Xagent verifies
+the live attachment before publishing or reusing a container and rejects the
+built-in `bridge`, `host`, `none`, and `default` network names. Creating the
+bridge and applying/persisting its firewall rules remain deployment duties.
+
+The dedicated-network runtime security profile changes the sandbox
+attestation version. Existing v2 containers created with the previous profile
+will not be adopted; drain and remove them during the coordinated maintenance
+window below so first use recreates them under the new network policy. Bind
+mounted workspace data is preserved.
+
+`XAGENT_SANDBOX_MAX_CONTAINERS` applies independently to each deployment
+namespace, not globally to the shared daemon. Size the daemon for up to the
+per-deployment limit multiplied by the number of co-located stacks, plus any
+legacy containers awaiting removal.
+
+Containers created before this scheme existed carry the legacy
+`xagent.managed=true` label and are ignored by current code: they are never
+listed, reclaimed, or counted against `XAGENT_SANDBOX_MAX_CONTAINERS`, and
+a backend restart recreates their sandboxes fresh (host bind mounts
+survive; container-layer state does not). The backend logs how many such
+containers exist at startup.
+
+Use one coordinated maintenance window to upgrade:
+
+1. Stop new sandbox admission and drain every task on the old stacks.
+2. Stop the old backends and their legacy sandbox containers before starting
+   any namespaced backend.
+3. Upgrade and start every co-located stack with a distinct Compose project
+   name and host storage root.
+4. After confirming that no old backend or task uses them, inventory and
+   remove the stopped legacy containers:
+
+   ```bash
+   docker ps -a --filter label=xagent.managed=true
+   ```
+
+Never run a legacy container and its v2 replacement concurrently. Both mount
+the same host workspace, so concurrent execution creates two live writers.
+
+Rollback also requires a maintenance window. Drain and stop the namespaced
+backends and their v2 containers before starting pre-namespace code; the old
+backend cannot see v2 containers and otherwise double-provisions sandboxes.
+
+#### Upgrading an existing sandbox.docker deployment
+
+The `xagent_data` volume holds what the worker wrote (staged and published
+uploads, and LanceDB rows and a `.kb-engine` from its own ingests such as web
+ingests). Do not copy the volume's `data` over the host directory, because
+LanceDB cannot be merged by copying files. Set `COMPOSE_PROJECT_NAME` and
+`XAGENT_HOST_STORAGE_ROOT` (an absolute path) in your shell first, then
+confirm the volume name; a mistyped name makes `docker run -v` create an empty
+volume, so the listing below would be silently empty:
+
+```bash
+docker volume ls | grep xagent_data
+```
+
+List the volume:
+
+```bash
+docker run --rm -v "${COMPOSE_PROJECT_NAME}_xagent_data":/v:ro alpine find /v -type f
+```
+
+If `uploads` holds files the host lacks, copy only those, never overwriting a
+host file (`cp -n` in Alpine's BusyBox skips a whole directory that already
+exists, so use a loop):
+
+```bash
+docker run --rm \
+  -v "${COMPOSE_PROJECT_NAME}_xagent_data":/v:ro \
+  -v "${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}":/h alpine sh -c '
+  cd /v/uploads && find . -type f | while IFS= read -r f; do
+    [ -e "/h/uploads/$f" ] || { mkdir -p "/h/uploads/$(dirname "$f")"; cp -p "$f" "/h/uploads/$f"; }
+  done'
+```
+
+Documents that only the worker ingested must be ingested again. Review the
+listing for any other paths the worker may have written before removing the
+volume.
+
+### Milvus Knowledge-Base Engine
+
+Knowledge bases are stored in LanceDB by default. On a new deployment, the Milvus
+add-on starts a Milvus standalone server and makes it the knowledge-base engine:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.milvus.yml \
+  up -d
+```
+
+The image tags in `docker-compose.yml` (`0.8.1`) do not contain the Milvus engine:
+that release predates it, so the add-on needs images built from `main` (see
+[Building Individual Images](#building-individual-images)) or from a later release.
+With the `0.8.1` images the add-on starts and Milvus idles, but the first
+knowledge-base request fails with `Vector backend 'milvus' is not implemented yet`.
+
+A deployment that already holds LanceDB knowledge-base data is refused at startup,
+and Milvus's official guidance is 8 GB of RAM. Resources, the engine lock, the
+consistency window, the chunk size limit, backup and restore, and the differences
+from LanceDB are in [README.milvus.md](README.milvus.md).
+
+## Docker Files
+
+- `Dockerfile.backend` - Backend image (FastAPI, Python, Node.js)
+- `Dockerfile.frontend` - Frontend image (Next.js, nginx)
+- `Dockerfile.sandbox` - Sandbox image for isolated code execution
+- `../docker-compose.yml` - Base multi-service orchestration
+- `docker-compose.sandbox.boxlite.yml` - Boxlite/KVM sandbox overlay
+- `docker-compose.sandbox.docker.yml` - Docker sibling sandbox overlay
+- `docker-compose.milvus.yml` - Milvus knowledge-base engine add-on
+- `README.milvus.md` - Milvus add-on deployment notes
+- `.dockerignore` - Backend build exclusions
+- `.dockerignore.frontend` - Frontend build exclusions
+- `nginx.conf` - Frontend nginx configuration
+- `entrypoint.sh` - Backend startup script
+
+## Cloud Ingest Limits and Timeouts
+
+`POST /api/kb/ingest-cloud` accepts one to five files per request. The bundled
+`nginx.conf` gives this route a 900-second read timeout. For native Google
+Workspace files, Drive polling has a 600-second default application deadline.
+The final transfer, parsing, chunking, and embedding all continue within the
+same HTTP request.
+
+Custom reverse proxies must allow for the full end-to-end request. Increase the
+proxy timeout when you increase
+`XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS`. A closed client request does
+not stop the active worker thread.
+
+## Building Individual Images
+
+### Backend
+
+Backend image dependencies are resolved from the committed `pyproject.toml` and
+`uv.lock` during the Docker build. Keep `uv.lock` up to date before publishing;
+the backend image build runs `uv sync --locked` for reproducible installs.
+
+**Build args:**
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the `/opt/google/chrome/chrome` binary + npx cache for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. This flag does not change the browser-use sandbox setting. The image defaults to Chromium sandboxing; the published Compose deployment explicitly sets `XAGENT_BROWSER_ALLOW_UNSANDBOXED=true` because its backend runs as root. This weakens Chromium isolation. Run the backend as a non-root user and set the variable to `false` whenever possible. Operator note: the connector launches via `npx` with an exact version pin; on a deployment whose npx cache is cold (a non-Docker install, or an `INSTALL_CHROME=false` image later flipped visible), the first tool call fetches that pinned package from the npm registry, as the backend user, before the server starts. |
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.backend \
+  -t xprobe/xagent-backend:latest \
+  --push .
+```
+
+### Sandbox
+
+The sandbox remains a separate image for untrusted code execution. Its Python
+packages come only from the dedicated `[dependency-groups].sandbox` group in
+`pyproject.toml`. Whenever that group changes, run `uv lock` from the repository
+root and commit the updated `uv.lock`. `docker/Dockerfile.sandbox` exports the
+group from the lockfile and checks all supported imports during the image build.
+The build stage does not copy `pyproject.toml` or `uv.lock` into the runtime
+image. The default working directory is `/home/sandbox`; custom images must
+create it and make it writable by uid 1100/gid 1010.
+
+Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox` and must provide uid 1100/gid 1010 with writable home/cache locations. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide `stat`, Linux `/proc`, Unix sockets, and a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail. A warmed writable npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser; the execution-scoped controller passes its cache path explicitly to the sandbox child.
+
+The Docker backend enforces uid 1100/gid 1010 even when a custom image declares
+another `USER`; Boxlite runs the image's user, which must be that `sandbox`
+identity. Custom images must also provide a writable `/home/sandbox` and support
+Python user-site installs there.
+
+**Build args:**
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. Docker enforces uid 1100/gid 1010; Boxlite runs the image's uid 1100/gid 1010 `sandbox` user. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache`; it is owned by that user so either backend can reuse it and safely update npm metadata on a cache miss. The execution-scoped Chrome controller passes this cache path explicitly together with `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`. Its launch config still passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`; the connector remains hidden pending security review. |
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.sandbox \
+  -t xprobe/xagent-sandbox:latest \
+  --push .
+```
+
+The `Publish Sandbox Image` workflow in
+`.github/workflows/sandbox-publish.yml` publishes release tags and supports
+manual tags. After a new sandbox tag is published, update the `SANDBOX_IMAGE`
+pins in `docker/docker-compose.sandbox.boxlite.yml` and
+`docker/docker-compose.sandbox.docker.yml` to reference it. Rolling back means
+restoring the previous tag, but the change is not free: Xagent reconciles
+running sandboxes against the new image spec, so they are stopped, deleted and
+recreated. Bind-mounted workspace and upload data survives; the container's
+writable layer (`/tmp`, `$HOME`, packages a tool installed at run time) does not.
+
+The same workflow publishes `docker/README.sandbox.md` as the Docker Hub overview for [`xprobe/xagent-sandbox`](https://hub.docker.com/r/xprobe/xagent-sandbox). That file is the public description of the image, so keep it in step with changes to the `sandbox` dependency group, the runtime requirements above, or the sandbox lifecycle. It only reaches Docker Hub when the image is published, so an edit merged without a release tag will not appear until the next publish.
+
+### Frontend
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.frontend \
+  -t xprobe/xagent-frontend:latest \
+  --push ./frontend
+```
+
+## Publishing Images
+
+Images are published to Docker Hub under the `xprobe` organization:
+- Backend: `xprobe/xagent-backend:latest`
+- Frontend: `xprobe/xagent-frontend:latest`
+- Sandbox: `xprobe/xagent-sandbox:latest`
+
+`docker/publish.sh` builds and publishes only the backend and frontend images.
+The sandbox image is published separately by the `Publish Sandbox Image`
+workflow in `.github/workflows/sandbox-publish.yml`; it is not part of
+`publish.sh`.
+
+Manual GitHub Container Registry publishing is also available for the backend
+and frontend through their GitHub Actions workflow:
+- Backend: `ghcr.io/<owner>/xagent-backend`
+- Frontend: `ghcr.io/<owner>/xagent-frontend`
+
+### Publish to Docker Hub
+
+To publish the backend and frontend, run these commands from the `docker/`
+directory:
+
+```bash
+# Publish with default tag (latest)
+PUSH=true ./publish.sh
+
+# Publish with version tag
+PUSH=true ./publish.sh v1.0.0
+
+# Local single-platform build without pushing
+PLATFORMS=linux/arm64 ./publish.sh
+```
+
+`publish.sh` behavior:
+
+- `PUSH=true` (or `CI=true`) -> publish images (`--push`)
+- local default (`PUSH=false`) -> local build only (`--load`, single platform)
+- local multi-platform without push will fail fast with a hint
+
+Or manually:
+
+```bash
+# Build and tag
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.backend -t xprobe/xagent-backend:latest --push .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile.frontend -t xprobe/xagent-frontend:latest --push ./frontend
+```
+
+> If Docker Buildx is not initialized locally, run:
+>
+> ```bash
+> docker buildx create --use
+> docker run --privileged --rm tonistiigi/binfmt --install all
+> ```
+
+### First Time Setup
+
+1. **Create Docker Hub repositories** (one-time):
+   - Go to https://hub.docker.com/
+   - Create repositories: `xagent-backend`, `xagent-frontend`, and
+     `xagent-sandbox`
+   - Or they will be auto-created on first push
+
+2. **Login to Docker Hub** (one-time):
+   ```bash
+   docker login
+   ```
+
+3. **Publish backend and frontend images** (on each release):
+   ```bash
+   ./docker/publish.sh
+   ```
+
+4. **Publish the sandbox image** separately by pushing a release tag or by
+   manually running the `Publish Sandbox Image` workflow defined in
+   `.github/workflows/sandbox-publish.yml`.
+
+### Docker Hub Repositories
+
+- https://hub.docker.com/r/xprobe/xagent-backend
+- https://hub.docker.com/r/xprobe/xagent-frontend
+- https://hub.docker.com/r/xprobe/xagent-sandbox
+
+### Automatic Publishing (GitHub Actions)
+
+Backend and frontend images are automatically published to Docker Hub when you
+create a GitHub release. The sandbox image is published separately by
+`.github/workflows/sandbox-publish.yml` when a tag is pushed. Both workflows
+can also be run manually; only the backend/frontend workflow supports optional
+GHCR publishing.
+
+**Setup (one-time):**
+
+1. Configure GitHub secrets:
+   - Go to repository Settings → Secrets and variables → Actions
+   - Add `DOCKERHUB_USERNAME`: Your Docker Hub username
+   - Add `DOCKERHUB_PASSWORD`: Your Docker Hub access token (not your password)
+     - Create at: https://hub.docker.com/settings/security
+     - "Read & Write" is enough to push images. The sandbox workflow also
+       updates the `xprobe/xagent-sandbox` Hub description with this same
+       token; that step additionally needs "Read, Write, Delete" scope and
+       Admin access on the repository, and is allowed to fail without
+       failing the release when the token lacks them
+
+2. Ensure Docker Hub repositories exist:
+   - `xprobe/xagent-backend`
+   - `xprobe/xagent-frontend`
+   - `xprobe/xagent-sandbox`
+
+**Publish on release:**
+
+```bash
+# Create a new release (triggers GitHub Actions)
+git tag v1.0.0
+git push origin v1.0.0
+gh release create v1.0.0
+```
+
+GitHub Actions will:
+- Build and publish the backend and frontend images from the GitHub release
+- Build and publish `xprobe/xagent-sandbox` separately when the tag is pushed
+- Tag the images with their workflow's release tags
+
+### Manual GHCR Publish
+
+1. Open the `Publish Docker Images` or `Nightly Build` workflow in GitHub Actions.
+2. Run it manually with `push_to_ghcr=true`.
+3. Leave `push_to_dockerhub=false` if you only want GHCR.
+
+GitHub Actions will:
+- Log in to GHCR with `GITHUB_TOKEN`
+- Build backend and frontend images
+- Push to `ghcr.io/<owner>/xagent-backend` and `ghcr.io/<owner>/xagent-frontend`
+
+**Workflow file:** `.github/workflows/docker-publish.yml`
+
+## Production Deployment
+
+### Environment Variables
+
+Key production variables:
+
+```bash
+# Database (set via docker-compose.yml)
+DATABASE_URL="postgresql://xagent:password@postgres:5432/xagent"
+
+# Image tag of the bundled postgres service (default: 17-bookworm).
+# Pin "16-bookworm" for a postgres_data volume that v16 initialized.
+POSTGRES_IMAGE_TAG="17-bookworm"
+
+# Security
+# Leave empty for persistent bootstrap by the stock image. For an explicit
+# deployment key, use Fernet.generate_key() / secrets.token_urlsafe(48), not
+# a copied placeholder. Preserve the generated values across upgrades.
+ENCRYPTION_KEY=""
+XAGENT_SECRET_ENCRYPTION_KEY=""
+XAGENT_JWT_SECRET=""
+```
+
+The stock backend image persists generated encryption and JWT signing keys in
+the shared `xagent_secrets` volume. An explicit `ENCRYPTION_KEY` or strong
+`XAGENT_JWT_SECRET` always takes precedence. On the first upgrade to an image
+with JWT bootstrap support, deployments that still use the exact
+`replace-with-a-long-random-secret` example value receive a generated persistent
+secret; deployments with an existing strong value keep it unchanged.
+Any browser session or password-reset token previously signed with the example
+placeholder is intentionally invalid after that first startup, so users must
+sign in again.
+
+Key bootstrap does not re-encrypt old data. Upgrades from published development
+keys or an implicit tool key must run the offline procedures in
+[the key upgrade guide](../docs/tool-credential-key-upgrade.md) before restart.
+Unreadable stored credentials now refuse production startup instead of silently
+appearing unconfigured. Celery worker and scheduler validate these keys too.
+
+This release also replaces wildcard credentialed CORS for private API routes
+with `XAGENT_CORS_ORIGINS` (default: `XAGENT_FRONTEND_URL`). Before upgrading,
+list every other trusted browser origin that calls non-widget APIs as a
+comma-separated value. Public `/api/widget/` embedding remains origin-agnostic
+and credential-free.
+
+### Volumes
+
+Data persists in Docker volumes:
+
+- `postgres_data` - PostgreSQL database
+- `xagent_data` - User data (~/.xagent/)
+- `xagent_secrets` - Generated encryption and JWT signing keys
+- `xagent_uploads` - Uploaded files
+
+### Backup
+
+```bash
+# Backup database
+docker compose exec postgres pg_dump -U xagent xagent > backup.sql
+
+# Restore database
+docker compose exec -T postgres psql -U xagent xagent < backup.sql
+```
+
+### LanceDB full-text index rebuild
+
+Knowledge-base full-text indexes store their tokenizer at build time, so a database created before the jieba tokenizer switch keeps the old one until the index is rebuilt, and no ingestion or maintenance path rebuilds it on its own. Existing deployments run this once; new installations do not need it.
+
+```bash
+# Report what would be rebuilt
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --dry-run
+
+# Rebuild (exit 1 means at least one table was not rebuilt; safe to re-run)
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes
+```
+
+Run it inside `backend` so it uses the same `LANCEDB_DIR` as the application. Full context, exit codes and verification are the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+
+### PostgreSQL major version upgrade (16 to 17)
+
+The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a v16 directory, exits with `FATAL: database files are incompatible with server`, and restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler`. It does not modify the directory, so pinning `POSTGRES_IMAGE_TAG="16-bookworm"` restores service at any point.
+
+The steps below are the standard major-version path — dump under v16, initialize a fresh v17 cluster, restore. **This is a general method, not a procedure tuned to your deployment: use the backup and verification process you already trust for this database, and rehearse it against a copy first.** Release-level context is the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+
+> **Data loss warning:** `docker compose down -v` and removing the live `<project>_postgres_data` volume destroy the database irreversibly. Neither is an upgrade step. Removing the separate `_pg16_backup` copy created in step 4 is expected.
+
+> **Sandbox overlays:** keep the `-f docker/docker-compose.sandbox.*.yml` arguments on every Compose command below, or `backend`, `worker`, and `scheduler` come back without the overlay.
+
+Set up. `PGVOL` is the Compose-prefixed volume name — find it with `docker volume ls | grep postgres_data`. Keep `BACKUP` outside the checkout; the dump carries password hashes, OAuth tokens, and encrypted provider credentials.
+
+```bash
+PGVOL=xagent_postgres_data
+BACKUP="$HOME/xagent-pg16-backup.sql"
+unset POSTGRES_IMAGE_TAG   # Compose prefers a shell value over .env
+```
+
+**1. Pin v16 and confirm the deployment is healthy.**
+
+```bash
+printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+docker compose up -d postgres
+docker compose exec postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
+```
+
+**2. Stop the writers**, leaving `postgres` running. `nginx` and `frontend` keep serving errors for the whole window; stop them too if that is unacceptable.
+
+```bash
+docker compose stop backend worker scheduler
+```
+
+**3. Back up and record what you will compare against.** An interrupted `pg_dump` still leaves a plausible-looking file, so check the result.
+
+```bash
+docker compose exec -T postgres pg_dump -U xagent -d xagent > "$BACKUP"
+grep -q 'PostgreSQL database dump complete' "$BACKUP" && echo OK || echo 'INCOMPLETE - do not proceed'
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
+```
+
+**4. Stop the stack and copy the v16 volume**, so rollback never depends on the dump alone. No `-v`; `-t 60` lets Postgres finish its shutdown checkpoint. The destination must be a fresh volume, because `cp -a` merges rather than mirrors.
+
+```bash
+docker compose down -t 60
+docker volume rm "${PGVOL}_pg16_backup" 2>/dev/null   # absent on a first attempt
+docker volume create "${PGVOL}_pg16_backup"
+docker run --rm -v "$PGVOL":/from:ro -v "${PGVOL}_pg16_backup":/to alpine sh -c 'cp -a /from/. /to/'
+docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION   # expect: 16
+```
+
+**5. Remove the v16 data directory from the live volume.** The guard blocks the destructive command unless the dump completed and the copy really is v16.
+
+```bash
+if grep -q 'PostgreSQL database dump complete' "$BACKUP" \
+   && [ "$(docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION)" = 16 ]; then
+  docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+else
+  echo 'PRECONDITIONS NOT MET - nothing changed; do not continue'
+fi
+```
+
+**6. Delete the `POSTGRES_IMAGE_TAG` line from `.env`** and start `postgres`, which initializes a fresh v17 cluster. `pg_isready` needs `-h 127.0.0.1`: during initialization the image runs a temporary server on the Unix socket only, which a socket check reports as ready.
+
+```bash
+docker compose up -d postgres
+docker compose exec postgres pg_isready -h 127.0.0.1 -U xagent -d xagent
+```
+
+**7. Restore and verify.** `ON_ERROR_STOP=1` fails loudly instead of leaving a half-populated database.
+
+```bash
+docker compose exec -T postgres psql -U xagent -d xagent -v ON_ERROR_STOP=1 < "$BACKUP"
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SHOW server_version'                        # expect: 17.x
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'    # expect: the step 3 value
+docker compose exec -T postgres vacuumdb -U xagent --all --analyze-in-stages
+```
+
+Those two queries establish only that the schema arrived. Run whatever proves the *data* arrived for your deployment — row counts on the tables you care about, spot checks against recent records, an application smoke test. `vacuumdb` rebuilds the optimizer statistics that `pg_dump` does not carry across.
+
+**8. Bring the writers back, only after your verification passes.**
+
+```bash
+docker compose up -d
+```
+
+**Rollback — valid only until step 8 restarts the writers.** Until then nothing has written to the v16 copy from step 4. Confirm it exists and really is v16 *before* removing anything: `docker run -v` creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
+
+```bash
+docker compose down -t 60
+if docker volume inspect "${PGVOL}_pg16_backup" >/dev/null 2>&1 \
+   && [ "$(docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION)" = 16 ]; then
+  docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+  docker run --rm -v "${PGVOL}_pg16_backup":/from:ro -v "$PGVOL":/to alpine sh -c 'cp -a /from/. /to/'
+  printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+  docker compose up -d
+else
+  echo "BACKUP VOLUME MISSING OR NOT v16 - live data untouched; restore from $BACKUP instead"
+fi
+```
+
+After v17 accepts writes the copy is stale, and copying it back discards everything written since the cutover; recovery from that point means a fresh v17 backup plus reconciliation. Keep the copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm "${PGVOL}_pg16_backup"`.
+
+## Troubleshooting
+
+### Container Won't Start
+
+```bash
+# Check logs
+docker compose logs backend
+
+# Check health status
+docker compose ps
+```
+
+### Database Connection Issues
+
+```bash
+# Verify postgres is running
+docker compose exec postgres pg_isready -U xagent
+
+# Check database logs
+docker compose logs postgres
+```
+
+### PostgreSQL Won't Start After an Upgrade
+
+`docker compose ps` reports `postgres` as `restarting` and `unhealthy`, and `backend`, `worker`, and `scheduler` never start because they wait for `service_healthy`. A data directory initialized by an older major version produces this in `docker compose logs postgres`:
+
+```
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 16, which is not compatible with this version 17.11 (Debian 17.11-1.pgdg12+2).
+```
+
+PostgreSQL 17 refuses to open the directory rather than modifying it, so the v16 data is intact. Pin the previous major version to restore service immediately, then upgrade deliberately using [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17).
+
+```bash
+printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+docker compose up -d postgres
+```
+
+If `postgres` still starts on 17 after this, a `POSTGRES_IMAGE_TAG` exported in the shell is overriding `.env`; `unset` it and retry.
+
+### Rebuild After Code Changes
+
+```bash
+# Rebuild specific service
+docker compose build backend
+docker compose up -d backend
+
+# Rebuild all
+docker compose build
+docker compose up -d
+```
+
+## Development
+
+### Running Tests in Docker
+
+```bash
+# Run backend tests
+docker compose exec backend pytest
+
+# Run with coverage
+docker compose exec backend pytest --cov=src/xagent --cov-report=html
+```
+
+### Hot Reload (Development Mode)
+
+For development with hot reload, use the standard setup instead of Docker:
+
+```bash
+# Backend (from project root)
+python -m xagent.web.__main__
+
+# Frontend (from frontend/)
+cd frontend
+npm run dev
+```
+
+## Security Notes
+
+- Change default passwords in production
+- Use `.env` file (never commit secrets)
+- Enable SSL/TLS for production deployments
+- Use Docker secrets for sensitive data
+- Keep images updated with security patches

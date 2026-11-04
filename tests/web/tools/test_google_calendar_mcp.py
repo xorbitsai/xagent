@@ -1,0 +1,10320 @@
+import copy
+import json
+import re
+from typing import Any
+from unittest.mock import Mock
+
+import pytest
+from googleapiclient.errors import HttpError
+
+from xagent.web.tools.mcp import calendar
+from xagent.web.tools.mcp import utils as mcp_utils
+
+
+class _HttpResponse:
+    def __init__(self, status: int):
+        self.status = status
+        self.reason = "error"
+
+
+def _fake_service(execute_result: dict, existing_event: dict | None = None):
+    """A stand-in for the googleapiclient Calendar service that records the
+    kwargs passed to events().insert()/update()/patch() and returns
+    execute_result. existing_event is what events().get() returns, simulating
+    an event that already has state (attendees, conferenceData) before this
+    call.
+
+    A deep copy is handed to the code under test (rather than the caller's
+    own existing_event object): calendar.py mutates the dict it gets back
+    from events().get().execute() in place before resending it as the update
+    body, so returning the original object would let that mutation leak back
+    into the test's "expected" value and make before/after comparisons a
+    tautology.
+    """
+    events = Mock()
+    request = Mock()
+    request.headers = {}
+    request.execute.return_value = execute_result
+    events.insert = Mock(return_value=request)
+    events.update = Mock(return_value=request)
+    events.patch = Mock(return_value=request)
+    # These Meet-focused tests do not exercise scheduling-conflict discovery.
+    # Return empty availability data so they continue to isolate event writes.
+    fetched_event = {
+        "id": "evt1",
+        "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+        "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+    }
+    if existing_event:
+        fetched_event.update(copy.deepcopy(existing_event))
+    default_list_items = (
+        [{"id": fetched_event["id"]}] if fetched_event.get("recurrence") else []
+    )
+    events.list = Mock(
+        return_value=Mock(execute=Mock(return_value={"items": default_list_items}))
+    )
+    events.get = Mock(return_value=Mock(execute=Mock(return_value=fetched_event)))
+    service = Mock()
+    service.events.return_value = events
+
+    def freebusy_query(**kwargs: Any) -> Mock:
+        calendars = {
+            item["id"]: {"busy": []} for item in kwargs.get("body", {}).get("items", [])
+        }
+        return Mock(execute=Mock(return_value={"calendars": calendars}))
+
+    service.freebusy.return_value = Mock(query=Mock(side_effect=freebusy_query))
+    service.calendars.return_value = Mock(
+        get=Mock(
+            return_value=Mock(
+                execute=Mock(
+                    return_value={"id": "organizer@example.com", "timeZone": "UTC"}
+                )
+            )
+        )
+    )
+    return service
+
+
+def _complete_exception_scan(service: Mock, event_id: str) -> None:
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": event_id}]
+    }
+
+
+def test_update_event_rejects_different_stored_timezones(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {
+            "dateTime": "2026-08-26T11:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "different start and end timeZones" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_adds_recurrence_using_one_existing_timezone(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=3"]
+    assert body["start"]["timeZone"] == "Asia/Shanghai"
+    assert body["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_update_event_replaces_a_parameterized_rrule(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=2"]
+
+
+def test_update_event_replaces_rrule_without_revalidating_unchanged_timezone(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T07:00:00+08:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "end": {
+            "dateTime": "2026-08-26T08:00:00+08:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == existing_event["start"]
+    assert body["end"] == existing_event["end"]
+    assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=2"]
+
+
+def test_update_event_replaces_rrule_without_rejecting_unchanged_two_zone_event(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T09:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-08-26T08:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == existing_event["start"]
+    assert body["end"] == existing_event["end"]
+
+
+def test_update_event_reschedule_preserves_each_existing_boundary_timezone(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T07:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-08-26T11:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-08-26T12:00:00",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == existing_event["start"]
+    assert body["end"] == {
+        "dateTime": "2026-08-26T12:00:00",
+        "timeZone": "America/Los_Angeles",
+    }
+
+
+def test_update_event_rule_only_rejects_existing_exception_lines(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=3",
+            "EXDATE:20260827T070000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "cannot be safely inferred" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("recurrence", "message"),
+    [
+        (
+            ["RRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20260827T070000Z"],
+            "embedded line break",
+        ),
+        (
+            ["RRULE:FREQ=DAILY;COUNT=3", "RRULE:FREQ=WEEKLY;COUNT=2"],
+            "multiple RRULE lines",
+        ),
+    ],
+)
+def test_update_event_recurrence_rejects_ambiguous_stored_rules(
+    monkeypatch, recurrence, message
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": recurrence,
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=MONTHLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize("missing_side", ["start", "end"])
+def test_update_event_recurrence_rejects_one_offsetless_boundary_without_timezone(
+    monkeypatch, missing_side
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+    }
+    existing_event[missing_side].pop("timeZone")
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timeZone on only one offsetless boundary" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_an_exception_on_a_later_list_page(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "iCalUID": "series@example.com",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.side_effect = [
+        Mock(
+            execute=Mock(
+                return_value={
+                    "items": [{"id": "other", "recurringEventId": "other-series"}],
+                    "nextPageToken": "page-2",
+                }
+            )
+        ),
+        Mock(
+            execute=Mock(
+                return_value={
+                    "items": [
+                        {
+                            "id": "exception-1",
+                            "recurringEventId": "existing-1",
+                            "originalStartTime": {"dateTime": "2026-08-27T07:00:00Z"},
+                        }
+                    ]
+                }
+            )
+        ),
+    ]
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "edited or cancelled instances" in result["message"]
+    list_calls = service.events.return_value.list.call_args_list
+    assert len(list_calls) == 2
+    assert list_calls[0].kwargs["singleEvents"] is False
+    assert list_calls[0].kwargs["showDeleted"] is True
+    assert list_calls[0].kwargs["showHiddenInvitations"] is True
+    assert list_calls[0].kwargs["fields"] == "items(id,recurringEventId),nextPageToken"
+    assert list_calls[0].kwargs["iCalUID"] == "series@example.com"
+    assert "pageToken" not in list_calls[0].kwargs
+    assert list_calls[1].kwargs["pageToken"] == "page-2"
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "schedule_change",
+    [
+        {
+            "start_time": "2026-09-02T09:00:00",
+            "end_time": "2026-09-02T10:00:00",
+        },
+        {"timezone": "Europe/Paris"},
+    ],
+)
+def test_update_event_reschedule_rejects_stored_instance_exceptions(
+    monkeypatch, schedule_change
+):
+    existing_event = {
+        "id": "existing-1",
+        "iCalUID": "series@example.com",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "exception-1",
+                "recurringEventId": "existing-1",
+            }
+        ]
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+            **schedule_change,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "edited or cancelled instances" in result["message"]
+    assert (
+        service.events.return_value.list.call_args.kwargs["iCalUID"]
+        == "series@example.com"
+    )
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_duration_change_does_not_scan_stored_instance_exceptions(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-09-01T11:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "stored_recurrence",
+    [
+        ["RRULE:FREQ=DAILY;COUNT=5"],
+        ["RDATE:20260902T090000Z,20260903T090000Z"],
+    ],
+)
+def test_update_event_recurring_schedule_requires_exception_risk_acknowledgement(
+    monkeypatch, stored_recurrence
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": stored_recurrence,
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="UTC",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "cannot atomically check instance exceptions" in result["message"]
+    assert "acknowledge_recurring_exception_risk=True" in result["message"]
+    assert "retained EXDATE/RDATE/EXRULE values" in result["message"]
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_scans_without_a_malformed_ical_uid(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "iCalUID": "  ",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    _complete_exception_scan(service, "existing-1")
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "iCalUID" not in service.events.return_value.list.call_args.kwargs
+
+
+def test_update_event_adding_first_recurrence_does_not_scan_for_exceptions(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.list.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "event_list",
+    [
+        {"items": []},
+        {"items": None},
+        {"items": [None]},
+        {"items": [{"id": "existing-1", "recurringEventId": 123}]},
+        {"items": [{"id": "existing-1"}], "nextPageToken": 123},
+    ],
+)
+def test_update_event_recurrence_fails_closed_on_inconclusive_exception_scan(
+    monkeypatch, event_list
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.return_value.execute.return_value = event_list
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_a_repeated_exception_page_token(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [{"id": "existing-1"}],
+        "nextPageToken": "same-page",
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "repeated event-list page token" in result["message"]
+    assert service.events.return_value.list.call_count == 2
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_with_attendees_uses_confirmed_conflict_bypass(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            attendees=["new@example.com"],
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["attendees"] == [{"email": "new@example.com"}]
+    service.freebusy.return_value.query.assert_not_called()
+
+
+def test_update_event_recurrence_can_add_google_meet(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=2",
+            add_google_meet=True,
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == ["RRULE:FREQ=WEEKLY;COUNT=2"]
+    assert body["conferenceData"]["createRequest"]["conferenceSolutionKey"] == {
+        "type": "hangoutsMeet"
+    }
+
+
+def test_update_event_adds_recurrence_to_all_day_event(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=2"]
+    assert body["start"] == {"date": "2026-08-26"}
+    assert body["end"] == {"date": "2026-08-27"}
+
+
+def test_update_event_offsetless_boundaries_default_to_the_calendar_timezone(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00"},
+        "end": {"dateTime": "2026-08-26T08:00:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"]["timeZone"] == "UTC"
+    assert body["end"]["timeZone"] == "UTC"
+
+
+def test_update_event_recurrence_reports_a_colonless_stored_line_as_malformed(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "malformed property" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_ignores_whitespace_only_timezone_without_recurrence(monkeypatch):
+    service = _fake_service({"id": "existing-1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1", summary="Updated", timezone="  "
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["summary"] == "Updated"
+
+
+def test_update_event_recurrence_requires_a_timed_expansion_timezone(monkeypatch):
+    service = _fake_service({"id": "existing-1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_a_malformed_stored_end(monkeypatch):
+    service = _fake_service(
+        {"id": "existing-1"},
+        existing_event={
+            "id": "existing-1",
+            "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "not-a-date", "timeZone": "UTC"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing event end must be a valid" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_an_offset_timezone_conflict(monkeypatch):
+    service = _fake_service(
+        {"id": "existing-1"},
+        existing_event={
+            "id": "existing-1",
+            "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+            "end": {"dateTime": "2026-08-26T08:00:00+08:00"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset conflicts with timeZone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_accepts_a_matching_offset_timezone(monkeypatch):
+    service = _fake_service(
+        {"id": "existing-1"},
+        existing_event={
+            "id": "existing-1",
+            "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+            "end": {"dateTime": "2026-08-26T08:00:00+08:00"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=2",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"]["timeZone"] == "Asia/Shanghai"
+    assert body["end"]["timeZone"] == "Asia/Shanghai"
+
+
+@pytest.mark.parametrize(
+    ("existing_event", "message"),
+    [
+        (
+            {
+                "start": {"dateTime": "2026-08-26T09:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+            },
+            "must be after start",
+        ),
+        (
+            {
+                "start": {"date": "2026-08-27"},
+                "end": {"date": "2026-08-27"},
+            },
+            "all-day event end must be later than its start",
+        ),
+    ],
+)
+def test_update_event_recurrence_rejects_a_nonpositive_stored_window(
+    monkeypatch, existing_event, message
+):
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_a_boundary_with_both_value_kinds(
+    monkeypatch,
+):
+    service = _fake_service(
+        {"id": "existing-1"},
+        existing_event={
+            "id": "existing-1",
+            "start": {
+                "date": "2026-08-26",
+                "dateTime": "2026-08-26T07:00:00Z",
+            },
+            "end": {"date": "2026-08-27"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "exactly one of date or dateTime" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_event_recurrence_rejects_an_occurrence_id(monkeypatch):
+    service = _fake_service(
+        {"id": "occurrence-1"},
+        existing_event={
+            "id": "occurrence-1",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "UTC"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="occurrence-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "single occurrence" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_has_own_utc_offset_true_for_a_z_suffix():
+    assert calendar._has_own_utc_offset("2026-08-26T07:00:00Z")
+
+
+def test_has_own_utc_offset_true_for_an_explicit_offset():
+    assert calendar._has_own_utc_offset("2026-08-26T07:00:00+08:00")
+
+
+def test_has_own_utc_offset_false_for_a_naive_datetime():
+    assert not calendar._has_own_utc_offset("2026-08-26T07:00:00")
+
+
+def test_has_own_utc_offset_false_for_unparseable_input():
+    assert not calendar._has_own_utc_offset("not-a-date")
+
+
+def test_normalize_rrule_returns_a_prefixed_uppercased_string():
+    assert (
+        calendar._normalize_rrule("freq=daily;count=3", "2026-08-26T07:00:00")
+        == "RRULE:FREQ=DAILY;COUNT=3"
+    )
+
+
+def test_create_events_sets_recurrence(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Daily Catch up with Bright",
+            start_time="2026-08-26T07:00:00",
+            end_time="2026-08-26T07:15:00",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z"
+    ]
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_create_events_stamps_matching_timezone_when_recurrence_has_its_own_offset(
+    monkeypatch,
+):
+    """Google's EventDateTime reference requires timeZone unconditionally
+    for a recurring event, regardless of whether start_time/end_time
+    already carry their own UTC offset - the offset only fixes this one
+    occurrence's instant, while timeZone governs how the recurrence
+    itself expands (e.g. across DST transitions). Must NOT be skipped
+    here just because the value is already self-describing."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Weekly sync",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="Asia/Shanghai",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+def test_create_events_rejects_recurrence_offset_timezone_conflict(
+    monkeypatch,
+):
+    """The recurrence zone must describe the offset-bearing wall time."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Weekly sync",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset conflicts with timeZone" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_skips_timezone_on_its_own_offset_without_recurrence(
+    monkeypatch,
+):
+    """Without recurrence, timeZone is merely optional (per Google's own
+    docs), so a side that already carries its own UTC offset is skipped
+    instead of risking a disagreeing zone on an optional field."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="One-off",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
+def test_create_events_skips_timezone_independently_per_side_on_asymmetric_offsets(
+    monkeypatch,
+):
+    """start/end are checked independently, not just with a shared
+    offset-or-not assumption - a mock that always gives both sides the
+    same offset shape couldn't catch _stamp_timezone's start/end
+    arguments being accidentally swapped."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="One-off",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert kwargs["body"]["end"]["timeZone"] == "America/Los_Angeles"
+
+
+def test_create_events_requires_timezone_when_recurrence_is_set(monkeypatch):
+    """Google documents timeZone as required specifically for recurring
+    events (it's what the recurrence is expanded in) - this must be
+    rejected here rather than silently sent to Google without one."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            recurrence="FREQ=DAILY",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_treats_empty_timezone_as_not_provided(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day recurring",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="  ",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
+def test_create_events_rejects_an_invalid_timezone_even_without_recurrence(
+    monkeypatch,
+):
+    """Confirmed bug: an invalid IANA timezone name was only ever caught
+    by resolve_zoneinfo when recurrence was also set (parse_rrule is its
+    only caller) - without recurrence, a bad timezone silently reached
+    Google's API and surfaced as an opaque server-side error instead of
+    this connector's own clean message."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00",
+            end_time="2026-08-26T09:15:00",
+            timezone="Not/AZone",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized IANA zone name" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_still_rejects_windows_timezone_names(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00",
+            end_time="2026-08-26T09:15:00",
+            timezone="Eastern Standard Time",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized IANA zone name" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_accepts_recurrence_with_explicit_prefix(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            recurrence="RRULE:FREQ=DAILY;COUNT=10",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=10"]
+
+
+def test_create_events_normalizes_lowercase_recurrence(monkeypatch):
+    """Regression test: dateutil's validation is lenient about case, so a
+    lowercase RRULE must still be canonicalized to uppercase before
+    reaching Google's API - not sent verbatim in whatever case an LLM
+    happened to produce."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Standup",
+        start_time="2026-08-26T09:00:00+08:00",
+        end_time="2026-08-26T09:15:00+08:00",
+        recurrence="freq=daily;count=10",
+        timezone="Asia/Shanghai",
+        ignore_conflicts=True,
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=10"]
+
+
+def test_create_events_rejects_invalid_recurrence_without_calling_the_api(
+    monkeypatch,
+):
+    """A rule that can't be parsed must be reported as an error, not sent
+    to Google where it would either be rejected opaquely or - the
+    originally reported failure mode - silently accepted as inert text
+    with no actual recurrence."""
+    service = _fake_service({"id": "created"})
+    get_calendar_service = Mock(return_value=service)
+    monkeypatch.setattr(calendar, "get_calendar_service", get_calendar_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            recurrence="FREQ=FORTNIGHTLY",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "invalid recurrence rule" in result["message"]
+    get_calendar_service.assert_not_called()
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize("frequency", ["SECONDLY", "MINUTELY", "HOURLY"])
+def test_create_events_rejects_frequencies_google_does_not_support(
+    monkeypatch, frequency
+):
+    get_calendar_service = Mock()
+    monkeypatch.setattr(calendar, "get_calendar_service", get_calendar_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Too frequent",
+            start_time="2026-09-01T09:00:00+08:00",
+            end_time="2026-09-01T09:15:00+08:00",
+            recurrence=f"FREQ={frequency};COUNT=3",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert f"does not support FREQ={frequency}" in result["message"]
+    get_calendar_service.assert_not_called()
+
+
+def test_create_events_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: every other optional field in this function treats
+    an explicitly-passed value as meaningful; recurrence="" must not be
+    silently treated the same as not mentioning recurrence at all."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T09:15:00+08:00",
+            timezone="Asia/Shanghai",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_without_recurrence_has_no_recurrence_key(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="One-off",
+        start_time="2026-08-26T09:00:00+08:00",
+        end_time="2026-08-26T09:15:00+08:00",
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "recurrence" not in kwargs["body"]
+
+
+def test_create_events_creates_an_all_day_event_from_bare_dates(monkeypatch):
+    """Confirmed bug: a bare-date start_time/end_time (e.g. "2026-09-01",
+    no time component) used to be silently written under the "dateTime"
+    key regardless - {"dateTime": "2026-09-01"} is not valid RFC3339 and
+    Google's real API would reject it. Must be written under "date"
+    instead, with no timeZone stamped onto it."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-09-01"}
+    assert kwargs["body"]["end"] == {"date": "2026-09-02"}
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    [
+        ("2026-02-30", "2026-03-01"),
+        ("2026-2-3", "2026-02-04"),
+        ("2026-13-01", "2026-13-02"),
+    ],
+)
+def test_create_events_rejects_invalid_all_day_dates(monkeypatch, start_time, end_time):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid all-day event",
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "valid YYYY-MM-DD date or RFC3339 dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    [("2026-09-01", "2026-09-01"), ("2026-09-02", "2026-09-01")],
+)
+def test_create_events_rejects_nonpositive_all_day_ranges(
+    monkeypatch, start_time, end_time
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid all-day range",
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end_time is exclusive" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_strips_whitespace_from_a_bare_date_before_sending_it(
+    monkeypatch,
+):
+    """is_bare_date strips surrounding whitespace to decide the shape, but
+    the raw start_time/end_time used to be written into the payload as-is
+    - a bare date with incidental whitespace would reach Google as
+    something other than the exact "YYYY-MM-DD" it requires."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="  2026-09-01  ",
+            end_time="  2026-09-02  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-09-01"}
+    assert kwargs["body"]["end"] == {"date": "2026-09-02"}
+
+
+def test_create_events_strips_whitespace_from_timed_values_before_validation_and_send(
+    monkeypatch,
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Standup",
+            start_time="  2026-09-01T09:00:00+08:00  ",
+            end_time="  2026-09-01T09:15:00+08:00  ",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["start"]["dateTime"] == "2026-09-01T09:00:00+08:00"
+    assert kwargs["body"]["end"]["dateTime"] == "2026-09-01T09:15:00+08:00"
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=3"]
+
+
+def test_create_events_accepts_a_whitespace_padded_all_day_recurrence(monkeypatch):
+    """Confirmed bug: the payload used the stripped bare-date value, but
+    recurrence validation was passed the raw, unstripped start_time - so
+    the exact same all-day start_time that succeeds without recurrence
+    was rejected as an "invalid start time" the moment recurrence was
+    also set."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day thing",
+            start_time="  2026-09-01  ",
+            end_time="  2026-09-02  ",
+            recurrence="FREQ=DAILY;COUNT=3",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_create_events_rejects_a_space_separated_datetime(
+    monkeypatch,
+):
+    """ISO 8601 permits a space separator, but Google's EventDateTime
+    contract requires RFC3339. Reject it locally instead of forwarding a
+    value the API may reject."""
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Timed with a space separator",
+            start_time="2026-09-01 10:00:00",
+            end_time="2026-09-01 11:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "RFC3339 dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["20260826T070000", "2026W011T070000"])
+def test_create_events_rejects_non_rfc3339_datetime_shapes(monkeypatch, value):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid datetime shape",
+            start_time=value,
+            end_time="2026-09-01T11:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "RFC3339 dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time"),
+    [
+        ("2026-09-01T10:00:00+08:00", "2026-09-01T10:00:00+08:00"),
+        ("2026-09-01T11:00:00+08:00", "2026-09-01T10:00:00+08:00"),
+    ],
+)
+def test_create_events_rejects_nonpositive_timed_ranges(
+    monkeypatch, start_time, end_time
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Invalid timed range",
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after start" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_rejects_mixed_bare_date_and_datetime(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Mixed",
+            start_time="2026-09-01",
+            end_time="2026-09-02T10:00:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must both be a bare date or both a dateTime" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_all_day_recurrence_does_not_require_timezone(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="All day recurring",
+            start_time="2026-09-01",
+            end_time="2026-09-02",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911"]
+    assert "timeZone" not in kwargs["body"]["start"]
+
+
+def test_create_events_recurring_series_requires_explicit_conflict_bypass(monkeypatch):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Weekly sync",
+            start_time="2026-09-01T09:00:00+08:00",
+            end_time="2026-09-01T09:30:00+08:00",
+            timezone="Asia/Shanghai",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "every occurrence" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_create_events_checks_all_day_window_in_primary_calendar_timezone(monkeypatch):
+    service = _fake_service({"id": "created"})
+    service.calendars.return_value.get.return_value.execute.return_value = {
+        "id": "organizer@example.com",
+        "timeZone": "Asia/Shanghai",
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Conference",
+            start_time="2026-09-01",
+            end_time="2026-09-03",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.list.call_args
+    assert kwargs["timeMin"] == "2026-09-01T00:00:00+08:00"
+    assert kwargs["timeMax"] == "2026-09-03T00:00:00+08:00"
+
+
+def test_create_events_normalizes_each_naive_conflict_boundary_independently(
+    monkeypatch,
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Mixed boundary representation",
+            start_time="2026-09-01T09:00:00+08:00",
+            end_time="2026-09-01T02:00:00",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.list.call_args
+    assert kwargs["timeMin"] == "2026-09-01T09:00:00+08:00"
+    assert kwargs["timeMax"] == "2026-09-01T02:00:00+00:00"
+
+
+def test_create_events_rejects_a_reversed_mixed_offset_window_after_normalizing(
+    monkeypatch,
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Reversed",
+            start_time="2026-09-01T09:00:00+08:00",
+            end_time="2026-09-01T00:30:00",
+            timezone="UTC",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "after start" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_event_boundary_returns_none_for_a_malformed_non_dict_boundary():
+    assert calendar._event_boundary(["not", "an", "object"], "UTC") is None
+
+
+def test_update_with_missing_boundary_fails_closed_before_write(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={
+            "start": ["not", "an", "object"],
+            "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", attendees=["new@example.com"]
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert "complete start/end window" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_ignore_conflicts_cannot_bypass_one_sided_window_validation(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={
+            "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+            "end": {
+                "dateTime": "2026-09-07T16:00:00",
+                "timeZone": "Not/AZone",
+            },
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            start_time="2026-09-07T17:00:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized IANA zone name" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_with_real_window_checks_a_new_attendee_before_write(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={
+            "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+            "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", attendees=["new@example.com"]
+        )
+    )
+
+    assert result["status"] == "success"
+    query_kwargs = service.freebusy.return_value.query.call_args.kwargs
+    assert query_kwargs["body"]["items"] == [{"id": "new@example.com"}]
+    service.events.return_value.update.assert_called_once()
+
+
+def test_create_event_without_attendees_or_meet_sends_conference_version_and_no_invites(
+    monkeypatch,
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            location="Google Meet",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "hangout_link" not in result
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert "attendees" not in kwargs["body"]
+    assert "conferenceData" not in kwargs["body"]
+    assert kwargs["body"]["location"] == "Google Meet"
+    # conferenceDataVersion=1 must always be sent: it only declares capability,
+    # it doesn't create a conference by itself (that needs a createRequest in
+    # the body), but omitting it would make Google ignore any conferenceData
+    # that IS present -- see the update() tests below for why this matters.
+    assert kwargs["conferenceDataVersion"] == 1
+    assert kwargs["sendUpdates"] == "none"
+
+
+def test_create_event_with_attendees_but_no_notify_does_not_send_invites(monkeypatch):
+    execute_result = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            attendees=["someone@example.com"],
+            add_google_meet=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+
+    _, kwargs = service.events.return_value.insert.call_args
+    body = kwargs["body"]
+    assert body["attendees"] == [{"email": "someone@example.com"}]
+    assert body["conferenceData"]["createRequest"]["conferenceSolutionKey"] == {
+        "type": "hangoutsMeet"
+    }
+    assert kwargs["conferenceDataVersion"] == 1
+    # Attendees are recorded on the event, but nobody is emailed unless
+    # notify_attendees is explicitly set.
+    assert kwargs["sendUpdates"] == "none"
+
+
+def test_create_event_with_attendees_and_notify_sends_invites(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        attendees=["someone@example.com"],
+        notify_attendees=True,
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["body"]["attendees"] == [{"email": "someone@example.com"}]
+    assert kwargs["sendUpdates"] == "all"
+
+
+def test_create_event_notify_attendees_without_attendees_does_not_send_invites(
+    monkeypatch,
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        notify_attendees=True,
+    )
+
+    _, kwargs = service.events.return_value.insert.call_args
+    assert kwargs["sendUpdates"] == "none"
+
+
+def test_update_event_without_attendees_or_meet_sends_conference_version_and_no_invites(
+    monkeypatch,
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", summary="New title")
+    )
+
+    assert result["status"] == "success"
+    assert "hangout_link" not in result
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert "attendees" not in kwargs["body"]
+    assert "conferenceData" not in kwargs["body"]
+    assert kwargs["conferenceDataVersion"] == 1
+    assert kwargs["sendUpdates"] == "none"
+
+
+def test_update_event_preserves_existing_meet_link_when_add_google_meet_not_set(
+    monkeypatch,
+):
+    """Regression test: conferenceDataVersion must be 1 even when
+    add_google_meet isn't passed, or Google ignores the conferenceData this
+    call resends from the fetched event and silently drops the Meet link."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceId": "abc-defg-hij",
+            "entryPoints": [{"uri": "https://meet.google.com/abc-defg-hij"}],
+        },
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service(existing_event, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", summary="New title")
+
+    _, kwargs = service.events.return_value.update.call_args
+    # The existing conferenceData must still be present in the body...
+    assert kwargs["body"]["conferenceData"] == existing_event["conferenceData"]
+    # ...and conferenceDataVersion must be 1, or Google would ignore it.
+    assert kwargs["conferenceDataVersion"] == 1
+
+
+def test_update_event_merges_new_attendees_with_existing_ones(monkeypatch):
+    existing_event = {
+        "id": "evt1",
+        "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", attendees=["bob@example.com"]
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    # Alice is kept (with her existing RSVP metadata intact), Bob is added.
+    assert kwargs["body"]["attendees"] == [
+        {"email": "alice@example.com", "responseStatus": "accepted"},
+        {"email": "bob@example.com"},
+    ]
+
+
+def test_update_event_does_not_duplicate_an_already_invited_attendee(monkeypatch):
+    existing_event = {
+        "id": "evt1",
+        "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", attendees=["alice@example.com"]
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    # Alice's existing entry (with her RSVP status) is kept, not replaced with
+    # a bare {"email": ...} dict, and she isn't duplicated.
+    assert kwargs["body"]["attendees"] == [
+        {"email": "alice@example.com", "responseStatus": "accepted"}
+    ]
+
+
+def test_update_event_dedupes_repeated_emails_in_the_same_attendees_call(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        attendees=["bob@example.com", "bob@example.com"],
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == [{"email": "bob@example.com"}]
+
+
+def test_update_event_ignores_a_whitespace_only_attendee_entry(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        attendees=["   ", "bob@example.com"],
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == [{"email": "bob@example.com"}]
+
+
+def test_update_event_attendee_matching_is_case_and_whitespace_insensitive(
+    monkeypatch,
+):
+    """Regression test: `Alice@Example.com` and `alice@example.com ` are the
+    same mailbox and must not produce a duplicate attendee entry."""
+    existing_event = {
+        "id": "evt1",
+        "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        attendees=["Alice@Example.com ", " BOB@example.com", "bob@example.com"],
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    # Alice's existing entry is kept as-is (not duplicated under different
+    # casing), and Bob is added once despite two differently-cased spellings.
+    assert kwargs["body"]["attendees"] == [
+        {"email": "alice@example.com", "responseStatus": "accepted"},
+        {"email": "BOB@example.com"},
+    ]
+
+
+def test_update_event_tolerates_a_malformed_existing_attendee_list(monkeypatch):
+    """Regression test: an existing attendee entry with no "email" key (e.g.
+    a resource/room attendee), or a non-dict item, must not crash the merge
+    or get treated as a real email to match/duplicate against."""
+    existing_event = {
+        "id": "evt1",
+        "attendees": [
+            {"displayName": "Conference Room A"},
+            "not-a-dict",
+            {"email": "alice@example.com"},
+        ],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", attendees=["bob@example.com"]
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == existing_event["attendees"] + [
+        {"email": "bob@example.com"}
+    ]
+
+
+def test_update_event_with_no_new_attendees_leaves_existing_attendees_untouched(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "evt1",
+        "attendees": [{"email": "alice@example.com", "responseStatus": "accepted"}],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", summary="New title")
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["attendees"] == existing_event["attendees"]
+
+
+def test_update_event_notify_attendees_notifies_existing_attendees_without_repassing_them(
+    monkeypatch,
+):
+    """Regression test: notify_attendees must look at the event's actual
+    attendees, not just the attendees param on this call, or you can never
+    notify already-invited people of e.g. a reschedule."""
+    existing_event = {
+        "id": "evt1",
+        "attendees": [{"email": "alice@example.com"}],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        start_time="2026-09-08T15:00:00+08:00",
+        end_time="2026-09-08T16:00:00+08:00",
+        notify_attendees=True,
+        ignore_conflicts=True,
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["sendUpdates"] == "all"
+
+
+def test_update_event_notify_attendees_is_noop_when_event_has_no_attendees(
+    monkeypatch,
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", summary="New title", notify_attendees=True
+    )
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["sendUpdates"] == "none"
+
+
+def test_update_event_add_google_meet_creates_conference_when_none_exists(
+    monkeypatch,
+):
+    execute_result = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["conferenceData"]["createRequest"][
+        "conferenceSolutionKey"
+    ] == {"type": "hangoutsMeet"}
+
+
+def test_update_event_add_google_meet_does_not_duplicate_a_legacy_hangout_link(
+    monkeypatch,
+):
+    """Regression test: a legacy event can carry hangoutLink with no
+    conferenceData at all (it predates the conferenceData API). Without a
+    hangoutLink check, add_google_meet=True would see "no conferenceData" and
+    request a second, duplicate conference for an event that already has
+    one."""
+    existing_event = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert "conferenceData" not in kwargs["body"]
+
+
+def test_update_event_add_google_meet_does_not_replace_existing_conference(
+    monkeypatch,
+):
+    """Regression test: add_google_meet=True must not orphan a Meet link
+    that's already shared with attendees by generating a brand-new one."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceId": "abc-defg-hij",
+            "entryPoints": [{"uri": "https://meet.google.com/abc-defg-hij"}],
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["conferenceData"] == existing_event["conferenceData"]
+    assert "createRequest" not in kwargs["body"]["conferenceData"]
+
+
+def test_update_event_add_google_meet_retries_after_a_failed_create_request(
+    monkeypatch,
+):
+    """Regression test: a failed createRequest leaves conferenceData set but
+    with no entryPoints/conferenceSolution. add_google_meet=True must treat
+    that as "no conference yet" and retry, not as an existing conference to
+    preserve -- otherwise the event is permanently stuck with no Meet link."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "abc123",
+                "status": {"statusCode": "failure"},
+            }
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    new_create_request = kwargs["body"]["conferenceData"]["createRequest"]
+    # A hardcoded different literal would also satisfy `!= "abc123"`; check
+    # it's actually a fresh uuid4().hex (32 lowercase hex chars), not just
+    # any old different string.
+    assert re.fullmatch(r"[0-9a-f]{32}", new_create_request["requestId"])
+    assert new_create_request["requestId"] != "abc123"
+    assert new_create_request["conferenceSolutionKey"] == {"type": "hangoutsMeet"}
+
+
+def test_update_event_add_google_meet_does_not_clobber_a_pending_create_request(
+    monkeypatch,
+):
+    """Regression test: a *pending* createRequest has no entryPoints/
+    conferenceSolution yet either -- the same shape as a failed one. It must
+    not be treated as retryable, or a second add_google_meet=True call (e.g.
+    while also changing the time) abandons the in-flight request and starts
+    a new, unrelated one."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "abc123",
+                "status": {"statusCode": "pending"},
+            }
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["conferenceData"] == existing_event["conferenceData"]
+    assert kwargs["body"]["conferenceData"]["createRequest"]["requestId"] == "abc123"
+
+
+def test_event_response_falls_back_to_entry_points_when_hangout_link_is_absent(
+    monkeypatch,
+):
+    """hangoutLink is only reliably populated for Meet conferences; fall back
+    to the canonical conferenceData.entryPoints when it's missing, but only
+    for an actual Meet conference (conferenceSolution.key.type ==
+    "hangoutsMeet") -- see the sibling test below for the non-Meet case."""
+    execute_result = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceSolution": {"key": {"type": "hangoutsMeet"}},
+            "entryPoints": [
+                {"entryPointType": "phone", "uri": "tel:+1-234-567-8900"},
+                {
+                    "entryPointType": "video",
+                    "uri": "https://meet.google.com/abc-defg-hij",
+                },
+            ],
+        },
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_event_response_does_not_label_a_non_meet_conference_as_hangout_link(
+    monkeypatch,
+):
+    """Regression test: a third-party conference (e.g. Zoom's Calendar add-on)
+    also registers its join URL under entryPointType "video". Surfacing that
+    as hangout_link would mislead a caller into thinking it's a Meet link."""
+    execute_result = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceSolution": {"key": {"type": "addOn"}, "name": "Zoom Meeting"},
+            "entryPoints": [
+                {"entryPointType": "video", "uri": "https://zoom.us/j/123456789"},
+            ],
+        },
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert "hangout_link" not in result
+
+
+def test_response_surfaces_pending_conference_status_instead_of_hangout_link(
+    monkeypatch,
+):
+    """Meet link creation is asynchronous; if hangoutLink isn't populated yet
+    the response should say so instead of silently omitting everything."""
+    execute_result = {
+        "id": "evt1",
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "abc123",
+                "status": {"statusCode": "pending"},
+            }
+        },
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert "hangout_link" not in result
+    assert result["conference_status"] == "pending"
+
+
+def test_response_handles_null_conference_data_without_crashing(monkeypatch):
+    """Guard against event["conferenceData"] (or nested keys) being present but
+    explicitly null in the API response, not just absent."""
+    service = _fake_service({"id": "evt1", "conferenceData": None})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "hangout_link" not in result
+    assert "conference_status" not in result
+
+
+def test_response_handles_null_conference_solution_key_without_crashing(monkeypatch):
+    """Guard against conferenceData.conferenceSolution.key being present but
+    explicitly null, not just absent -- .get("key", {}) only defaults for a
+    missing key, not a present-but-null one."""
+    service = _fake_service(
+        {
+            "id": "evt1",
+            "conferenceData": {"conferenceSolution": {"key": None}},
+        }
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "hangout_link" not in result
+
+
+def test_get_event_surfaces_hangout_link_like_create_and_update_do(monkeypatch):
+    """Regression test: both tool docstrings tell callers to fall back to
+    google_calendar_get_event to pick up a Meet link that wasn't ready yet
+    at create/update time -- it must honor that by using the same
+    hangout_link/conference_status convention, not return the raw event."""
+    fetched_event = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/abc-defg-hij",
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=fetched_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(calendar.google_calendar_get_event(event_id="evt1"))
+
+    assert result["status"] == "success"
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+def test_create_event_error_message_hints_at_add_google_meet_on_failure(monkeypatch):
+    """Regression test: if the whole insert() call fails while add_google_meet
+    was requested (e.g. the account/domain can't create Meet conferences at
+    all), the error should point at add_google_meet as the likely cause --
+    it's otherwise indistinguishable from any other request-level failure."""
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.insert.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Bad Request" in result["message"]
+    assert "add_google_meet" in result["message"]
+
+
+def test_update_event_error_message_hints_at_add_google_meet_on_failure(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.update.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["status"] == "error"
+    assert "Bad Request" in result["message"]
+    assert "add_google_meet" in result["message"]
+
+
+def test_update_event_error_message_has_no_hint_when_add_google_meet_was_a_noop(
+    monkeypatch,
+):
+    """Regression test: add_google_meet=True is a no-op when the event
+    already has a resolved conference -- this call's body never actually
+    carried a createRequest, so a failure has nothing to do with Meet and
+    the hint would misdirect the caller."""
+    existing_event = {
+        "id": "evt1",
+        "conferenceData": {
+            "conferenceSolution": {"key": {"type": "hangoutsMeet"}},
+            "entryPoints": [{"entryPointType": "video", "uri": "https://x"}],
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    service.events.return_value.update.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Bad Request"
+
+
+def test_update_event_error_message_has_no_hint_when_the_preliminary_fetch_fails(
+    monkeypatch,
+):
+    """Regression test: a failure in the preliminary events().get() fetch
+    (e.g. a bad event_id) happens before _apply_conference_request ever
+    runs, so this call's body never carried a createRequest either."""
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.get.return_value.execute.side_effect = RuntimeError(
+        "Not Found"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="evt1", add_google_meet=True)
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Not Found"
+
+
+def test_create_event_error_message_has_no_hint_when_service_setup_fails(monkeypatch):
+    """Regression test: a failure before any event body is even built (e.g.
+    a missing/invalid credential) happens before _apply_conference_request
+    ever runs, so blaming a Meet conference request would be wrong."""
+
+    def _raise():
+        raise ValueError("GOOGLE_ACCESS_TOKEN environment variable is missing")
+
+    monkeypatch.setattr(calendar, "get_calendar_service", _raise)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "add_google_meet" not in result["message"]
+
+
+def test_create_event_error_message_has_no_hint_without_add_google_meet(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    service.events.return_value.insert.return_value.execute.side_effect = RuntimeError(
+        "Bad Request"
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "Bad Request"
+
+
+_ZOOM_JOIN_URL = "https://us02web.zoom.us/j/85012345678?pwd=abcDEF123"
+
+
+def test_create_event_meeting_link_fills_location_and_description(monkeypatch):
+    """An external meeting's join URL must end up in the invite itself, with
+    no Google Meet conference requested alongside it."""
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            meeting_link=f"  {_ZOOM_JOIN_URL}  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["location"] == _ZOOM_JOIN_URL
+    assert body["description"] == f"Join the meeting: {_ZOOM_JOIN_URL}"
+    assert "conferenceData" not in body
+
+
+def test_create_event_meeting_link_keeps_location_and_appends_to_description(
+    monkeypatch,
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description="Agenda: roadmap",
+        location="Room 4",
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == (
+        f"Agenda: roadmap\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    )
+
+
+def test_create_event_meeting_link_is_not_repeated_in_description(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    description = f"Zoom: {_ZOOM_JOIN_URL}"
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description=description,
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["description"] == description
+
+
+def test_create_event_blank_meeting_link_is_treated_as_absent(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            meeting_link="   ",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert "location" not in body
+    assert "description" not in body
+
+
+def test_create_event_rejects_meeting_link_with_add_google_meet(monkeypatch):
+    """Two conference entry points in one invite is never what the caller
+    wants, and dropping the Meet request also keeps a Meet provisioning
+    failure from taking down an event that already has its link."""
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            add_google_meet=True,
+            meeting_link=_ZOOM_JOIN_URL,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "add_google_meet=False" in result["message"]
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "meeting_link",
+    [
+        "zoom.us/j/85012345678",
+        "javascript:alert(1)",
+        "ftp://zoom.us/j/85012345678",
+        "https:///j/85012345678",
+        "https://[zoom.us/j/85012345678",
+        f"{_ZOOM_JOIN_URL}\nPasscode: 123",
+        f"{_ZOOM_JOIN_URL} (passcode 123)",
+        "https://zoom.us/j/" + "1" * 2100,
+    ],
+)
+def test_create_event_rejects_invalid_meeting_link_before_any_api_call(
+    monkeypatch, meeting_link
+):
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Sync",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+            meeting_link=meeting_link,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "meeting_link" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_update_event_meeting_link_appends_to_existing_description(monkeypatch):
+    """A link-only update must not wipe the description the event already
+    has, and, as a metadata-only edit, must not run an availability check."""
+    existing_event = {"id": "evt1", "description": "Agenda: roadmap"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", meeting_link=_ZOOM_JOIN_URL
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["description"] == (
+        f"Agenda: roadmap\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    )
+    assert body["location"] == _ZOOM_JOIN_URL
+    service.freebusy.assert_not_called()
+
+
+def test_update_event_meeting_link_appends_to_the_new_description(monkeypatch):
+    existing_event = {"id": "evt1", "description": "Old agenda"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1",
+        description="New agenda",
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["description"] == f"New agenda\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+
+
+def test_update_event_meeting_link_keeps_location_and_existing_conference(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "evt1",
+        "location": "Room 4",
+        "description": f"Dial in: {_ZOOM_JOIN_URL}",
+        "conferenceData": {
+            "conferenceId": "abc-defg-hij",
+            "conferenceSolution": {"key": {"type": "hangoutsMeet"}},
+            "entryPoints": [
+                {
+                    "entryPointType": "video",
+                    "uri": "https://meet.google.com/abc-defg-hij",
+                }
+            ],
+        },
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(event_id="evt1", meeting_link=_ZOOM_JOIN_URL)
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == existing_event["description"]
+    assert body["conferenceData"] == existing_event["conferenceData"]
+
+
+def test_update_event_meeting_link_does_not_override_explicit_location(monkeypatch):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", location="Room 4", meeting_link=_ZOOM_JOIN_URL
+    )
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == f"Join the meeting: {_ZOOM_JOIN_URL}"
+
+
+def test_update_event_rejects_meeting_link_with_add_google_meet(monkeypatch):
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", add_google_meet=True, meeting_link=_ZOOM_JOIN_URL
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "add_google_meet=False" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_update_event_rejects_invalid_meeting_link_before_any_api_call(monkeypatch):
+    get_service = Mock(return_value=_fake_service({"id": "evt1"}))
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", meeting_link="javascript:alert(1)"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "meeting_link" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_calendar_tool_descriptions_explain_external_meeting_links():
+    """The model only learns the create-the-meeting-first order, and that a
+    failed external meeting must be reported rather than papered over with a
+    link-less event, from these descriptions."""
+    for tool_name in (
+        "google_calendar_create_events",
+        "google_calendar_update_events",
+    ):
+        tool = calendar.mcp._tool_manager.get_tool(tool_name)
+        assert "meeting_link" in tool.parameters["properties"]
+        assert "Never invent" in tool.description
+        assert "tell the user" in tool.description
+
+
+def test_calendar_tool_descriptions_say_a_present_link_is_not_appended_again():
+    """_attach_meeting_link skips a link the description already contains, so
+    neither tool may promise that the link is always appended."""
+    for tool_name in (
+        "google_calendar_create_events",
+        "google_calendar_update_events",
+    ):
+        tool = calendar.mcp._tool_manager.get_tool(tool_name)
+        description = " ".join(tool.description.split())
+        assert "unless already there" in description
+        assert "always appended" not in description
+
+
+def test_create_event_description_checks_the_window_before_the_external_meeting():
+    """An external meeting may not be movable once created, so the window is
+    checked before it is created, not only by this tool's conflict check."""
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_create_events")
+    description = " ".join(tool.description.split())
+
+    assert (
+        "check that window with google_calendar_search_events before creating "
+        "the external meeting"
+    ) in description
+
+
+def test_create_event_description_keeps_the_link_when_the_time_changes():
+    """A conflict that moves the event must not lead to a second external
+    meeting: the description tells the model to keep the same link."""
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_create_events")
+
+    assert "retrying at a different time" in tool.description
+    assert "keep the link" in tool.description
+
+
+def test_update_event_meeting_link_replaces_an_old_link_as_documented(monkeypatch):
+    """The update description says how to swap in a new link: pass a
+    description without the old one and the new link as location. Following
+    it must leave the old meeting's link nowhere in the event."""
+    old_link = "https://us02web.zoom.us/j/81111111111?pwd=old"
+    existing_event = {
+        "id": "evt1",
+        "location": old_link,
+        "description": f"Agenda\n\nJoin the meeting: {old_link}",
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            description="Agenda",
+            location=_ZOOM_JOIN_URL,
+            meeting_link=_ZOOM_JOIN_URL,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == _ZOOM_JOIN_URL
+    assert body["description"] == f"Agenda\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    assert old_link not in json.dumps(body)
+
+
+def test_update_event_empty_location_does_not_clear_an_old_link(monkeypatch):
+    """An empty location is ignored rather than cleared, which is why the
+    description points callers at passing the new link as location."""
+    old_link = "https://us02web.zoom.us/j/81111111111?pwd=old"
+    existing_event = {"id": "evt1", "location": old_link, "description": "Agenda"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_update_events(
+        event_id="evt1", location="", meeting_link=_ZOOM_JOIN_URL
+    )
+
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["location"] == old_link
+    assert body["description"] == f"Agenda\n\nJoin the meeting: {_ZOOM_JOIN_URL}"
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_update_events")
+    assert "pass the new link as" in tool.description
+    assert "an empty location is ignored" in tool.description
+
+
+@pytest.mark.parametrize(
+    ("description", "meeting_link"),
+    [
+        # A longer meeting id that merely starts with the new one.
+        ("Old: https://zoom.us/j/850123456789", "https://zoom.us/j/85012345678"),
+        # The same meeting id, but a different full join URL.
+        (
+            "Old: https://zoom.us/j/85012345678?pwd=old",
+            "https://zoom.us/j/85012345678",
+        ),
+        # The new link only as the tail of another URL.
+        (
+            "See https://example.com/redirect?to=https://zoom.us/j/85012345678",
+            "https://zoom.us/j/85012345678",
+        ),
+    ],
+)
+def test_meeting_link_is_appended_when_only_a_different_url_contains_it(
+    monkeypatch, description, meeting_link
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description=description,
+        location="Room 4",
+        meeting_link=meeting_link,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["location"] == "Room 4"
+    assert body["description"] == (f"{description}\n\nJoin the meeting: {meeting_link}")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        f"Join at {_ZOOM_JOIN_URL}.",
+        f"Join at {_ZOOM_JOIN_URL}, passcode in the invite",
+        f"Zoom ({_ZOOM_JOIN_URL})",
+        f"Zoom: <{_ZOOM_JOIN_URL}>",
+        f'<a href="{_ZOOM_JOIN_URL}">Join</a>',
+        f"{_ZOOM_JOIN_URL}\nAgenda",
+    ],
+)
+def test_meeting_link_already_in_the_description_is_not_repeated(
+    monkeypatch, description
+):
+    service = _fake_service({"id": "evt1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_create_events(
+        summary="Sync",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+        description=description,
+        meeting_link=_ZOOM_JOIN_URL,
+    )
+
+    body = service.events.return_value.insert.call_args.kwargs["body"]
+    assert body["description"] == description
+
+
+def test_event_response_caps_a_large_event_like_other_tools_in_this_package(
+    monkeypatch,
+):
+    """Regression test: the raw Google event (description, attendees,
+    recurrence rules, ...) can be large enough to blow past the platform's
+    output-length budget; this package's other tools already guard against
+    that with success_with_capped_dict, and this response builder must too."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
+    execute_result = {
+        "id": "evt1",
+        "attendees": [{"email": f"person{i}@example.com"} for i in range(200)],
+    }
+    service = _fake_service(execute_result)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["event"]["attendees"]) < 200
+
+
+def test_event_response_does_not_truncate_a_small_event(monkeypatch):
+    service = _fake_service({"id": "evt1", "summary": "1:1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is False
+
+
+def test_create_event_returns_conflict_for_a_real_overlap(monkeypatch):
+    service = _fake_service({"id": "created"})
+    service.events.return_value.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "busy-event",
+                "summary": "Already booked",
+                "start": {"dateTime": "2026-09-07T15:15:00+08:00"},
+                "end": {"dateTime": "2026-09-07T15:45:00+08:00"},
+            }
+        ]
+    }
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="New meeting",
+            start_time="2026-09-07T15:00:00+08:00",
+            end_time="2026-09-07T16:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "Already booked"
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_find_conflicts_follows_event_pages_and_excludes_recurring_instances():
+    service = _fake_service({"id": "unused"})
+    pages = {
+        None: {
+            "items": [
+                {
+                    "id": "series-instance",
+                    "recurringEventId": "series",
+                    "summary": "This event",
+                    "start": {"dateTime": "2026-09-07T15:00:00+08:00"},
+                    "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+                }
+            ],
+            "nextPageToken": "second-page",
+        },
+        "second-page": {
+            "items": [
+                {
+                    "id": "other-event",
+                    "summary": "Later-page conflict",
+                    "start": {"dateTime": "2026-09-07T15:30:00+08:00"},
+                    "end": {"dateTime": "2026-09-07T16:00:00+08:00"},
+                }
+            ]
+        },
+    }
+
+    def list_events(**kwargs: Any) -> Mock:
+        return Mock(execute=Mock(return_value=pages[kwargs.get("pageToken")]))
+
+    service.events.return_value.list.side_effect = list_events
+
+    conflicts, unchecked = calendar._find_conflicts(
+        service,
+        "2026-09-07T15:00:00+08:00",
+        "2026-09-07T16:00:00+08:00",
+        [],
+        exclude_event_id="series",
+    )
+
+    assert unchecked == []
+    assert [item["summary"] for item in conflicts] == ["Later-page conflict"]
+    assert [
+        call.kwargs["pageToken"]
+        for call in service.events.return_value.list.call_args_list
+    ] == [None, "second-page"]
+
+
+def test_find_conflicts_batches_more_than_fifty_attendees():
+    service = _fake_service({"id": "unused"})
+    attendees = [f"person{i}@example.com" for i in range(51)]
+
+    conflicts, unchecked = calendar._find_conflicts(
+        service,
+        "2026-09-07T15:00:00+08:00",
+        "2026-09-07T16:00:00+08:00",
+        attendees,
+        check_primary_calendar=False,
+    )
+
+    assert conflicts == []
+    assert unchecked == []
+    assert [
+        len(call.kwargs["body"]["items"])
+        for call in service.freebusy.return_value.query.call_args_list
+    ] == [50, 1]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}',
+        b'{"error":{"details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}',
+    ],
+)
+def test_is_insufficient_scope_error_supports_both_google_response_shapes(content):
+    error = HttpError(_HttpResponse(403), content)
+
+    assert calendar._is_insufficient_scope_error(error)
+
+
+def test_update_event_sends_the_fetched_etag_as_if_match(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"etag": '"version-1"'},
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", summary="Updated", ignore_conflicts=True
+        )
+    )
+
+    assert result["status"] == "success"
+    request = service.events.return_value.update.return_value
+    assert request.headers["If-Match"] == '"version-1"'
+
+
+def test_update_event_reports_precondition_failure_without_retrying(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"etag": '"version-1"'},
+    )
+    service.events.return_value.update.return_value.execute.side_effect = HttpError(
+        _HttpResponse(412),
+        b'{"error":{"code":412,"message":"Precondition Failed"}}',
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1", summary="Updated", ignore_conflicts=True
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "changed while its availability was being checked" in result["message"]
+    service.events.return_value.update.assert_called_once()
+
+
+def test_update_fails_closed_if_a_foreign_organizer_email_is_missing(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"organizer": {"self": False}},
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            start_time="2026-09-07T17:00:00+08:00",
+            end_time="2026-09-07T18:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["organizer (email unavailable)"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_ignore_conflicts_cannot_bypass_a_missing_stored_counterpart(monkeypatch):
+    service = _fake_service(
+        {"id": "evt1"},
+        existing_event={"end": {}},
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="evt1",
+            start_time="2026-09-07T17:00:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing event end" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+class _Exec:
+    def __init__(self, result: dict[str, Any], *, raise_error: Exception | None = None):
+        self._result = result
+        self._raise_error = raise_error
+        self.headers: dict[str, str] = {}
+
+    def execute(self) -> dict[str, Any]:
+        if self._raise_error is not None:
+            raise self._raise_error
+        return self._result
+
+
+class FakeEvents:
+    def __init__(self):
+        self._list_result: dict[str, Any] = {"items": []}
+        self._get_result: dict[str, Any] = {}
+        self._insert_result: dict[str, Any] = {"id": "created"}
+        self._update_result: dict[str, Any] = {"id": "updated"}
+        self._list_error: Exception | None = None
+        self._update_error: Exception | None = None
+        self.list_calls: list[dict[str, Any]] = []
+        self.insert_calls: list[dict[str, Any]] = []
+        self.update_calls: list[dict[str, Any]] = []
+
+    def list(self, **kwargs: Any) -> _Exec:
+        self.list_calls.append(kwargs)
+        if self._list_error is not None:
+            raise self._list_error
+        return _Exec(self._list_result)
+
+    def get(self, **kwargs: Any) -> _Exec:
+        return _Exec(copy.deepcopy(self._get_result))
+
+    def insert(self, **kwargs: Any) -> _Exec:
+        self.insert_calls.append(kwargs)
+        return _Exec(self._insert_result)
+
+    def update(self, **kwargs: Any) -> _Exec:
+        self.update_calls.append(kwargs)
+        return _Exec(self._update_result, raise_error=self._update_error)
+
+
+def _insufficient_scope_error() -> HttpError:
+    """A real Google API 403 for this case carries the reason on BOTH the
+    legacy `errors[].reason` field and a newer `details[].reason`
+    ErrorInfo entry at once - not one or the other. `HttpError`'s own
+    `_get_reason()` picks `details` over `errors` whenever both are
+    present, dropping the legacy reason from `str(exc)` entirely, which
+    is exactly what makes a naive `"insufficientPermissions" in str(exc)`
+    substring check unreliable (see `_is_insufficient_scope_error`)."""
+    return HttpError(
+        _HttpResponse(403),
+        (
+            b'{"error": {"code": 403, '
+            b'"message": "Request had insufficient authentication scopes.", '
+            b'"errors": [{"message": "Insufficient Permission", '
+            b'"domain": "global", "reason": "insufficientPermissions"}], '
+            b'"status": "PERMISSION_DENIED", '
+            b'"details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", '
+            b'"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT", '
+            b'"domain": "googleapis.com", '
+            b'"metadata": {"service": "calendar-json.googleapis.com", '
+            b'"method": "calendar.v3.Freebusy.Query"}}]}}'
+        ),
+    )
+
+
+def _legacy_only_insufficient_scope_error() -> HttpError:
+    """Older/less-instrumented responses may still carry only the legacy
+    field - must keep matching this shape too, not just the dual one."""
+    return HttpError(
+        _HttpResponse(403),
+        (
+            b'{"error": {"errors": [{"reason": "insufficientPermissions"}], '
+            b'"message": "Request had insufficient authentication scopes."}}'
+        ),
+    )
+
+
+class FakeFreebusy:
+    def __init__(
+        self,
+        result: dict[str, Any] | None = None,
+        *,
+        raise_error: Exception | None = None,
+    ):
+        self._result = result or {"calendars": {}}
+        self._raise_error = raise_error
+        self.query_calls: list[dict[str, Any]] = []
+
+    def query(self, **kwargs: Any) -> _Exec:
+        self.query_calls.append(kwargs)
+        if self._raise_error is not None:
+            raise self._raise_error
+        return _Exec(self._result)
+
+
+class FakeCalendars:
+    def __init__(
+        self,
+        timezone: str = "UTC",
+        *,
+        email: str = "me@example.com",
+        raise_error: Exception | None = None,
+    ):
+        self._timezone = timezone
+        # The connected account's own address (the "id" field
+        # calendars().get returns on a real primary calendar) - defaults
+        # to the same
+        # "me@example.com" convention most fixtures already use for the
+        # caller/organizer, so a test that never customizes this and
+        # never means to simulate a different-organizer scenario keeps
+        # caller_is_organizer=True without having to set this explicitly.
+        self._email = email
+        self._raise_error = raise_error
+        self.get_calls: list[dict[str, Any]] = []
+
+    def get(self, **kwargs: Any) -> _Exec:
+        self.get_calls.append(kwargs)
+        if self._raise_error is not None:
+            raise self._raise_error
+        return _Exec({"id": self._email, "timeZone": self._timezone})
+
+
+class FakeService:
+    def __init__(self):
+        self._events = FakeEvents()
+        self._freebusy = FakeFreebusy()
+        self._calendars = FakeCalendars()
+
+    def events(self) -> FakeEvents:
+        return self._events
+
+    def freebusy(self) -> FakeFreebusy:
+        return self._freebusy
+
+    def calendars(self) -> FakeCalendars:
+        return self._calendars
+
+
+@pytest.fixture
+def fake_service(monkeypatch):
+    service = FakeService()
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    return service
+
+
+def test_incomplete_check_response_caps_unchecked_attendees_before_write(
+    fake_service, monkeypatch
+):
+    """A large set of unchecked calendars returns a bounded pre-write
+    response instead of allowing the update and warning afterward."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    raw = calendar.google_calendar_update_events(
+        event_id="self-1",
+        attendees=[f"person{i}@example.com" for i in range(200)],
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 300
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["truncated"] is True
+    assert fake_service._events.update_calls == []
+
+
+def test_event_response_counts_hangout_link_in_the_output_cap(
+    fake_service, monkeypatch
+):
+    """A derived top-level Meet link must be included in the size budget;
+    otherwise appending it after event truncation can exceed the limit."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 300)
+    hangout_link = "https://meet.google.com/abc-defg-hij"
+    fake_service._events._insert_result = {
+        "id": "evt1",
+        "hangoutLink": hangout_link,
+        "attendees": [{"email": f"person{i}@example.com"} for i in range(200)],
+    }
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 300
+    assert result["status"] == "success"
+    assert result["hangout_link"] == hangout_link
+    assert result["truncated"] is True
+
+
+def test_event_response_fits_a_small_cap_with_a_large_conference_field(
+    fake_service, monkeypatch
+):
+    """Fixed response fields must be discardable when even one large value
+    would otherwise leave the success envelope above the output limit."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    fake_service._events._insert_result = {
+        "id": "evt1",
+        "hangoutLink": "https://meet.google.com/" + "x" * 200,
+    }
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def _large_event_with_hangout_link(
+    id_length: int, link_length: int = 100
+) -> dict[str, Any]:
+    """A big enough event (long description, many attendees) that phase 1
+    (list/dict shrinking) and phase 2 (dropping whole top-level keys) in
+    success_with_capped_dict both run and still don't fit -- unlike
+    test_event_response_fits_a_small_cap_with_a_large_conference_field's
+    trivial id-only body, which skips both phases and goes straight to the
+    last-resort ladder. Combined with hangoutLink, this reaches the ladder
+    the way a real large event with a Meet link actually would."""
+    return {
+        "id": "e" * id_length,
+        "description": "d" * 5000,
+        "attendees": [{"email": f"person{i}@example.com"} for i in range(300)],
+        "hangoutLink": "https://meet.google.com/" + "y" * link_length,
+    }
+
+
+def test_event_response_last_resort_drops_a_long_id_for_intact_extras(
+    fake_service, monkeypatch
+):
+    """Rung 2 of the last-resort ladder: once the id itself is long enough
+    that "id + intact extras" doesn't fit but "{} + intact extras" does,
+    the ladder must give up the id rather than degrade or drop the Meet
+    link -- a real link beside an empty record beats keeping only the id."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 200)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=60)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 200
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert result["hangout_link"] == "https://meet.google.com/" + "y" * 100
+
+
+def test_event_response_last_resort_falls_back_to_id_alone(fake_service, monkeypatch):
+    """Rung 4 of the last-resort ladder: once even "id + degraded extras"
+    doesn't fit, the id is worth keeping again over a degraded placeholder
+    -- id alone outranks id-plus-True."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 160)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 160
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {"id": "e" * 90}
+    assert "hangout_link" not in result
+    assert "conference_status" not in result
+
+
+def test_event_response_last_resort_degrades_extras_beside_an_empty_record(
+    fake_service, monkeypatch
+):
+    """Rung 5 of the last-resort ladder: once even the bare id no longer
+    fits, a degraded (True) extra beside an empty record is still more
+    informative than dropping it, so it must be kept over an empty
+    record alone."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert result["hangout_link"] is True
+
+
+def test_event_response_last_resort_falls_back_to_an_empty_record(
+    fake_service, monkeypatch
+):
+    """Rung 6 (the bottom of the ladder before the bare envelope): once
+    even a degraded extra beside an empty record doesn't fit, the response
+    still preserves the event's status/truncated envelope with an empty
+    record rather than dropping the field entirely."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 64
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert "hangout_link" not in result
+
+
+def test_incomplete_check_response_fits_a_small_cap_for_one_attendee(
+    fake_service, monkeypatch
+):
+    """The pre-write failure envelope stays bounded even when there is only
+    one collection item left, which cannot be reduced by list halving."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    raw = calendar.google_calendar_create_events(
+        summary="Kickoff",
+        start_time="2026-08-27T10:00:00+08:00",
+        end_time="2026-08-27T10:30:00+08:00",
+        attendees=["person-with-a-long-address@example.com"],
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["truncated"] is True
+    assert fake_service._events.insert_calls == []
+
+
+def _confirmed_event(
+    event_id="existing-1",
+    summary="1:1 with Hazel",
+    transparency=None,
+    status="confirmed",
+):
+    event: dict[str, Any] = {
+        "id": event_id,
+        "summary": summary,
+        "status": status,
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+    }
+    if transparency:
+        event["transparency"] = transparency
+    return event
+
+
+def test_create_events_ignores_transparent_organizer_event(fake_service):
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(transparency="transparent")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.insert_calls) == 1
+
+
+def test_create_events_ignores_cancelled_organizer_event(fake_service):
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(status="cancelled")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_create_events_detects_attendee_freebusy_conflict(fake_service):
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "chelsea@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["calendar"] == "chelsea@example.com"
+    assert fake_service._events.insert_calls == []
+
+
+def test_create_events_unchecked_attendee_blocks_creation(fake_service):
+    """An external/unshared calendar cannot be treated as available."""
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "outsider@gmail.com": {"errors": [{"reason": "notFound"}]},
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["outsider@gmail.com"],
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["outsider@gmail.com"]
+    assert fake_service._events.insert_calls == []
+
+
+def test_create_events_ignore_conflicts_skips_the_check_entirely(fake_service):
+    fake_service._events._list_result = {"items": [_confirmed_event()]}
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls == []
+    assert len(fake_service._events.insert_calls) == 1
+
+
+def test_create_events_rejects_a_reversed_window(fake_service):
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:30:00+08:00",
+            end_time="2026-08-27T10:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.insert_calls == []
+
+
+def test_create_events_rejects_an_offsetless_start_time(fake_service):
+    """Regression test: an offsetless start_time compared naive-against-
+    aware deep inside a downstream comparison would previously fall
+    through to Google's own freebusy/events.list APIs (which require an
+    RFC3339 offset on timeMin/timeMax) and fail there with an opaque
+    error, instead of this clear, actionable one raised up front."""
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00",  # no offset
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time" in result["message"]
+    assert fake_service._events.insert_calls == []
+
+
+def test_create_events_prefers_the_offset_error_over_the_reversed_window_one(
+    fake_service,
+):
+    """Regression test: two NAIVE values that also happen to be reversed
+    compare just fine (no TypeError, so reject_reversed_window's
+    permissive aware-vs-naive handling never kicks in) and would
+    otherwise raise the generic "must be after" message before the more
+    specific, actionable offset error ever got a chance to run - offset
+    validation must happen first."""
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:30:00",  # naive AND reversed
+            end_time="2026-08-27T10:00:00",  # naive
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time" in result["message"]
+    assert "offset" in result["message"]
+    assert fake_service._events.insert_calls == []
+
+
+def test_update_events_rejects_an_offsetless_start_time(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00",  # no offset
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time" in result["message"]
+    assert fake_service._events.update_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
+def test_update_events_excludes_the_event_being_moved_from_its_own_conflicts(
+    fake_service,
+):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+    }
+    fake_service._events._list_result = {
+        "items": [
+            {
+                "id": "self-1",
+                "summary": "old slot",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+                "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+            },
+            _confirmed_event(event_id="other-1", summary="Board sync"),
+        ]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
+
+
+def test_update_events_excludes_a_recurring_events_own_instances_from_its_conflicts(
+    fake_service,
+):
+    """Regression test: events.list(singleEvents=True) expands a recurring
+    event into instances that carry their OWN id
+    ("<masterId>_<recurrenceStamp>"), never the master's - rescheduling
+    the master itself (the normal way to address a recurring series)
+    must not report it as conflicting with its own instances just
+    because `id` alone never matches `exclude_event_id`. recurringEventId
+    is the field that actually names the master on each instance."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+    }
+    fake_service._events._list_result = {
+        "items": [
+            {
+                "id": "series-1_20260827T010000Z",
+                "recurringEventId": "series-1",
+                "summary": "Weekly sync (this instance)",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+                "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+            },
+            _confirmed_event(event_id="other-1", summary="Board sync"),
+        ]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
+
+
+def test_update_events_refuses_to_move_a_recurring_masters_time(fake_service):
+    """Regression test: the conflict check only ever evaluates the single
+    window this call computes - it has no way to expand a recurring
+    master's RRULE and check every occurrence it generates. Moving the
+    master's own time (recurrence present on the fetched event) must be
+    refused outright rather than silently succeed having only verified
+    one occurrence, since a later occurrence at the new time could have a
+    real conflict this call never looked at."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recurring" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_refuses_to_add_an_attendee_to_a_recurring_master(fake_service):
+    """Companion to the test above: adding a genuinely new attendee to a
+    recurring master is refused for the same reason - their availability
+    can only be checked against the one occurrence this call computes,
+    not the whole series."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recurring" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_allows_metadata_only_edits_on_a_recurring_master(fake_service):
+    """A pure metadata edit (no time/attendee change) on a recurring
+    master is unaffected by the new restriction - it never needed the
+    per-occurrence conflict check the restriction exists to guard."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            summary="Renamed series",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_allows_equivalent_rfc3339_times_on_a_recurring_master(
+    fake_service,
+):
+    """Equivalent RFC3339 spellings do not constitute a recurring-series
+    move after both timestamps have been normalized."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {"dateTime": "2026-08-27T01:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-08-27T01:30:00Z", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            start_time="2026-08-27T01:00:00+00:00",
+            end_time="2026-08-27T01:30:00+00:00",
+            summary="Renamed series",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_recurring_master_restriction_can_be_bypassed_with_ignore_conflicts(
+    fake_service,
+):
+    """ignore_conflicts=True is the caller's explicit escape hatch for a
+    check that can't run at all - including this one, once the user has
+    confirmed they've verified every occurrence themselves."""
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {
+            "dateTime": "2026-08-27T09:00:00+08:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-08-27T09:30:00+08:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+    }
+    fake_service._events._list_result = {"items": [{"id": "series-1"}]}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_moving_a_single_occurrence_is_unaffected_by_the_recurring_master_restriction(
+    fake_service,
+):
+    """A single occurrence (addressed by its own event id, carrying
+    recurringEventId rather than its own recurrence) is a single event
+    like any other for conflict-checking purposes - the restriction only
+    targets the master itself."""
+    fake_service._events._get_result = {
+        "id": "series-1_20260827T010000Z",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+    }
+    fake_service._events._list_result = {"items": []}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1_20260827T010000Z",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_metadata_only_edit_never_checks_conflicts(fake_service):
+    """A pure metadata edit (no time/attendee change) must never run the
+    conflict check at all - not just tolerate it, since even running the
+    check would spuriously self-conflict against the event's own attendees
+    (see the two tests below)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "chelsea@example.com"}],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="New Title",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+    assert fake_service._events.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_update_events_same_window_only_checks_newly_added_attendee(fake_service):
+    """Adding an attendee without moving the event must only check the new
+    attendee's free/busy - checking an existing attendee against the
+    unchanged window would always find the event's own busy block on their
+    calendar and falsely report a conflict."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "old@example.com"}],
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "old@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                },
+                "new@example.com": {"busy": []},
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["old@example.com", "new@example.com"],
+            notify_attendees=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls == []
+    queried_emails = {
+        item["id"]
+        for call in fake_service._freebusy.query_calls
+        for item in call["body"]["items"]
+    }
+    assert queried_emails == {"new@example.com"}
+    assert fake_service._events.update_calls[0]["sendUpdates"] == "all"
+
+
+@pytest.mark.parametrize(
+    "organizer",
+    [
+        pytest.param({"email": "me@example.com"}, id="explicit-organizer"),
+        pytest.param(None, id="implicit-calendar-owner"),
+    ],
+)
+def test_update_events_adding_the_organizer_as_an_attendee_does_not_self_conflict(
+    fake_service, organizer
+):
+    """Adding the connected account as an attendee must use the organizer
+    events-list check, whether Google returns an explicit organizer field or
+    implies that the calendar owner organized the event. A freebusy query would
+    see this event's own busy block and falsely report a conflict.
+    """
+    existing_event = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+    }
+    if organizer is not None:
+        existing_event["organizer"] = organizer
+    fake_service._events._get_result = existing_event
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "me@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1", attendees=["me@example.com"]
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._freebusy.query_calls == []
+    assert len(fake_service._events.list_calls) == 1
+
+
+def test_update_events_adding_the_organizer_as_an_attendee_still_catches_a_real_conflict(
+    fake_service,
+):
+    """Regression test: excluding the organizer from the freebusy batch
+    must not also skip checking their calendar altogether. Before this
+    fix, adding ONLY the organizer as a new attendee (window otherwise
+    unchanged) left both `attendees_to_check` empty (organizer filtered
+    out) and `check_organizer` false (window unchanged), so a genuinely
+    different conflicting event on the organizer's own calendar was
+    silently missed entirely."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com"},
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1", summary="Board sync")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["Board sync"]
+    assert fake_service._freebusy.query_calls == []
+
+
+def test_update_events_on_someone_elses_event_actually_checks_the_real_organizer(
+    fake_service,
+):
+    """Regression test: check_organizer queries calendarId="primary",
+    which is always the AUTHENTICATED CALLER's own calendar, not
+    necessarily this event's organizer - a guest with edit permission
+    (guestsCanModify) can update an event they didn't organize. Before
+    this fix, the organizer's email was unconditionally excluded from
+    freebusy and merely reported as unchecked in this scenario, even
+    though freebusy.query accepts any calendar/email id - not just
+    "primary" - so the real organizer (boss@example.com) CAN be checked
+    the same way a retained attendee is: over just the delta segment
+    beyond the event's old window, so their own pre-existing footprint
+    on this same event doesn't self-conflict. A genuine busy block of
+    theirs in the new-only territory must now be caught as a real
+    conflict, not silently missed."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+    # Default FakeCalendars() resolves the connected account's own
+    # address as "me@example.com" - different from the organizer above.
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "boss@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T14:10:00+08:00",
+                            "end": "2026-08-27T14:20:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["calendar"] for c in result["conflicts"]] == ["boss@example.com"]
+    assert result["unchecked_attendees"] == []
+    # Never queried "primary" (the caller's own calendar) as if it were
+    # the organizer's - the real organizer was checked via freebusy
+    # instead, using their own real address.
+    assert fake_service._events.list_calls == []
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["items"] == [{"id": "boss@example.com"}]
+
+
+def test_update_events_on_someone_elses_event_reports_the_real_organizer_unchecked_when_freebusy_has_no_data_for_them(
+    fake_service,
+):
+    """Companion to the test above: the real organizer IS now queried via
+    freebusy over the delta segment, but if their calendar is absent from
+    the response (the same per-attendee gap _find_conflicts already
+    handles for any other attendee), they must still be reported as
+    unchecked rather than silently treated as clear."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+    # FakeFreebusy defaults to an empty "calendars" dict - boss@example.com
+    # is absent from it, same as a real per-attendee visibility gap.
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    assert fake_service._events.update_calls == []
+    assert fake_service._events.list_calls == []
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["items"] == [{"id": "boss@example.com"}]
+
+
+def test_update_events_organizer_newly_added_with_unchanged_window_is_still_unverifiable(
+    fake_service,
+):
+    """Regression test for the one residual case the delta-segment fix
+    above can't cover: the real organizer is added as a "new" attendee
+    but the window itself never moves. window_delta_segments finds no
+    new territory at all in that case (correctly - a retained party's
+    existing footprint already covers an unchanged window), so unlike a
+    genuine window move, there is no safe way to freebusy-check them
+    without risking a self-conflict on their own pre-existing copy of
+    this same event. Must still be reported as unchecked, not silently
+    treated as clear, and not freebusy-queried at all."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "boss@example.com"},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["boss@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    assert fake_service._events.update_calls == []
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
+def test_update_events_organizer_self_false_needs_no_identity_api_call(
+    fake_service,
+):
+    """Regression test: Google's own organizer.self field ("Whether the
+    organizer corresponds to the calendar on which this copy of the
+    event appears") directly answers caller_is_organizer - when present,
+    no calendars().get(calendarId="primary") call is needed at all for
+    identity purposes, unlike the email-comparison fallback this uses
+    when organizer.self is absent. The organizer IS still freebusy-
+    checked over the delta segment (a separate mechanism from identity
+    resolution) - absent from the default empty freebusy response here,
+    so still reported as unchecked."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com", "self": False},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    assert fake_service._events.update_calls == []
+    assert fake_service._events.list_calls == []
+    # The whole point: organizer.self answered caller_is_organizer
+    # directly, so the connected account's own identity never needed
+    # looking up via calendars().get() at all.
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_organizer_self_false_with_no_email_still_checks_the_new_attendee(
+    fake_service,
+):
+    """Regression test: organizer.self=False with no organizer.email at
+    all must NOT trigger the "backfill organizer_email to the caller's
+    own address" fallback - that fallback exists for the "no organizer
+    info whatsoever" case, and backfilling here would wrongly exclude a
+    genuinely different, newly-added attendee ("me@example.com" - the
+    caller's own address, added as an ordinary attendee to someone
+    else's event) from the freebusy batch, silently skipping a real
+    conflict check for them."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"self": False},
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {"calendars": {"me@example.com": {"busy": []}}}
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+    queried_emails = {
+        item["id"]
+        for call in fake_service._freebusy.query_calls
+        for item in call["body"]["items"]
+    }
+    assert queried_emails == {"me@example.com"}
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_missing_scope_on_the_organizer_backfill_is_skipped_with_ignore_conflicts(
+    fake_service,
+):
+    """Regression test: the organizer-email backfill (resolving the
+    caller's own address when the event has no organizer info at all)
+    calls the same calendars().get(calendarId="primary") endpoint as the
+    all-day-timezone lookup, and must respect ignore_conflicts the same
+    way that sibling call site already does - a token missing
+    calendar.calendars.readonly must not hard-fail a call the caller
+    explicitly opted out of checking."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - triggers the backfill attempt.
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_non_scope_error_on_the_organizer_backfill_is_also_skipped_with_ignore_conflicts(
+    fake_service,
+):
+    """Companion to the test above: the backfill must forgive ANY failure
+    of calendars().get(), not just the specifically-recognized missing-
+    scope one - _primary_calendar_info re-raises any other HttpError
+    (rate limiting, a transient 5xx, an unrelated 403) unchanged rather
+    than converting it to InsufficientScopeError, and that's still "this
+    lookup couldn't run" every bit as much as a missing scope is."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - triggers the backfill attempt.
+    }
+    fake_service._calendars = FakeCalendars(
+        raise_error=HttpError(_HttpResponse(500), b'{"error": {"message": "boom"}}')
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_missing_scope_on_the_organizer_backfill_rejects_the_write_by_default(
+    fake_service,
+):
+    """Companion to the two tests above: without ignore_conflicts, a
+    missing-scope failure on the organizer-email backfill must reject
+    the write outright, same as its two sibling calendars().get() call
+    sites (the all-day-timezone lookup and the identity-fallback
+    comparison) already do - not silently proceed as if the caller had
+    opted out of the check."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        # No "organizer" field at all - triggers the backfill attempt.
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_organizer_self_true_needs_no_identity_api_call(
+    fake_service,
+):
+    """Companion to the test above: organizer.self=True must resolve
+    caller_is_organizer without an identity API call either, and let the
+    organizer-calendar check run normally."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com", "self": True},
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["1:1 with Hazel"]
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_on_someone_elses_event_still_catches_another_attendees_conflict(
+    fake_service,
+):
+    """Companion to the test above: the real organizer being unverifiable
+    must not swallow a genuinely different, checkable attendee's real
+    conflict."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "coworker@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T14:10:00+08:00",
+                            "end": "2026-08-27T14:20:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",
+            end_time="2026-08-27T14:30:00+08:00",
+            attendees=["coworker@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [c["calendar"] for c in result["conflicts"]] == ["coworker@example.com"]
+    assert set(result["unchecked_attendees"]) == {"boss@example.com"}
+
+
+def test_update_events_treats_existing_attendee_case_insensitively(fake_service):
+    """Regression test for a review finding: an existing attendee re-passed
+    with different casing must still be recognized as "already there" -
+    otherwise it's treated as newly-added, gets checked against the
+    unchanged window, and always self-conflicts on its own busy block for
+    this very event. Uses two DIFFERENT non-canonical casings (neither one
+    plain-lowercase, and the two not equal to each other without folding)
+    on the stored side vs. the resubmitted side - a fixture where either
+    side happens to already be lowercase can't tell a correct fold on
+    that side from a mutation that drops .lower() on it specifically,
+    since a dropped .lower() on an already-lowercase value is invisible."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "OLD@EXAMPLE.COM"}],
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                # This event's own busy block on the existing attendee's
+                # calendar - present so the test would fail with a false
+                # "conflict" if the case-insensitive exclusion regressed.
+                "old@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                },
+                "new@example.com": {"busy": []},
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["Old@Example.Com", "new@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    queried_emails = {
+        item["id"]
+        for call in fake_service._freebusy.query_calls
+        for item in call["body"]["items"]
+    }
+    assert queried_emails == {"new@example.com"}
+
+
+def test_update_events_reports_original_casing_in_conflicts(fake_service):
+    """Regression test: falling back to the event's existing attendees (no
+    attendees param passed) while moving the time must report a conflict
+    using the originally-stored casing, not the lowercased form used
+    internally for the case-insensitive membership check."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "John.Smith@Example.com"}],
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "john.smith@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["calendar"] == "John.Smith@Example.com"
+
+
+def test_update_events_moving_time_checks_organizer_and_all_attendees(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert len(fake_service._events.list_calls) == 1
+    queried_emails = {
+        item["id"]
+        for call in fake_service._freebusy.query_calls
+        for item in call["body"]["items"]
+    }
+    assert queried_emails == {"existing@example.com"}
+
+
+def test_update_events_rejects_a_reversed_window(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:30:00+08:00",
+            end_time="2026-08-27T10:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
+
+
+def test_freebusy_lookup_is_case_insensitive(fake_service):
+    """Not confirmed against real Google API behavior, but the lookup should
+    be defensive either way: a case-mismatched key must not silently
+    swallow a real conflict."""
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "Chelsea@Example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:00:00+08:00",
+                            "end": "2026-08-27T10:30:00+08:00",
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+
+
+def test_organizer_events_list_tolerates_null_items(fake_service):
+    """Regression test for a review finding: the API can return an explicit
+    "items": null instead of omitting the key, which must not crash the
+    tool with a TypeError."""
+    fake_service._events._list_result = {"items": None}
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_freebusy_tolerates_null_calendars(fake_service):
+    """Regression test for a review finding: freebusy.query can return an
+    explicit "calendars": null, which must not crash the tool with an
+    AttributeError."""
+    fake_service._freebusy = FakeFreebusy({"calendars": None})
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+    assert fake_service._events.insert_calls == []
+
+
+def test_update_events_ignore_conflicts_skips_the_check(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+    }
+    fake_service._events._list_result = {"items": [_confirmed_event()]}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_organizer_declined_but_opaque_event_is_still_a_conflict(fake_service):
+    """Google documents `responseStatus` and `transparency` as independent
+    fields with no guaranteed link - declining an invite doesn't reliably
+    clear its transparency, so a still-opaque declined event must still be
+    treated as busy rather than assumed free."""
+    event = _confirmed_event()
+    event["attendees"] = [
+        {"email": "me@example.com", "self": True, "responseStatus": "declined"}
+    ]
+    fake_service._events._list_result = {"items": [event]}
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+
+
+def test_organizer_declined_and_transparent_event_is_not_a_conflict(fake_service):
+    event = _confirmed_event(transparency="transparent")
+    event["attendees"] = [
+        {"email": "me@example.com", "self": True, "responseStatus": "declined"}
+    ]
+    fake_service._events._list_result = {"items": [event]}
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_organizer_accepted_event_is_still_a_conflict(fake_service):
+    event = _confirmed_event()
+    event["attendees"] = [
+        {"email": "me@example.com", "self": True, "responseStatus": "accepted"}
+    ]
+    fake_service._events._list_result = {"items": [event]}
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+
+
+def test_freebusy_missing_scope_rejects_the_write(fake_service):
+    """A whole-batch 403 means our own credential/scope is insufficient,
+    not that a particular attendee's calendar is merely invisible - proceed
+    would silently skip the entire conflict check, defeating the feature.
+    The write must be rejected rather than degraded to unchecked."""
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+def test_organizer_events_missing_scope_rejects_the_write(fake_service):
+    fake_service._events._list_error = _insufficient_scope_error()
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="1:1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["hazel@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "calendar.events permission" in result["message"]
+    assert "reconnect" in result["message"]
+    assert fake_service._events.insert_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
+def test_freebusy_missing_scope_rejects_the_write_even_with_ignore_conflicts_false(
+    fake_service,
+):
+    """`ignore_conflicts` is the caller's explicit escape hatch - without it,
+    a scope-insufficient 403 must reject rather than silently proceed."""
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+            ignore_conflicts=False,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+def test_freebusy_missing_scope_can_be_bypassed_with_ignore_conflicts(fake_service):
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.insert_calls) == 1
+
+
+def test_freebusy_missing_scope_still_reports_an_already_confirmed_conflict(
+    fake_service,
+):
+    """Regression test: a real conflict already confirmed before the scope
+    error hit (here, the organizer's own calendar, which doesn't need the
+    freebusy scope at all) must not be silently discarded just because a
+    later, unrelated attendee check then hit the same missing-scope 403 -
+    reporting a known conflict is always safe, and blindly rejecting
+    instead would tell the caller to retry with ignore_conflicts=true,
+    which would then book straight over the real conflict nobody ever
+    mentioned."""
+    fake_service._events._list_result = {"items": [_confirmed_event()]}
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert result["unchecked_attendees"] == ["chelsea@example.com"]
+    assert "reconnect" in result["check_error"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+def test_freebusy_missing_scope_legacy_only_body_still_rejects(fake_service):
+    """The dual-format body is what a real Calendar API 403 actually
+    carries, but a response with only the legacy `errors[]` field must
+    still be recognized - not just the newer `details[]` shape."""
+    fake_service._freebusy = FakeFreebusy(
+        raise_error=_legacy_only_insufficient_scope_error()
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            b'{"error": {"errors": [{"reason": "forbiddenForNonOrganizer"}]}}',
+            id="unrelated-reason",
+        ),
+        pytest.param(b"not json", id="malformed-body"),
+        pytest.param(
+            b'{"error": {"errors": true, "details": 42}}',
+            id="non-list-error-fields",
+        ),
+    ],
+)
+def test_is_insufficient_scope_error_rejects_unrecognized_bodies(content):
+    error = HttpError(_HttpResponse(403), content)
+
+    assert calendar._is_insufficient_scope_error(error) is False
+
+
+def test_freebusy_other_http_errors_still_propagate(fake_service):
+    """A 500 whose body happens to carry a scope-shaped reason must NOT be
+    treated as the missing-scope case - the gate is `status == 403` AND a
+    matching reason, not the reason alone. A body with no "errors"/
+    "details" field at all (as an arbitrary 500 body typically has) would
+    fail the reason check regardless of status, so it can't tell an
+    intact `status == 403` gate from a broken one; this fixture's body
+    would match the reason check, so it actually exercises the status
+    gate."""
+    other_error = HttpError(
+        _HttpResponse(500),
+        (
+            b'{"error": {"message": "boom", '
+            b'"errors": [{"reason": "insufficientPermissions"}]}}'
+        ),
+    )
+    fake_service._freebusy = FakeFreebusy(raise_error=other_error)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["chelsea@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" not in result["message"].lower()
+
+
+def test_organizer_events_non_scope_http_error_still_propagates(fake_service):
+    fake_service._events._list_error = HttpError(
+        _HttpResponse(403),
+        b'{"error": {"errors": [{"reason": "forbiddenForNonOrganizer"}]}}',
+    )
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" not in result["message"].lower()
+    assert fake_service._events.insert_calls == []
+
+
+def test_update_events_non_precondition_http_error_still_propagates(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "etag": '"version-1"',
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+    }
+    fake_service._events._update_error = HttpError(
+        _HttpResponse(500), b'{"error": {"message": "backend unavailable"}}'
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="self-1", summary="Renamed")
+    )
+
+    assert result["status"] == "error"
+    assert "backend unavailable" in result["message"].lower()
+    assert "changed while its availability was being checked" not in result["message"]
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_freebusy_attendee_absent_from_response_is_marked_unchecked(fake_service):
+    """An attendee simply missing from calendars (no entry at all, not even
+    an "errors" key) must not be silently reported as free."""
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Kickoff",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["ghost@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["ghost@example.com"]
+    assert fake_service._events.insert_calls == []
+
+
+def test_update_events_checks_conflicts_for_an_all_day_event(fake_service):
+    """Regression test: an all-day event stores its bounds under "date", not
+    "dateTime" - previously existing_start/existing_end came back None for
+    it, so the whole conflict check (and thus adding attendees) silently
+    skipped, even though sendUpdates="all" would still fire real invites.
+
+    Adding an attendee without moving the (all-day) window only checks the
+    newly-added attendee, same as the timed-event case - so this asserts
+    the freebusy query actually ran, with the date widened into a valid
+    RFC3339 bound, rather than an organizer-side conflict.
+    """
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "new@example.com": {
+                    "busy": [
+                        {"start": "2026-08-27T09:00:00Z", "end": "2026-08-27T10:00:00Z"}
+                    ]
+                }
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    # The fake calendar's own timezone also happens to be UTC, so a
+    # skipped lookup (needs_real_calendar_timezone wrongly False, falling
+    # through to the hardcoded "UTC" literal) would produce this exact
+    # same timeMin/timeMax undetected - assert the lookup actually ran,
+    # not just that its result looks right.
+    assert fake_service._calendars.get_calls
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["timeMin"] == "2026-08-27T00:00:00+00:00"
+    assert query_call["body"]["timeMax"] == "2026-08-28T00:00:00+00:00"
+
+
+def test_update_events_rejects_single_boundary_change_on_an_all_day_event(
+    fake_service,
+):
+    """Regression test: an all-day event's start/end are {"date": ...} -
+    writing only one of start_time/end_time would overwrite just that side
+    with {"dateTime": ...} while the other side keeps its {"date": ...}
+    shape, which Google rejects as a malformed mixed body. Must fail
+    loudly with an actionable message instead of sending that request."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "all-day" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_allows_replacing_both_boundaries_on_an_all_day_event(
+    fake_service,
+):
+    """Both start_time and end_time together are a full, unambiguous
+    replacement of an all-day event's bounds, so this must succeed."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {"items": []}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-29",
+            end_time="2026-08-31",
+        )
+    )
+
+    assert result["status"] == "success"
+    update_call = fake_service._events.update_calls[0]
+    assert update_call["body"]["start"] == {"date": "2026-08-29"}
+    assert update_call["body"]["end"] == {"date": "2026-08-31"}
+
+
+def test_update_events_widens_all_day_boundary_in_the_calendars_own_timezone(
+    fake_service,
+):
+    """Regression test: an all-day event's date is a day on the
+    *calendar's own* calendar, not a UTC day - hardcoding "T00:00:00Z"
+    shifts the queried window by the calendar's own UTC offset instead of
+    asking what timezone the calendar is actually configured in."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(timezone="Asia/Singapore")
+    fake_service._freebusy = FakeFreebusy(
+        {"calendars": {"new@example.com": {"busy": []}}}
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["timeMin"] == "2026-08-27T00:00:00+08:00"
+    assert query_call["body"]["timeMax"] == "2026-08-28T00:00:00+08:00"
+    assert fake_service._calendars.get_calls  # actually looked it up
+
+
+def test_update_events_organizer_only_new_attendee_on_all_day_event_widens_correctly(
+    fake_service,
+):
+    """Regression test: adding ONLY the organizer as a new attendee on an
+    all-day event, with the window otherwise unchanged, must still look
+    up the calendar's real timezone before checking their calendar - the
+    organizer-check that `organizer_newly_added` triggers on its own
+    (attendees_to_check ends up empty, the organizer is filtered out of
+    it) needs a correctly-widened window just as much as an ordinary new
+    attendee would, not one silently defaulted to UTC."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+        "organizer": {"email": "me@example.com"},
+    }
+    fake_service._calendars = FakeCalendars(timezone="Asia/Singapore")
+    fake_service._events._list_result = {"items": []}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["me@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls  # actually looked it up
+    list_call = fake_service._events.list_calls[0]
+    assert list_call["timeMin"] == "2026-08-27T00:00:00+08:00"
+    assert list_call["timeMax"] == "2026-08-28T00:00:00+08:00"
+
+
+def test_update_events_all_day_with_existing_attendees_resubmitted_unchanged_skips_the_timezone_lookup(
+    fake_service,
+):
+    """Regression test: an all-day event that already has attendees,
+    resubmitted with neither a new window nor new attendees (e.g. a
+    summary-only edit), must not trigger the calendar's real timezone
+    lookup at all - a resubmission that never moves the window makes any
+    retained attendee's delta segment trivially empty regardless of
+    timezone precision, so needs_real_calendar_timezone correctly stays
+    False here. Pins that this genuinely common "just editing the title"
+    case doesn't regress into an unnecessary API call (or a scope-403 for
+    a token that predates calendar.calendars.readonly, on an edit that
+    never needed timezone precision at all)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+
+
+def test_update_events_metadata_only_edit_on_someone_elses_event_skips_the_identity_lookup(
+    fake_service,
+):
+    """Regression test: caller_is_organizer must only be resolved (via a
+    calendars().get(calendarId="primary") call) when the organizer
+    actually needs (re)verifying at all (window_changed or
+    organizer_newly_added) - a metadata-only edit (here, just a summary
+    change) on an event with a different organizer must not pay for that
+    API call when nothing downstream would use its result."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "boss@example.com"}],
+        "organizer": {"email": "boss@example.com"},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_organizer_identity_comparison_is_case_insensitive(
+    fake_service,
+):
+    """Regression test: the caller-is-organizer comparison must fold case
+    on both sides - a mutation dropping either side's .lower() would pass
+    every other organizer-identity test in this file, since they all
+    happen to use already-lowercase addresses on both sides."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "Me@Example.com"},
+    }
+    fake_service._calendars = FakeCalendars(email="me@EXAMPLE.com")
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    # caller_is_organizer must resolve True despite the differing case,
+    # so the organizer conflict is found via "primary" (check_organizer)
+    # rather than the caller being wrongly treated as a different person
+    # (which would instead report "Me@Example.com" as unchecked).
+    assert result["status"] == "conflict"
+    assert [c["summary"] for c in result["conflicts"]] == ["1:1 with Hazel"]
+    assert result.get("unchecked_attendees", []) == []
+
+
+def test_update_events_all_day_with_a_different_organizer_shares_one_calendar_lookup(
+    fake_service,
+):
+    """Regression test: an all-day event whose organizer differs from the
+    caller needs BOTH the real calendar timezone (to widen the all-day
+    boundary) and the caller's own identity (to know they aren't the
+    organizer) - both come from the same calendars().get(calendarId=
+    "primary") call, so this must fire exactly once, not twice, and the
+    real organizer must still end up in unchecked_attendees using a
+    correctly-widened (non-UTC-defaulted) window."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+        "organizer": {"email": "boss@example.com"},
+    }
+    fake_service._calendars = FakeCalendars(
+        timezone="Asia/Singapore", email="me@example.com"
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-28",  # moves the all-day window
+            end_time="2026-08-29",
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert "2026-08-28T00:00:00+08:00 - 2026-08-29T00:00:00+08:00" in result["message"]
+    assert len(fake_service._calendars.get_calls) == 1
+    assert result["unchecked_attendees"] == ["boss@example.com"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_missing_scope_at_the_identity_check_rejects_the_write(
+    fake_service,
+):
+    """Regression test: the calendars.get call also drives caller-is-
+    organizer identity resolution (not just all-day timezone widening) -
+    a missing calendar.calendars.readonly scope must reject the write via
+    THIS call site too, on a plain timed event whose organizer differs
+    from the caller (needs_real_calendar_timezone stays False here, so
+    only the identity check would ever trigger this lookup)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+        "organizer": {"email": "boss@example.com"},
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_calendar_timezone_lookup_missing_scope_rejects_the_write(
+    fake_service,
+):
+    """The calendars.get call needed to widen an all-day boundary needs its
+    own calendar.calendars.readonly scope - a token that predates that
+    migration must reject the write outright, same as a missing
+    freebusy scope, rather than silently guessing at UTC."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_summary_only_edit_of_all_day_event_never_looks_up_calendar_timezone(
+    fake_service,
+):
+    """Regression test: a summary/location/description-only edit of an
+    all-day event never moves its window or touches attendees, so it has
+    no use for the calendar's real timezone - looking it up anyway would
+    needlessly block this benign edit behind a calendar.calendars.readonly
+    scope-403 for every pre-migration token, a far bigger blast radius
+    than the migration's stated purpose (all-day conflict checks)."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_calendar_timezone_lookup_missing_scope_falls_back_with_ignore_conflicts(
+    fake_service,
+):
+    """ignore_conflicts is the caller's explicit escape hatch - it must not
+    be defeated by an unrelated all-day-timezone-lookup failure; the
+    write still proceeds, just without a real calendar timezone."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-29",
+            end_time="2026-08-30",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_calendar_timezone_lookup_non_scope_error_also_falls_back_with_ignore_conflicts(
+    fake_service,
+):
+    """Companion to the test above: the timezone lookup must forgive ANY
+    failure of calendars().get(), not just the specifically-recognized
+    missing-scope one - a bare HttpError (rate limiting, a transient
+    5xx, an unrelated 403) is still "this lookup couldn't run" too, and
+    must not defeat ignore_conflicts either."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"date": "2026-08-27"},
+        "end": {"date": "2026-08-28"},
+        "attendees": [],
+    }
+    fake_service._calendars = FakeCalendars(
+        raise_error=HttpError(_HttpResponse(500), b'{"error": {"message": "boom"}}')
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-29",
+            end_time="2026-08-30",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_timed_event_never_looks_up_calendar_timezone(fake_service):
+    """The calendar-timezone lookup is only needed to widen an all-day
+    boundary - a plain timed-event update must not pay for it."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="self-1", summary="Renamed")
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls == []
+
+
+def test_update_events_partial_overlap_nudge_only_checks_the_new_delta_segment(
+    fake_service,
+):
+    """Regression test: nudging a meeting to a window that still overlaps
+    its old one (e.g. 10:00-10:30 -> 10:15-10:45) must only check existing
+    attendees against the genuinely new sliver (10:30-10:45) - the
+    retained 10:15-10:30 overlap still contains this event's own busy
+    block on their calendars, which isn't a real conflict. Checking the
+    delta segment (rather than skipping the check outright) still catches
+    a real conflict that happens to land in the newly-added time."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {"items": []}
+    # The fake, unlike the real freebusy.query endpoint, doesn't filter its
+    # configured busy blocks down to the requested [timeMin, timeMax) - so
+    # this leaves it empty and instead asserts directly on the query's
+    # timeMin/timeMax below. That's the actual behavior under our control;
+    # Google's own server is responsible for only returning busy blocks
+    # that overlap whatever window we send it.
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:15:00+08:00",
+            end_time="2026-08-27T10:45:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert len(fake_service._freebusy.query_calls) == 1
+    query_call = fake_service._freebusy.query_calls[0]
+    assert query_call["body"]["timeMin"] == "2026-08-27T10:30:00+08:00"
+    assert query_call["body"]["timeMax"] == "2026-08-27T10:45:00+08:00"
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_partial_overlap_nudge_still_catches_a_real_conflict(
+    fake_service,
+):
+    """The delta segment isn't just a smaller no-op window - a genuine
+    conflict that only exists in the newly-added time must still be
+    caught."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "existing@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T10:35:00+08:00",
+                            "end": "2026-08-27T10:40:00+08:00",
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:15:00+08:00",
+            end_time="2026-08-27T10:45:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["calendar"] == "existing@example.com"
+
+
+def test_update_events_disjoint_move_checks_existing_attendees(fake_service):
+    """The counterpart to the partial-overlap test: moving to a window
+    that's completely disjoint from the old one IS safe to check every
+    existing attendee against, since this event's own busy block can't
+    show up in a window it doesn't occupy."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(
+        {
+            "calendars": {
+                "existing@example.com": {
+                    "busy": [
+                        {
+                            "start": "2026-08-27T14:00:00+08:00",
+                            "end": "2026-08-27T14:30:00+08:00",
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["calendar"] == "existing@example.com"
+
+
+def test_update_events_empty_string_attendees_is_treated_as_not_provided(
+    fake_service,
+):
+    """Regression test: an accidental empty string (a stray default from a
+    template, or an LLM passing "" instead of omitting the argument) must
+    not be treated as a genuine attendees argument - attendees only ever
+    adds people, so there'd be nothing to add either way, but this
+    confirms the event's existing attendee data is left alone rather than
+    triggering any attendee-processing path at all."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com", "responseStatus": "accepted"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="self-1", attendees="")
+    )
+
+    assert result["status"] == "success"
+    update_call = fake_service._events.update_calls[0]
+    assert update_call["body"]["attendees"] == [
+        {"email": "existing@example.com", "responseStatus": "accepted"}
+    ]
+    assert update_call["sendUpdates"] == "none"
+
+
+def test_update_events_preserves_attendee_rsvp_state_on_resubmission(fake_service):
+    """Re-passing the same attendee list must not wipe responseStatus etc.
+    by replacing the whole array with bare {"email": ...} objects."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [
+            {
+                "email": "existing@example.com",
+                "responseStatus": "accepted",
+                "comment": "looking forward to it",
+            }
+        ],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            attendees=["existing@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    update_call = fake_service._events.update_calls[0]
+    assert update_call["body"]["attendees"] == [
+        {
+            "email": "existing@example.com",
+            "responseStatus": "accepted",
+            "comment": "looking forward to it",
+        }
+    ]
+    # Byte-identical resubmission is not a real change - no notification.
+    assert update_call["sendUpdates"] == "none"
+
+
+def test_update_events_treats_equivalent_timestamp_formats_as_unchanged(
+    fake_service,
+):
+    """A same-instant resubmission written in a different (but equivalent)
+    format must not be treated as a real time change - that would run the
+    organizer check on the same window and self-conflict."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T02:00:00+00:00"},
+        "end": {"dateTime": "2026-08-27T02:30:00+00:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",  # same instant, "Z"-free offset form
+            end_time="2026-08-27T10:30:00+08:00",
+            location="Room 4",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+    assert fake_service._events.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_update_events_summary_only_edit_never_revalidates_the_existing_window(
+    fake_service,
+):
+    """Regression test: an update that never touches start_time/end_time
+    isn't about to write any window at all, so it must not re-validate
+    the event's already-stored start/end - a zero-duration or malformed
+    pre-existing window (e.g. from another client/tool) would otherwise
+    reject an unrelated summary edit that never asked to change the
+    time."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:00:00+08:00"},  # zero-duration
+        "attendees": [],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            summary="Renamed",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_update_events_respects_sibling_timezone_on_an_offsetless_datetime(
+    fake_service,
+):
+    """Regression test: Google's own docs say dateTime "may" omit its
+    offset when a sibling timeZone field is present instead - treating
+    that offsetless value as if it belonged to some other zone (e.g. the
+    calendar's, or UTC) would misjudge a same-instant resubmission as a
+    real time change and run the organizer check against the event's own
+    now-"moved" window. The sibling zone here (Asia/Singapore, +08:00) is
+    deliberately NOT the code's own UTC fallback, so this only passes if
+    the sibling timeZone field is actually read rather than ignored -
+    falling back to UTC would compute a different instant and treat this
+    resubmission as a real move."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "Asia/Singapore"},
+        "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "Asia/Singapore"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T02:00:00+08:00",  # same instant, explicit offset
+            end_time="2026-08-27T02:30:00+08:00",
+            location="Room 4",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls == []
+    assert fake_service._freebusy.query_calls == []
+    assert fake_service._events.update_calls[0]["sendUpdates"] == "none"
+
+
+def test_update_events_missing_scope_rejects_the_write(fake_service):
+    """A whole-batch 403 while checking the newly-added attendee is our own
+    credential's problem, not a per-attendee visibility gap - with nothing
+    else already confirmed, the write must be rejected outright."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["outsider@gmail.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "reconnect" in result["message"].lower()
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_missing_scope_still_reports_an_already_confirmed_conflict(
+    fake_service,
+):
+    """Regression test: a real conflict already confirmed before the scope
+    error hit (here, the organizer's own calendar, which doesn't need the
+    freebusy scope at all) must not be silently discarded just because a
+    later, unrelated attendee check then hit the same missing-scope 403 -
+    reporting a known conflict is always safe, and blindly rejecting
+    instead would tell the caller to retry with ignore_conflicts=true,
+    which would then book straight over the real conflict nobody ever
+    mentioned."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["outsider@gmail.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert result["unchecked_attendees"] == ["outsider@gmail.com"]
+    assert "reconnect" in result["check_error"].lower()
+
+
+def test_update_events_missing_scope_on_retained_attendees_still_reports_the_first_calls_conflict(
+    fake_service,
+):
+    """Regression test for the multi-call accumulation path specifically
+    (as opposed to a single _find_conflicts call's own internal one): a
+    real conflict found by the FIRST call (organizer, via events.list,
+    which needs no extra scope) must survive being merged with a SECOND,
+    separate call's InsufficientScopeError (the retained-attendee delta
+    segment, via freebusy.query) at google_calendar_update_events' own
+    accumulation layer - not just within a single _find_conflicts call."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert result["unchecked_attendees"] == ["existing@example.com"]
+
+
+def test_update_events_missing_scope_in_first_call_still_checks_retained_attendees(
+    fake_service,
+):
+    """Regression test: when the FIRST _find_conflicts call (newly-added
+    attendees + organizer) raises InsufficientScopeError but already
+    carries an already-confirmed organizer conflict, the accumulation
+    layer must still attempt the SECOND call (retained attendees' delta
+    segments) rather than returning immediately - otherwise a retained
+    attendee is silently dropped from the response entirely: neither
+    reported as conflicting nor as unchecked, contradicting the whole
+    feature's guarantee that an unverified attendee is always surfaced."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T14:00:00+08:00",  # disjoint move
+            end_time="2026-08-27T14:30:00+08:00",
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "1:1 with Hazel"
+    assert set(result["unchecked_attendees"]) == {
+        "new@example.com",
+        "existing@example.com",
+    }
+
+
+def test_update_events_missing_scope_can_be_bypassed_with_ignore_conflicts(
+    fake_service,
+):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy(raise_error=_insufficient_scope_error())
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["outsider@gmail.com"],
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert len(fake_service._events.update_calls) == 1
+
+
+def test_update_events_conflict_response_still_reports_unchecked_attendees(
+    fake_service,
+):
+    """A conflict found via one source (the organizer's own calendar) must
+    not suppress unchecked_attendees info for a different attendee whose
+    calendar couldn't be read (absent from the freebusy response, a
+    per-attendee gap rather than a whole-batch 403) - a caller acting on
+    the conflict still needs to know that attendee was never actually
+    checked."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T09:30:00+08:00"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {
+        "items": [_confirmed_event(event_id="other-1")]
+    }
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T10:00:00+08:00",
+            end_time="2026-08-27T10:30:00+08:00",
+            attendees=["ghost@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["unchecked_attendees"] == ["ghost@example.com"]
+
+
+def test_update_events_widening_both_boundaries_does_not_duplicate_unchecked_attendees(
+    fake_service,
+):
+    """Regression test: widening a window on BOTH sides produces two
+    delta segments (window_delta_segments), and a retained attendee who's
+    unverifiable for a reason unrelated to which segment ran (here,
+    absent from every freebusy response) gets checked - and appended to
+    unchecked_attendees - once per segment, not once overall."""
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-27T10:00:00+08:00"},
+        "end": {"dateTime": "2026-08-27T10:30:00+08:00"},
+        "attendees": [{"email": "ghost@example.com"}],
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._freebusy = FakeFreebusy({"calendars": {}})
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27T09:45:00+08:00",  # widened earlier...
+            end_time="2026-08-27T10:45:00+08:00",  # ...and later
+        )
+    )
+
+    assert result["status"] == "conflict_check_incomplete"
+    assert result["unchecked_attendees"] == ["ghost@example.com"]
+    assert fake_service._events.update_calls == []
+
+
+def test_create_events_rejects_mixed_aware_and_naive_window_without_timezone(
+    monkeypatch,
+):
+    service = _fake_service({"id": "created"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_create_events(
+            summary="Ambiguous window",
+            start_time="2026-09-01T09:00:00",
+            end_time="2026-09-01T10:00:00Z",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must include a UTC offset" in result["message"]
+    service.events.return_value.insert.assert_not_called()
+
+
+def test_merge_recurrence_drops_a_lowercase_existing_rrule_line_too():
+    merged = calendar._merge_recurrence(["rrule:freq=daily"], "RRULE:FREQ=WEEKLY")
+    assert merged == ["RRULE:FREQ=WEEKLY"]
+
+
+def test_merge_recurrence_drops_a_parameterized_existing_rrule_line_too():
+    merged = calendar._merge_recurrence(
+        ["RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3"],
+        "RRULE:FREQ=WEEKLY;COUNT=2",
+    )
+    assert merged == ["RRULE:FREQ=WEEKLY;COUNT=2"]
+
+
+def test_merge_recurrence_keeps_an_existing_exrule_line_too():
+    """_merge_recurrence's own docstring and Google's recurrence field
+    both name EXRULE alongside EXDATE/RDATE as a line that must survive
+    replacing the RRULE - only ever exercised together with EXDATE/RDATE
+    before, never on its own."""
+    existing = ["RRULE:FREQ=DAILY", "EXRULE:FREQ=DAILY;BYDAY=SU"]
+    merged = calendar._merge_recurrence(existing, "RRULE:FREQ=WEEKLY")
+    assert merged == ["RRULE:FREQ=WEEKLY", "EXRULE:FREQ=DAILY;BYDAY=SU"]
+
+
+def test_merge_recurrence_replaces_the_rrule_but_keeps_other_lines():
+    existing = ["RRULE:FREQ=DAILY", "EXDATE:20260827T090000Z", "RDATE:20260830T090000Z"]
+    merged = calendar._merge_recurrence(existing, "RRULE:FREQ=WEEKLY")
+    assert merged == [
+        "RRULE:FREQ=WEEKLY",
+        "EXDATE:20260827T090000Z",
+        "RDATE:20260830T090000Z",
+    ]
+
+
+def test_merge_recurrence_with_no_existing_recurrence():
+    assert calendar._merge_recurrence(None, "RRULE:FREQ=WEEKLY") == [
+        "RRULE:FREQ=WEEKLY"
+    ]
+
+
+def test_recurrence_tzids_handles_case_whitespace_and_quoted_values():
+    assert calendar._recurrence_tzids(
+        [
+            'EXDATE; tzid = "Asia/Shanghai":20260902T090000',
+            "RDATE;TZID=America/Los_Angeles:20260903T090000",
+            "RRULE:FREQ=DAILY",
+        ]
+    ) == {"Asia/Shanghai", "America/Los_Angeles"}
+
+
+def test_recurrence_tzids_keeps_a_colon_inside_a_quoted_value():
+    assert calendar._recurrence_tzids(
+        ['EXDATE;TZID="Custom:Zone":20260902T090000']
+    ) == {"Custom:Zone"}
+
+
+def test_recurrence_tzids_ignores_semicolons_inside_quoted_parameter_values():
+    assert calendar._recurrence_tzids(
+        ['EXDATE;X-TEST="foo;TZID=Asia/Shanghai";TZID=America/New_York:20260902T090000']
+    ) == {"America/New_York"}
+
+
+def test_event_time_changed_treats_awareness_mismatch_as_a_change():
+    assert calendar._event_time_changed(
+        "2026-09-01T09:00:00Z",
+        "2026-09-01T09:00:00",
+        old_timezone=None,
+        new_timezone=None,
+    )
+
+
+def test_timezone_names_compare_case_insensitively_and_handle_none():
+    assert calendar._timezone_names_equal("Asia/Shanghai", "asia/shanghai")
+    assert calendar._timezone_names_equal(None, None)
+    assert not calendar._timezone_names_equal("UTC", None)
+
+
+def test_reject_nonpositive_event_window_reports_malformed_datetime():
+    with pytest.raises(ValueError, match="valid ISO 8601 dateTimes"):
+        calendar._reject_nonpositive_event_window(
+            "not-a-date",
+            "2026-08-26T08:00:00Z",
+            is_all_day=False,
+        )
+
+
+def test_update_events_adds_recurrence_to_a_previously_single_event(monkeypatch):
+    """Reproduces the reported bug: an event created as a single instance
+    must be convertible into a true recurring series via update, with the
+    RRULE actually reaching Google rather than only landing in
+    description text."""
+    existing_event = {
+        "id": "existing-1",
+        "summary": "Daily Catch up with Bright",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z"
+    ]
+
+
+def test_update_events_all_day_recurrence_with_bare_date_until_does_not_error(
+    monkeypatch,
+):
+    """Confirmed bug: a bare (no-time) UNTIL is the RFC 5545-correct value
+    type for a DATE (all-day) DTSTART - RFC 5545 requires UNTIL to match
+    DTSTART's own value type. The earlier fix for the "Z"-suffixed-UNTIL
+    case unconditionally localized the naive all-day anchor, which broke
+    this opposite, equally valid case by creating a NEW aware/naive
+    mismatch instead."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY;UNTIL=20260911"]
+
+
+def test_update_events_allows_duration_change_with_recurrence_exceptions(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-09-01T11:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["end"] == {
+        "dateTime": "2026-09-01T11:00:00",
+        "timeZone": "Asia/Shanghai",
+    }
+
+
+def test_update_events_allows_fully_specified_change_with_exceptions(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE:20260903T090000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="UTC",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "EXDATE:20260903T090000Z",
+    ]
+
+
+def test_update_events_matches_exception_tzid_case_insensitively(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=asia/shanghai:20260903T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.update.assert_called_once()
+
+
+def test_update_events_matches_semantically_equivalent_exception_timezone_alias(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00Z", "timeZone": "UTC"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Etc/UTC:20260903T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00Z",
+            end_time="2026-09-02T10:00:00Z",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="UTC",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "EXDATE;TZID=Etc/UTC:20260903T090000",
+    ]
+
+
+def test_timezone_name_comparison_falls_back_conservatively_for_opaque_names():
+    assert calendar._timezone_names_equal("Custom/Zone", "custom/zone")
+    assert not calendar._timezone_names_equal("Custom/Zone", "UTC")
+    assert not calendar._timezone_names_equal("Europe/Berlin", "Europe/Paris")
+    assert calendar._timezone_names_equal("utc", "Etc/UTC")
+
+
+def test_update_events_allows_metadata_update_on_mismatched_legacy_times(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T10:00:00Z"},
+        "end": {"date": "2026-09-02"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="Metadata only",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == existing_event["start"]
+    assert kwargs["body"]["end"] == existing_event["end"]
+
+
+def test_update_events_metadata_only_does_not_validate_a_legacy_dst_gap(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-03-08T02:30:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "end": {
+            "dateTime": "2026-03-08T03:30:00",
+            "timeZone": "America/Los_Angeles",
+        },
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="Metadata only",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == existing_event["start"]
+    assert body["end"] == existing_event["end"]
+
+
+def test_update_events_allows_metadata_update_with_malformed_recurrence(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T10:00:00Z"},
+        "end": {"dateTime": "2026-09-01T11:00:00Z"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3", None],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="Metadata only",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == existing_event["recurrence"]
+
+
+def test_update_events_allows_non_recurrence_changes_on_a_single_occurrence(
+    monkeypatch,
+):
+    """The recurringEventId guard is specifically about *setting*
+    recurrence on an occurrence - a plain reschedule/summary change on
+    one must still work normally."""
+    existing_event = {
+        "id": "instance-1",
+        "recurringEventId": "master-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "instance-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="instance-1",
+            summary="Rescheduled just this one",
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_update_events_rejects_repassing_same_end_with_incompatible_offset(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00Z", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-09-01T11:00:00+01:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end_time offset conflicts with timeZone 'UTC'" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_allows_repassing_the_same_start_with_exceptions(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=DAILY;COUNT=3",
+        "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+    ]
+
+
+def test_update_events_allows_unrelated_changes_on_a_zoneless_recurring_event(
+    monkeypatch,
+):
+    """Confirmed bug: the recurring-event timezone requirement fired for
+    *any* update to an already-recurring event, even one that never
+    touches start_time/end_time/recurrence at all - a plain title change
+    on an event that happens to have no timeZone (a pre-existing data
+    issue this call isn't making any worse) was rejected outright, never
+    even reaching events().update(). Must only apply when this call is
+    actually changing recurrence, timezone, or the event's start/end."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00"},
+        "end": {"dateTime": "2026-08-19T10:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="New title",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["summary"] == "New title"
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
+def test_update_events_rejects_equivalent_start_with_incompatible_offset(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00Z", "timeZone": "UTC"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE:20260903T090000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T10:00:00+01:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time offset conflicts with timeZone 'UTC'" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_derives_recurrence_start_from_all_day_events_date_field(
+    monkeypatch,
+):
+    """An all-day event has no "dateTime" (only "date") - recurrence must
+    still be derivable from that date without requiring the caller to
+    redundantly repeat start_time just because the event happens to be
+    all-day."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == ["RRULE:FREQ=DAILY"]
+
+
+def test_update_events_does_not_reuse_existing_timezone_when_new_value_has_own_offset(
+    monkeypatch,
+):
+    """Confirmed bug: a new start_time/end_time that already carries its
+    own UTC offset is fully self-describing - stamping a possibly-
+    different reused timeZone from the existing event on top of it
+    produces an internally-contradictory EventDateTime (e.g. "-07:00" in
+    dateTime alongside timeZone: "Asia/Manila", UTC+8)."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T09:00:00-07:00",
+            end_time="2026-08-27T09:15:00-07:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {"dateTime": "2026-08-27T09:00:00-07:00"}
+    assert kwargs["body"]["end"] == {"dateTime": "2026-08-27T09:15:00-07:00"}
+
+
+def test_update_events_does_not_revalidate_unchanged_cross_zone_start(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Manila"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20260911T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    def fail_if_revalidated(*_args, **_kwargs):
+        raise AssertionError(
+            "an unchanged start must not revalidate the retained RRULE"
+        )
+
+    monkeypatch.setattr(calendar, "_normalize_rrule", fail_if_revalidated)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-08-26T09:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.update.assert_called_once()
+
+
+def test_update_events_explicit_timezone_on_all_day_event_does_not_send_malformed_payload(
+    monkeypatch,
+):
+    """Confirmed bug: passing timezone while updating an all-day event
+    (with or without touching recurrence) used to unconditionally stamp
+    event["start"]/["end"] with timeZone before the all-day check, mixing
+    "date" and "timeZone" in the same object - a malformed EventDateTime.
+    timezone must still be usable to localize the UNTIL comparison for an
+    all-day event's recurrence, just never written into the payload."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "extra_kwargs",
+    [
+        {"notify_attendees": True},
+        {"attendees": []},
+        {"attendees": ["existing@example.com"]},
+    ],
+)
+def test_update_events_all_day_timezone_noop_variants_do_not_write(
+    monkeypatch, extra_kwargs
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+        "attendees": [{"email": "existing@example.com"}],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            **extra_kwargs,
+        )
+    )
+
+    assert result["status"] == "success"
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dateTime", 12345, "start boundary must be a string"),
+        ("timeZone", 12345, "start.timeZone must be a string"),
+    ],
+)
+def test_update_events_rejects_non_string_stored_boundary_fields(
+    monkeypatch, field, value, message
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T07:00:00",
+            "timeZone": "Asia/Shanghai",
+            field: value,
+        },
+        "end": {
+            "dateTime": "2026-08-26T08:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T08:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    assert "has no attribute" not in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_metadata_only_reports_non_string_boundary_cleanly(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": 12345},
+        "end": {"dateTime": "2026-08-26T08:00:00Z"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            summary="Metadata only",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start boundary must be a string" in result["message"]
+    assert "has no attribute" not in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_explicit_timezone_overrides_existing_one_on_reschedule(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T07:15:00",
+            timezone="America/New_York",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "America/New_York"
+    assert kwargs["body"]["end"]["timeZone"] == "America/New_York"
+
+
+def test_update_events_rejects_incompatible_timezone_on_existing_recurring_event(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T08:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset conflicts with timeZone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_one_offsetless_boundary_without_timezone(
+    monkeypatch,
+):
+    """A rule-only update cannot infer a missing offsetless boundary zone."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "only one offsetless boundary" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_ignores_timezone_for_all_day_recurrence_exceptions(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-09-01"},
+        "end": {"date": "2026-09-02"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;VALUE=DATE:20260903",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=DAILY;COUNT=3",
+        "EXDATE;VALUE=DATE:20260903",
+    ]
+    assert "timeZone" not in kwargs["body"]["start"]
+    assert "timeZone" not in kwargs["body"]["end"]
+
+
+def test_update_events_ignores_timezone_when_comparing_all_day_start(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-09-01"},
+        "end": {"date": "2026-09-02"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;VALUE=DATE:20260903",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["event"]["start"] == {"date": "2026-09-01"}
+    assert result["event"]["recurrence"] == existing_event["recurrence"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_preserves_existing_exdate_when_replacing_the_rrule(
+    monkeypatch,
+):
+    """Regression test: Google's `recurrence` field is a flat list of
+    RRULE/EXDATE/RDATE/EXRULE lines, not just the RRULE. Overwriting the
+    whole list with only the new RRULE would silently resurrect a
+    previously-cancelled single occurrence."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+        "recurrence": [
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+            "EXDATE:20260902T070000+08:00",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T07:00:00+08:00",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["recurrence"] == [
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+        "EXDATE:20260902T070000+08:00",
+    ]
+
+
+def test_update_events_preserves_existing_timezone_on_a_plain_reschedule(monkeypatch):
+    """Regression test: events().update() replaces the whole resource, so
+    rescheduling (start_time/end_time) without recurrence and without
+    re-passing timezone must not silently strip the event's existing
+    timeZone from Google's stored event - even though no recurrence logic
+    is involved in this call at all."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T07:15:00",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {
+        "dateTime": "2026-08-27T07:00:00",
+        "timeZone": "Asia/Manila",
+    }
+    assert kwargs["body"]["end"] == {
+        "dateTime": "2026-08-27T07:15:00",
+        "timeZone": "Asia/Manila",
+    }
+
+
+def test_update_events_rejects_a_naive_reschedule_of_a_recurring_event_with_no_zone_anywhere(
+    monkeypatch,
+):
+    """Confirmed bug: a naive (no-offset) reschedule of an already-
+    recurring event whose start/end have no timeZone at all used to
+    silently send an update with no timeZone whatsoever - the
+    contradiction guard above only fires for an offset-bearing move, and
+    the plain per-field reuse fallback had nothing to reuse. Must be
+    rejected and ask for an explicit timezone, the same as setting
+    recurrence for the first time on a zoneless event already is."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00"},
+        "end": {"dateTime": "2026-08-19T10:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00",
+            end_time="2026-09-01T10:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_a_non_dict_start_value(monkeypatch):
+    """Reject a corrupt start shape instead of forwarding it to Google."""
+    existing_event = {
+        "id": "existing-1",
+        "start": [1, 2, 3],
+        "end": {"dateTime": "2026-08-26T08:00:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing event start" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_a_reversed_mixed_offset_window(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T10:00:00Z"},
+        "end": {"dateTime": "2026-09-01T11:00:00Z"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-09-01T09:00:00",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after start" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_a_timezone_conflicting_with_exception_tzid(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00"},
+        "end": {"dateTime": "2026-09-01T10:00:00"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "conflicts with a TZID" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_validates_exception_tzid_before_conflict_checks(fake_service):
+    fake_service._events._get_result = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+        ],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-02T09:00:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "conflicts with a TZID" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_rejects_adding_timezone_with_floating_exception(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00"},
+        "end": {"dateTime": "2026-09-01T10:00:00"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE:20260902T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start_time, and timezone are supplied together" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_ambiguous_recurrence_only_replacement(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "RDATE:20261201T090000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;UNTIL=20260930T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert (
+        "unless recurrence, start_time, and timezone are supplied" in result["message"]
+    )
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize("field_name", ["start_time", "end_time"])
+def test_update_events_rejects_an_explicit_empty_event_time(monkeypatch, field_name):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-05T08:00:00+08:00"},
+        "end": {"dateTime": "2026-09-05T08:30:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            **{field_name: ""},
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "valid YYYY-MM-DD date or RFC3339 dateTime" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_an_invalid_timezone_even_without_recurrence(
+    monkeypatch,
+):
+    """Same fix as create_events: an invalid IANA timezone name must be
+    caught here directly, not only when recurrence is also set."""
+    service = _fake_service({"id": "existing-1"})
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Not/AZone",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recognized IANA zone name" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_bare_date_start_time_on_a_timed_event(monkeypatch):
+    """Confirmed bug: a bare date (no "T") passed as start_time on an
+    already-timed event flips is_all_day true for start alone, while end
+    (untouched) stays a "dateTime" - the same shape-mismatch class of bug
+    as the all-day case above, just approached from the opposite
+    direction and via undocumented misuse of start_time's RFC3339
+    contract."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T09:15:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start and end must use the same kind" in result["message"]
+    assert "supply both start_time and end_time" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_bare_date_until_on_a_timed_event(monkeypatch):
+    """Confirmed bug: fixing the all-day case above (a bare-date UNTIL
+    must be ACCEPTED for a DATE DTSTART) by only conditionally localizing
+    the anchor made a TIMED event's naive dateTime string (paired with a
+    separate timeZone field, not its own embedded offset) skip
+    localization too whenever UNTIL was also naive/bare-date - so the
+    mismatch (a DATE-TIME DTSTART needs an aware UNTIL) silently stopped
+    being caught for this one dtstart shape, even though it was still
+    correctly caught for an offset-carrying dtstart string. A bare-date
+    UNTIL must still be rejected for any timed event, regardless of
+    whether its dtstart string carries its own offset or relies on a
+    separate timeZone field."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "invalid recurrence rule" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_borrowing_a_timezone_for_an_aware_recurring_side(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00+08:00"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=5"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-09-01T11:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end's timeZone cannot be safely applied" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_datetime_until_for_all_day_recurrence(monkeypatch):
+    """RFC 5545 requires an all-day DATE start to use a DATE UNTIL."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "same DATE or DATE-TIME value type" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_end_time_only_on_an_all_day_event(monkeypatch):
+    """Confirmed bug: passing only end_time (a timed RFC3339 value) on an
+    all-day event left start as a bare "date" while end became a
+    "dateTime" - Google requires start and end to be the same kind, so
+    this mismatched payload would be rejected by the real API. Caught
+    here instead, with a clear error telling the caller to pass both."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            end_time="2026-08-28T10:00:00Z",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start and end must use the same kind" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_explicit_empty_recurrence(monkeypatch):
+    """Regression test: recurrence="" must not be silently treated the
+    same as not passing recurrence at all."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            recurrence="",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize("start_time", ["2026-02-30", "2026-2-3", "20260826"])
+def test_update_events_rejects_invalid_event_times(monkeypatch, start_time):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-09-05"},
+        "end": {"date": "2026-09-06"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time=start_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "valid YYYY-MM-DD date or RFC3339 dateTime" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_invalid_recurrence_without_calling_the_api(
+    monkeypatch,
+):
+    """Confirmed bug in the test itself: without an explicit timezone (and
+    an existing event with none either), the "timezone is required"
+    check fired first, so this test passed without ever actually
+    exercising recurrence validation - asserting only on
+    result["status"] would let it keep passing for a wrong reason."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=FORTNIGHTLY",
+            timezone="Asia/Shanghai",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "invalid recurrence rule" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_missing_start_for_timezone_update(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": None,
+        "end": {"date": "2026-09-02"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing event start" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_moving_a_recurring_events_start_to_a_new_offset_without_timezone(
+    monkeypatch,
+):
+    """Confirmed bug: moving a recurring event's start_time to a value
+    that carries its own UTC offset, without an explicit timezone, used
+    to silently reuse the event's stale pre-move zone - which may not
+    match the new offset at all - producing an internally contradictory
+    EventDateTime with no error. Must be rejected and ask for an explicit
+    timezone instead of guessing."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00-07:00",
+            end_time="2026-09-02T10:00:00",
+            recurrence="FREQ=DAILY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset conflicts with timeZone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("existing_event", "start_time", "end_time", "message"),
+    [
+        (
+            {
+                "id": "all-day",
+                "start": {"date": "2026-09-05"},
+                "end": {"date": "2026-09-06"},
+            },
+            "2026-09-06",
+            "2026-09-06",
+            "end_time is exclusive",
+        ),
+        (
+            {
+                "id": "timed",
+                "start": {"dateTime": "2026-09-05T08:00:00+08:00"},
+                "end": {"dateTime": "2026-09-05T08:30:00+08:00"},
+            },
+            "2026-09-05T10:00:00+08:00",
+            "2026-09-05T09:00:00+08:00",
+            "must be after start",
+        ),
+    ],
+)
+def test_update_events_rejects_nonpositive_rescheduled_ranges(
+    monkeypatch, existing_event, start_time, end_time, message
+):
+    service = _fake_service({"id": existing_event["id"]}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id=existing_event["id"],
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_recurrence_when_no_start_information_exists(
+    monkeypatch,
+):
+    """Neither "dateTime" nor "date" present on the existing event (a
+    malformed/unexpected shape) must still get a clear error instead of an
+    opaque TypeError from parsing None as a datetime."""
+    existing_event = {"id": "existing-1", "start": None, "end": None}
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing event start" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_recurrence_with_a_missing_end_key(monkeypatch):
+    """A schedule update must not forward an event without a required end."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": None,
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "existing event end" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_rescheduling_an_already_recurring_event_to_a_new_offset_without_timezone(
+    monkeypatch,
+):
+    """Confirmed bug: the same silent-stale-zone-reuse problem, but for a
+    *plain* reschedule (recurrence not repassed at all) of an event that
+    is already recurring - google_calendar_update_events doesn't clear an
+    existing recurrence just because this call omits the parameter, so
+    the outgoing request is still for a recurring event and still needs
+    a correct timeZone."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00-07:00",
+            end_time="2026-09-01T10:00:00-07:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset conflicts with timeZone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_setting_recurrence_on_a_single_occurrence(monkeypatch):
+    """google_calendar_search_events lists occurrences of a recurring
+    series with singleEvents=True, each carrying a recurringEventId
+    pointing at the actual series - passing one of those ids here with
+    recurrence set would target the wrong resource (the occurrence, not
+    the series) rather than doing what the caller almost certainly
+    intends. Must be rejected with a clear error instead of silently
+    sending Google a request against the wrong event."""
+    existing_event = {
+        "id": "instance-1",
+        "recurringEventId": "master-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "instance-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="instance-1",
+            recurrence="FREQ=DAILY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "single occurrence" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_shifting_recurrence_exceptions_between_timezones(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;COUNT=5",
+            "EXDATE;TZID=Asia/Shanghai:20260902T090000",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;COUNT=3",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "conflicts with a TZID" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_start_time_only_on_an_all_day_event(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T10:00:00Z",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "start and end must use the same kind" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_timezone_only_inverted_two_zone_window(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Tokyo"},
+        "end": {
+            "dateTime": "2026-09-01T09:30:00",
+            "timeZone": "America/Los_Angeles",
+        },
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must be after start" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_timezone_only_on_offset_event(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T08:00:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "cannot be combined with an offset-bearing" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_timezone_with_offset_without_recurrence(
+    monkeypatch,
+):
+    """Reject an explicit zone that could disagree with offset-bearing values."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "cannot be combined with an offset-bearing" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_unknown_existing_recurrence_property(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00Z"},
+        "end": {"dateTime": "2026-09-01T10:00:00Z"},
+        "recurrence": ["RRULE:FREQ=DAILY", "DTSTART:20260901T090000Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            timezone="UTC",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "unsupported property" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_reports_empty_recurrence_before_timezone(monkeypatch):
+    get_service = Mock()
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="   ",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recurrence rule must not be empty" in result["message"]
+    get_service.assert_not_called()
+
+
+def test_update_events_requires_timezone_when_recurrence_is_set_on_a_timed_event(
+    monkeypatch,
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_reschedules_an_already_recurring_event_with_a_naive_time_and_no_timezone(
+    monkeypatch,
+):
+    """The rejection above is specifically about a *new* value carrying
+    its own UTC offset - a naive (no-offset) reschedule of an
+    already-recurring event must still work by reusing the event's
+    existing zone, exactly as it did before recurrence existed as a
+    concept in this connector."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00",
+            end_time="2026-09-01T10:00:00",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Shanghai"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Shanghai"
+
+
+@pytest.mark.parametrize(
+    ("zone", "start_time", "end_time"),
+    [
+        (
+            "Asia/Shanghai",
+            "2026-09-02T09:00:00+08:00",
+            "2026-09-02T10:00:00+08:00",
+        ),
+        (
+            "America/Los_Angeles",
+            "2026-03-08T03:30:00-07:00",
+            "2026-03-08T04:30:00-07:00",
+        ),
+    ],
+)
+def test_update_events_reuses_matching_zone_for_offset_recurring_reschedule(
+    monkeypatch, zone, start_time, end_time
+):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-03-01T09:00:00-08:00", "timeZone": zone},
+        "end": {"dateTime": "2026-03-01T10:00:00-08:00", "timeZone": zone},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=10"],
+    }
+    if zone == "Asia/Shanghai":
+        existing_event["start"]["dateTime"] = "2026-09-01T09:00:00+08:00"
+        existing_event["end"]["dateTime"] = "2026-09-01T10:00:00+08:00"
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time=start_time,
+            end_time=end_time,
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["start"] == {"dateTime": start_time, "timeZone": zone}
+    assert body["end"] == {"dateTime": end_time, "timeZone": zone}
+
+
+def test_update_events_rejects_a_nonexistent_dst_gap_reschedule(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-03-01T09:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "end": {
+            "dateTime": "2026-03-01T10:00:00",
+            "timeZone": "America/Los_Angeles",
+        },
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=10"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-03-08T02:30:00",
+            end_time="2026-03-08T03:30:00",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "does not exist" in result["message"]
+    assert "daylight-saving transition" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_reschedules_an_already_recurring_event_with_an_explicit_timezone(
+    monkeypatch,
+):
+    """An explicit timezone confirms the caller's intent, so moving an
+    already-recurring event's start_time to a new offset-bearing value
+    must still succeed (and use the given zone) when timezone is passed,
+    even though the same move without one is rejected above."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-01T09:00:00-07:00",
+            end_time="2026-09-01T10:00:00-07:00",
+            timezone="America/Los_Angeles",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "America/Los_Angeles"
+    assert kwargs["body"]["end"]["timeZone"] == "America/Los_Angeles"
+
+
+def test_update_events_rejects_different_stored_timezones(monkeypatch):
+    """Adding recurrence must not silently collapse a cross-zone event."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T11:00:00", "timeZone": "America/Los_Angeles"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=WEEKLY;COUNT=3",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "different start and end timeZones" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_reuses_existing_timezone_even_when_moving_the_event(
+    monkeypatch,
+):
+    """Regression test: passing start_time (to move the event) together
+    with recurrence, but no explicit timezone, must still fall back to the
+    event's own existing timeZone - not be treated as if the event has
+    none just because start_time's reassignment happens to overwrite
+    event["start"] before the fallback is read."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27T07:00:00",
+            end_time="2026-08-27T07:15:00",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
+def test_update_events_reuses_the_existing_events_own_timezone(monkeypatch):
+    """When timezone isn't passed to the update, the event's own existing
+    timeZone must be reused rather than requiring the caller to repeat
+    it."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
+def test_update_events_revalidates_retained_until_after_start_moves(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20260905T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-09-10T09:00:00",
+            end_time="2026-09-10T10:00:00",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "is before the start time" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_rejects_recurrence_offset_timezone_conflict(
+    monkeypatch,
+):
+    """A rescheduled recurrence must use offsets matching its expansion zone."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-19T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-19T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00+08:00",
+            end_time="2026-08-26T10:00:00+08:00",
+            timezone="America/Los_Angeles",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "offset conflicts with timeZone" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_strips_whitespace_from_a_bare_date_before_sending_it(
+    monkeypatch,
+):
+    """Same fix as create_events: is_bare_date strips surrounding
+    whitespace to decide the shape, but the raw start_time/end_time used
+    to be written into the payload as-is."""
+    service = _fake_service(
+        {"id": "existing-1"},
+        existing_event={
+            "id": "existing-1",
+            "start": {"date": "2026-09-04"},
+            "end": {"date": "2026-09-05"},
+        },
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="  2026-09-05  ",
+            end_time="  2026-09-06  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-09-05"}
+    assert kwargs["body"]["end"] == {"date": "2026-09-06"}
+
+
+def test_update_events_strips_whitespace_from_timed_values(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-09-05T08:00:00+08:00"},
+        "end": {"dateTime": "2026-09-05T08:30:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="  2026-09-05T09:00:00+08:00  ",
+            end_time="  2026-09-05T09:30:00+08:00  ",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["dateTime"] == "2026-09-05T09:00:00+08:00"
+    assert kwargs["body"]["end"]["dateTime"] == "2026-09-05T09:30:00+08:00"
+
+
+def test_update_events_survives_an_explicit_none_start_and_end(monkeypatch):
+    """A malformed fetched event carrying "start"/"end" as an explicit
+    None (as opposed to missing the key entirely, covered above) used to
+    raise AttributeError/TypeError: `event.get("start", {})` and
+    `event.setdefault("start", {})` both only fall back to {} when the
+    key is *absent*, not when it's present with a None value."""
+    existing_event = {"id": "existing-1", "start": None, "end": None}
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T07:00:00",
+            end_time="2026-08-26T08:00:00",
+            timezone="Asia/Manila",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"]["timeZone"] == "Asia/Manila"
+    assert kwargs["body"]["end"]["timeZone"] == "Asia/Manila"
+
+
+def test_update_events_timezone_does_not_make_datetime_until_valid_for_all_day_recurrence(
+    monkeypatch,
+):
+    """An IANA timezone does not change an all-day DTSTART's DATE type."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            timezone="Asia/Shanghai",
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "same DATE or DATE-TIME value type" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_treats_blank_timezone_as_not_provided(monkeypatch):
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T07:15:00+08:00"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            recurrence="FREQ=DAILY",
+            timezone="  ",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone is required" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_validate_recurrence_rejects_a_non_list_existing_value():
+    with pytest.raises(ValueError, match="existing event recurrence must be a list"):
+        calendar._validated_recurrence_lines("RRULE:FREQ=DAILY")
+
+
+def test_validate_recurrence_rejects_a_non_string_existing_line():
+    """Never silently forward or drop malformed recurrence properties."""
+    with pytest.raises(ValueError, match="unsupported property"):
+        calendar._validated_recurrence_lines(
+            ["RRULE:FREQ=DAILY", None, "EXDATE:20260827T090000Z"]
+        )
+
+
+def test_validate_recurrence_rejects_an_empty_tzid():
+    with pytest.raises(ValueError, match="TZID parameter must not be empty"):
+        calendar._validated_recurrence_lines(
+            ["RRULE:FREQ=DAILY", "EXDATE;TZID=:20260902T090000"]
+        )
+
+
+def test_update_events_timezone_only_checks_the_reinterpreted_window(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {
+        "items": [
+            {
+                "id": "other-1",
+                "summary": "New-zone conflict",
+                "start": {"dateTime": "2026-09-01T09:15:00Z"},
+                "end": {"dateTime": "2026-09-01T09:45:00Z"},
+            }
+        ]
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(event_id="self-1", timezone="UTC")
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["summary"] == "New-zone conflict"
+    assert fake_service._events.list_calls[0]["timeMin"] == "2026-09-01T09:00:00+00:00"
+    assert fake_service._events.list_calls[0]["timeMax"] == "2026-09-01T10:00:00+00:00"
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_normalizes_naive_replacements_for_conflict_check(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "attendees": [],
+    }
+    fake_service._events._list_result = {"items": []}
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-09-02T12:00:00",
+            end_time="2026-09-02T13:00:00",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._events.list_calls[0]["timeMin"] == "2026-09-02T12:00:00+00:00"
+    assert fake_service._events.list_calls[0]["timeMax"] == "2026-09-02T13:00:00+00:00"
+
+
+def test_update_events_recurrence_change_requires_explicit_conflict_bypass(
+    fake_service,
+):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-09-01T09:00:00", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-09-01T10:00:00", "timeZone": "UTC"},
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            recurrence="FREQ=WEEKLY;COUNT=4",
+            timezone="UTC",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "every occurrence" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_recurring_timezone_change_requires_conflict_bypass(
+    fake_service,
+):
+    fake_service._events._get_result = {
+        "id": "series-1",
+        "start": {
+            "dateTime": "2026-09-01T09:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-09-01T10:00:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    }
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="series-1",
+            timezone="Asia/Tokyo",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "changing its timezone" in result["message"]
+    assert fake_service._events.list_calls == []
+    assert fake_service._events.update_calls == []
+
+
+def test_update_events_rejects_converting_all_day_with_existing_exdate_and_new_recurrence(
+    monkeypatch,
+):
+    """Confirmed bug: converting a recurring timed event to all-day (or
+    vice versa) while also replacing its recurrence rule used to carry a
+    preserved EXDATE/RDATE line forward verbatim - still typed for the
+    OLD kind (a DATE-TIME value with a time-of-day and "Z") even though
+    the event's DTSTART is now DATE-only, an RFC 5545 value-type mismatch
+    sent to Google in a single call. Must be rejected rather than send
+    the mismatched payload."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-03-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-03-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [
+            "RRULE:FREQ=DAILY;UNTIL=20261231T235959Z",
+            "EXDATE:20260302T090000Z",
+        ],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-03-02",
+            end_time="2026-03-03",
+            recurrence="FREQ=DAILY;COUNT=10",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "conversion is not supported" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+def test_update_events_allows_converting_all_day_and_recurrence_with_no_stale_lines(
+    monkeypatch,
+):
+    """The rejection above is specifically about a stale EXDATE/RDATE
+    line surviving a value-type change - a plain RRULE (nothing else to
+    preserve) converting kind in the same call is unaffected."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-03-01T09:00:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-03-01T10:00:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20261231T235959Z"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-03-02",
+            end_time="2026-03-03",
+            recurrence="FREQ=DAILY;COUNT=10",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+
+
+def test_update_events_converts_all_day_event_to_timed_when_both_are_provided(
+    monkeypatch,
+):
+    """The one legitimate way to convert an all-day event to a timed one:
+    both start_time and end_time given together, so start/end stay the
+    same kind throughout."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"},
+        "end": {"date": "2026-08-27"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00",
+            end_time="2026-08-26T10:00:00",
+            timezone="Asia/Shanghai",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {
+        "dateTime": "2026-08-26T09:00:00",
+        "timeZone": "Asia/Shanghai",
+    }
+    assert kwargs["body"]["end"] == {
+        "dateTime": "2026-08-26T10:00:00",
+        "timeZone": "Asia/Shanghai",
+    }
+
+
+def test_update_events_converts_a_timed_event_to_all_day_when_both_are_provided(
+    monkeypatch,
+):
+    """Confirmed bug: the mirror direction of the test above. A bare-date
+    start_time/end_time (converting an existing TIMED event to all-day)
+    used to still be written under the "dateTime" key - producing
+    {"dateTime": "2026-08-27", "timeZone": "Asia/Shanghai"}, a value
+    that's neither valid RFC3339 nor a legitimate all-day EventDateTime
+    (all-day events never carry timeZone). Must be written under "date",
+    with no timeZone."""
+    existing_event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-08-26T08:00:00", "timeZone": "Asia/Manila"},
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-27",
+            end_time="2026-08-28",
+        )
+    )
+
+    assert result["status"] == "success"
+    _, kwargs = service.events.return_value.update.call_args
+    assert kwargs["body"]["start"] == {"date": "2026-08-27"}
+    assert kwargs["body"]["end"] == {"date": "2026-08-28"}
+
+
+def test_timed_to_all_day_conversion_checks_the_calendar_timezone(fake_service):
+    fake_service._events._get_result = {
+        "id": "self-1",
+        "start": {"dateTime": "2026-08-26T09:00:00+08:00"},
+        "end": {"dateTime": "2026-08-26T10:00:00+08:00"},
+    }
+    fake_service._events._list_result = {"items": []}
+    fake_service._calendars = FakeCalendars(timezone="Asia/Singapore")
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="self-1",
+            start_time="2026-08-27",
+            end_time="2026-08-28",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert fake_service._calendars.get_calls
+    conflict_query = fake_service._events.list_calls[0]
+    assert conflict_query["timeMin"] == "2026-08-27T00:00:00+08:00"
+    assert conflict_query["timeMax"] == "2026-08-28T00:00:00+08:00"
+
+
+@pytest.mark.parametrize("all_day", [False, True])
+@pytest.mark.parametrize("replacement", [None, "FREQ=DAILY;COUNT=3"])
+@pytest.mark.parametrize("property_name", ["EXDATE", "RDATE", "EXRULE"])
+def test_kind_conversion_rejects_preserved_exception_lines(
+    monkeypatch, all_day, replacement, property_name
+):
+    exception = (
+        "EXRULE:FREQ=WEEKLY"
+        if property_name == "EXRULE"
+        else f"{property_name};VALUE=DATE:20260827"
+        if all_day
+        else f"{property_name}:20260827T010000Z"
+    )
+    event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"}
+        if all_day
+        else {"dateTime": "2026-08-26T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"date": "2026-08-27"}
+        if all_day
+        else {"dateTime": "2026-08-26T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3", exception],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00+08:00" if all_day else "2026-08-26",
+            end_time="2026-08-26T10:00:00+08:00" if all_day else "2026-08-27",
+            timezone="Asia/Shanghai",
+            recurrence=replacement,
+            ignore_conflicts=True,
+        )
+    )
+    assert result["status"] == "error"
+    assert "conversion is not supported" in result["message"]
+    service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize("all_day", [False, True])
+@pytest.mark.parametrize("replace_rule", [False, True])
+def test_kind_conversion_validates_until_against_the_new_kind(
+    monkeypatch, all_day, replace_rule
+):
+    old_rule = "RRULE:FREQ=DAILY;UNTIL=" + (
+        "20260930" if all_day else "20260930T235959Z"
+    )
+    new_rule = "RRULE:FREQ=DAILY;UNTIL=" + (
+        "20260930T235959Z" if all_day else "20260930"
+    )
+    event = {
+        "id": "existing-1",
+        "start": {"date": "2026-08-26"}
+        if all_day
+        else {"dateTime": "2026-08-26T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"date": "2026-08-27"}
+        if all_day
+        else {"dateTime": "2026-08-26T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": [old_rule],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26T09:00:00+08:00" if all_day else "2026-08-26",
+            end_time="2026-08-26T10:00:00+08:00" if all_day else "2026-08-27",
+            timezone="Asia/Shanghai",
+            recurrence=new_rule if replace_rule else None,
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+    if replace_rule:
+        assert result["status"] == "success"
+        body = service.events.return_value.update.call_args.kwargs["body"]
+        assert body["recurrence"] == [new_rule]
+        assert ("dateTime" in body["start"]) == all_day
+        assert ("dateTime" in body["end"]) == all_day
+    else:
+        assert result["status"] == "error"
+        assert "UNTIL" in result["message"]
+        service.events.return_value.update.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY;COUNT=3",
+        "FREQ=DAILY;BYHOUR=9",
+        "FREQ=DAILY;BYMINUTE=30",
+        "FREQ=DAILY;BYSECOND=10",
+    ],
+)
+def test_kind_conversion_revalidates_retained_rule(monkeypatch, rule):
+    event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-08-26T10:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "recurrence": ["RRULE:" + rule],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+    if "COUNT" in rule:
+        assert result["status"] == "success"
+        body = service.events.return_value.update.call_args.kwargs["body"]
+        assert body["recurrence"] == event["recurrence"]
+        assert body["start"] == {"date": "2026-08-26"}
+        assert body["end"] == {"date": "2026-08-27"}
+    else:
+        assert result["status"] == "error"
+        assert "must not be used with an all-day DATE start" in result["message"]
+        service.events.return_value.update.assert_not_called()
+
+
+def test_kind_conversion_allows_parameterized_rrule(monkeypatch):
+    event = {
+        "id": "existing-1",
+        "start": {
+            "dateTime": "2026-08-26T09:00:00+08:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "end": {
+            "dateTime": "2026-08-26T10:00:00+08:00",
+            "timeZone": "Asia/Shanghai",
+        },
+        "recurrence": ["RRULE;X-CUSTOM=provider:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    body = service.events.return_value.update.call_args.kwargs["body"]
+    assert body["recurrence"] == event["recurrence"]
+    assert body["start"] == {"date": "2026-08-26"}
+    assert body["end"] == {"date": "2026-08-27"}
+
+
+def test_kind_conversion_requires_risk_ack_when_midnight_values_compare_equal(
+    monkeypatch,
+):
+    event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T00:00:00"},
+        "end": {"dateTime": "2026-08-27T00:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "acknowledge_recurring_exception_risk=True" in result["message"]
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_not_called()
+
+
+def test_kind_conversion_validates_retained_rule_when_midnight_values_compare_equal(
+    monkeypatch,
+):
+    event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T00:00:00"},
+        "end": {"dateTime": "2026-08-27T00:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20260930T235959"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "UNTIL" in result["message"]
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# google_calendar_respond_to_event (accept / decline / tentative an invite)
+# ---------------------------------------------------------------------------
+
+_RSVP_ME = {
+    "email": "me@example.com",
+    "self": True,
+    "responseStatus": "needsAction",
+    "displayName": "Me",
+}
+_RSVP_ALICE = {
+    "email": "alice@example.com",
+    "organizer": True,
+    "responseStatus": "accepted",
+    "comment": "See you",
+}
+_RSVP_BOB = {
+    "email": "bob@example.com",
+    "responseStatus": "tentative",
+    "optional": True,
+}
+_RSVP_INVITE = {
+    "id": "evt1",
+    "status": "confirmed",
+    "organizer": {"email": "alice@example.com"},
+    "attendees": [_RSVP_ALICE, _RSVP_ME, _RSVP_BOB],
+}
+
+
+def _assert_respond_wrote_nothing(service: Mock) -> None:
+    events = service.events.return_value
+    events.patch.assert_not_called()
+    events.update.assert_not_called()
+    events.insert.assert_not_called()
+    events.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("response", ["accepted", "declined", "tentative"])
+def test_respond_to_event_normal_invitee_patches_only_own_entry(monkeypatch, response):
+    execute_result = {"id": "evt1", "status": "confirmed"}
+    service = _fake_service(execute_result, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response=response)
+    )
+
+    assert result["status"] == "success"
+    assert result["event"] == execute_result
+    events = service.events.return_value
+    events.get.assert_called_once_with(calendarId="primary", eventId="evt1")
+    events.patch.assert_called_once_with(
+        calendarId="primary",
+        eventId="evt1",
+        body={
+            "attendees": [{**_RSVP_ME, "responseStatus": response}],
+            "attendeesOmitted": True,
+        },
+        sendUpdates="all",
+    )
+    events.update.assert_not_called()
+    events.insert.assert_not_called()
+    events.delete.assert_not_called()
+
+
+def test_respond_to_event_notify_organizer_false_sends_no_updates(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", notify_organizer=False
+    )
+
+    _, kwargs = service.events.return_value.patch.call_args
+    assert kwargs["sendUpdates"] == "none"
+    assert kwargs["body"] == {
+        "attendees": [{**_RSVP_ME, "responseStatus": "accepted"}],
+        "attendeesOmitted": True,
+    }
+
+
+def test_respond_to_event_normalizes_response_case_and_whitespace(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(event_id="evt1", response=" Declined ")
+
+    body = service.events.return_value.patch.call_args.kwargs["body"]
+    assert body["attendees"] == [{**_RSVP_ME, "responseStatus": "declined"}]
+
+
+def test_respond_to_event_writes_a_given_comment(monkeypatch):
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="tentative", comment="  Please send an agenda  "
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {
+        **_RSVP_ME,
+        "responseStatus": "tentative",
+        "comment": "Please send an agenda",
+    }
+
+
+@pytest.mark.parametrize("comment", ["", "   ", None])
+def test_respond_to_event_clears_an_existing_comment_when_the_response_changes(
+    monkeypatch, comment
+):
+    """An old note (for example the reason for a previous decline) must not
+    stay attached to a different reply, and passing no comment is the only way
+    to ask for that, so the patch clears it explicitly."""
+    own_entry = {**_RSVP_ME, "comment": "Original note"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", comment=comment
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {**own_entry, "responseStatus": "accepted", "comment": ""}
+
+
+def test_respond_to_event_writes_a_new_comment_when_the_response_changes(monkeypatch):
+    own_entry = {**_RSVP_ME, "comment": "Original note"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="declined", comment="  Another time  "
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {
+        **own_entry,
+        "responseStatus": "declined",
+        "comment": "Another time",
+    }
+
+
+def test_respond_to_event_preserves_the_requested_existing_comment_on_new_response(
+    monkeypatch,
+):
+    own_entry = {
+        **_RSVP_ME,
+        "responseStatus": "tentative",
+        "comment": "Original note",
+    }
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", comment="Original note"
+    )
+
+    assert service.events.return_value.patch.call_args.kwargs["body"] == {
+        "attendees": [
+            {
+                **own_entry,
+                "responseStatus": "accepted",
+                "comment": "Original note",
+            }
+        ],
+        "attendeesOmitted": True,
+    }
+
+
+def test_respond_to_event_preserves_the_other_fields_of_the_own_entry(monkeypatch):
+    own_entry = {
+        "email": "me@example.com",
+        "self": True,
+        "responseStatus": "needsAction",
+        "displayName": "Me",
+        "optional": True,
+        "additionalGuests": 2,
+    }
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    fetched_event = service.events.return_value.get.return_value.execute.return_value
+    fetched_before = copy.deepcopy(fetched_event)
+
+    calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+
+    body = service.events.return_value.patch.call_args.kwargs["body"]
+    assert body["attendees"] == [{**own_entry, "responseStatus": "accepted"}]
+    assert fetched_event == fetched_before
+
+
+@pytest.mark.parametrize(
+    "response", ["maybe", "needsAction", "accept", "", "   ", None]
+)
+def test_respond_to_event_rejects_an_invalid_response_before_any_api_call(
+    monkeypatch, response
+):
+    get_service = Mock(
+        return_value=_fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response=response)
+    )
+
+    assert result["status"] == "error"
+    assert "response must be one of accepted, declined, tentative" in result["message"]
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize("event_id", ["", "   "])
+def test_respond_to_event_rejects_an_empty_event_id_before_any_api_call(
+    monkeypatch, event_id
+):
+    get_service = Mock(
+        return_value=_fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", get_service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id=event_id, response="accepted"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "event_id" in result["message"]
+    get_service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "existing_event",
+    [
+        {
+            "id": "evt1",
+            "status": "confirmed",
+            "organizer": {"email": "alice@example.com"},
+            "attendees": [_RSVP_ALICE, _RSVP_BOB],
+        },
+        {
+            "id": "evt1",
+            "status": "confirmed",
+            "organizer": {"email": "alice@example.com"},
+            "attendees": [],
+        },
+    ],
+)
+def test_respond_to_event_rejects_a_caller_who_is_not_an_attendee(
+    monkeypatch, existing_event
+):
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "not an attendee" in result["message"]
+    assert "Google Calendar" in result["message"]
+    assert "never adds the user as an attendee" in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize(
+    ("existing_event", "notify_organizer"),
+    [
+        # organizer.self on the event object; no attendee list at all.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+            },
+            True,
+        ),
+        # organizer.self; only the organizer's own attendee entry.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [{**_RSVP_ME, "organizer": True}],
+            },
+            True,
+        ),
+        # organizer.self; the organizer's own entry and another guest.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            True,
+        ),
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            False,
+        ),
+        # organizer.self; other guests and no own attendee entry.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com", "self": True},
+                "attendees": [_RSVP_ALICE, _RSVP_BOB],
+            },
+            True,
+        ),
+        # No organizer.self; only the own attendee entry says organizer: True.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com"},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            True,
+        ),
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com"},
+                "attendees": [{**_RSVP_ME, "organizer": True}, _RSVP_BOB],
+            },
+            False,
+        ),
+        # No organizer.self; the own entry is the only attendee.
+        (
+            {
+                "id": "evt1",
+                "status": "confirmed",
+                "organizer": {"email": "me@example.com"},
+                "attendees": [{**_RSVP_ME, "organizer": True}],
+            },
+            True,
+        ),
+    ],
+)
+def test_respond_to_event_rejects_the_organizer(
+    monkeypatch, existing_event, notify_organizer
+):
+    """A reply only applies to an invitation someone else organized: the
+    organizer cannot accept, decline or tentatively accept their own meeting
+    through this tool, whether the signal is organizer.self or the own attendee
+    entry's organizer flag."""
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id="evt1",
+            response="accepted",
+            notify_organizer=notify_organizer,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "organizer" in result["message"]
+    assert "google_calendar_delete_events" in result["message"]
+    assert "not an attendee" not in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_respond_to_event_reports_an_unknown_event_id(monkeypatch, status):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    content = f'{{"error":{{"code":{status},"message":"Not Found"}}}}'.encode()
+    service.events.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    with pytest.raises(ToolError) as excinfo:
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+
+    assert "evt1" in str(excinfo.value)
+    assert "not found" in str(excinfo.value).lower()
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_respond_to_event_reports_a_non_not_found_http_error_from_get(
+    monkeypatch, status
+):
+    """Only 404/410 get the friendly "not found" message; every other read
+    failure becomes a failed tool call and never reaches the patch."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    content = f'{{"error":{{"code":{status},"message":"Request failed"}}}}'.encode()
+    service.events.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    with pytest.raises(ToolError) as excinfo:
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+
+    assert f"HTTP {status}" in str(excinfo.value)
+    assert "Request failed" in str(excinfo.value)
+    service.events.return_value.get.assert_called_once()
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_skips_a_duplicate_reply(monkeypatch):
+    """Retrying the same reply must not patch again, or every retry sends the
+    organizer another RSVP notification."""
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    fetched_event = service.events.return_value.get.return_value.execute.return_value
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "success"
+    assert result["changed"] is False
+    assert "No reply was sent" in result["message"]
+    assert result["event"] == fetched_event
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_skips_a_duplicate_reply_with_the_same_comment(monkeypatch):
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted", "comment": "Sounds good"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id="evt1", response="accepted", comment="Sounds good"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["changed"] is False
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_writes_a_new_comment_without_changing_the_response(
+    monkeypatch,
+):
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", comment="Bringing slides"
+    )
+
+    entry = service.events.return_value.patch.call_args.kwargs["body"]["attendees"][0]
+    assert entry == {
+        **own_entry,
+        "responseStatus": "accepted",
+        "comment": "Bringing slides",
+    }
+
+
+def test_respond_to_event_rejects_a_cancelled_event(monkeypatch):
+    existing_event = {**_RSVP_INVITE, "status": "cancelled"}
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    )
+
+    assert result["status"] == "error"
+    assert "cancelled" in result["message"]
+    _assert_respond_wrote_nothing(service)
+
+
+@pytest.mark.parametrize(
+    ("event_id", "existing_event"),
+    [
+        (
+            "abc_20261021T070000Z",
+            {
+                "id": "abc_20261021T070000Z",
+                "status": "confirmed",
+                "recurringEventId": "abc",
+                "organizer": {"email": "alice@example.com"},
+                "attendees": [_RSVP_ALICE, _RSVP_ME, _RSVP_BOB],
+            },
+        ),
+        (
+            "abc",
+            {
+                "id": "abc",
+                "status": "confirmed",
+                "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=3"],
+                "organizer": {"email": "alice@example.com"},
+                "attendees": [_RSVP_ALICE, _RSVP_ME, _RSVP_BOB],
+            },
+        ),
+    ],
+)
+def test_respond_to_event_uses_the_given_id_for_an_occurrence_or_a_series(
+    monkeypatch, event_id, existing_event
+):
+    service = _fake_service({"id": event_id}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_respond_to_event(
+            event_id=event_id, response="accepted"
+        )
+    )
+
+    assert result["status"] == "success"
+    events = service.events.return_value
+    events.get.assert_called_once_with(calendarId="primary", eventId=event_id)
+    events.patch.assert_called_once_with(
+        calendarId="primary",
+        eventId=event_id,
+        body={
+            "attendees": [{**_RSVP_ME, "responseStatus": "accepted"}],
+            "attendeesOmitted": True,
+        },
+        sendUpdates="all",
+    )
+    events.instances.assert_not_called()
+
+
+async def _call_respond_to_event_over_mcp(arguments):
+    """Call the registered handler through a real MCP client session."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async with create_connected_server_and_client_session(
+        calendar.mcp._mcp_server
+    ) as session:
+        return await session.call_tool("google_calendar_respond_to_event", arguments)
+
+
+@pytest.mark.parametrize("failure_point", ["get", "patch"])
+async def test_respond_to_event_provider_failure_is_a_safe_failed_mcp_call(
+    monkeypatch, failure_point
+):
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
+    )
+
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    provider_error = HttpError(
+        _HttpResponse(403),
+        b'{"error":{"code":403,"message":"Calendar permission denied"}}',
+        uri="https://www.googleapis.com/calendar/v3/events/evt1?key=private-value",
+    )
+    if failure_point == "get":
+        service.events.return_value.get.return_value.execute.side_effect = (
+            provider_error
+        )
+    else:
+        service.events.return_value.patch.return_value.execute.side_effect = (
+            provider_error
+        )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = await _call_respond_to_event_over_mcp(
+        {"event_id": "evt1", "response": "accepted"}
+    )
+
+    assert result.isError is True
+    assert "HTTP 403" in result.content[0].text
+    assert "Calendar permission denied" in result.content[0].text
+    assert "private-value" not in result.content[0].text
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is False
+    if failure_point == "get":
+        _assert_respond_wrote_nothing(service)
+    else:
+        service.events.return_value.patch.assert_called_once()
+
+
+@pytest.mark.parametrize("status", [404, 410])
+async def test_respond_to_event_not_found_is_a_failed_mcp_call(monkeypatch, status):
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
+    )
+
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    content = f'{{"error":{{"code":{status},"message":"Not Found"}}}}'.encode()
+    service.events.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = await _call_respond_to_event_over_mcp(
+        {"event_id": "evt1", "response": "accepted"}
+    )
+
+    assert result.isError is True
+    assert "evt1" in result.content[0].text
+    assert "not found" in result.content[0].text.lower()
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is False
+    _assert_respond_wrote_nothing(service)
+
+
+async def test_respond_to_event_duplicate_reply_is_a_successful_mcp_noop(monkeypatch):
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted", "comment": "Sounds good"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = await _call_respond_to_event_over_mcp(
+        {
+            "event_id": "evt1",
+            "response": "accepted",
+            "comment": "Sounds good",
+        }
+    )
+
+    assert result.isError is False
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "success"
+    assert payload["changed"] is False
+    _assert_respond_wrote_nothing(service)
+
+
+def test_respond_to_event_is_registered_with_the_documented_parameters():
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_respond_to_event")
+
+    assert tool is not None
+    properties = tool.parameters["properties"]
+    assert set(properties) == {"event_id", "response", "comment", "notify_organizer"}
+    assert tool.parameters["required"] == ["event_id", "response"]
+    assert properties["comment"]["default"] == ""
+    assert properties["notify_organizer"]["default"] is True
+
+
+def test_respond_to_event_description_covers_the_rules_the_model_must_follow():
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_respond_to_event")
+    description = " ".join(tool.description.split())
+
+    assert "explicitly asked" in description
+    assert "accepted" in description
+    assert "declined" in description
+    assert "tentative" in description
+    assert "never adds the user as an attendee" in description
+    assert "not the same as deleting the event" in description
+    assert "recurringEventId" in description
+    assert "primary calendar" in description
+    assert "google_calendar_delete_events" in description
+    assert '"changed": false' in description
+    assert "duplicate reply" in description
+
+
+# --- google_calendar_search_events: local time zone and rescheduled instances ---
+#
+# The searched calendar's time zone must come from the events.list response
+# itself: search must not call calendars().get(), because that endpoint needs a
+# metadata permission older grants may not have. Nested fixtures deliberately
+# pair a different organizer timeZone with the response zone, and the
+# search-service helpers are local to these tests so the shared _fake_service
+# (built for event writes) keeps its existing behavior.
+
+_SEARCH_FIELDS = ("local_start", "local_end", "local_timezone", "rescheduled")
+
+
+def _search_service(
+    events: list[dict],
+    *,
+    response_timezone: str | None = "Asia/Manila",
+) -> Mock:
+    """A stand-in Calendar service for google_calendar_search_events.
+
+    events().list().execute() returns the `events` items plus the calendar's
+    top-level `timeZone`, which is where search reads the searched calendar's
+    zone from; response_timezone=None omits it (the zone-missing case). The
+    default zone is not UTC so a hardcoded UTC cannot pass by accident, and the
+    calendars().get() mock returns an obviously different zone so a regression
+    that calls it cannot match the expected local fields. The tests also assert
+    calendars().get() was never called.
+    """
+    service = Mock()
+    response: dict = {"items": events}
+    if response_timezone is not None:
+        response["timeZone"] = response_timezone
+    service.events.return_value.list.return_value = Mock(
+        execute=Mock(return_value=response)
+    )
+    service.calendars.return_value.get.return_value = Mock(
+        execute=Mock(return_value={"id": "member@example.com", "timeZone": "UTC"})
+    )
+    return service
+
+
+def _search_result(monkeypatch, service: Mock, **kwargs: Any) -> dict:
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+    return json.loads(calendar.google_calendar_search_events(**kwargs))
+
+
+def _search_events(monkeypatch, events: list[dict], **kwargs: Any) -> tuple[Mock, dict]:
+    service = _search_service(events)
+    return service, _search_result(monkeypatch, service, **kwargs)
+
+
+def _events_by_id(result: dict) -> dict:
+    return {event["id"]: event for event in result["events"]}
+
+
+def _assert_original_fields_kept(returned: dict, original: dict) -> None:
+    """The normalized event is the raw event plus exactly the four small
+    fields, with every original value unchanged."""
+    assert set(returned) == set(original) | set(_SEARCH_FIELDS)
+    for key, value in original.items():
+        assert returned[key] == value
+
+
+def test_search_events_reports_local_wall_time_for_a_cross_zone_organizer(
+    monkeypatch,
+):
+    event = {
+        "id": "instance-1",
+        "summary": "Daily Standup - Support",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {
+            "dateTime": "2026-10-23T06:15:00+08:00",
+            "timeZone": "Australia/Sydney",
+        },
+        "end": {
+            "dateTime": "2026-10-23T06:45:00+08:00",
+            "timeZone": "Australia/Sydney",
+        },
+        "originalStartTime": {
+            "dateTime": "2026-10-23T06:15:00+08:00",
+            "timeZone": "Australia/Sydney",
+        },
+    }
+    fixture = copy.deepcopy(event)
+
+    _, result = _search_events(monkeypatch, [event])
+
+    assert result["status"] == "success"
+    assert len(result["events"]) == 1
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2026-10-23T06:15:00+08:00"
+    assert normalized["local_end"] == "2026-10-23T06:45:00+08:00"
+    assert normalized["local_timezone"] == "Asia/Manila"
+    assert normalized["rescheduled"] is False
+    _assert_original_fields_kept(normalized, fixture)
+    assert event == fixture
+
+
+@pytest.mark.parametrize(
+    ("original_start", "current_start", "expected"),
+    [
+        ("2026-10-22T06:15:00+08:00", "2026-10-23T06:15:00+08:00", True),
+        ("2026-10-23T07:15:00+08:00", "2026-10-23T06:15:00+08:00", True),
+        ("2026-10-23T06:15:00+08:00", "2026-10-23T06:15:00+08:00", False),
+    ],
+)
+def test_search_events_marks_only_a_moved_instance_rescheduled(
+    monkeypatch, original_start, current_start, expected
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": current_start},
+        "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        "originalStartTime": {"dateTime": original_start},
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    assert result["events"][0]["rescheduled"] is expected
+    assert result["events"][0]["start"] == {"dateTime": current_start}
+
+
+@pytest.mark.parametrize(
+    ("original_start", "current_start", "expected"),
+    [
+        # Same instant written with two different offsets.
+        ("2026-10-22T22:15:00Z", "2026-10-23T06:15:00+08:00", False),
+        # Same instant with "Z" vs "+00:00" and fractional seconds.
+        ("2026-10-23T06:15:00.000+00:00", "2026-10-23T06:15:00Z", False),
+        # Same clock digits in different offsets are different instants.
+        ("2026-10-23T06:15:00+00:00", "2026-10-23T06:15:00+08:00", True),
+    ],
+)
+def test_search_events_compares_instance_starts_by_instant_not_text(
+    monkeypatch, original_start, current_start, expected
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": current_start},
+        "end": {"dateTime": "2026-10-23T08:15:00+08:00"},
+        "originalStartTime": {"dateTime": original_start},
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    assert result["events"][0]["rescheduled"] is expected
+
+
+def test_search_events_resolves_offsetless_times_with_their_own_time_zone(
+    monkeypatch,
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-10-23T06:15:00", "timeZone": "Australia/Sydney"},
+        "end": {"dateTime": "2026-10-23T06:45:00", "timeZone": "Australia/Sydney"},
+        # 2026-10-23T06:15 in Sydney (UTC+11 in October) is the same instant.
+        "originalStartTime": {"dateTime": "2026-10-22T19:15:00Z"},
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2026-10-23T03:15:00+08:00"
+    assert normalized["local_end"] == "2026-10-23T03:45:00+08:00"
+    assert normalized["local_timezone"] == "Asia/Manila"
+    assert normalized["rescheduled"] is False
+
+
+def test_search_events_compares_offsetless_times_in_their_own_time_zones(
+    monkeypatch,
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-10-23T06:15:00", "timeZone": "Asia/Manila"},
+        "end": {"dateTime": "2026-10-23T07:15:00", "timeZone": "Asia/Manila"},
+        # Same clock digits in Sydney is a different instant in October.
+        "originalStartTime": {
+            "dateTime": "2026-10-23T06:15:00",
+            "timeZone": "Australia/Sydney",
+        },
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2026-10-23T06:15:00+08:00"
+    assert normalized["rescheduled"] is True
+
+
+def test_search_events_falls_back_to_the_calendar_zone_for_offsetless_times(
+    monkeypatch,
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-10-23T06:15:00"},
+        "end": {"dateTime": "2026-10-23T06:45:00"},
+        "originalStartTime": {"dateTime": "2026-10-23T06:15:00"},
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2026-10-23T06:15:00+08:00"
+    assert normalized["local_end"] == "2026-10-23T06:45:00+08:00"
+    assert normalized["rescheduled"] is False
+
+
+@pytest.mark.parametrize(
+    ("calendar_timezone", "start", "end", "expected_start", "expected_end"),
+    [
+        (
+            "Asia/Manila",
+            "2026-10-22T22:15:00Z",
+            "2026-10-22T23:15:00Z",
+            "2026-10-23T06:15:00+08:00",
+            "2026-10-23T07:15:00+08:00",
+        ),
+        # Cross-day conversion; October is daylight time in New York.
+        (
+            "America/New_York",
+            "2026-10-24T02:00:00Z",
+            "2026-10-24T03:00:00Z",
+            "2026-10-23T22:00:00-04:00",
+            "2026-10-23T23:00:00-04:00",
+        ),
+        # After the November transition the same zone is on standard time.
+        (
+            "America/New_York",
+            "2026-11-05T14:00:00Z",
+            "2026-11-05T15:00:00Z",
+            "2026-11-05T09:00:00-05:00",
+            "2026-11-05T10:00:00-05:00",
+        ),
+    ],
+)
+def test_search_events_uses_the_searched_calendar_time_zone(
+    monkeypatch, calendar_timezone, start, end, expected_start, expected_end
+):
+    event = {
+        "id": "instance-1",
+        "summary": "Planning",
+        "status": "confirmed",
+        # The organizer's zone deliberately differs from the calendar's.
+        "start": {"dateTime": start, "timeZone": "Asia/Tokyo"},
+        "end": {"dateTime": end, "timeZone": "Asia/Tokyo"},
+    }
+    service = _search_service([event], response_timezone=calendar_timezone)
+
+    result = _search_result(monkeypatch, service)
+
+    normalized = result["events"][0]
+    assert normalized["local_timezone"] == calendar_timezone
+    assert normalized["local_start"] == expected_start
+    assert normalized["local_end"] == expected_end
+    assert normalized["rescheduled"] is False
+    assert "timeZone" not in service.events.return_value.list.call_args.kwargs
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_keeps_all_day_dates_and_flags_only_date_moves(monkeypatch):
+    events = [
+        {
+            "id": "all-day-1",
+            "summary": "Holiday",
+            "status": "confirmed",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+        },
+        {
+            "id": "instance-1",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+        {
+            "id": "instance-2",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"date": "2026-10-22"},
+        },
+    ]
+    fixture = copy.deepcopy(events)
+
+    _, result = _search_events(monkeypatch, events)
+
+    by_id = _events_by_id(result)
+    all_day = by_id["all-day-1"]
+    assert all_day["local_start"] == "2026-10-23"
+    assert all_day["local_end"] == "2026-10-24"
+    assert all_day["local_timezone"] == "Asia/Manila"
+    assert all_day["rescheduled"] is False
+    assert "T" not in all_day["local_start"]
+    assert "T" not in all_day["local_end"]
+    unmoved = by_id["instance-1"]
+    assert unmoved["local_start"] == "2026-10-23"
+    assert unmoved["local_end"] == "2026-10-24"
+    assert unmoved["rescheduled"] is False
+    moved = by_id["instance-2"]
+    assert moved["local_start"] == "2026-10-23"
+    assert moved["local_end"] == "2026-10-24"
+    assert moved["rescheduled"] is True
+    for event in result["events"]:
+        original = next(item for item in fixture if item["id"] == event["id"])
+        _assert_original_fields_kept(event, original)
+
+
+def test_search_events_compares_all_day_instances_by_date_not_midnight(monkeypatch):
+    """Pacific/Apia skipped 2011-12-30, so the local midnights of 30 Dec and
+    31 Dec are the same instant; the calendar dates are still different."""
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"date": "2011-12-31"},
+        "end": {"date": "2012-01-01"},
+        "originalStartTime": {"date": "2011-12-30"},
+    }
+    service = _search_service([event], response_timezone="Pacific/Apia")
+
+    result = _search_result(monkeypatch, service)
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2011-12-31"
+    assert normalized["local_end"] == "2012-01-01"
+    assert normalized["local_timezone"] == "Pacific/Apia"
+    assert normalized["rescheduled"] is True
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_local_start"),
+    [
+        (
+            {
+                "id": "instance-1",
+                "status": "confirmed",
+                "recurringEventId": "series-1",
+                "start": {"dateTime": "2026-10-23T00:00:00+08:00"},
+                "end": {"dateTime": "2026-10-23T01:00:00+08:00"},
+                "originalStartTime": {"date": "2026-10-23"},
+            },
+            "2026-10-23T00:00:00+08:00",
+        ),
+        (
+            {
+                "id": "instance-2",
+                "status": "confirmed",
+                "recurringEventId": "series-2",
+                "start": {"date": "2026-10-23"},
+                "end": {"date": "2026-10-24"},
+                "originalStartTime": {"dateTime": "2026-10-23T00:00:00+08:00"},
+            },
+            "2026-10-23",
+        ),
+    ],
+)
+def test_search_events_treats_all_day_and_timed_kind_changes_as_rescheduled(
+    monkeypatch, event, expected_local_start
+):
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] == expected_local_start
+    assert normalized["rescheduled"] is True
+
+
+@pytest.mark.parametrize(
+    ("timed_boundary", "response_timezone"),
+    [
+        ({"dateTime": "not-a-time"}, "Asia/Manila"),
+        ({"dateTime": "2026-03-08T02:30:00"}, "America/New_York"),
+        (
+            {"dateTime": "2026-10-23T06:15:00", "timeZone": "Not/AZone"},
+            "Asia/Manila",
+        ),
+        ({"dateTime": "2026-10-23T06:15:00"}, "Not/AZone"),
+    ],
+)
+def test_search_events_keeps_unresolvable_mixed_kind_boundaries_false(
+    monkeypatch, timed_boundary, response_timezone
+):
+    """A kind change is a reschedule only when the timed side resolves to a
+    real instant. A timed side that cannot be resolved (malformed value, a
+    daylight-saving gap, an unknown sibling zone, or no sibling plus an
+    unknown calendar zone) keeps the flag False in both directions."""
+    events = [
+        {
+            "id": "timed-current",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": dict(timed_boundary),
+            "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+        {
+            "id": "timed-original",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": dict(timed_boundary),
+        },
+    ]
+    service = _search_service(events, response_timezone=response_timezone)
+
+    result = _search_result(monkeypatch, service)
+
+    by_id = _events_by_id(result)
+    assert by_id["timed-current"]["rescheduled"] is False
+    assert by_id["timed-original"]["rescheduled"] is False
+    assert by_id["timed-current"]["start"] == dict(timed_boundary)
+    assert by_id["timed-original"]["originalStartTime"] == dict(timed_boundary)
+    assert by_id["timed-current"]["local_start"] is None
+
+
+def test_search_events_keeps_valid_mixed_kind_changes_without_a_usable_calendar_zone(
+    monkeypatch,
+):
+    """An offset-bearing timed boundary is a real instant even when the
+    calendar's reported zone cannot be resolved, so a valid kind change stays
+    true and only the timed local wall times are null."""
+    events = [
+        {
+            "id": "timed-current",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+        {
+            "id": "timed-original",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"dateTime": "2026-10-23T00:00:00+08:00"},
+        },
+    ]
+    service = _search_service(events, response_timezone="Not/AZone")
+
+    result = _search_result(monkeypatch, service)
+
+    by_id = _events_by_id(result)
+    assert by_id["timed-current"]["rescheduled"] is True
+    assert by_id["timed-original"]["rescheduled"] is True
+    assert by_id["timed-current"]["local_start"] is None
+    assert by_id["timed-original"]["local_start"] == "2026-10-23"
+
+
+def test_search_events_does_not_compare_an_original_start_without_a_current_start(
+    monkeypatch,
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    normalized = result["events"][0]
+    assert normalized["local_start"] is None
+    assert normalized["rescheduled"] is False
+
+
+@pytest.mark.parametrize(
+    "original_start",
+    [
+        None,
+        {},
+        "2026-10-23T06:15:00+08:00",
+        {"dateTime": "not-a-time"},
+        {"date": "2026-02-30"},
+    ],
+)
+def test_search_events_does_not_treat_unusable_original_starts_as_moves(
+    monkeypatch, original_start
+):
+    event = {
+        "id": "instance-1",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        "originalStartTime": original_start,
+    }
+
+    _, result = _search_events(monkeypatch, [event])
+
+    assert result["events"][0]["rescheduled"] is False
+
+
+def test_search_events_does_not_treat_an_invalid_all_day_date_as_a_move(monkeypatch):
+    events = [
+        {
+            "id": "invalid-original-date",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"date": "2026-02-30"},
+        },
+        {
+            "id": "invalid-current-date",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"date": "2026-02-30"},
+            "end": {"date": "2026-03-01"},
+            "originalStartTime": {"date": "2026-10-23"},
+        },
+    ]
+
+    _, result = _search_events(monkeypatch, events)
+
+    by_id = _events_by_id(result)
+    assert by_id["invalid-original-date"]["local_start"] == "2026-10-23"
+    assert by_id["invalid-original-date"]["rescheduled"] is False
+    assert by_id["invalid-current-date"]["local_start"] is None
+    assert by_id["invalid-current-date"]["rescheduled"] is False
+
+
+def test_search_events_handles_an_unresolvable_calendar_time_zone(monkeypatch):
+    events = [
+        {
+            "id": "timed",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+        },
+        {
+            "id": "all-day",
+            "status": "confirmed",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+        },
+        {
+            "id": "moved-all-day",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"date": "2026-10-23"},
+            "end": {"date": "2026-10-24"},
+            "originalStartTime": {"date": "2026-10-22"},
+        },
+        {
+            "id": "moved-timed",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-22T06:15:00+08:00"},
+        },
+        {
+            "id": "unmoved-timed",
+            "status": "confirmed",
+            "recurringEventId": "series-3",
+            "start": {"dateTime": "2026-10-23T06:15:00Z"},
+            "end": {"dateTime": "2026-10-23T06:45:00Z"},
+            "originalStartTime": {"dateTime": "2026-10-23T14:15:00+08:00"},
+        },
+    ]
+    service = _search_service(events, response_timezone="Not/AZone")
+
+    result = _search_result(monkeypatch, service)
+
+    assert result["status"] == "success"
+    by_id = _events_by_id(result)
+    assert by_id["timed"]["local_timezone"] == "Not/AZone"
+    assert by_id["timed"]["local_start"] is None
+    assert by_id["timed"]["local_end"] is None
+    assert by_id["timed"]["rescheduled"] is False
+    assert by_id["all-day"]["local_start"] == "2026-10-23"
+    assert by_id["all-day"]["local_end"] == "2026-10-24"
+    assert by_id["moved-all-day"]["rescheduled"] is True
+    # Offset-bearing timed starts compare as instants even when the calendar
+    # zone itself cannot be resolved and the local wall time is null.
+    assert by_id["moved-timed"]["local_start"] is None
+    assert by_id["moved-timed"]["rescheduled"] is True
+    assert by_id["unmoved-timed"]["rescheduled"] is False
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_does_not_infer_rescheduled_from_series_or_time(monkeypatch):
+    events = [
+        {
+            "id": "plain",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        },
+        {
+            "id": "past-instance",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-19T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-19T07:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-19T06:15:00+08:00"},
+        },
+        {
+            "id": "next-instance",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-26T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-26T07:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-26T06:15:00+08:00"},
+        },
+        {
+            "id": "changed-end",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T09:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        },
+        {
+            "id": "tentative",
+            "status": "tentative",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        },
+    ]
+
+    _, result = _search_events(monkeypatch, events)
+
+    for event in result["events"]:
+        assert event["rescheduled"] is False
+    assert _events_by_id(result)["tentative"]["status"] == "tentative"
+
+
+def test_search_events_returns_an_empty_list_unchanged(monkeypatch):
+    service = _search_service([])
+
+    result = _search_result(monkeypatch, service)
+
+    assert result == {"status": "success", "events": []}
+    service.events.return_value.list.assert_called_once_with(
+        calendarId="primary",
+        maxResults=10,
+        singleEvents=True,
+        orderBy="startTime",
+    )
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_reads_the_calendar_time_zone_from_the_list_response(
+    monkeypatch,
+):
+    event = {
+        "id": "evt-1",
+        "start": {"date": "2026-10-23"},
+        "end": {"date": "2026-10-24"},
+    }
+    service = _search_service([event])
+
+    result = _search_result(monkeypatch, service)
+
+    assert result["events"][0]["local_timezone"] == "Asia/Manila"
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_passes_query_window_and_max_results(monkeypatch):
+    service = _search_service([])
+
+    _search_result(
+        monkeypatch,
+        service,
+        query="standup",
+        time_min="2026-10-22T13:00:00Z",
+        time_max="2026-10-23T13:00:00Z",
+        max_results=5,
+    )
+
+    service.events.return_value.list.assert_called_once_with(
+        calendarId="primary",
+        maxResults=5,
+        singleEvents=True,
+        orderBy="startTime",
+        q="standup",
+        timeMin="2026-10-22T13:00:00Z",
+        timeMax="2026-10-23T13:00:00Z",
+    )
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_preserves_every_original_field(monkeypatch):
+    event = {
+        "id": "evt-9",
+        "summary": "Payload",
+        "description": "An agenda long enough to matter" * 5,
+        "location": "Room 1",
+        "status": "confirmed",
+        "htmlLink": "https://example.com/event",
+        "created": "2026-10-01T00:00:00Z",
+        "updated": "2026-10-02T00:00:00Z",
+        "iCalUID": "uid@example.com",
+        "sequence": 3,
+        "colorId": "5",
+        "transparency": "opaque",
+        "visibility": "default",
+        "recurringEventId": "series-1",
+        "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        "start": {
+            "dateTime": "2026-10-23T06:15:00+08:00",
+            "timeZone": "Australia/Sydney",
+        },
+        "end": {
+            "dateTime": "2026-10-23T06:45:00+08:00",
+            "timeZone": "Australia/Sydney",
+        },
+        "attendees": [
+            {"email": "alice@example.com", "responseStatus": "accepted"},
+            {"email": "bob@example.com", "optional": True},
+        ],
+        "organizer": {"email": "organizer@example.com", "self": False},
+        "extendedProperties": {"private": {"key": "value"}},
+        "reminders": {"useDefault": True},
+    }
+    fixture = copy.deepcopy(event)
+
+    _, result = _search_events(monkeypatch, [event])
+
+    assert set(result) == {"status", "events"}
+    assert result["events"][0] == {
+        **fixture,
+        "local_start": "2026-10-23T06:15:00+08:00",
+        "local_end": "2026-10-23T06:45:00+08:00",
+        "local_timezone": "Asia/Manila",
+        "rescheduled": False,
+    }
+    assert event == fixture
+
+
+def test_search_events_keeps_event_order_and_count(monkeypatch):
+    first = {
+        "id": "first",
+        "start": {"dateTime": "2026-10-23T09:00:00+08:00"},
+        "end": {"dateTime": "2026-10-23T10:00:00+08:00"},
+    }
+    second = {
+        "id": "second",
+        "start": {"dateTime": "2026-10-23T11:00:00+08:00"},
+        "end": {"dateTime": "2026-10-23T12:00:00+08:00"},
+    }
+
+    _, result = _search_events(monkeypatch, [second, first])
+
+    assert [event["id"] for event in result["events"]] == ["second", "first"]
+    assert len(result["events"]) == 2
+
+
+def test_search_events_description_documents_time_zone_and_state_rules():
+    tool = calendar.mcp._tool_manager.get_tool("google_calendar_search_events")
+
+    assert tool is not None
+    description = " ".join(tool.description.split())
+    assert "local_timezone" in description
+    assert "wall-clock times in local_timezone" in description
+    assert "local field is null" in description
+    assert "fall back to the event's own start or end" in description
+    assert "moved or rescheduled only when rescheduled is true" in description
+    assert 'status is "cancelled"' in description
+    assert "does not mean the occurrence was cancelled" in description
+    properties = tool.parameters["properties"]
+    assert set(properties) == {"query", "time_min", "time_max", "max_results"}
+    assert properties["max_results"]["default"] == 10
+    assert tool.parameters.get("required", []) == []
+
+
+def test_search_events_keeps_status_and_rescheduled_independent(monkeypatch):
+    events = [
+        {
+            "id": "confirmed-unmoved",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        },
+        {
+            "id": "confirmed-moved",
+            "status": "confirmed",
+            "recurringEventId": "series-2",
+            "start": {"dateTime": "2026-10-23T08:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T09:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-22T08:15:00+08:00"},
+        },
+        {
+            "id": "cancelled-unmoved",
+            "status": "cancelled",
+            "recurringEventId": "series-3",
+            "start": {"dateTime": "2026-10-23T10:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T11:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-23T10:15:00+08:00"},
+        },
+        {
+            "id": "cancelled-moved",
+            "status": "cancelled",
+            "recurringEventId": "series-4",
+            "start": {"dateTime": "2026-10-23T12:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T13:15:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-22T12:15:00+08:00"},
+        },
+    ]
+
+    _, result = _search_events(monkeypatch, events)
+
+    by_id = _events_by_id(result)
+    assert by_id["confirmed-unmoved"]["status"] == "confirmed"
+    assert by_id["confirmed-unmoved"]["rescheduled"] is False
+    assert by_id["confirmed-moved"]["status"] == "confirmed"
+    assert by_id["confirmed-moved"]["rescheduled"] is True
+    assert by_id["cancelled-unmoved"]["status"] == "cancelled"
+    assert by_id["cancelled-unmoved"]["rescheduled"] is False
+    assert by_id["cancelled-moved"]["status"] == "cancelled"
+    assert by_id["cancelled-moved"]["rescheduled"] is True
+
+
+def test_search_events_falls_back_to_utc_when_the_calendar_has_no_time_zone(
+    monkeypatch,
+):
+    event = {
+        "id": "evt-1",
+        "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+    }
+    service = _search_service([event], response_timezone=None)
+
+    result = _search_result(monkeypatch, service)
+
+    normalized = result["events"][0]
+    assert normalized["local_timezone"] == "UTC"
+    assert normalized["local_start"] == "2026-10-22T22:15:00+00:00"
+    assert normalized["local_end"] == "2026-10-22T22:45:00+00:00"
+    service.events.return_value.list.assert_called_once_with(
+        calendarId="primary",
+        maxResults=10,
+        singleEvents=True,
+        orderBy="startTime",
+    )
+    service.calendars.return_value.get.assert_not_called()
+
+
+def test_search_events_still_returns_events_when_the_metadata_permission_is_missing(
+    monkeypatch,
+):
+    """A grant that can list events but cannot read calendar metadata keeps
+    working: search must not call calendars.get at all, and it reads the
+    calendar's zone from the list response instead."""
+    events = [
+        {
+            "id": "instance-1",
+            "status": "confirmed",
+            "recurringEventId": "series-1",
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T06:45:00+08:00"},
+            "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        },
+        {
+            "id": "plain",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T09:00:00+08:00"},
+            "end": {"dateTime": "2026-10-23T10:00:00+08:00"},
+        },
+    ]
+    service = _search_service(events)
+    service.calendars.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(403),
+        (
+            b'{"error":{"code":403,"message":"Insufficient Permission",'
+            b'"errors":[{"reason":"insufficientPermissions"}]}}'
+        ),
+    )
+
+    result = _search_result(monkeypatch, service)
+
+    assert result["status"] == "success"
+    assert [event["id"] for event in result["events"]] == ["instance-1", "plain"]
+    normalized = result["events"][0]
+    assert normalized["local_start"] == "2026-10-23T06:15:00+08:00"
+    assert normalized["local_timezone"] == "Asia/Manila"
+    assert normalized["rescheduled"] is False
+    service.calendars.return_value.get.assert_not_called()
+    service.events.return_value.list.assert_called_once_with(
+        calendarId="primary",
+        maxResults=10,
+        singleEvents=True,
+        orderBy="startTime",
+    )
+
+    # The same denied metadata call with no events is still a success envelope,
+    # not an error and not a fabricated event.
+    empty_service = _search_service([])
+    empty_service.calendars.return_value.get.return_value.execute.side_effect = (
+        HttpError(
+            _HttpResponse(403),
+            (
+                b'{"error":{"code":403,"message":"Insufficient Permission",'
+                b'"errors":[{"reason":"insufficientPermissions"}]}}'
+            ),
+        )
+    )
+
+    empty_result = _search_result(monkeypatch, empty_service)
+
+    assert empty_result == {"status": "success", "events": []}
+    empty_service.calendars.return_value.get.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_search_events_returns_an_error_when_listing_fails(monkeypatch, status):
+    service = _search_service([])
+    content = f'{{"error":{{"code":{status},"message":"Request failed"}}}}'.encode()
+    service.events.return_value.list.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+
+    result = _search_result(monkeypatch, service)
+
+    assert result["status"] == "error"
+    assert "events" not in result
+    assert result["message"]
+
+
+def test_search_events_handles_unusable_event_times_without_guessing(monkeypatch):
+    events = [
+        {"id": "no-boundaries", "status": "confirmed"},
+        {
+            "id": "bad-date-time",
+            "status": "confirmed",
+            "start": {"dateTime": "not-a-time"},
+            "end": {"dateTime": "also-not-a-time"},
+            "originalStartTime": {"dateTime": "2026-10-23T06:15:00+08:00"},
+        },
+        {
+            "id": "bad-date",
+            "status": "confirmed",
+            "start": {"date": "2026-13-40"},
+            "end": {"date": "2026-13-41"},
+        },
+        {
+            "id": "bad-sibling-zone",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-10-23T06:15:00", "timeZone": "Not/AZone"},
+            "end": {"dateTime": "2026-10-23T07:15:00", "timeZone": "Not/AZone"},
+        },
+    ]
+    fixture = copy.deepcopy(events)
+
+    _, result = _search_events(monkeypatch, events)
+
+    for event in result["events"]:
+        assert event["local_timezone"] == "Asia/Manila"
+        assert event["local_start"] is None
+        assert event["local_end"] is None
+        assert event["rescheduled"] is False
+    by_id = _events_by_id(result)
+    assert by_id["bad-date-time"]["start"] == fixture[1]["start"]
+    assert events == fixture
+
+
+def test_search_events_does_not_guess_from_an_impossible_local_time(monkeypatch):
+    event = {
+        "id": "dst-gap",
+        "status": "confirmed",
+        "recurringEventId": "series-1",
+        # 02:30 does not exist in New York on the spring-forward date.
+        "start": {"dateTime": "2026-03-08T02:30:00"},
+        "end": {"dateTime": "2026-03-08T03:30:00"},
+        "originalStartTime": {"dateTime": "2026-03-08T02:30:00"},
+    }
+    service = _search_service([event], response_timezone="America/New_York")
+
+    result = _search_result(monkeypatch, service)
+
+    normalized = result["events"][0]
+    assert normalized["local_timezone"] == "America/New_York"
+    assert normalized["local_start"] is None
+    assert normalized["local_end"] == "2026-03-08T03:30:00-04:00"
+    assert normalized["rescheduled"] is False
+
+
+def test_search_events_uses_each_event_date_offset_for_conversion(monkeypatch):
+    events = [
+        {
+            "id": "daylight",
+            "start": {"dateTime": "2026-10-23T13:00:00Z"},
+            "end": {"dateTime": "2026-10-23T14:00:00Z"},
+        },
+        {
+            "id": "standard",
+            "start": {"dateTime": "2026-11-05T14:00:00Z"},
+            "end": {"dateTime": "2026-11-05T15:00:00Z"},
+        },
+    ]
+    service = _search_service(events, response_timezone="America/New_York")
+
+    result = _search_result(monkeypatch, service)
+
+    by_id = _events_by_id(result)
+    assert by_id["daylight"]["local_start"] == "2026-10-23T09:00:00-04:00"
+    assert by_id["standard"]["local_start"] == "2026-11-05T09:00:00-05:00"
+    assert by_id["daylight"]["local_timezone"] == "America/New_York"
+    assert by_id["standard"]["local_timezone"] == "America/New_York"
+
+
+def test_search_events_adds_only_four_small_fields_to_large_events(monkeypatch):
+    events = [
+        {
+            "id": f"evt-{index}",
+            "summary": "Large event",
+            "description": "x" * 5000,
+            "attendees": [
+                {"email": f"person-{index}-{number}@example.com"}
+                for number in range(10)
+            ],
+            "start": {"dateTime": "2026-10-23T06:15:00+08:00"},
+            "end": {"dateTime": "2026-10-23T07:15:00+08:00"},
+        }
+        for index in range(3)
+    ]
+    baseline_text = json.dumps({"status": "success", "events": copy.deepcopy(events)})
+    service = _search_service(events, response_timezone="America/New_York")
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result_text = calendar.google_calendar_search_events(max_results=3)
+
+    result = json.loads(result_text)
+    added_characters = len(result_text) - len(baseline_text)
+    assert added_characters > 0
+    assert added_characters < 1000
+    for returned, original in zip(result["events"], events):
+        _assert_original_fields_kept(returned, original)
+    service.events.return_value.list.assert_called_once_with(
+        calendarId="primary",
+        maxResults=3,
+        singleEvents=True,
+        orderBy="startTime",
+    )
+    service.calendars.return_value.get.assert_not_called()
+    events_api = service.events.return_value
+    events_api.get.assert_not_called()
+    events_api.insert.assert_not_called()
+    events_api.update.assert_not_called()
+    events_api.patch.assert_not_called()
+    events_api.delete.assert_not_called()
+    events_api.instances.assert_not_called()

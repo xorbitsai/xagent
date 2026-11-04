@@ -1,0 +1,1251 @@
+"""Gemini LLM implementation using official Google Generative AI SDK."""
+
+import asyncio
+import inspect
+import json
+import logging
+import os
+import uuid
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
+
+from google import genai  # type: ignore[import-untyped,unused-ignore]
+from google.genai import errors as genai_errors
+
+from ....utils.security import redact_sensitive_text
+from ...providers import is_placeholder_api_key
+from ...public_http import public_model_http_client_options
+from ..error import is_context_length_error
+from ..exceptions import (
+    LLMContextLengthError,
+    LLMEmptyContentError,
+    LLMInvalidResponseError,
+    LLMRetryableError,
+    LLMTimeoutError,
+)
+from ..stream_deadline import await_before_deadline
+from ..timeout_config import TimeoutConfig
+from ..token_context import add_token_usage
+from ..types import ChunkType, StreamChunk
+from .base import BaseLLM
+
+logger = logging.getLogger(__name__)
+
+
+def _contains_refs_or_defs(obj: Any) -> bool:
+    """Recursively check if object contains $defs or $ref keys."""
+    if isinstance(obj, dict):
+        if "$ref" in obj or "$defs" in obj or "definitions" in obj:
+            return True
+        return any(_contains_refs_or_defs(v) for v in obj.values())
+    elif isinstance(obj, list):
+        return any(_contains_refs_or_defs(item) for item in obj)
+    return False
+
+
+def _flatten_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a JSON schema by resolving $ref references and removing $defs."""
+    if not _contains_refs_or_defs(schema):
+        return schema
+
+    schema = json.loads(json.dumps(schema))
+
+    definitions: Dict[str, Any] = schema.get("$defs", {})
+    definitions.update(schema.get("definitions", {}))
+
+    def resolve_refs_and_filter(obj: Any, visited: Optional[set] = None) -> Any:
+        if visited is None:
+            visited = set()
+        if isinstance(obj, dict):
+            if "$ref" in obj:
+                ref_path = obj["$ref"]
+                if ref_path in visited:
+                    return {"type": "string"}
+                visited.add(ref_path)
+
+                # Handle different reference formats
+                if ref_path.startswith("#/$defs/") or ref_path.startswith(
+                    "#/definitions/"
+                ):
+                    def_name = ref_path.split("/")[-1]
+                    if def_name in definitions:
+                        return resolve_refs_and_filter(definitions[def_name], visited)
+                return {"type": "string"}
+
+            result: Dict[str, Any] = {}
+            for key, value in obj.items():
+                if key not in ["$defs", "definitions"]:
+                    result[key] = resolve_refs_and_filter(value, visited)
+            return result
+        elif isinstance(obj, list):
+            return [resolve_refs_and_filter(item, visited) for item in obj]
+        return obj
+
+    flattened: Dict[str, Any] = resolve_refs_and_filter(schema)
+    return flattened
+
+
+def _sanitize_schema_for_gemini(schema: Any) -> Any:
+    """Normalize JSON Schema fragments accepted by Gemini function declarations."""
+    unsupported_keys = {
+        # Pydantic/JSON Schema uses this for closed objects or dict value schemas.
+        # google-genai converts it to additional_properties, which Gemini rejects
+        # in function declaration schemas.
+        "additionalProperties",
+        "additional_properties",
+        "const",
+        "allOf",
+    }
+
+    if isinstance(schema, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in unsupported_keys:
+                continue
+            if key in {"properties", "patternProperties", "$defs", "definitions"}:
+                if isinstance(value, dict):
+                    sanitized[key] = {
+                        name: _sanitize_schema_for_gemini(child)
+                        for name, child in value.items()
+                    }
+                else:
+                    sanitized[key] = value
+            else:
+                sanitized[key] = _sanitize_schema_for_gemini(value)
+        # Gemini's Schema model accepts one type string and string enum
+        # members. JSON Schema permits a type list and arbitrary JSON enum
+        # values, so normalize or drop those provider-incompatible forms.
+        schema_type = sanitized.get("type")
+        if isinstance(schema_type, list):
+            valid_types = list(
+                dict.fromkeys(
+                    item
+                    for item in schema_type
+                    if isinstance(item, str)
+                    and item
+                    in {
+                        "array",
+                        "boolean",
+                        "integer",
+                        "null",
+                        "number",
+                        "object",
+                        "string",
+                    }
+                )
+            )
+            if len(valid_types) == 1:
+                sanitized["type"] = valid_types[0]
+            elif "null" in valid_types and len(valid_types) == 2:
+                non_null_type = next(item for item in valid_types if item != "null")
+                sanitized["type"] = non_null_type
+                sanitized["nullable"] = True
+            elif valid_types:
+                sanitized.pop("type", None)
+                existing_any_of = sanitized.get("anyOf")
+                type_options = [{"type": item} for item in valid_types]
+                if isinstance(existing_any_of, list):
+                    type_options.extend(existing_any_of)
+                sanitized["anyOf"] = type_options
+            else:
+                sanitized.pop("type", None)
+        enum = sanitized.get("enum")
+        if isinstance(enum, list):
+            string_members = [item for item in enum if isinstance(item, str)]
+            has_null = any(item is None for item in enum)
+            if string_members and len(string_members) + int(has_null) == len(enum):
+                sanitized["enum"] = string_members
+                if has_null:
+                    sanitized["nullable"] = True
+            else:
+                sanitized.pop("enum", None)
+        else:
+            sanitized.pop("enum", None)
+        one_of = sanitized.pop("oneOf", None)
+        if isinstance(one_of, list):
+            existing_any_of = sanitized.get("anyOf")
+            if isinstance(existing_any_of, list):
+                sanitized["anyOf"] = existing_any_of + one_of
+            else:
+                sanitized["anyOf"] = one_of
+        return sanitized
+    if isinstance(schema, list):
+        return [_sanitize_schema_for_gemini(item) for item in schema]
+    return schema
+
+
+def _get_obj_value(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a value from either a dict-like object or SDK model object."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _compact_repr(value: Any, limit: int = 500) -> str:
+    """Return a bounded representation safe for diagnostics."""
+    try:
+        text = repr(value)
+    except Exception:
+        text = f"<unrepresentable {type(value).__name__}>"
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after a deadline expired, best effort."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing aborted Gemini stream failed (%s)", type(exc).__name__)
+
+
+def _gemini_candidate_diagnostics(candidate: Any) -> Dict[str, Any]:
+    """Extract useful Gemini candidate diagnostics without dumping full payloads."""
+    diagnostics: Dict[str, Any] = {}
+    for field in ("finish_reason", "finish_message", "safety_ratings"):
+        value = _get_obj_value(candidate, field)
+        if value:
+            diagnostics[field] = _compact_repr(value)
+    return diagnostics
+
+
+def _partial_arg_to_diagnostic(partial_arg: Any) -> Dict[str, Any]:
+    diagnostic: Dict[str, Any] = {}
+    for field in (
+        "json_path",
+        "string_value",
+        "number_value",
+        "bool_value",
+        "null_value",
+        "will_continue",
+    ):
+        value = _get_obj_value(partial_arg, field)
+        if value is not None:
+            diagnostic[field] = value
+    return diagnostic
+
+
+def _extract_function_call(
+    func_call: Any,
+) -> tuple[Optional[str], Dict[str, Any], list]:
+    """Extract Gemini function call data and diagnostics for partial calls."""
+    name = _get_obj_value(func_call, "name")
+    args = _get_obj_value(func_call, "args")
+    partial_args = _get_obj_value(func_call, "partial_args") or []
+
+    diagnostics = []
+    if partial_args:
+        diagnostics.append(
+            {
+                "partial_args": [
+                    _partial_arg_to_diagnostic(partial_arg)
+                    for partial_arg in partial_args
+                ],
+                "will_continue": _get_obj_value(func_call, "will_continue"),
+            }
+        )
+
+    if isinstance(args, dict):
+        return name, args, diagnostics
+    if args is None and not partial_args:
+        return name, {}, diagnostics
+    return name, {}, diagnostics
+
+
+class GeminiLLM(BaseLLM):
+    """Google Gemini LLM client using the official Google Generative AI SDK."""
+
+    def __init__(
+        self,
+        model_name: str = "gemini-2.0-flash-exp",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        default_temperature: Optional[float] = None,
+        default_max_tokens: Optional[int] = None,
+        timeout: float = 180.0,
+        abilities: Optional[List[str]] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
+    ):
+        self._model_name = model_name
+        self.api_key = (
+            api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        )
+        self.base_url = base_url
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.timeout = timeout
+        self.timeout_config = timeout_config or TimeoutConfig()
+
+        # Determine abilities based on model name or explicit configuration
+        if abilities:
+            self._abilities = abilities
+        else:
+            # Gemini chat models are natively multimodal; the separate image
+            # generation adapter owns generation-only models.
+            self._abilities = ["chat", "tool_calling", "vision"]
+
+        # Initialize the Gemini client (lazy initialization)
+        self._client: Optional[Any] = None
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name/identifier."""
+        return self._model_name
+
+    @property
+    def abilities(self) -> List[str]:
+        """Get the list of abilities supported by this Gemini LLM implementation."""
+        return self._abilities
+
+    @property
+    def supports_native_video_input(self) -> bool:
+        """Gemini multimodal models process videos natively."""
+        return self.has_ability("vision")
+
+    @property
+    def supports_native_video_with_images(self) -> bool:
+        """Gemini accepts mixed image and native video parts."""
+        return self.supports_native_video_input
+
+    @property
+    def supports_native_video_time_range(self) -> bool:
+        """Gemini supports start and end offsets in video metadata."""
+        return self.supports_native_video_input
+
+    @staticmethod
+    def _supports_native_video_url(video_url: str) -> bool:
+        """Return whether Gemini can consume this video reference directly."""
+        return video_url.startswith(("data:video/", "gs://")) or any(
+            host in video_url for host in ("youtube.com/", "youtu.be/")
+        )
+
+    def build_native_video_content(
+        self,
+        video_url: str,
+        *,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> Dict[str, Any]:
+        """Build the canonical part converted to Gemini inline/file data later."""
+        if not self._supports_native_video_url(video_url):
+            raise ValueError(
+                "Gemini native video input requires an inline local video, "
+                "a Google Cloud Storage URI, or a YouTube URL"
+            )
+
+        metadata: Dict[str, Any] = {}
+        if start_time is not None:
+            metadata["start_offset"] = f"{start_time:g}s"
+        if end_time is not None:
+            metadata["end_offset"] = f"{end_time:g}s"
+
+        content: Dict[str, Any] = {
+            "type": "video_url",
+            "video_url": {"url": video_url},
+        }
+        if metadata:
+            content["video_metadata"] = metadata
+        return content
+
+    def _ensure_client(self) -> None:
+        """Ensure the Gemini client is initialized using official SDK."""
+        if self._client is None:
+            if not self.api_key:
+                raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY must be set")
+
+            try:
+                # Prepare HTTP options for custom base URL if configured
+                http_options = genai.types.HttpOptions(
+                    timeout=int(self.timeout * 1000),
+                    client_args=public_model_http_client_options(asynchronous=False),
+                    async_client_args=public_model_http_client_options(
+                        asynchronous=True
+                    ),
+                )
+                if self.base_url:
+                    # Remove trailing version paths (/v1beta, /v1) as SDK adds them automatically
+                    base_url = self.base_url.rstrip("/")
+                    for version_path in ["/v1beta", "/v1"]:
+                        if base_url.endswith(version_path):
+                            base_url = base_url[: -len(version_path)]
+                            logger.info(
+                                f"Removed version path from base_url: {self.base_url} -> {base_url}"
+                            )
+                            break
+
+                    http_options.base_url = base_url
+                    logger.info(f"Using custom base URL: {base_url}")
+
+                # Initialize the official Google Generative AI client
+                self._client = genai.Client(
+                    api_key=self.api_key,
+                    http_options=http_options,
+                )
+                logger.info("Initialized Gemini using official SDK")
+
+            except ImportError as e:
+                logger.error(f"Google Generative AI SDK not available: {e}")
+                raise RuntimeError(
+                    "google-genai package is required. Install it with: pip install google-genai"
+                ) from e
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini SDK: {e}")
+                raise
+
+    def _convert_messages_to_gemini_format(
+        self, messages: List[Dict[str, Any]]
+    ) -> tuple[Optional[str], List[Dict[str, Any]]]:
+        """Convert OpenAI format messages to Gemini format."""
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field, never a
+        # ``dict(msg)`` copy, so an internal marker like
+        # ``_xagent_provider_state`` on the input is never read and cannot
+        # leak into the Gemini request. Switching any branch here to copy
+        # ``msg`` wholesale would reopen that leak.
+        gemini_messages = []
+        system_instruction = None
+
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "system":
+                if isinstance(content, str):
+                    system_instruction = content
+                elif isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                    system_instruction = "\n".join(text_parts)
+                continue
+
+            gemini_role = "user" if role == "user" else "model"
+
+            if isinstance(content, str):
+                gemini_messages.append({"role": gemini_role, "parts": [content]})
+            elif isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            parts.append(item.get("text", ""))
+                        elif item.get("type") == "image_url":
+                            image_url = item.get("image_url", {})
+                            if isinstance(image_url, dict):
+                                url = image_url.get("url", "")
+                            else:
+                                url = image_url
+
+                            if url.startswith("data:image"):
+                                try:
+                                    mime_type = url.split(":")[1].split(";")[0]
+                                    base64_data = url.split(",", 1)[1]
+                                    parts.append(
+                                        {
+                                            "inline_data": {
+                                                "mime_type": mime_type,
+                                                "data": base64_data,
+                                            }
+                                        }
+                                    )
+                                except (IndexError, ValueError):
+                                    parts.append(
+                                        {
+                                            "inline_data": {
+                                                "mime_type": "image/jpeg",
+                                                "data": url,
+                                            }
+                                        }
+                                    )
+                            else:
+                                parts.append(
+                                    {
+                                        "inline_data": {
+                                            "mime_type": "image/jpeg",
+                                            "data": url,
+                                        }
+                                    }
+                                )
+                        elif item.get("type") == "video_url":
+                            video_url = item.get("video_url", {})
+                            if isinstance(video_url, dict):
+                                url = video_url.get("url", "")
+                            else:
+                                url = video_url
+
+                            video_part: Dict[str, Any]
+                            if isinstance(url, str) and url.startswith("data:video/"):
+                                try:
+                                    mime_type = url.split(":", 1)[1].split(";", 1)[0]
+                                    base64_data = url.split(",", 1)[1]
+                                except (IndexError, ValueError) as exc:
+                                    raise ValueError(
+                                        "Invalid video data URL for Gemini"
+                                    ) from exc
+                                video_part = {
+                                    "inline_data": {
+                                        "mime_type": mime_type,
+                                        "data": base64_data,
+                                    }
+                                }
+                            elif isinstance(
+                                url, str
+                            ) and self._supports_native_video_url(url):
+                                video_part = {
+                                    "file_data": {
+                                        "file_uri": url,
+                                        "mime_type": "video/mp4",
+                                    }
+                                }
+                            else:
+                                raise ValueError(
+                                    "Gemini native video input requires an inline local "
+                                    "video, a Google Cloud Storage URI, or a YouTube URL"
+                                )
+
+                            metadata = item.get("video_metadata")
+                            if isinstance(metadata, dict) and metadata:
+                                video_part["video_metadata"] = metadata
+                            parts.append(video_part)
+
+                gemini_messages.append({"role": gemini_role, "parts": parts})
+
+        return system_instruction, gemini_messages
+
+    def _convert_tools_to_gemini_format(
+        self, tools: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Convert OpenAI format tools to Gemini format."""
+        gemini_tools: Dict[str, Any] = {"function_declarations": []}
+
+        for tool in tools:
+            function = tool.get("function", {})
+            name = function.get("name", "")
+            description = function.get("description", "")
+            parameters = function.get("parameters", {})
+
+            # Flatten JSON schema if it contains $defs or $ref
+            if _contains_refs_or_defs(parameters):
+                parameters = _flatten_json_schema(parameters)
+            parameters = _sanitize_schema_for_gemini(parameters)
+
+            gemini_tools["function_declarations"].append(
+                {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            )
+
+        return gemini_tools
+
+    def _build_gemini_tool_config(
+        self,
+        tools: List[Dict[str, Any]],
+        tool_choice: Optional[Union[str, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Build Gemini SDK tool configuration from OpenAI-style tool options."""
+        from google.genai import types
+
+        gemini_tools_dict = self._convert_tools_to_gemini_format(tools)
+        tool_config: Dict[str, Any] = {
+            "tools": [types.Tool(**gemini_tools_dict)],
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        }
+
+        function_calling_config = None
+        if tool_choice == "none":
+            function_calling_config = types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.NONE
+            )
+        elif tool_choice and tool_choice != "auto":
+            allowed_function_names = None
+            if isinstance(tool_choice, dict):
+                function_choice = tool_choice.get("function")
+                if isinstance(function_choice, dict) and function_choice.get("name"):
+                    function_name = function_choice["name"]
+                    allowed_function_names = [function_name]
+
+            function_calling_config = types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.ANY,
+                allowed_function_names=allowed_function_names,
+            )
+
+        if function_calling_config is not None:
+            tool_config["tool_config"] = types.ToolConfig(
+                function_calling_config=function_calling_config
+            )
+
+        return tool_config
+
+    async def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Perform a chat completion using official Google Generative AI SDK."""
+        self._ensure_client()
+        assert self._client is not None
+
+        try:
+            system_instruction, gemini_messages = (
+                self._convert_messages_to_gemini_format(messages)
+            )
+
+            config: Dict[str, Any] = {}
+            if temperature is not None:
+                config["temperature"] = temperature
+            elif self.default_temperature is not None:
+                config["temperature"] = self.default_temperature
+
+            if max_tokens is not None:
+                config["max_output_tokens"] = max_tokens
+            elif self.default_max_tokens is not None:
+                config["max_output_tokens"] = self.default_max_tokens
+
+            if response_format:
+                response_type: str = response_format.get("type", "")
+                if response_type == "json_object":
+                    config["response_mime_type"] = "application/json"
+
+            if output_config is not None:
+                format_config = output_config.get("format", {})
+                if format_config.get("type") == "json_schema":
+                    schema = format_config.get("schema") or format_config.get(
+                        "json_schema", {}
+                    )
+                    if schema:
+                        config["response_mime_type"] = "application/json"
+                        config["response_json_schema"] = schema
+
+            # Combine all messages into contents for SDK
+            contents = []
+            if system_instruction:
+                contents.append(system_instruction)
+
+            for msg in gemini_messages:
+                parts = msg.get("parts", [])
+                if isinstance(parts, list):
+                    contents.extend(parts)
+                else:
+                    contents.append(parts)
+
+            # Make API call using SDK (async)
+            api_params: dict[str, Any] = {
+                "model": self._model_name,
+                "contents": contents,
+            }
+
+            # Prepare config
+            merged_config = config.copy() if config else {}
+
+            # Import types for config wrapping
+            from google.genai import types
+
+            # Add tools if available - wrap in types.Tool
+            if tools:
+                merged_config.update(self._build_gemini_tool_config(tools, tool_choice))
+
+            # Add config if present
+            if merged_config:
+                api_params["config"] = types.GenerateContentConfig(**merged_config)
+
+            response = await self._client.aio.models.generate_content(**api_params)
+
+            # Extract token usage
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                usage_metadata = response.usage_metadata
+                input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
+                output_tokens = getattr(usage_metadata, "candidates_token_count", 0)
+                cached_tokens = (
+                    getattr(usage_metadata, "cached_content_token_count", 0) or 0
+                )
+
+                if input_tokens > 0 or output_tokens > 0:
+                    add_token_usage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        model=self._model_name,
+                        model_id=self.model_id,
+                        call_type="chat",
+                        cached_input_tokens=cached_tokens,
+                    )
+            else:
+                logger.warning("No usage_metadata in Gemini SDK response")
+
+            # Extract response content
+            if not response.candidates or len(response.candidates) == 0:
+                raise LLMInvalidResponseError("No candidates in Gemini SDK response")
+
+            candidate = response.candidates[0]
+
+            # Check if candidate.content exists
+            if not hasattr(candidate, "content") or candidate.content is None:
+                raise LLMInvalidResponseError(
+                    "Candidate content is None in Gemini SDK response"
+                )
+
+            content_parts = candidate.content.parts
+
+            # Check if content_parts is None
+            if content_parts is None:
+                raise LLMInvalidResponseError(
+                    "Content parts is None in Gemini SDK response"
+                )
+
+            tool_calls = []
+            text_parts = []
+
+            for part in content_parts:
+                if hasattr(part, "function_call") and part.function_call:
+                    func_call = part.function_call
+                    func_name = func_call.name
+                    func_args = func_call.args
+
+                    tool_calls.append(
+                        {
+                            "id": f"call_{uuid.uuid4().hex[:16]}",
+                            "type": "function",
+                            "function": {
+                                "name": func_name,
+                                "arguments": json.dumps(func_args),
+                            },
+                        }
+                    )
+                elif hasattr(part, "text") and part.text:
+                    text_parts.append(part.text)
+
+            if tool_calls:
+                return {
+                    "type": "tool_call",
+                    "tool_calls": tool_calls,
+                }
+
+            content = "".join(text_parts).strip()
+
+            if not content:
+                raise LLMEmptyContentError(
+                    "LLM returned empty content and no tool calls"
+                )
+
+            return content
+
+        except Exception as e:
+            logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
+
+            if is_context_length_error(e):
+                raise LLMContextLengthError(str(e)) from e
+
+            error_text = str(e)
+            error_text_lower = error_text.lower()
+
+            # Check for Google SDK specific errors
+            if isinstance(e, genai_errors.ClientError):
+                # 429: Rate limit (RESOURCE_EXHAUSTED)
+                # 500, 502, 503, 504: Server errors (retryable)
+                if e.code in [429, 500, 502, 503, 504]:
+                    raise LLMRetryableError(
+                        f"Gemini API error (code={e.code}): {str(e)}"
+                    ) from e
+
+            # Check for timeout and network errors (string-based check for non-SDK exceptions)
+            if (
+                "timeout" in error_text_lower
+                or "network" in error_text_lower
+                or "deadline_exceeded" in error_text_lower
+            ):
+                raise LLMRetryableError(str(e)) from e
+
+            # Fallback: string-based check for rate limit/quota (for compatibility)
+            if "rate limit" in str(e).lower() or "quota" in str(e).lower():
+                raise LLMRetryableError(str(e)) from e
+
+            raise RuntimeError(f"Gemini SDK API error: {str(e)}") from e
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream chat completion using official Google Generative AI SDK."""
+        current_content = ""
+        usage_received = False
+
+        try:
+            self._ensure_client()  # ← 这是关键！
+            assert self._client is not None
+
+            system_instruction, gemini_messages = (
+                self._convert_messages_to_gemini_format(messages)
+            )
+
+            config: Dict[str, Any] = {}
+            if temperature is not None:
+                config["temperature"] = temperature
+            elif self.default_temperature is not None:
+                config["temperature"] = self.default_temperature
+
+            if max_tokens is not None:
+                config["max_output_tokens"] = max_tokens
+            elif self.default_max_tokens is not None:
+                config["max_output_tokens"] = self.default_max_tokens
+
+            if response_format:
+                response_type: str = response_format.get("type", "")
+                if response_type == "json_object":
+                    config["response_mime_type"] = "application/json"
+
+            if output_config is not None:
+                format_config = output_config.get("format", {})
+                if format_config.get("type") == "json_schema":
+                    schema = format_config.get("schema") or format_config.get(
+                        "json_schema", {}
+                    )
+                    if schema:
+                        config["response_mime_type"] = "application/json"
+                        config["response_json_schema"] = schema
+
+            # Combine all messages into contents for SDK
+            contents = []
+            if system_instruction:
+                contents.append(system_instruction)
+
+            for msg in gemini_messages:
+                parts = msg.get("parts", [])
+                if isinstance(parts, list):
+                    contents.extend(parts)
+                else:
+                    contents.append(parts)
+
+            # Make streaming API call using SDK (async)
+            # Note: Gemini streaming doesn't support tools directly
+            # Tools need to be passed through config
+            api_params: dict[str, Any] = {
+                "model": self._model_name,
+                "contents": contents,
+            }
+
+            # Prepare config
+            merged_config = config.copy() if config else {}
+
+            # Import types for config wrapping
+            from google.genai import types
+
+            # Add tools if available - wrap in types.Tool
+            if tools:
+                merged_config.update(self._build_gemini_tool_config(tools, tool_choice))
+
+            # Add config if present
+            if merged_config:
+                api_params["config"] = types.GenerateContentConfig(**merged_config)
+
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent. The configured HTTP timeout applies to both
+            # official and custom endpoints, but is not a first-token deadline.
+            # With tools
+            # (AFC is disabled in ``_build_gemini_tool_config``) the SDK sends
+            # the request and waits for the response headers inside
+            # ``generate_content_stream(...)``; without tools it sends the
+            # request on the first read. The first-token deadline bounds both.
+            loop = asyncio.get_running_loop()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            opened_at = loop.time()
+            first_token_deadline = opened_at + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            response_stream = await await_before_deadline(
+                self._client.aio.models.generate_content_stream(**api_params),
+                deadline=first_token_deadline,
+                timeout_message=first_token_message,
+            )
+
+            # Check if response_stream is None
+            if response_stream is None:
+                raise RuntimeError("Gemini SDK returned None response stream")
+
+            candidate_diagnostics: List[Dict[str, Any]] = []
+            partial_call_diagnostics: List[Dict[str, Any]] = []
+            emitted_content_or_tool = False
+            emitted_tool_call = False
+            last_candidate_finish_reason: Any = None
+            tool_call_index = 0
+
+            # Process streaming response (async iteration)
+            chunks = aiter(response_stream)
+            first_chunk = True
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_chunk:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                try:
+                    chunk = await await_before_deadline(
+                        anext(chunks),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(response_stream)
+                    raise
+                if first_chunk:
+                    first_chunk = False
+                    logger.debug(
+                        "First token received after %.2fs", loop.time() - opened_at
+                    )
+
+                # Check for usage metadata
+                if (
+                    hasattr(chunk, "usage_metadata")
+                    and chunk.usage_metadata
+                    and not usage_received
+                ):
+                    usage_metadata = chunk.usage_metadata
+                    input_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
+                    output_tokens = (
+                        getattr(usage_metadata, "candidates_token_count", 0) or 0
+                    )
+                    raw_cached = getattr(
+                        usage_metadata, "cached_content_token_count", 0
+                    )
+                    cached_tokens = raw_cached if isinstance(raw_cached, int) else 0
+
+                    if input_tokens > 0 or output_tokens > 0:
+                        usage_received = True
+
+                        add_token_usage(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            model=self._model_name,
+                            model_id=self.model_id,
+                            call_type="stream_chat",
+                            cached_input_tokens=cached_tokens,
+                        )
+
+                        usage_payload: Dict[str, Any] = {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        }
+                        if cached_tokens:
+                            usage_payload["cached_input_tokens"] = cached_tokens
+                        yield StreamChunk(
+                            type=ChunkType.USAGE,
+                            usage=usage_payload,
+                            raw=chunk,
+                        )
+
+                # Extract content
+                if not chunk.candidates or len(chunk.candidates) == 0:
+                    continue
+
+                candidate = chunk.candidates[0]
+                last_candidate_finish_reason = getattr(candidate, "finish_reason", None)
+                diagnostics = _gemini_candidate_diagnostics(candidate)
+                if diagnostics:
+                    candidate_diagnostics.append(diagnostics)
+
+                # Check if candidate.content exists
+                if not hasattr(candidate, "content") or candidate.content is None:
+                    continue
+
+                content_parts = candidate.content.parts
+
+                # Check if content_parts is None
+                if content_parts is None:
+                    continue
+
+                for part in content_parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        func_name, func_args, func_diagnostics = _extract_function_call(
+                            part.function_call
+                        )
+                        if func_diagnostics:
+                            partial_call_diagnostics.extend(func_diagnostics)
+
+                        if not func_name:
+                            logger.warning(
+                                "Gemini streamed a function_call without a name: %s",
+                                _compact_repr(part.function_call),
+                            )
+                            continue
+
+                        emitted_content_or_tool = True
+                        emitted_tool_call = True
+                        yield StreamChunk(
+                            type=ChunkType.TOOL_CALL,
+                            tool_calls=[
+                                {
+                                    "index": tool_call_index,
+                                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": func_name,
+                                        "arguments": json.dumps(func_args),
+                                    },
+                                }
+                            ],
+                            finish_reason="tool_calls",
+                            raw=chunk,
+                        )
+                        tool_call_index += 1
+
+                    elif hasattr(part, "text") and part.text:
+                        text = part.text
+                        current_content += text
+                        emitted_content_or_tool = True
+
+                        yield StreamChunk(
+                            type=ChunkType.TOKEN,
+                            content=current_content,
+                            delta=text,
+                            raw=chunk,
+                        )
+
+            if not emitted_content_or_tool and (
+                candidate_diagnostics or partial_call_diagnostics
+            ):
+                diagnostic_payload = {
+                    "candidate_diagnostics": candidate_diagnostics[-3:],
+                    "partial_call_diagnostics": partial_call_diagnostics[-3:],
+                }
+                yield StreamChunk(
+                    type=ChunkType.ERROR,
+                    content=(
+                        "Gemini stream ended without text or complete function calls. "
+                        f"Diagnostics: {_compact_repr(diagnostic_payload, limit=1200)}"
+                    ),
+                    raw=diagnostic_payload,
+                )
+                return
+
+            # Yield end chunk. Gemini reports STOP on the final chunk even for
+            # function-call turns, so tool calls are detected from what the
+            # stream actually emitted rather than trusted from the last
+            # candidate. MAX_TOKENS maps to the OpenAI-style "length" value
+            # this adapter already uses elsewhere (#2790 tracks the wider
+            # finish-reason vocabulary question).
+            end_finish_reason = "stop"
+            if emitted_tool_call:
+                end_finish_reason = "tool_calls"
+            else:
+                reason_value = getattr(
+                    last_candidate_finish_reason, "name", last_candidate_finish_reason
+                )
+                if (
+                    isinstance(reason_value, str)
+                    and reason_value.upper() == "MAX_TOKENS"
+                ):
+                    end_finish_reason = "length"
+
+            yield StreamChunk(
+                type=ChunkType.END,
+                finish_reason=end_finish_reason,
+                raw=None,
+            )
+
+        except LLMTimeoutError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Gemini SDK streaming error: %s", redact_sensitive_text(str(e))
+            )
+
+            if is_context_length_error(e):
+                raise LLMContextLengthError(str(e)) from e
+
+            error_text = str(e)
+            error_text_lower = error_text.lower()
+
+            # Check for Google SDK specific errors
+            if isinstance(e, genai_errors.ClientError):
+                # 429: Rate limit (RESOURCE_EXHAUSTED)
+                # 500, 502, 503, 504: Server errors (retryable)
+                if e.code in [429, 500, 502, 503, 504]:
+                    raise LLMRetryableError(
+                        f"Gemini API error (code={e.code}): {str(e)}"
+                    ) from e
+
+            # Check for timeout and network errors (string-based check for non-SDK exceptions)
+            if (
+                "timeout" in error_text_lower
+                or "network" in error_text_lower
+                or "deadline_exceeded" in error_text_lower
+            ):
+                raise LLMRetryableError(str(e)) from e
+
+            # Fallback: string-based check for rate limit/quota (for compatibility)
+            if "rate limit" in str(e).lower() or "quota" in str(e).lower():
+                raise LLMRetryableError(str(e)) from e
+
+            raise RuntimeError(f"Gemini SDK streaming error: {str(e)}") from e
+
+    async def vision_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Vision chat is same as regular chat for Gemini (supports multimodal by default)."""
+        self._ensure_client()  # Ensure client is initialized
+        return await self.chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            thinking=thinking,
+            output_config=output_config,
+            **kwargs,
+        )
+
+    @staticmethod
+    async def list_available_models(
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Fetch available models from Google Gemini API using SDK.
+
+        Args:
+            api_key: Google API key for Gemini
+            base_url: Base URL for the API (optional).
+                - If not provided, uses official Google Generative AI API
+                - If provided, uses the specified endpoint (e.g., proxy or custom service)
+            raise_on_error: Raise read failures instead of answering them
+                with an empty list; a rejected key (HTTP 401/403, or 400
+                ``API_KEY_INVALID``) is raised as ``ValueError``. A missing
+                or placeholder key is refused with ``ValueError`` before any
+                request, since ``genai.Client`` would replace a missing key
+                with ``GOOGLE_API_KEY``/``GEMINI_API_KEY``. Without this
+                option every failure, a rejected key included, returns an
+                empty list.
+
+        Returns:
+            List of available Gemini models with their information
+
+        Example:
+            >>> # Use official Google API
+            >>> models = await GeminiLLM.list_available_models("YOUR_API_KEY")
+            >>> # Use custom endpoint/proxy
+            >>> models = await GeminiLLM.list_available_models(
+            ...     "YOUR_API_KEY",
+            ...     base_url="https://my-proxy.com/v1beta"
+            ... )
+        """
+        if raise_on_error and is_placeholder_api_key(api_key):
+            raise ValueError("An explicit, non-placeholder api_key is required")
+        try:
+            # Prepare HTTP options for custom base URL if configured
+            http_options = genai.types.HttpOptions(
+                timeout=30000,
+                client_args=public_model_http_client_options(asynchronous=False),
+                async_client_args=public_model_http_client_options(asynchronous=True),
+            )
+            if base_url:
+                # Remove trailing version paths (/v1beta, /v1) as SDK adds them automatically
+                clean_base_url = base_url.rstrip("/")
+                for version_path in ["/v1beta", "/v1"]:
+                    if clean_base_url.endswith(version_path):
+                        clean_base_url = clean_base_url[: -len(version_path)]
+                        break
+
+                http_options.base_url = clean_base_url
+
+            # Initialize client with API key and optional custom base URL
+            client = genai.Client(
+                api_key=api_key,
+                http_options=http_options,
+            )
+
+            # Use SDK to list models (async)
+            models_pager = await client.aio.models.list()
+            models = []
+
+            async for model in models_pager:
+                models.append(
+                    {
+                        "id": model.name,
+                        "name": model.display_name,
+                        "description": model.description,
+                        "base_url": base_url,
+                    }
+                )
+
+            return models
+
+        except Exception as e:
+            logger.error(f"Failed to fetch Gemini models: {e}")
+            if raise_on_error:
+                if isinstance(e, genai_errors.ClientError) and (
+                    e.code in (401, 403)
+                    # A wrong or expired key is a 400 with reason API_KEY_INVALID.
+                    or (e.code == 400 and "API_KEY_INVALID" in str(e.details))
+                ):
+                    raise ValueError("Gemini rejected the API key") from e
+                raise
+            return []
+
+    async def close(self) -> None:
+        """Close the Gemini client and cleanup resources."""
+        client, self._client = self._client, None
+        if client is not None:
+            close_async = getattr(client.aio, "aclose", None)
+            if callable(close_async):
+                result = close_async()
+                if inspect.isawaitable(result):
+                    await result
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+    async def __aenter__(self) -> "GeminiLLM":
+        """Async context manager entry."""
+        self._ensure_client()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        """Check if this Gemini LLM supports thinking mode."""
+        return "thinking_mode" in self.abilities

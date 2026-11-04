@@ -1,0 +1,704 @@
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from xagent.core.agent import Agent, AgentRunner, ExecutionContext, PatternRuntime
+from xagent.core.agent.checkpoint import (
+    CHECKPOINT_EVENT_TYPE,
+    CHECKPOINT_TYPE,
+    LEGACY_CHECKPOINT_TYPES,
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointPersistenceError,
+    CheckpointUnavailableError,
+    TraceCheckpointStore,
+    read_latest_checkpoint_payload,
+)
+from xagent.core.agent.trace import (
+    ConsoleTraceHandler,
+    TraceEvent,
+    TraceHandler,
+    Tracer,
+)
+
+
+class PersistentTraceBackend:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        require_persisted: bool = False,
+        **_: Any,
+    ) -> str:
+        event_id = f"event-{len(self.events) + 1}"
+        self.events.append(
+            {
+                "event_id": event_id,
+                "event_type": str(event_type),
+                "task_id": task_id,
+                "data": dict(data or {}),
+                "require_persisted": require_persisted,
+            }
+        )
+        return event_id
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        for event in reversed(self.events):
+            data = event["data"]
+            if (
+                data.get("checkpoint_type") == CHECKPOINT_TYPE
+                and data.get("root_execution_id") == execution_id
+            ):
+                return dict(data)
+        return None
+
+
+class BestEffortTraceBackend:
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> str:
+        del event_type, task_id, data
+        return "best-effort"
+
+
+class NoneReturningCheckpointBackend:
+    async def checkpoint(self, **_: Any) -> None:
+        return None
+
+
+class NoneReturningTraceEventBackend:
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        require_persisted: bool = False,
+    ) -> None:
+        del event_type, task_id, data, require_persisted
+        return None
+
+
+class RaisingCheckpointBackend:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def checkpoint(self, **_: Any) -> None:
+        raise self.error
+
+
+class LegacyCheckpointBackend:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+        return {
+            "checkpoint_type": legacy_type,
+            "root_execution_id": execution_id,
+            "snapshot": dict(self.payload),
+        }
+
+
+class LegacyNamedCheckpointBackend:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def get_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        return {
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "root_execution_id": execution_id,
+            "snapshot": dict(self.payload),
+        }
+
+
+class FailingTraceHandler(TraceHandler):
+    async def handle_event(self, _: TraceEvent) -> None:
+        raise ValueError("checkpoint write failed: secret=supersecret")
+
+
+class FakeLLM:
+    async def chat(self, **_: Any) -> str:
+        return "done"
+
+
+class CheckpointingPattern:
+    async def run(self, *, context: Any, runtime: Any, **_: Any) -> dict[str, Any]:
+        context.add_assistant_message("done")
+        await runtime.checkpoint(
+            "final",
+            context=context,
+            pattern=self,
+            status="completed",
+        )
+        return {"success": True, "output": "done"}
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_persists_full_snapshot_event() -> None:
+    backend = PersistentTraceBackend()
+    store = TraceCheckpointStore(backend)
+    payload = {
+        "type": "checkpoint",
+        "label": "before_llm",
+        "execution_id": "exec-checkpoint",
+        "context": {"messages": []},
+        "pattern": "ReActPattern",
+        "pattern_state": {"current_iteration": 0},
+        "status": "thinking",
+    }
+
+    event_id = await store.checkpoint(**payload)
+    loaded = await store.load_latest_checkpoint("exec-checkpoint")
+
+    assert event_id == "event-1"
+    assert backend.events[0]["require_persisted"] is True
+    assert backend.events[0]["data"]["checkpoint_type"] == CHECKPOINT_TYPE
+    assert backend.events[0]["data"]["snapshot"] == payload
+    assert loaded == payload
+
+
+@pytest.mark.asyncio
+async def test_required_trace_error_preserves_redacted_handler_cause() -> None:
+    tracer = Tracer()
+    tracer.add_handler(FailingTraceHandler())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await tracer.trace_event(
+            CHECKPOINT_EVENT_TYPE,
+            task_id="trace-cause",
+            require_persisted=True,
+        )
+
+    message = str(exc_info.value)
+    assert "First failure: ValueError: checkpoint write failed" in message
+    assert "supersecret" not in message
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_reads_legacy_checkpoint_marker() -> None:
+    payload = {
+        "type": "checkpoint",
+        "label": "before_llm",
+        "execution_id": "legacy-exec",
+        "context": {"messages": []},
+    }
+    store = TraceCheckpointStore(LegacyCheckpointBackend(payload))
+
+    loaded = await store.load_latest_checkpoint("legacy-exec")
+
+    assert loaded == payload
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_supports_legacy_reader_name() -> None:
+    payload = {
+        "type": "checkpoint",
+        "execution_id": "legacy-reader-name",
+        "context": {"messages": []},
+    }
+    store = TraceCheckpointStore(LegacyNamedCheckpointBackend(payload))
+
+    loaded = await store.load_latest_checkpoint("legacy-reader-name")
+
+    assert loaded == payload
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_rejects_best_effort_trace_event() -> None:
+    store = TraceCheckpointStore(BestEffortTraceBackend())
+
+    with pytest.raises(CheckpointPersistenceError):
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-best-effort",
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_rejects_none_checkpoint_writer() -> None:
+    store = TraceCheckpointStore(NoneReturningCheckpointBackend())
+
+    with pytest.raises(CheckpointPersistenceError):
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-none-writer",
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_rejects_none_trace_event_writer() -> None:
+    store = TraceCheckpointStore(NoneReturningTraceEventBackend())
+
+    with pytest.raises(CheckpointPersistenceError):
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-none-trace-event",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, sqlite3.OperationalError])
+async def test_trace_checkpoint_store_normalizes_writer_failures(
+    error_type: type[Exception],
+) -> None:
+    failure = error_type("checkpoint unavailable")
+    store = TraceCheckpointStore(RaisingCheckpointBackend(failure))
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-failed-writer",
+        )
+
+    assert exc_info.value.__cause__ is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), SystemExit()])
+async def test_trace_checkpoint_store_preserves_base_exception_semantics(
+    failure: BaseException,
+) -> None:
+    store = TraceCheckpointStore(RaisingCheckpointBackend(failure))
+
+    with pytest.raises(type(failure)) as exc_info:
+        await store.checkpoint(
+            type="checkpoint",
+            label="before_llm",
+            execution_id="exec-interrupted-writer",
+        )
+
+    assert exc_info.value is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, sqlite3.OperationalError])
+async def test_pattern_runtime_normalizes_unwrapped_writer_failures(
+    error_type: type[Exception],
+) -> None:
+    """``PatternRuntime`` normalizes even without ``TraceCheckpointStore``.
+
+    Only ``xagent/service.py`` wraps the tracer; the fallback runtimes in
+    ``auto.py``, ``react.py`` and ``dag.py`` pass a bare tracer straight
+    through, so the boundary has to normalize centrally.
+    """
+
+    failure = error_type("checkpoint unavailable")
+    runtime = PatternRuntime(
+        tracer=RaisingCheckpointBackend(failure),
+        execution_id="exec-unwrapped",
+    )
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await runtime.checkpoint(
+            "before_llm",
+            context=ExecutionContext(execution_id="exec-unwrapped"),
+            pattern=SimpleNamespace(status="running"),
+        )
+
+    assert exc_info.value.__cause__ is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), SystemExit()])
+async def test_pattern_runtime_checkpoint_preserves_base_exception_semantics(
+    failure: BaseException,
+) -> None:
+    runtime = PatternRuntime(
+        tracer=RaisingCheckpointBackend(failure),
+        execution_id="exec-unwrapped-interrupted",
+    )
+
+    with pytest.raises(type(failure)) as exc_info:
+        await runtime.checkpoint(
+            "before_llm",
+            context=ExecutionContext(execution_id="exec-unwrapped-interrupted"),
+            pattern=SimpleNamespace(status="running"),
+        )
+
+    assert exc_info.value is failure
+
+
+@pytest.mark.asyncio
+async def test_pattern_runtime_does_not_double_wrap_normalized_failures() -> None:
+    """An error the store already normalized must pass through unchanged."""
+
+    failure = RuntimeError("database unavailable")
+    runtime = PatternRuntime(
+        tracer=TraceCheckpointStore(RaisingCheckpointBackend(failure)),
+        execution_id="exec-wrapped",
+    )
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await runtime.checkpoint(
+            "before_llm",
+            context=ExecutionContext(execution_id="exec-wrapped"),
+            pattern=SimpleNamespace(status="running"),
+        )
+
+    # Exactly one level of normalization: the cause is the writer's own
+    # error, not another CheckpointPersistenceError.
+    assert exc_info.value.__cause__ is failure
+
+
+class PersistedAwareTraceEventBackend:
+    """A plain event tracer that can be asked for persisted delivery."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        require_persisted: bool = False,
+    ) -> str:
+        self.calls.append({"task_id": task_id, "require_persisted": require_persisted})
+        return "evt-1"
+
+
+class BestEffortTraceEventBackend:
+    """A plain event tracer with no way to guarantee persistence."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> str:
+        self.calls += 1
+        return "evt-1"
+
+
+class NoWriterBackend:
+    """A tracer with no checkpoint capability at all."""
+
+
+@pytest.mark.asyncio
+async def test_pattern_runtime_requires_persisted_delivery_from_event_tracer() -> None:
+    """The bare-tracer event fallback must ask for persisted delivery."""
+
+    backend = PersistedAwareTraceEventBackend()
+    runtime = PatternRuntime(tracer=backend, execution_id="exec-persisted")
+
+    await runtime.checkpoint(
+        "before_llm",
+        context=ExecutionContext(execution_id="exec-persisted"),
+        pattern=SimpleNamespace(status="running"),
+    )
+
+    assert backend.calls == [{"task_id": "exec-persisted", "require_persisted": True}]
+
+
+@pytest.mark.asyncio
+async def test_pattern_runtime_rejects_a_best_effort_event_tracer() -> None:
+    """A tracer that cannot promise persistence is not a checkpoint writer.
+
+    Returning normally here would tell the caller the transition is durable
+    when the write was only best-effort.
+    """
+
+    backend = BestEffortTraceEventBackend()
+    runtime = PatternRuntime(tracer=backend, execution_id="exec-best-effort")
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await runtime.checkpoint(
+            "before_llm",
+            context=ExecutionContext(execution_id="exec-best-effort"),
+            pattern=SimpleNamespace(status="running"),
+        )
+
+    # The capability check must reject it up front. Without that check the
+    # call would still fail -- passing an unsupported ``require_persisted``
+    # raises TypeError, which the boundary normalizes -- so assert on the
+    # specific reason, not merely on the error type.
+    assert "cannot guarantee checkpoint persistence" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert backend.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_pattern_runtime_tolerates_a_tracer_without_any_writer() -> None:
+    """A span-only observability tracer is the "not configured" mode.
+
+    It carries no event writer at all, so it is treated like ``tracer=None``
+    rather than failing the run. Raising here would break every execution
+    that passes a spans-only tracer, which is a supported shape. The
+    best-effort *event* tracer above is the case that does raise: it claims
+    to record the checkpoint without being able to promise it survives.
+    """
+
+    runtime = PatternRuntime(tracer=NoWriterBackend(), execution_id="exec-no-writer")
+
+    payload = await runtime.checkpoint(
+        "before_llm",
+        context=ExecutionContext(execution_id="exec-no-writer"),
+        pattern=SimpleNamespace(status="running"),
+    )
+
+    assert payload["label"] == "before_llm"
+
+
+@pytest.mark.asyncio
+async def test_pattern_runtime_without_a_tracer_stays_a_no_op() -> None:
+    """``tracer=None`` is the documented no-tracing mode, not a failure.
+
+    The fallback ``PatternRuntime`` constructions in auto.py / react.py /
+    dag.py build one of these, and they must keep working.
+    """
+
+    runtime = PatternRuntime(execution_id="exec-no-tracer")
+
+    payload = await runtime.checkpoint(
+        "before_llm",
+        context=ExecutionContext(execution_id="exec-no-tracer"),
+        pattern=SimpleNamespace(status="running"),
+    )
+
+    assert payload["label"] == "before_llm"
+
+
+@pytest.mark.asyncio
+async def test_bare_tracer_checkpoint_round_trips_through_the_real_reader() -> None:
+    """A bare tracer's checkpoint must be findable on a cold resume.
+
+    Goes through the real ``EphemeralCheckpointTraceHandler`` and its real
+    ``load_latest_checkpoint``. Before the fallback wrote the canonical
+    envelope, this call reported success while the handler dropped the event,
+    so the lookup returned ``None`` and a resume could replay work that had
+    already run.
+
+    The ``DatabaseTraceHandler`` path is PostgreSQL-only and is not exercised
+    here; it selects on the same ``checkpoint_type`` /
+    ``READABLE_CHECKPOINT_TYPES`` filter that the wire-format assertions
+    below pin.
+    """
+
+    from xagent.web.tracing import EphemeralCheckpointTraceHandler
+
+    store: dict[str, dict[str, Any]] = {}
+    handler = EphemeralCheckpointTraceHandler(store)
+    tracer = Tracer()
+    tracer.add_handler(handler)
+    runtime = PatternRuntime(tracer=tracer, execution_id="exec-bare-roundtrip")
+
+    await runtime.checkpoint(
+        "after_tool",
+        context=ExecutionContext(execution_id="exec-bare-roundtrip"),
+        pattern=SimpleNamespace(status="running"),
+    )
+
+    restored = await handler.load_latest_checkpoint("exec-bare-roundtrip")
+
+    assert restored is not None
+    assert restored["label"] == "after_tool"
+    assert restored["execution_id"] == "exec-bare-roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_bare_tracer_rejects_a_console_only_handler() -> None:
+    """A ``Tracer`` with only observational handlers is not durable.
+
+    ``Tracer.trace_event(require_persisted=True)`` only proves every
+    currently attached handler dispatched without raising; it does not prove
+    any of them can answer a checkpoint read. A ``Tracer`` wired with only
+    ``ConsoleTraceHandler`` would previously "succeed" here (return a
+    non-``None`` event id) and still lose the checkpoint, since
+    ``ConsoleTraceHandler`` has no ``load_latest_checkpoint``. This must be
+    rejected instead of silently reported as durable.
+    """
+
+    tracer = Tracer()
+    tracer.add_handler(ConsoleTraceHandler())
+    runtime = PatternRuntime(tracer=tracer, execution_id="exec-console-only")
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await runtime.checkpoint(
+            "before_llm",
+            context=ExecutionContext(execution_id="exec-console-only"),
+            pattern=SimpleNamespace(status="running"),
+        )
+
+    assert "no checkpoint-reading handler" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_runner_can_use_trace_checkpoint_store_for_resume() -> None:
+    backend = PersistentTraceBackend()
+    store = TraceCheckpointStore(backend)
+    agent = Agent(
+        name="checkpointed",
+        patterns=[CheckpointingPattern()],
+        llm=FakeLLM(),
+    )
+    runner = AgentRunner(agent=agent, tracer=store)
+
+    result = await runner.run(task="Say done", execution_id="exec-runner-store")
+    loaded = await store.load_latest_checkpoint("exec-runner-store")
+
+    assert result["success"] is True
+    assert loaded is not None
+    assert loaded["label"] == "final"
+    assert loaded["context"]["messages"][-1]["content"] == "done"
+
+
+class RaisingCheckpointReader:
+    """Sole checkpoint-capable handler; a second handler must never run."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        raise self.error
+
+
+class UnreachableCheckpointReader:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        self.calls += 1
+        raise AssertionError("a prior capable reader already answered")
+
+
+@pytest.mark.asyncio
+async def test_tracer_returns_first_reader_result_verbatim_including_none() -> None:
+    """The first capable handler's result is authoritative -- Tracer must not
+    probe a second handler after a valid ``None`` (absent) result."""
+    tracer = Tracer()
+
+    class NoneReturningHandler:
+        async def load_latest_checkpoint(
+            self, execution_id: str
+        ) -> dict[str, Any] | None:
+            del execution_id
+            return None
+
+    unreachable = UnreachableCheckpointReader()
+    tracer.add_handler(NoneReturningHandler())
+    tracer.add_handler(unreachable)
+
+    result = await tracer.load_latest_checkpoint("exec-first-reader-wins")
+
+    assert result is None
+    assert unreachable.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_tracer_propagates_first_reader_exception() -> None:
+    """A raising first reader must abort the lookup, not fall through to a
+    second handler -- today's production stacks all run a single reader, so
+    treating a raise as "try the next one" would hide the failure."""
+    tracer = Tracer()
+    unreachable = UnreachableCheckpointReader()
+    tracer.add_handler(RaisingCheckpointReader(CheckpointUnavailableError("down")))
+    tracer.add_handler(unreachable)
+
+    with pytest.raises(CheckpointUnavailableError):
+        await tracer.load_latest_checkpoint("exec-raising-reader")
+
+    assert unreachable.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_read_latest_checkpoint_payload_propagates_reader_exception() -> None:
+    reader = RaisingCheckpointReader(CheckpointUnavailableError("down"))
+
+    with pytest.raises(CheckpointUnavailableError):
+        await read_latest_checkpoint_payload(reader, "exec-raising-probe")
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_propagates_reader_exception() -> None:
+    store = TraceCheckpointStore(
+        RaisingCheckpointReader(CheckpointUnavailableError("down"))
+    )
+
+    with pytest.raises(CheckpointUnavailableError):
+        await store.load_latest_checkpoint("exec-raising-store")
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_returns_none_without_raising() -> None:
+    """A wrapped reader's authoritative ``None`` must pass through as
+    absence, not be misread as an unrecognized (corrupt) shape."""
+
+    class NoneReturningReader:
+        async def load_latest_checkpoint(
+            self, execution_id: str
+        ) -> dict[str, Any] | None:
+            del execution_id
+            return None
+
+    store = TraceCheckpointStore(NoneReturningReader())
+
+    assert await store.load_latest_checkpoint("exec-none-passthrough") is None
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_unrecognized_shape_raises_corrupt() -> None:
+    class UnrecognizedShapeReader:
+        async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+            del execution_id
+            return {"unexpected": "shape"}
+
+    store = TraceCheckpointStore(UnrecognizedShapeReader())
+
+    with pytest.raises(CheckpointCorruptError):
+        await store.load_latest_checkpoint("exec-unrecognized-shape")
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_readable_type_without_snapshot_raises_corrupt() -> (
+    None
+):
+    class NoSnapshotReader:
+        async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+            return {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": execution_id,
+            }
+
+    store = TraceCheckpointStore(NoSnapshotReader())
+
+    with pytest.raises(CheckpointCorruptError):
+        await store.load_latest_checkpoint("exec-no-snapshot")
+
+
+def test_checkpoint_access_refused_error_reason_defaults_to_active_run() -> None:
+    """Existing call sites that construct this error without ``reason`` keep
+    working, and get the most common refusal classification for free."""
+    error = CheckpointAccessRefusedError("refused")
+    assert error.reason == "active_run"
+
+
+def test_checkpoint_access_refused_error_carries_an_explicit_reason() -> None:
+    error = CheckpointAccessRefusedError("refused", reason="lease_mismatch")
+    assert error.reason == "lease_mismatch"

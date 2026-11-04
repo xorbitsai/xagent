@@ -1,0 +1,2134 @@
+import asyncio
+import inspect
+import json
+import logging
+import os
+import time
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    TypeVar,
+    Union,
+)
+
+import openai
+from openai import AsyncOpenAI
+
+from ....runtime_performance import run_in_thread_with_telemetry
+from ....utils.security import redact_sensitive_text
+from ...public_http import create_owned_async_sdk_client
+from ..exceptions import (
+    LLMEmptyContentError,
+    LLMRetryableError,
+    LLMTimeoutError,
+    ModelProviderError,
+    ModelProviderRetryableError,
+    format_model_provider_error,
+)
+from ..stream_deadline import await_before_deadline
+from ..stream_progress import (
+    NO_PROGRESS_FINISH_REASON,
+    STREAM_ABORTED_KEY,
+    StreamAbort,
+    StreamProgressConfig,
+    StreamProgressGuard,
+)
+from ..timeout_config import TimeoutConfig
+from ..token_context import add_token_usage, extract_cached_input_tokens
+from ..types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+    PROVIDER_STATE_METADATA_KEY,
+    ChunkType,
+    StreamChunk,
+)
+from .base import BaseLLM
+
+logger = logging.getLogger(__name__)
+
+# ``PROVIDER_STATE_METADATA_KEY`` now lives in ``chat.types`` (see there for
+# why); imported here so existing code and tests that import it from this
+# transport module keep working unchanged.
+
+
+def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
+    text = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, default=str)
+    )
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+def _openai_error_body(error: BaseException) -> Any:
+    body = getattr(error, "body", None)
+    if body is not None:
+        return body
+    response = getattr(error, "response", None)
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _openai_error_payload(error: BaseException) -> dict[str, Any] | None:
+    """The error object itself, whichever shape it arrives in.
+
+    The wire format wraps it (``{"error": {...}}``), but the SDK unwraps that
+    in ``_make_status_error``, so ``BadRequestError.body`` is the inner object
+    already. Code that only looked for the wrapper therefore found nothing on
+    any error the SDK actually produced -- and passed its tests, because the
+    fixtures hand-built the wire shape. Normalize here so both work.
+    """
+    body = _openai_error_body(error)
+    if not isinstance(body, dict):
+        return None
+    inner = body.get("error")
+    return inner if isinstance(inner, dict) else body
+
+
+def _openai_error_code(error: BaseException) -> str | None:
+    """The machine-readable code for a 400, when the endpoint sends one.
+
+    The SDK lifts it onto the exception; the payload is the fallback for
+    anything that did not come through the SDK.
+    """
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    error_payload = _openai_error_payload(error)
+    if error_payload is None:
+        return None
+    payload_code = error_payload.get("code")
+    return payload_code if isinstance(payload_code, str) and payload_code else None
+
+
+def _openai_rejected_param(error: BaseException) -> str | None:
+    """The parameter the endpoint said was at fault, when it says so.
+
+    OpenAI-shaped error bodies name the offending parameter in
+    ``error.param``. That is worth reaching for because the human-readable
+    message is not a reliable substitute: ``_format_openai_error`` appends
+    ``provider_raw`` and ``previous_errors`` blobs, so for a gateway that
+    tried several upstreams the text is several providers' complaints
+    concatenated, and a keyword found there may belong to an attempt that has
+    nothing to do with this failure. ``param`` describes only this one.
+    """
+    param = getattr(error, "param", None)
+    if not isinstance(param, str) or not param:
+        error_payload = _openai_error_payload(error)
+        param = error_payload.get("param") if error_payload is not None else None
+    if not isinstance(param, str) or not param:
+        return None
+    # Structured-output rejections name a path ("response_format.json_schema
+    # .schema"); the parameter is its first segment. Returning the full path
+    # would satisfy "an explicit param exists" while matching nothing, which
+    # would skip the text fallback and lose a recovery that works today.
+    return param.split(".", 1)[0]
+
+
+def _openai_error_details(error: BaseException) -> list[str]:
+    details: list[str] = []
+    error_payload = _openai_error_payload(error)
+    if error_payload is not None:
+        metadata = error_payload.get("metadata")
+        if isinstance(metadata, dict):
+            provider_name = metadata.get("provider_name")
+            if provider_name:
+                details.append(f"provider_name={provider_name}")
+            raw = metadata.get("raw")
+            if raw:
+                details.append("provider_raw=" + _truncate_error_detail(raw))
+            previous_errors = metadata.get("previous_errors")
+            if previous_errors:
+                details.append(
+                    "previous_errors=" + _truncate_error_detail(previous_errors)
+                )
+        elif metadata is not None:
+            details.append("metadata=" + _truncate_error_detail(metadata))
+    return details
+
+
+def _degrade_rejected_params(
+    completion_params: dict[str, Any],
+    error_msg: str,
+    rejected_param: str | None = None,
+    error_code: str | None = None,
+) -> list[str]:
+    """Drop or rename request parameters a compatible endpoint rejected.
+
+    Returns the names degraded, empty when the 400 was about something else
+    and the caller should re-raise. Each parameter is judged independently:
+    one 400 can name both, and treating them as alternatives would silently
+    skip a degrade that was also needed.
+
+    ``rejected_param`` is the endpoint's own answer (see
+    ``_openai_rejected_param``) and settles it outright when present. Only
+    without one does this fall back to reading ``error_msg``, which is a
+    weaker signal: it carries ``provider_raw`` and ``previous_errors`` blobs,
+    so a keyword in it may come from a different upstream attempt in a
+    gateway's fallback chain rather than from this failure. The fallback
+    therefore requires the parameter name and the complaint to appear
+    together, not merely both somewhere in the text.
+
+    ``max_tokens`` is renamed rather than dropped -- reasoning models spell
+    the same budget ``max_completion_tokens``, and for context compaction that
+    budget is what keeps a summary small enough not to re-trigger the next
+    compaction.
+    """
+    lowered = error_msg.lower()
+    degraded: list[str] = []
+
+    # ``param`` says *which* parameter, never that renaming it would help:
+    # a plain out-of-range value ("max_tokens is too large") reports the same
+    # param, and renaming that one wastes the retry that could have recovered
+    # some other way. So an unsupported-parameter signal is required either
+    # way; ``param`` only narrows which parameter it applies to.
+    names_replacement = (
+        error_code == "unsupported_parameter" or "max_completion_tokens" in lowered
+    )
+    if (
+        "max_tokens" in completion_params
+        and names_replacement
+        and (rejected_param is None or rejected_param == "max_tokens")
+    ):
+        completion_params["max_completion_tokens"] = completion_params.pop("max_tokens")
+        degraded.append("max_tokens")
+
+    if "response_format" in completion_params and (
+        rejected_param == "response_format"
+        if rejected_param is not None
+        # Unchanged from before this degrade path existed: presence of the
+        # name anywhere in the text. Tightening it here would narrow a
+        # recovery that has been working, which is not this change's business.
+        else "response_format" in lowered
+    ):
+        completion_params.pop("response_format")
+        degraded.append("response_format")
+
+    # Some OpenAI-compatible chat-completions endpoints enable reasoning by
+    # default, but reject that default when function tools are present. Their
+    # error explicitly asks clients to opt out, even when the original request
+    # did not contain ``reasoning_effort``.
+    if (
+        "tools" in completion_params
+        and rejected_param == "reasoning_effort"
+        and "set reasoning_effort to 'none'" in lowered
+        and completion_params.get("reasoning_effort") != "none"
+    ):
+        completion_params["reasoning_effort"] = "none"
+        degraded.append("reasoning_effort")
+
+    return degraded
+
+
+def _format_openai_error(prefix: str, error: BaseException) -> str:
+    return format_model_provider_error(
+        prefix,
+        getattr(error, "status_code", None),
+        str(getattr(error, "message", None) or error),
+        _openai_error_details(error),
+    )
+
+
+def _provider_failure_kind(error: BaseException, status_code: int | None) -> str:
+    """The failure kind, from the SDK exception class and then the status.
+
+    The class is checked first: ``APITimeoutError`` is an
+    ``APIConnectionError``, and neither carries a status. No message text is
+    read.
+
+    The kind is derived from the exception class and the HTTP status alone,
+    and the vocabulary is deliberately distinct from ``classify_provider_failure``
+    in ``call_boundary.py``. That classifier folds 401 and 403 into one
+    credential code, so a decommissioned-model 403 would read as a rejected
+    credential; it also reads message text markers, and its vocabulary
+    (``PROVIDER_CALL_FAILURE_CODES``) carries codes no provider returns, such
+    as ``call_scope_unavailable``. Here 401 and 403 stay separate kinds and
+    the message never influences the result.
+    """
+    if isinstance(error, openai.APITimeoutError):
+        return "timeout"
+    if isinstance(error, openai.APIConnectionError):
+        return "connection_failed"
+    if status_code is None:
+        return "unknown"
+    if status_code == 408:
+        return "timeout"
+    named = {
+        400: "bad_request",
+        401: "authentication_failed",
+        403: "access_denied",
+        404: "not_found",
+        429: "rate_limited",
+    }
+    if status_code in named:
+        return named[status_code]
+    if 500 <= status_code <= 599:
+        return "server_error"
+    if 400 <= status_code <= 499:
+        return "rejected"
+    return "unknown"
+
+
+_T = TypeVar("_T")
+
+
+def _guarded(extract: Callable[[], _T], default: _T) -> _T:
+    """``extract()``, or ``default`` when it raises."""
+    try:
+        return extract()
+    except Exception:
+        return default
+
+
+def _model_provider_error(
+    prefix: str, error: BaseException, *, retryable: bool = False
+) -> ModelProviderError:
+    """The typed exception for a provider failure; never raises.
+
+    Each field is extracted under its own guard, so one failing accessor
+    leaves the others intact. The text has the same shape as
+    ``_format_openai_error``'s and is built by the same formatter, with the SDK
+    message capped and a non-integer or out-of-range status omitted.
+    """
+
+    def status_code_of() -> int | None:
+        value = getattr(error, "status_code", None)
+        return value if type(value) is int and 100 <= value <= 599 else None
+
+    def provider_message_of() -> str | None:
+        payload = _openai_error_payload(error)
+        value = payload.get("message") if payload is not None else None
+        if type(value) is str and value.strip():
+            return _truncate_error_detail(value)
+        return None
+
+    def sdk_message_of() -> str:
+        return _truncate_error_detail(str(getattr(error, "message", None) or error))
+
+    def sdk_message_fallback() -> str:
+        return _guarded(
+            lambda: _truncate_error_detail(str(error)),
+            _guarded(lambda: _truncate_error_detail(repr(error)), type(error).__name__),
+        )
+
+    status_code = _guarded(status_code_of, None)
+    kind = _guarded(lambda: _provider_failure_kind(error, status_code), "unknown")
+    cls = ModelProviderRetryableError if retryable else ModelProviderError
+    return cls(
+        prefix=prefix,
+        kind=kind,
+        status_code=status_code,
+        provider_code=_guarded(lambda: _openai_error_code(error), None),
+        provider_message=_guarded(provider_message_of, None),
+        sdk_message=_guarded(sdk_message_of, None) or sdk_message_fallback(),
+        details=_guarded(lambda: _openai_error_details(error), []),
+    )
+
+
+def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
+    """Return whether a provider message/delta explicitly set ``field_name``.
+
+    Checks, in order, a plain dict, a pydantic model's declared fields, and
+    its ``model_extra`` (unknown fields the SDK still preserves). ``__dict__``
+    is only consulted for objects that are neither of those two shapes: on a
+    pydantic model every declared field sits in ``__dict__`` carrying its
+    default whether or not the provider actually sent it, so it cannot
+    distinguish "the provider sent this" from "the class declares it" and
+    must not be used as a fallback there.
+
+    Public (not ``_``-prefixed) because it is a general-purpose probe over
+    any OpenAI-SDK-shaped message or delta object, not an implementation
+    detail private to this module: ``OpenRouterLLM`` reuses it as-is to
+    widen its own reasoning-field check across multiple wire spellings.
+    """
+    if isinstance(message, dict):
+        if field_name not in message:
+            return False, None
+        value = message.get(field_name)
+        return value is not None, value
+
+    model_fields_set = getattr(message, "model_fields_set", None)
+    is_pydantic_model = isinstance(model_fields_set, set)
+    if is_pydantic_model and field_name in model_fields_set:  # type: ignore[operator]
+        value = getattr(message, field_name, None)
+        return value is not None, value
+
+    model_extra = getattr(message, "model_extra", None)
+    if isinstance(model_extra, dict) and field_name in model_extra:
+        value = model_extra.get(field_name)
+        return value is not None, value
+
+    if is_pydantic_model:
+        # On a pydantic model every declared field sits in ``__dict__``
+        # carrying its default, set or not, so ``__dict__`` cannot tell
+        # "the provider sent this" from "the class declares it". The two
+        # checks above are the only ones that can.
+        return False, None
+
+    message_attrs = getattr(message, "__dict__", {})
+    if not isinstance(message_attrs, dict) or field_name not in message_attrs:
+        return False, None
+
+    value = message_attrs[field_name]
+    return value is not None, value
+
+
+def _finish_reason_entry(choice: Any) -> Dict[str, str]:
+    """``{"finish_reason": ...}`` for a choice that reports one, else empty.
+
+    Carried on the response so ``llm_call_end`` can record how the
+    generation ended (#2786); a missing or blank reason adds no key.
+    """
+    finish_reason = getattr(choice, "finish_reason", None)
+    if isinstance(finish_reason, str) and finish_reason:
+        return {"finish_reason": finish_reason}
+    return {}
+
+
+def _message_reasoning_content(message: Any) -> tuple[bool, Any]:
+    """Return whether a provider explicitly included reasoning content."""
+    return field_content(message, "reasoning_content")
+
+
+def _delta_field_names(delta: Any) -> tuple[str, ...]:
+    """Return every field name actually set on a streaming delta object.
+
+    Checks the same shapes ``field_content`` does -- a plain dict, a
+    pydantic model's declared fields, and its ``model_extra`` -- but
+    collects key names rather than one field's value, so it falls back to
+    ``__dict__`` whenever both of those come up empty, even on a pydantic
+    model. Used to log which reasoning-like field (if any) a delta carried
+    without ever logging its content.
+    """
+    if isinstance(delta, dict):
+        return tuple(delta.keys())
+
+    names: set[str] = set()
+    model_fields_set = getattr(delta, "model_fields_set", None)
+    if isinstance(model_fields_set, set):
+        names.update(model_fields_set)
+    model_extra = getattr(delta, "model_extra", None)
+    if isinstance(model_extra, dict):
+        names.update(model_extra.keys())
+    if not names:
+        delta_attrs = getattr(delta, "__dict__", None)
+        if isinstance(delta_attrs, dict):
+            names.update(delta_attrs.keys())
+    return tuple(names)
+
+
+def _delta_reasoning_fields(delta: Any) -> tuple[list[str], list[str], bool]:
+    """``(names, texts, opaque)`` for every ``reasoning*`` field on a delta.
+
+    ``names`` feeds the field-name log; ``texts`` and ``opaque`` feed the
+    no-progress guard (#2785). Any spelling counts, not only the recognized
+    ``reasoning_content``: a thinking model behind the generic provider may
+    use another name, and a loop under that name must still be inspected
+    rather than treated as live. Non-string values (a details list) cannot
+    be inspected here and are reported as opaque liveness instead.
+    """
+    names: list[str] = []
+    texts: list[str] = []
+    opaque = False
+    for name in _delta_field_names(delta):
+        if not name.startswith("reasoning"):
+            continue
+        names.append(name)
+        present, value = field_content(delta, name)
+        if not present:
+            continue
+        if isinstance(value, str):
+            texts.append(value)
+        elif value:
+            opaque = True
+    return names, texts, opaque
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after an early exit; the loop never did before."""
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("Closing aborted OpenAI stream failed (%s)", type(exc).__name__)
+
+
+def _is_retryable_stream_transport_error(error: BaseException) -> bool:
+    retryable_messages = (
+        "peer closed connection",
+        "incomplete chunked read",
+        "remoteprotocolerror",
+        "server disconnected",
+        "connection reset",
+        "connection aborted",
+        "connection lost",
+    )
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(
+            current,
+            (
+                LLMRetryableError,
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+            ),
+        ):
+            return True
+        detail = f"{type(current).__module__}.{type(current).__name__}: {current}"
+        if any(message in detail.lower() for message in retryable_messages):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+class OpenAICompatibleLLM(BaseLLM):
+    """
+    Internal OpenAI-compatible chat client using the official OpenAI SDK.
+
+    This base owns transport, streaming assembly, usage accounting, tool-call
+    parsing, and retry/error handling. Provider classes layer policy on top:
+    environment defaults, structured-output translation, thinking parameters,
+    vision support, and model listing.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        base_url: Optional[str],
+        api_key: Optional[str],
+        default_temperature: Optional[float] = None,
+        default_max_tokens: Optional[int] = None,
+        timeout: float = 180.0,
+        abilities: Optional[List[str]] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
+    ):
+        self._model_name = model_name
+        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self.api_key = api_key
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.timeout = timeout
+        self.timeout_config = timeout_config or TimeoutConfig()
+
+        # Use explicitly configured abilities
+        if abilities:
+            self._abilities = abilities
+        else:
+            self._abilities = ["chat", "tool_calling"]
+
+        # Initialize the async OpenAI client
+        self._client: Optional[AsyncOpenAI] = None
+        self._client_init_task: asyncio.Task[None] | None = None
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name/identifier."""
+        return self._model_name
+
+    @property
+    def abilities(self) -> List[str]:
+        """Get the list of abilities supported by this OpenAI LLM implementation."""
+        return self._abilities
+
+    def _ensure_client(self) -> None:
+        """Ensure the OpenAI client is initialized."""
+        if self._client is None:
+            self._client = create_owned_async_sdk_client(
+                AsyncOpenAI,
+                base_url=self.base_url
+                if self.base_url != "https://api.openai.com/v1"
+                else None,
+                api_key=self.api_key,
+                timeout=self.timeout,
+                # Retry policy lives in exactly one layer. Left at the SDK
+                # default this client would retry twice inside every attempt
+                # the shared RetryWrapper makes, multiplying the configured
+                # budget by three and putting the total beyond the reach of
+                # any single bound.
+                max_retries=0,
+            )
+
+    def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+        """Hook for OpenAI-compatible subclasses to customize extra_body."""
+        return extra_body
+
+    async def _ensure_client_async(self) -> None:
+        """Keep per-client TLS/proxy setup off the event loop.
+
+        Share initialization between concurrent calls on this instance, but
+        never share clients across models or credentials. Drain construction
+        before propagating cancellation so a late worker cannot race close().
+        The synchronous hook remains overridable by Azure and other providers.
+        """
+        task = self._client_init_task
+        if task is None:
+            if self._client is not None:
+                return
+            task = asyncio.create_task(
+                run_in_thread_with_telemetry("model_client_init", self._ensure_client)
+            )
+            self._client_init_task = task
+
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            # Each caller cancellation interrupts its shielded wait, not the
+            # constructor. Re-shield until construction finishes, then re-raise.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    if task.cancelled():
+                        raise
+                    cancellation = exc
+            task.result()
+        finally:
+            if task.done() and self._client_init_task is task:
+                self._client_init_task = None
+            if cancellation is not None:
+                raise cancellation
+
+    def _prepare_messages_for_request(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return provider-ready messages before shared sanitization."""
+        _ = thinking
+        return messages
+
+    def _response_provider_state(
+        self,
+        result: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return opaque provider-owned message state for future LLM requests.
+
+        ``thinking`` and ``response_format`` are this request's own thinking
+        configuration and response format, made available so a subclass can
+        decide whether this request could have produced reasoning at all
+        (e.g. to decide whether an empty capture is worth a warning).
+        Mirrors ``_check_stream_reasoning_capture``'s parameters, for the
+        non-streaming path.
+        """
+        _ = result, thinking, response_format
+        return {}
+
+    def _delta_reasoning_content(self, delta: Any) -> tuple[bool, Any]:
+        """Hook for subclasses that watch additional reasoning field spellings.
+
+        Default implementation only recognizes ``reasoning_content``, matching
+        historical behavior exactly.
+        """
+        return _message_reasoning_content(delta)
+
+    def _check_stream_reasoning_capture(
+        self,
+        *,
+        thinking: Optional[Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
+        has_tool_calls: bool,
+        has_reasoning_content: bool,
+        observed_field_names: tuple[str, ...],
+    ) -> None:
+        """Hook called once after a stream ends, for a silent-capture check.
+
+        Mirrors ``_response_provider_state``'s non-streaming warning, but for
+        the streaming path: called with the whole stream's outcome (whether
+        any delta ever carried a recognized reasoning field, whether the
+        response ended with tool calls, and every field name -- never a
+        value -- seen on any delta), so a subclass can decide whether this
+        request could have produced reasoning at all. ``response_format`` is
+        the value this request's extra_body was built from. Default is a
+        no-op; only ``OpenRouterLLM`` currently overrides it.
+        """
+        _ = (
+            thinking,
+            response_format,
+            has_tool_calls,
+            has_reasoning_content,
+            observed_field_names,
+        )
+
+    def _build_request_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        prepared = self._prepare_messages_for_request(messages, thinking=thinking)
+        sanitized_messages: List[Dict[str, Any]] = self._sanitize_unicode_content(
+            self._strip_internal_message_keys(prepared)
+        )
+        return sanitized_messages
+
+    def _apply_output_config(
+        self,
+        completion_params: Dict[str, Any],
+        output_config: Optional[Dict[str, Any]],
+    ) -> None:
+        """Apply provider-specific structured-output request policy."""
+        if output_config is None:
+            return
+
+        completion_params["output_config"] = output_config
+
+    def _prepare_provider_reasoning_extra_body(
+        self,
+        *,
+        extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> Dict[str, Any]:
+        """Hook for subclasses to add provider-specific reasoning payloads."""
+        _ = thinking, tools, response_format, output_config, is_streaming
+        return dict(extra_body)
+
+    async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Perform a chat completion or trigger tool call.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification (e.g., {"type": "json_object"})
+            thinking: Provider-specific reasoning configuration for subclasses.
+            output_config: Output configuration for structured outputs (e.g., {"format": {"type": "json_schema", "schema": {...}}})
+            **kwargs: Additional parameters to pass to the OpenAI API
+
+        Returns:
+            - If normal text reply: return dict with type "text" and content
+            - If tool call triggered: return dict with type "tool_call" and tool_calls list
+
+        Raises:
+            RuntimeError: If the API call fails
+        """
+        await self._ensure_client_async()
+        assert self._client is not None
+
+        extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
+
+        # Prepare the completion parameters
+        completion_params = {
+            "model": self._model_name,
+            "messages": self._build_request_messages(messages, thinking=thinking),
+            **kwargs,
+        }
+
+        # An explicit max_tokens (e.g. the compaction budget) wins; otherwise
+        # fall back to the configured ``default_max_tokens`` (for hub models,
+        # ``models.max_tokens``), consistent with the other provider classes.
+        # Without either, the API's own default applies.
+        if max_tokens is not None:
+            completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
+
+        if temperature is not None:
+            completion_params["temperature"] = temperature
+        elif self.default_temperature is not None:
+            completion_params["temperature"] = self.default_temperature
+
+        # Add optional parameters
+        if tools:
+            completion_params["tools"] = tools
+            if tool_choice:
+                completion_params["tool_choice"] = tool_choice
+        elif tool_choice:
+            completion_params["tool_choice"] = tool_choice
+        if response_format:
+            completion_params["response_format"] = response_format
+
+        self._apply_output_config(completion_params, output_config)
+
+        # The response_format degrade branch below (retry without
+        # response_format after a 400) resets the ``response_format``
+        # local to None so the structured-output degrade check further
+        # down still gates correctly. The capture sentinel further below
+        # needs to know what this particular request was actually built
+        # with, which can differ from that local on that narrow path, so
+        # it is tracked separately here.
+        extra_body = self._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=False,
+        )
+        built_response_format = response_format
+
+        # Helper function to process response
+        async def _make_api_call() -> Any:
+            """Make the API call with current completion_params"""
+            assert self._client is not None
+            if extra_body:
+                return await self._client.chat.completions.create(
+                    extra_body=extra_body, **completion_params
+                )
+            else:
+                return await self._client.chat.completions.create(**completion_params)
+
+        # Helper function to process response
+        def _process_response(
+            resp: Any, *, request_thinking: Optional[Dict[str, Any]]
+        ) -> Dict[str, Any]:
+            """Process the API response and return the result.
+
+            ``request_thinking`` is the thinking configuration that the
+            attempt producing ``resp`` actually sent. It is a parameter
+            rather than a closure read because this call can retry once
+            with thinking disabled (see the structured-output degrade
+            branch below): a closure read would judge the second response
+            by the first attempt's configuration.
+            """
+            # Validate response
+            if not hasattr(resp, "choices") or not resp.choices:
+                raise RuntimeError(
+                    f"Invalid API response: no choices in response. Response: {resp}"
+                )
+
+            # Extract the choice
+            choice = resp.choices[0]
+            message = choice.message
+
+            # Record token usage to context
+            if hasattr(resp, "usage") and resp.usage:
+                add_token_usage(
+                    input_tokens=resp.usage.prompt_tokens,
+                    output_tokens=resp.usage.completion_tokens,
+                    model=self._model_name,
+                    model_id=self.model_id,
+                    cached_input_tokens=extract_cached_input_tokens(resp.usage),
+                    call_type="chat",
+                )
+
+            # Check for tool calls
+            if message.tool_calls:
+                # Convert OpenAI tool calls to our format
+                tool_calls = []
+                for tool_call in message.tool_calls:
+                    # Only handle function tool calls, not custom tool calls
+                    if hasattr(tool_call, "function"):
+                        func = tool_call.function
+                        # Blank arguments pass through deliberately (#1501); the
+                        # repair contract lives in the pattern layer, not here.
+                        args = func.arguments or ""
+
+                        tool_calls.append(
+                            {
+                                "id": tool_call.id,
+                                "type": tool_call.type,
+                                "function": {
+                                    "name": func.name,
+                                    "arguments": args,
+                                },
+                            }
+                        )
+
+                result = {
+                    "type": "tool_call",
+                    "tool_calls": tool_calls,
+                    "raw": resp.model_dump(),
+                    **_finish_reason_entry(choice),
+                }
+                has_reasoning_content, reasoning_content = _message_reasoning_content(
+                    message
+                )
+                if has_reasoning_content:
+                    result["reasoning_content"] = reasoning_content
+                    result["reasoning"] = reasoning_content
+                provider_state = self._response_provider_state(
+                    result,
+                    thinking=request_thinking,
+                    response_format=built_response_format,
+                )
+                if provider_state:
+                    result[PROVIDER_STATE_METADATA_KEY] = provider_state
+                return result
+
+            # Handle text content
+            content = message.content
+            has_reasoning_content, reasoning_content = _message_reasoning_content(
+                message
+            )
+            finish_reason = getattr(choice, "finish_reason", None)
+
+            # Handle None or empty content when no tool calls
+            if not content or not content.strip():
+                # Reasoning models (e.g. qwen3-thinking, deepseek-r1, served
+                # via OpenAI-compatible endpoints like Xinference) can return
+                # ``content=""`` while ``reasoning_content`` carries the
+                # partial answer when the generation is truncated by
+                # ``max_tokens`` (``finish_reason="length"``) before the
+                # final answer is produced. Surface the reasoning text as
+                # content so callers (notably the model connection test) do
+                # not treat a truncated-but-otherwise-healthy response as
+                # invalid. Mirror the ``content`` whitespace check so a
+                # reasoning trace that is purely whitespace still falls
+                # through to the empty-response error.
+                #
+                # Gate the fallback strictly on ``finish_reason == "length"``:
+                # any other terminal reason (``"stop"``, ``"content_filter"``,
+                # ``None`` …) means the model claims to be done but produced
+                # no final answer, which is a real failure that callers
+                # must see -- promoting the reasoning trace would silently
+                # hide the bug.
+                if (
+                    finish_reason == "length"
+                    and reasoning_content
+                    and reasoning_content.strip()
+                ):
+                    return {
+                        "type": "text",
+                        "content": reasoning_content,
+                        CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+                        "reasoning_content": reasoning_content,
+                        "reasoning": reasoning_content,
+                        "raw": resp.model_dump(),
+                        **_finish_reason_entry(choice),
+                    }
+                # If there are no tool calls and no content, this is an error
+                raise LLMEmptyContentError(
+                    f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
+                )
+
+            result = {
+                "type": "text",
+                "content": content,
+                "raw": resp.model_dump(),
+                **_finish_reason_entry(choice),
+            }
+            if has_reasoning_content:
+                result["reasoning_content"] = reasoning_content
+                result["reasoning"] = reasoning_content
+            return result
+
+        try:
+            # Make the API call
+            while True:
+                try:
+                    response = await _make_api_call()
+                    break
+                except openai.BadRequestError as e:
+                    error_msg = _format_openai_error("OpenAI bad request", e)
+                    degraded = _degrade_rejected_params(
+                        completion_params,
+                        error_msg,
+                        _openai_rejected_param(e),
+                        _openai_error_code(e),
+                    )
+                    if not degraded:
+                        raise
+                    logger.warning(
+                        "API rejected %s, retrying without it. Error: %s",
+                        " and ".join(degraded),
+                        error_msg,
+                    )
+                    if "response_format" in degraded:
+                        # The structured-output degrade check below is gated
+                        # on response_format, so clear it here too.
+                        response_format = None
+                    # Bounded by construction: every degrade removes or
+                    # renames a parameter, and each is triggered only while
+                    # that parameter is still in the request, so at most one
+                    # round per supported degrade. Endpoints commonly report
+                    # one invalid parameter per response, so a single round
+                    # is not always enough.
+
+            result = _process_response(response, request_thinking=thinking)
+
+            # Provider reasoning can corrupt structured JSON on some compatible
+            # endpoints. Subclasses can disable provider reasoning for a retry.
+            if (
+                response_format
+                and "thinking_mode" in self.abilities
+                and result.get("type") == "text"
+                and hasattr(response, "choices")
+                and response.choices
+            ):
+                message = response.choices[0].message
+                # Check if response has reasoning_content (indicates thinking was active)
+                has_reasoning_content, _ = _message_reasoning_content(message)
+                if has_reasoning_content:
+                    content = result.get("content", "")
+                    # Try to parse as JSON
+                    try:
+                        json.loads(content)
+                    except (json.JSONDecodeError, ValueError):
+                        # Content is not valid JSON, retry with thinking disabled
+                        logger.warning(
+                            "Model returned non-JSON content with response_format while thinking was enabled. "
+                            "Retrying with thinking disabled."
+                        )
+                        # One variable for both halves: what this retry
+                        # sends, and what the response hook is told it
+                        # sent. Two literals here would drift apart.
+                        retry_thinking: Dict[str, Any] = {
+                            "type": "disabled",
+                            "enable": False,
+                        }
+                        extra_body = self._prepare_provider_reasoning_extra_body(
+                            extra_body=extra_body,
+                            thinking=retry_thinking,
+                            tools=tools,
+                            response_format=response_format,
+                            output_config=output_config,
+                            is_streaming=False,
+                        )
+                        built_response_format = response_format
+                        response = await _make_api_call()
+                        result = _process_response(
+                            response, request_thinking=retry_thinking
+                        )
+
+            return result
+
+        except LLMRetryableError:
+            raise
+
+        except openai.BadRequestError as e:
+            # Handle bad request errors, including a response_format resend
+            # that failed again (see the degrade loop above).
+            raise _model_provider_error("OpenAI bad request", e) from e
+
+        except openai.APITimeoutError as e:
+            # Handle timeout errors
+            raise _model_provider_error("OpenAI API timeout", e) from e
+
+        except openai.RateLimitError as e:
+            # Handle rate limit errors
+            raise _model_provider_error("OpenAI rate limit exceeded", e) from e
+
+        except openai.AuthenticationError as e:
+            # Handle authentication errors
+            raise _model_provider_error("OpenAI authentication failed", e) from e
+
+        except openai.APIError as e:
+            # Handle OpenAI API errors
+            raise _model_provider_error("OpenAI API error", e) from e
+
+        except Exception as e:
+            # Handle any other unexpected errors
+            raise RuntimeError(f"LLM chat failed: {str(e)}") from e
+
+    @property
+    def supports_thinking_mode(self) -> bool:
+        """
+        Check if this OpenAI LLM supports thinking mode.
+
+        Returns:
+            bool: True if the model has thinking_mode ability, False otherwise
+        """
+        return "thinking_mode" in self.abilities
+
+    def _attach_reasoning_content_to_raw(
+        self,
+        raw_payload: Any,
+        reasoning_content: str,
+        *,
+        has_reasoning_content: bool = False,
+    ) -> Any:
+        """Attach accumulated reasoning content to a raw payload when possible."""
+        if not has_reasoning_content:
+            return raw_payload
+
+        if hasattr(raw_payload, "model_dump"):
+            raw_payload = raw_payload.model_dump()
+
+        if isinstance(raw_payload, dict):
+            raw_payload = dict(raw_payload)
+            raw_payload["reasoning_content"] = reasoning_content
+            raw_payload["reasoning"] = reasoning_content
+
+        return raw_payload
+
+    async def vision_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Perform a vision-aware chat completion for OpenAI models that support vision.
+        This method handles multimodal messages with image content.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+                      Content can be a string or list of multimodal content items
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification
+            thinking: Provider-specific reasoning configuration for subclasses.
+            **kwargs: Additional parameters to pass to the OpenAI API
+
+        Returns:
+            - If normal text reply: return dict with type "text" and content
+            - If tool call triggered: return dict with type "tool_call" and tool_calls list
+
+        Raises:
+            RuntimeError: If the model doesn't support vision or the API call fails
+        """
+        if not self.has_ability("vision"):
+            raise RuntimeError(
+                f"Model {self._model_name} does not support vision capabilities"
+            )
+
+        await self._ensure_client_async()
+        assert self._client is not None
+
+        extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
+
+        # Prepare the completion parameters
+        completion_params = {
+            "model": self._model_name,
+            "messages": self._build_request_messages(messages, thinking=thinking),
+            **kwargs,
+        }
+
+        # See ``chat()``: explicit max_tokens wins, then the configured default.
+        if max_tokens is not None:
+            completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
+
+        if temperature is not None:
+            completion_params["temperature"] = temperature
+        elif self.default_temperature is not None:
+            completion_params["temperature"] = self.default_temperature
+
+        # Add optional parameters
+        if tools:
+            completion_params["tools"] = tools
+            if tool_choice:
+                completion_params["tool_choice"] = tool_choice
+        elif tool_choice:
+            completion_params["tool_choice"] = tool_choice
+        if response_format:
+            completion_params["response_format"] = response_format
+
+        self._apply_output_config(completion_params, output_config)
+
+        extra_body = self._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=False,
+        )
+
+        async def _make_api_call() -> Any:
+            assert self._client is not None
+            if extra_body:
+                return await self._client.chat.completions.create(
+                    extra_body=extra_body, **completion_params
+                )
+            return await self._client.chat.completions.create(**completion_params)
+
+        try:
+            # Make the API call with extra_body if needed
+            while True:
+                try:
+                    response = await _make_api_call()
+                    break
+                except openai.BadRequestError as e:
+                    error_msg = _format_openai_error("OpenAI bad request", e)
+                    degraded = _degrade_rejected_params(
+                        completion_params,
+                        error_msg,
+                        _openai_rejected_param(e),
+                        _openai_error_code(e),
+                    )
+                    if not degraded:
+                        raise
+                    logger.warning(
+                        "API rejected %s, retrying without it. Error: %s",
+                        " and ".join(degraded),
+                        error_msg,
+                    )
+                    # Loop because endpoints commonly report one invalid
+                    # parameter per response. Bounded by construction: each
+                    # degrade removes or renames a parameter and fires only
+                    # while it is still in the request.
+
+            # Validate response
+            if not hasattr(response, "choices") or not response.choices:
+                raise RuntimeError(
+                    f"Invalid API response: no choices in response. Response: {response}"
+                )
+
+            # Extract the choice
+            choice = response.choices[0]
+            message = choice.message
+
+            # Record token usage to context
+            if hasattr(response, "usage") and response.usage:
+                add_token_usage(
+                    input_tokens=response.usage.prompt_tokens,
+                    output_tokens=response.usage.completion_tokens,
+                    model=self._model_name,
+                    model_id=self.model_id,
+                    cached_input_tokens=extract_cached_input_tokens(response.usage),
+                    call_type="chat",
+                )
+
+            # Check for tool calls
+            if message.tool_calls:
+                # Convert OpenAI tool calls to our format
+                tool_calls = []
+                for tool_call in message.tool_calls:
+                    # Only handle function tool calls, not custom tool calls
+                    if hasattr(tool_call, "function"):
+                        func = tool_call.function
+                        # Blank arguments pass through deliberately (#1501); the
+                        # repair contract lives in the pattern layer, not here.
+                        args = func.arguments or ""
+
+                        tool_calls.append(
+                            {
+                                "id": tool_call.id,
+                                "type": tool_call.type,
+                                "function": {
+                                    "name": func.name,
+                                    "arguments": args,
+                                },
+                            }
+                        )
+
+                result = {
+                    "type": "tool_call",
+                    "tool_calls": tool_calls,
+                    "raw": response.model_dump(),
+                    **_finish_reason_entry(choice),
+                }
+                has_reasoning_content, reasoning_content = _message_reasoning_content(
+                    message
+                )
+                if has_reasoning_content:
+                    result["reasoning_content"] = reasoning_content
+                    result["reasoning"] = reasoning_content
+                provider_state = self._response_provider_state(
+                    result, thinking=thinking, response_format=response_format
+                )
+                if provider_state:
+                    result[PROVIDER_STATE_METADATA_KEY] = provider_state
+                return result
+
+            # Handle text content
+            content = message.content
+            has_reasoning_content, reasoning_content = _message_reasoning_content(
+                message
+            )
+            finish_reason = getattr(choice, "finish_reason", None)
+
+            # Handle None or empty content when no tool calls
+            if not content or not content.strip():
+                # See ``chat()``: reasoning models truncated by ``max_tokens``
+                # may return ``content=""`` with the partial answer in
+                # ``reasoning_content``. Surface it as content rather than
+                # treating the response as invalid. Mirror the ``content``
+                # whitespace check so a reasoning trace that is purely
+                # whitespace still falls through to the empty-response error.
+                # Gate strictly on ``finish_reason == "length"`` so a
+                # ``"stop"``/``"content_filter"``/``None`` choice with no
+                # final content still raises -- those mean the model claims
+                # to be done but produced nothing, which is a real failure.
+                if (
+                    finish_reason == "length"
+                    and reasoning_content
+                    and reasoning_content.strip()
+                ):
+                    return {
+                        "type": "text",
+                        "content": reasoning_content,
+                        CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+                        "reasoning_content": reasoning_content,
+                        "reasoning": reasoning_content,
+                        "raw": response.model_dump(),
+                        **_finish_reason_entry(choice),
+                    }
+                # If there are no tool calls and no content, this is an error
+                raise LLMEmptyContentError(
+                    f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
+                )
+
+            text_result: Dict[str, Any] = {
+                "type": "text",
+                "content": content,
+                "raw": response.model_dump(),
+                **_finish_reason_entry(choice),
+            }
+            if has_reasoning_content:
+                text_result["reasoning_content"] = reasoning_content
+                text_result["reasoning"] = reasoning_content
+            return text_result
+
+        except LLMRetryableError:
+            raise
+
+        except openai.APITimeoutError as e:
+            # Handle timeout errors
+            raise _model_provider_error("OpenAI API timeout", e) from e
+
+        except openai.RateLimitError as e:
+            # Handle rate limit errors
+            raise _model_provider_error("OpenAI rate limit exceeded", e) from e
+
+        except openai.AuthenticationError as e:
+            # Handle authentication errors
+            raise _model_provider_error("OpenAI authentication failed", e) from e
+
+        except openai.BadRequestError as e:
+            # Handle bad request errors, including a response_format resend
+            # that failed again (see the degrade loop above).
+            raise _model_provider_error("OpenAI bad request", e) from e
+
+        except openai.APIError as e:
+            # Handle OpenAI API errors
+            raise _model_provider_error("OpenAI API error", e) from e
+
+        except Exception as e:
+            # Handle any other unexpected errors
+            raise RuntimeError(f"LLM vision chat failed: {str(e)}") from e
+
+    async def stream_chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        thinking: Optional[Dict[str, Any]] = None,
+        output_config: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """
+        Stream chat completion with timeout controls and token tracking.
+
+        Supports real-time token output, flexible timeout controls, and precise token statistics.
+
+        Args:
+            messages: List of message dictionaries with 'role' and 'content'
+            temperature: Sampling temperature
+            max_tokens: Maximum number of tokens to generate
+            tools: List of tool definitions for function calling
+            tool_choice: Tool choice strategy
+            response_format: Response format specification
+            thinking: Provider-specific reasoning configuration for subclasses.
+            **kwargs: Additional parameters to pass to the OpenAI API
+
+        Yields:
+            StreamChunk: Streaming response chunks
+
+        Raises:
+            RuntimeError: API call failed
+            LLMTimeoutError: First token or token interval deadline expired
+        """
+        await self._ensure_client_async()
+        assert self._client is not None
+
+        extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
+
+        # Prepare completion parameters
+        completion_params = {
+            "model": self._model_name,
+            "messages": self._build_request_messages(messages, thinking=thinking),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            **kwargs,
+        }
+
+        # See ``chat()``: explicit max_tokens wins, then the configured default.
+        if max_tokens is not None:
+            completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
+
+        if temperature is not None:
+            completion_params["temperature"] = temperature
+        elif self.default_temperature is not None:
+            completion_params["temperature"] = self.default_temperature
+
+        # Add tools if provided
+        if tools:
+            completion_params["tools"] = tools
+            if tool_choice:
+                completion_params["tool_choice"] = tool_choice
+        elif tool_choice:
+            completion_params["tool_choice"] = tool_choice
+
+        if response_format:
+            completion_params["response_format"] = response_format
+
+        self._apply_output_config(completion_params, output_config)
+
+        extra_body = self._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=True,
+        )
+
+        try:
+            # Create streaming response
+            client = self._client
+            assert client is not None
+
+            async def _create_stream() -> Any:
+                if extra_body:
+                    return await client.chat.completions.create(
+                        extra_body=extra_body, **completion_params
+                    )
+                return await client.chat.completions.create(**completion_params)
+
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent (#3056). The first-token deadline also covers
+            # opening the stream.
+            loop = asyncio.get_running_loop()
+            start_time = time.time()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            while True:
+                try:
+                    stream = await await_before_deadline(
+                        _create_stream(),
+                        deadline=first_token_deadline,
+                        timeout_message=first_token_message,
+                    )
+                    break
+                except openai.BadRequestError as e:
+                    error_msg = _format_openai_error("OpenAI bad request", e)
+                    degraded = _degrade_rejected_params(
+                        completion_params,
+                        error_msg,
+                        _openai_rejected_param(e),
+                        _openai_error_code(e),
+                    )
+                    if not degraded:
+                        raise
+                    logger.warning(
+                        "API rejected %s, retrying without it. Error: %s",
+                        " and ".join(degraded),
+                        error_msg,
+                    )
+                    # Loop because endpoints commonly report one invalid
+                    # parameter per response. Bounded by construction: each
+                    # degrade removes or renames a parameter and fires only
+                    # while it is still in the request.
+
+            # Accumulate tool calls (across multiple chunks)
+            accumulated_tool_calls: Dict[str, Dict] = {}
+            accumulated_reasoning_content = ""
+            has_reasoning_content = False
+            observed_reasoning_field_names: set[str] = set()
+            last_raw_chunk = None  # Track last raw chunk for usage extraction
+            usage_received = False
+            # No-progress guard (#2785): fed one observation per raw delta,
+            # because the runtime never sees the deltas ``_parse_stream_chunks``
+            # drops and the interval timeout only measures silence.
+            progress_guard = StreamProgressGuard(
+                StreamProgressConfig.from_env(model_name=self._model_name)
+            )
+            stream_abort: StreamAbort | None = None
+            saw_content = False
+            raw_chunk_count = 0
+
+            chunks = aiter(stream)
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if raw_chunk_count:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                else:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                try:
+                    raw_chunk = await await_before_deadline(
+                        anext(chunks),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(stream)
+                    raise
+                if not raw_chunk_count:
+                    logger.debug(
+                        "First token received after %.2fs", time.time() - start_time
+                    )
+                raw_chunk_count += 1
+
+                # Store last raw chunk for potential usage extraction
+                last_raw_chunk = raw_chunk
+
+                # Parse chunk
+                reasoning_texts: list[str] = []
+                reasoning_opaque = False
+                delta_has_finish_reason = False
+                if hasattr(raw_chunk, "choices") and raw_chunk.choices:
+                    choice = raw_chunk.choices[0]
+                    delta = choice.delta
+                    delta_has_finish_reason = bool(
+                        getattr(choice, "finish_reason", None)
+                    )
+                    delta_has_reasoning, delta_reasoning_content = (
+                        self._delta_reasoning_content(delta)
+                    )
+                    if delta_has_reasoning:
+                        has_reasoning_content = True
+                        accumulated_reasoning_content += str(
+                            delta_reasoning_content or ""
+                        )
+                    reasoning_names, reasoning_texts, reasoning_opaque = (
+                        _delta_reasoning_fields(delta)
+                    )
+                    observed_reasoning_field_names.update(reasoning_names)
+                    # A subclass hook may extract text the raw fields hide
+                    # (e.g. from a details list); let the guard inspect it.
+                    if (
+                        not reasoning_texts
+                        and delta_has_reasoning
+                        and isinstance(delta_reasoning_content, str)
+                    ):
+                        reasoning_texts = [delta_reasoning_content]
+
+                parsed_chunks = self._parse_stream_chunks(
+                    raw_chunk,
+                    accumulated_tool_calls,
+                    accumulated_reasoning_content,
+                    has_reasoning_content=has_reasoning_content,
+                )
+                stream_abort = progress_guard.observe(
+                    has_content=any(chunk.is_token() for chunk in parsed_chunks),
+                    reasoning_texts=reasoning_texts,
+                    reasoning_opaque=reasoning_opaque,
+                    has_finish_reason=delta_has_finish_reason,
+                    has_usage=any(chunk.is_usage() for chunk in parsed_chunks),
+                    accumulated_tool_calls=accumulated_tool_calls,
+                )
+                if stream_abort is not None:
+                    # The chunk that tripped the guard carries the garbage;
+                    # the tail chunk yielded below stands in for it.
+                    break
+                for chunk in parsed_chunks:
+                    if chunk.is_usage():
+                        usage_received = True
+                    elif chunk.is_token():
+                        saw_content = True
+                    yield chunk
+
+            if stream_abort is not None:
+                await _close_stream(stream)
+                logger.warning(
+                    "Aborting OpenAI stream for %s after %.1fs and %d chunks: %s "
+                    "(%s; reasoning_fields=%s)",
+                    self._model_name,
+                    time.time() - start_time,
+                    raw_chunk_count,
+                    stream_abort.reason,
+                    stream_abort.detail,
+                    ",".join(sorted(observed_reasoning_field_names)) or "none",
+                )
+                yield self._no_progress_tail_chunk(
+                    stream_abort,
+                    accumulated_tool_calls,
+                    last_raw_chunk,
+                    accumulated_reasoning_content,
+                    has_reasoning_content=has_reasoning_content,
+                )
+
+            if not accumulated_tool_calls and not saw_content:
+                # The runtime retries this shape as a non-streaming call
+                # (#2785); until now nothing recorded that it happened or which
+                # reasoning field the deltas used. Names only, never values.
+                # After an abort the warning above already carries them.
+                logger.log(
+                    logging.DEBUG if stream_abort is not None else logging.WARNING,
+                    "OpenAI stream for %s ended with no content or tool calls after "
+                    "%d chunks (reasoning_fields=%s, aborted=%s)",
+                    self._model_name,
+                    raw_chunk_count,
+                    ",".join(sorted(observed_reasoning_field_names)) or "none",
+                    stream_abort.reason if stream_abort is not None else "no",
+                )
+
+            # One-time hook for a subclass to detect a silent streaming
+            # capture failure (the request did not go out with reasoning
+            # disabled, tool calls in the response, but no recognized
+            # reasoning field ever captured). See
+            # ``_check_stream_reasoning_capture``'s docstring.
+            # ``response_format`` is passed as the value this request's
+            # extra_body was built from: the response_format pop-and-retry
+            # above drops it from completion_params only and reuses the
+            # already-built extra_body, so the local variable still
+            # describes what actually went on the wire.
+            self._check_stream_reasoning_capture(
+                thinking=thinking,
+                response_format=response_format,
+                has_tool_calls=bool(accumulated_tool_calls),
+                has_reasoning_content=has_reasoning_content,
+                observed_field_names=tuple(sorted(observed_reasoning_field_names)),
+            )
+
+            # Fallback: Ensure usage chunk is always sent
+            # If no usage chunk was received, try to extract from the last raw chunk
+            # Skipped after an abort: the stream was cut before its usage chunk,
+            # so the aborted generation's tokens are not recorded anywhere; the
+            # trace shows ``usage_missing`` and the abort reason instead.
+            if (
+                stream_abort is None
+                and not usage_received
+                and last_raw_chunk is not None
+            ):
+                logger.warning(
+                    "OpenAI stream ended without usage chunk, attempting to extract from last chunk"
+                )
+                if hasattr(last_raw_chunk, "usage") and last_raw_chunk.usage:
+                    usage = last_raw_chunk.usage
+                    input_tokens = getattr(usage, "prompt_tokens", 0)
+                    output_tokens = getattr(usage, "completion_tokens", 0)
+
+                    if input_tokens > 0 or output_tokens > 0:
+                        # Record token usage
+                        add_token_usage(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            model=self._model_name,
+                            model_id=self.model_id,
+                            cached_input_tokens=extract_cached_input_tokens(usage),
+                            call_type="stream_chat",
+                        )
+
+                        # Yield usage chunk
+                        yield StreamChunk(
+                            type=ChunkType.USAGE,
+                            usage={
+                                "prompt_tokens": input_tokens,
+                                "completion_tokens": output_tokens,
+                                "total_tokens": input_tokens + output_tokens,
+                            },
+                            raw=last_raw_chunk,
+                        )
+                        logger.info(
+                            f"Extracted usage from last chunk: {input_tokens} + {output_tokens} tokens"
+                        )
+
+        except LLMTimeoutError:
+            # Re-raise timeout errors for retry
+            raise
+
+        except openai.APITimeoutError as e:
+            logger.error(f"OpenAI API timeout: {e}")
+            raise _model_provider_error("OpenAI API timeout", e, retryable=True) from e
+
+        except openai.RateLimitError as e:
+            logger.error(
+                "OpenAI rate limit exceeded: %s", redact_sensitive_text(str(e))
+            )
+            raise _model_provider_error(
+                "OpenAI rate limit exceeded", e, retryable=True
+            ) from e
+
+        except openai.APIConnectionError as e:
+            logger.error(
+                "OpenAI stream connection failed: %s", redact_sensitive_text(str(e))
+            )
+            raise _model_provider_error(
+                "OpenAI stream connection failed", e, retryable=True
+            ) from e
+
+        except openai.AuthenticationError as e:
+            logger.error(
+                "OpenAI authentication failed: %s", redact_sensitive_text(str(e))
+            )
+            raise _model_provider_error("OpenAI authentication failed", e) from e
+
+        except openai.BadRequestError as e:
+            logger.debug("OpenAI bad request: %s", redact_sensitive_text(str(e)))
+            raise _model_provider_error("OpenAI bad request", e) from e
+
+        except openai.APIError as e:
+            logger.error("OpenAI API error: %s", redact_sensitive_text(str(e)))
+            raise _model_provider_error("OpenAI API error", e) from e
+
+        except TimeoutError:
+            raise
+
+        except Exception as e:
+            logger.error("OpenAI stream chat failed: %s", redact_sensitive_text(str(e)))
+            if _is_retryable_stream_transport_error(e):
+                raise LLMRetryableError(
+                    f"OpenAI stream connection failed: {str(e)}"
+                ) from e
+            raise RuntimeError(f"LLM stream chat failed: {str(e)}") from e
+
+    def _no_progress_tail_chunk(
+        self,
+        abort: StreamAbort,
+        accumulated_tool_calls: Dict[str, Dict],
+        last_raw_chunk: Any,
+        accumulated_reasoning_content: str,
+        *,
+        has_reasoning_content: bool,
+    ) -> StreamChunk:
+        """The chunk that ends an aborted stream (#2785).
+
+        With tool calls accumulated it is a final ``TOOL_CALL`` snapshot with
+        the rejected delta undone: the call the guard named is cut back to
+        ``abort.keep_length``, its length before that delta, which equals or
+        extends the snapshot the runtime holds (a wrapper such as the
+        DeepSeek tool-protocol adapter may have streamed a shorter prefix; a
+        snapshot shorter than the runtime's would be merged as a delta
+        there). Otherwise an ``END``. Either way
+        ``finish_reason`` is ``no_progress`` so the runtime's #2786 markers
+        record the abort.
+        """
+        if abort.tool_call_id is not None and abort.keep_length is not None:
+            call = accumulated_tool_calls.get(abort.tool_call_id)
+            if call is not None:
+                function = call["function"]
+                function["arguments"] = function["arguments"][: abort.keep_length]
+        raw = self._attach_reasoning_content_to_raw(
+            last_raw_chunk,
+            accumulated_reasoning_content,
+            has_reasoning_content=has_reasoning_content,
+        )
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump()
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        # The runtime lifts this onto the response (and the no-payload
+        # fallback), so the trace records which predicate fired.
+        raw[STREAM_ABORTED_KEY] = abort.reason
+        if accumulated_tool_calls:
+            return StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=list(accumulated_tool_calls.values()),
+                finish_reason=NO_PROGRESS_FINISH_REASON,
+                raw=raw,
+            )
+        return StreamChunk(
+            type=ChunkType.END,
+            finish_reason=NO_PROGRESS_FINISH_REASON,
+            raw=raw,
+        )
+
+    def _parse_stream_chunks(
+        self,
+        raw_chunk: Any,
+        accumulated_tool_calls: Dict,
+        accumulated_reasoning_content: str = "",
+        *,
+        has_reasoning_content: bool = False,
+    ) -> List[StreamChunk]:
+        """
+        Parse OpenAI streaming chunk
+
+        Args:
+            raw_chunk: Raw chunk returned by OpenAI SDK
+            accumulated_tool_calls: Accumulated tool calls (across chunks)
+
+        Returns:
+            The StreamChunks this chunk expands to, in emission order (empty
+            when there is nothing to emit). A delta that carries both text
+            and tool-call fragments expands to a TOKEN followed by a
+            TOOL_CALL: consumers dispatch on chunk type, so folding the tool
+            calls into the TOKEN would lose them.
+        """
+        # Check choices
+        if not hasattr(raw_chunk, "choices") or not raw_chunk.choices:
+            # Check usage information (in the final chunk)
+            if hasattr(raw_chunk, "usage") and raw_chunk.usage:
+                # Automatically record to token context
+                add_token_usage(
+                    input_tokens=raw_chunk.usage.prompt_tokens,
+                    output_tokens=raw_chunk.usage.completion_tokens,
+                    model=self._model_name,
+                    model_id=self.model_id,
+                    cached_input_tokens=extract_cached_input_tokens(raw_chunk.usage),
+                    call_type="stream_chat",
+                )
+
+                return [
+                    StreamChunk(
+                        type=ChunkType.USAGE,
+                        usage={
+                            "prompt_tokens": raw_chunk.usage.prompt_tokens,
+                            "completion_tokens": raw_chunk.usage.completion_tokens,
+                            "total_tokens": raw_chunk.usage.total_tokens,
+                        },
+                        raw=raw_chunk,
+                    )
+                ]
+            return []
+
+        choice = raw_chunk.choices[0]
+        delta = choice.delta
+        # Some OpenAI-compatible endpoints put ``finish_reason`` on the same
+        # chunk as the final delta instead of on a trailing empty one, so the
+        # delta-bearing chunks below carry it as well (#2786).
+        finish_reason = getattr(choice, "finish_reason", None) or ""
+        chunks: List[StreamChunk] = []
+
+        # Handle token content
+        if hasattr(delta, "content") and delta.content:
+            chunks.append(
+                StreamChunk(
+                    type=ChunkType.TOKEN,
+                    content=delta.content,
+                    delta=delta.content,
+                    raw=self._attach_reasoning_content_to_raw(
+                        raw_chunk,
+                        accumulated_reasoning_content,
+                        has_reasoning_content=has_reasoning_content,
+                    ),
+                )
+            )
+
+        # Handle tool calls
+        if hasattr(delta, "tool_calls") and delta.tool_calls:
+            tool_calls_list = []
+
+            for tool_call in delta.tool_calls:
+                call_id = tool_call.id
+                index = tool_call.index
+                func = tool_call.function if hasattr(tool_call, "function") else None
+
+                # Handle Azure OpenAI's incremental tool call format
+                # where later chunks may have null id but have arguments
+                # Also handle qwen's empty string id format
+                if call_id is None or call_id == "":
+                    if accumulated_tool_calls and index is not None:
+                        # Try to associate with the most recent tool call by index
+                        for existing_id, existing_tc in accumulated_tool_calls.items():
+                            if existing_tc.get("index") == index:
+                                call_id = existing_id
+                                break
+                    if call_id is None or call_id == "":
+                        if not self._stream_tool_call_has_payload(tool_call):
+                            # Some OpenAI-compatible providers emit empty
+                            # placeholder slots while streaming multiple tool
+                            # calls. They carry no recoverable data and should
+                            # not become a real accumulated call.
+                            continue
+                        if index is None:
+                            # Cannot associate this chunk — skip it
+                            continue
+                        call_id = f"tool_call_{index}"
+
+                if not self._stream_tool_call_has_payload(tool_call):
+                    if call_id not in accumulated_tool_calls:
+                        continue
+
+                # Initialize or update accumulated tool call
+                if call_id not in accumulated_tool_calls:
+                    accumulated_tool_calls[call_id] = {
+                        "index": index,
+                        "id": call_id,
+                        "type": getattr(tool_call, "type", None) or "function",
+                        "function": {
+                            "name": "",
+                            "arguments": "",
+                        },
+                    }
+
+                # Update function information (even if call_id is empty string)
+                if call_id is not None:
+                    # Update function information
+                    if func:
+                        if hasattr(func, "name") and func.name:
+                            accumulated_tool_calls[call_id]["function"]["name"] = (
+                                func.name
+                            )
+                        # FIXED: Always accumulate arguments, even if empty string
+                        # Some models send empty chunks before/after actual arguments
+                        if hasattr(func, "arguments"):
+                            args_to_add = func.arguments if func.arguments else ""
+                            accumulated_tool_calls[call_id]["function"][
+                                "arguments"
+                            ] += args_to_add
+
+            # Return current accumulated tool calls
+            tool_calls_list = list(accumulated_tool_calls.values())
+            if tool_calls_list:
+                raw = (
+                    chunks[0].raw
+                    if chunks
+                    else self._attach_reasoning_content_to_raw(
+                        raw_chunk,
+                        accumulated_reasoning_content,
+                        has_reasoning_content=has_reasoning_content,
+                    )
+                )
+                chunks.append(
+                    StreamChunk(
+                        type=ChunkType.TOOL_CALL,
+                        tool_calls=tool_calls_list,
+                        raw=raw,
+                    )
+                )
+
+        # Check finish reason
+        if finish_reason:
+            if chunks:
+                # The marker rides on this delta's last payload chunk, so a
+                # mixed final delta ends on its TOOL_CALL, not its TOKEN.
+                chunks[-1].finish_reason = finish_reason
+            # No payload on this delta: emit the final tool-call snapshot.
+            elif accumulated_tool_calls:
+                tool_calls_list = list(accumulated_tool_calls.values())
+
+                # Blank accumulated arguments pass through deliberately (#1501);
+                # the repair contract lives in the pattern layer, not here.
+                chunks.append(
+                    StreamChunk(
+                        type=ChunkType.TOOL_CALL,
+                        tool_calls=tool_calls_list,
+                        finish_reason=finish_reason,
+                        raw=self._attach_reasoning_content_to_raw(
+                            raw_chunk,
+                            accumulated_reasoning_content,
+                            has_reasoning_content=has_reasoning_content,
+                        ),
+                    )
+                )
+            else:
+                chunks.append(
+                    StreamChunk(
+                        type=ChunkType.END,
+                        finish_reason=finish_reason,
+                        raw=self._attach_reasoning_content_to_raw(
+                            raw_chunk,
+                            accumulated_reasoning_content,
+                            has_reasoning_content=has_reasoning_content,
+                        ),
+                    )
+                )
+
+        return chunks
+
+    @staticmethod
+    def _stream_tool_call_has_payload(tool_call: Any) -> bool:
+        func = tool_call.function if hasattr(tool_call, "function") else None
+        if func is None:
+            return False
+        name = getattr(func, "name", None)
+        if isinstance(name, str) and name:
+            return True
+        arguments = getattr(func, "arguments", None)
+        if isinstance(arguments, str):
+            return bool(arguments)
+        return arguments is not None
+
+    async def close(self) -> None:
+        """Close the OpenAI client and cleanup resources."""
+        try:
+            if self._client_init_task is not None:
+                try:
+                    await self._ensure_client_async()
+                except Exception as exc:
+                    # The requesting caller receives the construction error;
+                    # cleanup only owns any client that was actually created.
+                    logger.debug(
+                        "Client initialization failed during close (%s)",
+                        type(exc).__name__,
+                    )
+        finally:
+            if self._client is not None:
+                await self._client.close()
+                self._client = None
+
+    async def __aenter__(self) -> "OpenAICompatibleLLM":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    @staticmethod
+    async def list_available_models(
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Fetch available models from OpenAI-compatible API using SDK.
+
+        Args:
+            api_key: API key for the OpenAI-compatible service
+            base_url: Base URL for the API (optional).
+                - If not provided, uses official OpenAI API: https://api.openai.com/v1
+                - If provided, uses the specified endpoint (e.g., proxy or custom service)
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
+
+        Returns:
+            List of available models with their information
+
+        Example:
+            >>> # Use official OpenAI API
+            >>> models = await OpenAILLM.list_available_models("sk-...")
+
+            >>> # Use custom endpoint/proxy
+            >>> models = await OpenAILLM.list_available_models(
+            ...     "sk-...",
+            ...     base_url="https://my-proxy.com/v1"
+            ... )
+        """
+        # Create a client using SDK
+        client = create_owned_async_sdk_client(
+            AsyncOpenAI,
+            base_url=base_url if base_url != "https://api.openai.com/v1" else None,
+            api_key=api_key,
+            timeout=30.0,
+            max_retries=0,
+        )
+
+        try:
+            # Use SDK's models.list() method
+            models_pager = await client.models.list()
+
+            models = []
+            for model in models_pager.data:
+                models.append(
+                    {
+                        "id": model.id,
+                        "created": getattr(model, "created", None),
+                        "owned_by": getattr(model, "owned_by", None),
+                    }
+                )
+
+            # Sort by created date (newest first)
+            models.sort(
+                key=lambda x: (
+                    (x.get("created") or 0) if x.get("created") is not None else 0
+                ),
+                reverse=True,
+            )
+            return models
+
+        except openai.AuthenticationError as e:
+            logger.error(
+                "OpenAI authentication failed: %s", redact_sensitive_text(str(e))
+            )
+            raise ValueError("Invalid API key") from e
+        except Exception as e:
+            logger.error("Failed to fetch models: %s", redact_sensitive_text(str(e)))
+            if raise_on_error:
+                raise
+            return []
+        finally:
+            await client.close()
+
+
+class OpenAILLM(OpenAICompatibleLLM):
+    """
+    OpenAI LLM client using the official OpenAI SDK.
+
+    This public provider class owns OpenAI defaults and request policy while
+    inheriting OpenAI-compatible transport/parsing from ``OpenAICompatibleLLM``.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "gpt-4o-mini",
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        default_temperature: Optional[float] = None,
+        default_max_tokens: Optional[int] = None,
+        timeout: float = 180.0,
+        abilities: Optional[List[str]] = None,
+        timeout_config: Optional[TimeoutConfig] = None,
+    ):
+        super().__init__(
+            model_name=model_name,
+            base_url=(
+                base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+            ),
+            api_key=api_key if api_key is not None else os.getenv("OPENAI_API_KEY"),
+            default_temperature=default_temperature,
+            default_max_tokens=default_max_tokens,
+            timeout=timeout,
+            abilities=abilities,
+            timeout_config=timeout_config,
+        )
+
+    def _apply_output_config(
+        self,
+        completion_params: Dict[str, Any],
+        output_config: Optional[Dict[str, Any]],
+    ) -> None:
+        if output_config is None:
+            return
+
+        format_config = output_config.get("format", {})
+        if format_config.get("type") == "json_schema":
+            schema = format_config.get("schema", {})
+            completion_params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.get("title", "response").lower().replace(" ", "_"),
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+            return
+
+        completion_params["output_config"] = output_config

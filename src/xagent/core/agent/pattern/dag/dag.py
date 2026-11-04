@@ -1,0 +1,2785 @@
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import json
+import logging
+from dataclasses import dataclass, replace
+from typing import Any
+
+from ....file_ref import final_deliverable_file_reference_instructions
+from ....model.chat.exceptions import ModelProviderError
+from ....model.intent import goal_scope
+from ....task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
+from ...context.enrichment import (
+    enrich_context_with_memory,
+    hydrate_top_level_user_request,
+    latest_pending_user_response,
+    pending_user_response_marker,
+    top_level_user_request,
+)
+from ...context.execution import tool_evidence_state
+from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from ...grounding import evidence_facts, grounding_rule, step_intent_not_fact_rule
+from ...language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    effective_output_language,
+    final_answer_language_rule,
+    render_dag_step_language_reference,
+    render_structured_request_language_policy,
+    serialize_pending_user_response,
+)
+from ...result import normalize_tool_failure_code, unwrap_final_answer_content
+from ...runtime import (
+    ExecutionInterrupted,
+    LLMCallInterrupted,
+    PatternRuntime,
+    prepare_llm_for_context,
+)
+from ..base import AgentPattern, PatternResult, RequiredToolCallError
+from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
+from ..partial_delivery import request_partial_delivery
+from ..react import ReActPattern, ReActReasoningMode
+from .failure_handoff import log_step_failure, step_results_handoff
+from .plan_generator import (
+    CallablePlanGenerator,
+    ExecutionPlan,
+    PlanGenerationRequest,
+    PlanGenerator,
+    PlanStep,
+    PlanValidationError,
+)
+
+logger = logging.getLogger(__name__)
+
+# The DAG step whose staged active-step entry is in scope for the checkpoint
+# payload currently being built, or ``None`` outside a step checkpoint.
+#
+# A ``ContextVar`` rather than an attribute because DAG steps run as
+# concurrent asyncio tasks: each task gets its own copy, so a sibling
+# building a payload at the same time sees ``None`` here and therefore only
+# committed state, which is the whole point of the staged/committed split.
+_STAGED_STEP_IN_SCOPE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "dag_staged_step_in_scope", default=None
+)
+
+DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS = 30.0
+
+# Precedence for _select_winner()'s ranking of a same-wakeup completed
+# batch: lower rank wins. A status not listed here (only "interrupted"
+# and "waiting_for_user" are expected -- every other completed result
+# status the codebase produces is a terminal one that never reaches
+# this sort) ranks after both via dict.get()'s default in the sort key.
+_COMPLETED_RESULT_RANK: dict[str, int] = {
+    "interrupted": 0,
+    "waiting_for_user": 1,
+}
+
+
+def _model_failure_metadata(exc: BaseException) -> dict[str, Any] | None:
+    """The result keys that carry a model-provider failure, or ``None``.
+
+    A failed DAG result is returned to the runner as it is, so these keys
+    are how a provider failure in planning, completion assessment or a step
+    reaches the web layer's projection instead of the raw ``error`` text.
+    """
+    if not isinstance(exc, ModelProviderError):
+        return None
+    return {"model_error": exc.structured_fields(), "diagnostic_error": str(exc)}
+
+
+@dataclass
+class DAGCompletionAssessment:
+    complete: bool
+    answer: str = ""
+    reason: str = ""
+    missing_work: str = ""
+    replan_instruction: str = ""
+
+
+@dataclass
+class _DAGStepRuntime:
+    """Runtime adapter that checkpoints child ReAct state into the root DAG state."""
+
+    parent: PatternRuntime
+    dag_pattern: "DAGPattern"
+    root_context: Any
+    step_id: str
+
+    @property
+    def execution_id(self) -> str | None:
+        return self.parent.execution_id
+
+    @execution_id.setter
+    def execution_id(self, value: str | None) -> None:
+        self.parent.execution_id = value
+
+    @property
+    def interrupt_reason(self) -> str | None:
+        return self.parent.interrupt_reason
+
+    @property
+    def tracer(self) -> Any | None:
+        return self.parent.tracer
+
+    @property
+    def active_react_step_id(self) -> str:
+        return self.step_id
+
+    @property
+    def active_turn_id(self) -> str | None:
+        # Unlike active_react_step_id (fixed to this step at construction),
+        # this is resolved from root_context on every access rather than
+        # cached: on_pattern_start never fires for a DAG step's inner ReAct
+        # run (this adapter's own on_pattern_start below is a no-op), so
+        # there is no per-step hook to compute it once. root_context is the
+        # DAG's real conversation context (unlike the synthetic per-step
+        # child_context ReActPattern actually runs against), so this reaches
+        # the same turn_id PatternRuntime._dag_turn_id already surfaces for
+        # the on_dag_step_start/end hooks.
+        return self.parent._dag_turn_id(self.root_context)
+
+    async def should_interrupt(self) -> bool:
+        return await self.parent.should_interrupt()
+
+    async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
+        return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return await self.parent.load_committed_tool_outcome(tool_call)
+
+    async def run_tool_call(self, invoke: Any) -> Any:
+        return await self.parent.run_tool_call(invoke)
+
+    async def run_streaming_llm_call(
+        self,
+        llm: Any,
+        *,
+        on_chunk: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del on_chunk
+        return await self.parent.run_streaming_llm_call(llm, **kwargs)
+
+    async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
+        return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def start_final_answer_stream(self) -> str | None:
+        return None
+
+    async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        del message_id, delta
+
+    async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        del message_id, content
+
+    async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        del message_id, error
+
+    async def send_message(
+        self,
+        *,
+        message: str,
+        message_type: str = "info",
+        expect_response: bool = False,
+        visible: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        outbound_metadata = dict(metadata or {})
+        outbound_metadata.setdefault("step_id", self.step_id)
+        outbound_metadata.setdefault("dag_step_id", self.step_id)
+        return await self.parent.send_message(
+            message=message,
+            message_type=message_type,
+            expect_response=expect_response,
+            visible=visible,
+            metadata=outbound_metadata,
+        )
+
+    async def checkpoint(
+        self,
+        label: str,
+        *,
+        context: Any,
+        pattern: Any,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # Stage this step's entry, checkpoint, then commit it only once the
+        # write is durable. Steps run concurrently (``max_concurrency``
+        # defaults to 4) and the ``await`` below is a suspension point, so a
+        # sibling can build its own payload while this one is in flight. A
+        # staged entry is visible only to the step that staged it, so the
+        # sibling's durable payload cannot capture state whose checkpoint has
+        # not been accepted yet -- and if this write fails, dropping the
+        # staged entry is a complete rollback.
+        #
+        # Nothing is copied here, which keeps the hot path (~23 checkpoint
+        # call sites per step) free of copying cost: ``context.to_dict()`` and
+        # ``pattern.get_state()`` already snapshot every container that any
+        # code path mutates in place, and what they hand out by reference is
+        # write-once. Both methods document each exemption, and the tests in
+        # ``test_context.py`` / ``test_react.py`` fail if a new shared
+        # container appears.
+        was_active = self.step_id in self.dag_pattern.active_step_ids
+        step_metadata = {
+            "active_step_id": self.step_id,
+            "child_label": label,
+        }
+        if metadata:
+            step_metadata.update(metadata)
+        token = _STAGED_STEP_IN_SCOPE.set(self.step_id)
+        try:
+            self.dag_pattern._stage_active_step_context(self.step_id, context.to_dict())
+            get_state = getattr(pattern, "get_state", None)
+            if callable(get_state):
+                self.dag_pattern._stage_active_step_pattern_state(
+                    self.step_id,
+                    get_state(),
+                )
+            result = await self.parent.checkpoint(
+                label=f"dag_{label}",
+                context=self.root_context,
+                pattern=self.dag_pattern,
+                status=status,
+                metadata=step_metadata,
+            )
+        except BaseException:
+            # The write never landed, so the staged entry must not become
+            # visible to anyone. Only this step's own staging is touched, so a
+            # sibling keeps whatever it committed while this coroutine was
+            # suspended.
+            self.dag_pattern._discard_staged_step(self.step_id)
+            if not was_active:
+                # Nothing in the ``try`` removes a step id, so it can only
+                # have been added by the staging calls above.
+                self.dag_pattern._unmark_step_active(self.step_id)
+            raise
+        finally:
+            _STAGED_STEP_IN_SCOPE.reset(token)
+        self.dag_pattern._commit_staged_step(self.step_id)
+        return result
+
+    async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+        await self.parent.on_tool_start(tool_call=self._with_step(tool_call))
+
+    async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
+        await self.parent.on_tool_end(
+            tool_call=self._with_step(tool_call), result=result
+        )
+
+    async def on_tool_error(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        error: Exception,
+        result: Any | None = None,
+    ) -> None:
+        await self.parent.on_tool_error(
+            tool_call=self._with_step(tool_call), error=error, result=result
+        )
+
+    async def on_tool_cancelled(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        reason: str | None = None,
+    ) -> None:
+        await self.parent.on_tool_cancelled(
+            tool_call=self._with_step(tool_call), reason=reason
+        )
+
+    async def on_llm_start(
+        self,
+        *,
+        context: Any,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.parent.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=tools,
+            metadata={
+                "task_id": self.root_context.execution_id,
+                "step_id": self.step_id,
+                "dag_step_id": self.step_id,
+                **(metadata or {}),
+            },
+        )
+
+    async def on_llm_end(
+        self,
+        *,
+        context: Any,
+        response: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.parent.on_llm_end(
+            context=context,
+            response=response,
+            metadata={
+                "task_id": self.root_context.execution_id,
+                "step_id": self.step_id,
+                "dag_step_id": self.step_id,
+                **(metadata or {}),
+            },
+        )
+
+    async def on_llm_error(
+        self,
+        *,
+        context: Any,
+        error: Exception,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.parent.on_llm_error(
+            context=context,
+            error=error,
+            metadata={
+                "task_id": self.root_context.execution_id,
+                "step_id": self.step_id,
+                "dag_step_id": self.step_id,
+                **(metadata or {}),
+            },
+        )
+
+    async def compact_context_if_needed(
+        self,
+        *,
+        context: Any,
+        llm: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        return await self.parent.compact_context_if_needed(
+            context=context,
+            llm=llm,
+            metadata={
+                "task_id": self.root_context.execution_id,
+                "step_id": self.step_id,
+                "dag_step_id": self.step_id,
+                **(metadata or {}),
+            },
+        )
+
+    def _with_step(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **tool_call,
+            "task_id": self.root_context.execution_id,
+            "step_id": self.step_id,
+            "dag_step_id": self.step_id,
+        }
+
+    async def on_pattern_start(self, *, context: Any, pattern: Any) -> None:
+        del context, pattern
+
+    async def on_pattern_end(
+        self,
+        *,
+        context: Any,
+        pattern: Any,
+        result: dict[str, Any],
+    ) -> None:
+        del context, pattern, result
+
+    async def on_pattern_error(
+        self,
+        *,
+        context: Any,
+        pattern: Any,
+        error: Exception,
+    ) -> None:
+        del context, pattern, error
+
+
+@dataclass
+class _RuntimeLLMProxy:
+    runtime: PatternRuntime
+    llm: Any
+    context: Any
+
+    async def chat(self, **kwargs: Any) -> Any:
+        messages = list(kwargs.get("messages") or [])
+        call_llm = await prepare_llm_for_context(
+            llm=self.llm,
+            messages=messages,
+            context=self.context,
+        )
+        return await self.runtime.run_llm_call(call_llm, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.llm, name)
+
+
+class DAGPattern(AgentPattern):
+    """Minimal DAG execution pattern that reuses ReActPattern for each step.
+
+    A task is only ever allowed one active question outstanding at a time
+    against the user; the DAG side of that rule is exactly-one: when
+    concurrent steps in the same batch all end up waiting for a user reply
+    in the same wakeup, exactly one of them gets to keep its question, and
+    the rest are invalidated rather than left to race the user's answer.
+    """
+
+    def __init__(
+        self,
+        plan_generator: PlanGenerator | Any,
+        *,
+        react_max_iterations: int = 200,
+        react_reasoning_mode: ReActReasoningMode
+        | str = ReActReasoningMode.TOOL_CALLING,
+        max_concurrency: int = 4,
+        max_completion_replans: int = 3,
+        user_interaction_enabled: bool = True,
+    ) -> None:
+        self.plan_generator = (
+            plan_generator
+            if isinstance(plan_generator, PlanGenerator)
+            else CallablePlanGenerator(plan_generator)
+        )
+        self.react_max_iterations = react_max_iterations
+        self.react_reasoning_mode = ReActReasoningMode(react_reasoning_mode)
+        self.max_concurrency = max(1, max_concurrency)
+        self.max_completion_replans = max(0, max_completion_replans)
+        self.user_interaction_enabled = user_interaction_enabled
+        self.status = "idle"
+        self.plan: ExecutionPlan | None = None
+        self.active_step_id: str | None = None
+        self.active_step_pattern_state: dict[str, Any] | None = None
+        self.active_step_context: dict[str, Any] | None = None
+        self.active_step_ids: list[str] = []
+        self.active_step_pattern_states: dict[str, dict[str, Any]] = {}
+        self.active_step_contexts: dict[str, dict[str, Any]] = {}
+        # Uncommitted writes from a step checkpoint that is still in flight.
+        # Never serialized: a staged entry has, by definition, no durable
+        # checkpoint behind it, so it must not reach a payload other than the
+        # one being written for the step that staged it.
+        self._staged_step_pattern_states: dict[str, dict[str, Any]] = {}
+        self._staged_step_contexts: dict[str, dict[str, Any]] = {}
+        # Model-provider failures of steps in this run, by step id. Not
+        # checkpointed: after a restore a failed step reports only its error text.
+        self._step_model_failures: dict[str, dict[str, Any]] = {}
+        self.step_results: dict[str, Any] = {}
+        # Failed-step observations are evidence only, never dependency results.
+        self.failed_step_evidence: dict[str, Any] = {}
+        self.failure_delivery_attempted = False
+        self.planned_user_message_count = 0
+        self.replan_owed_step_ids: list[str] = []
+        self.memory_input_text: str | None = None
+        self.completion_feedback: str | None = None
+        self.completion_replan_count = 0
+        # Live concurrent step tasks for the in-progress batch, maintained by
+        # _execute_ready_steps() and always empty once it returns (whatever
+        # the outcome). asyncio.Task objects are not JSON-serializable, so
+        # this must never be added to get_state().
+        self._live_step_tasks: set[asyncio.Task[Any]] = set()
+
+    async def run(
+        self,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        runtime = kwargs.get("runtime")
+        if runtime is None:
+            runtime = PatternRuntime(
+                execution_id=getattr(context, "execution_id", None)
+            )
+
+        if llm is None:
+            self.status = "failed"
+            return PatternResult(
+                success=False,
+                error="DAGPattern requires an llm instance.",
+                metadata={
+                    "status": self.status,
+                    "failure_reason": "missing_llm",
+                },
+            ).to_dict()
+
+        await runtime.on_pattern_start(context=context, pattern=self)
+        try:
+            result = await self._run(
+                context=context,
+                tools=tools,
+                llm=llm,
+                compact_llm=kwargs.get("compact_llm"),
+                runtime=runtime,
+                memory_store=kwargs.get("memory_store"),
+                memory_tools_factory=kwargs.get("memory_tools_factory"),
+                memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
+                skill_manager=kwargs.get("skill_manager"),
+                allowed_skills=kwargs.get("allowed_skills"),
+            )
+            if result.get("failure_reason") == "step_failed":
+                result = await self._deliver_after_step_failure(
+                    context=context, llm=llm, runtime=runtime, failure=result
+                )
+        except RequiredToolCallError as exc:
+            result = await self._fail(
+                context=context,
+                runtime=runtime,
+                error=exc.user_message,
+                failure_reason=exc.failure_reason,
+                checkpoint_label="dag_plan_generation_failed",
+                extra_metadata=exc.to_metadata(),
+            )
+            await runtime.on_pattern_end(context=context, pattern=self, result=result)
+            return result
+        except Exception as exc:
+            await runtime.on_pattern_error(context=context, pattern=self, error=exc)
+            raise
+        await runtime.on_pattern_end(context=context, pattern=self, result=result)
+        return result
+
+    async def _run(
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+        compact_llm: Any | None = None,
+        memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
+        memory_similarity_threshold: float | None = None,
+        skill_manager: Any | None = None,
+        allowed_skills: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if self.plan is None:
+            self.status = "planning"
+        try:
+            if self.plan is None:
+                memory_text = self._memory_text(context)
+                await enrich_context_with_memory(
+                    context=context,
+                    query=memory_text,
+                    category="dag_plan_execute_memory",
+                    memory_store=memory_store,
+                    runtime=runtime,
+                    similarity_threshold=memory_similarity_threshold,
+                )
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="dag_before_plan",
+                )
+                if interrupted is not None:
+                    return interrupted
+                await self._generate_plan(
+                    context=context,
+                    tools=tools,
+                    llm=llm,
+                    runtime=runtime,
+                    replan=False,
+                )
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="dag_after_plan",
+                )
+                if interrupted is not None:
+                    return interrupted
+        except PlanValidationError as exc:
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="invalid_plan",
+                checkpoint_label="dag_plan_invalid",
+            )
+        except LLMCallInterrupted:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="dag_during_plan",
+            )
+            if interrupted is not None:
+                return interrupted
+            raise
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # RequiredToolCallError already carries its own user-facing
+            # failure; re-raising lets the caller apply it directly.
+            # CheckpointPersistenceError is a durability failure, not a
+            # plan-generation failure: converting it to _fail() here would
+            # let its own checkpoint write (if it happens to succeed, e.g.
+            # after a transient failure) mask the durability error behind an
+            # ordinary unsuccessful PatternResult. That result reaches the
+            # runner's pattern loop as a recoverable failure, so a fallback
+            # pattern could run and repeat a non-idempotent side effect this
+            # pattern already performed. Let the runner's durability guard
+            # see it instead, same as the step-execution catch above.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="plan_generation_error",
+                checkpoint_label="dag_plan_generation_failed",
+                extra_metadata=_model_failure_metadata(exc),
+            )
+
+        while True:
+            if self._reply_replan_owed():
+                # The branch below may reach _generate_plan, which clears
+                # the interrupt; a real Stop must be reported first.
+                interrupted = await self._interrupt_if_requested(
+                    runtime=runtime,
+                    context=context,
+                    label="dag_before_owed_replan",
+                )
+                if interrupted is not None:
+                    return interrupted
+            if self._needs_replan(context):
+                if not self._forward_user_response_to_waiting_step(context):
+                    try:
+                        await self._generate_plan(
+                            context=context,
+                            tools=tools,
+                            llm=llm,
+                            runtime=runtime,
+                            replan=True,
+                        )
+                    except PlanValidationError as exc:
+                        return await self._fail(
+                            context=context,
+                            runtime=runtime,
+                            error=str(exc),
+                            failure_reason="invalid_plan",
+                            checkpoint_label="dag_plan_invalid",
+                        )
+                    except LLMCallInterrupted:
+                        interrupted = await self._interrupt_if_requested(
+                            runtime=runtime,
+                            context=context,
+                            label="dag_during_replan",
+                        )
+                        if interrupted is not None:
+                            return interrupted
+                        raise
+                    except (RequiredToolCallError, CheckpointPersistenceError):
+                        # See the matching comment on the first
+                        # plan-generation catch above.
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        return await self._fail(
+                            context=context,
+                            runtime=runtime,
+                            error=str(exc),
+                            failure_reason="replan_generation_error",
+                            checkpoint_label="dag_plan_generation_failed",
+                            extra_metadata=_model_failure_metadata(exc),
+                        )
+
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="dag_before_ready_steps",
+            )
+            if interrupted is not None:
+                return interrupted
+
+            ready_steps = self._ready_steps()
+            if not ready_steps:
+                if self.plan is None:
+                    return await self._fail(
+                        context=context,
+                        runtime=runtime,
+                        error="DAGPattern plan was not initialized.",
+                        failure_reason="plan_not_initialized",
+                        checkpoint_label="dag_plan_missing",
+                    )
+                if self._all_steps_completed():
+                    completion_result = await self._handle_completed_plan(
+                        context=context,
+                        tools=tools,
+                        llm=llm,
+                        runtime=runtime,
+                    )
+                    if completion_result is not None:
+                        return completion_result
+                    continue
+                failed_step = next(
+                    (step for step in self.plan.steps if step.status == "failed"),
+                    None,
+                )
+                if failed_step is not None:
+                    return await self._fail(
+                        context=context,
+                        runtime=runtime,
+                        error=failed_step.error or f"Step {failed_step.id} failed.",
+                        failure_reason="step_failed",
+                        checkpoint_label="dag_failed",
+                        failed_step_id=failed_step.id,
+                    )
+                return await self._fail(
+                    context=context,
+                    runtime=runtime,
+                    error="DAGPattern has no executable steps.",
+                    failure_reason="no_executable_steps",
+                    checkpoint_label="dag_no_executable_steps",
+                )
+
+            batch = ready_steps[: self.max_concurrency]
+            step_result = await self._execute_ready_steps(
+                steps=batch,
+                root_context=context,
+                tools=tools,
+                llm=llm,
+                compact_llm=compact_llm,
+                runtime=runtime,
+                memory_store=memory_store,
+                memory_tools_factory=memory_tools_factory,
+                memory_similarity_threshold=memory_similarity_threshold,
+                skill_manager=skill_manager,
+                allowed_skills=allowed_skills,
+            )
+            if step_result is not None:
+                return step_result
+
+    async def _execute_ready_steps(
+        self,
+        *,
+        steps: list[PlanStep],
+        root_context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+        compact_llm: Any | None = None,
+        memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
+        memory_similarity_threshold: float | None = None,
+        skill_manager: Any | None = None,
+        allowed_skills: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        if not steps:
+            return None
+        if len(steps) == 1:
+            step = steps[0]
+            result = await self._execute_step(
+                step=steps[0],
+                root_context=root_context,
+                tools=tools,
+                llm=llm,
+                compact_llm=compact_llm,
+                runtime=runtime,
+                memory_store=memory_store,
+                memory_tools_factory=memory_tools_factory,
+                memory_similarity_threshold=memory_similarity_threshold,
+                skill_manager=skill_manager,
+                allowed_skills=allowed_skills,
+            )
+            if result is not None:
+                return result
+            if step.status == "failed":
+                return await self._fail(
+                    context=root_context,
+                    runtime=runtime,
+                    error=step.error or f"Step {step.id} failed.",
+                    failure_reason="step_failed",
+                    checkpoint_label="dag_failed",
+                    failed_step_id=step.id,
+                )
+            return None
+
+        self.status = "running"
+        for step in steps:
+            self._mark_step_active(step.id)
+            step.status = "running"
+        await runtime.checkpoint(
+            "dag_before_ready_batch",
+            context=root_context,
+            pattern=self,
+            metadata={
+                "active_step_ids": [step.id for step in steps],
+                "max_concurrency": self.max_concurrency,
+            },
+        )
+
+        tasks = {
+            asyncio.create_task(
+                self._execute_step(
+                    step=step,
+                    root_context=root_context,
+                    tools=tools,
+                    llm=llm,
+                    compact_llm=compact_llm,
+                    runtime=runtime,
+                    memory_store=memory_store,
+                    memory_tools_factory=memory_tools_factory,
+                    memory_similarity_threshold=memory_similarity_threshold,
+                    skill_manager=skill_manager,
+                    allowed_skills=allowed_skills,
+                ),
+                name=f"dag_step_{step.id}",
+            ): step.id
+            for step in steps
+        }
+        steps_by_id = {step.id: step for step in steps}
+        pending = set(tasks)
+        scheduled_step_ids = set(steps_by_id)
+        self._live_step_tasks = set(pending)
+
+        async def cancel_all() -> None:
+            # `pending` is rebound (not mutated) by the `asyncio.wait()`
+            # call inside the loop below; this closure reads the free
+            # variable from the enclosing scope, so it always sees whatever
+            # `pending` is currently bound to -- same mechanism
+            # `schedule_ready_steps()` already relies on.
+            await self._cancel_pending_steps(
+                pending,
+                step_ids_by_task=tasks,
+                steps_by_id=steps_by_id,
+            )
+
+        def schedule_ready_steps() -> None:
+            if self.plan is None:
+                return
+            available_slots = self.max_concurrency - len(pending)
+            if available_slots <= 0:
+                return
+            for ready_step in self._pending_ready_steps():
+                if ready_step.id in scheduled_step_ids:
+                    continue
+                self._mark_step_active(ready_step.id)
+                ready_step.status = "running"
+                task = asyncio.create_task(
+                    self._execute_step(
+                        step=ready_step,
+                        root_context=root_context,
+                        tools=tools,
+                        llm=llm,
+                        compact_llm=compact_llm,
+                        runtime=runtime,
+                        memory_store=memory_store,
+                        memory_tools_factory=memory_tools_factory,
+                        memory_similarity_threshold=memory_similarity_threshold,
+                        skill_manager=skill_manager,
+                        allowed_skills=allowed_skills,
+                    ),
+                    name=f"dag_step_{ready_step.id}",
+                )
+                tasks[task] = ready_step.id
+                steps_by_id[ready_step.id] = ready_step
+                pending.add(task)
+                self._live_step_tasks.add(task)
+                scheduled_step_ids.add(ready_step.id)
+                available_slots -= 1
+                if available_slots <= 0:
+                    break
+
+        hold_scheduling = False
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                self._live_step_tasks = set(pending)
+
+                # A single wakeup can complete more than one step; collect
+                # every non-None result instead of acting on whichever task
+                # a ``set`` happens to iterate first.
+                completed_results: list[tuple[asyncio.Task[Any], dict[str, Any]]] = []
+                for task in done:
+                    result = task.result()
+                    if result is not None:
+                        completed_results.append((task, result))
+
+                # A batch containing a failed step fails fast, before any
+                # winner is chosen: a DAG that is already doomed must not
+                # ask the user a question or report an interrupt instead of
+                # the failure. This scan therefore runs ahead of the
+                # completed_results winner selection below, so a failure
+                # always outranks an interrupted or waiting result from a
+                # sibling that completed in the same wakeup.
+                failed_step = next(
+                    (step for step in steps_by_id.values() if step.status == "failed"),
+                    None,
+                )
+                if failed_step is not None:
+                    # A completed sibling in this same wakeup (e.g. one that
+                    # reached waiting_for_user or got interrupted) is never
+                    # coming back for its own turn -- the batch is failing
+                    # regardless -- so its active-step bookkeeping must be
+                    # cleared here too, not just the still-pending ones
+                    # cancel_all() below handles. Every completed sibling is
+                    # cleared unconditionally (clear_all_bookkeeping=True),
+                    # unlike the winner path below, which only clears a
+                    # "waiting_for_user" loser -- there is no winner here to
+                    # spare an "interrupted" sibling's bookkeeping for.
+                    self._invalidate_batch_siblings(
+                        completed_results,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                        clear_all_bookkeeping=True,
+                    )
+                    await cancel_all()
+                    return await self._fail(
+                        context=root_context,
+                        runtime=runtime,
+                        error=(failed_step.error or f"Step {failed_step.id} failed."),
+                        failure_reason="step_failed",
+                        checkpoint_label="dag_failed",
+                        failed_step_id=failed_step.id,
+                    )
+
+                if completed_results:
+                    winner_task, winner_result = self._select_winner(
+                        completed_results,
+                        step_ids_by_task=tasks,
+                    )
+                    winner_step_id = tasks[winner_task]
+
+                    # This invalidates losers drawn from `done`; the
+                    # cancellation below acts on `pending`. `asyncio.wait`
+                    # partitions the tasks it was given into exactly these
+                    # two sets, so a task can never be in both -- the two
+                    # cleanup passes touch disjoint task sets, and running
+                    # this one before or after the cancellation below
+                    # cannot change which steps end up invalidated versus
+                    # cancelled.
+                    superseded_step_ids = self._invalidate_batch_siblings(
+                        completed_results[1:],
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+
+                    if superseded_step_ids:
+                        # A superseded question always means a waiting loser,
+                        # but the winner is not always a question itself --
+                        # an interrupted winner delivers no question of its
+                        # own, so the log line must say so truthfully rather
+                        # than implying %s's question was the one delivered.
+                        if winner_result.get("status") == "waiting_for_user":
+                            log_message = (
+                                "Multiple concurrent DAG steps completed with "
+                                "a pending user question in the same batch; "
+                                "only %s's question is delivered, the rest "
+                                "are invalidated."
+                            )
+                        else:
+                            log_message = (
+                                "Multiple concurrent DAG steps completed with "
+                                "a pending user question in the same batch; "
+                                "questions from the superseded steps were "
+                                "discarded because an interrupt from %s takes "
+                                "precedence."
+                            )
+                        logger.warning(
+                            log_message,
+                            winner_step_id,
+                            extra={
+                                "execution_id": getattr(
+                                    root_context, "execution_id", None
+                                ),
+                                "superseded_step_ids": superseded_step_ids,
+                                "winner_step_id": winner_step_id,
+                            },
+                        )
+                        winner_result = {
+                            **winner_result,
+                            "clarification_superseded_step_ids": superseded_step_ids,
+                        }
+
+                    await cancel_all()
+                    if pending or superseded_step_ids:
+                        await runtime.checkpoint(
+                            "dag_after_cancelled_siblings",
+                            context=root_context,
+                            pattern=self,
+                            status=self.status,
+                            metadata={
+                                "active_step_ids": list(self.active_step_ids),
+                                "cancelled_step_ids": [
+                                    step_id
+                                    for task, step_id in tasks.items()
+                                    if task in pending
+                                ],
+                                "superseded_step_ids": superseded_step_ids,
+                            },
+                        )
+                    return winner_result
+
+                if self._reply_awaiting_replan():
+                    # An owed replan reuses whatever this batch finishes, so
+                    # let it drain and only stop scheduling new steps.
+                    hold_scheduling = True
+                if self.status in {"interrupted", "waiting_for_user"}:
+                    await cancel_all()
+                    return None
+                if not hold_scheduling:
+                    schedule_ready_steps()
+        except BaseException:
+            # A sibling that already completed by this point is not in
+            # `pending`, so cancel_all() below never clears its active-step
+            # bookkeeping. Unobserved today: this exit writes no checkpoint,
+            # and the pattern object is discarded right after re-raising.
+            # Closing or formally waiving this gap is tracked in #1311.
+            try:
+                await cancel_all()
+            except Exception:
+                logger.exception("Failed to clean up cancelled DAG sibling steps.")
+            raise
+        finally:
+            self._live_step_tasks.clear()
+        return None
+
+    async def _execute_step(
+        self, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        # While a step runs, its own objective is the active goal — so the
+        # "auto" model routes that step on the step, not the whole-task request.
+        with goal_scope(step.description or step.task):
+            return await self._execute_step_impl(step=step, **kwargs)
+
+    async def _execute_step_impl(
+        self,
+        *,
+        step: PlanStep,
+        root_context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+        compact_llm: Any | None = None,
+        memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
+        memory_similarity_threshold: float | None = None,
+        skill_manager: Any | None = None,
+        allowed_skills: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        self.status = "running"
+        self._mark_step_active(step.id)
+        step.status = "running"
+        # A step id can run again after a replan; the failure recorded for its
+        # earlier attempt must not be attached to a later, different failure.
+        self._step_model_failures.pop(step.id, None)
+        step.failure_code = None
+
+        active_context = self.active_step_contexts.get(step.id)
+        output_language = self._output_language(root_context)
+        if active_context is not None:
+            child_context = type(root_context).from_dict(active_context)
+            self._refresh_restored_step_runtime_metadata(
+                child_context,
+                root_context,
+            )
+            if output_language and not child_context.metadata.get(
+                OUTPUT_LANGUAGE_METADATA_KEY
+            ):
+                child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = output_language
+            self._refresh_restored_step_instruction(
+                child_context,
+                root_context=root_context,
+                step=step,
+            )
+        else:
+            child_context = root_context.create_child_context(
+                metadata={
+                    "dag_step_id": step.id,
+                    "dag_step_name": step.task,
+                    "dag_step_description": step.description or step.task,
+                    "dag_dependencies": list(step.dependencies),
+                    "dag_tool_names": list(step.tool_names),
+                    OUTPUT_LANGUAGE_METADATA_KEY: output_language,
+                },
+            )
+            if step.dependencies:
+                child_context.add_user_message(
+                    f"Dependency results: {self._dependency_summary(step)}",
+                    metadata={
+                        "kind": "dag_dependency_results",
+                        "dag_step_id": step.id,
+                    },
+                )
+            child_context.add_user_message(
+                self._step_instruction(root_context=root_context, step=step),
+                metadata={
+                    "kind": "dag_step_instruction",
+                    "dag_step_id": step.id,
+                    "dag_completion_evidence": step.completion_evidence or "",
+                },
+            )
+
+        react_pattern = ReActPattern(
+            max_iterations=self.react_max_iterations,
+            reasoning_mode=self.react_reasoning_mode,
+            finalize_after_tool_result=False,
+            user_interaction_enabled=self.user_interaction_enabled,
+        )
+        react_pattern.seed_memory_input(self._memory_text(root_context))
+        active_pattern_state = self.active_step_pattern_states.get(step.id)
+        if active_pattern_state is not None:
+            react_pattern.load_state(active_pattern_state)
+            react_pattern.finalize_after_tool_result = False
+
+        step_runtime = _DAGStepRuntime(
+            parent=runtime,
+            dag_pattern=self,
+            root_context=root_context,
+            step_id=step.id,
+        )
+        await runtime.checkpoint(
+            "dag_before_step",
+            context=root_context,
+            pattern=self,
+            metadata={"active_step_id": step.id},
+        )
+        await runtime.on_dag_step_start(
+            context=root_context,
+            step_id=step.id,
+            data={
+                "step_id": step.id,
+                "step_name": step.task,
+                "step_task": step.task,
+                "description": step.description,
+                "dependencies": list(step.dependencies),
+                "tool_names": list(step.tool_names),
+            },
+        )
+        try:
+            step_tools = self._tools_for_step(tools, step.tool_names)
+            result = await react_pattern.run(
+                context=child_context,
+                tools=step_tools,
+                llm=llm,
+                compact_llm=compact_llm,
+                runtime=step_runtime,
+                memory_store=memory_store,
+                memory_tools_factory=memory_tools_factory,
+                memory_similarity_threshold=memory_similarity_threshold,
+                skill_manager=skill_manager,
+                allowed_skills=allowed_skills,
+            )
+        except (ExecutionInterrupted, CheckpointPersistenceError):
+            # A checkpoint that did not persist is a durability failure, not a
+            # step failure: converting it here would clear the active step and
+            # let a later ``_fail()`` checkpoint durably overwrite the last
+            # good checkpoint with the post-failure state.
+            raise
+        except Exception as exc:
+            step.status = "failed"
+            step.error = str(exc)
+            metadata = _model_failure_metadata(exc)
+            if metadata is not None:
+                self._step_model_failures[step.id] = metadata
+            log_step_failure(
+                task_id=root_context.execution_id,
+                step_id=step.id,
+                code=getattr(exc, "code", None) or type(exc).__name__,
+                exc_info=exc,
+            )
+            self._retain_failed_step_evidence(step.id, child_context, react_pattern)
+            self._clear_active_step(step.id)
+            await runtime.on_dag_step_end(
+                context=root_context,
+                step_id=step.id,
+                data={
+                    "step_id": step.id,
+                    "step_name": step.task,
+                    "description": step.description,
+                    "dependencies": list(step.dependencies),
+                    "tool_names": list(step.tool_names),
+                    "status": "failed",
+                    "error": step.error,
+                },
+            )
+            return None
+
+        status = result.get("status")
+        if status == "interrupted":
+            self.status = "interrupted"
+            step.status = "interrupted"
+            self._set_active_step_pattern_state(step.id, react_pattern.get_state())
+            self._set_active_step_context(step.id, child_context.to_dict())
+            await runtime.checkpoint(
+                "dag_interrupted",
+                context=root_context,
+                pattern=self,
+                metadata={"active_step_id": step.id},
+            )
+            if self._needs_replan(root_context):
+                return None
+            return {
+                **result,
+                "execution_id": root_context.execution_id,
+                "context": root_context,
+                "active_step_id": step.id,
+            }
+        if status == "waiting_for_user":
+            self.status = "waiting_for_user"
+            self._set_active_step_pattern_state(step.id, react_pattern.get_state())
+            self._set_active_step_context(step.id, child_context.to_dict())
+            await runtime.checkpoint(
+                "dag_waiting_for_user",
+                context=root_context,
+                pattern=self,
+                metadata={"active_step_id": step.id},
+            )
+            # ReAct itself never knows which DAG step it is running as (its
+            # draft always carries step_id=None); attribute the draft to
+            # this step here, where that identity is known. The draft is a
+            # frozen dataclass, so this is a copy, not an in-place edit.
+            draft = result.get("clarification_draft")
+            attributed_result = dict(result)
+            if draft is not None:
+                attributed_result["clarification_draft"] = draft.with_origin_step(
+                    step.id
+                )
+            return {
+                **attributed_result,
+                "execution_id": root_context.execution_id,
+                "context": root_context,
+                "active_step_id": step.id,
+            }
+        if not result.get("success"):
+            step.status = "failed"
+            step.error = result.get("error", f"Step {step.id} failed.")
+            step.failure_code = normalize_tool_failure_code(result.get("failure_code"))
+            log_step_failure(
+                task_id=root_context.execution_id,
+                step_id=step.id,
+                code=result.get("protocol_code") or result.get("status"),
+                finish_reason=result.get("finish_reason"),
+            )
+            self._retain_failed_step_evidence(step.id, child_context, react_pattern)
+            await runtime.on_dag_step_end(
+                context=root_context,
+                step_id=step.id,
+                data={
+                    "step_id": step.id,
+                    "step_name": step.task,
+                    "description": step.description,
+                    "dependencies": list(step.dependencies),
+                    "tool_names": list(step.tool_names),
+                    "status": "failed",
+                    "error": step.error,
+                },
+            )
+            self._clear_active_step(step.id)
+            return None
+
+        step.status = "completed"
+        step.result = result.get("output", result.get("response", result))
+        self.step_results[step.id] = step.result
+        self._clear_active_step(step.id)
+        await runtime.on_dag_step_end(
+            context=root_context,
+            step_id=step.id,
+            data={
+                "step_id": step.id,
+                "step_name": step.task,
+                "description": step.description,
+                "dependencies": list(step.dependencies),
+                "tool_names": list(step.tool_names),
+                "status": "completed",
+                "result": step.result,
+            },
+        )
+        await runtime.checkpoint(
+            "dag_after_step",
+            context=root_context,
+            pattern=self,
+            metadata={"completed_step_id": step.id},
+        )
+        return None
+
+    def get_state(self) -> dict[str, Any]:
+        # The three legacy scalars are resolved here rather than shipped from
+        # the pre-computed attributes. Those attributes are refreshed on every
+        # active-step write, including a staging write, and they keep that
+        # value across the checkpoint ``await``. A root-level payload built
+        # while a sibling step is mid-write would otherwise carry that
+        # sibling's uncommitted state even though the maps beside it are
+        # clean -- and ``load_state`` feeds these scalars back into the
+        # committed maps via ``setdefault``, which would make a rejected
+        # checkpoint durable on resume.
+        contexts = self._payload_step_contexts()
+        states = self._payload_step_pattern_states()
+        head = self.active_step_ids[0] if self.active_step_ids else None
+        return {
+            "status": self.status,
+            "plan": self.plan.to_dict() if self.plan is not None else None,
+            "active_step_id": head,
+            "active_step_pattern_state": (
+                states.get(head) if head is not None else None
+            ),
+            "active_step_context": contexts.get(head) if head is not None else None,
+            "active_step_ids": list(self.active_step_ids),
+            "active_step_pattern_states": states,
+            "active_step_contexts": contexts,
+            "step_results": dict(self.step_results),
+            "failed_step_evidence": dict(self.failed_step_evidence),
+            "failure_delivery_attempted": self.failure_delivery_attempted,
+            "planned_user_message_count": self.planned_user_message_count,
+            "replan_owed_step_ids": list(self.replan_owed_step_ids),
+            "memory_input_text": self.memory_input_text,
+            "max_concurrency": self.max_concurrency,
+            "completion_feedback": self.completion_feedback,
+            "completion_replan_count": self.completion_replan_count,
+            "max_completion_replans": self.max_completion_replans,
+        }
+
+    def get_execution_snapshot(self, root_context: Any) -> dict[str, Any]:
+        root_execution_id = getattr(root_context, "execution_id", "unknown")
+        root_frame_id = f"{root_execution_id}:dag"
+        active_child_ids = [
+            self._child_frame_id(root_execution_id, step_id)
+            for step_id in self.active_step_ids
+        ]
+        active_child_id = active_child_ids[0] if active_child_ids else None
+        root_frame = ExecutionFrame(
+            frame_id=root_frame_id,
+            root_execution_id=root_execution_id,
+            pattern_type="dag",
+            status=self._execution_status(self.status),
+            context=root_context.to_dict()
+            if callable(getattr(root_context, "to_dict", None))
+            else {},
+            pattern_state=self.get_state(),
+            children=active_child_ids,
+            active_child_id=active_child_id,
+            metadata={
+                "active_step_id": self.active_step_id,
+                "active_step_ids": list(self.active_step_ids),
+                "plan_step_count": len(self.plan.steps) if self.plan else 0,
+            },
+        )
+        frames = {root_frame_id: root_frame}
+        active_frame_ids = [root_frame_id]
+        # Same view as ``get_state()`` above: both halves go into one payload,
+        # so a step's child frame must carry the staged entry its own
+        # checkpoint is committing, and a sibling's frame must not.
+        contexts = self._payload_step_contexts()
+        states = self._payload_step_pattern_states()
+        for step_id, child_frame_id in zip(self.active_step_ids, active_child_ids):
+            child_frame = ExecutionFrame(
+                frame_id=child_frame_id,
+                parent_frame_id=root_frame_id,
+                root_execution_id=root_execution_id,
+                pattern_type="react",
+                status=self._execution_status(self.status),
+                context=dict(contexts.get(step_id, {})),
+                pattern_state=dict(states.get(step_id, {})),
+                metadata={"dag_step_id": step_id},
+            )
+            frames[child_frame_id] = child_frame
+            active_frame_ids.append(child_frame_id)
+
+        return ExecutionSnapshot(
+            root_execution_id=root_execution_id,
+            status=self._execution_status(self.status),
+            frames=frames,
+            active_frame_ids=active_frame_ids,
+            control_state={
+                "planned_user_message_count": self.planned_user_message_count,
+                "replan_owed_step_ids": list(self.replan_owed_step_ids),
+                "max_concurrency": self.max_concurrency,
+            },
+        ).to_dict()
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        # Staged entries are per-run and never serialized, so a restored
+        # pattern starts from committed state only. Resetting here also keeps
+        # a reused instance from carrying a previous run's staging.
+        self._staged_step_contexts = {}
+        self._staged_step_pattern_states = {}
+        self.status = str(state.get("status", "idle"))
+        plan_payload = state.get("plan")
+        self.plan = (
+            ExecutionPlan.from_dict(plan_payload)
+            if isinstance(plan_payload, dict)
+            else None
+        )
+        self.active_step_id = state.get("active_step_id")
+        self.active_step_pattern_state = state.get("active_step_pattern_state")
+        self.active_step_context = state.get("active_step_context")
+        self.active_step_ids = list(state.get("active_step_ids", []))
+        self.active_step_pattern_states = dict(
+            state.get("active_step_pattern_states", {})
+        )
+        self.active_step_contexts = dict(state.get("active_step_contexts", {}))
+        if self.active_step_id and self.active_step_id not in self.active_step_ids:
+            self.active_step_ids.append(self.active_step_id)
+        if self.active_step_id and self.active_step_pattern_state:
+            self.active_step_pattern_states.setdefault(
+                self.active_step_id,
+                self.active_step_pattern_state,
+            )
+        if self.active_step_id and self.active_step_context:
+            self.active_step_contexts.setdefault(
+                self.active_step_id,
+                self.active_step_context,
+            )
+        self._sync_legacy_active_step()
+        self.step_results = dict(state.get("step_results", {}))
+        self.failed_step_evidence = dict(state.get("failed_step_evidence", {}))
+        self.failure_delivery_attempted = bool(
+            state.get("failure_delivery_attempted", False)
+        )
+        self.planned_user_message_count = int(
+            state.get("planned_user_message_count", 0)
+        )
+        owed_step_ids: list[str] = []
+        for owed_step_id in state.get("replan_owed_step_ids") or []:
+            if owed_step_id and str(owed_step_id) not in owed_step_ids:
+                owed_step_ids.append(str(owed_step_id))
+        self.replan_owed_step_ids = owed_step_ids
+        stored_memory_input = state.get("memory_input_text")
+        if stored_memory_input:
+            self.memory_input_text = str(stored_memory_input)
+        elif self.memory_input_text is None:
+            for child_state in self.active_step_pattern_states.values():
+                child_memory_input = child_state.get("memory_input_text")
+                if child_memory_input:
+                    self.memory_input_text = str(child_memory_input)
+                    break
+        self.max_concurrency = max(1, int(state.get("max_concurrency", 4)))
+        feedback = state.get("completion_feedback")
+        self.completion_feedback = str(feedback) if feedback else None
+        self.completion_replan_count = int(state.get("completion_replan_count", 0))
+        self.max_completion_replans = max(
+            0,
+            int(state.get("max_completion_replans", self.max_completion_replans)),
+        )
+
+    def _memory_text(self, context: Any) -> str:
+        if self.memory_input_text is None:
+            self.memory_input_text = context.current_user_request_text(
+                prefer_display=True,
+                user_message_limit=(
+                    self.planned_user_message_count if self.plan is not None else None
+                ),
+            )
+        return self.memory_input_text
+
+    async def _fail(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        error: str,
+        failure_reason: str,
+        checkpoint_label: str,
+        failed_step_id: str | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.status = "failed"
+        metadata: dict[str, Any] = {
+            "status": self.status,
+            "failure_reason": failure_reason,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        if failed_step_id is not None:
+            metadata["failed_step_id"] = failed_step_id
+            failed_step = next(
+                (
+                    step
+                    for step in (self.plan.steps if self.plan is not None else [])
+                    if step.id == failed_step_id
+                ),
+                None,
+            )
+            if failed_step is not None and failed_step.failure_code is not None:
+                metadata["failure_code"] = failed_step.failure_code
+            # A step that failed on a model-provider error carries the same
+            # keys as a failed plan or completion call.
+            metadata.update(self._step_model_failures.get(failed_step_id, {}))
+        await runtime.checkpoint(
+            checkpoint_label,
+            context=context,
+            pattern=self,
+            status=self.status,
+            metadata=metadata,
+        )
+        return PatternResult(
+            success=False,
+            error=error,
+            metadata=metadata,
+        ).to_dict()
+
+    def _retain_failed_step_evidence(
+        self, step_id: str, context: Any, pattern: ReActPattern
+    ) -> None:
+        # Child contexts inherit root messages, but their durable tool ledger
+        # belongs to this step. Keep only its observations, using the latest
+        # visible result when a provider reuses an inherited tool-call id.
+        tool_call_ids = {
+            record.tool_call_id
+            for record in pattern._provider_compatible_tool_records()
+            if record.status == "completed"
+        }
+        observations = {
+            message["tool_call_id"]: message["content"]
+            for message in context.get_messages_for_llm()
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") in tool_call_ids
+        }
+        self.failed_step_evidence[step_id] = {
+            "evidence_state": evidence_facts(tool_evidence_state(context)),
+            "observations": list(observations.values()),
+        }
+
+    async def _deliver_after_step_failure(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        failure: dict[str, Any],
+    ) -> dict[str, Any]:
+        # _run has already stopped scheduling and drained concurrent siblings.
+        # Preserve failure dominance over a simultaneous sibling interruption;
+        # a user stop must not start a new LLM call either.
+        if self.failure_delivery_attempted or await runtime.should_interrupt():
+            return failure
+        if not self.step_results and not any(
+            evidence.get("observations")
+            for evidence in self.failed_step_evidence.values()
+        ):
+            return failure
+        self.failure_delivery_attempted = True
+        await runtime.checkpoint(
+            "dag_before_failure_delivery",
+            context=context,
+            pattern=self,
+            metadata={"failure_reason": "step_failed"},
+        )
+        # Reuse the final-answer scope/language/evidence payload, but never send
+        # raw exceptions or planner prose as facts for the handoff.
+        payload = self._delivery_evidence_payload(context)
+        payload.update(
+            failed_step_id=failure.get("failed_step_id"),
+            failed_step_evidence=self.failed_step_evidence,
+        )
+        system_prompt = (
+            "DAG execution stopped because a step failed. No further work or "
+            "verification is possible in this run. Call final_answer exactly "
+            "once to hand over useful existing results and trusted deliverable "
+            "links. Clearly distinguish completed work from incomplete steps "
+            "and list missing or unverified parts of the user's request. Do not "
+            "claim full completion or promise to keep working. Set outcome to "
+            "partial if useful results exist, otherwise blocked. Failed-step "
+            "observations may show individual operations succeeded, not that "
+            "the step completed. Only authoritative_user_requests determine "
+            "required scope. Plan structure is execution status, not facts. "
+            "Do not reproduce raw exceptions or tool payloads. "
+            f"{grounding_rule(can_call_tools=False)}\n\n"
+            f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+            f"{final_answer_language_rule(subject='output_language_policy field')}"
+        )
+        user_prompt = json.dumps(payload, ensure_ascii=False) + (
+            "\n\nRuntime notice: work has stopped. Call only final_answer to "
+            "hand over existing results and explain what was not done. "
+            "No other tools are available."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "final_answer",
+                "description": "Deliver existing results after execution stopped.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "outcome": {"type": "string", "enum": ["partial", "blocked"]},
+                    },
+                    "required": ["answer", "outcome"],
+                },
+            },
+        }
+
+        def parse_response(response: Any) -> dict[str, Any] | None:
+            if len(self._response_tool_calls(response)) != 1:
+                return None
+            args = self._extract_tool_arguments(response, "final_answer")
+            answer = args.get("answer")
+            return args if isinstance(answer, str) and answer.strip() else None
+
+        try:
+            args = await request_partial_delivery(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+                messages=messages,
+                schema=schema,
+                parse_response=parse_response,
+                metadata={"phase": "dag_failure_delivery"},
+                timeout=DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS,
+            )
+        except ExecutionInterrupted:
+            return failure
+        deterministic_handoff = False
+        # The delivery call gave nothing usable (it can be cut off at its own
+        # output cap); completed results must still reach the user. A step that
+        # failed on a model-provider error never gets this handoff, so its
+        # failure result keeps carrying the provider error to the client.
+        if args is None and "model_error" not in failure:
+            args = step_results_handoff(
+                self.plan.steps if self.plan is not None else [],
+                self.step_results,
+                failure.get("failed_step_id"),
+            )
+            deterministic_handoff = args is not None
+        if args is None or await runtime.should_interrupt():
+            await runtime.checkpoint(
+                "dag_failed",
+                context=context,
+                pattern=self,
+                metadata={
+                    "failure_reason": "step_failed",
+                    "failed_step_id": failure.get("failed_step_id"),
+                },
+            )
+            return failure
+        outcome = args["outcome"]
+        answer = (
+            "DAG execution stopped after a step failed; this is not a completed task."
+            f"\n\n{args['answer']}"
+        )
+        context.add_assistant_message(answer)
+        self.status = "completed"
+        result = PatternResult(
+            success=True,
+            output=answer,
+            metadata={
+                "status": self.status,
+                "completion_outcome": outcome,
+                "termination_reason": "step_failed",
+                "failed_step_id": failure.get("failed_step_id"),
+                "step_results": dict(self.step_results),
+            },
+        ).to_dict()
+        await runtime.checkpoint(
+            "dag_partial_delivery",
+            context=context,
+            pattern=self,
+            metadata={
+                "completion_outcome": outcome,
+                "termination_reason": "step_failed",
+                **({"handoff": "step_results"} if deterministic_handoff else {}),
+            },
+        )
+        return result
+
+    def _ready_steps(self) -> list[PlanStep]:
+        if self.plan is None:
+            return []
+        ready: list[PlanStep] = []
+        active_step_ids = set(self.active_step_ids)
+        for step in self.plan.steps:
+            if step.status in {"completed", "failed"}:
+                continue
+            if active_step_ids:
+                if step.id in active_step_ids:
+                    ready.append(step)
+                continue
+            if all(dep in self.step_results for dep in step.dependencies):
+                ready.append(step)
+        return ready
+
+    def _pending_ready_steps(self) -> list[PlanStep]:
+        if self.plan is None:
+            return []
+        return [
+            step
+            for step in self.plan.steps
+            if step.status == "pending"
+            and all(dep in self.step_results for dep in step.dependencies)
+        ]
+
+    def _all_steps_completed(self) -> bool:
+        return self.plan is not None and all(
+            step.status == "completed" for step in self.plan.steps
+        )
+
+    async def _handle_completed_plan(
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any] | None:
+        try:
+            assessment = await self._assess_completion(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+            )
+        except LLMCallInterrupted:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="dag_during_completion_assessment",
+            )
+            if interrupted is not None:
+                return interrupted
+            raise
+        except ExecutionEventPersistenceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="completion_assessment_error",
+                checkpoint_label="dag_completion_assessment_failed",
+                extra_metadata=_model_failure_metadata(exc),
+            )
+
+        if assessment.complete:
+            self.status = "completed"
+            self.completion_feedback = None
+            self.replan_owed_step_ids = []
+            output = assessment.answer or self._final_output()
+            await runtime.checkpoint("dag_completed", context=context, pattern=self)
+            return PatternResult(
+                success=True,
+                output=output,
+                metadata={
+                    "status": self.status,
+                    "step_results": self.step_results,
+                    "completion_assessment": assessment.__dict__,
+                },
+            ).to_dict()
+
+        if self.completion_replan_count >= self.max_completion_replans:
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=(
+                    "DAG completion assessment requested additional work after "
+                    f"{self.max_completion_replans} replans."
+                ),
+                failure_reason="completion_replan_limit_exceeded",
+                checkpoint_label="dag_completion_replan_limit",
+            )
+
+        self.completion_replan_count += 1
+        self.completion_feedback = (
+            assessment.replan_instruction
+            or assessment.missing_work
+            or assessment.reason
+        )
+        await runtime.checkpoint(
+            "dag_completion_incomplete",
+            context=context,
+            pattern=self,
+            metadata={
+                "completion_assessment": assessment.__dict__,
+                "completion_replan_count": self.completion_replan_count,
+            },
+        )
+        try:
+            await self._generate_plan(
+                context=context,
+                tools=tools,
+                llm=llm,
+                runtime=runtime,
+                replan=True,
+            )
+        except PlanValidationError as exc:
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="invalid_plan",
+                checkpoint_label="dag_plan_invalid",
+            )
+        except LLMCallInterrupted:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="dag_during_completion_replan",
+            )
+            if interrupted is not None:
+                return interrupted
+            raise
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # See the matching comment on the first plan-generation catch
+            # above.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="completion_replan_generation_error",
+                checkpoint_label="dag_plan_generation_failed",
+                extra_metadata=_model_failure_metadata(exc),
+            )
+        return None
+
+    async def _assess_completion(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> DAGCompletionAssessment:
+        messages = self._completion_assessment_messages(context)
+        tools = [self._completion_assessment_tool_schema()]
+        await runtime.on_dag_execution(
+            context=context,
+            phase="completion_assessment",
+            data={
+                "completed_step_count": len(self.step_results),
+                "plan_step_count": len(self.plan.steps) if self.plan else 0,
+            },
+        )
+        await runtime.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=tools,
+            metadata={"phase": "dag_completion_assessment"},
+        )
+        final_answer_stream = FinalAnswerStreamSession(runtime)
+        streamer = ToolCallStringFieldStreamer(
+            runtime=runtime,
+            tool_name=DAG_COMPLETION_TOOL_NAME,
+            field_name="answer",
+            guard_field="status",
+            guard_value="completed",
+            emitter=final_answer_stream,
+        )
+        try:
+            call_llm = await prepare_llm_for_context(
+                llm=llm,
+                messages=messages,
+                context=context,
+            )
+            response = await runtime.run_streaming_llm_call(
+                call_llm,
+                messages=messages,
+                tools=tools,
+                tool_choice="required",
+                thinking={"type": "disabled", "enable": False},
+                on_chunk=streamer.handle_chunk,
+            )
+        except Exception as exc:
+            await streamer.fail(str(exc))
+            await runtime.on_llm_error(
+                context=context,
+                error=exc,
+                metadata={"phase": "dag_completion_assessment"},
+            )
+            raise
+        await runtime.on_llm_end(
+            context=context,
+            response=response,
+            metadata={"phase": "dag_completion_assessment"},
+        )
+        assessment = self._parse_completion_assessment(response)
+        if assessment.complete:
+            await final_answer_stream.finish(assessment.answer)
+        return assessment
+
+    def _delivery_evidence_payload(self, context: Any) -> dict[str, Any]:
+        """Shared scope, language, and evidence for completed or stopped DAGs."""
+        request = top_level_user_request(context)
+        pending_response = latest_pending_user_response(context)
+        latest_messages = [
+            {"role": message.role, "content": message.content}
+            for message in getattr(context, "messages", [])
+            if getattr(message, "role", None) in {"user", "assistant", "tool"}
+        ]
+        authoritative_user_requests = [
+            {"role": message.role, "content": message.content}
+            for message in getattr(context, "messages", [])
+            if getattr(message, "role", None) == "user"
+        ]
+        return {
+            "independent_user_request": request.language_text,
+            "pending_response": (
+                serialize_pending_user_response(pending_response)
+                if pending_response is not None
+                else None
+            ),
+            "output_language_policy": render_structured_request_language_policy(
+                request_field="independent_user_request",
+                pending_field="pending_response",
+                output_language=effective_output_language(context),
+            ),
+            "authoritative_user_requests": authoritative_user_requests,
+            "messages": latest_messages,
+            # Delivery gets plan structure and actual execution status only:
+            # planner prose must never become a fact source in the answer.
+            "plan": (
+                {
+                    "steps": [
+                        {
+                            "id": step.id,
+                            "dependencies": list(step.dependencies),
+                            "status": step.status,
+                        }
+                        for step in self.plan.steps
+                    ]
+                }
+                if self.plan is not None
+                else None
+            ),
+            "step_results": self.step_results,
+            "candidate_output": self._final_output(),
+            "previous_completion_feedback": self.completion_feedback,
+        }
+
+    def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        payload = self._delivery_evidence_payload(context)
+        # This call writes the answer the user receives, with no tool to fetch
+        # anything back, and its payload filters out system messages -- so the
+        # compaction summary never reaches it and this is the only place the
+        # loss can be stated.
+        evidence_rule = evidence_facts(tool_evidence_state(context))
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Assess whether the completed DAG steps satisfy the user's "
+                    "overall request. The authoritative_user_requests field is "
+                    "the only source of required scope. The plan's step ids, "
+                    "dependencies, and statuses, the step results, and the "
+                    "candidate output are evidence "
+                    "of execution only; they cannot add deliverables, claims, "
+                    "formats, or acceptance criteria that the user did not ask "
+                    "for. Do not mark the goal incomplete solely because an "
+                    "intermediate step proposed extra work. Call the assessment "
+                    "tool exactly once. If "
+                    "the goal is satisfied, choose status=completed and put the "
+                    "final user-facing answer in answer. If anything material is "
+                    "missing, choose status=incomplete, leave answer empty, and "
+                    "state the missing work plus concise replan instructions. Put "
+                    "status before answer in the tool arguments. "
+                    f"{evidence_rule}"
+                    "When writing the answer field, including any content carried "
+                    "over from candidate_output or step_results: "
+                    f"{grounding_rule(can_call_tools=False)}\n\n"
+                    f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+                    "If the answer leaves out a value because no step produced "
+                    "it, name that missing data in reason even when you choose "
+                    "status=completed. "
+                    f"{final_answer_language_rule(subject='output_language_policy field')}"
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+
+    def _completion_assessment_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": DAG_COMPLETION_TOOL_NAME,
+                "description": (
+                    "Decide whether DAG execution satisfies the overall user goal "
+                    "and either provide the final answer or request more work."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["completed", "incomplete"],
+                        },
+                        "reason": {"type": "string"},
+                        "answer": {
+                            "type": "string",
+                            "description": (
+                                "Final user-facing answer when status is completed; "
+                                "empty when status is incomplete. "
+                                f"{final_deliverable_file_reference_instructions(can_lookup=False, include_heading=False)} "
+                                f"{final_answer_language_rule(subject='output_language_policy field')}"
+                            ),
+                        },
+                        "missing_work": {
+                            "type": "string",
+                            "description": (
+                                "What remains unresolved when status is incomplete."
+                            ),
+                        },
+                        "replan_instruction": {
+                            "type": "string",
+                            "description": (
+                                "Concise instruction for the next DAG replan when "
+                                "status is incomplete."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "status",
+                        "reason",
+                        "answer",
+                        "missing_work",
+                        "replan_instruction",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _parse_completion_assessment(self, response: Any) -> DAGCompletionAssessment:
+        payload = self._extract_tool_arguments(response, DAG_COMPLETION_TOOL_NAME)
+        status = str(payload.get("status", "")).strip().lower()
+        if status not in {"completed", "incomplete"}:
+            raise ValueError(f"Invalid DAG completion status: {status}")
+        answer = str(payload.get("answer", ""))
+        return DAGCompletionAssessment(
+            complete=status == "completed",
+            answer=answer,
+            reason=str(payload.get("reason", "")),
+            missing_work=str(payload.get("missing_work", "")),
+            replan_instruction=str(payload.get("replan_instruction", "")),
+        )
+
+    def _extract_tool_arguments(self, response: Any, tool_name: str) -> dict[str, Any]:
+        tool_calls = self._response_tool_calls(response)
+        for tool_call in tool_calls:
+            function_payload = self._function_payload(tool_call)
+            if not function_payload or function_payload.get("name") != tool_name:
+                continue
+            return self._coerce_tool_arguments(function_payload.get("arguments", {}))
+        raise ValueError(f"DAG completion requires a {tool_name} tool call response.")
+
+    def _response_tool_calls(self, response: Any) -> list[Any]:
+        if isinstance(response, dict):
+            return list(response.get("tool_calls") or [])
+        return list(getattr(response, "tool_calls", []) or [])
+
+    def _function_payload(self, tool_call: Any) -> dict[str, Any] | None:
+        if isinstance(tool_call, dict):
+            function_payload = tool_call.get("function")
+            return function_payload if isinstance(function_payload, dict) else None
+        function_payload = getattr(tool_call, "function", None)
+        if function_payload is None:
+            return None
+        return {
+            "name": getattr(function_payload, "name", None),
+            "arguments": getattr(function_payload, "arguments", {}),
+        }
+
+    def _coerce_tool_arguments(self, arguments: Any) -> dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if not isinstance(arguments, str):
+            raise TypeError("Tool call arguments must be an object or JSON string.")
+        payload = json.loads(arguments)
+        if not isinstance(payload, dict):
+            raise TypeError("Tool call arguments must decode to an object.")
+        return payload
+
+    def _final_output(self) -> Any:
+        if self.plan is None:
+            return self.step_results
+        if len(self.plan.steps) == 1:
+            return self.step_results.get(self.plan.steps[0].id)
+        terminal_steps = self._terminal_steps()
+        terminal_results = [
+            self.step_results.get(step.id)
+            for step in terminal_steps
+            if step.id in self.step_results
+        ]
+        if len(terminal_results) == 1:
+            return self._display_output(terminal_results[0])
+        if terminal_results:
+            return "\n\n".join(
+                self._display_output(result) for result in terminal_results if result
+            )
+        return self.step_results
+
+    def _display_output(self, result: Any) -> str:
+        if isinstance(result, str):
+            return unwrap_final_answer_content(result)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+    def _terminal_steps(self) -> list[PlanStep]:
+        if self.plan is None:
+            return []
+        dependency_ids = {
+            dependency for step in self.plan.steps for dependency in step.dependencies
+        }
+        terminal_steps = [
+            step
+            for step in self.plan.steps
+            if step.id not in dependency_ids and step.status == "completed"
+        ]
+        return terminal_steps or [
+            step for step in self.plan.steps if step.status == "completed"
+        ]
+
+    def _dependency_summary(self, step: PlanStep) -> dict[str, Any]:
+        return {dep: self.step_results.get(dep) for dep in step.dependencies}
+
+    def _step_instruction(self, *, root_context: Any, step: PlanStep) -> str:
+        dependency_note = (
+            "Dependency results, if any, are provided immediately before this "
+            "message. Use them as inputs for this step only."
+            if step.dependencies
+            else "This step has no dependencies."
+        )
+        suggested_tools = ", ".join(step.tool_names) if step.tool_names else "(none)"
+        termination_condition = (
+            step.termination_condition
+            or "Return final_answer when the current step description is satisfied."
+        )
+        completion_evidence = step.completion_evidence or "(none)"
+        return (
+            "DAG STEP EXECUTION BOUNDARY\n"
+            "The overall user goal is background context only. Do not execute it "
+            "directly and do not use it to expand the current step's completion "
+            "criteria.\n\n"
+            "OUTPUT LANGUAGE POLICY\n"
+            f"{render_dag_step_language_reference()}\n"
+            "Use this policy only to preserve language for user-facing prose and "
+            "persisted tool arguments. Do not use it to expand this step's "
+            "completion criteria.\n\n"
+            "CURRENT STEP - ONLY EXECUTABLE GOAL\n"
+            f"Current DAG step id: {step.id}\n"
+            f"Current DAG step title: {step.task}\n"
+            f"Current DAG step description: {step.description or step.task}\n"
+            f"Current DAG step dependencies: {list(step.dependencies)}\n"
+            f"Suggested tools for this step: {suggested_tools}\n\n"
+            "TERMINATION CONDITION - AUTHORITATIVE STOP RULE\n"
+            f"{termination_condition}\n"
+            f"Completion evidence: {completion_evidence}\n"
+            "Treat this termination condition as authoritative for when this step "
+            "stops. "
+            "Once it is satisfied, your next action must be final_answer for this "
+            "step. Do not inspect, verify, revise, optimize, regenerate, or perform "
+            "downstream work unless the termination condition explicitly requires "
+            "that work.\n\n"
+            f"{step_intent_not_fact_rule()}\n\n"
+            f"{dependency_note}\n\n"
+            "Execute only the current DAG step. The current step title and "
+            "description plus the termination condition define the entire "
+            "actionable work for this ReAct run. "
+            "Do not infer extra work from the overall user goal. Do not complete "
+            "downstream, sibling, final synthesis, rendering, screenshots, visual "
+            "inspection, export, or delivery work unless that work is explicitly "
+            "part of this current step description. If the current step creates an "
+            "artifact that a later step will render, inspect, export, or deliver, "
+            "stop after creating that artifact and report it as this step's result. "
+            "Treat the suggested tools as the primary tool scope for this step. "
+            "Prefer those tools and avoid other tools unless this current step "
+            "cannot be completed or recovered without them. If no suggested tools "
+            "are listed, do not call tools unless the step clearly cannot be "
+            "completed from the provided context and dependency results. When this "
+            "step is done, return a final answer for this step only."
+        )
+
+    @staticmethod
+    def _output_language(root_context: Any) -> str:
+        if isinstance(root_context, dict):
+            metadata = root_context.get("metadata", {})
+        else:
+            metadata = getattr(root_context, "metadata", {})
+        if isinstance(metadata, dict):
+            return str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "").strip()
+        return ""
+
+    async def _generate_plan(
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+        replan: bool,
+    ) -> None:
+        reply_driven = self._reply_awaiting_replan()
+        self.status = "replanning" if replan else "planning"
+        if replan:
+            self._clear_all_active_steps()
+        await runtime.on_dag_execution(
+            context=context,
+            phase="replanning" if replan else "planning",
+            data={
+                "completed_step_count": len(self.step_results),
+                "previous_step_count": len(self.plan.steps) if self.plan else 0,
+            },
+        )
+        request = PlanGenerationRequest(
+            context=context,
+            execution_id=getattr(context, "execution_id", None),
+            replan=replan,
+            completed_step_results=dict(self.step_results),
+            previous_plan=self.plan,
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            available_tool_names=[
+                name
+                for tool in tools
+                if (name := self._tool_name(tool)) != SPILL_READ_TOOL_NAME
+            ],
+            completion_feedback=self.completion_feedback,
+            reply_driven=reply_driven,
+        )
+        self.plan = await self.plan_generator.generate_plan(
+            request=request,
+            llm=_RuntimeLLMProxy(runtime=runtime, llm=llm, context=context),
+        )
+        self.plan.validate()
+        self._apply_completed_results_to_plan()
+        self.planned_user_message_count = self._user_message_count(context)
+        self.replan_owed_step_ids = []
+        if replan:
+            runtime.clear_interrupt()
+        await runtime.checkpoint(
+            "dag_replanned" if replan else "dag_plan_generated",
+            context=context,
+            pattern=self,
+        )
+        await runtime.on_dag_execution(
+            context=context,
+            phase="executing",
+            data={
+                "replan": replan,
+                "plan_step_count": len(self.plan.steps) if self.plan else 0,
+                "steps": [step.to_dict() for step in self.plan.steps]
+                if self.plan
+                else [],
+            },
+        )
+        self.status = "running"
+
+    async def _interrupt_if_requested(
+        self,
+        *,
+        runtime: PatternRuntime,
+        context: Any,
+        label: str,
+    ) -> dict[str, Any] | None:
+        if not await runtime.should_interrupt():
+            return None
+        self.status = "interrupted"
+        await runtime.checkpoint(
+            "dag_interrupted",
+            context=context,
+            pattern=self,
+            status=self.status,
+            metadata={"safe_point": label, "reason": runtime.interrupt_reason},
+        )
+        return PatternResult(
+            success=False,
+            error="DAGPattern interrupted.",
+            metadata={
+                "status": self.status,
+                "interrupt_reason": runtime.interrupt_reason,
+            },
+        ).to_dict()
+
+    def _apply_completed_results_to_plan(self) -> None:
+        if self.plan is None:
+            return
+        for step in self.plan.steps:
+            if step.id in self.step_results:
+                step.status = "completed"
+                step.result = self.step_results[step.id]
+
+    def _reply_awaiting_replan(self) -> bool:
+        """A consumed reply no plan has answered yet; unlike the owed check it
+        ignores plan completion, so a completion replan still sees it."""
+        return any(
+            step_id in self.step_results for step_id in self.replan_owed_step_ids
+        )
+
+    def _reply_replan_owed(self) -> bool:
+        return (
+            self._reply_awaiting_replan()
+            and not self._all_steps_completed()
+            and not self.active_step_ids
+        )
+
+    def _needs_replan(self, context: Any) -> bool:
+        if self._reply_replan_owed():
+            return True
+        if self.status not in {"interrupted", "waiting_for_user", "replanning"}:
+            return False
+        return self._user_message_count(context) > self.planned_user_message_count
+
+    def _forward_user_response_to_waiting_step(self, root_context: Any) -> bool:
+        if self.status != "waiting_for_user":
+            return False
+
+        step_id = self._waiting_step_id()
+        if step_id is None:
+            return False
+
+        root_user_messages = [
+            (index, message)
+            for index, message in enumerate(root_context.messages)
+            if message.role == "user"
+        ]
+        if len(root_user_messages) <= self.planned_user_message_count:
+            return False
+
+        active_context = self.active_step_contexts.get(step_id)
+        if not active_context:
+            return False
+
+        new_root_messages = root_user_messages[self.planned_user_message_count :]
+        response_index, response_message = new_root_messages[0]
+        pattern_state = self.active_step_pattern_states.get(step_id)
+        waiting_request = (
+            pattern_state.get("waiting_for_user_request")
+            if isinstance(pattern_state, dict)
+            else None
+        )
+        marker = pending_user_response_marker(waiting_request)
+        if marker is not None:
+            # The answer belongs to this step; the planner reads the pairing.
+            marker = {**marker, "step_id": step_id}
+        raw_response_metadata = getattr(response_message, "metadata", None)
+        response_metadata = (
+            dict(raw_response_metadata)
+            if isinstance(raw_response_metadata, dict)
+            else {}
+        )
+        if marker is not None:
+            response_metadata["response_to_waiting_for_user"] = marker
+            root_context.messages[response_index] = replace(
+                response_message,
+                metadata=response_metadata,
+            )
+
+        child_context = type(root_context).from_dict(active_context)
+        self._refresh_restored_step_runtime_metadata(child_context, root_context)
+        for _, message in new_root_messages:
+            metadata = dict(getattr(message, "metadata", None) or {})
+            if message is response_message and marker is not None:
+                metadata["response_to_waiting_for_user"] = marker
+            child_context.add_user_message(
+                message.content,
+                metadata={
+                    **metadata,
+                    "kind": "dag_waiting_user_response",
+                    "forwarded_from_root": True,
+                    "dag_step_id": step_id,
+                },
+            )
+
+        self._set_active_step_context(step_id, child_context.to_dict())
+        self.planned_user_message_count = len(root_user_messages)
+        # Every consumed reply stays listed until a plan absorbs them all.
+        if step_id not in self.replan_owed_step_ids:
+            self.replan_owed_step_ids.append(step_id)
+        self.status = "running"
+        return True
+
+    def _refresh_restored_step_instruction(
+        self,
+        child_context: Any,
+        *,
+        root_context: Any,
+        step: PlanStep,
+    ) -> None:
+        """Re-emit the instruction message of a checkpoint-restored step.
+
+        Older checkpoints can bake an output-language policy into message
+        content, which the metadata-only checkpoint migration cannot reach.
+        """
+        instruction = self._step_instruction(root_context=root_context, step=step)
+        for index, message in enumerate(child_context.messages):
+            metadata = getattr(message, "metadata", None) or {}
+            if (
+                metadata.get("kind") == "dag_step_instruction"
+                and message.content != instruction
+            ):
+                child_context.messages[index] = replace(message, content=instruction)
+
+    @staticmethod
+    def _refresh_restored_step_runtime_metadata(
+        child_context: Any,
+        root_context: Any,
+    ) -> None:
+        """Refresh volatile routing metadata on a checkpoint-restored DAG step."""
+
+        hydrate_top_level_user_request(child_context, root_context)
+
+        root_metadata = getattr(root_context, "metadata", {})
+        preferred_modalities = normalize_input_modalities(
+            root_metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
+            if isinstance(root_metadata, dict)
+            else ()
+        )
+        if preferred_modalities:
+            child_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        else:
+            child_context.metadata.pop(
+                PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+                None,
+            )
+
+    def has_live_step_tasks(self) -> bool:
+        """Return whether a concurrent step batch is still running right now.
+
+        Only the multi-step branch of ``_execute_ready_steps`` ever
+        populates ``_live_step_tasks``; the single-step fast path never
+        creates an ``asyncio.Task`` and this is always ``False`` on that
+        path. ``_execute_ready_steps`` clears the set in a ``finally``
+        before it returns, whatever the outcome, so a caller inspecting
+        this once ``run()`` has returned always sees an accurate answer.
+        This holds for cancellation too: when the task running the
+        pattern is cancelled, the sibling step tasks are cancelled and
+        awaited inside the exception handler that wraps the batch loop,
+        before the ``finally`` clears the set, so an empty set on return
+        still means no step task is left running.
+        """
+
+        return bool(self._live_step_tasks)
+
+    def _waiting_step_id(self) -> str | None:
+        for step_id in self.active_step_ids:
+            state = self.active_step_pattern_states.get(step_id)
+            if (
+                isinstance(state, dict)
+                and state.get("status") == "waiting_for_user"
+                and state.get("waiting_for_user_request")
+            ):
+                return step_id
+        return None
+
+    def _user_message_count(self, context: Any) -> int:
+        return sum(1 for message in context.messages if message.role == "user")
+
+    def _tools_for_step(
+        self,
+        tools: list[Any],
+        suggested_tool_names: list[str],
+    ) -> list[Any]:
+        suggested_order = [
+            name.strip() for name in suggested_tool_names if name and name.strip()
+        ]
+        if not suggested_order:
+            return tools
+
+        rank = {name: index for index, name in enumerate(suggested_order)}
+        ordered = sorted(
+            enumerate(tools),
+            key=lambda item: (
+                rank.get(self._tool_name(item[1]), len(rank)),
+                item[0],
+            ),
+        )
+        return [tool for _, tool in ordered]
+
+    def _tool_name(self, tool: Any) -> str:
+        metadata = getattr(tool, "metadata", None)
+        if metadata is not None and getattr(metadata, "name", None):
+            return str(metadata.name)
+        if getattr(tool, "name", None):
+            return str(tool.name)
+        return str(tool)
+
+    def _select_winner(
+        self,
+        completed_results: list[tuple[asyncio.Task[Any], dict[str, Any]]],
+        *,
+        step_ids_by_task: dict[asyncio.Task[Any], str],
+    ) -> tuple[asyncio.Task[Any], dict[str, Any]]:
+        """Pick the one result a same-wakeup completed batch delivers.
+
+        Sorts ``completed_results`` in place and returns its new first
+        entry. The full precedence a batch's outcome follows, from
+        highest to lowest:
+
+        1. A failed step outranks every completed result in the same
+           batch (handled by the caller before this method is even
+           reached: a doomed DAG must not ask a question or report an
+           interrupt in place of the failure).
+        2. Among completed results, rank comes from
+           ``_COMPLETED_RESULT_RANK``: "interrupted" outranks
+           "waiting_for_user" -- an interrupt is a control instruction,
+           not a workflow question the user can be asked to sit
+           through. A result status the table does not know sorts last
+           instead of raising (see ``rank()`` below for why), and is
+           logged as a warning since an unranked status is a handled
+           anomaly worth investigating, not a failure of this method.
+        3. Within the same rank, the lexicographically first step id
+           wins, for a deterministic pick regardless of which task an
+           ``asyncio.wait()`` wakeup or set iteration happens to surface
+           first.
+        4. Any completed result -- winner or loser -- outranks a
+           pending replan. The caller only checks ``_needs_replan()``
+           after this batch has been fully handled, so a result the
+           user has already been shown (a question, an interrupt) is
+           never discarded just because a new user message arrived
+           mid-batch. That message is not lost either: it does not
+           advance ``planned_user_message_count``, so the next
+           iteration of ``run()``'s loop still sees the replan as
+           pending and picks it up one turn later.
+
+        Callers needing the losers read ``completed_results[1:]`` after
+        this call.
+        """
+
+        def rank(
+            item: tuple[asyncio.Task[Any], dict[str, Any]],
+        ) -> tuple[int, str]:
+            task, result = item
+            status = result.get("status")
+            # dict.get()'s key must be `str`; a missing or non-string
+            # status (both otherwise valid at this untyped result-dict
+            # boundary) stringifies to something that is never a table
+            # key, which is exactly the "unranked" case below.
+            status_key = str(status)
+            if status_key not in _COMPLETED_RESULT_RANK:
+                # This runs inside the asyncio.wait() loop in
+                # _execute_ready_steps(); raising here would propagate
+                # through the BaseException cancellation handler and fail
+                # the entire batch over one unrecognized status string.
+                # Sorting it last instead preserves the invariant that a
+                # question already asked is delivered whenever possible.
+                logger.warning(
+                    "Completed DAG step %s has an unranked result status "
+                    "%r; ranking it last in this batch instead of raising.",
+                    step_ids_by_task[task],
+                    status,
+                )
+            return (
+                _COMPLETED_RESULT_RANK.get(status_key, len(_COMPLETED_RESULT_RANK)),
+                step_ids_by_task[task],
+            )
+
+        completed_results.sort(key=rank)
+        return completed_results[0]
+
+    def _invalidate_batch_siblings(
+        self,
+        siblings: list[tuple[asyncio.Task[Any], dict[str, Any]]],
+        *,
+        step_ids_by_task: dict[asyncio.Task[Any], str],
+        steps_by_id: dict[str, PlanStep],
+        clear_all_bookkeeping: bool = False,
+    ) -> list[str]:
+        """Invalidate the losers of a same-wakeup completed batch.
+
+        By default (the winner path) a sibling is only touched at all if
+        its result is "waiting_for_user": its active-step bookkeeping is
+        cleared and its step is flipped to "clarification_invalidated".
+        Any other sibling -- e.g. one that lost an id tie-break between
+        two "interrupted" results -- is left completely alone,
+        bookkeeping included; that tie is not this method's problem to
+        solve.
+
+        Pass clear_all_bookkeeping=True (the failure fast-path) to
+        instead clear every sibling's bookkeeping unconditionally: the
+        whole batch is terminating there, so no sibling's active-step
+        registration should survive into the dag_failed checkpoint
+        regardless of what status it completed with. The
+        clarification_invalidated flip still only ever applies to a
+        "waiting_for_user" result, since that status is reserved for a
+        step whose question was live and never reached the user -- an
+        "interrupted" sibling caught up in a failure is not that step,
+        so it only loses its bookkeeping, not its status.
+
+        Returns the ids that got the clarification_invalidated flip, in
+        input order.
+        """
+        invalidated_step_ids: list[str] = []
+        for sibling_task, sibling_result in siblings:
+            is_waiting = sibling_result.get("status") == "waiting_for_user"
+            if not is_waiting and not clear_all_bookkeeping:
+                continue
+            sibling_step_id = step_ids_by_task[sibling_task]
+            self._clear_active_step(sibling_step_id)
+            if not is_waiting:
+                continue
+            sibling_step = steps_by_id.get(sibling_step_id)
+            if sibling_step is not None:
+                # Non-terminal, and not picked up by the same-wakeup
+                # backfill in schedule_ready_steps(): _ready_steps() offers
+                # this step again once active_step_ids drains, but
+                # _pending_ready_steps() only collects steps already at
+                # "pending", so it waits for the next wakeup's readiness
+                # check before it reruns.
+                sibling_step.status = "clarification_invalidated"
+                invalidated_step_ids.append(sibling_step_id)
+        return invalidated_step_ids
+
+    async def _cancel_pending_steps(
+        self,
+        pending: set[asyncio.Task[Any]],
+        *,
+        step_ids_by_task: dict[asyncio.Task[Any], str] | None = None,
+        steps_by_id: dict[str, PlanStep] | None = None,
+    ) -> None:
+        cancelled_step_ids: list[str] = []
+        for task in pending:
+            step_id = step_ids_by_task.get(task) if step_ids_by_task else None
+            if step_id is not None:
+                cancelled_step_ids.append(step_id)
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for step_id in cancelled_step_ids:
+            self._clear_active_step(step_id)
+            step = steps_by_id.get(step_id) if steps_by_id else None
+            if step is not None and step.status == "running":
+                step.status = "pending"
+
+    def _mark_step_active(self, step_id: str) -> None:
+        if step_id not in self.active_step_ids:
+            self.active_step_ids.append(step_id)
+        self._sync_legacy_active_step()
+
+    def _set_active_step_context(
+        self,
+        step_id: str,
+        context: dict[str, Any],
+    ) -> None:
+        self.active_step_contexts[step_id] = context
+        self._mark_step_active(step_id)
+        self._sync_legacy_active_step()
+
+    def _set_active_step_pattern_state(
+        self,
+        step_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        self.active_step_pattern_states[step_id] = state
+        self._mark_step_active(step_id)
+        self._sync_legacy_active_step()
+
+    def _stage_active_step_context(
+        self,
+        step_id: str,
+        context: dict[str, Any],
+    ) -> None:
+        self._staged_step_contexts[step_id] = context
+        self._mark_step_active(step_id)
+
+    def _stage_active_step_pattern_state(
+        self,
+        step_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        self._staged_step_pattern_states[step_id] = state
+        self._mark_step_active(step_id)
+
+    def _commit_staged_step(self, step_id: str) -> None:
+        """Promote a step's staged entry after its checkpoint was accepted."""
+        if step_id in self._staged_step_contexts:
+            self.active_step_contexts[step_id] = self._staged_step_contexts.pop(step_id)
+        if step_id in self._staged_step_pattern_states:
+            self.active_step_pattern_states[step_id] = (
+                self._staged_step_pattern_states.pop(step_id)
+            )
+        self._sync_legacy_active_step()
+
+    def _discard_staged_step(self, step_id: str) -> None:
+        """Drop a step's staged entry after its checkpoint failed."""
+        self._staged_step_contexts.pop(step_id, None)
+        self._staged_step_pattern_states.pop(step_id, None)
+        self._sync_legacy_active_step()
+
+    def _unmark_step_active(self, step_id: str) -> None:
+        self.active_step_ids = [
+            active_step_id
+            for active_step_id in self.active_step_ids
+            if active_step_id != step_id
+        ]
+        self._sync_legacy_active_step()
+
+    def _clear_active_step(self, step_id: str) -> None:
+        self.active_step_ids = [
+            active_step_id
+            for active_step_id in self.active_step_ids
+            if active_step_id != step_id
+        ]
+        self.active_step_contexts.pop(step_id, None)
+        self.active_step_pattern_states.pop(step_id, None)
+        self._staged_step_contexts.pop(step_id, None)
+        self._staged_step_pattern_states.pop(step_id, None)
+        self._sync_legacy_active_step()
+
+    def _clear_all_active_steps(self) -> None:
+        self.active_step_ids = []
+        self.active_step_contexts = {}
+        self.active_step_pattern_states = {}
+        self._staged_step_contexts = {}
+        self._staged_step_pattern_states = {}
+        self._sync_legacy_active_step()
+
+    def _payload_step_contexts(self) -> dict[str, dict[str, Any]]:
+        """Active-step contexts as they may be written to a checkpoint.
+
+        Committed entries, plus the staged entry of the step this checkpoint
+        is being written for (if any). A sibling step building its own
+        payload at the same time has no step in scope and therefore sees only
+        committed state, so it cannot durably capture an entry whose own
+        checkpoint has not been accepted.
+        """
+        payload = dict(self.active_step_contexts)
+        step_id = _STAGED_STEP_IN_SCOPE.get()
+        if step_id is not None and step_id in self._staged_step_contexts:
+            payload[step_id] = self._staged_step_contexts[step_id]
+        return payload
+
+    def _payload_step_pattern_states(self) -> dict[str, dict[str, Any]]:
+        """Pattern states as they may be written; see ``_payload_step_contexts``."""
+        payload = dict(self.active_step_pattern_states)
+        step_id = _STAGED_STEP_IN_SCOPE.get()
+        if step_id is not None and step_id in self._staged_step_pattern_states:
+            payload[step_id] = self._staged_step_pattern_states[step_id]
+        return payload
+
+    def _sync_legacy_active_step(self) -> None:
+        self.active_step_id = self.active_step_ids[0] if self.active_step_ids else None
+        if self.active_step_id is None:
+            self.active_step_context = None
+            self.active_step_pattern_state = None
+            return
+        # Mirrors the payload view: the staged entry is visible only to the
+        # step that staged it, so these legacy scalars never expose another
+        # step's uncommitted state. Resolved with direct lookups rather than
+        # via the payload helpers -- this runs on every active-step write, and
+        # building the merged maps here would allocate two dicts each time.
+        staged_step_id = _STAGED_STEP_IN_SCOPE.get()
+        in_scope = staged_step_id is not None and staged_step_id == self.active_step_id
+        if in_scope and self.active_step_id in self._staged_step_contexts:
+            self.active_step_context = self._staged_step_contexts[self.active_step_id]
+        else:
+            self.active_step_context = self.active_step_contexts.get(
+                self.active_step_id
+            )
+        if in_scope and self.active_step_id in self._staged_step_pattern_states:
+            self.active_step_pattern_state = self._staged_step_pattern_states[
+                self.active_step_id
+            ]
+        else:
+            self.active_step_pattern_state = self.active_step_pattern_states.get(
+                self.active_step_id
+            )
+
+    def _child_frame_id(self, root_execution_id: str, step_id: str | None) -> str:
+        return f"{root_execution_id}:dag_step:{step_id or 'unknown'}"
+
+    def _execution_status(self, status: str) -> ExecutionStatus:
+        mapping = {
+            "planning": ExecutionStatus.RUNNING,
+            "running": ExecutionStatus.RUNNING,
+            "replanning": ExecutionStatus.REPLANNING,
+            "completed": ExecutionStatus.COMPLETED,
+            "failed": ExecutionStatus.FAILED,
+            "interrupted": ExecutionStatus.INTERRUPTED,
+            "waiting_for_user": ExecutionStatus.WAITING_FOR_USER,
+        }
+        return mapping.get(status, ExecutionStatus.RUNNING)

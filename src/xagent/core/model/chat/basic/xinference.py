@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
 from ..exceptions import LLMTimeoutError
+from ..routing_context import xinference_routing_key
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -193,6 +194,9 @@ class XinferenceLLM(BaseLLM):
 
         # Add any additional kwargs to the config
         config.update(kwargs)
+        routing_key = xinference_routing_key.get()
+        if routing_key is not None:
+            config.setdefault("routing_key", routing_key)
 
         return config
 

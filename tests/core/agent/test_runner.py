@@ -48,6 +48,7 @@ from xagent.core.agent.language import (
 from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.model.chat.basic.xinference import XinferenceLLM
 from xagent.core.model.chat.exceptions import (
     LLMEmptyContentError,
     LLMTimeoutError,
@@ -55,6 +56,7 @@ from xagent.core.model.chat.exceptions import (
     ModelProviderRetryableError,
 )
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
+from xagent.core.user_context import current_user_id
 
 
 @pytest.fixture(autouse=True)
@@ -1563,6 +1565,70 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
     ]
     assert len(workspace_manager.thread_ids) == 1
     assert workspace_manager.thread_ids[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_xinference_routing_key_survives_checkpoint_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_XINFERENCE_SESSION_AFFINITY", "true")
+    keys: list[str | None] = []
+    messages = [{"role": "user", "content": "Continue the task"}]
+
+    class ModelHandle:
+        async def chat(self, *, generate_config: dict[str, Any], **kwargs: Any) -> Any:
+            keys.append(generate_config.get("routing_key"))
+            if generate_config["stream"]:
+
+                async def chunks():
+                    yield {
+                        "choices": [
+                            {"delta": {"content": "ok"}, "finish_reason": "stop"}
+                        ]
+                    }
+
+                return chunks()
+            return {"content": "ok"}
+
+    class ModelPattern(FakePattern):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            llm = kwargs["llm"]
+            await llm.chat(messages=messages)
+            async for _ in llm.stream_chat(messages=messages):
+                pass
+            return await super().run(**kwargs)
+
+    llm = XinferenceLLM()
+    llm._client = MagicMock()
+    llm._model_handle = ModelHandle()
+    runner = AgentRunner(
+        agent=Agent(name="writer", llm=llm, patterns=[ModelPattern({"success": True})]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    token = current_user_id.set(42)
+    try:
+        first = await runner.run(task="Initial task", execution_id="task-1")
+        restored = await runner.run(
+            task=None, checkpoint={"context": first["context"].to_dict()}, resume=True
+        )
+        other = await runner.run(task="Another task", execution_id="task-2")
+        assert first["success"] and restored["success"] and other["success"]
+    finally:
+        current_user_id.reset(token)
+
+    token = current_user_id.set(43)
+    try:
+        other_owner = await runner.run(task="Different owner", execution_id="task-1")
+        assert other_owner["success"]
+    finally:
+        current_user_id.reset(token)
+    await llm.chat(messages=messages)
+    assert len(keys) == 9
+    assert keys[0] is not None and keys[:4] == [keys[0]] * 4
+    assert keys[4] is not None and keys[4] == keys[5]
+    assert keys[6] is not None and keys[6] == keys[7]
+    assert len({keys[0], keys[4], keys[6]}) == 3
+    assert keys[8] is None
 
 
 @pytest.mark.asyncio

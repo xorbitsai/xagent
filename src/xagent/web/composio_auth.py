@@ -16,14 +16,19 @@ cookie is sent to:
    checked *before* Composio is called; a refused request creates no link.
    Then a Composio link is created and the browser is sent to it. Composio's
    verification trip will not carry ``state``, so it is kept in an encrypted
-   flow cookie together with the connected account id the link created.
+   cookie of this flow's own, together with the connected account id the link
+   created. Other flows of the same actor keep their cookies; another actor's
+   are dropped, so a browser holds one actor's flows only.
 3. **Verify** (``?session_uri=`` only, sent by Composio's OAuth callback
-   identity verification): the flow cookie gives back the state, the same
-   actor checks run, the flow is consumed, and ``complete_auth`` is called
-   with the Composio user id derived from *our* session. The account it
-   activates must be the one this flow created, ``ACTIVE``, of our auth config
-   and of the Facebook toolkit. ``GET /me`` through the proxy gives the
-   Facebook user id, and the grant is stored for #3531 to execute.
+   identity verification): the session names no flow, so every open flow's
+   checks run first, then ``complete_auth`` is called with that actor's
+   Composio user id, derived from *our* session. The account it activates
+   says which flow this was; only that flow is spent. It must be ``ACTIVE``,
+   of our auth config and of the Facebook toolkit. ``GET /me`` through the
+   proxy gives the Facebook user id, and the grant is stored for #3531 to
+   execute. A refused completion spends nothing; a completion whose outcome
+   was lost ends the flow and deletes its account only when a single open
+   flow ties the session to it.
 
 The three steps are told apart by their parameters only: a ``session_uri``
 never begins a flow and a ``state`` never completes one.
@@ -88,7 +93,13 @@ META_PROVIDER = "meta"
 AUTH_BACKEND_CLAIM = "auth_backend"
 AUTH_BACKEND = "composio"
 
-FLOW_COOKIE_NAME = "xagent_composio_flow"
+# One cookie per open flow, named after its nonce, so a second connect in the
+# same browser never overwrites the first one's verification context.
+FLOW_COOKIE_PREFIX = "xagent_composio_flow_"
+# Open flows one browser may hold for one actor. Each cookie is about 1.3 kB;
+# a begin past this is refused rather than evicting a flow whose session could
+# still come back and be activated with no way to bind it.
+_MAX_OPEN_FLOWS = 3
 _FLOW_COOKIE_VERSION = 1
 _FLOW_TTL_SECONDS = 600
 _REQUEST_TIMEOUT_SECONDS = 10
@@ -660,6 +671,10 @@ def _cookie_scope(db_provider: Any) -> tuple[bool, str]:
     return _actor_oauth_cookie_scope(META_PROVIDER, db_provider)
 
 
+def _flow_cookie_name(nonce: str) -> str:
+    return f"{FLOW_COOKIE_PREFIX}{nonce[:24]}"
+
+
 def _encode_flow_cookie(state: str, account_id: str) -> str:
     from ..core.utils.encryption import get_cipher
 
@@ -691,11 +706,63 @@ def _decode_flow_cookie(value: str) -> tuple[str, str] | None:
     return envelope["state"], envelope["account"]
 
 
-def _clear_flow_cookie(response: Response, db_provider: Any) -> Response:
+@dataclass(frozen=True)
+class _OpenFlow:
+    """A flow this browser holds, checked except for its Composio outcome."""
+
+    flow: _Flow
+    account_id: str
+    cookie_name: str
+
+    @property
+    def actor(self) -> tuple[int, str]:
+        return self.flow.user_id, self.flow.owner_key
+
+
+def _open_flows(
+    request: Any, db: Session
+) -> tuple[list[_OpenFlow], list[str], list[str]]:
+    """Check every flow cookie the browser sent, without spending any flow.
+
+    Returns the flows that pass every check that needs no Composio call, the
+    cookie names to clear because their flow is dead, and the rejection
+    reasons of those dead flows.
+    """
+    open_flows: list[_OpenFlow] = []
+    dead: list[str] = []
+    reasons: list[str] = []
+    for name, value in sorted(request.cookies.items()):
+        if not name.startswith(FLOW_COOKIE_PREFIX):
+            continue
+        decoded = _decode_flow_cookie(value) if isinstance(value, str) else None
+        if decoded is None:
+            dead.append(name)
+            reasons.append("cookie_mismatch")
+            continue
+        state, account_id = decoded
+        try:
+            flow = _verified_flow(state, request, db)
+            if name != _flow_cookie_name(flow.nonce):
+                raise _reject("cookie_mismatch")
+            if _flow_row_query(db, flow.nonce).count() != 1:
+                raise _reject("flow_used_or_expired")
+        except _Rejected as rejected:
+            dead.append(name)
+            reasons.append(rejected.reason)
+            continue
+        open_flows.append(_OpenFlow(flow, account_id, name))
+    db.rollback()
+    return open_flows, dead, reasons
+
+
+def _clear_flow_cookies(
+    response: Response, db_provider: Any, names: Iterable[str]
+) -> Response:
     secure, path = _cookie_scope(db_provider)
-    response.delete_cookie(
-        FLOW_COOKIE_NAME, path=path, secure=secure, httponly=True, samesite="lax"
-    )
+    for name in dict.fromkeys(names):
+        response.delete_cookie(
+            name, path=path, secure=secure, httponly=True, samesite="lax"
+        )
     return response
 
 
@@ -705,6 +772,16 @@ def handle_callback(
     if step == "begin":
         return _handle_begin(request, db, db_provider)
     return _handle_verify(request, db, db_provider)
+
+
+def _too_many_flows_page() -> HTMLResponse:
+    return _page(
+        "Too many Facebook sign-in windows are open",
+        "Facebook was not connected.",
+        "Close the other Facebook sign-in windows, or wait ten minutes, and "
+        "then select Connect again.",
+        status_code=400,
+    )
 
 
 def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
@@ -718,6 +795,22 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
         _log_rejection(rejected.reason)
         return rejected.response
     db.rollback()
+
+    # Only one actor's flows stay open in a browser, so a verification can be
+    # completed with the one Composio user id they share. Another actor's
+    # flows are dropped: their sessions then fail complete_auth's user check
+    # and are never activated.
+    existing, dead, _ = _open_flows(request, db)
+    stale = dead + [
+        open_flow.cookie_name
+        for open_flow in existing
+        if open_flow.actor != (flow.user_id, flow.owner_key)
+        or open_flow.flow.nonce == flow.nonce
+    ]
+    kept = [open_flow for open_flow in existing if open_flow.cookie_name not in stale]
+    if len(kept) >= _MAX_OPEN_FLOWS:
+        _log_rejection("too_many_open_flows")
+        return _clear_flow_cookies(_too_many_flows_page(), db_provider, stale)
 
     config = load_config()
     if config is None:
@@ -736,14 +829,20 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     except ComposioError as exc:
         _log_rejection(exc.reason)
         return _unavailable_page()
+    # A begin reloaded for the same flow replaces its link; the previous link's
+    # account is this flow's own and could no longer be bound, so delete it.
+    for open_flow in existing:
+        if open_flow.flow.nonce == flow.nonce and open_flow.account_id != account_id:
+            delete_account(config.api_key, open_flow.account_id)
 
     response = RedirectResponse(redirect_url, status_code=302)
     # Our URL carries the state; Composio's page must not receive it.
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
+    _clear_flow_cookies(response, db_provider, stale)
     secure, path = _cookie_scope(db_provider)
     response.set_cookie(
-        FLOW_COOKIE_NAME,
+        _flow_cookie_name(flow.nonce),
         _encode_flow_cookie(flow.state, account_id),
         max_age=max(1, min(_FLOW_TTL_SECONDS, int(flow.expires_at - time.time()))),
         secure=secure,
@@ -752,6 +851,18 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
         path=path,
     )
     return response
+
+
+def _spend(db: Session, open_flow: _OpenFlow) -> bool:
+    """Spend one flow; False when it was spent or expired meanwhile."""
+    deleted = _flow_row_query(db, open_flow.flow.nonce).delete(
+        synchronize_session=False
+    )
+    if deleted != 1:
+        db.rollback()
+        return False
+    db.commit()
+    return True
 
 
 def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
@@ -767,53 +878,74 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         _log_rejection("claims_invalid")
         return _reject("claims_invalid").response
 
-    cookie = request.cookies.get(FLOW_COOKIE_NAME)
-    decoded = _decode_flow_cookie(cookie) if isinstance(cookie, str) else None
-    if decoded is None:
-        _log_rejection("cookie_missing")
-        return _reject("cookie_missing").response
-    state, expected_account_id = decoded
-
-    try:
-        flow = _verified_flow(state, request, db)
-        deleted = _flow_row_query(db, flow.nonce).delete(synchronize_session=False)
-        if deleted != 1:
-            raise _reject("flow_used_or_expired")
-    except _Rejected as rejected:
-        db.rollback()
-        _log_rejection(rejected.reason)
-        return _clear_flow_cookie(rejected.response, db_provider)
-    # The flow is spent before Composio is asked to activate anything.
-    db.commit()
+    # The session_uri names no flow, so every flow this browser holds is
+    # checked first; complete_auth's answer then says which one it was.
+    open_flows, dead, reasons = _open_flows(request, db)
+    if not open_flows:
+        reason = reasons[-1] if reasons else "cookie_missing"
+        _log_rejection(reason)
+        return _clear_flow_cookies(_reject(reason).response, db_provider, dead)
+    actors = {open_flow.actor for open_flow in open_flows}
+    if len(actors) != 1:
+        # begin keeps one actor per browser; anything else is not completed.
+        _log_rejection("claims_invalid")
+        return _clear_flow_cookies(
+            _reject("claims_invalid").response, db_provider, dead
+        )
 
     config = load_config()
     if config is None:
         _log_rejection("composio_not_configured")
-        return _clear_flow_cookie(_unavailable_page(), db_provider)
-    composio_user = composio_user_id(
-        config, user_id=flow.user_id, owner_key=flow.owner_key
-    )
+        return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
+    user_id, owner_key = actors.pop()
+    composio_user = composio_user_id(config, user_id=user_id, owner_key=owner_key)
     try:
         account_id = complete_auth(
             config, session_uri=session_uri, user_id=composio_user
         )
     except ComposioError as exc:
         _log_rejection(exc.reason)
-        response = (
-            _reject("composio_rejected").response
-            if exc.rejected
-            else _unavailable_page()
-        )
-        return _clear_flow_cookie(response, db_provider)
+        if exc.rejected:
+            # Nothing was activated, so every open flow stays usable.
+            return _clear_flow_cookies(
+                _reject("composio_rejected").response, db_provider, dead
+            )
+        # Composio may have activated the account before the answer was
+        # lost. Only a single open flow ties this session to one account,
+        # so only then is that flow ended and its account deleted.
+        if len(open_flows) == 1:
+            (only,) = open_flows
+            _spend(db, only)
+            delete_account(config.api_key, only.account_id)
+            dead.append(only.cookie_name)
+        else:
+            logger.warning(
+                "Composio completion outcome unknown with %d open flows; "
+                "nothing was deleted",
+                len(open_flows),
+            )
+        return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
 
-    if account_id != expected_account_id:
-        # Not the link this flow created, so not ours to bind or to delete.
-        logger.warning("Composio completed a connection this flow did not create")
+    matches = [
+        open_flow for open_flow in open_flows if open_flow.account_id == account_id
+    ]
+    if not matches:
+        # Not a link any open flow created, so not ours to bind or to delete.
+        logger.warning("Composio completed a connection no open flow created")
         _log_rejection("account_invalid")
-        return _clear_flow_cookie(_reject("composio_rejected").response, db_provider)
-
+        return _clear_flow_cookies(
+            _reject("composio_rejected").response, db_provider, dead
+        )
+    (match,) = matches
+    dead.append(match.cookie_name)
     # From here on the account is the one this flow created for this actor:
     # if it cannot be bound, it is deleted rather than left unbound.
+    if not _spend(db, match):
+        _log_rejection("flow_used_or_expired")
+        delete_account(config.api_key, account_id)
+        return _clear_flow_cookies(
+            _reject("flow_used_or_expired").response, db_provider, dead
+        )
     try:
         verify_account(config, account_id=account_id, user_id=composio_user)
         facebook_id = fetch_facebook_user_id(
@@ -821,7 +953,7 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         )
         stored = _store_grant(
             db,
-            flow=flow,
+            flow=match.flow,
             account_id=account_id,
             composio_user=composio_user,
             facebook_id=facebook_id,
@@ -834,11 +966,11 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             if exc.rejected
             else _unavailable_page()
         )
-        return _clear_flow_cookie(response, db_provider)
+        return _clear_flow_cookies(response, db_provider, dead)
     except _Rejected as rejected:
         _log_rejection(rejected.reason)
         delete_account(config.api_key, account_id)
-        return _clear_flow_cookie(rejected.response, db_provider)
+        return _clear_flow_cookies(rejected.response, db_provider, dead)
     except Exception as exc:
         db.rollback()
         logger.warning(
@@ -846,7 +978,7 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             type(exc).__name__,
         )
         delete_account(config.api_key, account_id)
-        return _clear_flow_cookie(
+        return _clear_flow_cookies(
             HTMLResponse(
                 content=(
                     "<h1>Authentication Failed</h1><p>An unexpected error "
@@ -856,8 +988,9 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
                 status_code=500,
             ),
             db_provider,
+            dead,
         )
-    return _clear_flow_cookie(stored, db_provider)
+    return _clear_flow_cookies(stored, db_provider, dead)
 
 
 def _store_grant(

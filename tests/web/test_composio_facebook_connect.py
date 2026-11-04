@@ -43,7 +43,7 @@ USER_ID_SECRET = "test-user-id-secret"
 CALLBACK_URL = "https://app.example.com/api/auth/meta/callback"
 CALLBACK_PATH = "/api/auth/meta/callback"
 COMPOSIO_REDIRECT = "https://connect.composio.dev/link/lk_test"
-SESSION_URI = "https://backend.composio.dev/verify/sess_test_value_123"
+SESSION_PREFIX = "https://backend.composio.dev/verify/sess_"
 FACEBOOK_USER_ID = "102030405060"
 # xagent-saas's own checks on the start response (region.py,
 # toby_onboarding.py), reproduced so a change here that breaks them fails.
@@ -69,6 +69,10 @@ class FakeComposio:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, Any]] = []
         self.created: list[str] = []
+        # Composio binds each link to the user id it was created for, and a
+        # session can be completed once, only with that user id.
+        self.owners: dict[str, str] = {}
+        self.completed: set[str] = set()
         self.complete_status = 200
         self.complete_account: str | None = None
         self.account_overrides: dict[str, Any] = {}
@@ -89,6 +93,7 @@ class FakeComposio:
         if method == "POST" and path == "/connected_accounts/link":
             account_id = f"ca_created_{len(self.created) + 1}"
             self.created.append(account_id)
+            self.owners[account_id] = json["user_id"]
             return _Response(
                 201,
                 {
@@ -103,10 +108,16 @@ class FakeComposio:
                 return _Response(
                     self.complete_status, {"error": {"message": "refused"}}
                 )
+            account_id = json["session_uri"].removeprefix(SESSION_PREFIX)
+            if account_id not in self.owners or account_id in self.completed:
+                return _Response(404, {"error": {"message": "not found"}})
+            if json["user_id"] != self.owners[account_id]:
+                return _Response(400, {"error": {"message": "user mismatch"}})
+            self.completed.add(account_id)
             return _Response(
                 200,
                 {
-                    "connected_account_id": self.complete_account or self.created[-1],
+                    "connected_account_id": self.complete_account or account_id,
                     "toolkit_slug": "facebook",
                 },
             )
@@ -115,7 +126,7 @@ class FakeComposio:
             account = {
                 "id": account_id,
                 "status": "ACTIVE",
-                "user_id": json_user_id(self.calls),
+                "user_id": self.owners.get(account_id),
                 "toolkit": {"slug": "facebook"},
                 "auth_config": {"id": AUTH_CONFIG_ID},
             }
@@ -128,14 +139,6 @@ class FakeComposio:
         if method == "DELETE" and path.startswith("/connected_accounts/"):
             return _Response(200, {"success": True})
         raise AssertionError(f"unexpected Composio call {method} {path}")
-
-
-def json_user_id(calls: list[tuple[str, str, Any]]) -> str | None:
-    """The user id the flow completed with, as Composio would report it."""
-    for verb, path, body in reversed(calls):
-        if verb == "POST" and path == "/connected_accounts/complete_auth":
-            return body["user_id"]
-    return None
 
 
 @pytest.fixture
@@ -262,8 +265,24 @@ def _connect_until_verification(db: Session, user: User, owner: str = OWNER):
     return browser, start
 
 
-def _verify_url(**extra: str) -> str:
-    query = {"session_uri": SESSION_URI, **extra}
+def _session_for(account_id: str) -> str:
+    return f"{SESSION_PREFIX}{account_id}"
+
+
+def _flow_cookies(browser: Browser) -> list[str]:
+    return [
+        name
+        for name in browser.cookies
+        if name.startswith(composio_auth.FLOW_COOKIE_PREFIX)
+    ]
+
+
+def _verify_url(
+    composio: FakeComposio, account_id: str | None = None, **extra: str
+) -> str:
+    """The verification trip for ``account_id``'s session (default: the latest)."""
+    session = _session_for(account_id or composio.created[-1])
+    query = {"session_uri": session, **extra}
     return f"{CALLBACK_URL}?" + "&".join(f"{k}={v}" for k, v in query.items())
 
 
@@ -378,7 +397,11 @@ def test_begin_creates_the_link_and_keeps_the_flow(db_session, composio_env, com
     assert db.query(ActorOAuthFlowState).count() == 1
     jar = SimpleCookie()
     jar.load(begin.headers["set-cookie"])
-    flow_cookie = jar[composio_auth.FLOW_COOKIE_NAME]
+    (flow_cookie,) = [
+        morsel
+        for name, morsel in jar.items()
+        if name.startswith(composio_auth.FLOW_COOKIE_PREFIX)
+    ]
     assert flow_cookie["path"] == CALLBACK_PATH
     assert flow_cookie["httponly"]
     assert flow_cookie["samesite"].lower() == "lax"
@@ -450,7 +473,7 @@ def test_begin_carrying_a_session_uri_is_not_a_begin(
     start = _start(db, user, browser)
 
     response = browser.get(
-        db, start.headers["location"] + f"&session_uri={SESSION_URI}"
+        db, start.headers["location"] + f"&session_uri={_session_for('ca_x')}"
     )
 
     assert response.status_code == 400
@@ -486,7 +509,7 @@ def test_verification_stores_the_composio_grant(db_session, composio_env, compos
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 200, response.body
     body = response.body.decode()
@@ -499,7 +522,10 @@ def test_verification_stores_the_composio_grant(db_session, composio_env, compos
         (
             "POST",
             "/connected_accounts/complete_auth",
-            {"session_uri": SESSION_URI, "user_id": composio_user},
+            {
+                "session_uri": _session_for(composio.created[0]),
+                "user_id": composio_user,
+            },
         )
     ]
     account_id = composio.created[0]
@@ -521,7 +547,7 @@ def test_verification_stores_the_composio_grant(db_session, composio_env, compos
     assert grant.refresh_token is None
     assert grant.expires_at is None
     assert db.query(ActorOAuthFlowState).count() == 0
-    assert composio_auth.FLOW_COOKIE_NAME not in browser.cookies
+    assert _flow_cookies(browser) == []
     assert composio.paths("DELETE") == []
 
 
@@ -530,7 +556,7 @@ def test_verification_with_a_state_is_not_accepted(db_session, composio_env, com
     browser, start = _connect_until_verification(db, user)
     state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
 
-    response = browser.get(db, _verify_url(state=state))
+    response = browser.get(db, _verify_url(composio, state=state))
 
     assert response.status_code == 400
     assert "/connected_accounts/complete_auth" not in composio.paths()
@@ -546,10 +572,10 @@ def test_verification_without_the_proof_cookie_does_not_complete(
     browser.cookies = {
         name: value
         for name, value in browser.cookies.items()
-        if name == composio_auth.FLOW_COOKIE_NAME
+        if name.startswith(composio_auth.FLOW_COOKIE_PREFIX)
     }
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert "/connected_accounts/complete_auth" not in composio.paths()
@@ -561,10 +587,11 @@ def test_verification_with_a_tampered_flow_cookie_does_not_complete(
 ):
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
-    value, path = browser.cookies[composio_auth.FLOW_COOKIE_NAME]
-    browser.cookies[composio_auth.FLOW_COOKIE_NAME] = (value[:-4] + "AAAA", path)
+    (name,) = _flow_cookies(browser)
+    value, path = browser.cookies[name]
+    browser.cookies[name] = (value[:-4] + "AAAA", path)
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert "/connected_accounts/complete_auth" not in composio.paths()
@@ -576,10 +603,10 @@ def test_a_reused_session_uri_is_not_completed_twice(
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
     saved = dict(browser.cookies)
-    assert browser.get(db, _verify_url()).status_code == 200
+    assert browser.get(db, _verify_url(composio)).status_code == 200
     browser.cookies = saved
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert "start" in response.body.decode().lower() or "Connect again" in (
@@ -589,18 +616,135 @@ def test_a_reused_session_uri_is_not_completed_twice(
     assert len(_grants(db)) == 1
 
 
+def _begin(db: Session, user: User, browser: Browser, owner: str = OWNER) -> None:
+    start = _start(db, user, browser, owner)
+    assert browser.get(db, start.headers["location"]).status_code == 302
+
+
+def test_two_connects_in_one_browser_each_complete_their_own_flow(
+    db_session, composio_env, composio
+):
+    """Begin A, begin B, then A's session returns first (R1)."""
+    db, user = db_session
+    browser = Browser()
+    _begin(db, user, browser)
+    _begin(db, user, browser)
+    first, second = composio.created
+    assert len(_flow_cookies(browser)) == 2
+
+    assert browser.get(db, _verify_url(composio, first)).status_code == 200
+
+    (grant,) = _grants(db)
+    assert grant.access_token == first
+    # B's flow and its cookie are untouched, and it still completes.
+    assert db.query(ActorOAuthFlowState).count() == 1
+    assert len(_flow_cookies(browser)) == 1
+    assert browser.get(db, _verify_url(composio, second)).status_code == 200
+    (grant,) = _grants(db)
+    assert grant.access_token == second
+    # The reconnect replaced A's grant, so A's account is deleted.
+    assert composio.paths("DELETE") == [f"/connected_accounts/{first}"]
+
+
+def test_another_actors_begin_drops_the_first_actors_flow(
+    db_session, composio_env, composio
+):
+    """A browser keeps one actor's flows: the earlier actor's session then
+    fails Composio's user check and is never activated."""
+    db, user = db_session
+    browser = Browser()
+    _begin(db, user, browser, OWNER)
+    _begin(db, user, browser, OTHER_OWNER)
+    alice, bob = composio.created
+    assert len(_flow_cookies(browser)) == 1
+
+    assert browser.get(db, _verify_url(composio, alice)).status_code == 400
+
+    assert alice not in composio.completed
+    assert _grants(db) == []
+    # Bob's flow is not spent by the refused session.
+    assert browser.get(db, _verify_url(composio, bob)).status_code == 200
+    (grant,) = _grants(db)
+    assert (grant.resource_owner_key, grant.access_token) == (OTHER_OWNER, bob)
+
+
+def test_a_begin_past_the_open_flow_limit_creates_no_link(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser = Browser()
+    for _ in range(3):
+        _begin(db, user, browser)
+    start = _start(db, user, browser)
+
+    response = browser.get(db, start.headers["location"])
+
+    assert response.status_code == 400
+    assert "Too many" in response.body.decode()
+    assert composio.paths().count("/connected_accounts/link") == 3
+
+
+def test_a_reloaded_begin_deletes_the_link_it_replaces(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser = Browser()
+    start = _start(db, user, browser)
+    assert browser.get(db, start.headers["location"]).status_code == 302
+    assert browser.get(db, start.headers["location"]).status_code == 302
+    replaced, current = composio.created
+
+    assert composio.paths("DELETE") == [f"/connected_accounts/{replaced}"]
+    assert browser.get(db, _verify_url(composio, current)).status_code == 200
+    assert _grants(db)[0].access_token == current
+
+
+def test_a_lost_completion_with_one_open_flow_ends_it_and_deletes_its_account(
+    db_session, composio_env, composio
+):
+    """Composio may have activated the account before the answer was lost (R2)."""
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+    composio.raise_on = "/connected_accounts/complete_auth"
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 503
+    assert _grants(db) == []
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert _flow_cookies(browser) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+
+
+def test_a_lost_completion_with_several_open_flows_deletes_nothing(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser = Browser()
+    _begin(db, user, browser)
+    _begin(db, user, browser)
+    composio.raise_on = "/connected_accounts/complete_auth"
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 503
+    assert composio.paths("DELETE") == []
+    assert db.query(ActorOAuthFlowState).count() == 2
+    assert len(_flow_cookies(browser)) == 2
+
+
 def test_a_user_id_composio_refuses_stores_nothing(db_session, composio_env, composio):
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
     composio.complete_status = 400
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert _grants(db) == []
     assert "/tools/execute/proxy" not in composio.paths()
-    # The flow is spent either way: the member starts again.
-    assert db.query(ActorOAuthFlowState).count() == 0
+    # Nothing was activated, so the flow is not spent by a refused session.
+    assert db.query(ActorOAuthFlowState).count() == 1
 
 
 @pytest.mark.parametrize(
@@ -620,7 +764,7 @@ def test_an_account_that_fails_verification_is_not_stored(
     browser, _ = _connect_until_verification(db, user)
     composio.account_overrides = override
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert _grants(db) == []
@@ -636,7 +780,7 @@ def test_an_account_without_the_deprecated_user_id_is_accepted(
     browser, _ = _connect_until_verification(db, user)
     composio.account_overrides = {"user_id": None}
 
-    assert browser.get(db, _verify_url()).status_code == 200
+    assert browser.get(db, _verify_url(composio)).status_code == 200
     assert len(_grants(db)) == 1
 
 
@@ -647,7 +791,7 @@ def test_an_account_this_flow_did_not_create_is_not_stored_or_deleted(
     browser, _ = _connect_until_verification(db, user)
     composio.complete_account = "ca_belongs_to_someone_else"
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert _grants(db) == []
@@ -670,7 +814,7 @@ def test_no_facebook_identity_stores_nothing(
     browser, _ = _connect_until_verification(db, user)
     composio.me_response = me_response
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code in (400, 503)
     assert _grants(db) == []
@@ -692,7 +836,7 @@ def test_a_link_turned_off_during_sign_in_stores_nothing(
 
     monkeypatch.setattr(composio_auth.requests, "request", disconnect_during_lookup)
 
-    response = browser.get(db, _verify_url())
+    response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
     assert _grants(db) == []
@@ -704,13 +848,13 @@ def test_reconnecting_replaces_the_grant_and_deletes_the_old_account(
 ):
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
-    assert browser.get(db, _verify_url()).status_code == 200
+    assert browser.get(db, _verify_url(composio)).status_code == 200
     (old,) = _grants(db)
     old_account = old.access_token
 
     browser, _ = _connect_until_verification(db, user)
     composio.me_response = (200, {"data": {"id": "999888777"}, "status": 200})
-    assert browser.get(db, _verify_url()).status_code == 200
+    assert browser.get(db, _verify_url(composio)).status_code == 200
 
     (new,) = _grants(db)
     assert new.access_token == composio.created[1] != old_account
@@ -742,21 +886,26 @@ def test_no_secret_reaches_logs_or_responses(
     browser = Browser()
     responses.append(_start(db, user, browser))
     responses.append(browser.get(db, responses[0].headers["location"]))
-    responses.append(browser.get(db, _verify_url()))
-    # And a failing run, whose logs are the likelier place for a leak.
+    responses.append(browser.get(db, _verify_url(composio)))
+    # And two failing runs, whose logs are the likelier place for a leak.
     browser, _ = _connect_until_verification(db, user)
     composio.account_overrides = {"status": "FAILED"}
-    responses.append(browser.get(db, _verify_url()))
-    composio.raise_on = f"/connected_accounts/{composio.created[1]}"
-    responses.append(browser.get(db, _verify_url()))
+    responses.append(browser.get(db, _verify_url(composio)))
+    composio.account_overrides = {}
+    # A fresh flow, so the request reaches the account lookup that raises.
+    browser, _ = _connect_until_verification(db, user)
+    lookup = f"/connected_accounts/{composio.created[2]}"
+    composio.raise_on = lookup
+    responses.append(browser.get(db, _verify_url(composio)))
+    assert ("GET", lookup) in [(verb, path) for verb, path, _ in composio.calls]
+    assert responses[-1].status_code == 503
 
     secrets = [
         API_KEY,
         USER_ID_SECRET,
-        SESSION_URI,
-        "sess_test_value_123",
         _expected_composio_user(user),
         *composio.created,
+        *(_session_for(account_id) for account_id in composio.created),
     ]
     texts = [record.getMessage() for record in caplog.records]
     texts += [str(record.exc_info) for record in caplog.records if record.exc_info]

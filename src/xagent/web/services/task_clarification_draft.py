@@ -223,6 +223,12 @@ FailClosedReason = Literal[
     "attempt_mismatch",
 ]
 
+# The fail-closed reasons that discard the whole settlement, not only the
+# publication: they mean the task row is no longer owned by this lease.
+_SETTLEMENT_DISCARDING_REASONS: frozenset[str] = frozenset(
+    {"unfenced_lease", "ownership_changed", "attempt_mismatch"}
+)
+
 
 @dataclass(frozen=True)
 class Publishable:
@@ -282,6 +288,12 @@ class FailClosed:
     @property
     def fail_closed_reason(self) -> FailClosedReason:
         return self.reason
+
+    @property
+    def discards_settlement(self) -> bool:
+        """Whether the caller must discard this round's settlement through
+        its own late-result exit, rather than settle it unpublished."""
+        return self.reason in _SETTLEMENT_DISCARDING_REASONS
 
 
 ClarificationResolution = Publishable | NotApplicable | FailClosed

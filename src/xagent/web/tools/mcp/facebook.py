@@ -307,7 +307,9 @@ def facebook_publish_image_post(
     """Publish an image post from a public URL or a workspace image file.
 
     Provide exactly one of image_url and file_path. file_path must be an
-    absolute path inside the current task workspace.
+    absolute path inside the current task workspace. Some connections cannot
+    upload local files; on those, file_path returns an error and image_url
+    must be used.
     """
     try:
         url_value = (
@@ -320,6 +322,8 @@ def facebook_publish_image_post(
         has_file = file_value is not None
         if has_url == has_file:
             raise ValueError("Provide exactly one of image_url or file_path")
+        if has_file and meta_graph.uses_composio_proxy():
+            raise ValueError(meta_graph.PROXY_FILE_UPLOAD_UNSUPPORTED)
         if url_value is not None and not _is_public_image_url(url_value):
             raise ValueError("image_url must be a public http or https URL")
         local_image = _read_allowed_image(file_value) if file_value else None

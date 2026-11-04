@@ -210,6 +210,9 @@ class _LegacyOAuthTokenResolution:
     # Set only for providers that return a per-org API host instead of
     # using a fixed domain (Salesforce) -- None for everyone else.
     instance_url: str | None = None
+    # The grant's UserOAuth.token_type. "composio" marks a grant held by
+    # Composio, which launches with Composio values instead of a token.
+    token_type: str | None = None
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -365,6 +368,51 @@ class _OAuthInstanceUrlRequired(Exception):
     def __init__(self, *, env_key: str) -> None:
         super().__init__(env_key)
         self.env_key = env_key
+
+
+# Apps whose MCP subprocess can run a Composio-backed grant through Proxy
+# Execute (#3531). Another app's Composio grant is reported unavailable until
+# its subprocess can proxy it (Instagram Login mode: #3533).
+_COMPOSIO_PROXY_APPS = frozenset({"facebook"})
+
+
+def _composio_grant_env(
+    *, app_id: str, connected_account_id: str, composio_user_id: str | None
+) -> dict[str, str]:
+    """Env for a Composio-backed grant, which replaces the launch config's
+    env_mapping: the grant holds Composio ids, not a provider token.
+
+    A grant that cannot be proxied raises _OAuthInstanceUrlRequired, so it is
+    surfaced as unavailable/reconnect-required like a missing instance_url.
+    """
+    from .mcp.meta_graph import (
+        COMPOSIO_API_KEY_ENV,
+        COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
+        COMPOSIO_USER_ID_ENV,
+    )
+
+    if app_id not in _COMPOSIO_PROXY_APPS:
+        logger.warning(
+            "Composio-backed grant for app '%s' cannot be proxied; "
+            "reporting the connector unavailable",
+            app_id,
+        )
+        raise _OAuthInstanceUrlRequired(env_key=COMPOSIO_CONNECTED_ACCOUNT_ID_ENV)
+    api_key = os.environ.get(COMPOSIO_API_KEY_ENV)
+    if not api_key:
+        # A deployment fault, not something the user can fix by reconnecting.
+        logger.warning(
+            "%s is not configured; Composio-backed grants are unavailable",
+            COMPOSIO_API_KEY_ENV,
+        )
+        raise _OAuthInstanceUrlRequired(env_key=COMPOSIO_API_KEY_ENV)
+    if not composio_user_id:
+        raise _OAuthInstanceUrlRequired(env_key=COMPOSIO_USER_ID_ENV)
+    return {
+        COMPOSIO_API_KEY_ENV: api_key,
+        COMPOSIO_CONNECTED_ACCOUNT_ID_ENV: connected_account_id,
+        COMPOSIO_USER_ID_ENV: composio_user_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -3897,7 +3945,10 @@ class WebToolConfig(BaseToolConfig):
         app_info: Mapping[str, Any],
         access_token: str,
         instance_url: str | None = None,
+        grant_token_type: str | None = None,
     ) -> Dict[str, Any]:
+        from ..models.user_oauth import COMPOSIO_TOKEN_TYPE
+
         launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
             transport_config: Dict[str, Any] = {
@@ -3907,33 +3958,41 @@ class WebToolConfig(BaseToolConfig):
             }
 
             env = {}
-            for env_key, token_type in _oauth_launch_config_env_mapping(
-                launch_config
-            ).items():
-                if token_type == "access_token":
-                    env[env_key] = access_token
-                elif token_type == "instance_url":
-                    if not instance_url:
-                        raise _OAuthInstanceUrlRequired(env_key=env_key)
-                    env[env_key] = instance_url
-                else:
-                    # A typo'd env_mapping value (e.g. "acess_token") would
-                    # otherwise silently emit neither an env var nor an
-                    # error -- the exact opaque failure mode
-                    # _OAuthInstanceUrlRequired exists to prevent for the
-                    # one token_type above it. Not developer-only: an admin
-                    # can reach this through POST /admin/mcp/apps, whose
-                    # launch_config is an unvalidated free-form dict (see
-                    # PublicMCPAppCreate in admin_mcp.py -- its validator
-                    # checks command/required_env/url/auth.type, not
-                    # env_mapping's values), so a hand-typed custom OAuth
-                    # app's env_mapping can carry this too.
-                    logger.warning(
-                        "Unrecognized launch_config.env_mapping token_type "
-                        "'%s' for env var '%s'; no value forwarded",
-                        token_type,
-                        env_key,
+            env_mapping = _oauth_launch_config_env_mapping(launch_config)
+            if grant_token_type == COMPOSIO_TOKEN_TYPE:
+                env.update(
+                    _composio_grant_env(
+                        app_id=str(app_info.get("id") or "").strip().lower(),
+                        connected_account_id=access_token,
+                        composio_user_id=instance_url,
                     )
+                )
+            else:
+                for env_key, token_type in env_mapping.items():
+                    if token_type == "access_token":
+                        env[env_key] = access_token
+                    elif token_type == "instance_url":
+                        if not instance_url:
+                            raise _OAuthInstanceUrlRequired(env_key=env_key)
+                        env[env_key] = instance_url
+                    else:
+                        # A typo'd env_mapping value (e.g. "acess_token") would
+                        # otherwise silently emit neither an env var nor an
+                        # error -- the exact opaque failure mode
+                        # _OAuthInstanceUrlRequired exists to prevent for the
+                        # one token_type above it. Not developer-only: an admin
+                        # can reach this through POST /admin/mcp/apps, whose
+                        # launch_config is an unvalidated free-form dict (see
+                        # PublicMCPAppCreate in admin_mcp.py -- its validator
+                        # checks command/required_env/url/auth.type, not
+                        # env_mapping's values), so a hand-typed custom OAuth
+                        # app's env_mapping can carry this too.
+                        logger.warning(
+                            "Unrecognized launch_config.env_mapping token_type "
+                            "'%s' for env var '%s'; no value forwarded",
+                            token_type,
+                            env_key,
+                        )
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
@@ -4321,11 +4380,13 @@ class WebToolConfig(BaseToolConfig):
 
         access_token = str(oauth_account.access_token)
         instance_url = getattr(oauth_account, "instance_url", None)
+        token_type = getattr(oauth_account, "token_type", None)
         oauth_db.commit()
         return _LegacyOAuthTokenResolution(
             access_token=access_token,
             instance_url=instance_url,
             credential_present=True,
+            token_type=token_type,
         )
 
     def _resolve_shared_google_oauth_account(
@@ -4948,6 +5009,7 @@ class WebToolConfig(BaseToolConfig):
                         app_info=app_info,
                         access_token=access_token,
                         instance_url=legacy_token.instance_url,
+                        grant_token_type=legacy_token.token_type,
                     )
                     if serialized_slack_policy is not None:
                         transport_config.setdefault("env", {})[

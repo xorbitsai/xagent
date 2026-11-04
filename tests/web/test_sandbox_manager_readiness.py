@@ -54,6 +54,84 @@ async def test_readiness_skipped_when_backend_does_not_support_reconciliation():
 
 
 @pytest.mark.asyncio
+async def test_volume_subpath_readiness_rejects_legacy_backend():
+    with patch.dict(
+        "os.environ",
+        {"XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath"},
+        clear=True,
+    ):
+        with pytest.raises(
+            SandboxRuntimeConflictError, match="require.*Docker/spec-reconciliation"
+        ):
+            await check_sandbox_static_readiness(_ProbeStub(False))
+
+
+@pytest.mark.asyncio
+async def test_volume_subpath_readiness_requires_complete_configuration(tmp_path):
+    with patch.dict(
+        "os.environ",
+        {
+            "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(tmp_path),
+        },
+        clear=True,
+    ):
+        with pytest.raises(SandboxRuntimeConflictError, match="requires both"):
+            await check_sandbox_static_readiness(_ProbeStub(True))
+
+
+@pytest.mark.asyncio
+async def test_volume_subpath_readiness_rejects_invalid_volume_name(tmp_path):
+    with patch.dict(
+        "os.environ",
+        {
+            "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME": "invalid volume!",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(tmp_path),
+        },
+        clear=True,
+    ):
+        with pytest.raises(SandboxRuntimeConflictError, match="Invalid volume_subpath"):
+            await check_sandbox_static_readiness(_ProbeStub(True))
+
+
+@pytest.mark.asyncio
+async def test_volume_subpath_readiness_rejects_missing_root(tmp_path):
+    missing_root = tmp_path / "missing"
+    with patch.dict(
+        "os.environ",
+        {
+            "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(missing_root),
+        },
+        clear=True,
+    ):
+        with pytest.raises(SandboxRuntimeConflictError, match=repr(str(missing_root))):
+            await check_sandbox_static_readiness(_ProbeStub(True))
+
+
+@pytest.mark.asyncio
+async def test_volume_subpath_readiness_rejects_external_dir_outside_root(tmp_path):
+    volume_root = tmp_path / "workspaces"
+    volume_root.mkdir()
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    with patch.dict(
+        "os.environ",
+        {
+            "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+            "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(volume_root),
+            "XAGENT_EXTERNAL_UPLOAD_DIRS": str(external_dir),
+        },
+        clear=True,
+    ):
+        with pytest.raises(SandboxRuntimeConflictError, match=repr(str(external_dir))):
+            await check_sandbox_static_readiness(_ProbeStub(True))
+
+
+@pytest.mark.asyncio
 async def test_readiness_skipped_when_no_relevant_env_configured():
     """Code mounts alone are never checked when neither SANDBOX_VOLUMES nor
     XAGENT_EXTERNAL_UPLOAD_DIRS is configured -- the self-conflicting code

@@ -8,6 +8,7 @@ import abc
 import hashlib
 import os
 import posixpath
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -24,6 +25,7 @@ CodeType = Literal["python", "javascript"]
 SANDBOX_RUNTIME_UID = 1100
 SANDBOX_RUNTIME_GID = 1010
 MIN_SANDBOX_PIDS_LIMIT = 64
+_DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]+$")
 
 
 def normalize_sandbox_pids_limit(value: int | None) -> int | None:
@@ -240,6 +242,60 @@ class SandboxTemplate(BaseModel):
     )
 
 
+@dataclass(frozen=True, order=True)
+class SandboxMount:
+    """A structured mount whose security-relevant fields are explicit.
+
+    ``SandboxConfig.volumes`` remains the legacy bind-mount compatibility
+    surface.  Production named-volume workspaces use this type so a volume
+    name can never be mistaken for a host path and the Docker volume subpath
+    is covered by desired-state fingerprinting and runtime attestation.
+
+    Volume mounts deliberately require a non-empty ``subpath``. The Docker
+    adapter creates them with ``NoCopy``; Docker inspect does not report that
+    creation-only option, so runtime attestation covers the source, target,
+    mode and subpath instead. Mounting a volume root is not part of the sandbox
+    contract: only trusted application services, configured by the deployment,
+    receive that broader view.
+    """
+
+    type: Literal["bind", "volume"]
+    source: str
+    target: str
+    mode: Literal["ro", "rw"] = "rw"
+    subpath: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.type not in {"bind", "volume"}:
+            raise ValueError("mount type must be 'bind' or 'volume'")
+        if self.mode not in {"ro", "rw"}:
+            raise ValueError("mount mode must be 'ro' or 'rw'")
+        target = canonical_sandbox_path(self.target)
+        if not target.startswith("/") or target == "/":
+            raise ValueError("mount target must be a non-root absolute POSIX path")
+        object.__setattr__(self, "target", target)
+
+        if self.type == "bind":
+            source = canonical_sandbox_path(self.source)
+            if not source.startswith("/"):
+                raise ValueError("bind mount source must be an absolute POSIX path")
+            if self.subpath is not None:
+                raise ValueError("bind mounts do not support a volume subpath")
+            object.__setattr__(self, "source", source)
+            return
+
+        if not _DOCKER_VOLUME_NAME_RE.fullmatch(self.source):
+            raise ValueError("volume source must be a valid Docker volume name")
+        if self.subpath is None:
+            raise ValueError("sandbox volume mounts require a non-empty subpath")
+        if "\x00" in self.subpath or "\\" in self.subpath:
+            raise ValueError("volume subpath contains an invalid character")
+        parts = self.subpath.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            raise ValueError("volume subpath must be a canonical relative POSIX path")
+        object.__setattr__(self, "subpath", "/".join(parts))
+
+
 class SandboxConfig(BaseModel):
     """
     Configuration parameters for creating a sandbox.
@@ -269,6 +325,11 @@ class SandboxConfig(BaseModel):
     volumes: Optional[list[tuple[str, str, str]]] = Field(
         default=None,
         description="Volume mounts as (host_path, guest_path, mode). Mode: 'ro' (read-only) or 'rw' (read-write)",
+    )
+
+    mounts: Optional[list[SandboxMount]] = Field(
+        default=None,
+        description="Structured bind or named-volume subpath mounts",
     )
 
     network_isolated: Optional[bool] = Field(
@@ -342,7 +403,7 @@ class ExecResult(BaseModel):
 # untrustworthy for matching against a newly-desired spec. Not part of the
 # fingerprint itself (see ResolvedSandboxRuntimeSpec.fingerprint), so bumping
 # it does not change any existing fingerprint value.
-SPEC_CONTRACT_VERSION = 2
+SPEC_CONTRACT_VERSION = 3
 
 # Realizable bounds for a resolved spec, mirroring the `ge=` constraints
 # SandboxConfig declares for the same two fields. Kept here so an
@@ -420,6 +481,7 @@ class ResolvedSandboxRuntimeSpec:
     ports: tuple[tuple[int, int], ...]
     pids_limit: Optional[int] = None
     security_profile: Optional[str] = None
+    mounts: tuple[SandboxMount, ...] = ()
 
     def __post_init__(self) -> None:
         if self.template_type == "image":
@@ -470,6 +532,7 @@ class ResolvedSandboxRuntimeSpec:
         memory: Optional[int] = None,
         env: Optional[Mapping[str, str]] = None,
         volumes: Optional[Sequence[tuple[str, str, str]]] = None,
+        mounts: Optional[Sequence[SandboxMount]] = None,
         network_isolated: bool = False,
         ports: Optional[Sequence[tuple[int, int]]] = None,
         pids_limit: Optional[int] = None,
@@ -503,6 +566,7 @@ class ResolvedSandboxRuntimeSpec:
         normalized_ports = tuple(
             sorted({(host, guest) for host, guest in (ports or [])})
         )
+        normalized_mounts = tuple(sorted(set(mounts or ())))
         return cls(
             template_type=template_type,
             image=image,
@@ -518,6 +582,7 @@ class ResolvedSandboxRuntimeSpec:
             ports=normalized_ports,
             pids_limit=pids_limit,
             security_profile=security_profile,
+            mounts=normalized_mounts,
         )
 
     def to_backend_config(self) -> tuple["SandboxTemplate", "SandboxConfig"]:
@@ -537,6 +602,7 @@ class ResolvedSandboxRuntimeSpec:
             memory=self.memory,
             env=dict(self.env) or None,
             volumes=[tuple(volume) for volume in self.volumes] or None,
+            mounts=list(self.mounts) or None,
             network_isolated=self.network_isolated,
             ports=[tuple(port) for port in self.ports] or None,
             pids_limit=self.pids_limit,
@@ -565,6 +631,7 @@ class ResolvedSandboxRuntimeSpec:
                 self.ports,
                 self.pids_limit,
                 self.security_profile,
+                self.mounts,
             )
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -576,6 +643,7 @@ class ResolvedSandboxRuntimeSpec:
         return (
             f"{type(self).__name__}(fingerprint={self.fingerprint()[:12]}, "
             f"env_count={len(self.env)}, volumes_count={len(self.volumes)}, "
+            f"mounts_count={len(self.mounts)}, "
             f"ports_count={len(self.ports)})"
         )
 
@@ -617,6 +685,7 @@ class ObservedRuntimeFacts:
     created_at: Optional[str]
     working_dir: Optional[str]
     raw_pids_limit: Optional[int]
+    mounts: tuple[SandboxMount, ...] = ()
 
 
 @dataclass(eq=False)

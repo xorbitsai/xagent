@@ -12,6 +12,7 @@ import pytest
 from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.sandbox.base import (
     SandboxConfig,
+    SandboxContractError,
     SandboxInfo,
     SandboxMountIntent,
     SandboxRuntimeConflictError,
@@ -612,6 +613,124 @@ class TestSandboxConfigParsing:
 
         assert config.env == {"KEY": "val"}
         assert config.volumes == [("/host", "/container", "ro")]
+
+    def test_volume_subpath_mode_builds_only_the_user_workspace_mount(self, tmp_path):
+        uploads = tmp_path / "uploads"
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_UPLOADS_DIR": str(uploads),
+                "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(uploads),
+            },
+            clear=False,
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            spec = manager._build_runtime_spec("user", "42")
+
+        assert len(spec.mounts) == 1
+        mount = spec.mounts[0]
+        assert mount.type == "volume"
+        assert mount.source == "xagent-stage-workspaces"
+        assert mount.target == str(uploads / "user_42")
+        assert mount.subpath == "user_42"
+        assert all(volume[0] != str(uploads / "user_42") for volume in spec.volumes)
+
+    def test_volume_subpath_mode_requires_complete_configuration(self, tmp_path):
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_UPLOADS_DIR": str(tmp_path / "uploads"),
+                "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME": "",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": "",
+            },
+            clear=False,
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            with pytest.raises(SandboxContractError, match="requires both"):
+                manager._build_runtime_spec("user", "42")
+
+    def test_volume_subpath_mode_rejects_workspace_outside_volume_root(self, tmp_path):
+        uploads = tmp_path / "uploads"
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_UPLOADS_DIR": str(uploads),
+                "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(uploads),
+            },
+            clear=False,
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            intent = SandboxMountIntent(mount_root=str(tmp_path / "outside"))
+            with pytest.raises(SandboxContractError, match="must be below"):
+                manager._build_runtime_spec("task", "9", mount_intent=intent)
+
+    def test_volume_subpath_mode_rejects_missing_extra_mount(self, tmp_path):
+        volume_root = tmp_path / "workspaces"
+        mount_root = volume_root / "user_1" / "task_2"
+        mount_root.mkdir(parents=True)
+        missing_extra = volume_root / "shared" / "missing"
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(volume_root),
+            },
+            clear=True,
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            intent = SandboxMountIntent(
+                mount_root=str(mount_root), extra_mounts=(str(missing_extra),)
+            )
+
+            with pytest.raises(SandboxContractError, match=repr(str(missing_extra))):
+                manager._build_runtime_spec("task", "9", mount_intent=intent)
+
+    def test_volume_subpath_mode_resolves_in_volume_symlink_to_physical_subpath(
+        self, tmp_path
+    ):
+        volume_root = tmp_path / "workspaces"
+        physical_workspace = volume_root / "shared" / "kb"
+        physical_workspace.mkdir(parents=True)
+        aliases = volume_root / "aliases"
+        aliases.mkdir()
+        aliased_workspace = aliases / "kb"
+        aliased_workspace.symlink_to(physical_workspace, target_is_directory=True)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(volume_root),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            manager._backend_probe = True
+            intent = SandboxMountIntent(mount_root=str(aliased_workspace))
+            spec = manager._build_runtime_spec("task", "9", mount_intent=intent)
+
+            assert len(spec.mounts) == 1
+            assert spec.mounts[0].target == str(physical_workspace)
+            assert spec.mounts[0].subpath == "shared/kb"
+            assert manager.workspace_dirs_are_host_mounted(
+                "task",
+                "9",
+                intent,
+                [str(physical_workspace / "output")],
+            )
 
 
 class TestSandboxLifecycleConfig:

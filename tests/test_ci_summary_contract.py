@@ -113,6 +113,7 @@ _CACHE_MISS = "(needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')"
 # predicates is false on some reachable run, so one that is right on a setup step
 # silently skips a workload step (PR #1848 review).
 STEP_GUARD_EXTRAS = {
+    ("pytest-fast", "Free GitHub-hosted runner disk space"): ("(matrix.name == 'web')"),
     ("pytest-fast", "Pre-pull the sandbox image"): "(matrix.name == 'web')",
     ("pytest-fast", "Run privileged writable sandbox tests"): (
         "(matrix.name == 'web')"

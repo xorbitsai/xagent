@@ -27,6 +27,7 @@ from xagent.sandbox.base import (
     SANDBOX_RUNTIME_UID,
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
+    SandboxMount,
     SandboxRuntimeConflictError,
     SandboxTemplate,
     SpecVerdict,
@@ -245,6 +246,39 @@ def test_inspect_treats_unrealizable_pids_limit_as_unset(raw_pids_limit) -> None
     assert info.config.pids_limit is None
 
 
+def test_inspect_recovers_named_volume_subpath_mount() -> None:
+    container = _labeled_container({})
+    container.attrs["HostConfig"]["Mounts"] = [
+        {
+            "Type": "volume",
+            "Source": "xagent-stage-workspaces",
+            "Target": "/root/.xagent/uploads/user_1",
+            "ReadOnly": False,
+            "VolumeOptions": {"NoCopy": True, "Subpath": "user_1"},
+        }
+    ]
+    container.attrs["Mounts"] = [
+        {
+            "Type": "volume",
+            "Name": "xagent-stage-workspaces",
+            "Destination": "/root/.xagent/uploads/user_1",
+            "RW": True,
+        }
+    ]
+
+    info = _parse_container_config(container)
+
+    assert info.config.mounts == [
+        SandboxMount(
+            type="volume",
+            source="xagent-stage-workspaces",
+            target="/root/.xagent/uploads/user_1",
+            subpath="user_1",
+        )
+    ]
+    assert info.config.volumes is None
+
+
 @pytest.fixture(scope="module")
 def event_loop():
     loop = asyncio.new_event_loop()
@@ -321,6 +355,7 @@ class _FakeDockerClient:
 
     def __init__(self, containers=()):
         self.containers = _FakeContainerCollection(containers)
+        self.api = SimpleNamespace(_version="1.45")
         self.networks = SimpleNamespace(
             get=lambda name: SimpleNamespace(
                 name=name,
@@ -340,6 +375,9 @@ class _FakeDockerClient:
     def info(self):
         return {"SecurityOptions": []}
 
+    def version(self):
+        return {"Version": "26.1.4", "ApiVersion": "1.45"}
+
 
 class _FailingStartContainer:
     """Container stub whose start fails before sandbox initialization finishes."""
@@ -349,6 +387,22 @@ class _FailingStartContainer:
 
     def start(self) -> None:
         raise RuntimeError("port conflict")
+
+    def remove(self, force: bool = False) -> None:
+        self.remove_calls.append(force)
+
+
+class _PostStartContainer:
+    """Container stub used to exercise failures while observing a new runtime."""
+
+    def __init__(self) -> None:
+        self.remove_calls: list[bool] = []
+
+    def start(self) -> None:
+        return None
+
+    def reload(self) -> None:
+        return None
 
     def remove(self, force: bool = False) -> None:
         self.remove_calls.append(force)
@@ -390,6 +444,103 @@ class TestDockerSandboxServiceFailures:
         assert len(created_container.remove_calls) == 1
         assert created_container.remove_calls[0] is True
 
+    @pytest.mark.asyncio
+    async def test_get_or_create_removes_container_when_parse_fails(self, monkeypatch):
+        created_container = _PostStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        def reject_parse(_container):
+            raise RuntimeError("malformed runtime config")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module, "_parse_container_config", reject_parse
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="malformed runtime config"):
+            await service.get_or_create("parse-failure")
+
+        assert created_container.remove_calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_create_removes_container_when_inspection_fails(self, monkeypatch):
+        created_container = _PostStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        def reject_inspection(_container):
+            raise RuntimeError("malformed inspection")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module, "_build_inspection", reject_inspection
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="malformed inspection"):
+            await service.create(
+                "inspection-failure",
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(),
+            )
+
+        assert created_container.remove_calls == [True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["get_or_create", "create"])
+    async def test_named_volume_subpath_rejects_unsupported_daemon_before_create(
+        self, monkeypatch, route
+    ):
+        client = _FakeDockerClient()
+        client.version = lambda: {"Version": "25.0.18", "ApiVersion": "1.45"}
+        create_calls = 0
+
+        async def fake_create_container(*args, **kwargs):
+            nonlocal create_calls
+            create_calls += 1
+            raise AssertionError("container creation must not be reached")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        config = SandboxConfig(
+            mounts=[
+                SandboxMount(
+                    type="volume",
+                    source="workspaces",
+                    target="/home/sandbox/workspace",
+                    subpath="user_1/task_2",
+                )
+            ]
+        )
+
+        with pytest.raises(SandboxRuntimeConflictError, match="Engine >= 26.0"):
+            if route == "get_or_create":
+                await service.get_or_create("unsupported", config=config)
+            else:
+                await service.create(
+                    "unsupported",
+                    SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                    config,
+                )
+
+        assert create_calls == 0
+
     @pytest.mark.parametrize("security_options", [[], None])
     def test_host_workspace_readiness_probe_succeeds_and_cleans_up(
         self, tmp_path, monkeypatch, security_options
@@ -422,6 +573,49 @@ class TestDockerSandboxServiceFailures:
         with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
             service.validate_host_workspace_access()
         assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    @pytest.mark.parametrize(
+        ("version", "negotiated_api"),
+        [
+            ({"Version": "25.0.18", "ApiVersion": "1.45"}, "1.45"),
+            ({"Version": "26.1.4", "ApiVersion": "1.45"}, "1.44"),
+            ({}, None),
+        ],
+    )
+    def test_volume_subpath_readiness_rejects_unsupported_daemon(
+        self, tmp_path, monkeypatch, version, negotiated_api
+    ):
+        client = _FakeDockerClient()
+        client.version = lambda: version
+        client.api._version = negotiated_api
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE", "volume_subpath")
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="Engine >= 26.0"):
+            service.validate_host_workspace_access()
+
+    def test_volume_subpath_capability_probe_is_cached(self):
+        client = _FakeDockerClient()
+        calls = 0
+
+        def version():
+            nonlocal calls
+            calls += 1
+            return {"Version": "26.1.4", "ApiVersion": "1.45"}
+
+        client.version = version
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+
+        service._require_volume_subpath_support()
+        service._require_volume_subpath_support()
+
+        assert calls == 1
 
     def test_host_workspace_readiness_wraps_upload_root_creation_failure(
         self, tmp_path, monkeypatch
@@ -1083,6 +1277,45 @@ class TestNamespaceIsolation:
         assert "network" not in captured
 
     @pytest.mark.asyncio
+    async def test_create_container_uses_nocopy_volume_subpath_mount(self, monkeypatch):
+        async def _noop_ensure_image(_client, _image):
+            return None
+
+        monkeypatch.setattr(docker_sandbox_module, "_ensure_image", _noop_ensure_image)
+        client, captured = _capture_create_client()
+        mount = SandboxMount(
+            type="volume",
+            source="xagent-stage-workspaces",
+            target="/root/.xagent/uploads/user_1",
+            subpath="user_1/task_2",
+        )
+
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(mounts=[mount]),
+            "alpha-sandbox-egress",
+        )
+
+        assert captured["volumes"] is None
+        assert captured["mounts"] == [
+            {
+                "Target": "/root/.xagent/uploads/user_1",
+                "Source": "xagent-stage-workspaces",
+                "Type": "volume",
+                "ReadOnly": False,
+                "VolumeOptions": {
+                    "NoCopy": True,
+                    "Subpath": "user_1/task_2",
+                },
+            }
+        ]
+        assert "/root" in captured["tmpfs"]
+
+    @pytest.mark.asyncio
     async def test_create_defaults_runtime_security_profile(self, monkeypatch):
         service = DockerSandboxService(
             MemDockerStore(), namespace="test", client=_FakeDockerClient()
@@ -1396,6 +1629,67 @@ class TestDockerSandboxService:
                 await service.delete(name)
             except Exception:
                 pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_named_volume_subpath_is_real_and_attested(self, docker_service):
+        client = docker_service._client
+        version = client.version()
+        engine = tuple(int(part) for part in version["Version"].split(".")[:2])
+        api = tuple(int(part) for part in version["ApiVersion"].split(".")[:2])
+        if engine < (26, 0) or api < (1, 45):
+            pytest.skip("Docker Engine 26/API 1.45 required for volume subpath")
+
+        suffix = uuid.uuid4().hex[:10]
+        volume_name = f"xagent-test-workspaces-{suffix}"
+        sandbox_name = f"volume-subpath-{suffix}"
+        volume = client.volumes.create(name=volume_name)
+        try:
+            await docker_sandbox_module._ensure_image(client, DEFAULT_SANDBOX_IMAGE)
+            await asyncio.to_thread(
+                client.containers.run,
+                DEFAULT_SANDBOX_IMAGE,
+                [
+                    "sh",
+                    "-c",
+                    "mkdir -p /seed/user_1/task_2 /seed/user_1/other && "
+                    "printf sibling > /seed/user_1/other/secret.txt && "
+                    "chown -R 1100:1010 /seed/user_1",
+                ],
+                user="0:0",
+                remove=True,
+                volumes={volume_name: {"bind": "/seed", "mode": "rw"}},
+            )
+            mount = SandboxMount(
+                type="volume",
+                source=volume_name,
+                target="/home/sandbox/workspace",
+                subpath="user_1/task_2",
+            )
+            sandbox = await docker_service.create(
+                sandbox_name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(mounts=[mount]),
+            )
+            await sandbox.write_file(
+                "volume-subpath-ok", "/home/sandbox/workspace/probe.txt"
+            )
+            assert (
+                await sandbox.read_file("/home/sandbox/workspace/probe.txt")
+                == "volume-subpath-ok"
+            )
+            sibling_probe = await sandbox.exec(
+                "test",
+                "!",
+                "-e",
+                "/home/sandbox/workspace/user_1/other/secret.txt",
+            )
+            assert sibling_probe.exit_code == 0
+            inspection = await docker_service.inspect(sandbox_name)
+            assert inspection is not None
+            assert inspection.facts.mounts == (mount,)
+        finally:
+            await docker_service.delete(sandbox_name)
+            await asyncio.to_thread(volume.remove, force=True)
 
     @pytest.mark.asyncio(loop_scope="module")
     async def test_get_or_create_reuse(self, docker_service):

@@ -17,6 +17,7 @@ import stat
 import tarfile
 import tempfile
 import textwrap
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -31,6 +32,8 @@ from typing import (
     cast,
 )
 
+from docker.types import Mount as DockerMount
+
 from docker import errors, from_env
 
 from ..config import (
@@ -38,6 +41,7 @@ from ..config import (
     get_sandbox_namespace,
     get_sandbox_network,
     get_sandbox_pids_limit,
+    get_sandbox_workspace_mount_mode,
     get_uploads_dir,
     validate_sandbox_namespace,
     validate_sandbox_network,
@@ -55,6 +59,7 @@ from .base import (
     SandboxConfig,
     SandboxInfo,
     SandboxInspection,
+    SandboxMount,
     SandboxNotFoundError,
     SandboxRuntimeConflictError,
     SandboxService,
@@ -99,6 +104,11 @@ _SANDBOX_ARCHIVE_PAX_VERSION_KEY = "Xagent.archive.version"
 _SANDBOX_ARCHIVE_PAX_VERSION = "1"
 _MAX_SANDBOX_ARCHIVE_NAME_BYTES = 255
 _MAX_SANDBOX_ARCHIVE_FILE_SIZE = 8**11
+
+
+def _version_at_least(value: object, minimum: tuple[int, int]) -> bool:
+    match = re.match(r"^(\d+)\.(\d+)", str(value or ""))
+    return bool(match and tuple(map(int, match.groups())) >= minimum)
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -288,6 +298,57 @@ def _get_state(status: str | None) -> str:
     return "unknown"
 
 
+def _parse_mount_facts(
+    attrs: dict[str, Any],
+) -> tuple[list[tuple[str, str, str]], list[SandboxMount]]:
+    """Read legacy binds and structured mounts from Docker inspect data.
+
+    Docker reports effective mount points in top-level ``Mounts``, but keeps
+    ``VolumeOptions.Subpath`` only in ``HostConfig.Mounts``.  The latter is
+    therefore authoritative for structured mounts.  Binds represented there
+    are excluded from the legacy list so one mount is not compared twice.
+    """
+    host_config = cast(dict[str, Any], attrs.get("HostConfig") or {})
+    structured: list[SandboxMount] = []
+    structured_keys: set[tuple[str, str]] = set()
+    for raw in cast(list[dict[str, Any]], host_config.get("Mounts") or []):
+        mount_type = str(raw.get("Type") or "")
+        if mount_type not in {"bind", "volume"}:
+            raise SandboxRuntimeConflictError(
+                f"Unsupported structured sandbox mount type: {mount_type!r}"
+            )
+        source = str(raw.get("Source") or "")
+        target = str(raw.get("Target") or "")
+        volume_options = cast(dict[str, Any], raw.get("VolumeOptions") or {})
+        subpath = volume_options.get("Subpath")
+        try:
+            mount = SandboxMount(
+                type=cast(Any, mount_type),
+                source=source,
+                target=target,
+                mode=cast(Any, "ro" if bool(raw.get("ReadOnly")) else "rw"),
+                subpath=str(subpath) if subpath is not None else None,
+            )
+        except ValueError as exc:
+            raise SandboxRuntimeConflictError(
+                "Docker reported an invalid structured sandbox mount"
+            ) from exc
+        structured.append(mount)
+        structured_keys.add((mount.source, mount.target))
+
+    volumes: list[tuple[str, str, str]] = []
+    for raw in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
+        if raw.get("Type") != "bind":
+            continue
+        source = str(raw.get("Source") or "")
+        target = str(raw.get("Destination") or "")
+        if not source or not target or (source, target) in structured_keys:
+            continue
+        mode = "ro" if bool(raw.get("RW")) is False else "rw"
+        volumes.append((source, target, mode))
+    return volumes, structured
+
+
 def _parse_container_config(container: Container) -> SandboxInfo:
     """Reconstruct SandboxInfo from Docker inspect data."""
     attrs = cast(dict[str, Any], container.attrs)
@@ -302,16 +363,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
             key, value = item.split("=", 1)
             env_map[key] = value
 
-    volumes: list[tuple[str, str, str]] = []
-    # Only bind mounts
-    for mount in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
-        if mount.get("Type") != "bind":
-            continue
-        source = str(mount.get("Source") or "")
-        target = str(mount.get("Destination") or "")
-        mode = "ro" if bool(mount.get("RW")) is False else "rw"
-        if source and target:
-            volumes.append((source, target, mode))
+    volumes, mounts = _parse_mount_facts(attrs)
 
     ports: list[tuple[int, int]] = []
     port_bindings = cast(
@@ -348,6 +400,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
         pids_limit=pids_limit,
         env=env_map or None,
         volumes=volumes or None,
+        mounts=mounts or None,
         network_isolated=bool(
             attrs.get("NetworkSettings", {}).get("Networks") == {}
             or host_config.get("NetworkMode") == "none"
@@ -400,15 +453,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
             key, value = item.split("=", 1)
             env_map[key] = value
 
-    volumes: list[tuple[str, str, str]] = []
-    for mount in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
-        if mount.get("Type") != "bind":
-            continue
-        source = str(mount.get("Source") or "")
-        target = str(mount.get("Destination") or "")
-        mode = "ro" if bool(mount.get("RW")) is False else "rw"
-        if source and target:
-            volumes.append((source, target, mode))
+    volumes, mounts = _parse_mount_facts(attrs)
 
     ports: list[tuple[int, int]] = []
     port_bindings = cast(
@@ -446,6 +491,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
         labels=labels,
         created_at=cast(Optional[str], attrs.get("Created")),
         working_dir=cast(Optional[str], config_data.get("WorkingDir")),
+        mounts=tuple(mounts),
     )
     return SandboxInspection(
         state="running" if _get_state(raw_status) == "running" else "stopped",
@@ -477,6 +523,7 @@ def _attestation_label(value: Optional[str]) -> Optional[str]:
 
 def _check_no_conflicting_volumes(
     volumes: Optional[list[tuple[str, str, str]]],
+    mounts: Optional[list[SandboxMount]] = None,
 ) -> None:
     """Reject desired volumes that collide on either side of the mount.
 
@@ -500,11 +547,11 @@ def _check_no_conflicting_volumes(
     uses) so equivalent-but-differently-spelled paths are treated as the
     same key on both sides.
     """
-    if not volumes:
+    if not volumes and not mounts:
         return
     seen_by_host: dict[str, tuple[str, str]] = {}
-    seen_by_guest: dict[str, tuple[str, str]] = {}
-    for host_path, guest_path, mode in volumes:
+    seen_by_guest: dict[str, tuple[str, ...]] = {}
+    for host_path, guest_path, mode in volumes or []:
         normalized_host = canonical_sandbox_path(host_path)
         normalized_guest = canonical_sandbox_path(guest_path)
 
@@ -525,6 +572,20 @@ def _check_no_conflicting_volumes(
                 f"{normalized_guest!r}: {prior_for_guest} vs {guest_key}"
             )
         seen_by_guest[normalized_guest] = guest_key
+
+    for mount in mounts or []:
+        structured_guest_key = (
+            mount.type,
+            mount.source,
+            mount.mode,
+            mount.subpath or "",
+        )
+        prior_for_guest = seen_by_guest.get(mount.target)
+        if prior_for_guest is not None and prior_for_guest != structured_guest_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting desired mounts for guest path {mount.target!r}"
+            )
+        seen_by_guest[mount.target] = structured_guest_key
 
 
 def _check_no_conflicting_ports(
@@ -628,6 +689,8 @@ def _find_publish_mismatches(
         mismatches.append("image")
     if set(facts.volumes) != set(desired.volumes):
         mismatches.append("volumes")
+    if set(facts.mounts) != set(desired.mounts):
+        mismatches.append("mounts")
     if set(facts.ports) != set(desired.ports):
         mismatches.append("ports")
     if facts.working_dir != desired.working_dir:
@@ -1209,6 +1272,7 @@ async def _create_container(
     deployment's owner. This function is the single owner of their value
     for every container it creates."""
     await _ensure_image(client, image)
+    _check_no_conflicting_volumes(config.volumes, config.mounts)
 
     volumes: dict[str, dict[str, str]] | None = None
     if config.volumes:
@@ -1216,6 +1280,20 @@ async def _create_container(
             host_path: {"bind": guest_path, "mode": mode}
             for host_path, guest_path, mode in config.volumes
         }
+
+    mounts: list[DockerMount] | None = None
+    if config.mounts:
+        mounts = [
+            DockerMount(
+                target=mount.target,
+                source=mount.source,
+                type=mount.type,
+                read_only=mount.mode == "ro",
+                no_copy=mount.type == "volume",
+                subpath=mount.subpath,
+            )
+            for mount in sorted(set(config.mounts))
+        ]
 
     ports: dict[str, int] | None = None
     if config.ports:
@@ -1254,6 +1332,7 @@ async def _create_container(
         # intentionally configured another value.
         "environment": {"HOME": "/home/sandbox", **(config.env or {})},
         "volumes": volumes,
+        "mounts": mounts,
         "ports": ports,
         "nano_cpus": int((config.cpus or 1) * _CPU_NANOS),
         "mem_limit": (config.memory or 512) * 1024 * 1024,
@@ -1273,6 +1352,7 @@ async def _create_container(
     if effective_pids_limit is not None:
         kwargs["pids_limit"] = effective_pids_limit
     guest_paths = [guest for _, guest, _ in (config.volumes or [])]
+    guest_paths.extend(mount.target for mount in (config.mounts or []))
     if any(path.startswith("/root/") for path in guest_paths):
         # The stock image keeps /root at 0700. A private tmpfs supplies only
         # traversable parents for nested workspace bind mounts; it exposes no
@@ -1338,6 +1418,11 @@ class DockerSandboxService(SandboxService):
         self._client = client or _create_docker_client()
         self._client.ping()
         self._store = store
+        # DockerClient.version() performs a blocking daemon request. Cache the
+        # result behind a thread lock so concurrent async creates neither block
+        # the event loop nor repeat the capability probe.
+        self._volume_subpath_versions: tuple[str | None, str | None] | None = None
+        self._volume_subpath_versions_lock = threading.Lock()
         # Per-name lifecycle locks, one entry per sandbox name currently held
         # or waited on. The registry evicts unreferenced entries so it does
         # not grow with every sandbox name ever seen (names such as
@@ -1362,6 +1447,37 @@ class DockerSandboxService(SandboxService):
         a container name).
         """
         return self._locks.locked(name)
+
+    def _require_volume_subpath_support(self) -> None:
+        """Fail before create when the daemon cannot enforce volume subpaths."""
+        with self._volume_subpath_versions_lock:
+            if self._volume_subpath_versions is None:
+                try:
+                    daemon_version = self._client.version()
+                    api_client = getattr(self._client, "api", None)
+                    negotiated_api = getattr(api_client, "_version", None)
+                except Exception as exc:
+                    raise SandboxRuntimeConflictError(
+                        "Cannot verify Docker Engine support for volume subpaths"
+                    ) from exc
+                self._volume_subpath_versions = (
+                    daemon_version.get("Version"),
+                    negotiated_api,
+                )
+            engine_version, negotiated_api = self._volume_subpath_versions
+
+        if not _version_at_least(engine_version, (26, 0)) or not (
+            _version_at_least(negotiated_api, (1, 45))
+        ):
+            raise SandboxRuntimeConflictError(
+                "Named-volume subpath mounts require Docker Engine >= 26.0 and "
+                "a negotiated API >= 1.45; bind fallback is intentionally disabled"
+            )
+
+    async def _validate_structured_mount_support(self, config: SandboxConfig) -> None:
+        """Validate daemon features required by an explicit sandbox config."""
+        if any(mount.type == "volume" for mount in config.mounts or ()):
+            await asyncio.to_thread(self._require_volume_subpath_support)
 
     @staticmethod
     async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -1474,6 +1590,8 @@ class DockerSandboxService(SandboxService):
         config: Optional[SandboxConfig] = None,
     ) -> DockerSandbox:
         """Get, resume, or create a Docker-backed sandbox."""
+        if config is not None:
+            await self._validate_structured_mount_support(config)
         async with self._named_lock(name):
             control = self._get_live_control(name)
 
@@ -1517,11 +1635,16 @@ class DockerSandboxService(SandboxService):
             )
             try:
                 await asyncio.to_thread(container.start)
-            except Exception:
-                await asyncio.to_thread(container.remove, force=True)
-                raise
-            await asyncio.to_thread(container.reload)
-            runtime_info = _parse_container_config(container)
+                await asyncio.to_thread(container.reload)
+                runtime_info = _parse_container_config(container)
+            except BaseException as create_exc:
+                try:
+                    await self._await_shielded(
+                        asyncio.to_thread(container.remove, force=True)
+                    )
+                except Exception as remove_exc:
+                    raise create_exc from remove_exc
+                raise create_exc
             stored_info = SandboxInfo(
                 name=name,
                 state=runtime_info.state,
@@ -1628,6 +1751,7 @@ class DockerSandboxService(SandboxService):
         inspect-then-create sequence: that window belongs to the caller's
         critical section (see ``_named_lock``).
         """
+        await self._validate_structured_mount_support(config)
         async with self._named_lock(name):
             existing = await self._find_container(name)
             if existing is not None:
@@ -1646,7 +1770,7 @@ class DockerSandboxService(SandboxService):
                 resolved_image = template.image or DEFAULT_SANDBOX_IMAGE
                 spec_image, spec_snapshot_id = resolved_image, None
 
-            _check_no_conflicting_volumes(config.volumes)
+            _check_no_conflicting_volumes(config.volumes, config.mounts)
             _check_no_conflicting_ports(config.ports)
 
             desired = ResolvedSandboxRuntimeSpec.from_parts(
@@ -1658,6 +1782,7 @@ class DockerSandboxService(SandboxService):
                 memory=config.memory,
                 env=config.env,
                 volumes=config.volumes,
+                mounts=config.mounts,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
                 pids_limit=_effective_pids_limit(config),
@@ -1697,33 +1822,34 @@ class DockerSandboxService(SandboxService):
 
             try:
                 await asyncio.to_thread(container.start)
-            except BaseException as start_exc:
+                await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                mismatches = _find_publish_mismatches(
+                    desired, resolved_image, inspection, self._network
+                )
+            except BaseException as observation_exc:
                 # Compensate with a raw container removal, never
                 # self.delete(): delete() acquires this same _named_lock
                 # entry, so calling it here would self-deadlock. The
-                # original start failure (including a cancellation) is
+                # original creation/observation failure (including a
+                # cancellation) is
                 # preserved as the raised exception regardless of whether
                 # the compensating remove itself succeeds. The remove runs
                 # through _await_shielded so that a cancellation landing
                 # here (e.g. a second cancel on top of the one that failed
-                # start) cannot cut the remove short and let this method's
+                # observation) cannot cut the remove short and let this method's
                 # `_named_lock(name)` release while it is still in flight —
                 # that would let a same-name create() race an in-flight
                 # remove. If such a cancellation occurs, it is re-raised
-                # once the remove settles, taking priority over start_exc.
+                # once the remove settles, taking priority over the original
+                # observation failure.
                 try:
                     await self._await_shielded(
                         asyncio.to_thread(container.remove, force=True)
                     )
                 except Exception as remove_exc:
-                    raise start_exc from remove_exc
-                raise start_exc
-
-            await asyncio.to_thread(container.reload)
-            inspection = _build_inspection(container)
-            mismatches = _find_publish_mismatches(
-                desired, resolved_image, inspection, self._network
-            )
+                    raise observation_exc from remove_exc
+                raise observation_exc
             if mismatches:
                 # A container whose observed facts disagree with what we
                 # asked for must never be published: remove it directly
@@ -2023,6 +2149,8 @@ class DockerSandboxService(SandboxService):
                 "docker-socket-proxy is in use, allow the /info endpoint "
                 "(for Tecnativa/docker-socket-proxy, set INFO=1)."
             ) from exc
+        if get_sandbox_workspace_mount_mode() == "volume_subpath":
+            self._require_volume_subpath_support()
         try:
             sandbox_network = self._client.networks.get(self._network)
         except errors.NotFound as exc:

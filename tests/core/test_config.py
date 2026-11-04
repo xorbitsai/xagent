@@ -90,6 +90,9 @@ from xagent.config import (
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
+    SANDBOX_WORKSPACE_MOUNT_MODE,
+    SANDBOX_WORKSPACE_VOLUME,
+    SANDBOX_WORKSPACE_VOLUME_ROOT,
     SLACK_APP_TOKEN,
     SLACK_CLIENT_ID,
     SLACK_CLIENT_SECRET,
@@ -203,6 +206,9 @@ from xagent.config import (
     get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_sandbox_workspace_mount_mode,
+    get_sandbox_workspace_volume,
+    get_sandbox_workspace_volume_root,
     get_slack_app_token,
     get_slack_client_id,
     get_slack_client_secret,
@@ -2178,6 +2184,40 @@ class TestGetSandboxNetwork:
     def test_direct_validation_is_fail_closed(self):
         with pytest.raises(ValueError, match="Invalid sandbox network"):
             validate_sandbox_network("")
+
+
+class TestSandboxWorkspaceMountConfig:
+    def test_mount_mode_defaults_to_bind(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_WORKSPACE_MOUNT_MODE, raising=False)
+        assert get_sandbox_workspace_mount_mode() == "bind"
+
+    def test_volume_subpath_mode_and_settings(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_MOUNT_MODE, "volume_subpath")
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME, "xagent-stage-workspaces")
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME_ROOT, "/root/.xagent/uploads")
+        assert get_sandbox_workspace_mount_mode() == "volume_subpath"
+        assert get_sandbox_workspace_volume() == "xagent-stage-workspaces"
+        assert get_sandbox_workspace_volume_root() == Path("/root/.xagent/uploads")
+
+    @pytest.mark.parametrize("value", ["", "volume", "host", "named-volume"])
+    def test_invalid_mount_mode_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_MOUNT_MODE, value)
+        if value == "":
+            assert get_sandbox_workspace_mount_mode() == "bind"
+        else:
+            with pytest.raises(ValueError, match=SANDBOX_WORKSPACE_MOUNT_MODE):
+                get_sandbox_workspace_mount_mode()
+
+    @pytest.mark.parametrize("value", ["/host/path", "bad volume", "a"])
+    def test_invalid_volume_name_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME, value)
+        with pytest.raises(ValueError, match="Docker volume name"):
+            get_sandbox_workspace_volume()
+
+    def test_relative_volume_root_is_rejected(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME_ROOT, "uploads")
+        with pytest.raises(ValueError, match="absolute path"):
+            get_sandbox_workspace_volume_root()
 
 
 class TestGetBoxliteHomeDir:

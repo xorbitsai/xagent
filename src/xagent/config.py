@@ -208,6 +208,9 @@ SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
 SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
 SANDBOX_NETWORK = "XAGENT_SANDBOX_NETWORK"
+SANDBOX_WORKSPACE_MOUNT_MODE = "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE"
+SANDBOX_WORKSPACE_VOLUME = "XAGENT_SANDBOX_WORKSPACE_VOLUME"
+SANDBOX_WORKSPACE_VOLUME_ROOT = "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
@@ -4184,6 +4187,43 @@ def get_sandbox_network() -> str | None:
         return None
     validate_sandbox_network(raw)
     return raw
+
+
+def get_sandbox_workspace_mount_mode() -> Literal["bind", "volume_subpath"]:
+    """Return the workspace mount mechanism used for sandbox containers."""
+    value = os.getenv(SANDBOX_WORKSPACE_MOUNT_MODE, "").strip().lower() or "bind"
+    if value not in {"bind", "volume_subpath"}:
+        raise ValueError(
+            f"{SANDBOX_WORKSPACE_MOUNT_MODE} must be 'bind' or "
+            f"'volume_subpath', got {value!r}"
+        )
+    return value  # type: ignore[return-value]
+
+
+_DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]+$")
+
+
+def get_sandbox_workspace_volume() -> str | None:
+    """Return the deployment-owned workspace volume name, when configured."""
+    value = os.getenv(SANDBOX_WORKSPACE_VOLUME, "").strip()
+    if not value:
+        return None
+    if not _DOCKER_VOLUME_NAME_RE.fullmatch(value):
+        raise ValueError(
+            f"{SANDBOX_WORKSPACE_VOLUME} must be a valid Docker volume name"
+        )
+    return value
+
+
+def get_sandbox_workspace_volume_root() -> Path | None:
+    """Return the backend path at which the workspace volume root is mounted."""
+    value = os.getenv(SANDBOX_WORKSPACE_VOLUME_ROOT, "").strip()
+    if not value:
+        return None
+    root = Path(os.path.expandvars(value)).expanduser()
+    if not root.is_absolute():
+        raise ValueError(f"{SANDBOX_WORKSPACE_VOLUME_ROOT} must be an absolute path")
+    return root
 
 
 def get_sandbox_worker_id() -> str | None:

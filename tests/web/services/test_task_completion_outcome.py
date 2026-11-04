@@ -3,6 +3,9 @@
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.chat_message import TaskChatMessage
@@ -31,6 +34,16 @@ from xagent.web.services.task_execution_controller import (
     control_state_for_status,
     task_control_snapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_rollout_policy(monkeypatch):
+    """Finalizers consult the rollout policy, which only a host process's
+    startup installs."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode="legacy", shared_task_execution=False
+    )
+
 
 engine = engine_fixture
 task_id = task_id_fixture

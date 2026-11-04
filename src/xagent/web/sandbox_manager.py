@@ -1301,10 +1301,8 @@ class SandboxManager:
                 "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
             )
 
-        canonical_root = Path(
-            canonical_sandbox_path(str(absolute_backend_mount_path(volume_root)))
-        )
-        if Path(os.path.realpath(canonical_root)) != canonical_root:
+        root_views = backend_mount_path_views(volume_root)
+        if root_views.physical != root_views.lexical:
             raise SandboxContractError(
                 "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT must not be a symlink"
             )
@@ -1313,11 +1311,9 @@ class SandboxManager:
         for backend_path, _should_create in self._workspace_mount_paths(
             lifecycle_type, lifecycle_id, mount_intent
         ):
-            target = Path(
-                canonical_sandbox_path(str(absolute_backend_mount_path(backend_path)))
-            )
+            target_views = backend_mount_path_views(backend_path)
             try:
-                relative = target.relative_to(canonical_root)
+                relative = target_views.physical.relative_to(root_views.physical)
             except ValueError as exc:
                 raise SandboxContractError(
                     "Every workspace mount must be below "
@@ -1332,7 +1328,7 @@ class SandboxManager:
                 SandboxMount(
                     type="volume",
                     source=volume,
-                    target=str(target),
+                    target=str(target_views.physical),
                     mode="rw",
                     subpath=subpath,
                 )
@@ -3087,7 +3083,16 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
             shared host or guest path, or a configured mount lands inside
             the reserved per-user uploads subtree.
     """
-    if not await sandbox_mgr._resolve_backend_probe():
+    supports_runtime_spec = await sandbox_mgr._resolve_backend_probe()
+    if (
+        get_sandbox_workspace_mount_mode() == "volume_subpath"
+        and not supports_runtime_spec
+    ):
+        raise SandboxRuntimeConflictError(
+            "volume_subpath workspace mounts require a Docker/spec-reconciliation "
+            "sandbox backend"
+        )
+    if not supports_runtime_spec:
         return
 
     if sandbox_mgr.requires_host_workspace_access():

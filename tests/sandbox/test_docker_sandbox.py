@@ -288,6 +288,22 @@ class _FailingStartContainer:
         self.remove_calls.append(force)
 
 
+class _PostStartContainer:
+    """Container stub used to exercise failures while observing a new runtime."""
+
+    def __init__(self) -> None:
+        self.remove_calls: list[bool] = []
+
+    def start(self) -> None:
+        return None
+
+    def reload(self) -> None:
+        return None
+
+    def remove(self, force: bool = False) -> None:
+        self.remove_calls.append(force)
+
+
 def _get_free_host_port() -> int:
     """Reserve an ephemeral host port for Docker port-mapping tests."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -323,6 +339,103 @@ class TestDockerSandboxServiceFailures:
 
         assert len(created_container.remove_calls) == 1
         assert created_container.remove_calls[0] is True
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_removes_container_when_parse_fails(self, monkeypatch):
+        created_container = _PostStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        def reject_parse(_container):
+            raise RuntimeError("malformed runtime config")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module, "_parse_container_config", reject_parse
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="malformed runtime config"):
+            await service.get_or_create("parse-failure")
+
+        assert created_container.remove_calls == [True]
+
+    @pytest.mark.asyncio
+    async def test_create_removes_container_when_inspection_fails(self, monkeypatch):
+        created_container = _PostStartContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created_container
+
+        def reject_inspection(_container):
+            raise RuntimeError("malformed inspection")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module, "_build_inspection", reject_inspection
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+
+        with pytest.raises(RuntimeError, match="malformed inspection"):
+            await service.create(
+                "inspection-failure",
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(),
+            )
+
+        assert created_container.remove_calls == [True]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["get_or_create", "create"])
+    async def test_named_volume_subpath_rejects_unsupported_daemon_before_create(
+        self, monkeypatch, route
+    ):
+        client = _FakeDockerClient()
+        client.version = lambda: {"Version": "25.0.18", "ApiVersion": "1.44"}
+        create_calls = 0
+
+        async def fake_create_container(*args, **kwargs):
+            nonlocal create_calls
+            create_calls += 1
+            raise AssertionError("container creation must not be reached")
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        config = SandboxConfig(
+            mounts=[
+                SandboxMount(
+                    type="volume",
+                    source="workspaces",
+                    target="/home/sandbox/workspace",
+                    subpath="user_1/task_2",
+                )
+            ]
+        )
+
+        with pytest.raises(SandboxRuntimeConflictError, match="Engine >= 26.0"):
+            if route == "get_or_create":
+                await service.get_or_create("unsupported", config=config)
+            else:
+                await service.create(
+                    "unsupported",
+                    SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                    config,
+                )
+
+        assert create_calls == 0
 
     @pytest.mark.parametrize("security_options", [[], None])
     def test_host_workspace_readiness_probe_succeeds_and_cleans_up(

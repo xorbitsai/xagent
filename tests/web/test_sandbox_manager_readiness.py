@@ -54,6 +54,19 @@ async def test_readiness_skipped_when_backend_does_not_support_reconciliation():
 
 
 @pytest.mark.asyncio
+async def test_volume_subpath_readiness_rejects_legacy_backend():
+    with patch.dict(
+        "os.environ",
+        {"XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath"},
+        clear=True,
+    ):
+        with pytest.raises(
+            SandboxRuntimeConflictError, match="require.*Docker/spec-reconciliation"
+        ):
+            await check_sandbox_static_readiness(_ProbeStub(False))
+
+
+@pytest.mark.asyncio
 async def test_readiness_skipped_when_no_relevant_env_configured():
     """Code mounts alone are never checked when neither SANDBOX_VOLUMES nor
     XAGENT_EXTERNAL_UPLOAD_DIRS is configured -- the self-conflicting code

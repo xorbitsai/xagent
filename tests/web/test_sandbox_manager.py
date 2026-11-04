@@ -669,6 +669,47 @@ class TestSandboxConfigParsing:
             with pytest.raises(SandboxContractError, match="must be below"):
                 manager._build_runtime_spec("task", "9", mount_intent=intent)
 
+    def test_volume_subpath_mode_resolves_in_volume_symlink_to_physical_subpath(
+        self, tmp_path
+    ):
+        volume_root = tmp_path / "workspaces"
+        physical_workspace = volume_root / "shared" / "kb"
+        physical_workspace.mkdir(parents=True)
+        aliases = volume_root / "aliases"
+        aliases.mkdir()
+        aliased_workspace = aliases / "kb"
+        aliased_workspace.symlink_to(physical_workspace, target_is_directory=True)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(volume_root),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            manager._backend_probe = True
+            intent = SandboxMountIntent(mount_root=str(aliased_workspace))
+            spec = manager._build_runtime_spec("task", "9", mount_intent=intent)
+
+            assert len(spec.mounts) == 1
+            assert spec.mounts[0].target == str(physical_workspace)
+            assert spec.mounts[0].subpath == "shared/kb"
+            assert manager.workspace_dirs_are_host_mounted(
+                "task",
+                "9",
+                intent,
+                [str(physical_workspace / "output")],
+            )
+
 
 class TestSandboxLifecycleConfig:
     """Test sandbox lifecycle identity and runtime config consistency."""

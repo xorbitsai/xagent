@@ -1384,6 +1384,27 @@ class DockerSandboxService(SandboxService):
         """
         return self._locks.locked(name)
 
+    def _require_volume_subpath_support(self) -> None:
+        """Fail before create when the daemon cannot enforce volume subpaths."""
+        try:
+            daemon_version = self._client.version()
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                "Cannot verify Docker Engine support for volume subpaths"
+            ) from exc
+        if not _version_at_least(daemon_version.get("Version"), (26, 0)) or not (
+            _version_at_least(daemon_version.get("ApiVersion"), (1, 45))
+        ):
+            raise SandboxRuntimeConflictError(
+                "Named-volume subpath mounts require Docker Engine >= 26.0 and "
+                "API >= 1.45; bind fallback is intentionally disabled"
+            )
+
+    def _validate_structured_mount_support(self, config: SandboxConfig) -> None:
+        """Validate daemon features required by an explicit sandbox config."""
+        if any(mount.type == "volume" for mount in config.mounts or ()):
+            self._require_volume_subpath_support()
+
     @staticmethod
     async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
         """Run ``coro`` to completion even under repeated cancellation.
@@ -1496,6 +1517,8 @@ class DockerSandboxService(SandboxService):
     ) -> DockerSandbox:
         """Get, resume, or create a Docker-backed sandbox."""
         async with self._named_lock(name):
+            if config is not None:
+                self._validate_structured_mount_support(config)
             control = self._get_live_control(name)
 
             container = await self._find_container(name)
@@ -1538,11 +1561,16 @@ class DockerSandboxService(SandboxService):
             )
             try:
                 await asyncio.to_thread(container.start)
-            except Exception:
-                await asyncio.to_thread(container.remove, force=True)
-                raise
-            await asyncio.to_thread(container.reload)
-            runtime_info = _parse_container_config(container)
+                await asyncio.to_thread(container.reload)
+                runtime_info = _parse_container_config(container)
+            except BaseException as create_exc:
+                try:
+                    await self._await_shielded(
+                        asyncio.to_thread(container.remove, force=True)
+                    )
+                except Exception as remove_exc:
+                    raise create_exc from remove_exc
+                raise create_exc
             stored_info = SandboxInfo(
                 name=name,
                 state=runtime_info.state,
@@ -1650,6 +1678,7 @@ class DockerSandboxService(SandboxService):
         critical section (see ``_named_lock``).
         """
         async with self._named_lock(name):
+            self._validate_structured_mount_support(config)
             existing = await self._find_container(name)
             if existing is not None:
                 raise SandboxAlreadyExistsError(f"Sandbox already exists: {name!r}")
@@ -1719,33 +1748,34 @@ class DockerSandboxService(SandboxService):
 
             try:
                 await asyncio.to_thread(container.start)
-            except BaseException as start_exc:
+                await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                mismatches = _find_publish_mismatches(
+                    desired, resolved_image, inspection, self._network
+                )
+            except BaseException as observation_exc:
                 # Compensate with a raw container removal, never
                 # self.delete(): delete() acquires this same _named_lock
                 # entry, so calling it here would self-deadlock. The
-                # original start failure (including a cancellation) is
+                # original creation/observation failure (including a
+                # cancellation) is
                 # preserved as the raised exception regardless of whether
                 # the compensating remove itself succeeds. The remove runs
                 # through _await_shielded so that a cancellation landing
                 # here (e.g. a second cancel on top of the one that failed
-                # start) cannot cut the remove short and let this method's
+                # observation) cannot cut the remove short and let this method's
                 # `_named_lock(name)` release while it is still in flight —
                 # that would let a same-name create() race an in-flight
                 # remove. If such a cancellation occurs, it is re-raised
-                # once the remove settles, taking priority over start_exc.
+                # once the remove settles, taking priority over the original
+                # observation failure.
                 try:
                     await self._await_shielded(
                         asyncio.to_thread(container.remove, force=True)
                     )
                 except Exception as remove_exc:
-                    raise start_exc from remove_exc
-                raise start_exc
-
-            await asyncio.to_thread(container.reload)
-            inspection = _build_inspection(container)
-            mismatches = _find_publish_mismatches(
-                desired, resolved_image, inspection, self._network
-            )
+                    raise observation_exc from remove_exc
+                raise observation_exc
             if mismatches:
                 # A container whose observed facts disagree with what we
                 # asked for must never be published: remove it directly
@@ -2046,19 +2076,7 @@ class DockerSandboxService(SandboxService):
                 "(for Tecnativa/docker-socket-proxy, set INFO=1)."
             ) from exc
         if get_sandbox_workspace_mount_mode() == "volume_subpath":
-            try:
-                daemon_version = self._client.version()
-            except Exception as exc:
-                raise SandboxRuntimeConflictError(
-                    "Cannot verify Docker Engine support for volume subpaths"
-                ) from exc
-            if not _version_at_least(daemon_version.get("Version"), (26, 0)) or not (
-                _version_at_least(daemon_version.get("ApiVersion"), (1, 45))
-            ):
-                raise SandboxRuntimeConflictError(
-                    "volume_subpath mode requires Docker Engine >= 26.0 and "
-                    "API >= 1.45; bind fallback is intentionally disabled"
-                )
+            self._require_volume_subpath_support()
         try:
             sandbox_network = self._client.networks.get(self._network)
         except errors.NotFound as exc:

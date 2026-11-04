@@ -1065,10 +1065,6 @@ async def test_unavailable_read_lets_the_resume_proceed_outside_native_shared_ex
     assert seam.resume_scheduled.is_set()
     seam.transition.assert_awaited()
     assert _sent_errors(seam.connection_manager) == []
-    assert (
-        ops_signals.INTERACTION_LEGACY_RESUME_SHIM
-        not in ops_signals.active_degradations()
-    )
     assert ops_signals.active_degradations() == {}
     assert result.outcome is not command_execution_service.ResumeCommandOutcome.REJECTED
     assert [

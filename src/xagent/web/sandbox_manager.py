@@ -1304,14 +1304,20 @@ class SandboxManager:
         root_views = backend_mount_path_views(volume_root)
         if root_views.physical != root_views.lexical:
             raise SandboxContractError(
-                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT must not be a symlink"
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT and its ancestors must "
+                "resolve without symlinks"
             )
 
         mounts: list[SandboxMount] = []
-        for backend_path, _should_create in self._workspace_mount_paths(
+        for backend_path, should_create in self._workspace_mount_paths(
             lifecycle_type, lifecycle_id, mount_intent
         ):
             target_views = backend_mount_path_views(backend_path)
+            if not should_create and not target_views.physical.is_dir():
+                raise SandboxContractError(
+                    "Sandbox workspace extra mount does not exist or is not a "
+                    f"directory: {str(backend_path)!r}"
+                )
             try:
                 relative = target_views.physical.relative_to(root_views.physical)
             except ValueError as exc:
@@ -3046,8 +3052,10 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
 
     Only meaningful for backends that support spec reconciliation (Docker
     today): the legacy Boxlite route never reconciles a desired spec against
-    a live container, so there is nothing here for it to protect. Skipped
-    entirely when neither ``SANDBOX_VOLUMES`` nor
+    a live container, so there is nothing here for it to protect. In
+    ``volume_subpath`` mode, the named-volume configuration and its physical
+    root are validated before serving traffic. The later bind-mount conflict
+    scan is skipped when neither ``SANDBOX_VOLUMES`` nor
     ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
     conflict with themselves, and they never land under the uploads guest
     root either (``build_code_mount_volumes`` mounts fixed ``/app/src`` and
@@ -3055,8 +3063,8 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     reserved-subtree check below has nothing to reject; that is also why the
     reserved-subtree check runs after this early return rather than before
     it. When the check does run, code mounts are still part of the scanned
-    volume list along with everything else — they are not specially
-    exempted, they simply do not match the reserved shape.
+    volume list along with everything else — they are not specially exempted,
+    they simply do not match the reserved shape.
 
     Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
     using the same ``host_side_sources`` flag the runtime build path uses)
@@ -3081,19 +3089,54 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     Raises:
         SandboxRuntimeConflictError: Two configured mounts disagree at a
             shared host or guest path, or a configured mount lands inside
-            the reserved per-user uploads subtree.
+            the reserved per-user uploads subtree, or ``volume_subpath``
+            configuration cannot be enforced safely.
     """
     supports_runtime_spec = await sandbox_mgr._resolve_backend_probe()
-    if (
-        get_sandbox_workspace_mount_mode() == "volume_subpath"
-        and not supports_runtime_spec
-    ):
+    workspace_mount_mode = get_sandbox_workspace_mount_mode()
+    if workspace_mount_mode == "volume_subpath" and not supports_runtime_spec:
         raise SandboxRuntimeConflictError(
             "volume_subpath workspace mounts require a Docker/spec-reconciliation "
             "sandbox backend"
         )
     if not supports_runtime_spec:
         return
+
+    if workspace_mount_mode == "volume_subpath":
+        try:
+            volume = get_sandbox_workspace_volume()
+            volume_root = get_sandbox_workspace_volume_root()
+        except ValueError as exc:
+            raise SandboxRuntimeConflictError(
+                f"Invalid volume_subpath workspace configuration: {exc}"
+            ) from exc
+        if volume is None or volume_root is None:
+            raise SandboxRuntimeConflictError(
+                "volume_subpath mode requires both "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME and "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
+            )
+        root_views = backend_mount_path_views(volume_root)
+        if root_views.physical != root_views.lexical:
+            raise SandboxRuntimeConflictError(
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT and its ancestors must "
+                "resolve without symlinks"
+            )
+        if not root_views.physical.is_dir():
+            raise SandboxRuntimeConflictError(
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT does not exist or is not "
+                f"a directory: {str(volume_root)!r}"
+            )
+        for external_dir in get_external_upload_dirs():
+            external_views = backend_mount_path_views(external_dir)
+            try:
+                external_views.physical.relative_to(root_views.physical)
+            except ValueError as exc:
+                raise SandboxRuntimeConflictError(
+                    "Every external upload directory must be below "
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT in volume_subpath mode: "
+                    f"{str(external_dir)!r}"
+                ) from exc
 
     if sandbox_mgr.requires_host_workspace_access():
         sandbox_mgr.validate_host_workspace_access()

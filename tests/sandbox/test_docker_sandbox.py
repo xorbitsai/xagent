@@ -252,6 +252,7 @@ class _FakeDockerClient:
 
     def __init__(self, containers=()):
         self.containers = _FakeContainerCollection(containers)
+        self.api = SimpleNamespace(_version="1.45")
         self.networks = SimpleNamespace(
             get=lambda name: SimpleNamespace(
                 name=name,
@@ -400,7 +401,7 @@ class TestDockerSandboxServiceFailures:
         self, monkeypatch, route
     ):
         client = _FakeDockerClient()
-        client.version = lambda: {"Version": "25.0.18", "ApiVersion": "1.44"}
+        client.version = lambda: {"Version": "25.0.18", "ApiVersion": "1.45"}
         create_calls = 0
 
         async def fake_create_container(*args, **kwargs):
@@ -471,18 +472,19 @@ class TestDockerSandboxServiceFailures:
         assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
 
     @pytest.mark.parametrize(
-        "version",
+        ("version", "negotiated_api"),
         [
-            {"Version": "25.0.18", "ApiVersion": "1.45"},
-            {"Version": "26.1.4", "ApiVersion": "1.44"},
-            {},
+            ({"Version": "25.0.18", "ApiVersion": "1.45"}, "1.45"),
+            ({"Version": "26.1.4", "ApiVersion": "1.45"}, "1.44"),
+            ({}, None),
         ],
     )
     def test_volume_subpath_readiness_rejects_unsupported_daemon(
-        self, tmp_path, monkeypatch, version
+        self, tmp_path, monkeypatch, version, negotiated_api
     ):
         client = _FakeDockerClient()
         client.version = lambda: version
+        client.api._version = negotiated_api
         service = DockerSandboxService(
             MemDockerStore(), namespace="test", client=client
         )
@@ -492,6 +494,25 @@ class TestDockerSandboxServiceFailures:
 
         with pytest.raises(SandboxRuntimeConflictError, match="Engine >= 26.0"):
             service.validate_host_workspace_access()
+
+    def test_volume_subpath_capability_probe_is_cached(self):
+        client = _FakeDockerClient()
+        calls = 0
+
+        def version():
+            nonlocal calls
+            calls += 1
+            return {"Version": "26.1.4", "ApiVersion": "1.45"}
+
+        client.version = version
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+
+        service._require_volume_subpath_support()
+        service._require_volume_subpath_support()
+
+        assert calls == 1
 
     def test_host_workspace_readiness_wraps_upload_root_creation_failure(
         self, tmp_path, monkeypatch
@@ -1498,7 +1519,9 @@ class TestDockerSandboxService:
                 [
                     "sh",
                     "-c",
-                    "mkdir -p /seed/user_1/task_2 && chown -R 1100:1010 /seed/user_1",
+                    "mkdir -p /seed/user_1/task_2 /seed/user_1/other && "
+                    "printf sibling > /seed/user_1/other/secret.txt && "
+                    "chown -R 1100:1010 /seed/user_1",
                 ],
                 user="0:0",
                 remove=True,
@@ -1522,6 +1545,13 @@ class TestDockerSandboxService:
                 await sandbox.read_file("/home/sandbox/workspace/probe.txt")
                 == "volume-subpath-ok"
             )
+            sibling_probe = await sandbox.exec(
+                "test",
+                "!",
+                "-e",
+                "/home/sandbox/workspace/user_1/other/secret.txt",
+            )
+            assert sibling_probe.exit_code == 0
             inspection = await docker_service.inspect(sandbox_name)
             assert inspection is not None
             assert inspection.facts.mounts == (mount,)

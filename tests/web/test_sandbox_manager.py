@@ -669,6 +669,28 @@ class TestSandboxConfigParsing:
             with pytest.raises(SandboxContractError, match="must be below"):
                 manager._build_runtime_spec("task", "9", mount_intent=intent)
 
+    def test_volume_subpath_mode_rejects_missing_extra_mount(self, tmp_path):
+        volume_root = tmp_path / "workspaces"
+        mount_root = volume_root / "user_1" / "task_2"
+        mount_root.mkdir(parents=True)
+        missing_extra = volume_root / "shared" / "missing"
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_SANDBOX_WORKSPACE_MOUNT_MODE": "volume_subpath",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME": "xagent-stage-workspaces",
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT": str(volume_root),
+            },
+            clear=True,
+        ):
+            manager = SandboxManager(FakeSandboxService())
+            intent = SandboxMountIntent(
+                mount_root=str(mount_root), extra_mounts=(str(missing_extra),)
+            )
+
+            with pytest.raises(SandboxContractError, match=repr(str(missing_extra))):
+                manager._build_runtime_spec("task", "9", mount_intent=intent)
+
     def test_volume_subpath_mode_resolves_in_volume_symlink_to_physical_subpath(
         self, tmp_path
     ):

@@ -251,10 +251,12 @@ class SandboxMount:
     name can never be mistaken for a host path and the Docker volume subpath
     is covered by desired-state fingerprinting and runtime attestation.
 
-    Volume mounts deliberately require a non-empty ``subpath`` and always use
-    Docker's ``NoCopy`` option.  Mounting a volume root is not part of the
-    sandbox contract: only trusted application services, configured by the
-    deployment, receive that broader view.
+    Volume mounts deliberately require a non-empty ``subpath``. The Docker
+    adapter creates them with ``NoCopy``; Docker inspect does not report that
+    creation-only option, so runtime attestation covers the source, target,
+    mode and subpath instead. Mounting a volume root is not part of the sandbox
+    contract: only trusted application services, configured by the deployment,
+    receive that broader view.
     """
 
     type: Literal["bind", "volume"]

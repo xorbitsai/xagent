@@ -17,6 +17,7 @@ import stat
 import tarfile
 import tempfile
 import textwrap
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -1359,6 +1360,11 @@ class DockerSandboxService(SandboxService):
         self._client = client or _create_docker_client()
         self._client.ping()
         self._store = store
+        # DockerClient.version() performs a blocking daemon request. Cache the
+        # result behind a thread lock so concurrent async creates neither block
+        # the event loop nor repeat the capability probe.
+        self._volume_subpath_versions: tuple[str | None, str | None] | None = None
+        self._volume_subpath_versions_lock = threading.Lock()
         # Per-name lifecycle locks, one entry per sandbox name currently held
         # or waited on. The registry evicts unreferenced entries so it does
         # not grow with every sandbox name ever seen (names such as
@@ -1386,24 +1392,34 @@ class DockerSandboxService(SandboxService):
 
     def _require_volume_subpath_support(self) -> None:
         """Fail before create when the daemon cannot enforce volume subpaths."""
-        try:
-            daemon_version = self._client.version()
-        except Exception as exc:
-            raise SandboxRuntimeConflictError(
-                "Cannot verify Docker Engine support for volume subpaths"
-            ) from exc
-        if not _version_at_least(daemon_version.get("Version"), (26, 0)) or not (
-            _version_at_least(daemon_version.get("ApiVersion"), (1, 45))
+        with self._volume_subpath_versions_lock:
+            if self._volume_subpath_versions is None:
+                try:
+                    daemon_version = self._client.version()
+                    api_client = getattr(self._client, "api", None)
+                    negotiated_api = getattr(api_client, "_version", None)
+                except Exception as exc:
+                    raise SandboxRuntimeConflictError(
+                        "Cannot verify Docker Engine support for volume subpaths"
+                    ) from exc
+                self._volume_subpath_versions = (
+                    daemon_version.get("Version"),
+                    negotiated_api,
+                )
+            engine_version, negotiated_api = self._volume_subpath_versions
+
+        if not _version_at_least(engine_version, (26, 0)) or not (
+            _version_at_least(negotiated_api, (1, 45))
         ):
             raise SandboxRuntimeConflictError(
                 "Named-volume subpath mounts require Docker Engine >= 26.0 and "
-                "API >= 1.45; bind fallback is intentionally disabled"
+                "a negotiated API >= 1.45; bind fallback is intentionally disabled"
             )
 
-    def _validate_structured_mount_support(self, config: SandboxConfig) -> None:
+    async def _validate_structured_mount_support(self, config: SandboxConfig) -> None:
         """Validate daemon features required by an explicit sandbox config."""
         if any(mount.type == "volume" for mount in config.mounts or ()):
-            self._require_volume_subpath_support()
+            await asyncio.to_thread(self._require_volume_subpath_support)
 
     @staticmethod
     async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -1516,9 +1532,9 @@ class DockerSandboxService(SandboxService):
         config: Optional[SandboxConfig] = None,
     ) -> DockerSandbox:
         """Get, resume, or create a Docker-backed sandbox."""
+        if config is not None:
+            await self._validate_structured_mount_support(config)
         async with self._named_lock(name):
-            if config is not None:
-                self._validate_structured_mount_support(config)
             control = self._get_live_control(name)
 
             container = await self._find_container(name)
@@ -1677,8 +1693,8 @@ class DockerSandboxService(SandboxService):
         inspect-then-create sequence: that window belongs to the caller's
         critical section (see ``_named_lock``).
         """
+        await self._validate_structured_mount_support(config)
         async with self._named_lock(name):
-            self._validate_structured_mount_support(config)
             existing = await self._find_container(name)
             if existing is not None:
                 raise SandboxAlreadyExistsError(f"Sandbox already exists: {name!r}")

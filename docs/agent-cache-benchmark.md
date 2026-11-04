@@ -1,6 +1,6 @@
 # Agent long-context cache benchmark
 
-This opt-in benchmark runs Xagent's real ReAct pattern through its native
+This benchmark runs Xagent's real ReAct pattern through its native
 Xinference adapter. The model audits a synthetic invoice ledger, follows a chain
 of tool-generated receipts, retries an injected transient tool failure, calculates
 the total with a real arithmetic tool, saves a
@@ -94,12 +94,11 @@ cache usage means unknown, rather than a measured zero hit rate. Prefix-cache
 reuse accelerates prefill; output generation and tool time still contribute to
 task latency.
 
-## Optional runtime prefix observation
+## Runtime prefix observation
 
-Enable `ExecutionContext.metadata["observe_prompt_prefix"] = True` to attach a
-small `prompt_prefix` observation to `llm_call_start` and its matching end event.
-The default is off. This complements existing prompt-composition and cached-token
-statistics without changing requests, clocks, tool ordering, or cache isolation.
+The runtime automatically attaches a small `prompt_prefix` observation to
+`llm_call_start` and its matching end event when a tracer records LLM events.
+It complements the existing prompt-composition and cached-token statistics.
 
 The observer compares adjacent **runtime** message/schema representations within
 the same execution, step, model and call kind. It reports `initial`,

@@ -24,7 +24,6 @@ from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.agent.context.execution import CompactConfig
-from xagent.core.agent.prompt_prefix import OBSERVE_PROMPT_PREFIX_KEY
 from xagent.core.agent.runtime import load_pattern_checkpoint
 from xagent.core.agent.trace import TraceCategory
 from xagent.core.model.chat.basic.xinference import XinferenceLLM
@@ -406,7 +405,6 @@ def build_context(
 ) -> ExecutionContext:
     context = ExecutionContext(
         system_prompt="You audit invoices using the supplied ledger and tools. Complete the entire audit and save it before answering. Never invent amounts or receipts.",
-        metadata={OBSERVE_PROMPT_PREFIX_KEY: True},
         compact_config=CompactConfig(threshold=int(context_window * 0.9)),
     )
     context.add_user_message(

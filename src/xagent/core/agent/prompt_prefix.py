@@ -1,4 +1,4 @@
-"""Opt-in comparisons of runtime requests, without retaining prompt text.
+"""Compare traced runtime requests without retaining prompt text.
 
 These are message/schema comparisons before provider templating and reference
 materialization, not token-prefix lengths or explanations of engine cache misses.
@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 PROMPT_PREFIX_KEY = "prompt_prefix"
-OBSERVE_PROMPT_PREFIX_KEY = "observe_prompt_prefix"
 
 
 def _digest(value: Any) -> bytes:
@@ -43,7 +42,7 @@ class PromptPrefixObserver:
         try:
             schemas = _digest(tools or [])
             fingerprints = tuple(_digest(message) for message in messages)
-        except (TypeError, ValueError, UnicodeError):
+        except (TypeError, ValueError, RecursionError):
             self._previous.pop(call_kind, None)
             return {"change": "unavailable"}
         previous = self._previous.get(call_kind)

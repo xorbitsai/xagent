@@ -76,11 +76,7 @@ from .context.execution import (
     context_checkpoint_gate,
     derive_compact_threshold,
 )
-from .prompt_prefix import (
-    OBSERVE_PROMPT_PREFIX_KEY,
-    PROMPT_PREFIX_KEY,
-    PromptPrefixObserver,
-)
+from .prompt_prefix import PROMPT_PREFIX_KEY, PromptPrefixObserver
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -1602,11 +1598,7 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
-        context_metadata = getattr(context, "metadata", None)
-        if (
-            isinstance(context_metadata, Mapping)
-            and context_metadata.get(OBSERVE_PROMPT_PREFIX_KEY) is True
-        ):
+        if callable(getattr(self.tracer, "trace_event", None)):
             if self._prompt_prefix_observer is None:
                 self._prompt_prefix_observer = PromptPrefixObserver()
             observation = self._prompt_prefix_observer.observe(

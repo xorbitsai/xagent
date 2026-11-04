@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 from typing import Any
 
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
 from xagent.core.agent.prompt_prefix import (
-    OBSERVE_PROMPT_PREFIX_KEY,
     PROMPT_PREFIX_KEY,
     PromptPrefixObserver,
 )
@@ -87,6 +87,11 @@ def test_non_json_observation_does_not_break_calls_or_reuse_old_baseline():
     observe(observer, [])
     assert observe(observer, [{"content": object()}]) == {"change": "unavailable"}
     assert observe(observer, []) == {"change": "initial"}
+    content: Any = "deeply nested tool arguments"
+    for _ in range(sys.getrecursionlimit()):
+        content = [content]
+    assert observe(observer, [{"content": content}]) == {"change": "unavailable"}
+    assert observe(observer, []) == {"change": "initial"}
 
 
 def test_snapshot_and_telemetry_do_not_retain_content():
@@ -110,10 +115,10 @@ class Trace:
 
 
 @pytest.mark.asyncio
-async def test_runtime_opt_in_pairs_start_and_end_observation():
+async def test_runtime_trace_pairs_start_and_end_observation_by_default():
     trace = Trace()
     runtime = PatternRuntime(tracer=trace)
-    context = ExecutionContext(metadata={OBSERVE_PROMPT_PREFIX_KEY: True})
+    context = ExecutionContext()
     metadata: dict[str, Any] = {}
     await runtime.on_llm_start(context=context, messages=[], metadata=metadata)
     await runtime.on_llm_end(
@@ -129,20 +134,12 @@ async def test_runtime_opt_in_pairs_start_and_end_observation():
 
 
 @pytest.mark.asyncio
-async def test_runtime_observation_is_off_by_default():
-    runtime = PatternRuntime()
+@pytest.mark.parametrize("tracer", [None, object()])
+async def test_runtime_without_trace_events_skips_observation(tracer):
+    runtime = PatternRuntime(tracer=tracer)
     await runtime.on_llm_start(
         context=ExecutionContext(), messages=[{"content": object()}]
     )
-    assert runtime._prompt_prefix_observer is None
-
-
-@pytest.mark.asyncio
-async def test_absent_context_metadata_does_not_enable_or_break_observation():
-    from types import SimpleNamespace
-
-    runtime = PatternRuntime()
-    await runtime.on_llm_start(context=SimpleNamespace(metadata=None), messages=[])
     assert runtime._prompt_prefix_observer is None
 
 

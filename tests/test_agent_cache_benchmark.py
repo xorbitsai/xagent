@@ -15,7 +15,6 @@ from scripts.agent_cache_benchmark import (
     invoice_amount,
 )
 from xagent.core.agent import ExecutionContext, ReActPattern
-from xagent.core.agent.prompt_prefix import OBSERVE_PROMPT_PREFIX_KEY
 from xagent.core.agent.runtime import load_pattern_checkpoint
 
 
@@ -145,7 +144,7 @@ async def test_benchmark_tracer_supports_real_runtime_and_checkpoint_resume(tmp_
             repeated_tool_decision_after_consecutive_work_tool_calls=None,
         )
 
-    context = ExecutionContext(metadata={OBSERVE_PROMPT_PREFIX_KEY: True})
+    context = ExecutionContext()
     context.add_user_message("Audit the invoice chain and save the verified file.")
     tools = [AuditTool(workload), AuditTool(workload, save=True), SumAmountsTool()]
     runtime = BenchmarkRuntime(

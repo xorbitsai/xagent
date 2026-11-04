@@ -306,6 +306,22 @@ def classify_injection(
     return InjectionDisposition.DEFER
 
 
+def _session_routing_key(context: ExecutionContext, execution_id: str) -> str:
+    scope = get_execution_scope()
+    owner = current_user_id.get()
+    identity = json.dumps(
+        [
+            "xinference-session-affinity",
+            str(owner) if owner is not None else context.user_id,
+            scope.workspace_segments if scope is not None else (),
+            execution_id,
+        ]
+    )
+    return hmac.new(
+        get_session_secret().encode(), identity.encode(), "sha256"
+    ).hexdigest()
+
+
 class AgentRunner:
     """Execute an agent by materializing an execution context and invoking patterns."""
 
@@ -535,20 +551,9 @@ class AgentRunner:
         routing_token = None
 
         try:
-            scope = get_execution_scope()
-            owner = current_user_id.get()
-            identity = json.dumps(
-                [
-                    "xinference-session-affinity",
-                    str(owner) if owner is not None else context.user_id,
-                    scope.workspace_segments if scope is not None else (),
-                    execution_id,
-                ]
+            routing_token = xinference_routing_key.set(
+                _session_routing_key(context, execution_id)
             )
-            key = hmac.new(
-                get_session_secret().encode(), identity.encode(), "sha256"
-            ).hexdigest()
-            routing_token = xinference_routing_key.set(key)
             if inherited_budget is None:
                 policy = (
                     self.budget_policy_provider()

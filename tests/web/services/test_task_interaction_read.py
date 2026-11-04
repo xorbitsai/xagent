@@ -1243,27 +1243,13 @@ def test_a_recheck_that_finds_an_active_row_counts_no_read_fallback(
 # ---------------------------------------------------------------------------
 
 
-def test_stream_snapshot_reads_the_same_question_under_every_rollout_state(
-    _db: Session, _session_factory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``load_task_stream_snapshots`` gives a waiting task the same pending
-    question with the rollout policy uninitialized, frozen in ``legacy``
-    mode, and frozen in ``native`` mode with this task's source allowed:
-    the rollout mode decides only whether a new native row is produced,
-    never what a reader sees."""
-    task = _make_task(_db, marker=None)
-    task.status = TaskStatus.WAITING_FOR_USER
-    _db.commit()
-    _db.refresh(task)
-    persist_assistant_message(
-        _db,
-        int(task.id),
-        int(task.user_id),
-        "A live question",
-        message_type="question",
-        interactions=[{"type": "text_input", "label": "Live"}],
-    )
-    monkeypatch.setattr(database, "_SessionLocal", _session_factory)
+def _stream_snapshot_question_under_every_rollout_state(
+    task: Task, session_factory, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[Any, Any]]:
+    """The question and interactions ``load_task_stream_snapshots`` gives
+    ``task`` with the rollout policy uninitialized, frozen in ``legacy`` mode,
+    and frozen in ``native`` mode with this task's source allowed."""
+    monkeypatch.setattr(database, "_SessionLocal", session_factory)
     source = ir.gating_key(task)
     assert source is not None
 
@@ -1284,11 +1270,57 @@ def test_stream_snapshot_reads_the_same_question_under_every_rollout_state(
         native_sources=frozenset({source}),
     )
     native = _read()
+    return [uninitialized, legacy, native]
 
+
+def test_stream_snapshot_reads_the_same_question_under_every_rollout_state(
+    _db: Session, _session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A waiting task whose question lives in the legacy transcript reads the
+    same under every rollout state: the rollout mode decides only whether a
+    new native row is produced, never what a reader sees."""
+    task = _make_task(_db, marker=None)
+    task.status = TaskStatus.WAITING_FOR_USER
+    _db.commit()
+    _db.refresh(task)
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "A live question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Live"}],
+    )
     expected = (
         read_surface.get_pending_interaction_question(_db, task)[0],
         [{"type": "text_input", "label": "Live"}],
     )
-    assert uninitialized == expected
-    assert legacy == expected
-    assert native == expected
+    assert _stream_snapshot_question_under_every_rollout_state(
+        task, _session_factory, monkeypatch
+    ) == [expected, expected, expected]
+
+
+def test_stream_snapshot_reads_the_same_native_row_under_every_rollout_state(
+    _db: Session, _session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same holds for a question that lives only in a native row, with no
+    transcript message to fall back on: a deployment rolled back from native
+    still shows the row it published."""
+    task = _make_task(_db, marker=1)
+    task.status = TaskStatus.WAITING_FOR_USER
+    _db.commit()
+    _db.refresh(task)
+    _make_active_row(
+        _db,
+        task_id=int(task.id),
+        resume_trace_event_id=_make_trace_event(_db, task_id=int(task.id)),
+    )
+
+    reads = _stream_snapshot_question_under_every_rollout_state(
+        task, _session_factory, monkeypatch
+    )
+
+    assert reads[0][0] == "Which environment?"
+    assert reads[0][1][0]["field"] == "env"
+    assert reads[1] == reads[0]
+    assert reads[2] == reads[0]

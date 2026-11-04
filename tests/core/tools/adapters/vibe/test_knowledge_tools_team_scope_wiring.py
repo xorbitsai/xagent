@@ -22,13 +22,7 @@ from xagent.web.tools.config import WebToolConfig
 
 
 class _FakeConfig:
-    """A minimal ``BaseToolConfig``-shaped stand-in.
-
-    ``_connector_team_id`` is a bare attribute, not a method: this mirrors
-    how ``WebToolConfig`` actually stores it and how ``knowledge_tools.py``
-    reads it (``getattr(config, "_connector_team_id", None)``, the
-    accessor-less option this seam settled on).
-    """
+    """A minimal ``BaseToolConfig``-shaped stand-in."""
 
     def __init__(
         self,
@@ -36,14 +30,14 @@ class _FakeConfig:
         allowed_collections: Optional[List[str]] = None,
         user_id: Optional[int] = 7,
         is_admin: bool = False,
-        connector_team_id: Optional[int] = None,
+        knowledge_base_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
     ) -> None:
         self.allowed_collections = allowed_collections
         self.user_id = user_id
         self.is_admin_value = is_admin
-        self._connector_team_id = connector_team_id
+        self._knowledge_base_team_id = knowledge_base_team_id
         self._agent_creator_user_id = agent_creator_user_id
         self._declared_knowledge_bases = declared_knowledge_bases
 
@@ -55,6 +49,9 @@ class _FakeConfig:
 
     def is_admin(self) -> bool:
         return self.is_admin_value
+
+    def get_knowledge_base_team_id(self) -> Optional[int]:
+        return self._knowledge_base_team_id
 
     def get_agent_creator_user_id(self) -> Optional[int]:
         return self._agent_creator_user_id
@@ -116,7 +113,7 @@ async def test_running_the_search_tool_forwards_all_three_values_through_the_rea
         db=None,
         request=None,
         user_id=7,
-        connector_team_id=42,
+        knowledge_base_team_id=42,
         agent_creator_user_id=99,
         declared_knowledge_bases=["kb1"],
     )
@@ -155,7 +152,7 @@ async def test_running_the_list_tool_forwards_only_the_governing_team_id(
         request=None,
         user_id=7,
         allowed_collections=None,  # required for the list tool to be built
-        connector_team_id=42,
+        knowledge_base_team_id=42,
         agent_creator_user_id=99,
         declared_knowledge_bases=["kb1"],
     )
@@ -166,3 +163,20 @@ async def test_running_the_list_tool_forwards_only_the_governing_team_id(
     assert captured.get("governing_team_id") == 42
     assert "agent_creator_user_id" not in captured
     assert "declared_knowledge_bases" not in captured
+
+
+@pytest.mark.asyncio
+async def test_connector_team_id_alone_does_not_govern_knowledge_bases() -> None:
+    """Knowledge-base scope and connector visibility are separate config
+    values: a config that opens team connectors and says nothing about
+    knowledge bases must leave knowledge-base resolution runner-keyed."""
+    config = WebToolConfig(
+        db=None,
+        request=None,
+        user_id=7,
+        connector_team_id=42,
+    )
+    list_tool, search_tool = await _build_tools(config)
+
+    assert list_tool.governing_team_id is None
+    assert search_tool.governing_team_id is None

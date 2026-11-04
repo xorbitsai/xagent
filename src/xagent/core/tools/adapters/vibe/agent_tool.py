@@ -273,6 +273,23 @@ def _apply_agent_visibility_filters(
     return query
 
 
+def _visibility_filters_skip_ownership(
+    allowed_agent_ids: Optional[list[int]],
+    allow_cross_user_agent_ids: bool,
+) -> bool:
+    """Whether ``_apply_agent_visibility_filters`` admits a row without the
+    live ``owned_agent_clause`` for these arguments.
+
+    Mirrors the branch condition there: an explicit allowlist together with
+    cross-user execution (a workforce run's snapshot allowlist). A row loaded
+    that way was authorized when the allowlist was built, not re-checked
+    when it is read.
+    """
+    return bool(allow_cross_user_agent_ids) and (
+        _normalize_agent_ids(allowed_agent_ids) is not None
+    )
+
+
 def _exclude_private_workforce_manager_agents(query: Any, agent_model: Any) -> Any:
     from .....web.models.agent import AgentOrigin
 
@@ -2392,6 +2409,8 @@ class AgentTool(AbstractBaseTool):
             agent_tool_categories = None
             agent_models = None
             agent_execution_mode = None
+            agent_creator_user_id: Optional[int] = None
+            knowledge_base_team_id: Optional[int] = None
 
             with tool_session_scope(self._session_factory) as db:
                 # Load agent from database - support both PUBLISHED and DRAFT
@@ -2429,6 +2448,44 @@ class AgentTool(AbstractBaseTool):
                 agent_tool_categories = agent.tool_categories
                 agent_models = agent.models
                 agent_execution_mode = agent.execution_mode
+                agent_creator_user_id = int(agent.user_id)
+
+                # Knowledge bases resolve against the delegated agent's own
+                # team, the same way a directly run agent's do -- but only
+                # for a non-empty stored declaration. With no declaration
+                # the search tool falls back to "everything visible", and a
+                # team set there would add the team's whole knowledge-base
+                # set to it; the direct-run path never exposes that set for
+                # such an agent (it builds no knowledge tool for it), so the
+                # team is left unset here and resolution stays keyed on the
+                # runner, as before. An empty declaration builds no
+                # knowledge tool at all, so it needs no team either.
+                if agent.team_id is not None and agent_knowledge_bases:
+                    from .....web.services.agent_access import can_user_run_agent_now
+
+                    if _visibility_filters_skip_ownership(
+                        self._target_allowed_agent_ids,
+                        self._target_allow_cross_user_agent_ids,
+                    ) and not can_user_run_agent_now(db, self._user_id, agent):
+                        # The query above skipped the live ownership check
+                        # (a workforce run's snapshot allowlist), and the
+                        # runner can no longer run this agent directly: the
+                        # agent may have moved teams, narrowed its
+                        # visibility, or the runner may have left the team
+                        # since the run started. Granting the agent's team
+                        # here would read that team's documents on access
+                        # nobody re-verified, so the delegated run gets no
+                        # knowledge tools instead -- not the runner's own
+                        # same-named collections either.
+                        logger.warning(
+                            "Delegated agent %s: runner %s can no longer run "
+                            "it directly; building no knowledge tools",
+                            self._agent_id,
+                            self._user_id,
+                        )
+                        agent_knowledge_bases = []
+                    else:
+                        knowledge_base_team_id = int(agent.team_id)
 
                 # Resolve models
                 storage = UserAwareModelStorage(db)
@@ -2579,6 +2636,16 @@ class AgentTool(AbstractBaseTool):
                 # not an error; this is the deliberate scope this parameter
                 # enforces, not an oversight.
                 connector_team_id=None,
+                # Knowledge-base scope is decided separately in Phase 1:
+                # the delegated agent's own team, its creator and its stored
+                # declaration -- the same three values the direct-run path
+                # supplies. The team is unset for a personal agent or an
+                # absent declaration, and on a workforce allowlist hop whose
+                # runner can no longer run the agent the declaration is
+                # emptied, so no knowledge tool is built.
+                knowledge_base_team_id=knowledge_base_team_id,
+                agent_creator_user_id=agent_creator_user_id,
+                declared_knowledge_bases=agent_knowledge_bases,
             )
 
             async def execute_delegated_runtime() -> tuple[dict[str, Any], Any]:

@@ -77,6 +77,8 @@ def _delegated_agent_tool() -> AgentTool:
         session_factory=lambda: _DelegatedSession(
             SimpleNamespace(
                 id=1,
+                user_id=1,
+                team_id=None,
                 name="Delegated",
                 instructions=None,
                 knowledge_bases=None,
@@ -847,6 +849,8 @@ async def test_agent_tool_without_resolved_model_fails_closed(monkeypatch):
         session_factory=lambda: _DelegatedSession(
             SimpleNamespace(
                 id=1,
+                user_id=1,
+                team_id=None,
                 name="Delegated",
                 instructions=None,
                 knowledge_bases=None,
@@ -936,6 +940,8 @@ async def test_empty_model_config_falls_back_to_the_configured_default(
         session_factory=lambda: _DelegatedSession(
             SimpleNamespace(
                 id=1,
+                user_id=1,
+                team_id=None,
                 name="Delegated",
                 instructions=None,
                 knowledge_bases=None,
@@ -1024,6 +1030,8 @@ async def test_a_partial_config_without_a_general_slot_falls_back(monkeypatch, m
         session_factory=lambda: _DelegatedSession(
             SimpleNamespace(
                 id=1,
+                user_id=1,
+                team_id=None,
                 name="Delegated",
                 instructions=None,
                 knowledge_bases=None,
@@ -1197,6 +1205,8 @@ def _real_delegated_agent_tool(
         session_factory=lambda: _DelegatedSession(
             SimpleNamespace(
                 id=1,
+                user_id=1,
+                team_id=None,
                 name="Delegated",
                 instructions=None,
                 knowledge_bases=None,

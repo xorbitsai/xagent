@@ -1,6 +1,8 @@
 """``create_default_tools`` forwards ``agent_creator_user_id`` and
 ``declared_knowledge_bases`` into the ``WebToolConfig`` it builds, the same
-way it already forwards ``connector_team_id``.
+way it already forwards ``connector_team_id`` -- which it also passes as
+``knowledge_base_team_id``, since on the direct-run path one governing team
+scopes both connectors and knowledge bases.
 
 Scope: this covers the *definition* -- the signature at
 ``create_default_tools(...)`` and its body's construction of
@@ -65,6 +67,9 @@ async def test_create_default_tools_forwards_creator_and_declaration_to_web_tool
     )
 
     assert captured.get("connector_team_id") == 42
+    # On the direct-run path the governing agent's team scopes knowledge
+    # bases too; it reaches WebToolConfig through its own parameter.
+    assert captured.get("knowledge_base_team_id") == 42
     assert captured.get("agent_creator_user_id") == 99
     assert captured.get("declared_knowledge_bases") == ["kb1", "kb2"]
 
@@ -99,5 +104,6 @@ async def test_create_default_tools_leaves_creator_and_declaration_unset_by_defa
         task_id="web_task_11",
     )
 
+    assert captured.get("knowledge_base_team_id") is None
     assert captured.get("agent_creator_user_id") is None
     assert captured.get("declared_knowledge_bases") is None

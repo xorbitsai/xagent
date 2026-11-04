@@ -716,23 +716,23 @@ async def test_composio_facebook_grant_launches_with_composio_env(
 async def test_composio_grant_for_an_app_that_cannot_proxy_is_unavailable(
     db_session, monkeypatch
 ):
-    """Only Facebook's subprocess can proxy a Composio grant. Instagram's
-    talks to graph.facebook.com, where an Instagram Login token is invalid,
-    so its Composio grant is reported unavailable instead (#3533)."""
+    """Only Facebook's and Instagram's subprocesses can proxy a Composio
+    grant. Any other app's Composio grant (here WhatsApp, which stays native)
+    is reported unavailable instead of being misrouted."""
     db, user = db_session
     monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
     server = _add_oauth_server(
         db,
         user,
-        name="Instagram",
-        app_id="instagram",
+        name="WhatsApp",
+        app_id="whatsapp",
         provider="meta",
         launch_config=dict(_FACEBOOK_LAUNCH_CONFIG),
     )
     _add_user_oauth(
         db,
         user,
-        provider="instagram",
+        provider="whatsapp",
         access_token="ca_456",
         instance_url="actor-hmac",
         token_type="composio",

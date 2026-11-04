@@ -1151,6 +1151,131 @@ async def test_actor_composio_facebook_grant_launches_with_composio_env(
 
 
 @pytest.mark.asyncio
+async def test_actor_composio_instagram_grant_is_not_shadowed_by_a_bare_meta_grant(
+    db_session, monkeypatch
+) -> None:
+    """#3533: Instagram accepts a bare ``meta`` grant, but the actor path
+    looks grants up by exact app id, so a Composio ``instagram`` grant in the
+    same namespace is the one that launches, with the Composio values."""
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    db = db_session.db
+    _add_instagram_server(db, db_session.user)
+    for provider, token, token_type, instance_url in (
+        ("instagram", "ca_ig", "composio", "actor-hmac"),
+        ("meta", "bare-meta-token", "bearer", None),
+    ):
+        _add_instagram_grant(
+            db,
+            db_session.user,
+            owner=OWNER_A,
+            provider=provider,
+            token=token,
+            token_type=token_type,
+            instance_url=instance_url,
+        )
+    db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    env = configs[0]["config"]["env"]
+    assert "META_ACCESS_TOKEN" not in env
+    assert env["COMPOSIO_CONNECTED_ACCOUNT_ID"] == "ca_ig"
+    assert "bare-meta-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy_owner", "native_provider"),
+    [(OWNER_B, "instagram"), (None, "meta")],
+    ids=["other-actor", "ordinary-bare-meta"],
+)
+async def test_a_composio_instagram_grant_leaves_native_resolution_alone(
+    db_session, monkeypatch, policy_owner, native_provider
+) -> None:
+    """#3533 item 4, the other direction: an actor's Composio ``instagram``
+    grant never replaces the native grant another resolution uses: another
+    actor's own ``instagram`` grant, or the bare ``meta`` grant of the
+    ordinary namespace."""
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    db = db_session.db
+    _add_instagram_server(db, db_session.user)
+    _add_instagram_grant(
+        db,
+        db_session.user,
+        owner=OWNER_A,
+        provider="instagram",
+        token="ca_ig",
+        token_type="composio",
+        instance_url="actor-hmac",
+    )
+    _add_instagram_grant(
+        db,
+        db_session.user,
+        owner=policy_owner,
+        provider=native_provider,
+        token="native-meta-token",
+        token_type="bearer",
+        instance_url=None,
+    )
+    db.commit()
+    policy = _policy(policy_owner) if policy_owner else None
+
+    configs = await _config(db_session, policy=policy).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    env = configs[0]["config"]["env"]
+    assert env["META_ACCESS_TOKEN"] == "native-meta-token"
+    assert not any(key.startswith("COMPOSIO_") for key in env)
+    assert "ca_ig" not in str(configs)
+
+
+def _add_instagram_server(db: Session, user: User) -> None:
+    app = get_builtin_public_mcp_app("instagram")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Instagram",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "instagram", "provider": "meta"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+
+
+def _add_instagram_grant(
+    db: Session,
+    user: User,
+    *,
+    owner: str | None,
+    provider: str,
+    token: str,
+    token_type: str,
+    instance_url: str | None,
+) -> None:
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider=provider,
+            resource_owner_key=owner,
+            provider_user_id=f"{provider}-user",
+            access_token=token,
+            token_type=token_type,
+            instance_url=instance_url,
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_actor_builtin_refresh_remains_in_exact_owner_namespace(
     db_session, monkeypatch
 ) -> None:

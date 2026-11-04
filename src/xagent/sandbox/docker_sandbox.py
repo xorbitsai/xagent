@@ -31,8 +31,9 @@ from typing import (
     cast,
 )
 
-from docker import errors, from_env
 from docker.types import Mount as DockerMount
+
+from docker import errors, from_env
 
 from ..config import (
     get_sandbox_image,
@@ -1230,9 +1231,7 @@ async def _create_container(
                 type=mount.type,
                 read_only=mount.mode == "ro",
                 no_copy=mount.type == "volume",
-                # docker 7.2 implements this argument; types-docker's latest
-                # 7.1-derived stub has not caught up yet.
-                subpath=mount.subpath,  # type: ignore[call-arg]
+                subpath=mount.subpath,
             )
             for mount in sorted(set(config.mounts))
         ]

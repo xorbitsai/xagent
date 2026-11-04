@@ -29,11 +29,11 @@ from ..config import (
     get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_sandbox_worker_id,
+    get_sandbox_worker_namespace,
     get_sandbox_workspace_mount_mode,
     get_sandbox_workspace_volume,
     get_sandbox_workspace_volume_root,
-    get_sandbox_worker_id,
-    get_sandbox_worker_namespace,
     get_storage_root,
     get_uploads_dir,
 )

@@ -61,6 +61,11 @@ class EncryptedOAuthToken(TypeDecorator[str]):
 
 
 USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
+# ``token_type`` of a grant held by Composio rather than by us (#3531). Its
+# ``access_token`` is the Composio connected account id and its
+# ``instance_url`` the Composio user id; the provider token itself is never
+# readable, so every call goes through Composio's Proxy Execute endpoint.
+COMPOSIO_TOKEN_TYPE = "composio"
 _ORDINARY_OWNER_CLAUSE = text("resource_owner_key IS NULL")
 _ACTOR_OWNER_CLAUSE = text("resource_owner_key IS NOT NULL")
 

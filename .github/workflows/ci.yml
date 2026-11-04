@@ -451,6 +451,7 @@ jobs:
             paths: >-
               tests/test_ci_summary_contract.py
               tests/test_docker_workflow_versions.py
+              tests/test_format_release_notes.py
               tests/test_runtime_baseline.py
               tests/test_shared_worker_benchmark.py
               tests/agent

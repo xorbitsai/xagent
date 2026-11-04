@@ -100,13 +100,13 @@ The runtime automatically attaches a small `prompt_prefix` observation to
 `llm_call_start` and its matching end event when a tracer records LLM events.
 It complements the existing prompt-composition and cached-token statistics.
 
-The observer compares adjacent **runtime** message/schema representations within
-the same execution, step, model and call kind. It reports `initial`,
-`scope_changed`, `append_only`, `identical`, `messages_changed`,
-`messages_removed`, or `tools_changed`, along with the unchanged whole-message
-count and first changed message index. Compaction/decision/retry calls have
-separate baselines. Only content digests and scope identifiers are retained in memory; neither hashes nor text
-are emitted. A fresh runtime starts with `initial`, including after resume.
+The observer compares **runtime** message and schema representations within
+the same execution, step, model, call kind and phase. It reports `initial`,
+`append_only`, `identical`, `messages_changed`, `messages_removed`, or
+`tools_changed`, with the unchanged whole-message count and first changed
+message index when a baseline exists. The runtime keeps the 32 most recently
+used baselines in memory and emits only the comparison statistics. A fresh
+runtime starts with `initial`, including after resume.
 
 These observations precede provider templating and context-reference
 materialization. They do not measure token-prefix length, prove cache residency,
@@ -120,5 +120,5 @@ performance:
 
 ```bash
 PYTHONPATH=src:. uv run --frozen pytest -q \
-  tests/core/agent/test_prompt_prefix.py tests/test_agent_cache_benchmark.py
+  tests/core/agent/test_prompt_prefix.py tests/core/agent/test_agent_cache_benchmark.py
 ```

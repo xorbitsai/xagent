@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
 PROMPT_PREFIX_KEY = "prompt_prefix"
+_MAX_BASELINES = 32
 
 
 def _digest(value: Any) -> bytes:
@@ -25,11 +27,10 @@ def _digest(value: Any) -> bytes:
 
 @dataclass
 class PromptPrefixObserver:
-    # One snapshot per call kind (main, retry, decision, compaction), so an
-    # auxiliary call cannot replace the main loop's comparison baseline.
-    _previous: dict[str, tuple[tuple[str, ...], bytes, tuple[bytes, ...]]] = field(
-        default_factory=dict, repr=False
-    )
+    # Parallel steps and auxiliary phases keep separate comparison baselines.
+    _previous: OrderedDict[
+        tuple[tuple[str, ...], str, str], tuple[bytes, tuple[bytes, ...]]
+    ] = field(default_factory=OrderedDict, repr=False)
 
     def observe(
         self,
@@ -38,24 +39,29 @@ class PromptPrefixObserver:
         *,
         scope: tuple[str, ...],
         call_kind: str,
+        phase: str = "",
     ) -> dict[str, Any]:
+        key = (scope, call_kind, phase)
         try:
             schemas = _digest(tools or [])
             fingerprints = tuple(_digest(message) for message in messages)
         except (TypeError, ValueError, RecursionError):
-            self._previous.pop(call_kind, None)
+            self._previous.pop(key, None)
             return {"change": "unavailable"}
-        previous = self._previous.get(call_kind)
-        self._previous[call_kind] = (scope, schemas, fingerprints)
-        if previous is None or previous[0] != scope:
-            return {"change": "initial" if previous is None else "scope_changed"}
-        old = previous[2]
+        previous = self._previous.get(key)
+        self._previous[key] = (schemas, fingerprints)
+        self._previous.move_to_end(key)
+        if len(self._previous) > _MAX_BASELINES:
+            self._previous.popitem(last=False)
+        if previous is None:
+            return {"change": "initial"}
+        previous_schemas, old = previous
         common = 0
         for before, after in zip(old, fingerprints):
             if before != after:
                 break
             common += 1
-        tools_changed = previous[1] != schemas
+        tools_changed = previous_schemas != schemas
         if tools_changed:
             change = "tools_changed"
         elif common < min(len(old), len(fingerprints)):

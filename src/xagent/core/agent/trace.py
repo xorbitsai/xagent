@@ -102,7 +102,6 @@ _RESERVED_TRACE_FIELDS = frozenset(
         "output_tokens",
         "total_tokens",
         "cached_input_tokens",
-        "prompt_prefix",
         # cardinality counters (not the values they count)
         "messages_count",
         "candidates_count",

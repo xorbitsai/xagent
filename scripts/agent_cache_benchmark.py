@@ -306,7 +306,7 @@ class BenchmarkLLM(XinferenceLLM):
                     row["usage"] = chunk.usage
                 yield chunk
             row["success"] = True
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError, GeneratorExit) as exc:
             row.update(success=False, error_type=type(exc).__name__)
             raise
         finally:
@@ -324,7 +324,7 @@ class BenchmarkLLM(XinferenceLLM):
                 usage=result.get("usage", {}) if isinstance(result, dict) else {},
             )
             return result
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError, GeneratorExit) as exc:
             row.update(success=False, error_type=type(exc).__name__)
             raise
         finally:
@@ -377,11 +377,18 @@ class BenchmarkTrace:
 
 
 class BenchmarkRuntime(PatternRuntime):
-    def __init__(self, *, workload: AuditWorkload, compact_after: int, **kwargs: Any):
+    def __init__(
+        self,
+        *,
+        workload: AuditWorkload,
+        compact_after: int,
+        compaction_attempted: bool = False,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         self.workload = workload
         self.compact_after = compact_after
-        self.compaction_attempted = False
+        self.compaction_attempted = compaction_attempted
 
     async def compact_context_if_needed(self, *, context: Any, **kwargs: Any):
         force = (
@@ -500,12 +507,14 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     "attempts": workload.attempts,
                     "failed_once": workload.failed_once,
                     "saved": workload.saved,
+                    "compaction_attempted": runtime.compaction_attempted,
                 },
             )
             checkpoint = json.loads(
                 (args.output / "resume-checkpoint.json").read_text()
             )
             saved_state = json.loads((args.output / "audit-state.json").read_text())
+            compaction_attempted = saved_state.pop("compaction_attempted")
             workload = AuditWorkload(
                 targets=targets, output=args.output, fail_at=args.fail_at, **saved_state
             )
@@ -513,7 +522,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             next_pattern = pattern()
             load_pattern_checkpoint(next_pattern, checkpoint)
             runtime = BenchmarkRuntime(
-                workload=workload, compact_after=args.compact_after, tracer=trace
+                workload=workload,
+                compact_after=args.compact_after,
+                compaction_attempted=compaction_attempted,
+                tracer=trace,
             )
             resumed = True
             result = await next_pattern.run(

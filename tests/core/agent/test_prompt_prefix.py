@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import copy
 import json
-import sys
 from typing import Any
 
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
+from xagent.core.agent.pattern.dag.dag import DAGPattern, _DAGStepRuntime
 from xagent.core.agent.prompt_prefix import (
+    _MAX_BASELINES,
     PROMPT_PREFIX_KEY,
     PromptPrefixObserver,
 )
-from xagent.core.agent.trace import normalize_llm_trace_payload
 
 
 def observe(observer, messages, tools=None, **kwargs):
@@ -21,6 +21,7 @@ def observe(observer, messages, tools=None, **kwargs):
         tools,
         scope=kwargs.get("scope", ("task", "model")),
         call_kind=kwargs.get("call_kind", "main"),
+        phase=kwargs.get("phase", ""),
     )
 
 
@@ -78,8 +79,34 @@ def test_auxiliary_call_does_not_overwrite_main_baseline():
     )
     assert observe(observer, original)["change"] == "identical"
     assert observe(observer, original, scope=("different-task", "model")) == {
-        "change": "scope_changed"
+        "change": "initial"
     }
+
+
+def test_alternating_scopes_and_phases_preserve_their_own_baselines():
+    observer = PromptPrefixObserver()
+    original = [{"role": "user", "content": "A"}]
+    other = [{"role": "user", "content": "B"}]
+    first = {"scope": ("task", "step-a", "model"), "phase": "assessment"}
+    second = {"scope": ("task", "step-b", "model"), "phase": "assessment"}
+    third = {**first, "phase": "delivery"}
+    assert observe(observer, original, **first)["change"] == "initial"
+    assert observe(observer, other, **second)["change"] == "initial"
+    assert observe(observer, other, **third)["change"] == "initial"
+    assert observe(observer, original + other, **first)["change"] == "append_only"
+    assert observe(observer, other, **second)["change"] == "identical"
+    assert observe(observer, other, **third)["change"] == "identical"
+
+
+def test_observer_evicts_the_least_recently_used_baseline():
+    observer = PromptPrefixObserver()
+    scopes = [(str(i), "model") for i in range(_MAX_BASELINES + 1)]
+    for scope in scopes[:-1]:
+        assert observe(observer, [], scope=scope)["change"] == "initial"
+    assert observe(observer, [], scope=scopes[0])["change"] == "identical"
+    assert observe(observer, [], scope=scopes[-1])["change"] == "initial"
+    assert observe(observer, [], scope=scopes[0])["change"] == "identical"
+    assert observe(observer, [], scope=scopes[1])["change"] == "initial"
 
 
 def test_non_json_observation_does_not_break_calls_or_reuse_old_baseline():
@@ -87,9 +114,8 @@ def test_non_json_observation_does_not_break_calls_or_reuse_old_baseline():
     observe(observer, [])
     assert observe(observer, [{"content": object()}]) == {"change": "unavailable"}
     assert observe(observer, []) == {"change": "initial"}
-    content: Any = "deeply nested tool arguments"
-    for _ in range(sys.getrecursionlimit()):
-        content = [content]
+    content: list[Any] = []
+    content.append(content)
     assert observe(observer, [{"content": content}]) == {"change": "unavailable"}
     assert observe(observer, []) == {"change": "initial"}
 
@@ -100,9 +126,9 @@ def test_snapshot_and_telemetry_do_not_retain_content():
     result = observe(observer, [{"role": "user", "content": secret}])
     assert secret not in repr(observer._previous)
     assert secret not in json.dumps(result)
+    _, fingerprints = next(iter(observer._previous.values()))
     assert all(
-        isinstance(digest, bytes) and len(digest) == 32
-        for digest in observer._previous["main"][2]
+        isinstance(digest, bytes) and len(digest) == 32 for digest in fingerprints
     )
 
 
@@ -143,9 +169,26 @@ async def test_runtime_without_trace_events_skips_observation(tracer):
     assert runtime._prompt_prefix_observer is None
 
 
-def test_prefix_metrics_survive_trace_normalization():
-    observation = {"change": "messages_changed", "first_changed_message_index": 0}
-    result = normalize_llm_trace_payload(
-        {PROMPT_PREFIX_KEY: observation, "response": "large" * 10000}
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_dag_step_keeps_prefix_observation_on_terminal_event(failed):
+    trace = Trace()
+    context = ExecutionContext()
+    runtime = _DAGStepRuntime(
+        parent=PatternRuntime(tracer=trace),
+        dag_pattern=DAGPattern(lambda **_: None),
+        root_context=context,
+        step_id="step-a",
     )
-    assert result[PROMPT_PREFIX_KEY] == observation
+    metadata = {}
+    await runtime.on_llm_start(context=context, messages=[], metadata=metadata)
+    if failed:
+        await runtime.on_llm_error(
+            context=context, error=ValueError("failed"), metadata=metadata
+        )
+    else:
+        await runtime.on_llm_end(context=context, response={}, metadata=metadata)
+    assert [event[PROMPT_PREFIX_KEY] for event in trace.events] == [
+        {"change": "initial"},
+        {"change": "initial"},
+    ]

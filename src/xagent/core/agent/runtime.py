@@ -1610,6 +1610,7 @@ class PatternRuntime:
                     str(event_metadata.get("selected_model") or ""),
                 ),
                 call_kind=call_kind_from_metadata(event_metadata),
+                phase=str(event_metadata.get("phase") or ""),
             )
             if metadata is not None:
                 metadata[PROMPT_PREFIX_KEY] = observation

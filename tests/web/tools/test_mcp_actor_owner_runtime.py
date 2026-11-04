@@ -1100,6 +1100,57 @@ async def test_xero_uses_exact_actor_token(db_session, owner) -> None:
 
 
 @pytest.mark.asyncio
+async def test_actor_composio_facebook_grant_launches_with_composio_env(
+    db_session, monkeypatch
+) -> None:
+    """#3531: Toby's per-actor Facebook grant created through Composio carries
+    token_type="composio"; the actor path must hand the subprocess the
+    Composio values, never the connected-account id as a Meta token."""
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    db, user = db_session.db, db_session.user
+    app = get_builtin_public_mcp_app("facebook")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Facebook Pages",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "facebook", "provider": "meta"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="facebook",
+            resource_owner_key=OWNER_A,
+            provider_user_id="fb-user-1",
+            access_token="ca_123",
+            instance_url="actor-hmac",
+            token_type="composio",
+        )
+    )
+    db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    env = configs[0]["config"]["env"]
+    assert "META_ACCESS_TOKEN" not in env
+    assert env["COMPOSIO_API_KEY"] == "composio-key"
+    assert env["COMPOSIO_CONNECTED_ACCOUNT_ID"] == "ca_123"
+    assert env["COMPOSIO_USER_ID"] == "actor-hmac"
+
+
+@pytest.mark.asyncio
 async def test_actor_builtin_refresh_remains_in_exact_owner_namespace(
     db_session, monkeypatch
 ) -> None:

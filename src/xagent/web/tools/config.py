@@ -5374,6 +5374,7 @@ class WebToolConfig(BaseToolConfig):
             .order_by(MCPServer.id)
         )
 
+<<<<<<< HEAD
     def resolve_connector_team_selection(self) -> Any:
         """Resolve the governing connector team once for this config."""
         from ..services.connector_team_scope import resolve_team_connector_selection_or_raise
@@ -5394,6 +5395,9 @@ class WebToolConfig(BaseToolConfig):
     async def load_mcp_server_config(
         self, server_id: int, *, team_selection: Any | None = None
     ) -> Dict[str, Any] | None:
+=======
+    async def load_mcp_server_config(self, server_id: int) -> Dict[str, Any] | None:
+>>>>>>> origin/main
         """Build one visible server's config exactly as a task would, uncached.
 
         Returns None when the server is not visible to this config's user.
@@ -5402,15 +5406,20 @@ class WebToolConfig(BaseToolConfig):
         """
         if self._user_id is None:
             return None
+<<<<<<< HEAD
         for config in await self._load_mcp_server_configs(
             only_server_id=server_id, team_selection=team_selection
         ):
+=======
+        for config in await self._load_mcp_server_configs(only_server_id=server_id):
+>>>>>>> origin/main
             inner = config.get("config")
             unavailable_id = inner.get("server_id") if isinstance(inner, dict) else None
             if server_id in (config.get("id"), unavailable_id):
                 return config
         return None
 
+<<<<<<< HEAD
     async def load_actor_stdio_config(
         self, app_id: str, *, team_selection: Any | None = None
     ) -> Dict[str, Any] | None:
@@ -5440,6 +5449,10 @@ class WebToolConfig(BaseToolConfig):
 
     async def _load_mcp_server_configs(
         self, *, only_server_id: int | None = None, team_selection: Any | None = None
+=======
+    async def _load_mcp_server_configs(
+        self, *, only_server_id: int | None = None
+>>>>>>> origin/main
     ) -> List[Dict[str, Any]]:
         """Load MCP server configurations visible to this run: the user's
         personal servers, unioned with the governing agent's team-owned
@@ -5462,8 +5475,20 @@ class WebToolConfig(BaseToolConfig):
         # for "the scope could not be resolved". The typed error is what
         # survives the tool-creator frame -- an untyped one is dropped there
         # with a WARNING and no tool set at all.
+<<<<<<< HEAD
         if team_selection is None:
             team_selection = self.resolve_connector_team_selection()
+=======
+        from ..services.connector_team_scope import (
+            resolve_team_connector_selection_or_raise,
+        )
+
+        team_selection = resolve_team_connector_selection_or_raise(
+            self.db,
+            team_id=self._connector_team_id,
+            log_subject=self._user_id,
+        )
+>>>>>>> origin/main
         team_mcp_ids = team_selection.mcp_ids
 
         try:

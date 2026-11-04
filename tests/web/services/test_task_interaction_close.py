@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import textwrap
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import get_args
@@ -998,21 +999,74 @@ def test_active_interaction_id_sync_is_called_from_exactly_four_production_funct
     ]
 
 
-def _is_read_state_check(test: ast.expr) -> bool:
-    """``isinstance(<x>, <one of the three read states>)``."""
-    return (
-        isinstance(test, ast.Call)
-        and isinstance(test.func, ast.Name)
-        and test.func.id == "isinstance"
-        and len(test.args) == 2
-        and isinstance(test.args[1], ast.Name)
-        and test.args[1].id in _READ_STATE_NAMES
+def _names_a_read_state(node: ast.AST) -> bool:
+    """Whether any of the three read states is named anywhere under ``node``,
+    whatever expression or pattern wraps it."""
+    return any(
+        (isinstance(inner, ast.Name) and inner.id in _READ_STATE_NAMES)
+        or (isinstance(inner, ast.Attribute) and inner.attr in _READ_STATE_NAMES)
+        for inner in ast.walk(node)
     )
+
+
+def _read_state_branches(node: ast.AST) -> list[list[ast.stmt]]:
+    """The statement lists ``node`` chooses between, if it branches on a read
+    state: both arms of an ``if``, every case of a ``match``. A check stored in
+    a variable first, or a conditional expression, is not followed."""
+    if isinstance(node, ast.If) and _names_a_read_state(node.test):
+        return [node.body, node.orelse]
+    if isinstance(node, ast.Match) and any(
+        _names_a_read_state(case.pattern)
+        or (case.guard is not None and _names_a_read_state(case.guard))
+        for case in node.cases
+    ):
+        return [case.body for case in node.cases]
+    return []
+
+
+def _returning_read_state_branches(tree: ast.AST) -> list[ast.AST]:
+    """Every node under ``tree`` with a read-state branch that returns."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if any(
+            isinstance(inner, ast.Return)
+            for branch in _read_state_branches(node)
+            for statement in branch
+            for inner in ast.walk(statement)
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if isinstance(read, ActiveInteractionFound):\n    return 1\n",
+        "if isinstance(read, (ActiveInteractionFound, Other)):\n    return 1\n",
+        "if not isinstance(read, ActiveInteractionAbsent):\n    return 1\n",
+        "if isinstance(read, ActiveInteractionFound) and flag:\n    return 1\n",
+        "if type(read) is ActiveInteractionFound:\n    return 1\n",
+        "if isinstance(read, close.ActiveInteractionFound):\n    return 1\n",
+        "if isinstance(read, ActiveInteractionAbsent):\n    pass\nelse:\n    return 1\n",
+        "match read:\n    case ActiveInteractionFound():\n        return 1\n",
+        "match read:\n"
+        "    case close.ActiveInteractionUnavailable(reason=why):\n"
+        "        return 1\n",
+        "match read:\n"
+        "    case state if isinstance(state, ActiveInteractionFound):\n"
+        "        return 1\n",
+    ],
+)
+def test_the_read_state_branch_scan_recognizes_each_way_to_write_the_branch(
+    source: str,
+) -> None:
+    tree = ast.parse(f"def caller(read):\n{textwrap.indent(source, '    ')}")
+    assert _returning_read_state_branches(tree) != []
 
 
 def test_only_resume_task_returns_from_a_branch_on_the_active_interaction_read():
     """Only the resume command seam turns the read's result into a decision
-    that ends the call (a refusal or a skip). The three injection sites
+    that ends the call (a refusal, a skip or a deferral). The three injection sites
     branch on the same result but always go on to inject the message, so
     none of their branches on it returns."""
     returning = set()
@@ -1020,16 +1074,8 @@ def test_only_resume_task_returns_from_a_branch_on_the_active_interaction_read()
         for func in _function_defs(tree):
             if func.name != func_name:
                 continue
-            for node in ast.walk(func):
-                if isinstance(node, ast.If) and _is_read_state_check(node.test):
-                    returns = [
-                        inner
-                        for statement in node.body
-                        for inner in ast.walk(statement)
-                        if isinstance(inner, ast.Return)
-                    ]
-                    if returns:
-                        returning.add((name, func_name))
+            if _returning_read_state_branches(func):
+                returning.add((name, func_name))
     assert returning == {("task_command_execution.py", "resume_task")}
 
 

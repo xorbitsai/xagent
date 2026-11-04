@@ -1105,6 +1105,7 @@ async def test_own_retry_defers_an_unverifiable_read_and_goes_on_after_it(
         record.getMessage()
         for record in caplog.records
         if record.name == commands.__name__
+        and record.levelno == logging.INFO
         and record.getMessage().startswith("Deferring resume")
     ] == [
         f"Deferring resume for task {task_id} run {RUN}: the active interaction "
@@ -1117,6 +1118,31 @@ async def test_own_retry_defers_an_unverifiable_read_and_goes_on_after_it(
     assert retry.outcome is ResumeCommandOutcome.SCHEDULED
     task = _task(factory, task_id)
     assert (task.control_state, task.state_version) == ("resume_requested", PV + 2)
+
+
+@pytest.mark.asyncio
+async def test_a_manual_resume_at_resume_requested_is_refused_not_deferred(
+    factory, handler, monkeypatch
+):
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+    with factory() as db:
+        task_id, _ = _seed(db, control_state="resume_requested", state_version=PV + 1)
+        db.commit()
+        user_id = db.get(Task, task_id).user_id
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+    reply = AsyncMock()
+
+    result = await commands.resume_task(
+        reply,
+        task_id,
+        {"type": "resume_task", "user": SimpleNamespace(id=user_id, is_admin=False)},
+    )
+
+    assert result.outcome is ResumeCommandOutcome.REJECTED
+    assert result.reason_code == "interaction_unverifiable"
+    reply.assert_awaited_once()
 
 
 def _just_after_next_attempt(row: TaskAutoRecovery) -> datetime:

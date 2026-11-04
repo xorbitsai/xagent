@@ -3841,11 +3841,11 @@ async def resume_task(
                 # confirmation and never dispatch another one, leaving the
                 # task in resume_requested. Deferring keeps this command
                 # alive instead, and it writes nothing, so the next attempt
-                # is still its own retry and goes ahead once the read
-                # succeeds. A read that outlasts max_command_defers() fails
-                # the command with the budget's terminal error; housekeeping
-                # then still confirms the moved fence, so the task stays in
-                # resume_requested until someone resumes it.
+                # is still its own retry and is decided again on what that
+                # read returns. A read that outlasts max_command_defers()
+                # fails the command with the budget's terminal error;
+                # housekeeping then still confirms the moved fence, so the
+                # task stays in resume_requested until someone resumes it.
                 logger.info(
                     "Deferring resume for task %s run %s: the active "
                     "interaction read was unavailable (reason=%s) (attempt %s)",

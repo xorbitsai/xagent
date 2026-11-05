@@ -59,6 +59,7 @@ from xagent.web.models.user import User
 from xagent.web.services import chat_history_service
 from xagent.web.services import interaction_rollout as ir
 from xagent.web.services import managed_task_lease as managed
+from xagent.web.services import ops_signals
 from xagent.web.services import task_execution as execution
 from xagent.web.services import task_execution_event_writer, task_interaction_service
 from xagent.web.services.chat_history_service import (
@@ -655,9 +656,14 @@ def test_a_replayed_draft_keeps_its_question(
 
     resumed = _resume_same_run(round_)
     _prepare("resumed", resumed)
+    ops_signals.clear_degradation(ops_signals.INTERACTION_HANDOFF_DEGRADED)
     _finalize("resumed", resumed, _waiting_result())
 
     assert _rows(round_.task_id) == first
+    assert (
+        ops_signals.INTERACTION_HANDOFF_DEGRADED
+        not in ops_signals.active_degradations()
+    )
 
 
 @pytest.mark.parametrize("late", FINALIZERS)

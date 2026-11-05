@@ -1441,11 +1441,13 @@ def test_a_retired_key_cannot_take_back_the_slot(tmp_path: Path) -> None:
             task_id=task_id,
             **_stage_kwargs(anchor, request_idempotency_key=first_key),
         )
-    db.rollback()
-
+    # Read inside the failed call's own transaction: a caller that rolls back
+    # afterwards would hide a reclaim that had already retired the current
+    # question.
     current = _row_state(db, second.staged_db_id)
     assert current.status == "active"
     assert current.active_slot == 1
+    db.rollback()
     assert _row_state(db, first.staged_db_id).terminal_reason == "run_superseded"
     db.close()
 

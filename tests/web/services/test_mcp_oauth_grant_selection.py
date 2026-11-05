@@ -3,8 +3,9 @@ an association row for the server.
 
 A caller without an association is a team member who authorized a shared
 connector themselves. The selector returns nothing for that caller unless the
-call site passes ``allow_team_member_grants=True``. A caller with an
-association is unaffected by the parameter.
+call site passes ``allow_team_member_grants=True``, and even then only grants
+whose resource equals the server's current URL. A caller with an association
+is unaffected by the parameter and by the resource rule.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ def _add_user(db, name: str) -> User:
     return user
 
 
-def _add_server(db) -> MCPServer:
+def _add_server(db, *, url: str | None = MCP_URL) -> MCPServer:
     server = MCPServer.from_config(
         {
             "name": "selection-server",
@@ -58,13 +59,16 @@ def _add_server(db) -> MCPServer:
             "auth": AUTH,
         }
     )
+    server.url = url
     db.add(server)
     db.commit()
     db.refresh(server)
     return server
 
 
-def _add_grant(db, *, server: MCPServer, user: User) -> MCPOAuthGrant:
+def _add_grant(
+    db, *, server: MCPServer, user: User, resource: str = MCP_URL
+) -> MCPOAuthGrant:
     oauth_client = MCPOAuthClient(
         mcp_server_id=server.id,
         issuer=ISSUER,
@@ -82,7 +86,7 @@ def _add_grant(db, *, server: MCPServer, user: User) -> MCPOAuthGrant:
         mcp_oauth_client_id=oauth_client.id,
         resource_owner_key=f"xagent:user:{user.id}",
         issuer=ISSUER,
-        resource=MCP_URL,
+        resource=resource,
         scope="",
         access_token=encrypt_value("selection-access-token"),
         status="active",
@@ -204,19 +208,80 @@ def test_grant_selection_looks_up_association_only_when_the_rule_applies(
     assert len(selected) == (1 if expect_returned else 0)
 
 
+OTHER_URL = "https://other.selection.test/mcp"
+
+
 @pytest.mark.parametrize(
-    ("holds_association", "expect_returned"),
+    (
+        "holds_association",
+        "allow",
+        "server_url",
+        "grant_resource",
+        "expect_returned",
+    ),
     [
-        pytest.param(False, False, id="no_association_not_allowed"),
-        pytest.param(True, True, id="association_holder_gets_grant"),
+        pytest.param(
+            False, False, MCP_URL, MCP_URL, False, id="no_association_not_allowed"
+        ),
+        pytest.param(
+            True, False, MCP_URL, MCP_URL, True, id="association_holder_gets_grant"
+        ),
+        pytest.param(
+            True,
+            True,
+            MCP_URL,
+            OTHER_URL,
+            True,
+            id="association_holder_resource_mismatch",
+        ),
+        # The stored URL is not in canonical form; the grant stores the
+        # canonical resource, so the comparison must canonicalize the URL.
+        pytest.param(
+            False,
+            True,
+            "https://MCP.selection.test:443/mcp/?tenant=1",
+            MCP_URL,
+            True,
+            id="no_association_resource_match",
+        ),
+        pytest.param(
+            False,
+            True,
+            MCP_URL,
+            OTHER_URL,
+            False,
+            id="no_association_resource_mismatch",
+        ),
+        pytest.param(
+            False, True, None, MCP_URL, False, id="no_association_server_url_none"
+        ),
+        # A URL that cannot be parsed matches no stored resource.
+        pytest.param(
+            False,
+            True,
+            "http://[bad/mcp",
+            MCP_URL,
+            False,
+            id="no_association_server_url_unparsable",
+        ),
     ],
 )
 def test_grant_selection_resource_rule_for_callers_without_association(
-    db_session, holds_association: bool, expect_returned: bool
+    db_session,
+    holds_association: bool,
+    allow: bool,
+    server_url: str | None,
+    grant_resource: str,
+    expect_returned: bool,
 ) -> None:
     user = _add_user(db_session, "selection-member")
-    server = _add_server(db_session)
-    grant = _add_grant(db_session, server=server, user=user)
+    # A second connector with a different URL exists in every case, so the
+    # server's current URL has to be read for this connector only.
+    _add_other_server(db_session)
+    server = _add_server(db_session, url=server_url)
+    grant = _add_grant(db_session, server=server, user=user, resource=grant_resource)
+    # An association counts whatever its is_active flag says, so a holder is
+    # exercised with both values; a caller without one runs once.
     association_states = [True, False] if holds_association else [None]
     for is_active in association_states:
         if is_active is not None:
@@ -236,6 +301,7 @@ def test_grant_selection_resource_rule_for_callers_without_association(
             user_id=user.id,
             auth_config=AUTH,
             resource_owner_key=f"xagent:user:{user.id}",
+            allow_team_member_grants=allow,
         )
 
         assert [g.id for g in selected] == ([grant.id] if expect_returned else [])

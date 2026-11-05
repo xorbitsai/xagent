@@ -928,8 +928,14 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     grants selected under another owner key (an actor policy) are returned as
     before.
     A missing owner key is treated as the caller's own default key.
+
+    Under the same owner-key condition, and when ``allow_team_member_grants``
+    is true, a caller who holds no association for the server gets only grants
+    whose resource equals the server's current URL: their tokens are sent to
+    that URL, and the URL is controlled by the server's owner, not by the
+    grant holder.
     """
-    from ..models.mcp import UserMCPServer
+    from ..models.mcp import MCPServer, UserMCPServer
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
@@ -992,9 +998,19 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         .first()
         is not None
     )
-    if holds_association or allow_team_member_grants:
+    if holds_association:
         return list(grants)
-    return []
+    if not allow_team_member_grants:
+        return []
+    server_url = db.query(MCPServer.url).filter(MCPServer.id == server_id).scalar()
+    if not server_url:
+        return []
+    try:
+        current_resource = _canonical_resource(str(server_url))
+    except ValueError:
+        # A URL that cannot be parsed matches no stored resource.
+        return []
+    return [grant for grant in grants if grant.resource == current_resource]
 
 
 async def _discover_with_client(  # noqa: PLR0913

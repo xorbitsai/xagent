@@ -38,7 +38,9 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import String
+from sqlalchemy import cast as sa_cast
+from sqlalchemy import literal, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -60,7 +62,12 @@ from ...core.tools.adapters.vibe.signed_upload import (
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
-from ...core.utils.encryption import decrypt_value, encrypt_value
+from ...core.utils.encryption import (
+    EncryptionDecodeError,
+    decrypt_value,
+    decrypt_value_strict,
+    encrypt_value,
+)
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
@@ -2333,6 +2340,100 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
             setattr(server, db_field, value)
 
 
+# The auth keys that decide where a granted token is sent and which OAuth client
+# it was issued to. They are exactly the keys the OAuth code reads, apart from
+# ``scope`` and ``required_scope``: scope-insufficient grants are already
+# excluded by grant selection.
+_MEMBER_GRANT_BINDING_AUTH_KEYS: tuple[str, ...] = (
+    "type",
+    "resource",
+    "resource_metadata_url",
+    "issuer",
+    "client_id",
+    "client_secret",
+    "token_endpoint_auth_method",
+    "redirect_uri",
+)
+
+
+def _member_grant_binding(server: MCPServer) -> tuple[tuple[Any, ...], bool]:
+    """Return what a team member's grant on ``server`` is bound to.
+
+    The first element is the stored URL text (whitespace-stripped, not
+    normalized) followed by the values of ``_MEMBER_GRANT_BINDING_AUTH_KEYS``.
+    The second element is true when a sensitive value could not be decrypted.
+    Sensitive values are decrypted strictly: ``decrypt_value`` hands back the
+    ciphertext when it cannot open it, which would make two different secrets
+    look equal.
+    """
+    stored_auth: Any = server.auth
+    auth: dict[str, Any] = stored_auth if isinstance(stored_auth, dict) else {}
+    decrypt_failed = False
+    values: list[Any] = []
+    for key in _MEMBER_GRANT_BINDING_AUTH_KEYS:
+        value = auth.get(key)
+        if key in SENSITIVE_AUTH_FIELDS and isinstance(value, str) and value:
+            try:
+                value = decrypt_value_strict(value)
+            except EncryptionDecodeError:
+                value = None
+                decrypt_failed = True
+        values.append(value)
+    # ``strip()`` is defensive: the route already strips the URL before it is
+    # written back, so stored values carry no surrounding whitespace.
+    return ((str(server.url or "").strip(), *values), decrypt_failed)
+
+
+def _delete_team_path_mcp_oauth_state(db: Session, *, server_id: int) -> None:
+    """Delete the team-path OAuth flows and grants of one connector.
+
+    A team-path row belongs to a user who holds no association for the server
+    and whose ``resource_owner_key`` is their own default key. Grants are
+    deleted in any status. Rows are locked in id order before they are
+    deleted, flows first. Team visibility is not consulted: once the binding
+    changed, every such grant is stale. The caller owns the transaction.
+    The deleted counts are only logged.
+    """
+
+    def _delete(model: Any) -> int:
+        holds_association = (
+            db.query(UserMCPServer.id)
+            .filter(
+                UserMCPServer.user_id == model.user_id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .exists()
+        )
+        ids = [
+            row_id
+            for (row_id,) in db.query(model.id)
+            .filter(
+                model.mcp_server_id == server_id,
+                ~holds_association,
+                model.resource_owner_key
+                == literal("xagent:user:") + sa_cast(model.user_id, String),
+            )
+            .order_by(model.id)
+            .with_for_update()
+            .all()
+        ]
+        if not ids:
+            return 0
+        db.query(model).filter(model.id.in_(ids)).delete(synchronize_session=False)
+        return len(ids)
+
+    flows = _delete(MCPOAuthFlowState)
+    grants = _delete(MCPOAuthGrant)
+    if flows or grants:
+        logger.info(
+            "Deleted team-path MCP OAuth state after a definition change: "
+            "server_id=%s flows=%d grants=%d",
+            server_id,
+            flows,
+            grants,
+        )
+
+
 def _parse_config_field(
     field_name: str, value: Any, transport: str | None = None
 ) -> Any:
@@ -3145,7 +3246,9 @@ def _local_mcp_can_attach(
       ``select_mcp_oauth_grants`` also matches resource, issuer,
       ``resource_owner_key``, ``client_id`` and a scope subset. Auth-config
       edits do not reconcile grants (#1388); narrowing belongs there, not in a
-      fourth copy of that predicate here.
+      fourth copy of that predicate here. (Grants of users who hold no
+      association are the exception: a definition edit that changes where
+      tokens go deletes them in ``update_mcp_server``.)
     - The resolver hook is probed for presence, not for this provider and
       user -- see ``oauth_token_resolver_installed``.
     """
@@ -5107,6 +5210,7 @@ def update_mcp_server(
                 )
 
             # Update server fields (global config; no-op values for non-owners)
+            binding_before, decrypt_failed_before = _member_grant_binding(server)
             try:
                 _update_server_from_config(server, config)
             except ValueError as exc:
@@ -5115,6 +5219,20 @@ def update_mcp_server(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid environment variables: {exc}",
                 ) from exc
+            binding_after, decrypt_failed_after = _member_grant_binding(server)
+            # Compared as written, not through a sentinel for "could not
+            # decrypt": a sentinel equals itself, so a secret that is
+            # unreadable both before and after would look unchanged. When
+            # either side cannot be read, the change cannot be ruled out and
+            # the team-path state is deleted. This runs in the transaction
+            # that holds the definition row lock; the route's commit below
+            # makes the write and the deletion one change.
+            if (
+                decrypt_failed_before
+                or decrypt_failed_after
+                or binding_before != binding_after
+            ):
+                _delete_team_path_mcp_oauth_state(db, server_id=int(server.id))
             if can_edit_global:
                 orm_server = cast(Any, server)
                 if "runtime_input_schema" in fields_set:

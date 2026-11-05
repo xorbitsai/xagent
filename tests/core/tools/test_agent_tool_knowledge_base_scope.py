@@ -9,11 +9,12 @@ run right after that point.
 Workforce delegation reaches a worker through the run snapshot's allowlist
 without re-checking the runner's current access to it, so the governing
 team is only granted on that branch while the runner can still run the
-agent directly; otherwise the delegated run gets no knowledge tools at all.
+agent directly; otherwise the delegation fails visibly.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
@@ -28,7 +29,9 @@ from xagent.core.tools.adapters.vibe.document_search import KnowledgeSearchTool
 from xagent.web.models import Base, User
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.services import agent_team_scope
+from xagent.web.services.agent_access import can_user_run_agent_now
 from xagent.web.services.agent_team_scope import AgentTeamScope
+from xagent.web.services.llm_utils import _load_agent_for_task_runtime
 from xagent.web.services.workforce_access import (
     WorkforcePolicy,
     set_workforce_policy,
@@ -172,18 +175,25 @@ async def _search_kwargs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runner", ["creator", "team_member"])
 async def test_team_agent_delegation_resolves_against_the_agents_team(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, runner: str
 ) -> None:
-    session_factory, agent_id, creator_id, _ = _seed(
+    session_factory, agent_id, creator_id, runner_id = _seed(
         team_id=T1, knowledge_bases=["kb1"]
     )
+    if runner == "team_member":
+        # A teammate delegating the team's agent: the ordinary (non-workforce)
+        # query admits it through the live team-visible ownership clause.
+        agent_team_scope.set_agent_team_scope_hook(
+            lambda _db, user_id: AgentTeamScope(team_id=T1, is_team_admin=False)
+        )
 
     captured, _ = await _delegate(
         monkeypatch,
         session_factory=session_factory,
         agent_id=agent_id,
-        runner_id=creator_id,
+        runner_id=creator_id if runner == "creator" else runner_id,
     )
 
     tool_config = captured["instance"]
@@ -287,28 +297,104 @@ async def test_workforce_delegation_with_current_access_uses_agents_team(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("agent_team_id", "runner_scope", "visibility"),
+    ("agent_team_id", "runner_scope", "visibility", "status", "policy_visible"),
     [
         # The runner left the agent's team after the workforce run started.
-        (T1, None, "team"),
+        (T1, None, "team", AgentStatus.PUBLISHED, False),
         # The agent was moved to a team the runner has never belonged to.
-        (T2, AgentTeamScope(team_id=T1, is_team_admin=False), "team"),
+        (
+            T2,
+            AgentTeamScope(team_id=T1, is_team_admin=False),
+            "team",
+            AgentStatus.PUBLISHED,
+            False,
+        ),
         # The agent was narrowed to team admins; the runner is not one.
-        (T1, AgentTeamScope(team_id=T1, is_team_admin=False), "admins"),
+        (
+            T1,
+            AgentTeamScope(team_id=T1, is_team_admin=False),
+            "admins",
+            AgentStatus.PUBLISHED,
+            False,
+        ),
+        # Policy-visible but admins-only: policy visibility never admits an
+        # admins-only agent to a non-member.
+        (T1, None, "admins", AgentStatus.PUBLISHED, True),
+        # Policy-visible but a draft: only published agents run through the
+        # policy-visible branch.
+        (T1, None, "team", AgentStatus.DRAFT, True),
     ],
 )
-async def test_workforce_delegation_without_current_access_gets_no_knowledge_tools(
+async def test_workforce_delegation_without_current_access_fails(
     monkeypatch: pytest.MonkeyPatch,
     agent_team_id: int,
     runner_scope: Optional[AgentTeamScope],
     visibility: str,
+    status: AgentStatus,
+    policy_visible: bool,
 ) -> None:
     session_factory, agent_id, _, runner_id = _seed(
-        team_id=agent_team_id, knowledge_bases=["kb1"], visibility=visibility
+        team_id=agent_team_id,
+        knowledge_bases=["kb1"],
+        visibility=visibility,
+        status=status,
     )
     agent_team_scope.set_agent_team_scope_hook(
         lambda _db, user_id: runner_scope if user_id == runner_id else None
     )
+    if policy_visible:
+        set_workforce_policy(_VisibleAgentPolicy(agent_id))
+
+    traced: list[tuple[str, Optional[str], Optional[str]]] = []
+
+    async def _record_trace(
+        self: AgentTool,
+        status: str,
+        execution_task_id: Optional[str] = None,
+        output: Optional[str] = None,
+        error: Optional[str] = None,
+        file_outputs: Any = None,
+    ) -> None:
+        traced.append((status, execution_task_id, error))
+
+    monkeypatch.setattr(AgentTool, "_trace_delegation", _record_trace)
+
+    captured, result = await _delegate(
+        monkeypatch,
+        session_factory=session_factory,
+        agent_id=agent_id,
+        runner_id=runner_id,
+        workforce=True,
+    )
+
+    # Neither the team's knowledge bases nor the runner's own same-named
+    # ones: the delegation fails with a reason the parent can see, and the
+    # delegation trace that was started is closed with that same error.
+    expected = (
+        f"Error: Agent {agent_id} declares team knowledge bases, but the "
+        "current user can no longer run this agent"
+    )
+    assert result["is_error"] is True
+    assert result["error"] == expected
+    assert [status for status, _, _ in traced] == ["start", "error"]
+    start_id, error_id = traced[0][1], traced[1][1]
+    assert start_id is not None and error_id == start_id
+    assert traced[1][2] == expected
+    assert "instance" not in captured
+
+
+@pytest.mark.asyncio
+async def test_workforce_delegation_with_empty_declaration_skips_the_access_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty declaration builds no knowledge tool, so it needs no team and
+    no access check: a broken check must not fail this delegation."""
+    session_factory, agent_id, _, runner_id = _seed(team_id=T1, knowledge_bases=[])
+
+    def _broken_scope(_db: Any, _user_id: int) -> AgentTeamScope:
+        raise RuntimeError("team scope unavailable")
+
+    agent_team_scope.set_agent_team_scope_hook(_broken_scope)
 
     captured, _ = await _delegate(
         monkeypatch,
@@ -320,7 +406,6 @@ async def test_workforce_delegation_without_current_access_gets_no_knowledge_too
 
     tool_config = captured["instance"]
     assert tool_config.get_knowledge_base_team_id() is None
-    assert tool_config.get_allowed_collections() == []
     assert await knowledge_tools._create_knowledge_tools_impl(tool_config) == []
 
 
@@ -348,3 +433,84 @@ async def test_workforce_delegation_fails_when_the_access_check_cannot_run(
     assert result["success"] is False
     assert "team scope unavailable" in str(result)
     assert "instance" not in captured
+
+
+def test_can_user_run_agent_now_matches_the_direct_run_loader() -> None:
+    """``can_user_run_agent_now`` must admit exactly the agents the direct-run
+    task loader admits for a non-workforce task, across owned, team-visible,
+    admins-only, draft, policy-visible and invisible agents, and for a runner
+    whose user row no longer exists. Workforce-generated manager agents are
+    outside this matrix: callers exclude them in their own agent query."""
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine)
+    deleted_runner_id = 9999
+
+    with session_factory() as db:
+        runner = User(username="parity-runner", password_hash="hash")
+        other = User(username="parity-other", password_hash="hash")
+        db.add_all([runner, other])
+        db.flush()
+
+        def _agent(**fields: Any) -> Agent:
+            defaults: dict[str, Any] = {
+                "user_id": other.id,
+                "team_id": None,
+                "visibility": "team",
+                "name": f"parity-{len(db.new)}",
+                "status": AgentStatus.PUBLISHED,
+                "execution_mode": "balanced",
+                "models": {"general": 1},
+                "knowledge_bases": ["kb1"],
+                "skills": [],
+                "tool_categories": ["knowledge"],
+            }
+            defaults.update(fields)
+            row = Agent(**defaults)
+            db.add(row)
+            return row
+
+        agents = [
+            _agent(user_id=runner.id),  # runner's own personal agent
+            _agent(team_id=T1),  # team-visible in the runner's team
+            _agent(team_id=T1, visibility="admins"),  # admins-only
+            _agent(team_id=T1, status=AgentStatus.DRAFT),  # team draft
+            _agent(team_id=T2),  # other team, policy-visible
+            _agent(team_id=T2, status=AgentStatus.DRAFT),  # policy-visible draft
+            _agent(team_id=T2, visibility="admins"),  # policy-visible admins-only
+            _agent(team_id=T2),  # other team, invisible
+            _agent(),  # someone else's personal agent, invisible
+        ]
+        db.commit()
+        policy_visible = {int(a.id) for a in agents[4:7]}
+        agent_ids = [int(a.id) for a in agents]
+        runner_id = int(runner.id)
+
+    agent_team_scope.set_agent_team_scope_hook(
+        lambda _db, user_id: (
+            AgentTeamScope(team_id=T1, is_team_admin=False)
+            if user_id == runner_id
+            else None
+        )
+    )
+
+    class _Policy(WorkforcePolicy):
+        def get_visible_agent_ids(self, db: Any, user: Any, purpose: str) -> set[int]:
+            return policy_visible
+
+    set_workforce_policy(_Policy())
+
+    with session_factory() as db:
+        for user_id in (runner_id, deleted_runner_id):
+            for agent_id in agent_ids:
+                agent = db.query(Agent).filter(Agent.id == agent_id).one()
+                task_row = SimpleNamespace(agent_id=agent_id, user_id=user_id)
+                direct = _load_agent_for_task_runtime(db, task_row, None) is not None
+                assert can_user_run_agent_now(db, user_id, agent) is direct, (
+                    user_id,
+                    agent_id,
+                )

@@ -221,7 +221,10 @@ def can_user_run_agent_now(db: Session, user_id: int, agent: Agent) -> bool:
     since, which is exactly what that exemption skips.
 
     Hook failures (team scope, visibility policy) propagate; they are never
-    read as access.
+    read as access. Workforce-generated manager agents are not excluded here
+    (the direct-run loader rejects them outside their own workforce); the
+    caller's agent query is expected to have filtered them out already, as
+    the delegation query does.
     """
     if owns_agent(agent, int(user_id), get_agent_team_scope(db, int(user_id))):
         return True

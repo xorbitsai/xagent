@@ -1884,9 +1884,9 @@ class WebToolConfig(BaseToolConfig):
         # the two decisions can differ: the direct-run path opens both onto
         # the same team, while delegated sub-agents keep connectors closed
         # and still resolve knowledge bases against the delegated agent's
-        # team -- left ``None`` there for a personal agent, an absent
-        # declaration, or a workforce allowlist hop whose runner can no
-        # longer run the agent.
+        # team -- left ``None`` there for a personal agent or an absent or
+        # empty declaration (a workforce allowlist hop whose runner can no
+        # longer run the agent fails before any config is built).
         self._knowledge_base_team_id = knowledge_base_team_id
         # The governing agent's creator -- always the same agent as
         # ``_knowledge_base_team_id`` above, populated by the same caller.

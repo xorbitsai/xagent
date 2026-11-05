@@ -263,7 +263,11 @@ def _apply_agent_visibility_filters(
     # Cross-user execution is only valid for explicit allowlists. Global
     # discovery and direct execution stay scoped to what the user owns, which
     # under a team scope means team-visible agents (admins-only stay hidden).
-    if not allow_cross_user_agent_ids or normalized_allowed_agent_ids is None:
+    # The skip condition lives in one helper so callers that must re-check
+    # rows admitted without ownership read the same decision.
+    if not _visibility_filters_skip_ownership(
+        allowed_agent_ids, allow_cross_user_agent_ids
+    ):
         query = query.filter(
             owned_agent_clause(user_id, get_agent_team_scope(db, user_id))
         )
@@ -280,10 +284,10 @@ def _visibility_filters_skip_ownership(
     """Whether ``_apply_agent_visibility_filters`` admits a row without the
     live ``owned_agent_clause`` for these arguments.
 
-    Mirrors the branch condition there: an explicit allowlist together with
-    cross-user execution (a workforce run's snapshot allowlist). A row loaded
-    that way was authorized when the allowlist was built, not re-checked
-    when it is read.
+    The filter itself branches on this helper: an explicit allowlist
+    together with cross-user execution (a workforce run's snapshot
+    allowlist). A row loaded that way was authorized when the allowlist was
+    built, not re-checked when it is read.
     """
     return bool(allow_cross_user_agent_ids) and (
         _normalize_agent_ids(allowed_agent_ids) is not None
@@ -2474,18 +2478,24 @@ class AgentTool(AbstractBaseTool):
                         # visibility, or the runner may have left the team
                         # since the run started. Granting the agent's team
                         # here would read that team's documents on access
-                        # nobody re-verified, so the delegated run gets no
-                        # knowledge tools instead -- not the runner's own
-                        # same-named collections either.
-                        logger.warning(
-                            "Delegated agent %s: runner %s can no longer run "
-                            "it directly; building no knowledge tools",
-                            self._agent_id,
-                            self._user_id,
+                        # nobody re-verified, and resolving its declared
+                        # names against the runner would read the runner's
+                        # own same-named collections instead. Running it
+                        # without knowledge tools would hide that from the
+                        # parent agent, the trace and the user, so the
+                        # delegation fails visibly.
+                        error_msg = (
+                            f"Error: Agent {self._agent_id} declares team "
+                            "knowledge bases, but the current user can no "
+                            "longer run this agent"
                         )
-                        agent_knowledge_bases = []
-                    else:
-                        knowledge_base_team_id = int(agent.team_id)
+                        await self._trace_delegation(
+                            "error",
+                            execution_task_id=execution_task_id,
+                            error=error_msg,
+                        )
+                        return _classified_failure(error_msg)
+                    knowledge_base_team_id = int(agent.team_id)
 
                 # Resolve models
                 storage = UserAwareModelStorage(db)
@@ -2640,9 +2650,9 @@ class AgentTool(AbstractBaseTool):
                 # the delegated agent's own team, its creator and its stored
                 # declaration -- the same three values the direct-run path
                 # supplies. The team is unset for a personal agent or an
-                # absent declaration, and on a workforce allowlist hop whose
-                # runner can no longer run the agent the declaration is
-                # emptied, so no knowledge tool is built.
+                # absent or empty declaration; a workforce allowlist hop
+                # whose runner can no longer run the agent has already
+                # failed in Phase 1.
                 knowledge_base_team_id=knowledge_base_team_id,
                 agent_creator_user_id=agent_creator_user_id,
                 declared_knowledge_bases=agent_knowledge_bases,

@@ -5,8 +5,10 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches: [main]
+  # No `push` trigger: the merge queue already ran this workflow on the exact
+  # commit it moves main to. main-push-check.yml calls it, through
+  # workflow_call, for a push that did not come through the queue.
+  workflow_call:
   # Required once "CI Summary" is a required status check and a merge queue is
   # enabled: without this the context is never reported on a merge group, its
   # entries time out, and every merge stalls. Harmless before a queue exists --
@@ -43,7 +45,7 @@ jobs:
       # every pull request fails here. Fail-closed, but total -- do not drop it.
       pull-requests: read
     outputs:
-      # Non-pull_request events (merge_group, push to main, workflow_dispatch)
+      # Non-pull_request events (merge_group, workflow_dispatch)
       # never filter. The merge queue is the last gate before main and has to
       # behave exactly as it did before this job existed, which also makes it
       # the safety net for anything the pull-request filters get wrong.

@@ -30,7 +30,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,13 @@ from xagent.web.services import task_execution_event_writer, task_interaction_se
 from xagent.web.services.chat_history_service import (
     persist_assistant_message_no_commit,
 )
+from xagent.web.services.task_execution_controller import (
+    TaskControlState,
+    transition_task_control_state_sync,
+)
+from xagent.web.services.task_interaction_close import (
+    close_legacy_resume_interaction_sync,
+)
 from xagent.web.services.task_interaction_service import InteractionPrincipalKind
 from xagent.web.services.task_lease_service import (
     TASK_RUN_ID_TRACE_FIELD,
@@ -73,6 +80,9 @@ from xagent.web.services.task_lease_service import (
 
 SOURCE = "sdk"
 QUESTION = "Which color do you want?"
+SECOND_QUESTION = "Which size do you want?"
+SECOND_EVENT_ID = "22222222-2222-4222-8222-222222222222"
+LATE_EVENT_ID = "33333333-3333-4333-8333-333333333333"
 FINALIZERS = ["fresh", "resumed", "channel"]
 TASK_EXECUTION_FINALIZERS = ["fresh", "resumed"]
 DECISION_PREFIX = "rollout.decision."
@@ -221,6 +231,77 @@ def _finalize(
 def _prepare(finalizer: str, round_: Round) -> None:
     if finalizer != "channel":
         _commit_transcript_question(round_)
+
+
+def _second_question_result(
+    round_: Round,
+    *,
+    message: str = SECOND_QUESTION,
+    event_id: str = SECOND_EVENT_ID,
+) -> dict[str, Any]:
+    """What a run that asks again after its first question returns: a new
+    checkpoint, the legacy question row the outbound event commits, and a
+    waiting result whose draft carries a new ``event_id``."""
+    with get_session_local()() as db:
+        checkpoint = TraceEvent(
+            task_id=round_.task_id,
+            event_id=f"checkpoint-{round_.task_id}-{event_id}",
+            event_type="system_update_general",
+            timestamp=datetime.now(timezone.utc),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                TASK_RUN_ID_TRACE_FIELD: round_.lease.run_id,
+            },
+        )
+        db.add(checkpoint)
+        db.flush()
+        db.get(Task, round_.task_id).last_checkpoint_trace_event_id = checkpoint.id
+        db.add(
+            TaskChatMessage(
+                task_id=round_.task_id,
+                user_id=round_.user_id,
+                role="assistant",
+                content=message,
+                message_type=chat_history_service.QUESTION_MESSAGE_TYPE,
+            )
+        )
+        db.commit()
+    draft = _draft(
+        message=message,
+        event_id=event_id,
+        turn_message_count=5,
+        origin_step_id="step-2",
+    )
+    return _waiting_result(output=message, clarification_draft=draft)
+
+
+def _resume_same_run(round_: Round, *, close_id: int | None = None) -> Round:
+    """Accept an answer on the round's run and resume it: the resume is
+    requested, the legacy close runs with the id the message observed
+    (``None`` when it observed no question), and a new lease attempt is
+    taken the way the resumed execution takes it."""
+    transition_task_control_state_sync(
+        round_.task_id,
+        TaskControlState.RESUME_REQUESTED,
+        expected_run_id=round_.lease.run_id,
+        fence_live_owner=True,
+        owner_lease=round_.lease,
+        expected_state_version=None,
+        refuse_terminal_status=True,
+    )
+    close_legacy_resume_interaction_sync(
+        task_id=round_.task_id,
+        run_id=str(round_.lease.run_id),
+        interaction_id=close_id,
+    )
+    lease = execution._acquire_resume_task_lease(
+        round_.task_id,
+        round_.user_id,
+        round_.lease.run_id,
+        refuse_terminal_status=True,
+    )
+    assert lease is not None
+    return replace(round_, lease=lease)
 
 
 @dataclass(frozen=True)
@@ -520,7 +601,8 @@ def test_resume_requested_wait_is_not_published(
 ) -> None:
     """Covers one ordering only: the resume was requested before the
     finalizer took the task row's lock. The ``running`` cells are the
-    control: the same round publishes."""
+    control: the same round publishes. The other ordering is covered by
+    tests/web/api/test_message_answer_publication_race.py."""
     _native(monkeypatch)
     round_ = _seed_round()
     _prepare(finalizer, round_)
@@ -542,6 +624,100 @@ def test_resume_requested_wait_is_not_published(
     if finalizer == "fresh":
         assert observed.control_state == "resume_requested"
         assert observed.status == TaskStatus.WAITING_FOR_USER
+
+
+def _rows(task_id: int) -> list[tuple[int, str, str | None, str]]:
+    with get_session_local()() as db:
+        return [
+            (
+                int(row.id),
+                str(row.status),
+                row.terminal_reason,
+                str(row.request_idempotency_key),
+            )
+            for row in db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.task_id == task_id)
+            .order_by(TaskInteractionRequest.id)
+        ]
+
+
+def test_a_replayed_draft_keeps_its_question(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume that waits again on the same draft republishes the same
+    question: the publication replays its row instead of retiring it."""
+    _native(monkeypatch)
+    round_ = _seed_round()
+    _prepare("fresh", round_)
+    _finalize("fresh", round_, _waiting_result())
+    first = _rows(round_.task_id)
+    assert [(status, reason) for _, status, reason, _ in first] == [("active", None)]
+
+    resumed = _resume_same_run(round_)
+    _prepare("resumed", resumed)
+    _finalize("resumed", resumed, _waiting_result())
+
+    assert _rows(round_.task_id) == first
+
+
+@pytest.mark.parametrize("late", FINALIZERS)
+def test_a_superseded_attempt_cannot_retire_the_current_question(
+    database, monkeypatch: pytest.MonkeyPatch, late: str
+) -> None:
+    """A finalizer from an older attempt of the task's run is turned away
+    before it publishes, so it cannot retire the question the current
+    attempt published."""
+    _native(monkeypatch)
+    first = _seed_round()
+    _prepare("fresh", first)
+    _finalize("fresh", first, _waiting_result())
+    second = _resume_same_run(first)
+    assert second.lease.attempt_id != first.lease.attempt_id
+    _prepare("resumed", second)
+    _finalize("resumed", second, _second_question_result(second))
+    before = _rows(first.task_id)
+    assert [(status, reason) for _, status, reason, _ in before] == [
+        ("terminated", "run_superseded"),
+        ("active", None),
+    ]
+
+    _resume_same_run(second)
+    _finalize(late, first, _second_question_result(first, event_id=LATE_EVENT_ID))
+
+    assert _rows(first.task_id) == before
+
+
+def test_a_close_that_lost_to_the_next_question_leaves_it_active(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close that observed the first question is bound to its id. When
+    the next question has already retired that row, the close matches
+    nothing and the new question stays active with its marker."""
+    _native(monkeypatch)
+    first = _seed_round()
+    _prepare("fresh", first)
+    _finalize("fresh", first, _waiting_result())
+    ((first_id, _, _, _),) = _rows(first.task_id)
+
+    resumed = _resume_same_run(first, close_id=None)
+    _prepare("resumed", resumed)
+    _finalize("resumed", resumed, _second_question_result(resumed))
+    rowcount = close_legacy_resume_interaction_sync(
+        task_id=first.task_id, run_id=str(first.lease.run_id), interaction_id=first_id
+    )
+
+    assert rowcount == 0
+    rows = _rows(first.task_id)
+    assert [(status, reason) for _, status, reason, _ in rows] == [
+        ("terminated", "run_superseded"),
+        ("active", None),
+    ]
+    assert rows[0][0] == first_id
+    observed = _observe(first.task_id)
+    assert observed.marker == 1
+    with get_session_local()() as db:
+        assert_marker_residue(db, task_id=first.task_id, run_id=first.lease.run_id)
+        assert_interaction_marker_invariant(db, task_id=first.task_id)
 
 
 # --------------------------------------------------------------------------

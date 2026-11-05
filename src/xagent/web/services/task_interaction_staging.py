@@ -260,6 +260,10 @@ class InteractionSlotTaken(InteractionHandoffError):
     exception is also what a programming error that skipped the
     plain-Python validation block would surface as. See the module
     docstring's misclassification-funnel paragraph.
+
+    Step 4 retires every other active row first, so a real slot conflict takes a
+    concurrent publisher's row that step 4 could not see. The finalizers' task
+    row lock excludes that among themselves.
     """
 
 
@@ -814,20 +818,46 @@ def _identity_lookup_stmt(
     )
 
 
-def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.Update:
+def _reclaim_stale_slot_stmt(
+    *, task_id: int, run_id: str, request_idempotency_key: str, now: datetime
+) -> sa.Update:
     """The reclaim UPDATE (step 4). Stays in the caller's outer transaction,
     not this function's inner savepoint -- it dies with the whole handoff on
     rollback, and the post-conflict re-check must not have undone it.
 
+    Retires the task's active row unless it is this call's own identity
+    (``run_id`` and ``request_idempotency_key``) and still within its deadline.
+    A row under another key on the same run is a question the run has moved
+    past. Only the lease's current execution reaches this statement, and an
+    execution that asks again is no longer blocked on the question before it.
+    The close that should have retired that row may have matched nothing: it
+    binds the id read before its injection, and a row published after that read
+    is out of its reach. Publication therefore cannot depend on that close
+    having run, and must not fail because of the row it left behind.
+
+    The key term keeps this call off its own row. Step 3 replays a row with this
+    identity, so the term only matters when step 3 missed a row committed since;
+    step 6 then has to find that row still active to replay it.
+
+    Within one task coordinator executions share an attempt id, so the attempt
+    fence does not separate an older execution from its successor there. They
+    are ordered instead: a resume waits for the previous execution
+    (``execute_resume_background``'s ``previous_task``) and the resume slot admits
+    one successor at a time, so an older execution's finalizer cannot run after a
+    newer one's and retire its question.
+
+    ``run_superseded`` on the same run means what it means for the question
+    cancel: the asking run no longer holds this slot for that question. It does
+    not claim an answer. Nothing here knows whether one arrived, which is why
+    this is not ``answered_via_legacy_resume``.
+
     Branch order is load-bearing: cross-run supersession takes priority over
-    plain expiry when a row is both (``run_id <> :reclaim_run_id`` is
-    checked before falling through to ``deadline_elapsed``).
+    plain expiry when a row is both, and a same-run row that has expired reads
+    as ``deadline_elapsed`` rather than superseded.
 
     ``terminal_reason`` is built with ``sa.case``, not ``sa.text`` -- Core
     compiles and parameterizes ``run_id`` on both backends without any raw
-    SQL fragment, verified equivalent to the earlier hand-written ``CASE
-    WHEN run_id <> :reclaim_run_id THEN 'run_superseded' ELSE
-    'deadline_elapsed' END``. The only remaining ``sa.text`` usage in this
+    SQL fragment. The only remaining ``sa.text`` usage in this
     module is ``interaction_handoff``'s SQLite-only savepoint guard, which
     needs no parameter because its predicate is a hardcoded constant, not
     caller input.
@@ -852,17 +882,25 @@ def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.
             sa.or_(
                 TaskInteractionRequest.expires_at <= now,
                 TaskInteractionRequest.run_id != run_id,
+                TaskInteractionRequest.request_idempotency_key
+                != request_idempotency_key,
             ),
         )
         .values(
             status="terminated",
             terminal_reason=sa.case(
                 (TaskInteractionRequest.run_id != run_id, "run_superseded"),
-                else_="deadline_elapsed",
+                (TaskInteractionRequest.expires_at <= now, "deadline_elapsed"),
+                else_="run_superseded",
             ),
             active_slot=None,
             terminated_at=now,
             updated_at=now,
+        )
+        .returning(
+            TaskInteractionRequest.id,
+            TaskInteractionRequest.run_id,
+            TaskInteractionRequest.terminal_reason,
         )
     )
 
@@ -983,10 +1021,10 @@ def stage_interaction_request(
        ``answered`` or ``terminated`` raises ``InteractionRequestClosed``:
        identity is scoped by ``run_id``, so a key reclaimed to
        ``terminated`` earlier in *this same run* still raises here on reuse.
-    4. Reclaim: retire this task's stale or run-superseded active row, if
-       any, in the same outer transaction as everything else -- not inside
-       the inner savepoint opened next, so a post-conflict re-check below
-       cannot undo it.
+    4. Reclaim: retire this task's active row, if any, unless step 3 would have
+       replayed it (see ``_reclaim_stale_slot_stmt``), in the same outer
+       transaction as everything else -- not inside the inner savepoint opened
+       next, so a post-conflict re-check below cannot undo it.
     5. Insert the new active row inside a savepoint this function opens and
        owns (``db.begin_nested()``), then flush. A savepoint shared with a
        caller (or with ``interaction_handoff``'s own savepoint) does not
@@ -1100,10 +1138,25 @@ def stage_interaction_request(
     if replay is not None:
         return replay
 
-    db.execute(
-        _reclaim_stale_slot_stmt(task_id=resolved_task_id, run_id=run_id, now=now),
+    reclaimed = db.execute(
+        _reclaim_stale_slot_stmt(
+            task_id=resolved_task_id,
+            run_id=run_id,
+            request_idempotency_key=normalized_key,
+            now=now,
+        ),
         execution_options={"synchronize_session": False},
-    )
+    ).first()
+    if reclaimed is not None:
+        logger.info(
+            "Retiring interaction %s of task %s (run %s) as %s for a new "
+            "question on run %s",
+            reclaimed.id,
+            resolved_task_id,
+            reclaimed.run_id,
+            reclaimed.terminal_reason,
+            run_id,
+        )
 
     row = {
         "task_id": resolved_task_id,

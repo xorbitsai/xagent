@@ -165,14 +165,14 @@ class TaskInteractionRequest(Base):  # type: ignore
     reach the column as the JSON text ``null``, which ``NOT NULL`` does not
     reject.
 
-    ``terminal_reason`` vocabulary: each of the three members is spoken for
-    by exactly one intended writer. ``deadline_elapsed`` and
-    ``run_superseded`` are the two reclaim branches the staging primitive's
-    ``_reclaim_stale_slot_stmt`` already writes (``task_interaction_staging.py``)
-    -- that write statement exists, and the staging primitive it belongs to
-    is reached only from the finalizers' native publication, which the
-    rollout policy keeps off by default, so with it off neither value is
-    reachable outside tests; ``answered_via_legacy_resume`` already has both its write
+    ``terminal_reason`` vocabulary. ``deadline_elapsed`` and ``run_superseded``
+    are the reclaim branches of ``_reclaim_stale_slot_stmt``
+    (``task_interaction_staging.py``): an expired row, and a row whose run no
+    longer holds the slot for that question, whether another run took over or the
+    same run asked again. The question cancel also writes ``run_superseded``. The
+    statement is reached only from the finalizers' native publication, which the
+    rollout policy keeps off by default, so with it off the reclaim writes neither;
+    ``answered_via_legacy_resume`` already has both its write
     statement and a production caller, the transitional close in
     ``task_interaction_close.py`` on the legacy answer path. It is not the
     same outcome as ``answered`` -- that path recovers a free-text chat

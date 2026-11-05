@@ -45,9 +45,12 @@ short transaction only after the message write has already committed --
 the close is a best-effort step that follows the message write, not part
 of it. If that separate transaction fails, both call sites only log the
 failure; they do not retry, raise, or register a degradation signal. That
-is a deliberate choice, not a gap: a stale marker degrades to the legacy
-fallback question by design -- the same guarantee documented in the marker
-comment on ``Task.interaction_protocol_version`` (``models/task.py``) -- so
+is a deliberate choice, not a gap: the row stays active, so the read surface
+keeps showing that question until the next chat message closes it or the
+run's next published question retires it (``_reclaim_stale_slot_stmt``). A
+marker left with no active row falls back to the transcript question, the
+guarantee documented in the marker comment on
+``Task.interaction_protocol_version`` (``models/task.py``). So
 there is nothing left to protect by escalating. Both WebSocket call sites
 handle the failure of the delivery marker write immediately beside each
 close call (``mark_user_message_delivery_sync``) the identical log-only
@@ -65,9 +68,9 @@ transaction that writes the resumed input and closes the interaction row
 together. A crash between those two commits leaves the interaction row
 ``active`` and the marker still set to ``1`` even though the injected
 message already answered the question. That window is benign for the same
-reason as the reader fallback documented above: a reader keys off
-``status`` first, so a stale active row here just makes it fall back to
-asking the legacy question again.
+reason as the best-effort close documented
+above: the question stays on display until the next chat message closes the
+row or the run's next published question retires it.
 
 The replay ``AgentRunner.inject_user_message`` short-circuits on a
 repeated turn id is not a window of that same benign family. A replay
@@ -121,7 +124,9 @@ the close runs, which an unbound statement would retire as though the
 injected message had answered it. Reading the id at close time instead of
 before the injection leaves that window exactly as wide as it is with no
 key at all -- the value has to be the one observed before the message
-went in.
+went in. A row published after that read is out of this statement's reach, and
+re-reading here to catch it would reopen the window above. The run's next
+published question retires such a row (``_reclaim_stale_slot_stmt``).
 
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens

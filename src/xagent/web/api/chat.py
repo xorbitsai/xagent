@@ -8,7 +8,7 @@ from typing import Any, Dict, List, NoReturn, Optional, cast
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from ...config import (
     get_default_task_execution_mode,
@@ -965,7 +965,13 @@ async def get_tasks(
             query = (
                 query.order_by(ordering, Task.id.desc()).offset(offset).limit(per_page)
             )
-            tasks_query = query.all()
+            # Loaded without structured_output_record: reading the column from these
+            # objects, or from the same rows reached again through Session.get or a
+            # relationship in this session, raises; do not keep using these Task objects
+            # after a commit, because the reload after a commit reads the column back.
+            tasks_query = query.options(
+                defer(cast(Any, Task.structured_output_record), raiseload=True)
+            ).all()
 
             # Batch fetch agents for tasks with agent_id
             agent_ids = {task.agent_id for task in tasks_query if task.agent_id}

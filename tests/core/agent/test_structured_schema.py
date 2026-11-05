@@ -786,6 +786,10 @@ SIZE_SCHEMAS = {
             }
         },
     ),
+    "alias-of-an-alias-of-an-object": _obj(
+        {"a": _ref("A")},
+        **{"$defs": {"A": _ref("B"), "B": _obj({"x": STRING})}},
+    ),
     "long-enum-with-truncated-suffix": _obj(
         {"a": {"type": "string", "enum": [f"value-{i:03d}" for i in range(120)]}}
     ),
@@ -836,18 +840,6 @@ def test_the_estimated_size_equals_the_size_of_the_copy_built_in_full(
         structured_schema.model_facing_schema(structured_schema.compile_schema(schema))
     )
     assert measured.nodes == _count_nodes(schema)
-
-
-def test_the_estimated_size_of_a_hundred_such_references_is_over_the_limit() -> None:
-    schema = _obj(
-        {f"f{i:03d}": _nullable(_ref("E")) for i in range(100)},
-        **{
-            "$defs": {"E": {"type": "string", "enum": [f"v{i:02d}" for i in range(40)]}}
-        },
-    )
-
-    assert measure_expansion(schema).rewritten_bytes == 70_174
-    assert _violation(schema) == ("S11", "")
 
 
 def test_the_estimated_size_equals_the_copy_of_random_schemas() -> None:

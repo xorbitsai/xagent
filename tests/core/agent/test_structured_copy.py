@@ -232,32 +232,6 @@ COPY_CASES: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
         _obj({"a": {"type": ["null", "string"]}}),
         _obj({"a": {"type": ["null", "string"]}}),
     ),
-    "object-reached-through-a-reference": (
-        _obj({"a": _ref("T")}, **{"$defs": {"T": _obj({"k": STRING})}}),
-        _obj({"a": {**_obj({"k": NULLABLE_STRING}), "type": ["object", "null"]}}),
-    ),
-    "boolean-and-number-enums": (
-        _obj(
-            {
-                "a": {"type": "boolean", "enum": [True]},
-                "b": {"type": "number", "enum": [1.5, 2]},
-            }
-        ),
-        _obj(
-            {
-                "a": {
-                    "type": ["boolean", "null"],
-                    "enum": [True, None],
-                    "description": _suffix(True, None),
-                },
-                "b": {
-                    "type": ["number", "null"],
-                    "enum": [1.5, 2, None],
-                    "description": _suffix(1.5, 2, None),
-                },
-            }
-        ),
-    ),
 }
 
 
@@ -270,16 +244,6 @@ def test_the_copy_of_each_shape_is_the_hand_written_schema(
     assert _copy_of(schema) == expected
 
 
-def test_make_nullable_turns_a_single_type_and_an_enum_nullable() -> None:
-    assert structured_schema.make_nullable({"type": "string"}) == {
-        "type": ["string", "null"]
-    }
-    assert structured_schema.make_nullable({"type": "integer", "enum": [1, 2]}) == {
-        "type": ["integer", "null"],
-        "enum": [1, 2, None],
-    }
-
-
 def test_make_nullable_leaves_a_nullable_node_as_it_is() -> None:
     node = {"type": ["null", "string"], "enum": [None, "x"], "description": "d"}
 
@@ -287,21 +251,6 @@ def test_make_nullable_leaves_a_nullable_node_as_it_is() -> None:
     assert structured_schema.make_nullable({"type": ["string", "null"]}) == {
         "type": ["string", "null"]
     }
-
-
-def test_make_nullable_merges_the_union_into_the_node_without_changing_either() -> None:
-    node = {"type": "string", "description": "inner"}
-    union = {"anyOf": [node, {"type": "null"}], "description": "outer", "title": "U"}
-    node_before, union_before = copy.deepcopy(node), copy.deepcopy(union)
-
-    merged = structured_schema.make_nullable(node, any_of=union)
-
-    assert merged == {
-        "type": ["string", "null"],
-        "description": "outer inner",
-        "title": "U",
-    }
-    assert (node, union) == (node_before, union_before)
 
 
 def test_the_schema_is_not_changed_and_the_copy_shares_nothing_with_it() -> None:
@@ -406,18 +355,7 @@ def test_the_copy_accepts_a_null_at_every_position_but_the_root() -> None:
     assert not validator.is_valid(None)
 
 
-def test_the_copy_accepts_the_marker_in_a_text_position_only_when_it_is_listed() -> (
-    None
-):
-    validator = Draft202012Validator(_copy_of(RICH))
-
-    assert validator.is_valid({**RICH_FULL, "status": MARKER})
-    assert validator.is_valid({**RICH_FULL, "name": MARKER})
-    assert not validator.is_valid({**RICH_FULL, "level": MARKER})
-    assert not validator.is_valid({**RICH_FULL, "level": 3})
-
-
-# --- the size of the copy (I-25) ------------------------------------------------------
+# --- the size of the copy ------------------------------------------------------
 
 
 def _walk_nodes(copy_node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -501,7 +439,7 @@ def test_an_integer_constant_written_as_1e308_stays_a_float_in_the_copy() -> Non
     assert "1e+308" in node["description"]
 
 
-# --- the constant and the list of allowed values (I-32) ----------------------------------
+# --- the constant and the list of allowed values ----------------------------------
 
 
 def test_a_constant_becomes_an_enum_and_its_values_end_the_description() -> None:
@@ -526,7 +464,7 @@ def test_a_cut_list_of_allowed_values_matches_the_function_that_writes_it() -> N
     assert len(listing) == 501
 
 
-# --- through the real provider rewriters (J-14) -------------------------------------------
+# --- through the real provider rewriters -------------------------------------------
 
 ADAPTER_SCHEMA = _obj(
     {

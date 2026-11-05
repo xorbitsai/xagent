@@ -126,7 +126,7 @@ def _gen_plain(
     if k == "const":
         return _maybe_desc(rng, {"type": "string", "const": rng.choice(STR_POOL)})
     if k == "bconst":
-        return {"type": "boolean", "const": True}
+        return {"type": "boolean", "const": rng.choice([True, False])}
     return _maybe_desc(rng, {"type": k})
 
 
@@ -222,7 +222,7 @@ def gen_value(rng: random.Random, n: RNode) -> Any:
     if n.enum_list is not None:
         return rng.choice(n.enum_list)
     pools: dict[str, list[Any]] = {
-        "string": ["Alice", "1 Main St", "2025-03-03", "x y"],
+        "string": ["Alice", "1 Main St", "2025-03-03", "x y", "é中\U0001f600", 'q"\\'],
         "integer": [0, 1, 7, -3],
         "number": [0, 1.5, 2, -0.25],
         "boolean": [True, False],

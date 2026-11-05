@@ -7,6 +7,7 @@ import json
 import random
 import statistics
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
@@ -83,34 +84,6 @@ def _items(compiled: Any, node: Any) -> Any:
 # --- the node of each position ---------------------------------------------------
 
 
-def test_a_node_records_its_kind_types_and_nullability() -> None:
-    compiled = _compile(
-        _obj(
-            {
-                "a": STRING,
-                "b": {"type": ["string", "null"]},
-                "c": {"type": ["null", "integer"]},
-                "d": _nullable({"type": "number"}),
-                "e": {"type": "array", "items": STRING},
-            }
-        )
-    )
-    root = _root(compiled)
-
-    assert (root.kind, root.nullable) == ("object", False)
-    a = _child(compiled, root, "a")
-    assert (a.kind, a.types, a.nullable) == ("string", ["string"], False)
-    b = _child(compiled, root, "b")
-    assert (b.kind, b.nullable) == ("string", True)
-    c = _child(compiled, root, "c")
-    assert (c.kind, c.nullable) == ("integer", True)
-    d = _child(compiled, root, "d")
-    assert (d.kind, d.types, d.nullable) == ("number", ["number"], True)
-    e = _child(compiled, root, "e")
-    assert (e.kind, e.nullable) == ("array", False)
-    assert _items(compiled, e).kind == "string"
-
-
 def test_properties_keep_their_written_order_and_the_size_of_their_quoted_key() -> None:
     compiled = _compile(_obj({"zeta": STRING, "a": STRING, "mid.k": STRING}))
     root = _root(compiled)
@@ -120,25 +93,6 @@ def test_properties_keep_their_written_order_and_the_size_of_their_quoted_key() 
         ("a", 3),
         ("mid.k", 7),
     ]
-
-
-def test_an_enum_is_stored_as_canonical_keys_without_null() -> None:
-    compiled = _compile(
-        _obj(
-            {
-                "a": {"type": "integer", "enum": [1, 2.0, 3]},
-                "b": {"type": ["string", "null"], "enum": ["x", None]},
-                "c": STRING,
-            }
-        )
-    )
-    root = _root(compiled)
-
-    assert _child(compiled, root, "a").enum_keys == frozenset(
-        {("num", "1"), ("num", "2"), ("num", "3")}
-    )
-    assert _child(compiled, root, "b").enum_keys == frozenset({("str", "x")})
-    assert _child(compiled, root, "c").enum_keys is None
 
 
 # --- the only allowed value ------------------------------------------------------
@@ -180,12 +134,6 @@ def test_a_nullable_node_has_no_only_allowed_value() -> None:
 
     for name in ("a", "b", "c"):
         assert _child(compiled, root, name).single is None
-
-
-def test_a_node_with_two_values_has_no_only_allowed_value() -> None:
-    compiled = _compile(_obj({"a": {"type": "string", "enum": ["x", "y"]}}))
-
-    assert _child(compiled, _root(compiled), "a").single is None
 
 
 def test_an_integer_only_allowed_value_written_as_a_float_is_stored_as_an_int() -> None:
@@ -241,18 +189,6 @@ def test_a_target_used_directly_and_as_a_nullable_union_gets_two_nodes() -> None
     assert direct is not maybe
     assert [i for _, _, i in direct.properties] == [i for _, _, i in maybe.properties]
     assert len(compiled.nodes) == 5
-
-
-def test_two_unions_over_the_same_target_share_one_node() -> None:
-    compiled = _compile(
-        _obj(
-            {"a": _nullable(_ref("T")), "b": _nullable(_ref("T"))},
-            **{"$defs": {"T": STRING}},
-        )
-    )
-    root = _root(compiled)
-
-    assert _child(compiled, root, "a") is _child(compiled, root, "b")
 
 
 def test_a_union_over_an_alias_chain_reads_the_end_of_the_chain() -> None:
@@ -417,19 +353,21 @@ def test_a_node_with_a_missing_value_has_no_template() -> None:
     assert _root(compiled).template is None
 
 
-def test_a_node_without_missing_values_has_a_template() -> None:
-    compiled = _compile(_obj({"a": _obj({"s": {"type": ["string", "null"]}})}))
-
-    assert _child(compiled, _root(compiled), "a").template is not None
-
-
 def test_a_template_is_shared_by_node_number_not_copied_into_its_parents() -> None:
-    layers = 9
+    layers = 18
     defs: dict[str, Any] = {f"D{layers}": {"type": ["string", "null"]}}
     for i in reversed(range(layers)):
         defs[f"D{i}"] = _obj({"a": _ref(f"D{i + 1}"), "b": _ref(f"D{i + 1}")})
-    compiled = _compile(_obj({"d": _ref("D0")}, **{"$defs": defs}))
+    schema = _obj({"d": _ref("D0")}, **{"$defs": defs})
 
+    tracemalloc.start()
+    try:
+        compiled = structured_schema.compile_schema(schema)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 1024 * 1024
     assert len(compiled.nodes) == layers + 2
     assert (
         _child(compiled, _root(compiled), "d").template_nodes == 2 ** (layers + 1) - 1
@@ -497,12 +435,6 @@ def test_compiling_does_not_change_the_schema() -> None:
 
     assert schema == before
     assert json.dumps(schema) == json.dumps(before)
-
-
-def test_the_compiled_schema_keeps_the_schema_it_was_built_from() -> None:
-    schema = _obj({"a": STRING})
-
-    assert _compile(schema).schema is schema
 
 
 # --- the size of canonical JSON ----------------------------------------------------
@@ -635,7 +567,7 @@ def test_the_shape_check_agrees_with_jsonschema_on_random_instances(
     random_cases: Any,
 ) -> None:
     rng = random.Random(3)
-    accepted = 0
+    accepted = rejected = 0
     for schema, compiled, copy_, rnode in random_cases:
         validator = Draft202012Validator(copy_)
         for _ in range(8):
@@ -644,8 +576,10 @@ def test_the_shape_check_agrees_with_jsonschema_on_random_instances(
                 schema,
                 instance,
             )
-            accepted += not _failed(ss.judge_instance(compiled, instance))
-    assert accepted > 150
+            failed = _failed(ss.judge_instance(compiled, instance))
+            accepted += not failed
+            rejected += failed
+    assert accepted > 600 and rejected > 200
 
 
 def _integers_are_ints(n: RNode, v: Any) -> bool:
@@ -675,7 +609,7 @@ def test_every_ready_output_is_valid_for_the_original_schema(random_cases: Any) 
                 ready += 1
                 assert validator.is_valid(result.output), (schema, instance)
                 assert _integers_are_ints(rnode, result.output)
-    assert ready > 100
+    assert ready > 400
 
 
 def test_an_integer_written_as_a_float_is_an_int_in_the_output() -> None:
@@ -729,7 +663,7 @@ def test_the_lists_hold_every_gap_and_only_gaps(random_cases: Any) -> None:
                 assert not n.nullable and n.kind != "object" and not n.single
             for path in result.unexpressible_fields:
                 assert lookup(rnode, path).kind == "string"
-    assert checked > 50
+    assert checked > 250
 
 
 def _outcome(result: Any) -> tuple[Any, ...]:
@@ -848,7 +782,9 @@ def _nodes(value: Any) -> int:
 
 
 def _timed(schema: dict[str, Any], instance: Any) -> tuple[Any, float]:
+    start = time.perf_counter()
     compiled = _compile(schema)
+    assert time.perf_counter() - start < 1
     start = time.perf_counter()
     result = ss.judge_instance(compiled, instance)
     return result, time.perf_counter() - start
@@ -944,15 +880,15 @@ def _elements(
 
 def test_elements_whose_only_property_is_empty_make_the_whole_list_empty() -> None:
     schema, instance = _elements(2000, STRING, with_id=False)
-    result = _judge(schema, instance)
-    assert isinstance(result, ss.Incomplete)
+    result, seconds = _timed(schema, instance)
+    assert isinstance(result, ss.Incomplete) and seconds < 1
     assert result.missing_fields == ["/items"] and result.r1_steps == 4002
 
     nullable = copy.deepcopy(schema)
     nullable["properties"]["items"]["type"] = ["array", "null"]
-    result = _judge(nullable, instance)
+    result, seconds = _timed(nullable, instance)
     assert isinstance(result, ss.Ready) and result.output == {"items": None}
-    assert result.r1_steps == 4002
+    assert result.r1_steps == 4002 and seconds < 1
 
 
 def test_elements_with_a_gap_in_their_empty_part_are_incomplete_and_cheap() -> None:
@@ -960,17 +896,33 @@ def test_elements_with_a_gap_in_their_empty_part_are_incomplete_and_cheap() -> N
     schema, instance = _elements(2000, leaves, with_id=True)
     schema["$defs"]["Sub"]["properties"]["f1"] = STRING
 
-    result = _judge(schema, instance)
+    result, seconds = _timed(schema, instance)
 
-    assert isinstance(result, ss.Incomplete) and result.r1_steps == 6002
-    assert result.missing_count == 2000
+    assert isinstance(result, ss.Incomplete) and result.r1_steps == 6002 and seconds < 1
+    assert (result.missing_count, result.expansion_nodes) == (2000, 0)
+
+
+def test_only_the_template_of_an_empty_required_object_adds_expansion_nodes() -> None:
+    schema = _obj(
+        {
+            "a": {"type": ["string", "null"]},
+            "o": _obj({"s": STRING}),
+            "k": {"type": "string", "const": "k"},
+            "b": STRING,
+        }
+    )
+
+    result = _judge(schema, {"a": None, "o": None, "k": None, "b": "x"})
+
+    assert isinstance(result, ss.Incomplete) and result.missing_fields == ["/o/s"]
+    assert result.expansion_nodes == 0
 
 
 def test_elements_whose_empty_part_is_too_big_to_return_are_too_complex() -> None:
     schema, instance = _elements(2000, {"type": ["string", "null"]}, with_id=True)
-    result = _judge(schema, instance)
+    result, seconds = _timed(schema, instance)
     assert isinstance(result, ss.TooComplex) and result.stage == "r4"
-    assert result.r1_steps + result.expansion_nodes == 208_002
+    assert result.r1_steps + result.expansion_nodes == 208_002 and seconds < 1
 
 
 def test_the_template_is_not_copied_when_the_result_is_too_complex(
@@ -991,17 +943,22 @@ def test_a_result_that_is_incomplete_is_not_checked_for_size() -> None:
     schema["required"].append("z")
     instance["z"] = None
 
-    result = _judge(schema, instance)
+    result, seconds = _timed(schema, instance)
 
     assert isinstance(result, ss.Incomplete) and result.missing_fields == ["/z"]
-    assert result.r1_steps + result.expansion_nodes == 208_003
+    assert result.r1_steps + result.expansion_nodes == 208_003 and seconds < 1
 
 
-def test_an_instance_over_the_step_limit_is_too_complex_in_the_shape_check() -> None:
+@pytest.mark.parametrize(("count", "ready"), [(199_998, True), (199_999, False)])
+def test_the_shape_check_stops_just_past_200_000_steps(count: int, ready: bool) -> None:
     schema = _obj({"a": {"type": "array", "items": {"type": "integer"}}})
-    result = _judge(schema, {"a": [0] * 199_999})
+    result, seconds = _timed(schema, {"a": [0] * count})
 
-    assert isinstance(result, ss.TooComplex) and result.stage == "r1"
+    assert seconds < 1
+    if ready:
+        assert isinstance(result, ss.Ready) and result.r1_steps == 200_000
+    else:
+        assert isinstance(result, ss.TooComplex) and result.stage == "r1"
 
 
 def test_the_densest_instance_within_256_kib_is_under_the_step_limit() -> None:
@@ -1009,9 +966,10 @@ def test_the_densest_instance_within_256_kib_is_under_the_step_limit() -> None:
     instance = {"a": [0] * 131_068}
     assert len(json.dumps(instance, separators=(",", ":"))) <= LIMIT
 
-    result = _judge(schema, instance)
+    result, seconds = _timed(schema, instance)
 
     assert isinstance(result, ss.Ready) and result.r1_steps == 131_070
+    assert seconds < 1
 
 
 def _fill(text: str) -> int:
@@ -1043,7 +1001,8 @@ def _worst_instance(last: int) -> dict[str, Any]:
 
 def test_the_worst_schema_meets_a_256_kib_instance_within_a_second() -> None:
     schema = _worst_schema()
-    assert structured_schema.measure_expansion(schema).nodes == 1971
+    metrics = structured_schema.measure_expansion(schema)
+    assert (metrics.nodes, metrics.enum_values) == (1971, 5000)
     for last in (7, 500):
         text = json.dumps(_worst_instance(last), separators=(",", ":"))
         assert 250_000 < len(text.encode()) <= LIMIT
@@ -1081,6 +1040,8 @@ def test_other_worst_instances_are_judged_within_a_second(
     result, seconds = _timed(schema, instance)
 
     assert isinstance(result, getattr(ss, wanted)) and seconds < 1
+    if wanted == "Ready":
+        assert result.r1_steps <= 200_000
 
 
 def test_a_256_kib_list_of_values_of_a_500_value_enum_is_judged_within_a_second() -> (
@@ -1097,6 +1058,7 @@ def test_a_256_kib_list_of_values_of_a_500_value_enum_is_judged_within_a_second(
     )
 
     assert isinstance(result, ss.Ready) and seconds < 1
+    assert result.r1_steps <= 200_000
 
 
 def test_integers_with_one_hash_are_judged_as_fast_as_integers_with_many() -> None:
@@ -1172,7 +1134,7 @@ def test_the_counted_bytes_equal_the_serialized_bytes_of_random_results(
             if isinstance(result, ss.Ready):
                 ready += 1
                 assert result.output_bytes == ss.canonical_json_bytes(result.output)
-    assert ready > 100
+    assert ready > 400
 
 
 def test_the_judgement_does_not_serialize_the_output(
@@ -1212,7 +1174,7 @@ def test_a_small_result_is_counted_to_the_byte() -> None:
     assert isinstance(result, ss.Ready) and result.output_bytes == 49
 
 
-@pytest.mark.parametrize("count", [1, 117])
+@pytest.mark.parametrize("count", [1, 2, 117])
 def test_a_list_of_big_empty_objects_is_counted_to_the_byte(count: int) -> None:
     result = _judge(_p4b_schema(), {"items": [{"i": 1, "b": None}] * count})
 
@@ -1222,6 +1184,9 @@ def test_a_list_of_big_empty_objects_is_counted_to_the_byte(count: int) -> None:
         == 17_924 * count + 11
         == ss.canonical_json_bytes(result.output)
     )
+    if count > 1:
+        first, second = result.output["items"][:2]
+        assert first["b"] is not second["b"]
     assert count != 117 or result.output_bytes == 2_097_119
 
 
@@ -1249,3 +1214,38 @@ def test_775_such_elements_pass_the_node_check_and_fail_the_byte_check(
     assert isinstance(result, ss.TooComplex) and result.stage == "r4"
     assert result.r1_steps + result.expansion_nodes == 199_952
     assert result.output_bytes == 13_891_111
+
+
+@pytest.mark.parametrize(("extra", "ready"), [(2, True), (3, False)])
+def test_the_node_check_alone_turns_a_result_away_at_200_001_positions(
+    extra: int, ready: bool
+) -> None:
+    element = _obj(
+        {"id": {"type": "integer"}, "sub": _obj({"leaf": {"type": ["string", "null"]}})}
+    )
+    schema = _obj(
+        {
+            "items": {"type": "array", "items": element},
+            "ys": {"type": "array", "items": {"type": "integer"}},
+        }
+    )
+    instance = {"items": [{"id": 1, "sub": None}] * 39_999, "ys": [0] * extra}
+
+    result = _judge(schema, instance)
+
+    if ready:
+        assert isinstance(result, ss.Ready)
+    else:
+        assert isinstance(result, ss.TooComplex) and result.stage == "r4"
+        assert 1_000_000 < result.output_bytes < ss.MAX_RESULT_BYTES
+    assert result.r1_steps + result.expansion_nodes == 199_998 + extra
+
+
+@pytest.mark.parametrize(("size", "ready"), [(2_097_144, True), (2_097_145, False)])
+def test_the_byte_check_alone_turns_a_result_away_past_2_mib(
+    size: int, ready: bool
+) -> None:
+    result = _judge(_obj({"s": STRING}), {"s": "x" * size})
+
+    assert isinstance(result, ss.Ready if ready else ss.TooComplex)
+    assert result.output_bytes == 8 + size

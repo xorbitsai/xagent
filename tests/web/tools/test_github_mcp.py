@@ -4782,3 +4782,258 @@ def test_workflow_runs_error_mapping(monkeypatch, status):
     _routes(monkeypatch, {("GET", "/actions/runs"): _err(status, "x")})
     result = json.loads(github.github_list_workflow_runs("octocat/Hello-World"))
     assert result["status"] == "error"
+
+
+# --- update submodule ------------------------------------------------------
+
+HEAD = "1" * 40
+TREE = "2" * 40
+NEW_TREE = "3" * 40
+NEW_COMMIT = "4" * 40
+OLD_SUB = "5" * 40
+NEW_SUB = "6" * 40
+GITMODULES = (
+    '[submodule "other"]\n\tpath = other\n\turl = https://github.com/o/other.git\n'
+    '[submodule "xagent"]\n\tpath = xagent\n\turl = git@github.com:xorbitsai/xagent.git\n'
+)
+
+
+def _sub_routes(overrides=None, entry=None, gitmodules=GITMODULES):
+    entry = entry or {
+        "path": "xagent",
+        "mode": "160000",
+        "type": "commit",
+        "sha": OLD_SUB,
+    }
+    routes = {
+        ("GET", ""): MockResponse(json_data={"default_branch": "main"}),
+        ("GET", "/git/ref/heads/main"): MockResponse(
+            json_data={"object": {"sha": HEAD}}
+        ),
+        ("GET", f"/git/commits/{HEAD}"): MockResponse(
+            json_data={"tree": {"sha": TREE}}
+        ),
+        ("GET", f"/git/trees/{TREE}"): MockResponse(
+            json_data={
+                "tree": [
+                    {
+                        "path": "README.md",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": "e" * 40,
+                    },
+                    entry,
+                ]
+            }
+        ),
+        ("GET", "/git/ref/heads/bump/xagent"): _err(404, "Not Found"),
+        ("POST", "/git/trees"): MockResponse(
+            json_data={"sha": NEW_TREE}, status_code=201
+        ),
+        ("POST", "/git/commits"): MockResponse(
+            json_data={"sha": NEW_COMMIT}, status_code=201
+        ),
+        ("POST", "/git/refs"): MockResponse(
+            json_data={"ref": "refs/heads/bump/xagent"}, status_code=201
+        ),
+        ("GET", "/contents/.gitmodules"): MockResponse(
+            json_data={
+                "encoding": "base64",
+                "content": base64.b64encode(gitmodules.encode()).decode(),
+            }
+        ),
+    }
+    routes.update(overrides or {})
+    return routes
+
+
+def _bump(**kwargs):
+    args = {"path": "xagent", "sha": NEW_SUB, "branch": "bump/xagent"}
+    args.update(kwargs)
+    return json.loads(github.github_update_submodule("octocat/Hello-World", **args))
+
+
+def _posts(calls):
+    return [c for c in calls if c[0][0] == "POST"]
+
+
+def test_update_submodule_happy_path(monkeypatch):
+    calls = _routes(monkeypatch, _sub_routes())
+    result = _bump()
+    assert result["status"] == "success"
+    assert result["updated"] is True
+    assert (result["old_sha"], result["new_sha"]) == (OLD_SUB, NEW_SUB)
+    assert result["commit_sha"] == NEW_COMMIT
+    assert result["branch"] == "bump/xagent"
+    assert result["compare_url"] == (
+        f"https://github.com/xorbitsai/xagent/compare/{OLD_SUB}...{NEW_SUB}"
+    )
+    posts = {c[0][1]: c[1]["json"] for c in _posts(calls)}
+    assert posts["/git/trees"] == {
+        "base_tree": TREE,
+        "tree": [
+            {"path": "xagent", "mode": "160000", "type": "commit", "sha": NEW_SUB}
+        ],
+    }
+    assert posts["/git/commits"] == {
+        "message": f"chore: bump xagent to {NEW_SUB[:8]}",
+        "tree": NEW_TREE,
+        "parents": [HEAD],
+    }
+    assert posts["/git/refs"] == {"ref": "refs/heads/bump/xagent", "sha": NEW_COMMIT}
+
+
+def test_update_submodule_custom_base_message_and_uppercase_sha(monkeypatch):
+    routes = _sub_routes()
+    routes[("GET", "/git/ref/heads/release/1")] = routes.pop(
+        ("GET", "/git/ref/heads/main")
+    )
+    calls = _routes(monkeypatch, routes)
+    result = _bump(
+        base="release/1", message="custom", sha=NEW_SUB.upper().replace("6", "A")
+    )
+    assert result["status"] == "success"
+    assert result["new_sha"] == "a" * 40
+    assert not any(c[0] == ("GET", "") for c in calls)
+    assert [
+        c[1]["json"]["message"] for c in _posts(calls) if c[0][1] == "/git/commits"
+    ] == ["custom"]
+
+
+def test_update_submodule_compare_url_is_optional(monkeypatch):
+    for routes in (
+        _sub_routes({("GET", "/contents/.gitmodules"): _err(404, "Not Found")}),
+        _sub_routes(gitmodules="garbage"),
+        _sub_routes(
+            gitmodules='[submodule "x"]\n\tpath = xagent\n\turl = https://gitlab.com/o/x.git\n'
+        ),
+    ):
+        _routes(monkeypatch, routes)
+        result = _bump()
+        assert result["status"] == "success"
+        assert result["compare_url"] is None
+
+
+def test_update_submodule_nested_path(monkeypatch):
+    routes = _sub_routes()
+    routes[("GET", f"/git/trees/{TREE}")] = MockResponse(
+        json_data={
+            "tree": [
+                {"path": "libs", "mode": "040000", "type": "tree", "sha": "7" * 40}
+            ]
+        }
+    )
+    routes[("GET", f"/git/trees/{'7' * 40}")] = MockResponse(
+        json_data={
+            "tree": [
+                {"path": "xagent", "mode": "160000", "type": "commit", "sha": OLD_SUB}
+            ]
+        }
+    )
+    calls = _routes(monkeypatch, routes)
+    result = _bump(path="libs/xagent")
+    assert result["status"] == "success"
+    tree_post = next(c for c in _posts(calls) if c[0][1] == "/git/trees")
+    assert tree_post[1]["json"]["tree"][0]["path"] == "libs/xagent"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"path": "xagent", "mode": "100644", "type": "blob", "sha": "e" * 40},
+        {"path": "xagent", "mode": "040000", "type": "tree", "sha": "e" * 40},
+    ],
+)
+def test_update_submodule_refuses_non_submodule(monkeypatch, entry):
+    calls = _routes(monkeypatch, _sub_routes(entry=entry))
+    result = _bump()
+    assert result["status"] == "error"
+    assert "not a submodule" in result["message"]
+    assert _posts(calls) == []
+
+
+def test_update_submodule_missing_path(monkeypatch):
+    calls = _routes(monkeypatch, _sub_routes())
+    result = _bump(path="nope")
+    assert result["status"] == "error"
+    assert "does not exist" in result["message"]
+    assert _posts(calls) == []
+
+
+def test_update_submodule_noop_when_already_at_sha(monkeypatch):
+    calls = _routes(monkeypatch, _sub_routes())
+    result = _bump(sha=OLD_SUB)
+    assert result["status"] == "success"
+    assert result["updated"] is False
+    assert "already at" in result["message"]
+    assert _posts(calls) == []
+
+
+def test_update_submodule_refuses_existing_branch_before_writing(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        _sub_routes(
+            {
+                ("GET", "/git/ref/heads/bump/xagent"): MockResponse(
+                    json_data={"object": {}}
+                )
+            }
+        ),
+    )
+    result = _bump()
+    assert result["status"] == "error"
+    assert "already exists" in result["message"]
+    assert _posts(calls) == []
+
+
+def test_update_submodule_branch_race_422(monkeypatch):
+    _routes(
+        monkeypatch,
+        _sub_routes({("POST", "/git/refs"): _err(422, "Reference already exists")}),
+    )
+    result = _bump()
+    assert result["status"] == "error"
+    assert "already exists" in result["message"]
+
+
+@pytest.mark.parametrize("sha", ["", "abc123", "g" * 40, "6" * 41, None])
+def test_update_submodule_rejects_bad_sha(monkeypatch, sha):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    assert _bump(sha=sha)["status"] == "error"
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("branch", ["", "a b", "refs/heads/x", "a..b"])
+def test_update_submodule_rejects_bad_branch(monkeypatch, branch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    assert _bump(branch=branch)["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_submodule_404_on_base(monkeypatch):
+    _routes(
+        monkeypatch,
+        _sub_routes({("GET", "/git/ref/heads/main"): _err(404, "Not Found")}),
+    )
+    result = _bump()
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "route,status,needle",
+    [
+        ("/git/trees", 403, "push access"),
+        ("/git/commits", 403, "push access"),
+        ("/git/refs", 403, "push access"),
+        ("/git/trees", 422, "rejected the submodule update"),
+        ("/git/commits", 404, "Not Found"),
+    ],
+)
+def test_update_submodule_write_error_mapping(monkeypatch, route, status, needle):
+    _routes(monkeypatch, _sub_routes({("POST", route): _err(status, "Not Found")}))
+    result = _bump()
+    assert result["status"] == "error"
+    assert needle in result["message"]

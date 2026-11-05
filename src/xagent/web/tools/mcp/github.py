@@ -2321,5 +2321,241 @@ def github_list_workflow_runs(
         return _error(str(e))
 
 
+_GITMODULES_SECTION = re.compile(r'^\s*\[submodule\s+"[^"]*"\]\s*$')
+_GITHUB_REMOTE = re.compile(
+    r"^(?:https?://(?:www\.)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$"
+)
+
+
+def _submodule_compare_url(
+    owner: str, name: str, base: str, path: str, old_sha: str, new_sha: str
+) -> str | None:
+    """Best-effort compare URL for a submodule's own repo, read from
+    `.gitmodules` at `base`. Returns None (never raises) when the file is
+    missing, unparsable, or the submodule is not hosted on github.com."""
+    try:
+        response = _request(
+            "GET",
+            f"/repos/{owner}/{name}/contents/.gitmodules",
+            params={"ref": base},
+        )
+        if not isinstance(response, dict) or response.get("encoding") != "base64":
+            return None
+        text = _decode_base64_content(response.get("content") or "").decode("utf-8")
+        sections: list[dict[str, str]] = []
+        for line in text.splitlines():
+            if _GITMODULES_SECTION.match(line):
+                sections.append({})
+            elif sections and "=" in line:
+                key, _, value = line.partition("=")
+                sections[-1][key.strip()] = value.strip()
+        for section in sections:
+            if section.get("path") == path and section.get("url"):
+                match = _GITHUB_REMOTE.match(section["url"])
+                if match:
+                    return (
+                        f"https://github.com/{match.group(1)}/{match.group(2)}"
+                        f"/compare/{old_sha}...{new_sha}"
+                    )
+    except Exception:
+        logger.debug("Could not derive submodule compare URL", exc_info=True)
+    return None
+
+
+@mcp.tool()
+def github_update_submodule(
+    repo: str,
+    path: str,
+    sha: str,
+    branch: str,
+    base: str = "",
+    message: str = "",
+) -> str:
+    """
+    Point a git submodule at a new commit on a NEW branch (the contents API
+    cannot update a submodule pointer, so this uses the git data API). Open
+    the pull request afterwards with github_create_pull_request.
+    repo: "owner/repo" -- the repository that contains the submodule.
+    path: the submodule's path in that repository (e.g. "xagent"). It must
+    already be a submodule; a regular file or directory is refused.
+    sha: the full 40-character commit sha in the submodule's own repository.
+    branch: the new branch to create (bare name). Refused if it exists.
+    base: the branch to start from (defaults to the default branch).
+    message: commit message (defaults to "chore: bump <path> to <sha[:8]>").
+
+    Returns the old and new submodule sha, the new commit sha, and -- when
+    .gitmodules points at a github.com repo -- a compare URL for old...new.
+    If the submodule is already at `sha`, nothing is created and
+    `updated` is false.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        _require_nonblank(path, field="path")
+        encoded_segments = [
+            _encode_file_path_segment(seg, field="path")
+            for seg in path.strip("/").split("/")
+        ]
+        path = path.strip("/")
+        new_sha = sha.strip().lower() if isinstance(sha, str) else ""
+        if not _COMMIT_SHA_PATTERN.fullmatch(new_sha):
+            raise ValueError(
+                f"sha must be a full 40-character hex commit sha, got: {sha!r}"
+            )
+        branch = _validate_branch_name(branch, field="branch")
+        if not isinstance(base, str) or not isinstance(message, str):
+            raise ValueError("base and message must be strings")
+
+        try:
+            base_branch = (
+                _validate_branch_name(base, field="base")
+                if base
+                else _validate_branch_name(
+                    _default_branch(owner, name, repo), field="base"
+                )
+            )
+            base_ref = _request(
+                "GET",
+                f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(base_branch)}",
+            )
+            _require_object(base_ref, context=f"ref 'heads/{base_branch}' in '{repo}'")
+            base_commit_sha = (base_ref.get("object") or {}).get("sha")
+            if not isinstance(base_commit_sha, str) or not base_commit_sha:
+                return _error(
+                    f"Ref 'heads/{base_branch}' in '{repo}' has no commit sha"
+                )
+            base_commit = _request(
+                "GET", f"/repos/{owner}/{name}/git/commits/{base_commit_sha}"
+            )
+            _require_object(base_commit, context=f"commit {base_commit_sha}")
+            tree_sha = (base_commit.get("tree") or {}).get("sha")
+            if not isinstance(tree_sha, str) or not tree_sha:
+                return _error(f"Commit {base_commit_sha} in '{repo}' has no tree sha")
+
+            # Walk the path one directory level at a time (a recursive tree
+            # fetch can be truncated on big repos) down to the entry itself.
+            entry: dict[str, Any] | None = None
+            current_tree = tree_sha
+            for index, segment in enumerate(path.split("/")):
+                tree = _request(
+                    "GET", f"/repos/{owner}/{name}/git/trees/{current_tree}"
+                )
+                _require_object(tree, context=f"tree {current_tree}")
+                items = tree.get("tree") or []
+                _require_object_items(items, context="tree entries")
+                entry = next((i for i in items if i.get("path") == segment), None)
+                if entry is None:
+                    break
+                if index < len(encoded_segments) - 1:
+                    if entry.get("type") != "tree":
+                        entry = None
+                        break
+                    current_tree = entry.get("sha") or ""
+        except _GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return _not_found_error(
+                    exc,
+                    f"repository '{repo}' or base branch '{base or 'default'}' not found",
+                )
+            raise
+
+        if entry is None:
+            return _error(f"'{path}' does not exist in '{repo}' at '{base_branch}'")
+        if entry.get("mode") != "160000" or entry.get("type") != "commit":
+            return _error(
+                f"'{path}' in '{repo}' is not a submodule (mode "
+                f"{entry.get('mode')}, type {entry.get('type')}); refusing to "
+                "replace it with a submodule pointer"
+            )
+        old_sha = entry.get("sha")
+        if old_sha == new_sha:
+            return _success(
+                updated=False,
+                message=f"Submodule '{path}' in '{repo}' is already at {new_sha}; nothing to do",
+                path=path,
+                old_sha=old_sha,
+                new_sha=new_sha,
+                base=base_branch,
+            )
+
+        # Refuse an existing branch BEFORE writing any objects.
+        try:
+            _request(
+                "GET",
+                f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(branch)}",
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            return _error(
+                f"Branch '{branch}' already exists in '{repo}'; choose another name"
+            )
+
+        try:
+            new_tree = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/trees",
+                json_data={
+                    "base_tree": tree_sha,
+                    "tree": [
+                        {
+                            "path": path,
+                            "mode": "160000",
+                            "type": "commit",
+                            "sha": new_sha,
+                        }
+                    ],
+                },
+            )
+            _require_object(new_tree, context="created tree")
+            commit = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/commits",
+                json_data={
+                    "message": message or f"chore: bump {path} to {new_sha[:8]}",
+                    "tree": new_tree.get("sha"),
+                    "parents": [base_commit_sha],
+                },
+            )
+            _require_object(commit, context="created commit")
+            ref = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/refs",
+                json_data={"ref": f"refs/heads/{branch}", "sha": commit.get("sha")},
+            )
+            _require_object(ref, context=f"created branch '{branch}'")
+        except _GitHubAPIError as exc:
+            if exc.status_code == 403:
+                return _forbidden_write_error(exc, repo=repo)
+            if exc.status_code == 422 and "already exists" in str(exc).lower():
+                return _error(
+                    f"{exc} -- branch '{branch}' already exists in '{repo}'; choose another name"
+                )
+            if exc.status_code == 422:
+                return _error(
+                    f"{exc} -- GitHub rejected the submodule update (check that "
+                    f"'{path}' and sha {new_sha} are valid)"
+                )
+            raise
+        return _success(
+            updated=True,
+            path=path,
+            old_sha=old_sha,
+            new_sha=new_sha,
+            commit_sha=commit.get("sha"),
+            branch=branch,
+            base=base_branch,
+            compare_url=_submodule_compare_url(
+                owner, name, base_branch, path, str(old_sha), new_sha
+            ),
+        )
+    except Exception as e:
+        logger.error(
+            f"Error updating GitHub submodule {repo}:{path}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -60,6 +60,7 @@ from ...schemas.v1 import (
     UploadFilesResponse,
 )
 from ...services import task_start as task_start_service
+from ...services.api_idempotency import IdempotencyClaim
 from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
@@ -106,7 +107,7 @@ from .deps import (
     record_principal_usage,
 )
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
-from .idempotency import run_with_idempotency
+from .idempotency import IDEMPOTENCY_KEY_HEADER, run_with_idempotency
 
 logger = logging.getLogger(__name__)
 
@@ -370,7 +371,7 @@ def _ensure_agent_reachable(
 async def create_chat_task(
     request: CreateTaskRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> CreateTaskResponse:
     """Create a new SDK-driven task and kick off its first turn.
 
@@ -445,7 +446,7 @@ async def create_chat_task(
             operation="create_task",
             header_value=idempotency_key,
             request_payload=request.model_dump(mode="json"),
-            run=lambda claim_id: _create_chat_task(request, principal, claim_id),
+            run=lambda claim: _create_chat_task(request, principal, claim),
         ),
     )
 
@@ -453,7 +454,7 @@ async def create_chat_task(
 async def _create_chat_task(
     request: CreateTaskRequest,
     principal: ApiKeyPrincipal,
-    idempotency_claim_id: int | None,
+    idempotency_claim: IdempotencyClaim | None,
 ) -> CreateTaskResponse:
     agent_identity = principal.agent
     _validate_prompt_context(request.prompt_context)
@@ -485,7 +486,7 @@ async def _create_chat_task(
             requested_priority=request.priority,
             prompt_context=request.prompt_context,
             credential_kind=credential_kind,
-            idempotency_claim_id=idempotency_claim_id,
+            idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -1083,7 +1084,7 @@ async def append_message_to_task(
     task_id: int,
     request: AppendMessageRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> AppendMessageResponse:
     """Append the next user message to an existing task and kick off its next turn.
 
@@ -1156,8 +1157,8 @@ async def append_message_to_task(
             operation=f"append_message:{task_id}",
             header_value=idempotency_key,
             request_payload=request.model_dump(mode="json"),
-            run=lambda claim_id: _append_message_to_task(
-                task_id, request, principal, claim_id
+            run=lambda claim: _append_message_to_task(
+                task_id, request, principal, claim
             ),
         ),
     )
@@ -1167,7 +1168,7 @@ async def _append_message_to_task(
     task_id: int,
     request: AppendMessageRequest,
     principal: ApiKeyPrincipal,
-    idempotency_claim_id: int | None,
+    idempotency_claim: IdempotencyClaim | None,
 ) -> AppendMessageResponse:
     _validate_prompt_context(request.prompt_context)
     if request.prompt_context is not None and principal.workforce is not None:
@@ -1189,7 +1190,7 @@ async def _append_message_to_task(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
             prompt_context=request.prompt_context,
-            idempotency_claim_id=idempotency_claim_id,
+            idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)

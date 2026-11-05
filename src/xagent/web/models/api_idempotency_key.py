@@ -55,6 +55,10 @@ class ApiIdempotencyKey(Base):  # type: ignore
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Fences the owner: every takeover issues a new token, and bind, complete
+    # and release only act for the token they were given, so a slow original
+    # request cannot act on a row its retry now owns.
+    claim_token: Mapped[str] = mapped_column(String(32), nullable=False)
     # Until this instant a retry of an ``in_progress`` row is answered 409;
     # afterwards the reserving request is presumed dead.
     lease_expires_at: Mapped[datetime] = mapped_column(
@@ -66,7 +70,10 @@ class ApiIdempotencyKey(Base):  # type: ignore
     )
     # SET NULL: a deleted task leaves the key unreplayable, not reusable.
     task_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+        Integer,
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     response_body: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)

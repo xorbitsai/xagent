@@ -19,6 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 TABLE = "api_idempotency_keys"
 UNIQUE = "uq_api_idempotency_scope_operation_key"
 EXPIRES_INDEX = "ix_api_idempotency_keys_expires_at"
+TASK_INDEX = "ix_api_idempotency_keys_task_id"
 
 
 def _has_table() -> bool:
@@ -37,6 +38,7 @@ def upgrade() -> None:
         sa.Column("idempotency_key", sa.String(255), nullable=False),
         sa.Column("request_fingerprint", sa.String(64), nullable=False),
         sa.Column("state", sa.String(16), nullable=False),
+        sa.Column("claim_token", sa.String(32), nullable=False),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column(
@@ -58,10 +60,12 @@ def upgrade() -> None:
         ),
     )
     op.create_index(EXPIRES_INDEX, TABLE, ["expires_at"])
+    op.create_index(TASK_INDEX, TABLE, ["task_id"])
 
 
 def downgrade() -> None:
     if not _has_table():
         return
+    op.drop_index(TASK_INDEX, table_name=TABLE)
     op.drop_index(EXPIRES_INDEX, table_name=TABLE)
     op.drop_table(TABLE)

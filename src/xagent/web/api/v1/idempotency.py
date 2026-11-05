@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, NoReturn
 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -32,7 +32,7 @@ def idempotency_scope(principal: ApiKeyPrincipal) -> tuple[str, int]:
     raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
 
-def raise_idempotency_rejection(exc: api_idempotency.IdempotencyRejected) -> None:
+def raise_idempotency_rejection(exc: api_idempotency.IdempotencyRejected) -> NoReturn:
     if exc.reason == "reused":
         raise V1ApiError(V1ErrorCode.IDEMPOTENCY_KEY_REUSED, 422)
     if exc.reason == "in_progress":
@@ -46,9 +46,10 @@ def raise_idempotency_rejection(exc: api_idempotency.IdempotencyRejected) -> Non
             V1ErrorCode.IDEMPOTENCY_CONFLICT,
             409,
             message=(
-                "The original request with this Idempotency-Key was accepted as "
-                f"task {exc.task_id} but its response was not recorded; read the "
-                "task with GET /v1/chat/tasks/{task_id}. It was not started again."
+                "The original request with this Idempotency-Key created task "
+                f"{exc.task_id}, but its outcome was not recorded. Read the task "
+                f"with GET /v1/chat/tasks/{exc.task_id} to see its state; a new "
+                "task was not started."
             ),
             details={"task_id": exc.task_id},
         )
@@ -61,37 +62,48 @@ async def run_with_idempotency(
     operation: str,
     header_value: str | None,
     request_payload: dict,
-    run: Callable[[int | None], Awaitable[BaseModel]],
+    run: Callable[[api_idempotency.IdempotencyClaim | None], Awaitable[BaseModel]],
 ) -> BaseModel | JSONResponse:
     """Run ``run`` once per ``Idempotency-Key``.
 
-    ``run`` receives the reservation id (``None`` without a header) and must
-    pass it to the call that creates the task so the reservation is bound in
-    that transaction. Without the header this is exactly ``await run(None)``.
+    ``run`` receives the reservation (``None`` without a header) and must pass
+    it to the call that creates the task so the reservation is bound in that
+    transaction. Without the header this is exactly ``await run(None)``.
     """
     try:
         key = api_idempotency.validate_idempotency_key(header_value)
     except ValueError as exc:
-        raise V1ApiError(
-            V1ErrorCode.IDEMPOTENCY_KEY_INVALID, 422, message=str(exc)
-        ) from exc
+        raise V1ApiError(V1ErrorCode.IDEMPOTENCY_KEY_INVALID, 422) from exc
     if key is None:
         return await run(None)
 
     scope_kind, scope_id = idempotency_scope(principal)
     fingerprint = api_idempotency.request_fingerprint(request_payload)
-    try:
-        outcome = await run_db_io_cancellation_safe(
-            lambda: api_idempotency.acquire_sync(
-                scope_kind=scope_kind,
-                scope_id=scope_id,
-                operation=operation,
-                key=key,
-                fingerprint=fingerprint,
-            )
+    acquired: list[api_idempotency.IdempotencyClaim] = []
+
+    def acquire() -> (
+        api_idempotency.IdempotencyClaim | api_idempotency.IdempotencyReplay
+    ):
+        outcome = api_idempotency.acquire_sync(
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+            operation=operation,
+            key=key,
+            fingerprint=fingerprint,
         )
+        if isinstance(outcome, api_idempotency.IdempotencyClaim):
+            # Recorded inside the worker: the claim is committed even when the
+            # awaiting request is cancelled while the worker finishes.
+            acquired.append(outcome)
+        return outcome
+
+    try:
+        outcome = await run_db_io_cancellation_safe(acquire)
     except api_idempotency.IdempotencyRejected as exc:
         raise_idempotency_rejection(exc)
+    except BaseException:
+        if acquired:
+            await _release_quietly(acquired[0])
         raise
     if isinstance(outcome, api_idempotency.IdempotencyReplay):
         return JSONResponse(
@@ -100,18 +112,20 @@ async def run_with_idempotency(
             headers={IDEMPOTENT_REPLAYED_HEADER: "true"},
         )
 
-    claim_id = outcome.claim_id
+    claim = outcome
     try:
-        response = await run(claim_id)
+        response = await run(claim)
+    except api_idempotency.IdempotencyRejected as exc:
+        # Fenced out: a retry took the reservation over while this request was
+        # still running, and nothing was created for it.
+        raise_idempotency_rejection(exc)
     except BaseException:
-        await run_db_io_cancellation_safe(
-            lambda: api_idempotency.release_sync(claim_id)
-        )
+        await _release_quietly(claim)
         raise
     try:
         await run_db_io_cancellation_safe(
             lambda: api_idempotency.complete_sync(
-                claim_id, status=202, body=response.model_dump(mode="json")
+                claim, status=202, body=response.model_dump(mode="json")
             )
         )
     except Exception:
@@ -119,3 +133,12 @@ async def run_with_idempotency(
         # retry. The bound reservation keeps that retry from starting another.
         logger.exception("failed to record the Idempotency-Key response")
     return response
+
+
+async def _release_quietly(claim: api_idempotency.IdempotencyClaim) -> None:
+    """Release ``claim`` without letting a storage error replace the exception
+    that is already unwinding."""
+    try:
+        await run_db_io_cancellation_safe(lambda: api_idempotency.release_sync(claim))
+    except Exception:
+        logger.exception("failed to release the Idempotency-Key reservation")

@@ -11,6 +11,7 @@ import pytest
 from xagent.web.models.api_idempotency_key import ApiIdempotencyKey
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.schemas.v1 import AppendMessageRequest
 from xagent.web.services import api_idempotency
 
 from ..conftest import _admin_headers, _direct_db_session, client
@@ -262,6 +263,8 @@ def test_accepted_task_with_unrecorded_response_is_not_started_again() -> None:
     error = retry.json()["error"]
     assert error["code"] == "idempotency_conflict"
     assert error["details"] == {"task_id": task_id}
+    # The message must not imply the task is running: its outcome is unknown.
+    assert f"GET /v1/chat/tasks/{task_id}" in error["message"]
     assert _task_count() == 1
 
 
@@ -312,7 +315,7 @@ def test_replay_fails_when_the_original_task_was_deleted() -> None:
     assert retry.json()["error"]["code"] == "idempotency_conflict"
 
 
-@pytest.mark.parametrize("value", ["x" * 256, "has space", "tab\tkey"])
+@pytest.mark.parametrize("value", ["", "x" * 256, "has space", "tab\tkey"])
 def test_malformed_key_is_422(value: str) -> None:
     agent_id, key = _create_agent_with_key()
 
@@ -388,3 +391,112 @@ def test_append_without_header_is_unchanged() -> None:
 
     assert first.status_code == 202 and second.status_code == 202
     assert "idempotent-replayed" not in second.headers
+
+
+def test_a_slow_owner_is_fenced_out_after_its_reservation_was_taken_over() -> None:
+    agent_id, key = _create_agent_with_key()
+    slow = api_idempotency.acquire_sync(
+        scope_kind="agent",
+        scope_id=agent_id,
+        operation="create_task",
+        key="retry-9",
+        fingerprint=api_idempotency.request_fingerprint(
+            _create_body_dump(agent_id, "first turn")
+        ),
+    )
+    assert isinstance(slow, api_idempotency.IdempotencyClaim)
+    _patch_row(lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    # The retry takes the reservation over and creates the task.
+    retry = _create(key, agent_id, "retry-9")
+    assert retry.status_code == 202
+
+    # The slow original finally reaches its bind: it must not create a second
+    # task, and its release must not delete the row its retry owns.
+    db = _direct_db_session()
+    try:
+        with pytest.raises(api_idempotency.IdempotencyRejected):
+            api_idempotency.bind_task_no_commit(db, slow, task_id=999999)
+    finally:
+        db.rollback()
+        db.close()
+    api_idempotency.release_sync(slow)
+    api_idempotency.complete_sync(slow, status=202, body={"stale": True})
+
+    row = _only_row()
+    assert row["task_id"] == retry.json()["task_id"]
+    replay = _create(key, agent_id, "retry-9")
+    assert replay.json() == retry.json()
+    assert _task_count() == 1
+
+
+def test_a_failing_release_does_not_replace_the_original_error() -> None:
+    agent_id, key = _create_agent_with_key()
+
+    with patch.object(
+        api_idempotency, "release_sync", side_effect=RuntimeError("db down")
+    ):
+        rejected = _create(key, agent_id + 999, "retry-10")
+
+    assert rejected.status_code == 404
+
+
+def test_a_failing_purge_does_not_fail_the_request() -> None:
+    agent_id, key = _create_agent_with_key()
+
+    with patch.object(api_idempotency, "delete", side_effect=RuntimeError("locked")):
+        response = _create(key, agent_id, "retry-11")
+
+    assert response.status_code == 202
+
+
+def test_append_stale_reservation_that_created_nothing_is_taken_over() -> None:
+    agent_id, key = _create_agent_with_key()
+    task_id = _create(key, agent_id).json()["task_id"]
+    _set_status(task_id, TaskStatus.COMPLETED)
+    body = AppendMessageRequest(
+        agent_id=agent_id, message={"role": "user", "content": "next turn"}
+    ).model_dump(mode="json")
+    api_idempotency.acquire_sync(
+        scope_kind="agent",
+        scope_id=agent_id,
+        operation=f"append_message:{task_id}",
+        key="append-2",
+        fingerprint=api_idempotency.request_fingerprint(body),
+    )
+    _patch_row(lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    response = _append(key, agent_id, task_id, "append-2")
+
+    assert response.status_code == 202, response.text
+    assert _only_row()["task_id"] == task_id
+
+
+def test_a_taken_over_owner_cannot_bind_or_release_before_the_new_owner_binds() -> None:
+    agent_id, _key = _create_agent_with_key()
+    fingerprint = api_idempotency.request_fingerprint(
+        _create_body_dump(agent_id, "first turn")
+    )
+    scope = {"scope_kind": "agent", "scope_id": agent_id, "operation": "create_task"}
+    slow = api_idempotency.acquire_sync(
+        **scope, key="retry-12", fingerprint=fingerprint
+    )
+    _patch_row(lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+    new_owner = api_idempotency.acquire_sync(
+        **scope, key="retry-12", fingerprint=fingerprint
+    )
+    assert isinstance(slow, api_idempotency.IdempotencyClaim)
+    assert isinstance(new_owner, api_idempotency.IdempotencyClaim)
+    assert new_owner.token != slow.token
+
+    # Nothing is bound yet, so only the token tells the two owners apart.
+    db = _direct_db_session()
+    try:
+        with pytest.raises(api_idempotency.IdempotencyRejected):
+            api_idempotency.bind_task_no_commit(db, slow, task_id=999999)
+    finally:
+        db.rollback()
+        db.close()
+    api_idempotency.release_sync(slow)
+
+    assert _only_row()["state"] == "in_progress"

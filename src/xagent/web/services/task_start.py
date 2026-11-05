@@ -25,11 +25,11 @@ from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.task_input_receipt import TaskInputReceipt
-from .api_idempotency import bind_task_no_commit
 from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
 from .a2a_task_read import load_a2a_task_snapshot
 from .agent_store import AgentStore
+from .api_idempotency import IdempotencyClaim, bind_task_no_commit
 from .connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -310,7 +310,7 @@ def _prepare_created_task_isolated(
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
     credential_kind: SdkCredentialKind,
-    idempotency_claim_id: int | None = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
@@ -418,9 +418,9 @@ def _prepare_created_task_isolated(
                     )
                 ).scalar_one(),
             )
-        if idempotency_claim_id is not None:
+        if idempotency_claim is not None:
             # Same transaction as the task: the key is bound to it or to nothing.
-            bind_task_no_commit(db, idempotency_claim_id, task_id)
+            bind_task_no_commit(db, idempotency_claim, task_id)
         commit_claimed_turn_or_reconcile(
             db,
             task_id=task_id,
@@ -520,7 +520,7 @@ def _prepare_append_turn_isolated(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
-    idempotency_claim_id: int | None = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedAppendTurn:
     """Resolve append authorization and runtime inputs into detached values."""
 
@@ -608,8 +608,8 @@ def _prepare_append_turn_isolated(
             payload=payload,
             claimed_turn=claimed_turn,
         )
-        if idempotency_claim_id is not None:
-            bind_task_no_commit(db, idempotency_claim_id, int(task.id))
+        if idempotency_claim is not None:
+            bind_task_no_commit(db, idempotency_claim, int(task.id))
         commit_claimed_turn_or_reconcile(
             db,
             task_id=int(task.id),
@@ -784,7 +784,7 @@ async def create_sdk_task(
     requested_priority: int | None = None,
     prompt_context: dict[str, Any] | None = None,
     credential_kind: SdkCredentialKind,
-    idempotency_claim_id: int | None = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     """Create an SDK task and schedule its first turn.
 
@@ -808,7 +808,7 @@ async def create_sdk_task(
                 requested_dispatch_class=requested_dispatch_class,
                 requested_priority=requested_priority,
                 credential_kind=credential_kind,
-                idempotency_claim_id=idempotency_claim_id,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -857,7 +857,7 @@ async def append_sdk_turn(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
-    idempotency_claim_id: int | None = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
         # A runner may still be finishing local cleanup after its terminal
@@ -878,7 +878,7 @@ async def append_sdk_turn(
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
                 prompt_context=prompt_context,
-                idempotency_claim_id=idempotency_claim_id,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:

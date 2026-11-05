@@ -1,9 +1,12 @@
 """Per-run settlement notification for the hosting application.
 
 The execution entry points build a ``TurnFacts`` for each run, the run fills
-it in, and after the run's lease has been settled the entry point hands a
-frozen ``TurnSettlement`` to the hook registered with
-``set_turn_settled_hook``. Delivery is detached: the entry point never waits
+it in, and once the run's outcome is settled -- its own result committed, or
+its lease settled by the entry point -- the entry point hands a frozen
+``TurnSettlement`` to the hook registered with ``set_turn_settled_hook``. A
+run whose result committed is reported even when its lease is then left to
+lease recovery; a run deferred to lease recovery before its result was
+written is not reported. Delivery is detached: the entry point never waits
 for the hook, so a slow hook cannot delay the next turn of the same task.
 
 A synchronous hook is called on the event loop and must not block; a hook
@@ -81,7 +84,7 @@ class TurnFacts:
     model_error_kind: str | None = None
     tool_failure_code: str | None = None
     # Set once this run's settlement was reported; a run is reported at most
-    # once even when two entry points both see its lease settle.
+    # once even when two entry points both see its outcome settle.
     notified: bool = False
 
     def record_usage(self, usage: TurnUsage) -> None:
@@ -123,7 +126,7 @@ def _parse_timestamp(raw: Any) -> datetime | None:
 
 @dataclass(frozen=True)
 class TurnSettlement:
-    """How one run of a task ended, reported once its lease was settled."""
+    """How one run of a task ended, reported once its outcome was settled."""
 
     task_id: int
     run_id: str | None

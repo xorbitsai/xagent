@@ -3706,8 +3706,8 @@ async def execute_resume_background(
     resume executes as (``UserContext``), not the acting principal.
 
     Once the resume's lease is settled -- by the result finalizer, or by the
-    failure/pause settlement in its cleanup -- the settlement is reported
-    once through ``notify_turn_settled``.
+    failure/pause settlement in its cleanup -- this function reports the
+    settlement once through ``report_turn_settled``.
     """
     from .agent_service_manager import caller_facing_execution_metadata
 

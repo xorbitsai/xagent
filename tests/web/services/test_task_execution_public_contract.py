@@ -106,8 +106,9 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     # delivery it claimed itself, so a claim refused for an ended run
     # withdraws the never-injected row instead of settling it unknown.
     ("delivery_claimed_fresh", False),
-    # Appended for the same reason: the facts bag the caller reports the
-    # run's settlement from. The default keeps every other caller unchanged.
+    # Appended for the same reason: the facts bag this resume fills and
+    # reports its own settlement from; None makes the resume create one. The
+    # default keeps every other caller unchanged.
     ("turn_facts", None),
 ]
 

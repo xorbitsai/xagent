@@ -2699,7 +2699,7 @@ def _schedule_bg(
         # retryable ``failed`` delivery (it would invite a double execution).
         execution_started = False
         cleanup_cancellation: asyncio.CancelledError | None = None
-        # What this run reports once its lease is settled.
+        # What this run reports once its outcome is settled.
         facts = TurnFacts(started_at=datetime.now(timezone.utc))
         try:
             # A cancellation can land after the worker commits but before the

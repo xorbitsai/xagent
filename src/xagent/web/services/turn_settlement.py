@@ -76,6 +76,9 @@ class TurnFacts:
     empty_visible_answer: bool = False
     model_error_kind: str | None = None
     tool_failure_code: str | None = None
+    # Set once this run's settlement was reported; a run is reported at most
+    # once even when two entry points both see its lease settle.
+    notified: bool = False
 
     def record_usage(self, usage: TurnUsage) -> None:
         self.usage = usage
@@ -198,6 +201,42 @@ def build_turn_settlement(
         ended_at=ended_at,
         first_answer_delta_at=facts.first_answer_delta_at,
     )
+
+
+def report_turn_settled(
+    facts: TurnFacts,
+    *,
+    task_id: int,
+    run_id: str | None,
+    turn_id: str | None,
+    task_source: str | None,
+    status: str,
+    error_code: Any,
+    ended_at: datetime,
+) -> bool:
+    """Report this run's settlement unless it was already reported.
+
+    Returns whether this call reported it. A missing ``turn_id`` is counted
+    and the settlement is still reported.
+    """
+    if facts.notified:
+        return False
+    facts.notified = True
+    if turn_id is None:
+        increment_counter(_HOOK_METRIC, attributes={"outcome": "missing_turn_id"})
+    notify_turn_settled(
+        build_turn_settlement(
+            facts,
+            task_id=task_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            task_source=task_source,
+            status=status,
+            error_code=error_code,
+            ended_at=ended_at,
+        )
+    )
+    return True
 
 
 def notify_turn_settled(settlement: TurnSettlement) -> None:

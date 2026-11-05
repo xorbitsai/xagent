@@ -129,7 +129,7 @@ from .task_lease_service import (
     task_lease_attempt_predicate,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
-from .turn_settlement import TurnFacts, build_turn_settlement, notify_turn_settled
+from .turn_settlement import TurnFacts, report_turn_settled
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -3724,7 +3724,6 @@ async def execute_resume_background(
     # pause); the result finalizer's commit is recorded on ``facts``.
     resume_settled_by_cleanup = False
     resume_settled_paused = False
-    notified = False
 
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
@@ -4404,6 +4403,9 @@ async def execute_resume_background(
                 expected_runner_id=lease.runner_id,
                 expected_attempt_id=lease.attempt_id,
             )
+            # Both completion points below (the normal one and the cleanup's)
+            # report this run's usage through the tracker.
+            resume_tracker.turn_usage_sink = facts.record_usage
             await resume_tracker.start_tracking()
             agent_service.set_interrupt_checker(
                 resume_tracker.interrupt_reason_for_quota
@@ -4466,15 +4468,7 @@ async def execute_resume_background(
             tracker_to_complete = resume_tracker
             resume_tracker = None
             agent_service.set_interrupt_checker(None)
-            completed_usage = await tracker_to_complete.complete_tracking()
-            try:
-                facts.record_usage(tracker_to_complete.turn_usage(completed_usage))
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "turn usage capture failed for task %s",
-                    task_id,
-                    exc_info=True,
-                )
+            await tracker_to_complete.complete_tracking()
 
         # Output object storage can be arbitrarily slow. Stage and checksum it
         # while this exact runner's heartbeat is still active; after heartbeat
@@ -4829,7 +4823,7 @@ async def execute_resume_background(
             nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
             nonlocal settlement_error
             nonlocal prepared_outputs
-            nonlocal resume_settled_by_cleanup, resume_settled_paused, notified
+            nonlocal resume_settled_by_cleanup, resume_settled_paused
             settlement_returned = False
 
             try:
@@ -5117,10 +5111,9 @@ async def execute_resume_background(
                 # the cleanup only settles a lease the finalizer did not
                 # release.
                 try:
-                    if not notified and (
+                    if not facts.notified and (
                         facts.finalized_status is not None or resume_settled_by_cleanup
                     ):
-                        notified = True
                         status = facts.finalized_status
                         if status is None:
                             status = (
@@ -5131,29 +5124,25 @@ async def execute_resume_background(
                         error_code = facts.error_code
                         if error_code is None and status == TaskStatus.FAILED.value:
                             error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
-                        notify_turn_settled(
-                            build_turn_settlement(
-                                facts,
-                                task_id=task_id,
-                                run_id=(
-                                    lease.run_id
-                                    if lease is not None
-                                    else expected_run_id
-                                ),
-                                turn_id=(
-                                    history_turn_id
-                                    or (
-                                        _latest_result_user_turn_id(result)
-                                        if isinstance(result, dict)
-                                        else None
-                                    )
-                                    or None
-                                ),
-                                task_source=trusted_task_source,
-                                status=status,
-                                error_code=error_code,
-                                ended_at=datetime.now(timezone.utc),
-                            )
+                        report_turn_settled(
+                            facts,
+                            task_id=task_id,
+                            run_id=(
+                                lease.run_id if lease is not None else expected_run_id
+                            ),
+                            turn_id=(
+                                history_turn_id
+                                or (
+                                    _latest_result_user_turn_id(result)
+                                    if isinstance(result, dict)
+                                    else None
+                                )
+                                or None
+                            ),
+                            task_source=trusted_task_source,
+                            status=status,
+                            error_code=error_code,
+                            ended_at=datetime.now(timezone.utc),
                         )
                 except Exception:  # noqa: BLE001
                     logger.warning(

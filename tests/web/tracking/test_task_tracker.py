@@ -1462,6 +1462,48 @@ class TestTaskTracker:
         # Without an argument it reads the current context's usage.
         assert tracker.turn_usage() == turn
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("persisted", [True, False])
+    async def test_turn_usage_sink_receives_usage_once_per_completion(
+        self, db_session, monkeypatch, persisted
+    ):
+        """The sink runs whether or not the final write was persisted, and a
+        failing sink never changes what completion returns."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        monkeypatch.setattr(
+            tracker_module,
+            "_complete_task_usage_sync",
+            lambda *_args, **_kwargs: persisted,
+        )
+        received = []
+        tracker = TaskTracker(
+            task_id=123, db_session=db_session, turn_usage_sink=received.append
+        )
+        await tracker.start_tracking()
+        add_token_usage(input_tokens=4, output_tokens=2, model="m", call_type="chat")
+
+        usage = await tracker.complete_tracking()
+
+        assert len(received) == 1
+        assert received[0] == tracker.turn_usage(usage)
+        assert (received[0].input_tokens, received[0].output_tokens) == (4, 2)
+
+    @pytest.mark.asyncio
+    async def test_failing_turn_usage_sink_is_only_logged(self, db_session):
+        def sink(_usage):
+            raise RuntimeError("sink broke")
+
+        tracker = TaskTracker(task_id=123, db_session=db_session, turn_usage_sink=sink)
+        await tracker.start_tracking()
+        add_token_usage(input_tokens=4, output_tokens=2, model="m", call_type="chat")
+
+        with patch("xagent.web.tracking.task_tracker.logger.warning") as warning:
+            usage = await tracker.complete_tracking()
+
+        assert usage.input_tokens == 4
+        assert warning.call_count == 1
+
 
 class TestTaskTrackerManager:
     """Test cases for TaskTrackerManager."""

@@ -4088,10 +4088,11 @@ class AgentServiceManager:
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
-            turn_usage_sink: Receives this run's usage once the tracker has
-                completed. Not called when tracking is off, when completing the
-                tracker raises, or when lease ownership was lost. Its own
-                failure is logged and never changes the run's result.
+            turn_usage_sink: Handed to the run's tracker, which passes it this
+                run's usage when tracking completes. Not called when tracking
+                is off, when completing the tracker raises, or when lease
+                ownership was lost. Its own failure is logged and never
+                changes the run's result.
 
         Returns:
             Execution result dictionary
@@ -4333,6 +4334,9 @@ class AgentServiceManager:
                             else None
                         ),
                     )
+                    # The tracker hands this run's usage to the sink each
+                    # time its completion returns.
+                    tracker.turn_usage_sink = turn_usage_sink
                     await tracker.start_tracking()
                     # Enforce quota mid-run: the pattern loop polls this every step
                     # (each LLM reply / tool call) and stops the run once its live
@@ -4473,20 +4477,11 @@ class AgentServiceManager:
                             if lease_ownership_lost:
                                 await tracker.stop_periodic_updates()
                             else:
-                                usage = await tracker.complete_tracking()
+                                await tracker.complete_tracking()
                                 logger.info(
                                     "Completed token tracking for task %s",
                                     tracker_task_id,
                                 )
-                                if turn_usage_sink is not None:
-                                    try:
-                                        turn_usage_sink(tracker.turn_usage(usage))
-                                    except Exception:  # noqa: BLE001
-                                        logger.warning(
-                                            "turn usage sink failed for task %s",
-                                            tracker_task_id,
-                                            exc_info=True,
-                                        )
                         except Exception as e:
                             if is_database_pool_timeout(e):
                                 tracker_pool_timeout = e

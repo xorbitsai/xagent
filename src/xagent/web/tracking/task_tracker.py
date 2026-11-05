@@ -7,7 +7,7 @@ with support for periodic updates to the database.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ...core.model.chat.token_context import (
     TokenUsage,
@@ -357,6 +357,8 @@ class TaskTracker:
         expected_run_id: str | None = None,
         expected_runner_id: str | None = None,
         expected_attempt_id: str | None = None,
+        *,
+        turn_usage_sink: Callable[[TurnUsage], None] | None = None,
     ) -> None:
         """Initialize the task tracker.
 
@@ -371,12 +373,17 @@ class TaskTracker:
             expected_runner_id: Optional durable runner fence. When provided,
                 seed reads and writes require the run, runner, and acquisition.
             expected_attempt_id: Acquisition that owns the tracked counters.
+            turn_usage_sink: Receives this run's ``turn_usage`` each time
+                completion returns, whether or not the final write was
+                persisted. Not called when completion raises. Its own failure
+                is logged and never changes the completion result.
         """
         self.task_id = task_id
         self.update_interval_seconds = update_interval_seconds
         self.expected_run_id = expected_run_id
         self.expected_runner_id = expected_runner_id
         self.expected_attempt_id = expected_attempt_id
+        self.turn_usage_sink = turn_usage_sink
         self._is_tracking = False
         self._update_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
@@ -678,7 +685,9 @@ class TaskTracker:
                 # retain the current run's lease for TTL recovery instead of
                 # immediately performing a second blocking DB checkout.
                 raise
+            self._deliver_turn_usage(usage)
             return usage
+        self._deliver_turn_usage(usage)
         if not persisted:
             return usage
 
@@ -719,6 +728,17 @@ class TaskTracker:
         )
 
         return usage
+
+    def _deliver_turn_usage(self, usage: TokenUsage) -> None:
+        sink = self.turn_usage_sink
+        if sink is None:
+            return
+        try:
+            sink(self.turn_usage(usage))
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "turn usage sink failed for task %s", self.task_id, exc_info=True
+            )
 
     async def complete_tracking(self) -> TokenUsage:
         """Complete tracking and return final statistics.

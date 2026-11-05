@@ -53,6 +53,7 @@ from xagent.web.services.turn_settlement import (
     build_turn_settlement,
     drain_turn_settlement_hooks,
     notify_turn_settled,
+    report_turn_settled,
     set_turn_settled_hook,
 )
 
@@ -687,6 +688,23 @@ async def test_scheduled_turn_reports_real_tracker_usage(canonical) -> None:
     assert usage.by_model == (TurnModelUsage("7", "model-a", 12, 4),)
 
 
+def _report_like_the_channel_entry(kwargs: dict[str, Any]) -> None:
+    """What the channel entry reports once its result committed."""
+    facts = kwargs["turn_facts"]
+    assert isinstance(facts, TurnFacts)
+    facts.finalized_status = "completed"
+    report_turn_settled(
+        facts,
+        task_id=kwargs["command"].task_id,
+        run_id=kwargs["lease"].run_id,
+        turn_id="cmd",
+        task_source=None,
+        status="completed",
+        error_code=None,
+        ended_at=datetime.now(timezone.utc),
+    )
+
+
 @pytest.mark.usefixtures("_clear_bg_manager")
 @pytest.mark.parametrize("coordinated", [False, True], ids=["local", "coordinator"])
 async def test_channel_turn_is_reported_once_by_its_finalizer(
@@ -711,9 +729,7 @@ async def test_channel_turn_is_reported_once_by_its_finalizer(
             assistant_content="ok",
             turn_id="cmd",
         )
-        notify_turn_settled(
-            _settlement(task_id=kwargs["command"].task_id, turn_id="cmd")
-        )
+        _report_like_the_channel_entry(kwargs)
 
     settle = orchestrator.settle_task_lease_isolated
     calls: list[bool] = []
@@ -793,6 +809,7 @@ async def _drive_resume(
     delivery_turn_id: str | None = "turn-r",
     settled: bool = True,
     trusted_task_source: str | None = "sdk",
+    extra_patches: tuple[Any, ...] = (),
 ) -> type[BaseException] | None:
     from xagent.web.services.task_execution import execute_resume_background
 
@@ -863,6 +880,7 @@ async def _drive_resume(
                 "xagent.web.services.task_execution.background_task_manager"
                 ".promote_resume_task"
             ),
+            *extra_patches,
         ):
             stack.enter_context(active)
         try:
@@ -969,3 +987,149 @@ async def test_resume_whose_cleanup_settlement_was_fenced_out_reports_nothing(
     await _drive_resume(monkeypatch, RuntimeError("agent failed"), settled=False)
 
     assert received == []
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_channel_turn_cancelled_after_its_settlement_is_reported_once(
+    canonical,
+) -> None:
+    """The channel entry reported, then the run was cancelled and the
+    scheduler's settlement still returned True (coordinator context): the
+    shared facts bag keeps it to one report."""
+    received = _capture()
+
+    async def channel_run(**kwargs: Any) -> None:
+        from xagent.web.services.managed_task_lease import (
+            finalize_managed_task_lease_result_sync,
+        )
+
+        assert await asyncio.to_thread(
+            finalize_managed_task_lease_result_sync,
+            kwargs["lease"],
+            status=TaskStatus.COMPLETED,
+            assistant_content="ok",
+            turn_id="cmd",
+        )
+        _report_like_the_channel_entry(kwargs)
+        raise asyncio.CancelledError()
+
+    settle = orchestrator.settle_task_lease_isolated
+
+    def settle_as_coordinator(*args: Any, **kwargs: Any) -> bool:
+        settle(*args, **kwargs)
+        return True
+
+    _lease, _payload, raised = await _schedule_turn(
+        canonical,
+        _result_manager({"success": True}),
+        channel_command=SimpleNamespace(task_id=canonical[1], command_id="cmd"),
+        extra_patches=(
+            patch(
+                "xagent.web.services.shared_channel_execution."
+                "execute_channel_background",
+                new=channel_run,
+            ),
+            patch.object(
+                orchestrator, "settle_task_lease_isolated", new=settle_as_coordinator
+            ),
+        ),
+    )
+
+    assert raised is asyncio.CancelledError
+    assert [(s.status, s.turn_id) for s in received] == [("completed", "cmd")]
+
+
+def test_report_turn_settled_reports_a_run_once() -> None:
+    facts = TurnFacts(started_at=datetime.now(timezone.utc))
+    kwargs: dict[str, Any] = {
+        "task_id": 1,
+        "run_id": "r",
+        "turn_id": "t",
+        "task_source": None,
+        "status": "completed",
+        "error_code": None,
+        "ended_at": datetime.now(timezone.utc),
+    }
+
+    with patch.object(turn_settlement, "notify_turn_settled") as notify:
+        assert report_turn_settled(facts, **kwargs) is True
+        assert report_turn_settled(facts, **kwargs) is False
+
+    assert notify.call_count == 1
+    assert facts.notified is True
+
+
+class _SinkTracker:
+    """Stands in for ``TaskTracker``: completion hands the sink a usage."""
+
+    quota_interrupt_reason = None
+
+    def __init__(self, **_kwargs: Any) -> None:
+        self.turn_usage_sink: Any = None
+
+    async def start_tracking(self) -> None:
+        return None
+
+    async def interrupt_reason_for_quota(self) -> None:
+        return None
+
+    async def complete_tracking(self) -> None:
+        if self.turn_usage_sink is not None:
+            self.turn_usage_sink(USAGE)
+
+    async def stop_periodic_updates(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("path", ["normal", "exception"])
+async def test_resumed_run_reports_usage_from_either_completion_point(
+    monkeypatch, path
+) -> None:
+    received = _capture()
+    outcome = RESUME_OK if path == "normal" else RuntimeError("agent failed")
+
+    await _drive_resume(
+        monkeypatch,
+        outcome,
+        extra_patches=(
+            patch("xagent.web.tracking.task_tracker.TaskTracker", new=_SinkTracker),
+        ),
+    )
+
+    assert len(received) == 1
+    assert received[0].usage == USAGE
+
+
+async def test_resume_paused_for_an_unaccepted_input_reports_paused(
+    monkeypatch,
+) -> None:
+    from xagent.web.services.task_execution import (
+        _DeferredInjectionRejectedRetryableError,
+    )
+
+    received = _capture()
+    pause = AsyncMock(return_value=True)
+
+    await _drive_resume(
+        monkeypatch,
+        _DeferredInjectionRejectedRetryableError("not accepted", fenced=True),
+        extra_patches=(
+            patch.object(orchestrator, "pause_unknown_task_lease", new=pause),
+        ),
+    )
+
+    pause.assert_awaited_once()
+    assert [(s.status, s.error_code) for s in received] == [("paused", None)]
+
+
+async def test_resume_without_any_turn_id_is_counted_and_still_reported(
+    monkeypatch,
+) -> None:
+    received = _capture()
+
+    with patch.object(turn_settlement, "increment_counter") as counter:
+        await _drive_resume(monkeypatch, RESUME_OK, delivery_turn_id=None)
+        await _settle_inflight()
+
+    assert [(s.status, s.turn_id) for s in received] == [("completed", None)]
+    assert _outcomes(counter).count("missing_turn_id") == 1

@@ -75,12 +75,7 @@ from .task_start_protocol import (
     TaskStartPayload,
     stage_task_start_command,
 )
-from .turn_settlement import (
-    TurnFacts,
-    build_error_code,
-    build_turn_settlement,
-    notify_turn_settled,
-)
+from .turn_settlement import TurnFacts, build_error_code, report_turn_settled
 from .workspace_binding import canonical_workspace_base
 
 logger = logging.getLogger(__name__)
@@ -752,7 +747,13 @@ async def execute_channel_background(
     heartbeat_task: asyncio.Task,
     snapshot: Any,
     payload: TaskTurnPayload,
+    turn_facts: TurnFacts | None = None,
 ) -> None:
+    """Run one channel turn and report its settlement once its result commits.
+
+    ``turn_facts`` is the scheduler's facts bag for this run, so a run the
+    scheduler also settles is still reported once; None creates one here.
+    """
     from ..user_isolated_memory import UserContext
     from .agent_service_manager import get_agent_manager
     from .execution_result_projection import project_execution_result_for_channel
@@ -761,7 +762,11 @@ async def execute_channel_background(
         materialize_task_execution_recovery_state,
     )
 
-    facts = TurnFacts(started_at=datetime.now(timezone.utc))
+    facts = (
+        turn_facts
+        if turn_facts is not None
+        else TurnFacts(started_at=datetime.now(timezone.utc))
+    )
     manager = get_agent_manager()
     service = await manager.get_agent_for_task(
         command.task_id,
@@ -878,9 +883,9 @@ async def execute_channel_background(
 
             if not await run_db_io_cancellation_safe(finalize):
                 raise TaskLeaseLostError("Channel result no longer owns its execution")
-            # The result and the lease are settled: report the run. Only this
-            # committed path reports; a run that raises settles in the
-            # scheduler, which does not report channel runs.
+            # The result and the lease are settled: report the run. A run
+            # that raises instead is settled and reported by the scheduler;
+            # the shared facts bag keeps either path from reporting twice.
             try:
                 facts.finalized_status = (
                     projection.task_status.value
@@ -898,17 +903,15 @@ async def execute_channel_background(
                     and facts.finalized_status == TaskStatus.FAILED.value
                 ):
                     error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
-                notify_turn_settled(
-                    build_turn_settlement(
-                        facts,
-                        task_id=command.task_id,
-                        run_id=lease.run_id,
-                        turn_id=command.command_id,
-                        task_source=getattr(snapshot.task, "source", None),
-                        status=facts.finalized_status,
-                        error_code=error_code,
-                        ended_at=datetime.now(timezone.utc),
-                    )
+                report_turn_settled(
+                    facts,
+                    task_id=command.task_id,
+                    run_id=lease.run_id,
+                    turn_id=command.command_id,
+                    task_source=getattr(snapshot.task, "source", None),
+                    status=facts.finalized_status,
+                    error_code=error_code,
+                    ended_at=datetime.now(timezone.utc),
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(

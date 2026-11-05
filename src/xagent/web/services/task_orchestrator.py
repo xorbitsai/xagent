@@ -158,7 +158,7 @@ from .task_runtime import (
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
-from .turn_settlement import TurnFacts, build_turn_settlement, notify_turn_settled
+from .turn_settlement import TurnFacts, report_turn_settled
 
 logger = logging.getLogger(__name__)
 
@@ -2860,6 +2860,7 @@ def _schedule_bg(
                             heartbeat_task=hb_task,
                             snapshot=snapshot,
                             payload=payload,
+                            turn_facts=facts,
                         )
                     else:
                         await execute_task_background(
@@ -3241,10 +3242,12 @@ def _schedule_bg(
                             )
             # Report the run once its lease is settled here. Skipped when the
             # turn body never ran and nothing failed (a pre-execution
-            # short-circuit), and for a channel run that ended normally: its
-            # own result finalizer reported it.
+            # short-circuit), for a channel run that ended normally (its own
+            # result finalizer reports it), and for a run already reported
+            # through the shared facts bag.
             if (
-                lease is not None
+                not facts.notified
+                and lease is not None
                 and lease_settled
                 and (execution_started or settlement_error is not None)
                 and (channel_command is None or settlement_error is not None)
@@ -3265,17 +3268,15 @@ def _schedule_bg(
                             error_code = ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
                         else:
                             error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
-                    notify_turn_settled(
-                        build_turn_settlement(
-                            facts,
-                            task_id=task_id,
-                            run_id=lease.run_id,
-                            turn_id=turn_id,
-                            task_source=task_source,
-                            status=status,
-                            error_code=error_code,
-                            ended_at=datetime.now(timezone.utc),
-                        )
+                    report_turn_settled(
+                        facts,
+                        task_id=task_id,
+                        run_id=lease.run_id,
+                        turn_id=turn_id,
+                        task_source=task_source,
+                        status=status,
+                        error_code=error_code,
+                        ended_at=datetime.now(timezone.utc),
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(

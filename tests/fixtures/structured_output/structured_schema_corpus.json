@@ -1,0 +1,5954 @@
+{
+ "accept": [
+  {
+   "id": "text-format",
+   "response_format": {
+    "type": "text"
+   }
+  },
+  {
+   "id": "plain-object",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       },
+       "b": {
+        "type": "integer"
+       },
+       "c": {
+        "type": "number"
+       },
+       "d": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "a",
+       "b",
+       "c",
+       "d"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "defs-and-pure-reference",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/A"
+       },
+       "b": {
+        "$ref": "#/$defs/B"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "$ref": "#/$defs/B"
+       },
+       "B": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "property-named-pattern-and-not",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "not": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern",
+       "not"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "nullable-type-array",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "b": {
+        "type": [
+         "object",
+         "null"
+        ],
+        "properties": {
+         "x": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "x"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "nullable-any-of",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "b": {
+        "anyOf": [
+         {
+          "type": "null"
+         },
+         {
+          "$ref": "#/$defs/X"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "X": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "typed-enum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "x",
+         "y"
+        ]
+       },
+       "b": {
+        "type": "integer",
+        "enum": [
+         1,
+         2.0
+        ]
+       },
+       "c": {
+        "type": [
+         "string",
+         "null"
+        ],
+        "enum": [
+         "x",
+         null
+        ]
+       },
+       "d": {
+        "type": "boolean",
+        "enum": [
+         true
+        ]
+       }
+      },
+      "required": [
+       "a",
+       "b",
+       "c",
+       "d"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "const-with-type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "const": "x"
+       },
+       "b": {
+        "type": "number",
+        "const": 1
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "array-of-objects",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "items": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "x": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "x"
+         ],
+         "additionalProperties": false
+        }
+       }
+      },
+      "required": [
+       "items"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "descriptions-and-titles",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "title": "A",
+        "description": "the a"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "title": "root",
+      "description": "d"
+     },
+     "description": "format description"
+    }
+   }
+  },
+  {
+   "id": "strict-true",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "strict": true
+    }
+   }
+  },
+  {
+   "id": "tail-newline-contrast-names",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "a",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       },
+       "q": {
+        "$ref": "#/$defs/a"
+       }
+      },
+      "required": [
+       "a",
+       "q"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "a": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "boolean-enum-true",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "boolean",
+        "enum": [
+         true
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "dotted-property-names",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a.b": {
+        "type": "string"
+       },
+       "a-b": {
+        "type": "string"
+       },
+       "a_b": {
+        "type": "string"
+       },
+       "1a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a.b",
+       "a-b",
+       "a_b",
+       "1a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  }
+ ],
+ "reject": [
+  {
+   "id": "n1-string",
+   "rule": "N1",
+   "path": "",
+   "response_format": "x"
+  },
+  {
+   "id": "n1-array",
+   "rule": "N1",
+   "path": "",
+   "response_format": []
+  },
+  {
+   "id": "n1-number",
+   "rule": "N1",
+   "path": "",
+   "response_format": 1
+  },
+  {
+   "id": "n1-boolean",
+   "rule": "N1",
+   "path": "",
+   "response_format": true
+  },
+  {
+   "id": "n2-unknown-type",
+   "rule": "N2",
+   "path": "/type",
+   "response_format": {
+    "type": "x"
+   }
+  },
+  {
+   "id": "n2-number-type",
+   "rule": "N2",
+   "path": "/type",
+   "response_format": {
+    "type": 1
+   }
+  },
+  {
+   "id": "n2-array-type",
+   "rule": "N2",
+   "path": "/type",
+   "response_format": {
+    "type": []
+   }
+  },
+  {
+   "id": "n2-object-type",
+   "rule": "N2",
+   "path": "/type",
+   "response_format": {
+    "type": {}
+   }
+  },
+  {
+   "id": "n2-missing-type",
+   "rule": "N2",
+   "path": "/type",
+   "response_format": {}
+  },
+  {
+   "id": "n3-text-with-json-schema",
+   "rule": "N3",
+   "path": "/json_schema",
+   "response_format": {
+    "type": "text",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n3-text-with-extra-key",
+   "rule": "N3",
+   "path": "/foo",
+   "response_format": {
+    "type": "text",
+    "foo": 1
+   }
+  },
+  {
+   "id": "n3-json-schema-with-strict-at-top",
+   "rule": "N3",
+   "path": "/strict",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "strict": false
+   }
+  },
+  {
+   "id": "n3-first-extra-key-wins",
+   "rule": "N3",
+   "path": "/zzz",
+   "response_format": {
+    "type": "json_schema",
+    "zzz": 1,
+    "aaa": 2,
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n4-json-schema-missing",
+   "rule": "N4",
+   "path": "/json_schema",
+   "response_format": {
+    "type": "json_schema"
+   }
+  },
+  {
+   "id": "n4-json-schema-not-object",
+   "rule": "N4",
+   "path": "/json_schema",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": "x"
+   }
+  },
+  {
+   "id": "n4-extra-key",
+   "rule": "N4",
+   "path": "/json_schema/foo",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "foo": 1
+    }
+   }
+  },
+  {
+   "id": "n4-missing-schema",
+   "rule": "N4",
+   "path": "/json_schema/schema",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result"
+    }
+   }
+  },
+  {
+   "id": "n4-extra-key-beats-missing-schema",
+   "rule": "N4",
+   "path": "/json_schema/foo",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "foo": 1
+    }
+   }
+  },
+  {
+   "id": "n5-missing-name",
+   "rule": "N5",
+   "path": "/json_schema/name",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n5-trailing-newline",
+   "rule": "N5",
+   "path": "/json_schema/name",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "a\n",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n5-space",
+   "rule": "N5",
+   "path": "/json_schema/name",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "a b",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n5-too-long",
+   "rule": "N5",
+   "path": "/json_schema/name",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n5-empty",
+   "rule": "N5",
+   "path": "/json_schema/name",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n5-not-string",
+   "rule": "N5",
+   "path": "/json_schema/name",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": 1,
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "n6-nul",
+   "rule": "N6",
+   "path": "/json_schema/description",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "description": "a\u0000b"
+    }
+   }
+  },
+  {
+   "id": "n6-too-long",
+   "rule": "N6",
+   "path": "/json_schema/description",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "description": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+   }
+  },
+  {
+   "id": "n6-not-string",
+   "rule": "N6",
+   "path": "/json_schema/description",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "description": 1
+    }
+   }
+  },
+  {
+   "id": "n6-null",
+   "rule": "N6",
+   "path": "/json_schema/description",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "description": null
+    }
+   }
+  },
+  {
+   "id": "n7-integer-one",
+   "rule": "N7",
+   "path": "/json_schema/strict",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "strict": 1
+    }
+   }
+  },
+  {
+   "id": "n7-float-one",
+   "rule": "N7",
+   "path": "/json_schema/strict",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "strict": 1.0
+    }
+   }
+  },
+  {
+   "id": "n7-string-true",
+   "rule": "N7",
+   "path": "/json_schema/strict",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "strict": "true"
+    }
+   }
+  },
+  {
+   "id": "n7-false",
+   "rule": "N7",
+   "path": "/json_schema/strict",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     },
+     "strict": false
+    }
+   }
+  },
+  {
+   "id": "s1-nul-in-const",
+   "rule": "S1",
+   "path": "/properties/p/const",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "type": "string",
+        "const": "a\u0000b"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s1-lone-surrogate-in-description",
+   "rule": "S1",
+   "path": "/properties/p/description",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "type": "string",
+        "description": "x\ud800y"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s1-surrogate-property-name",
+   "rule": "S1",
+   "path": "/properties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "\ud800": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "\ud800"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s1-nul-in-unknown-keyword-value",
+   "rule": "S1",
+   "path": "/properties/p/format",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "type": "string",
+        "format": "a\u0000"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s1-over-16-kib",
+   "rule": "S1",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p0": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p1": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p2": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p3": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p4": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p5": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p6": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p7": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p8": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p9": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p10": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p11": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p12": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p13": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p14": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p15": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p16": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       }
+      },
+      "required": [
+       "p0",
+       "p1",
+       "p2",
+       "p3",
+       "p4",
+       "p5",
+       "p6",
+       "p7",
+       "p8",
+       "p9",
+       "p10",
+       "p11",
+       "p12",
+       "p13",
+       "p14",
+       "p15",
+       "p16"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s1-over-16-kib-with-nul",
+   "rule": "S1",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p0": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p1": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p2": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p3": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\u0000"
+       },
+       "p4": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p5": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p6": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p7": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p8": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p9": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p10": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p11": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p12": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p13": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p14": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p15": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       },
+       "p16": {
+        "type": "string",
+        "description": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       }
+      },
+      "required": [
+       "p0",
+       "p1",
+       "p2",
+       "p3",
+       "p4",
+       "p5",
+       "p6",
+       "p7",
+       "p8",
+       "p9",
+       "p10",
+       "p11",
+       "p12",
+       "p13",
+       "p14",
+       "p15",
+       "p16"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s2-depth-33-items",
+   "rule": "S2",
+   "path": "/properties/p/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "type": "array",
+        "items": {
+         "type": "array",
+         "items": {
+          "type": "array",
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "array",
+            "items": {
+             "type": "array",
+             "items": {
+              "type": "array",
+              "items": {
+               "type": "array",
+               "items": {
+                "type": "array",
+                "items": {
+                 "type": "array",
+                 "items": {
+                  "type": "array",
+                  "items": {
+                   "type": "array",
+                   "items": {
+                    "type": "array",
+                    "items": {
+                     "type": "array",
+                     "items": {
+                      "type": "array",
+                      "items": {
+                       "type": "array",
+                       "items": {
+                        "type": "array",
+                        "items": {
+                         "type": "array",
+                         "items": {
+                          "type": "array",
+                          "items": {
+                           "type": "array",
+                           "items": {
+                            "type": "array",
+                            "items": {
+                             "type": "array",
+                             "items": {
+                              "type": "array",
+                              "items": {
+                               "type": "array",
+                               "items": {
+                                "type": "array",
+                                "items": {
+                                 "type": "array",
+                                 "items": {
+                                  "type": "array",
+                                  "items": {
+                                   "type": "array",
+                                   "items": {
+                                    "type": "array",
+                                    "items": {
+                                     "type": "array",
+                                     "items": {
+                                      "type": "array",
+                                      "items": {
+                                       "type": "array",
+                                       "items": {
+                                        "type": "array",
+                                        "items": {
+                                         "type": "array",
+                                         "items": {
+                                          "type": "array",
+                                          "items": {
+                                           "type": "array",
+                                           "items": {
+                                            "type": "array",
+                                            "items": {
+                                             "type": "array",
+                                             "items": {
+                                              "type": "array",
+                                              "items": {
+                                               "type": "array",
+                                               "items": {
+                                                "type": "string"
+                                               }
+                                              }
+                                             }
+                                            }
+                                           }
+                                          }
+                                         }
+                                        }
+                                       }
+                                      }
+                                     }
+                                    }
+                                   }
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           }
+                          }
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  }
+                 }
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s2-surrogate-name-and-depth",
+   "rule": "S2",
+   "path": "/properties/\\ud800/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items/items",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "\ud800": {
+        "type": "array",
+        "items": {
+         "type": "array",
+         "items": {
+          "type": "array",
+          "items": {
+           "type": "array",
+           "items": {
+            "type": "array",
+            "items": {
+             "type": "array",
+             "items": {
+              "type": "array",
+              "items": {
+               "type": "array",
+               "items": {
+                "type": "array",
+                "items": {
+                 "type": "array",
+                 "items": {
+                  "type": "array",
+                  "items": {
+                   "type": "array",
+                   "items": {
+                    "type": "array",
+                    "items": {
+                     "type": "array",
+                     "items": {
+                      "type": "array",
+                      "items": {
+                       "type": "array",
+                       "items": {
+                        "type": "array",
+                        "items": {
+                         "type": "array",
+                         "items": {
+                          "type": "array",
+                          "items": {
+                           "type": "array",
+                           "items": {
+                            "type": "array",
+                            "items": {
+                             "type": "array",
+                             "items": {
+                              "type": "array",
+                              "items": {
+                               "type": "array",
+                               "items": {
+                                "type": "array",
+                                "items": {
+                                 "type": "array",
+                                 "items": {
+                                  "type": "array",
+                                  "items": {
+                                   "type": "array",
+                                   "items": {
+                                    "type": "array",
+                                    "items": {
+                                     "type": "array",
+                                     "items": {
+                                      "type": "array",
+                                      "items": {
+                                       "type": "array",
+                                       "items": {
+                                        "type": "array",
+                                        "items": {
+                                         "type": "array",
+                                         "items": {
+                                          "type": "array",
+                                          "items": {
+                                           "type": "array",
+                                           "items": {
+                                            "type": "array",
+                                            "items": {
+                                             "type": "array",
+                                             "items": {
+                                              "type": "array",
+                                              "items": {
+                                               "type": "array",
+                                               "items": {
+                                                "type": "string"
+                                               }
+                                              }
+                                             }
+                                            }
+                                           }
+                                          }
+                                         }
+                                        }
+                                       }
+                                      }
+                                     }
+                                    }
+                                   }
+                                  }
+                                 }
+                                }
+                               }
+                              }
+                             }
+                            }
+                           }
+                          }
+                         }
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  }
+                 }
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      },
+      "required": [
+       "\ud800"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$schema",
+   "rule": "S3",
+   "path": "/properties/a/$schema",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$schema": "https://json-schema.org/draft/2020-12/schema"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$id",
+   "rule": "S3",
+   "path": "/properties/a/$id",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$id": "urn:x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$anchor",
+   "rule": "S3",
+   "path": "/properties/a/$anchor",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$anchor": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$dynamicAnchor",
+   "rule": "S3",
+   "path": "/properties/a/$dynamicAnchor",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$dynamicAnchor": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$dynamicRef",
+   "rule": "S3",
+   "path": "/properties/a/$dynamicRef",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$dynamicRef": "#x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$vocabulary",
+   "rule": "S3",
+   "path": "/properties/a/$vocabulary",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$vocabulary": {
+         "urn:x": true
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-$comment",
+   "rule": "S3",
+   "path": "/properties/a/$comment",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$comment": "c"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-definitions",
+   "rule": "S3",
+   "path": "/properties/a/definitions",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "definitions": {
+         "x": {
+          "type": "string"
+         }
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-allOf",
+   "rule": "S3",
+   "path": "/properties/a/allOf",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "allOf": [
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-oneOf",
+   "rule": "S3",
+   "path": "/properties/a/oneOf",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "oneOf": [
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-not",
+   "rule": "S3",
+   "path": "/properties/a/not",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "not": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-if",
+   "rule": "S3",
+   "path": "/properties/a/if",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "if": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-then",
+   "rule": "S3",
+   "path": "/properties/a/then",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "then": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-else",
+   "rule": "S3",
+   "path": "/properties/a/else",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "else": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-dependentSchemas",
+   "rule": "S3",
+   "path": "/properties/a/dependentSchemas",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "dependentSchemas": {
+         "x": {
+          "type": "string"
+         }
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-dependentRequired",
+   "rule": "S3",
+   "path": "/properties/a/dependentRequired",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "dependentRequired": {
+         "x": [
+          "y"
+         ]
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-prefixItems",
+   "rule": "S3",
+   "path": "/properties/a/prefixItems",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "prefixItems": [
+         {
+          "type": "string"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-contains",
+   "rule": "S3",
+   "path": "/properties/a/contains",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "contains": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-unevaluatedItems",
+   "rule": "S3",
+   "path": "/properties/a/unevaluatedItems",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "unevaluatedItems": false
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-unevaluatedProperties",
+   "rule": "S3",
+   "path": "/properties/a/unevaluatedProperties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "unevaluatedProperties": false
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-patternProperties",
+   "rule": "S3",
+   "path": "/properties/a/patternProperties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "patternProperties": {
+         "^x": {
+          "type": "string"
+         }
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-propertyNames",
+   "rule": "S3",
+   "path": "/properties/a/propertyNames",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "propertyNames": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-multipleOf",
+   "rule": "S3",
+   "path": "/properties/a/multipleOf",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "multipleOf": 2
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-maximum",
+   "rule": "S3",
+   "path": "/properties/a/maximum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "maximum": 5
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-exclusiveMaximum",
+   "rule": "S3",
+   "path": "/properties/a/exclusiveMaximum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "exclusiveMaximum": 5
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-minimum",
+   "rule": "S3",
+   "path": "/properties/a/minimum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-exclusiveMinimum",
+   "rule": "S3",
+   "path": "/properties/a/exclusiveMinimum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "exclusiveMinimum": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-maxLength",
+   "rule": "S3",
+   "path": "/properties/a/maxLength",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "maxLength": 5
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-minLength",
+   "rule": "S3",
+   "path": "/properties/a/minLength",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "minLength": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-pattern",
+   "rule": "S3",
+   "path": "/properties/a/pattern",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "pattern": "^x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-maxItems",
+   "rule": "S3",
+   "path": "/properties/a/maxItems",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "maxItems": 5
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-minItems",
+   "rule": "S3",
+   "path": "/properties/a/minItems",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "minItems": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-uniqueItems",
+   "rule": "S3",
+   "path": "/properties/a/uniqueItems",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "uniqueItems": true
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-maxContains",
+   "rule": "S3",
+   "path": "/properties/a/maxContains",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "maxContains": 2
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-minContains",
+   "rule": "S3",
+   "path": "/properties/a/minContains",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "minContains": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-maxProperties",
+   "rule": "S3",
+   "path": "/properties/a/maxProperties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "maxProperties": 5
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-minProperties",
+   "rule": "S3",
+   "path": "/properties/a/minProperties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "minProperties": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-format",
+   "rule": "S3",
+   "path": "/properties/a/format",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "format": "date"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-contentEncoding",
+   "rule": "S3",
+   "path": "/properties/a/contentEncoding",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "contentEncoding": "base64"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-contentMediaType",
+   "rule": "S3",
+   "path": "/properties/a/contentMediaType",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "contentMediaType": "text/plain"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-contentSchema",
+   "rule": "S3",
+   "path": "/properties/a/contentSchema",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "contentSchema": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-default",
+   "rule": "S3",
+   "path": "/properties/a/default",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "default": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-deprecated",
+   "rule": "S3",
+   "path": "/properties/a/deprecated",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "deprecated": true
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-readOnly",
+   "rule": "S3",
+   "path": "/properties/a/readOnly",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "readOnly": true
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-writeOnly",
+   "rule": "S3",
+   "path": "/properties/a/writeOnly",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "writeOnly": true
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-keyword-examples",
+   "rule": "S3",
+   "path": "/properties/a/examples",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "examples": [
+         "x"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-additional-properties-zero",
+   "rule": "S3",
+   "path": "/additionalProperties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": 0
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-additional-properties-true",
+   "rule": "S3",
+   "path": "/properties/a/additionalProperties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": true
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-type-empty-array",
+   "rule": "S3",
+   "path": "/properties/a/type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": []
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-type-empty-object",
+   "rule": "S3",
+   "path": "/properties/a/type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": {}
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-type-unknown-name",
+   "rule": "S3",
+   "path": "/properties/a/type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "text"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-type-array-of-two-non-null",
+   "rule": "S3",
+   "path": "/properties/a/type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "string",
+         "integer"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-type-null-outside-any-of",
+   "rule": "S3",
+   "path": "/properties/a/type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-type-array-of-null-only",
+   "rule": "S3",
+   "path": "/properties/a/type",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "null"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-enum-string",
+   "rule": "S3",
+   "path": "/properties/a/enum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": "abc"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-enum-object",
+   "rule": "S3",
+   "path": "/properties/a/enum",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": {
+         "a": 1
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-defs-empty-array",
+   "rule": "S3",
+   "path": "/$defs",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": []
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-defs-number-array",
+   "rule": "S3",
+   "path": "/$defs",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": [
+       1,
+       2
+      ]
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-any-of-string",
+   "rule": "S3",
+   "path": "/properties/a/anyOf",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-any-of-element-not-object",
+   "rule": "S3",
+   "path": "/properties/a/anyOf/1",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         1
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-property-not-object",
+   "rule": "S3",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": 1
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-items-not-object",
+   "rule": "S3",
+   "path": "/properties/a/items",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "array",
+        "items": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-defs-entry-not-object",
+   "rule": "S3",
+   "path": "/$defs/A",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": 1
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-description-too-long",
+   "rule": "S3",
+   "path": "/properties/a/description",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "description": "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-title-not-string",
+   "rule": "S3",
+   "path": "/properties/a/title",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "title": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-required-not-list",
+   "rule": "S3",
+   "path": "/required",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": "a",
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-required-element-not-string",
+   "rule": "S3",
+   "path": "/required",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       1
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-const-array",
+   "rule": "S3",
+   "path": "/properties/a/const",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "const": [
+         "x"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-properties-not-object",
+   "rule": "S3",
+   "path": "/properties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": [
+       1,
+       2,
+       3
+      ],
+      "required": [],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s3-root-keyword-before-child",
+   "rule": "S3",
+   "path": "/minLength",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "x": 1
+      },
+      "required": [
+       "x"
+      ],
+      "additionalProperties": false,
+      "minLength": 1
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-empty-node",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {}
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-description-only",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "description": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-type-and-any-of",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-ref-and-any-of",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/A",
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-ref-and-type",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/A",
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-const-without-type",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "const": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-enum-without-type",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "enum": [
+         "x"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-const-and-enum",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "const": "x",
+        "enum": [
+         "x"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-integer-enum-true",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "integer",
+        "enum": [
+         true
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-number-const-false",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "number",
+        "const": false
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-string-enum-number",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "x",
+         1
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-integer-enum-fraction",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "integer",
+        "enum": [
+         1.5
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-nullable-const-without-null",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "string",
+         "null"
+        ],
+        "const": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s4-nullable-enum-without-null",
+   "rule": "S4",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "string",
+         "null"
+        ],
+        "enum": [
+         "x"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-required-missing",
+   "rule": "S5",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "type": "string"
+         }
+        },
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-required-duplicate",
+   "rule": "S5",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a",
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-required-misses-a-property",
+   "rule": "S5",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       },
+       "b": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-required-names-unknown-property",
+   "rule": "S5",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a",
+       "z"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-additional-properties-missing",
+   "rule": "S5",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-properties-missing",
+   "rule": "S5",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "required": [],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-array-without-items",
+   "rule": "S5",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "array"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-string-with-properties",
+   "rule": "S5",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "properties": {}
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-string-with-items",
+   "rule": "S5",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s5-nullable-object-without-required",
+   "rule": "S5",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "object",
+         "null"
+        ],
+        "properties": {},
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s6-root-string",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": "x"
+    }
+   }
+  },
+  {
+   "id": "s6-root-array",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": []
+    }
+   }
+  },
+  {
+   "id": "s6-root-null",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": null
+    }
+   }
+  },
+  {
+   "id": "s6-root-number",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": 1
+    }
+   }
+  },
+  {
+   "id": "s6-root-nullable-type-array",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": [
+       "object",
+       "null"
+      ],
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s6-root-string-type",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  {
+   "id": "s6-root-reference",
+   "rule": "S6",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "$ref": "#/$defs/A",
+      "$defs": {
+       "A": {
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "a"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s7-key-trailing-newline",
+   "rule": "S7",
+   "path": "/$defs/a\\n",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "a\n": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s7-key-with-space",
+   "rule": "S7",
+   "path": "/$defs/a b",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "a b": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s7-key-empty",
+   "rule": "S7",
+   "path": "/$defs/",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s7-unreferenced-entry",
+   "rule": "S7",
+   "path": "/$defs/Unused",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/Used"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "Used": {
+        "type": "string"
+       },
+       "Unused": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s7-first-unreferenced-entry-in-key-order",
+   "rule": "S7",
+   "path": "/$defs/B",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/A"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "B": {
+        "type": "string"
+       },
+       "A": {
+        "type": "string"
+       },
+       "C": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-trailing-newline",
+   "rule": "S8",
+   "path": "/properties/p/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/a\n"
+       },
+       "q": {
+        "$ref": "#/$defs/a"
+       }
+      },
+      "required": [
+       "p",
+       "q"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "a": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-missing-target",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/Nope"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-without-defs",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/A"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-definitions-pointer",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/definitions/A"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-percent-encoded-fragment",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/%24defs/A"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-not-string",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": 1
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s8-ref-external",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "http://example.com/x#/$defs/A"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s9-two-entry-cycle-first-key-reported",
+   "rule": "S9",
+   "path": "/$defs/b",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/a"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "b": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/a"
+         }
+        },
+        "required": [
+         "x"
+        ],
+        "additionalProperties": false
+       },
+       "a": {
+        "type": "object",
+        "properties": {
+         "y": {
+          "$ref": "#/$defs/b"
+         }
+        },
+        "required": [
+         "y"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s9-self-reference",
+   "rule": "S9",
+   "path": "/$defs/A",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/A"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "$ref": "#/$defs/A"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s9-entry-that-only-reaches-a-cycle-is-not-reported",
+   "rule": "S9",
+   "path": "/$defs/c",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/a"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "a": {
+        "$ref": "#/$defs/c"
+       },
+       "c": {
+        "$ref": "#/$defs/d"
+       },
+       "d": {
+        "$ref": "#/$defs/c"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-three-branches",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-two-branches-no-null",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "integer"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-two-null-branches",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "null"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-one-branch",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-empty",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": []
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-value-branch-is-nested-any-of",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "anyOf": [
+           {
+            "type": "string"
+           },
+           {
+            "type": "null"
+           }
+          ]
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-value-branch-type-array",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": [
+           "string",
+           "null"
+          ]
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s10-value-branch-alias-to-any-of",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "$ref": "#/$defs/A"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-duplicate-strings",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "a",
+         "a"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-one-and-one-point-zero",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "number",
+        "enum": [
+         1,
+         1.0
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-duplicate-null",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": [
+         "string",
+         "null"
+        ],
+        "enum": [
+         "x",
+         null,
+         null
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-empty",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": []
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-501-values",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "v0",
+         "v1",
+         "v2",
+         "v3",
+         "v4",
+         "v5",
+         "v6",
+         "v7",
+         "v8",
+         "v9",
+         "v10",
+         "v11",
+         "v12",
+         "v13",
+         "v14",
+         "v15",
+         "v16",
+         "v17",
+         "v18",
+         "v19",
+         "v20",
+         "v21",
+         "v22",
+         "v23",
+         "v24",
+         "v25",
+         "v26",
+         "v27",
+         "v28",
+         "v29",
+         "v30",
+         "v31",
+         "v32",
+         "v33",
+         "v34",
+         "v35",
+         "v36",
+         "v37",
+         "v38",
+         "v39",
+         "v40",
+         "v41",
+         "v42",
+         "v43",
+         "v44",
+         "v45",
+         "v46",
+         "v47",
+         "v48",
+         "v49",
+         "v50",
+         "v51",
+         "v52",
+         "v53",
+         "v54",
+         "v55",
+         "v56",
+         "v57",
+         "v58",
+         "v59",
+         "v60",
+         "v61",
+         "v62",
+         "v63",
+         "v64",
+         "v65",
+         "v66",
+         "v67",
+         "v68",
+         "v69",
+         "v70",
+         "v71",
+         "v72",
+         "v73",
+         "v74",
+         "v75",
+         "v76",
+         "v77",
+         "v78",
+         "v79",
+         "v80",
+         "v81",
+         "v82",
+         "v83",
+         "v84",
+         "v85",
+         "v86",
+         "v87",
+         "v88",
+         "v89",
+         "v90",
+         "v91",
+         "v92",
+         "v93",
+         "v94",
+         "v95",
+         "v96",
+         "v97",
+         "v98",
+         "v99",
+         "v100",
+         "v101",
+         "v102",
+         "v103",
+         "v104",
+         "v105",
+         "v106",
+         "v107",
+         "v108",
+         "v109",
+         "v110",
+         "v111",
+         "v112",
+         "v113",
+         "v114",
+         "v115",
+         "v116",
+         "v117",
+         "v118",
+         "v119",
+         "v120",
+         "v121",
+         "v122",
+         "v123",
+         "v124",
+         "v125",
+         "v126",
+         "v127",
+         "v128",
+         "v129",
+         "v130",
+         "v131",
+         "v132",
+         "v133",
+         "v134",
+         "v135",
+         "v136",
+         "v137",
+         "v138",
+         "v139",
+         "v140",
+         "v141",
+         "v142",
+         "v143",
+         "v144",
+         "v145",
+         "v146",
+         "v147",
+         "v148",
+         "v149",
+         "v150",
+         "v151",
+         "v152",
+         "v153",
+         "v154",
+         "v155",
+         "v156",
+         "v157",
+         "v158",
+         "v159",
+         "v160",
+         "v161",
+         "v162",
+         "v163",
+         "v164",
+         "v165",
+         "v166",
+         "v167",
+         "v168",
+         "v169",
+         "v170",
+         "v171",
+         "v172",
+         "v173",
+         "v174",
+         "v175",
+         "v176",
+         "v177",
+         "v178",
+         "v179",
+         "v180",
+         "v181",
+         "v182",
+         "v183",
+         "v184",
+         "v185",
+         "v186",
+         "v187",
+         "v188",
+         "v189",
+         "v190",
+         "v191",
+         "v192",
+         "v193",
+         "v194",
+         "v195",
+         "v196",
+         "v197",
+         "v198",
+         "v199",
+         "v200",
+         "v201",
+         "v202",
+         "v203",
+         "v204",
+         "v205",
+         "v206",
+         "v207",
+         "v208",
+         "v209",
+         "v210",
+         "v211",
+         "v212",
+         "v213",
+         "v214",
+         "v215",
+         "v216",
+         "v217",
+         "v218",
+         "v219",
+         "v220",
+         "v221",
+         "v222",
+         "v223",
+         "v224",
+         "v225",
+         "v226",
+         "v227",
+         "v228",
+         "v229",
+         "v230",
+         "v231",
+         "v232",
+         "v233",
+         "v234",
+         "v235",
+         "v236",
+         "v237",
+         "v238",
+         "v239",
+         "v240",
+         "v241",
+         "v242",
+         "v243",
+         "v244",
+         "v245",
+         "v246",
+         "v247",
+         "v248",
+         "v249",
+         "v250",
+         "v251",
+         "v252",
+         "v253",
+         "v254",
+         "v255",
+         "v256",
+         "v257",
+         "v258",
+         "v259",
+         "v260",
+         "v261",
+         "v262",
+         "v263",
+         "v264",
+         "v265",
+         "v266",
+         "v267",
+         "v268",
+         "v269",
+         "v270",
+         "v271",
+         "v272",
+         "v273",
+         "v274",
+         "v275",
+         "v276",
+         "v277",
+         "v278",
+         "v279",
+         "v280",
+         "v281",
+         "v282",
+         "v283",
+         "v284",
+         "v285",
+         "v286",
+         "v287",
+         "v288",
+         "v289",
+         "v290",
+         "v291",
+         "v292",
+         "v293",
+         "v294",
+         "v295",
+         "v296",
+         "v297",
+         "v298",
+         "v299",
+         "v300",
+         "v301",
+         "v302",
+         "v303",
+         "v304",
+         "v305",
+         "v306",
+         "v307",
+         "v308",
+         "v309",
+         "v310",
+         "v311",
+         "v312",
+         "v313",
+         "v314",
+         "v315",
+         "v316",
+         "v317",
+         "v318",
+         "v319",
+         "v320",
+         "v321",
+         "v322",
+         "v323",
+         "v324",
+         "v325",
+         "v326",
+         "v327",
+         "v328",
+         "v329",
+         "v330",
+         "v331",
+         "v332",
+         "v333",
+         "v334",
+         "v335",
+         "v336",
+         "v337",
+         "v338",
+         "v339",
+         "v340",
+         "v341",
+         "v342",
+         "v343",
+         "v344",
+         "v345",
+         "v346",
+         "v347",
+         "v348",
+         "v349",
+         "v350",
+         "v351",
+         "v352",
+         "v353",
+         "v354",
+         "v355",
+         "v356",
+         "v357",
+         "v358",
+         "v359",
+         "v360",
+         "v361",
+         "v362",
+         "v363",
+         "v364",
+         "v365",
+         "v366",
+         "v367",
+         "v368",
+         "v369",
+         "v370",
+         "v371",
+         "v372",
+         "v373",
+         "v374",
+         "v375",
+         "v376",
+         "v377",
+         "v378",
+         "v379",
+         "v380",
+         "v381",
+         "v382",
+         "v383",
+         "v384",
+         "v385",
+         "v386",
+         "v387",
+         "v388",
+         "v389",
+         "v390",
+         "v391",
+         "v392",
+         "v393",
+         "v394",
+         "v395",
+         "v396",
+         "v397",
+         "v398",
+         "v399",
+         "v400",
+         "v401",
+         "v402",
+         "v403",
+         "v404",
+         "v405",
+         "v406",
+         "v407",
+         "v408",
+         "v409",
+         "v410",
+         "v411",
+         "v412",
+         "v413",
+         "v414",
+         "v415",
+         "v416",
+         "v417",
+         "v418",
+         "v419",
+         "v420",
+         "v421",
+         "v422",
+         "v423",
+         "v424",
+         "v425",
+         "v426",
+         "v427",
+         "v428",
+         "v429",
+         "v430",
+         "v431",
+         "v432",
+         "v433",
+         "v434",
+         "v435",
+         "v436",
+         "v437",
+         "v438",
+         "v439",
+         "v440",
+         "v441",
+         "v442",
+         "v443",
+         "v444",
+         "v445",
+         "v446",
+         "v447",
+         "v448",
+         "v449",
+         "v450",
+         "v451",
+         "v452",
+         "v453",
+         "v454",
+         "v455",
+         "v456",
+         "v457",
+         "v458",
+         "v459",
+         "v460",
+         "v461",
+         "v462",
+         "v463",
+         "v464",
+         "v465",
+         "v466",
+         "v467",
+         "v468",
+         "v469",
+         "v470",
+         "v471",
+         "v472",
+         "v473",
+         "v474",
+         "v475",
+         "v476",
+         "v477",
+         "v478",
+         "v479",
+         "v480",
+         "v481",
+         "v482",
+         "v483",
+         "v484",
+         "v485",
+         "v486",
+         "v487",
+         "v488",
+         "v489",
+         "v490",
+         "v491",
+         "v492",
+         "v493",
+         "v494",
+         "v495",
+         "v496",
+         "v497",
+         "v498",
+         "v499",
+         "v500"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-empty-string",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         ""
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-blank-string",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "a",
+         " "
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-marker",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "__NOT_EXPRESSIBLE__"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-contains-marker",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "x__NOT_EXPRESSIBLE__y"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-long-string",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "enum": [
+         "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-enum-array-value",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "enum": [
+         [
+          "x"
+         ]
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-const-empty-string",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "const": ""
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12a-const-marker",
+   "rule": "S12a",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "const": "__NOT_EXPRESSIBLE__"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-with-space",
+   "rule": "S13",
+   "path": "/properties/a b",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a b": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a b"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-trailing-newline",
+   "rule": "S13",
+   "path": "/properties/a\\n",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a\n": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a\n"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-definitions",
+   "rule": "S13",
+   "path": "/properties/definitions",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "definitions": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "definitions"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-dash",
+   "rule": "S13",
+   "path": "/properties/-",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "-": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "-"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-digits",
+   "rule": "S13",
+   "path": "/properties/123",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "123": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "123"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-too-long",
+   "rule": "S13",
+   "path": "/properties/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-empty",
+   "rule": "S13",
+   "path": "/properties/",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "": {
+        "type": "string"
+       }
+      },
+      "required": [
+       ""
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-non-ascii",
+   "rule": "S13",
+   "path": "/properties/caf\\u00e9",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "caf\u00e9": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "caf\u00e9"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s13-name-slash-escaped-in-path",
+   "rule": "S13",
+   "path": "/properties/a~1b",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a/b": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a/b"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "owner-ref-with-description-is-s8-not-s4",
+   "rule": "S8",
+   "path": "/properties/a/$ref",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "$ref": "#/$defs/A",
+        "description": "x"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "owner-null-branch-with-description-is-s10-not-s3",
+   "rule": "S10",
+   "path": "/properties/a",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null",
+          "description": "x"
+         }
+        ]
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "owner-defs-in-property-s4-before-s7",
+   "rule": "S4",
+   "path": "/properties/a/$defs/x",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$defs": {
+         "x": {}
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "owner-defs-in-property-with-valid-entry-is-s7",
+   "rule": "S7",
+   "path": "/properties/a/$defs",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "$defs": {
+         "x": {
+          "type": "string"
+         }
+        }
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "order-s3-beats-earlier-s5",
+   "rule": "S3",
+   "path": "/properties/b/minLength",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+       },
+       "b": {
+        "type": "string",
+        "minLength": 1
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "order-first-s3-in-document-order",
+   "rule": "S3",
+   "path": "/properties/a/minLength",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "string",
+        "minLength": 1
+       },
+       "b": {
+        "type": "string",
+        "maxLength": 1
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  }
+ ]
+}

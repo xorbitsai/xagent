@@ -356,6 +356,8 @@ async def test_auto_child_runtime_finishes_the_shared_cache_session() -> None:
     assert events == []
     await child.finish_cache_session()
     await child.finish_cache_session()
+    if parent._cache_session._publisher is not None:
+        await parent._cache_session._publisher
 
     assert events == [{"id": session_id, "revision": 1, "phase": "finished"}]
     assert parent._cache_session.phase == "finished"
@@ -2771,3 +2773,39 @@ async def test_auto_ordinary_tool(action):
     )
     assert result["success"]
     assert len(tool.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_child_hooks_emit_one_finished_for_shared_session() -> None:
+    events = []
+
+    async def notify(payload):
+        events.append(payload)
+
+    class CacheAwareLLM(FakeLLM):
+        async def chat(self, **kwargs):
+            session = agent_cache_session.get()
+            assert session is not None
+            session.register(("auto-hooks", "model"), notify)
+            return await super().chat(**kwargs)
+
+    class HookedChild(CapturingChildPattern):
+        async def run(self, **kwargs):
+            runtime, context = kwargs["runtime"], kwargs["context"]
+            await runtime.on_pattern_start(context=context, pattern=self)
+            result = await super().run(**kwargs)
+            await runtime.on_pattern_end(context=context, pattern=self, result=result)
+            assert runtime.parent._cache_session.phase == "active"
+            return result
+
+    runtime = PatternRuntime()
+    llm = CacheAwareLLM([decision_tool_response("react", "Needs a tool.")])
+    pattern = AutoPattern(react_pattern=HookedChild())  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-lifecycle-hooks")
+    context.add_user_message("Use a tool")
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+    assert result["success"]
+    if runtime._cache_session._publisher is not None:
+        await runtime._cache_session._publisher
+    assert [item["phase"] for item in events] == ["finished"]
+    assert runtime._cache_pattern_count == 0

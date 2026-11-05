@@ -213,7 +213,7 @@ class XinferenceLLM(BaseLLM):
 
     def _apply_cache_lifecycle(self, config: dict[str, Any]) -> None:
         session = agent_cache_session.get()
-        if getattr(self, "_supports_cache_lifecycle", False) and session is not None:
+        if self._supports_cache_lifecycle and session is not None:
             metadata = session.register(
                 (self.base_url, self._model_uid), self._update_cache_session
             )

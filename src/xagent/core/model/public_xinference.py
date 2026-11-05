@@ -57,7 +57,7 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
         )
         self._cluster_authed = api_key is not None
         self.timeout = aiohttp.ClientTimeout(total=1800)
-        self._chat_descriptions: dict[str, dict[str, Any]] = {}
+        self._cache_lifecycle_support: dict[str, bool] = {}
         self.session = create_public_model_aiohttp_session(timeout=self.timeout)
 
     async def get_model(self, model_uid: str) -> Any:
@@ -67,7 +67,9 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
     async def get_chat_model(self, model_uid: str) -> tuple[Any, bool]:
         """Discover the chat handle and its routing support in one request."""
         description = await self.describe_model(model_uid)
-        self._chat_descriptions[model_uid] = description
+        self._cache_lifecycle_support[model_uid] = (
+            description.get("supports_agent_cache_lifecycle") is True
+        )
         if description.get("model_type") != "LLM" or "chat" not in description.get(
             "model_ability", []
         ):
@@ -81,12 +83,7 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
         )
 
     def supports_agent_cache_lifecycle(self, model_uid: str) -> bool:
-        return (
-            self._chat_descriptions.get(model_uid, {}).get(
-                "supports_agent_cache_lifecycle"
-            )
-            is True
-        )
+        return self._cache_lifecycle_support.get(model_uid, False)
 
     async def update_cache_session(
         self, model_uid: str, session: dict[str, Any]

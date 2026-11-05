@@ -3363,3 +3363,37 @@ def test_the_marker_is_stamped_before_any_client_metadata_is_merged(
     runner._apply_request_context = record  # type: ignore[method-assign]
     runner._merge_context_metadata(context, {"request_context": {"a": 1}})
     assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_finishes_cache_when_pattern_exits_without_error_hook(
+    tmp_path: Path,
+) -> None:
+    from xagent.core.agent.runtime import ExecutionInterrupted
+
+    events = []
+    runtimes = []
+
+    async def notify(payload):
+        events.append(payload)
+
+    class InterruptedPattern:
+        async def run(self, **kwargs):
+            runtime = kwargs["runtime"]
+            runtimes.append(runtime)
+            await runtime.on_pattern_start(context=kwargs["context"], pattern=self)
+            runtime._cache_session.register(("runner-interrupt", "model"), notify)
+            raise ExecutionInterrupted("stopped without pattern error hook")
+
+    runner = AgentRunner(
+        agent=Agent(name="interrupted", patterns=[InterruptedPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    result = await runner.run(task="work", execution_id="cache-interrupted")
+    assert result["status"] == "interrupted"
+    runtime = runtimes[0]
+    if runtime._cache_session._publisher is not None:
+        await runtime._cache_session._publisher
+    assert not runtime.pattern_error_reported
+    assert runtime._cache_pattern_count == 0
+    assert [item["phase"] for item in events] == ["finished"]

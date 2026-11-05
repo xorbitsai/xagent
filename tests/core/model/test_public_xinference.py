@@ -124,14 +124,25 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_cache_control_uses_guarded_session_and_auth_headers(monkeypatch):
+@pytest.mark.parametrize("api_key", [None, "test-key"])
+@pytest.mark.parametrize(
+    "model_uid,quoted", [("model-id", "model-id"), ("a/b ?", "a%2Fb%20%3F")]
+)
+@pytest.mark.parametrize("status", [200, 401, 404, 503])
+async def test_cache_control_uses_guarded_session_and_auth_headers(
+    monkeypatch, api_key, model_uid, quoted, status
+):
     from unittest.mock import MagicMock
 
-    client = PublicAsyncXinferenceClient(
-        "https://xinference.example", api_key="test-key"
-    )
+    client = PublicAsyncXinferenceClient("https://xinference.example", api_key=api_key)
     response = MagicMock()
     response.read = AsyncMock(return_value=b'{"accepted": true}')
+    if status != 200:
+        response.raise_for_status.side_effect = aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=status,
+        )
     context = MagicMock()
     context.__aenter__ = AsyncMock(return_value=response)
     context.__aexit__ = AsyncMock(return_value=False)
@@ -140,11 +151,20 @@ async def test_cache_control_uses_guarded_session_and_auth_headers(monkeypatch):
     try:
         assert isinstance(client.session.connector, PublicTCPConnector)
         payload = {"id": "run", "revision": 1, "phase": "waiting"}
-        await client.update_cache_session("model-id", payload)
+        if status == 200:
+            await client.update_cache_session(model_uid, payload)
+            response.read.assert_awaited_once()
+        else:
+            with pytest.raises(aiohttp.ClientResponseError) as exc:
+                await client.update_cache_session(model_uid, payload)
+            assert exc.value.status == status
+            response.read.assert_not_awaited()
         assert post.call_args.args == (
-            "https://xinference.example/v1/models/model-id/cache_sessions",
+            f"https://xinference.example/v1/models/{quoted}/cache_sessions",
         )
-        assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer test-key"}
+        assert post.call_args.kwargs["headers"] == (
+            {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        )
         assert post.call_args.kwargs["json"] == payload
         assert post.call_args.kwargs["timeout"].total == 0.5
         response.raise_for_status.assert_called_once()

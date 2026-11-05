@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -12,6 +13,7 @@ import pytest
 
 from xagent.core.agent import structured_output as so
 from xagent.core.agent import structured_schema as ss
+from xagent.core.agent.trace import SYSTEM_INFO
 from xagent.core.model.chat.exceptions import LLMRetryableError, LLMToolProtocolError
 from xagent.core.model.chat.types import PROVIDER_STATE_METADATA_KEY
 
@@ -1145,3 +1147,305 @@ async def test_the_real_openrouter_adapter_raises_an_error_the_loop_corrects(
     llm.chat = spy  # type: ignore[method-assign]
     assert await _step(llm) == _failed("schema_mismatch")
     assert sizes == [2, 2, 2]
+
+
+# --- the time limit -----------------------------------------------------------------------------------------
+
+
+async def test_a_model_that_is_too_slow_ends_in_an_extraction_timeout(monkeypatch):
+    monkeypatch.setattr(so, "EXTRACTION_TIMEOUT_SECONDS", 0.05)
+
+    class Slow(ScriptedModel):
+        async def chat(self, **kwargs: Any) -> Any:
+            await asyncio.sleep(5)
+
+    assert await _step(Slow()) == _failed("extraction_timeout")
+
+
+async def test_a_model_that_is_slow_to_prepare_ends_in_an_extraction_timeout(
+    monkeypatch,
+):
+    monkeypatch.setattr(so, "EXTRACTION_TIMEOUT_SECONDS", 0.05)
+
+    class Slow:
+        async def prepare_for_call(self, messages: Any) -> Any:
+            await asyncio.sleep(5)
+
+    assert await _step(Slow()) == _failed("extraction_timeout")
+
+
+async def test_a_timeout_raised_by_the_adapter_is_a_model_error():
+    llm = ScriptedModel([TimeoutError("adapter")])
+    assert await _step(llm) == _failed("model_error")
+
+
+async def test_a_timeout_that_the_limit_did_not_raise_is_a_model_error(monkeypatch):
+    async def raising(*args: Any, **kwargs: Any) -> Any:
+        raise TimeoutError("not the limit")
+
+    monkeypatch.setattr(so, "_extract", raising)
+    assert await _step(ScriptedModel()) == _failed("model_error")
+
+
+async def test_a_model_that_cannot_be_prepared_is_a_model_error():
+    class Broken:
+        async def prepare_for_call(self, messages: Any) -> Any:
+            raise RuntimeError("no route")
+
+    assert await _step(Broken()) == _failed("model_error")
+
+
+# --- the boundary --------------------------------------------------------------------------------------------
+
+
+class RecordingTracer:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.events: list[dict[str, Any]] = []
+        self.error = error
+
+    async def trace_event(
+        self, event_type: Any, task_id: Any = None, **kwargs: Any
+    ) -> None:
+        if self.error is not None:
+            raise self.error
+        self.events.append({"event_type": event_type, "task_id": task_id, **kwargs})
+
+
+async def _attach(result: Any, fmt: Any, llm: Any, tracer: Any = None) -> Any:
+    return await so._attach_structured_output(
+        result, fmt, llm=llm, task_id="t-1", run_id="r-1", tracer=tracer
+    )
+
+
+class Unused(ScriptedModel):
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("the model must not be called")
+
+
+async def test_a_run_without_a_result_comes_back_as_none_and_leaves_no_trace():
+    tracer = RecordingTracer()
+    llm = Unused()
+    assert await _attach(None, _fmt(), llm, tracer) is None
+    assert llm.calls == [] and tracer.events == []
+
+
+async def test_a_run_without_a_format_comes_back_untouched():
+    tracer = RecordingTracer()
+    result = _result()
+    before = copy.deepcopy(result)
+    llm = Unused()
+    assert await _attach(result, None, llm, tracer) is result
+    assert result == before and llm.calls == [] and tracer.events == []
+
+
+async def test_a_skipped_run_gets_no_key_and_no_event():
+    tracer = RecordingTracer()
+    result = _result(success=False)
+    assert await _attach(result, _fmt(), Unused(), tracer) is result
+    assert so.STRUCTURED_OUTPUT_RESULT_KEY not in result and tracer.events == []
+
+
+async def test_an_extracted_result_is_put_on_the_same_dict():
+    result = _result()
+    llm = ScriptedModel([_args_reply(GOOD)])
+    assert await _attach(result, _fmt(SHAPE), llm, RecordingTracer()) is result
+    assert result[so.STRUCTURED_OUTPUT_RESULT_KEY] == _settled("ready", output=GOOD)
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        (
+            _obj({"a": STRING, "b": {"type": "integer"}}),
+            _settled("incomplete", "information_missing", missing_fields=["/a", "/b"]),
+        ),
+        (
+            _obj({"a": NULLABLE_STRING}),
+            _settled("ready", output={"a": None}),
+        ),
+        (
+            _obj({"kind": {"type": "string", "const": "person"}}),
+            _settled("ready", output={"kind": "person"}),
+        ),
+    ],
+)
+async def test_an_empty_answer_is_settled_without_a_call_to_the_model(schema, expected):
+    result = _result(output="")
+    tracer = RecordingTracer()
+    llm = Unused()
+    await _attach(result, _fmt(schema), llm, tracer)
+    assert result[so.STRUCTURED_OUTPUT_RESULT_KEY] == expected
+    assert llm.calls == [] and tracer.events == []
+
+
+async def test_the_outcome_of_a_partial_run_needs_no_event():
+    tracer = RecordingTracer()
+    result = _result(completion_outcome="partial")
+    await _attach(result, _fmt(), Unused(), tracer)
+    assert result[so.STRUCTURED_OUTPUT_RESULT_KEY] == _settled(
+        "incomplete", "agent_partial"
+    )
+    assert tracer.events == []
+
+
+@pytest.mark.parametrize("where", ["prepare", "chat"])
+async def test_a_cancellation_goes_through_and_leaves_no_key(where):
+    class Cancelled(ScriptedModel):
+        async def chat(self, **kwargs: Any) -> Any:
+            raise asyncio.CancelledError
+
+        async def prepare_for_call(self, messages: Any) -> Any:
+            if where == "prepare":
+                raise asyncio.CancelledError
+            return self
+
+    result = _result()
+    tracer = RecordingTracer()
+    with pytest.raises(asyncio.CancelledError):
+        await _attach(result, _fmt(), Cancelled(), tracer)
+    assert so.STRUCTURED_OUTPUT_RESULT_KEY not in result and tracer.events == []
+
+
+async def test_a_bug_in_the_extraction_is_an_internal_error_that_leaks_nothing(
+    monkeypatch, caplog
+):
+    secret = "SECRET-" + "KEY"
+
+    def broken(schema: Any) -> Any:
+        raise KeyError(secret)
+
+    monkeypatch.setattr(so, "compile_schema", broken)
+    result = _result()
+    tracer = RecordingTracer()
+    with caplog.at_level(logging.WARNING):
+        await _attach(result, _fmt(), ScriptedModel(), tracer)
+    assert result[so.STRUCTURED_OUTPUT_RESULT_KEY] == _failed("internal_error")
+    text = "\n".join(_warnings(caplog))
+    assert "SECRET-KEY" not in text
+    assert "KeyError" in text and "task_id=t-1" in text and "run_id=r-1" in text
+    assert all(r.exc_info is None for r in caplog.records)
+    assert tracer.events[0]["data"]["status"] == "failed"
+    assert tracer.events[0]["data"]["reason_code"] == "internal_error"
+
+
+# --- the trace event --------------------------------------------------------------------------------------------
+
+EVENT_KEYS = {
+    "attempts",
+    "status",
+    "reason_code",
+    "missing_count",
+    "unexpressible_count",
+    "blank_as_null_count",
+    "model",
+    "answer_chars",
+    "duration_ms",
+    "text_only_replies",
+}
+
+
+async def _event(
+    script: Any, schema: dict[str, Any] | None = None, **result: Any
+) -> dict[str, Any]:
+    tracer = RecordingTracer()
+    llm = ScriptedModel(script)
+    await _attach(_result(**result), _fmt(schema or SHAPE), llm, tracer)
+    (event,) = tracer.events
+    assert event["event_type"] is SYSTEM_INFO and event["task_id"] == "t-1"
+    return event["data"]
+
+
+async def test_the_event_holds_the_routing_keys_and_only_counts_and_fixed_names():
+    data = await _event([_text_reply(), _args_reply(GOOD)], output="Bo is here")
+    assert data.pop("__audit_only__") is True
+    assert data.pop("event_type") == "structured_output_extraction"
+    assert set(data) == EVENT_KEYS
+    assert data == {
+        "attempts": 2,
+        "status": "ready",
+        "reason_code": None,
+        "missing_count": 0,
+        "unexpressible_count": 0,
+        "blank_as_null_count": 0,
+        "model": "fake-model",
+        "answer_chars": len("Bo is here"),
+        "duration_ms": data["duration_ms"],
+        "text_only_replies": 1,
+    }
+    assert type(data["duration_ms"]) is int and data["duration_ms"] >= 0
+
+
+async def test_the_event_never_holds_the_answer_or_what_the_model_wrote():
+    data = await _event(
+        [_args_reply({"name": "SECRET-VALUE", "note": None})], output="SECRET-ANSWER"
+    )
+    assert "SECRET" not in json.dumps(data)
+
+
+async def test_the_blank_count_comes_from_the_judgement_that_settled_it():
+    data = await _event(
+        [_args_reply({"name": 5, "note": " "}), _args_reply({"name": "x", "note": " "})]
+    )
+    assert (data["attempts"], data["blank_as_null_count"], data["status"]) == (
+        2,
+        1,
+        "ready",
+    )
+
+
+async def test_the_counts_of_an_incomplete_result_are_the_totals():
+    schema = _obj({"a": STRING, "b": STRING, "c": STRING, "d": NULLABLE_STRING})
+    data = await _event(
+        [_args_reply({"a": None, "b": MARKER, "c": " ", "d": None})], schema
+    )
+    assert (data["missing_count"], data["unexpressible_count"]) == (2, 1)
+    assert data["blank_as_null_count"] == 1
+    assert data["reason_code"] == "information_missing"
+
+
+async def test_a_model_error_has_no_blank_count():
+    data = await _event([LLMRetryableError("boom")])
+    assert (data["reason_code"], data["blank_as_null_count"]) == ("model_error", 0)
+
+
+async def test_a_result_that_is_too_large_stops_the_count_of_attempts():
+    schema, instance = _elements(2000, {"type": ["string", "null"]})
+    data = await _event([_args_reply(instance)], schema)
+    assert (data["attempts"], data["reason_code"], data["blank_as_null_count"]) == (
+        1,
+        "result_too_large",
+        0,
+    )
+    data = await _event(
+        [_args_reply({"name": 5, "note": None}), _args_reply(instance)], schema
+    )
+    assert (data["attempts"], data["reason_code"]) == (2, "result_too_large")
+
+
+async def test_arguments_that_are_too_long_count_one_attempt():
+    data = await _event([_args_reply(json.dumps(_long_arguments()))])
+    assert (data["attempts"], data["reason_code"]) == (1, "result_too_large")
+
+
+async def test_a_failure_to_write_the_event_does_not_change_the_outcome(caplog):
+    result = _result()
+    tracer = RecordingTracer(error=RuntimeError("SECRET-DB-DETAIL"))
+    with caplog.at_level(logging.WARNING):
+        await _attach(result, _fmt(SHAPE), ScriptedModel([_args_reply(GOOD)]), tracer)
+    assert result[so.STRUCTURED_OUTPUT_RESULT_KEY] == _settled("ready", output=GOOD)
+    text = "\n".join(_warnings(caplog))
+    assert "RuntimeError" in text and "SECRET-DB-DETAIL" not in text
+
+
+async def test_a_cancellation_while_writing_the_event_goes_through():
+    tracer = RecordingTracer(error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _attach(
+            _result(), _fmt(SHAPE), ScriptedModel([_args_reply(GOOD)]), tracer
+        )
+
+
+async def test_a_run_without_a_tracer_still_gets_its_result():
+    result = _result()
+    await _attach(result, _fmt(SHAPE), ScriptedModel([_args_reply(GOOD)]), None)
+    assert result[so.STRUCTURED_OUTPUT_RESULT_KEY]["status"] == "ready"

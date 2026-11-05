@@ -5,17 +5,21 @@ structured result and extract it from the final answer.
 format and returns :data:`SKIP`, :data:`EXTRACT` or an outcome that is already
 settled. Judging always uses the compiled form of the caller's own schema; the
 nullable copy written by :func:`model_facing_schema` is only shown to the
-model. This module belongs to the core layer and imports nothing from the web
-layer.
+model. :func:`_attach_structured_output` is the one place that turns an
+exception the extraction did not classify into an outcome. This module belongs
+to the core layer and imports nothing from the web layer.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import math
 import re
+import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final
 
@@ -36,6 +40,7 @@ from .structured_schema import (
     judge_instance,
     model_facing_schema,
 )
+from .trace import SYSTEM_INFO, Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -412,9 +417,12 @@ async def _extract(
     prepared = llm
     prepare = getattr(llm, "prepare_for_call", None)
     if callable(prepare):
-        prepared = prepare([{"role": "user", "content": messages[1]["content"]}])
-        if inspect.isawaitable(prepared):
-            prepared = await prepared
+        try:
+            prepared = prepare([{"role": "user", "content": messages[1]["content"]}])
+            if inspect.isawaitable(prepared):
+                prepared = await prepared
+        except Exception:
+            return _settled("failed", "model_error")
     max_tokens = _output_limit(llm, prepared)
 
     corrected_system = False
@@ -541,4 +549,114 @@ async def run_structured_output_step(
         return _settled("failed", "model_error")
     name = getattr(llm, "model_name", None)
     stats.model = name if isinstance(name, str) else None
-    return await _extract(fmt, answer, llm, task_id=task_id, run_id=run_id, stats=stats)
+    try:
+        async with asyncio.timeout(EXTRACTION_TIMEOUT_SECONDS) as limit:
+            return await _extract(
+                fmt, answer, llm, task_id=task_id, run_id=run_id, stats=stats
+            )
+    except TimeoutError:
+        # A timeout the limit did not raise comes from the model's own client.
+        code = "extraction_timeout" if limit.expired() else "model_error"
+        return _settled("failed", code)
+
+
+async def _emit_extraction_event(
+    tracer: Tracer | None,
+    task_id: str | None,
+    outcome: dict[str, Any],
+    stats: _ExtractionStats,
+    *,
+    answer_chars: int,
+    duration_ms: int,
+) -> None:
+    """Record the counts of one extraction. The event holds counts and fixed
+    names only. It is best effort: a failure to write it is logged by type and
+    never changes the outcome."""
+    if tracer is None:
+        return
+    reason = outcome.get("reason")
+    try:
+        await tracer.trace_event(
+            SYSTEM_INFO,
+            task_id=task_id,
+            data={
+                "__audit_only__": True,
+                "event_type": "structured_output_extraction",
+                "attempts": stats.attempts,
+                "status": outcome["status"],
+                "reason_code": reason["code"] if reason else None,
+                "missing_count": stats.missing_count,
+                "unexpressible_count": stats.unexpressible_count,
+                "blank_as_null_count": stats.blank_as_null_count,
+                "model": stats.model,
+                "answer_chars": answer_chars,
+                "duration_ms": duration_ms,
+                "text_only_replies": stats.text_only_replies,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to emit the structured output extraction event (%s)",
+            type(exc).__name__,
+        )
+
+
+async def _attach_structured_output(
+    result: dict[str, Any] | None,
+    fmt: StructuredOutputFormat | None,
+    *,
+    llm: Any,
+    task_id: str | None,
+    run_id: str | None,
+    tracer: Tracer | None,
+) -> dict[str, Any] | None:
+    """Put the structured outcome of a finished run on ``result`` and return it.
+
+    This is the only place that turns an exception the extraction did not
+    classify into an outcome: ``asyncio.CancelledError`` goes through
+    untouched, and any other ``Exception`` becomes ``failed`` /
+    ``internal_error``, logged by its type and traceback only, because its
+    message may hold text of the answer. A
+    missing result or format comes back as it is. The trace event is written
+    after the outcome is settled and outside the guarded part, and only when the
+    model was asked.
+    """
+    if result is None or fmt is None:
+        return result
+    stats = _ExtractionStats()
+    started = time.monotonic()
+    extracted = False
+    answer_chars = 0
+    try:
+        decision = structured_output_eligibility(result, fmt)
+        if decision is SKIP:
+            return result
+        if isinstance(decision, dict):
+            outcome = decision
+        else:
+            extracted = True
+            answer = answer_text(result)
+            answer_chars = len(answer)
+            outcome = await run_structured_output_step(
+                fmt, answer, llm, task_id=task_id, run_id=run_id, stats=stats
+            )
+    except Exception as exc:
+        logger.warning(
+            "Structured output failed. task_id=%s run_id=%s error=%s traceback=%s",
+            task_id,
+            run_id,
+            type(exc).__name__,
+            "".join(traceback.format_tb(exc.__traceback__)),
+        )
+        outcome = _settled("failed", "internal_error")
+    result[STRUCTURED_OUTPUT_RESULT_KEY] = outcome
+    if extracted:
+        await _emit_extraction_event(
+            tracer,
+            task_id,
+            outcome,
+            stats,
+            answer_chars=answer_chars,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+    return result

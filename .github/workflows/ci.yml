@@ -453,7 +453,10 @@ jobs:
 
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    # Keep the command-policy, CSV and sandbox regressions on the validated
+    # toolchain. ubuntu-latest now rolls to 26.04 with different coreutils and
+    # Python behavior; migrate that environment separately from feature PRs.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, prepare-deepdoc-cache, pre-commit]

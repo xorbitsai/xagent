@@ -107,7 +107,11 @@ from .deps import (
     record_principal_usage,
 )
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
-from .idempotency import IDEMPOTENCY_KEY_HEADER, run_with_idempotency
+from .idempotency import (
+    IDEMPOTENCY_KEY_HEADER,
+    fingerprint_payload,
+    run_with_idempotency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -445,7 +449,7 @@ async def create_chat_task(
             principal=principal,
             operation="create_task",
             header_value=idempotency_key,
-            request_payload=request.model_dump(mode="json"),
+            request_payload=fingerprint_payload(request),
             run=lambda claim: _create_chat_task(request, principal, claim),
         ),
     )
@@ -1156,7 +1160,7 @@ async def append_message_to_task(
             principal=principal,
             operation=f"append_message:{task_id}",
             header_value=idempotency_key,
-            request_payload=request.model_dump(mode="json"),
+            request_payload=fingerprint_payload(request),
             run=lambda claim: _append_message_to_task(
                 task_id, request, principal, claim
             ),

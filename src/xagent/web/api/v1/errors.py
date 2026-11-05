@@ -78,9 +78,14 @@ class V1ErrorCode(str, Enum):
     IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"
     IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
 
-    # A request with this ``Idempotency-Key`` is still being processed (or its
-    # outcome was not recorded). 409; retry later with the same key.
+    # A request with this ``Idempotency-Key`` is still being processed. 409;
+    # retry later with the same key.
     IDEMPOTENCY_KEY_IN_PROGRESS = "idempotency_key_in_progress"
+
+    # The first request with this ``Idempotency-Key`` was accepted but its
+    # outcome was never recorded, so it can be neither replayed nor re-run.
+    # 409; read the task named in ``details.task_id`` instead.
+    IDEMPOTENCY_OUTCOME_UNKNOWN = "idempotency_outcome_unknown"
 
     # A file id passed in ``message.files`` on run creation isn't
     # accessible to the caller. 404 -- distinct from workforce_not_found
@@ -212,6 +217,10 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.IDEMPOTENCY_KEY_IN_PROGRESS: (
         "A request with this Idempotency-Key is still being processed; "
         "retry with the same key shortly."
+    ),
+    V1ErrorCode.IDEMPOTENCY_OUTCOME_UNKNOWN: (
+        "The first request with this Idempotency-Key was accepted but its "
+        "outcome was not recorded."
     ),
     V1ErrorCode.FILE_NOT_FOUND: "One or more file ids are not accessible.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",

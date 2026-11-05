@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.web.api.v1.idempotency import fingerprint_payload
 from xagent.web.models.api_idempotency_key import ApiIdempotencyKey
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
@@ -183,9 +184,11 @@ def test_same_key_with_different_body_is_422() -> None:
 def _create_body_dump(agent_id: int, content: str) -> dict[str, Any]:
     from xagent.web.schemas.v1 import CreateTaskRequest
 
-    return CreateTaskRequest(
-        agent_id=agent_id, message={"role": "user", "content": content}
-    ).model_dump(mode="json")
+    return fingerprint_payload(
+        CreateTaskRequest(
+            agent_id=agent_id, message={"role": "user", "content": content}
+        )
+    )
 
 
 def test_retry_while_first_request_is_in_flight_is_409() -> None:
@@ -261,7 +264,7 @@ def test_accepted_task_with_unrecorded_response_is_not_started_again() -> None:
 
     assert retry.status_code == 409
     error = retry.json()["error"]
-    assert error["code"] == "idempotency_conflict"
+    assert error["code"] == "idempotency_outcome_unknown"
     assert error["details"] == {"task_id": task_id}
     # The message must not imply the task is running: its outcome is unknown.
     assert f"GET /v1/chat/tasks/{task_id}" in error["message"]
@@ -454,9 +457,11 @@ def test_append_stale_reservation_that_created_nothing_is_taken_over() -> None:
     agent_id, key = _create_agent_with_key()
     task_id = _create(key, agent_id).json()["task_id"]
     _set_status(task_id, TaskStatus.COMPLETED)
-    body = AppendMessageRequest(
-        agent_id=agent_id, message={"role": "user", "content": "next turn"}
-    ).model_dump(mode="json")
+    body = fingerprint_payload(
+        AppendMessageRequest(
+            agent_id=agent_id, message={"role": "user", "content": "next turn"}
+        )
+    )
     api_idempotency.acquire_sync(
         scope_kind="agent",
         scope_id=agent_id,
@@ -500,3 +505,52 @@ def test_a_taken_over_owner_cannot_bind_or_release_before_the_new_owner_binds() 
     api_idempotency.release_sync(slow)
 
     assert _only_row()["state"] == "in_progress"
+
+
+def test_a_bound_row_whose_task_was_deleted_is_never_taken_over() -> None:
+    agent_id, key = _create_agent_with_key()
+    first = _create(key, agent_id, "retry-13")
+    task_id = first.json()["task_id"]
+    _set_status(task_id, TaskStatus.COMPLETED)
+    # The response was never recorded, then the task was deleted, then the
+    # lease ran out: nothing may start a second task under this key.
+    _patch_row(
+        state="bound",
+        response_body=None,
+        response_status=None,
+        lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).delete()
+        db.commit()
+    finally:
+        db.close()
+    assert _only_row()["task_id"] is None
+
+    retry = _create(key, agent_id, "retry-13")
+
+    assert retry.status_code == 409
+    assert retry.json()["error"]["code"] == "idempotency_conflict"
+    assert _task_count() == 0
+
+
+def test_a_retry_that_only_changes_metadata_replays_the_original() -> None:
+    agent_id, key = _create_agent_with_key()
+    body = {"agent_id": agent_id, "message": {"role": "user", "content": "hi"}}
+    first = client.post(
+        "/v1/chat/tasks",
+        headers=_headers(key, "retry-14"),
+        json={**body, "metadata": {"trace_id": "attempt-1"}},
+    )
+    retry = client.post(
+        "/v1/chat/tasks",
+        headers=_headers(key, "retry-14"),
+        json={**body, "metadata": {"trace_id": "attempt-2"}},
+    )
+
+    assert first.status_code == 202, first.text
+    assert retry.status_code == 202
+    assert retry.headers["Idempotent-Replayed"] == "true"
+    assert retry.json() == first.json()
+    assert _task_count() == 1

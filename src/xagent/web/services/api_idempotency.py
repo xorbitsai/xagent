@@ -34,6 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..models.api_idempotency_key import (
+    IDEMPOTENCY_STATE_BOUND,
     IDEMPOTENCY_STATE_COMPLETED,
     IDEMPOTENCY_STATE_IN_PROGRESS,
     ApiIdempotencyKey,
@@ -192,9 +193,12 @@ def _judge_existing(
     old_lease = row.lease_expires_at
     if normalize_datetime_from_db(old_lease) > moment:
         raise IdempotencyRejected("in_progress")
-    if row.task_id is not None:
+    if row.state == IDEMPOTENCY_STATE_BOUND or row.task_id is not None:
         # The task was accepted but the process died before the response was
-        # recorded. Starting another run would duplicate it.
+        # recorded. Starting another run would duplicate it. If the task has
+        # since been deleted (task_id is NULL) the key is just as unusable.
+        if row.task_id is None:
+            raise IdempotencyRejected("conflict")
         raise IdempotencyRejected("outcome_unknown", task_id=int(row.task_id))
     # The reserving request created nothing before its lease ran out: take it
     # over. The compare-and-set keeps two retries from both taking it, and the
@@ -231,7 +235,7 @@ def bind_task_no_commit(db: Session, claim: IdempotencyClaim, task_id: int) -> N
             ApiIdempotencyKey.claim_token == claim.token,
             ApiIdempotencyKey.task_id.is_(None),
         )
-        .values(task_id=task_id)
+        .values(task_id=task_id, state=IDEMPOTENCY_STATE_BOUND)
     )
     if bound.rowcount != 1:
         raise IdempotencyRejected("in_progress")

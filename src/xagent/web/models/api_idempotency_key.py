@@ -28,6 +28,9 @@ from sqlalchemy.sql import func
 from .database import Base
 
 IDEMPOTENCY_STATE_IN_PROGRESS = "in_progress"
+# Bound to a task but the response was not recorded (yet). Never taken over:
+# the task exists, or existed, so running the call again would duplicate it.
+IDEMPOTENCY_STATE_BOUND = "bound"
 IDEMPOTENCY_STATE_COMPLETED = "completed"
 
 
@@ -68,7 +71,9 @@ class ApiIdempotencyKey(Base):  # type: ignore
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
-    # SET NULL: a deleted task leaves the key unreplayable, not reusable.
+    # SET NULL: a deleted task leaves the key unreplayable, not reusable. A row
+    # that was ever bound is in state ``bound`` or ``completed``, so a NULL
+    # here with either state means the task was deleted and is never retaken.
     task_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("tasks.id", ondelete="SET NULL"),

@@ -20,6 +20,16 @@ IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed"
 _RETRY_AFTER_SECONDS = "2"
 
 
+def fingerprint_payload(request: BaseModel) -> dict:
+    """The part of a request an ``Idempotency-Key`` retry must repeat.
+
+    Defaulted fields are left out so a deploy that adds one cannot make an
+    identical retry hash differently, and so is the free-form ``metadata``
+    (trace and request ids), which clients may regenerate for every attempt.
+    """
+    return request.model_dump(mode="json", exclude_unset=True, exclude={"metadata"})
+
+
 def idempotency_scope(principal: ApiKeyPrincipal) -> tuple[str, int]:
     """The tenant a key is deduplicated within: the bound agent or workforce of a
     runtime key, or the holder of a personal key."""
@@ -43,13 +53,13 @@ def raise_idempotency_rejection(exc: api_idempotency.IdempotencyRejected) -> NoR
         )
     if exc.reason == "outcome_unknown":
         raise V1ApiError(
-            V1ErrorCode.IDEMPOTENCY_CONFLICT,
+            V1ErrorCode.IDEMPOTENCY_OUTCOME_UNKNOWN,
             409,
             message=(
-                "The original request with this Idempotency-Key created task "
-                f"{exc.task_id}, but its outcome was not recorded. Read the task "
-                f"with GET /v1/chat/tasks/{exc.task_id} to see its state; a new "
-                "task was not started."
+                "The original request with this Idempotency-Key was accepted on "
+                f"task {exc.task_id}, but its outcome was not recorded. Read the "
+                f"task with GET /v1/chat/tasks/{exc.task_id} to see its state; "
+                "the request was not run again."
             ),
             details={"task_id": exc.task_id},
         )

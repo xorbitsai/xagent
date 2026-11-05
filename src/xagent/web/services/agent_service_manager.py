@@ -853,7 +853,11 @@ async def create_default_tools(
     ``connector_team_id`` is the *governing agent's* owning team, never the
     calling user's own team membership. It threads into ``WebToolConfig`` so
     the connector-visibility team-scope hook (when installed) resolves that
-    team's connectors instead of the run owner's personal set only.
+    team's connectors instead of the run owner's personal set only. On this
+    path the same team also governs knowledge-base resolution, so it is
+    forwarded as ``WebToolConfig``'s separate ``knowledge_base_team_id`` as
+    well; delegated sub-agents build their own config and set the two
+    independently.
 
     ``db_task_id`` and ``file_operation_access_version`` are appended to the
     historical positional signature. Runtime callers pass them by keyword so
@@ -862,7 +866,7 @@ async def create_default_tools(
 
     ``agent_creator_user_id`` and ``declared_knowledge_bases`` thread the same
     governing agent's creator and its *stored* ``knowledge_bases`` list
-    alongside ``connector_team_id`` into ``WebToolConfig``, so the
+    alongside that team into ``WebToolConfig``, so the
     knowledge-base search path can resolve a declared name against the
     governing team, fall back to the creator's own collection, and report a
     name the team never received rather than reaching for the runner's own
@@ -949,6 +953,7 @@ async def create_default_tools(
         mcp_load_summary_tracer=mcp_load_summary_tracer,
         mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
         connector_team_id=connector_team_id,
+        knowledge_base_team_id=connector_team_id,
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
     )

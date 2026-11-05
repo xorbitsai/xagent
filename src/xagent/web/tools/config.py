@@ -1910,6 +1910,7 @@ class WebToolConfig(BaseToolConfig):
         voice: Optional[str] = None,
         mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+        knowledge_base_team_id: Optional[int] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1925,10 +1926,21 @@ class WebToolConfig(BaseToolConfig):
         # path ever supplies this directly, it is read off a loaded ``Agent``
         # row (or a frozen snapshot of one) by the caller.
         self._connector_team_id = connector_team_id
+        # The team the governing agent's knowledge bases resolve against.
+        # Like ``_connector_team_id`` it is read off a loaded ``Agent`` row
+        # (or a frozen snapshot of one) by the caller, never off a request,
+        # and ``None`` is the closed default. It is a separate field because
+        # the two decisions can differ: the direct-run path opens both onto
+        # the same team, while delegated sub-agents keep connectors closed
+        # and still resolve knowledge bases against the delegated agent's
+        # team -- left ``None`` there for a personal agent or an absent or
+        # empty declaration (a workforce allowlist hop whose runner can no
+        # longer run the agent fails before any config is built).
+        self._knowledge_base_team_id = knowledge_base_team_id
         # The governing agent's creator -- always the same agent as
-        # ``_connector_team_id`` above, populated by the same caller. Used by
-        # the knowledge-base resolution path to tell the agent's creator
-        # apart from any other runner of a team-governed agent.
+        # ``_knowledge_base_team_id`` above, populated by the same caller.
+        # Used by the knowledge-base resolution path to tell the agent's
+        # creator apart from any other runner of a team-governed agent.
         self._agent_creator_user_id = agent_creator_user_id
         # The governing agent's own STORED ``knowledge_bases`` declaration --
         # never the model-supplied value on a search request. Read from the
@@ -2728,6 +2740,10 @@ class WebToolConfig(BaseToolConfig):
     def get_allowed_collections(self) -> Optional[List[str]]:
         """Get allowed knowledge base collections. None means all collections are allowed."""
         return self._allowed_collections
+
+    def get_knowledge_base_team_id(self) -> Optional[int]:
+        """Get the team the governing agent's knowledge bases resolve against."""
+        return self._knowledge_base_team_id
 
     def get_agent_creator_user_id(self) -> Optional[int]:
         """Get the governing agent's creator, for the knowledge-base seam."""

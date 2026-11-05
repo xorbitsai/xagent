@@ -497,10 +497,13 @@ async def test_create_default_tools_registers_production_adapter_only_for_actor_
 def test_web_tool_config_actor_parameters_are_appended_after_voice() -> None:
     parameters = list(inspect.signature(WebToolConfig.__init__).parameters)
 
-    assert parameters[-3:] == [
+    # Later parameters are appended after these, never inserted before
+    # them, so positional callers keep binding the same values.
+    assert parameters[-4:] == [
         "voice",
         "mcp_actor_stdio_connection_adapter",
         "mcp_actor_execution_identity",
+        "knowledge_base_team_id",
     ]
 
 

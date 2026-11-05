@@ -210,3 +210,139 @@ def build_rnode(
 def root_rnode(schema: dict[str, Any]) -> RNode:
     """The :class:`RNode` of a whole schema."""
     return build_rnode(schema, schema.get("$defs", {}))
+
+
+# --- instances, decisions and writings ------------------------------------------------
+
+MARKER = "__NOT_EXPRESSIBLE__"
+
+
+def gen_value(rng: random.Random, n: RNode) -> Any:
+    """A value the node allows."""
+    if n.enum_list is not None:
+        return rng.choice(n.enum_list)
+    pools: dict[str, list[Any]] = {
+        "string": ["Alice", "1 Main St", "2025-03-03", "x y"],
+        "integer": [0, 1, 7, -3],
+        "number": [0, 1.5, 2, -0.25],
+        "boolean": [True, False],
+    }
+    return rng.choice(pools[n.kind])
+
+
+def gen_instance(
+    rng: random.Random, n: RNode, is_root: bool = True, p_bad: float = 0.04
+) -> Any:
+    """An instance that is mostly valid for the copy, sometimes broken."""
+    r = rng.random()
+    if not is_root:
+        if r < 0.12:
+            return None
+        if r < 0.17:
+            return rng.choice(["", "  ", "\t"])
+        if r < 0.20 and n.kind == "string":
+            return MARKER
+    if rng.random() < p_bad:
+        wrong = [MARKER, "x" + MARKER, 3, "zz", True, [], {}, None, 2.5, 1.0, 1]
+        return rng.choice(wrong)
+    if n.kind == "object":
+        d = {k: gen_instance(rng, c, False, p_bad) for k, c in n.props}
+        if n.props and rng.random() < p_bad:
+            d.pop(rng.choice([k for k, _ in n.props]))
+        if rng.random() < p_bad:
+            d["zz_extra"] = 1
+        return d
+    if n.kind == "array":
+        assert n.items is not None
+        return [
+            gen_instance(rng, n.items, False, p_bad) for _ in range(rng.randint(0, 3))
+        ]
+    return gen_value(rng, n)
+
+
+# A decision is what the final answer says, whatever way it is written:
+#   ("val", v) stated      ("ns",) not stated      ("nx",) stated, cannot be written
+#   ("obj", [..]) ("arr", [..])      ("nonelist",) the answer says there are none
+Decision = tuple[Any, ...]
+
+
+def gen_decision(rng: random.Random, n: RNode, is_root: bool = False) -> Decision:
+    if n.kind == "object":
+        if not is_root and rng.random() < 0.25:
+            return ("ns",)
+        return ("obj", [gen_decision(rng, c) for _, c in n.props])
+    if n.kind == "array":
+        assert n.items is not None
+        r = rng.random()
+        if r < 0.2:
+            return ("ns",)
+        if r < 0.3:
+            return ("nonelist",)
+        return ("arr", [gen_decision(rng, n.items) for _ in range(rng.randint(1, 3))])
+    r = rng.random()
+    if r < 0.5:
+        return ("val", gen_value(rng, n))
+    return ("ns",) if r < 0.85 else ("nx",)
+
+
+def render(
+    rng: random.Random,
+    d: Decision,
+    n: RNode,
+    in_object: bool = False,
+    is_root: bool = False,
+) -> Any:
+    """One way of writing decision ``d``."""
+    tag = d[0]
+    if tag == "val":
+        return d[1]
+    if tag == "nx":
+        return MARKER if n.kind == "string" else None
+    if tag == "nonelist":
+        return []
+    if tag == "obj":
+        return {k: render(rng, cd, c, True) for (k, c), cd in zip(n.props, d[1])}
+    if tag == "arr":
+        assert n.items is not None
+        return [render(rng, cd, n.items) for cd in d[1]]
+    return skeleton(rng, n) if is_root else render_ns(rng, n, in_object)
+
+
+def render_ns(rng: random.Random, n: RNode, in_object: bool) -> Any:
+    """Every writing of "the answer says nothing here"; inside an object a
+    property with one allowed value may also be written as that value."""
+    if n.kind == "object":
+        return None if rng.random() < 0.5 else skeleton(rng, n)
+    if n.kind == "array":
+        assert n.items is not None
+        if rng.random() < 0.5:
+            return None
+        return [render_ns(rng, n.items, False) for _ in range(rng.randint(1, 3))]
+    choices: list[Any] = [None, None, "", "  "]
+    if in_object and n.single:
+        assert n.enum_list is not None
+        choices.append(n.enum_list[0])
+    return rng.choice(choices)
+
+
+def skeleton(rng: random.Random, n: RNode) -> dict[str, Any]:
+    return {k: render_ns(rng, c, True) for k, c in n.props}
+
+
+def lookup(root: RNode, path: str) -> RNode:
+    """The node at a JSON Pointer made of property names and indices."""
+    n = root
+    for seg in path.split("/")[1:]:
+        n = dict(n.props)[seg] if n.kind == "object" else n.items  # type: ignore[assignment]
+    return n
+
+
+def synth_valid(n: RNode) -> Any:
+    """Some value the node allows."""
+    if n.enum_list is not None:
+        return n.enum_list[0]
+    if n.kind == "object":
+        return {k: synth_valid(c) for k, c in n.props}
+    if n.kind == "array":
+        return []
+    return {"string": "s", "integer": 1, "number": 1.5, "boolean": True}[n.kind]

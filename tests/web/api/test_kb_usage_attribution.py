@@ -329,7 +329,27 @@ def test_kb_work_runs_under_the_resolution_it_was_gated_on(
     assert resolved_under is not None and ran_under is resolved_under
 
 
-def test_ingest_job_is_gated_on_the_resolved_model(client, model_gate, tmp_path):
+@pytest.mark.parametrize(
+    "path,data,files,source",
+    [
+        (
+            "/api/kb/ingest/jobs",
+            {"collection": "team-kb"},
+            {"file": ("notes.txt", b"abc", "text/plain")},
+            "kb_ingest_job",
+        ),
+        (
+            "/api/kb/ingest-web/jobs",
+            {"collection": "team-kb", "start_url": "https://example.com"},
+            None,
+            "kb_ingest_web_job",
+        ),
+    ],
+    ids=["ingest-job", "ingest-web-job"],
+)
+def test_a_job_is_gated_on_the_resolved_model_when_queued(
+    client, model_gate, tmp_path, path, data, files, source
+):
     with (
         patch.object(
             kb_module,
@@ -348,10 +368,61 @@ def test_ingest_job_is_gated_on_the_resolved_model(client, model_gate, tmp_path)
             side_effect=RuntimeError("stop"),
         ),
     ):
-        client.post(
-            "/api/kb/ingest/jobs",
-            data={"collection": "team-kb"},
-            files={"file": ("notes.txt", b"abc", "text/plain")},
-        )
+        client.post(path, data=data, files=files)
 
-    assert model_gate == [(ACTOR_ID, "kb_ingest_job", ("platform/text-embedding-v4",))]
+    assert model_gate == [(ACTOR_ID, source, ("platform/text-embedding-v4",))]
+
+
+@pytest.mark.parametrize(
+    "path,data,files,resolver",
+    [
+        (
+            "/api/kb/search",
+            {"collection": "team-kb", "query_text": "q"},
+            None,
+            "resolve_search_model_ids",
+        ),
+        (
+            "/api/kb/ingest/jobs",
+            {"collection": "team-kb"},
+            {"file": ("notes.txt", b"abc", "text/plain")},
+            "resolve_ingestion_model_ids",
+        ),
+        (
+            "/api/kb/ingest-web/jobs",
+            {"collection": "team-kb", "start_url": "https://example.com"},
+            None,
+            "resolve_ingestion_model_ids",
+        ),
+    ],
+    ids=["search", "ingest-job", "ingest-web-job"],
+)
+def test_without_a_gate_nothing_is_resolved_for_it(
+    client, tmp_path, path, data, files, resolver
+):
+    pins: list = []
+
+    def search(**_kwargs: Any) -> Any:
+        pins.append(_active_pin())
+        raise RuntimeError("stop")
+
+    with (
+        patch.object(kb_module, resolver) as resolve,
+        patch.object(kb_module, "run_document_search", side_effect=search),
+        patch.object(
+            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+        ),
+        patch.object(
+            kb_module, "_ensure_background_job_queue_available_async", new=AsyncMock()
+        ),
+        patch.object(
+            kb_module,
+            "_enqueue_background_job_or_503_async",
+            side_effect=RuntimeError("stop"),
+        ),
+    ):
+        client.post(path, data=data, files=files)
+
+    resolve.assert_not_called()
+    # And nothing is pinned: the work resolves as it did before gating.
+    assert pins == ([None] if path == "/api/kb/search" else [])

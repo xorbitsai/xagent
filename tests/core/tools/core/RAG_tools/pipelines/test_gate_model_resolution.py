@@ -240,11 +240,74 @@ def test_an_environment_model_is_gated_with_no_id(world, dense_hits, monkeypatch
     assert world.embedded_with == [""]
 
 
+def _rerank(model_id: str) -> RerankModelConfig:
+    return RerankModelConfig(id=model_id, model_name="qwen3-rerank", api_key="k")
+
+
 def test_a_sparse_search_gates_no_embedding_model(world):
     world.rows = {PLATFORM: _embedding(PLATFORM)}
     config = SearchConfig(search_type=SearchType.SPARSE, embedding_model_id=PLATFORM)
 
     assert _search(ModelResolutionPin(), config) == ()
+
+
+def test_a_sparse_search_gates_the_rerank_it_calls(world, monkeypatch):
+    hit = SearchResult(
+        doc_id="d", chunk_id="c", text="t", score=1.0, parse_hash="p", model_tag="m"
+    )
+    monkeypatch.setattr(
+        document_search,
+        "_execute_sparse_search",
+        lambda *_args, **_kwargs: ([hit], "success", [], "ok"),
+    )
+    world.rows = {PLATFORM: _embedding(PLATFORM), "platform/rerank": _rerank("r")}
+    config = SearchConfig(
+        search_type=SearchType.SPARSE,
+        embedding_model_id=PLATFORM,
+        rerank_model_id="platform/rerank",
+    )
+    pin = ModelResolutionPin()
+
+    model_ids = _search(pin, config)
+    result = _run_search(pin, config)
+
+    assert result.status == "success", result.message
+    assert model_ids == ("r",)
+    assert world.embedded_with == []
+    assert world.reranked_with == ["r"]
+
+
+def _rerank_adapter_fails(_cfg: Any) -> Any:
+    raise RuntimeError("provider client failed to start")
+
+
+@pytest.mark.parametrize(
+    "adapter_fails", [False, True], ids=["not-found", "unexpected-adapter-error"]
+)
+def test_a_rerank_that_does_not_resolve_is_not_gated(
+    world, dense_hits, monkeypatch, adapter_fails
+):
+    world.rows = {PLATFORM: _embedding(PLATFORM)}
+    if adapter_fails:
+        # Not one of the errors the rerank lookup expects.
+        world.rows["platform/rerank"] = _rerank("platform/rerank")
+        monkeypatch.setattr(
+            model_resolver, "create_rerank_adapter", _rerank_adapter_fails
+        )
+    config = SearchConfig(
+        search_type=SearchType.DENSE,
+        embedding_model_id=PLATFORM,
+        rerank_model_id="platform/rerank",
+    )
+    pin = ModelResolutionPin()
+
+    # Never raises: an unexpected error is the search's to report.
+    model_ids = _search(pin, config)
+    _run_search(pin, config)
+
+    assert model_ids == (PLATFORM,)
+    assert world.embedded_with == [PLATFORM]
+    assert world.reranked_with == []
 
 
 def test_a_resolution_that_failed_for_the_gate_fails_the_search(world, dense_hits):
@@ -358,3 +421,32 @@ def test_threads_racing_on_one_resolution_all_use_the_first_that_lands():
         thread.join(timeout=10)
 
     assert seen == ["early", "early"]
+
+
+def test_a_kept_failure_is_replayed_as_a_fresh_copy_of_itself():
+    import traceback
+
+    from xagent.core.tools.core.RAG_tools.utils.model_resolution_pin import (
+        pinned_resolution,
+    )
+
+    pin = ModelResolutionPin()
+
+    def fail() -> None:
+        raise ModelNotFoundError("platform/x")
+
+    replays = []
+    for _ in range(3):
+        with pytest.raises(ModelNotFoundError) as raised:
+            pin.run(pinned_resolution, "key", fail)
+        replays.append(raised.value)
+
+    first, second, third = replays
+    # Same type, message and state, as raised by the resolution itself ...
+    assert [str(e) for e in replays] == [str(ModelNotFoundError("platform/x"))] * 3
+    assert third.model_id == "platform/x"
+    # ... but a new instance each time, so no traceback keeps growing.
+    assert first is not second and second is not third
+    assert first.__cause__ is third.__cause__
+    depths = [len(traceback.extract_tb(e.__traceback__)) for e in replays]
+    assert depths[0] == depths[1] == depths[2]

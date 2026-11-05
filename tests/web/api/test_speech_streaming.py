@@ -1113,7 +1113,7 @@ def test_tts_refused_when_the_stream_opens_is_still_a_402_and_closes_the_model(
     # Allowed by the endpoint, refused by the metering scope a moment later.
     answers = iter([None, "Out of AI credits"])
     monkeypatch.setattr(
-        quota_hooks, "_standalone_gate_hook", lambda *_args: next(answers)
+        quota_hooks, "_standalone_gate_hook", lambda _user, _source: next(answers)
     )
     response = api.client.post(
         TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}

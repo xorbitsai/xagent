@@ -192,6 +192,7 @@ from ..services.managed_file_ref import (
     DurableObjectMissingError,
     ManagedFileRef,
 )
+from ..services.quota_hooks import get_standalone_gate
 from ..services.uploaded_file_store import (
     UploadedFileStore,
     UploadedFileVersionConflict,
@@ -3341,7 +3342,12 @@ async def _resolve_kb_ingestion_models(
     Returns a fresh pin holding the resolution and the model ids to gate on.
     Run the ingestion under the pin and it embeds with exactly those models.
     ``user`` is the collection's storage tenant, whom the pipeline resolves for.
+    Call it once access to the collection is confirmed: resolving reads, and
+    may record, the collection's binding. With no gate registered nothing is
+    resolved, the ids are empty and the pin binds nothing.
     """
+    if get_standalone_gate() is None:
+        return ModelResolutionPin(enabled=False), ()
     pin = ModelResolutionPin()
     model_ids = await asyncio.to_thread(
         pin.run,
@@ -3487,7 +3493,9 @@ async def ingest(
     model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
         safe_collection, {"embedding_model_id": embedding_model_id}, _user
     )
-    await check_standalone_gate_async(int(actor_user.id), "kb_ingest", ingest_model_ids)
+    await check_standalone_gate_async(
+        int(actor_user.id), "kb_ingest", model_ids=ingest_model_ids
+    )
 
     existing_file_record = (
         db.query(UploadedFile)
@@ -3842,7 +3850,7 @@ async def create_ingest_job(
         safe_collection, {"embedding_model_id": embedding_model_id}, _user
     )
     await check_standalone_gate_async(
-        int(actor_user.id), "kb_ingest_job", ingest_model_ids
+        int(actor_user.id), "kb_ingest_job", model_ids=ingest_model_ids
     )
 
     try:
@@ -4051,15 +4059,6 @@ async def ingest_cloud(
         max_retries=request.max_retries or 3,
         retry_delay=request.retry_delay or 1.0,
     )
-    # Before the collection can be created; every file is ingested under this
-    # resolution and checked again as it starts.
-    model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
-        safe_collection, config, _user
-    )
-    await check_standalone_gate_async(
-        int(actor_user.id), "kb_ingest_cloud", ingest_model_ids
-    )
-
     progress_manager = get_progress_manager()
 
     try:
@@ -4069,6 +4068,14 @@ async def ingest_cloud(
         collection_existed_before = False
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    # Once access is confirmed and before anything is downloaded; every file
+    # is ingested under this resolution and checked again as it starts.
+    model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
+        safe_collection, config, _user
+    )
+    await check_standalone_gate_async(
+        int(actor_user.id), "kb_ingest_cloud", model_ids=ingest_model_ids
+    )
 
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
@@ -5055,14 +5062,17 @@ async def search(
     progress_manager = get_progress_manager()
     # Resolved once: the search runs under the pin, so it calls the models
     # the gate was told about.
-    model_pin = ModelResolutionPin()
-    search_model_ids = model_pin.run(
-        resolve_search_model_ids,
-        safe_collection,
-        config=config,
-        user_id=int(_user.id),
-        is_admin=bool(_user.is_admin),
-    )
+    gated = get_standalone_gate() is not None
+    model_pin = ModelResolutionPin(enabled=gated)
+    search_model_ids: tuple[str, ...] = ()
+    if gated:
+        search_model_ids = model_pin.run(
+            resolve_search_model_ids,
+            safe_collection,
+            config=config,
+            user_id=int(_user.id),
+            is_admin=bool(_user.is_admin),
+        )
     async with usage_scope(
         actor_user_id, usage_source="kb_search", model_ids=search_model_ids
     ):
@@ -5689,7 +5699,7 @@ async def create_ingest_web_job(
         safe_collection, {"embedding_model_id": embedding_model_id}, _user
     )
     await check_standalone_gate_async(
-        int(actor_user.id), "kb_ingest_web_job", ingest_model_ids
+        int(actor_user.id), "kb_ingest_web_job", model_ids=ingest_model_ids
     )
 
     try:

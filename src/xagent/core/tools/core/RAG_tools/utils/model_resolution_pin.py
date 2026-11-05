@@ -12,6 +12,18 @@ effective embedding model of a collection, and the config a model id resolves
 to. The entry point resolves under the pin to learn the model ids, gates on
 them, and runs the pipeline under the same pin. Adapters are not kept; each
 resolution still builds a fresh one from the kept config.
+
+Failures are kept as deliberately as results. If a resolution failed while
+the gate was asked, the gate was told the work calls nothing; resolving
+again could succeed and call a priced model the gate never saw. The cost is
+that a pin outlives one call: for an ``/ingest-web`` crawl, an
+``/ingest-cloud`` batch or a background job, a hub error -- transient or
+not, including one that made resolution fall back to the environment --
+holds for every page or file, where each used to resolve on its own.
+Likewise, a batch into an unbound collection keeps the model it resolved
+first: if a concurrent ingestion binds the collection to another model,
+the remaining files fail as already initialized with that model instead of
+adopting it, which would call a model the gate was not told about.
 """
 
 from __future__ import annotations
@@ -19,7 +31,16 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Hashable, Iterator, Optional, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Hashable,
+    Iterator,
+    NoReturn,
+    Optional,
+    TypeVar,
+    cast,
+)
 
 _T = TypeVar("_T")
 
@@ -36,14 +57,20 @@ class ModelResolutionPin:
     bind it again with :meth:`run`. Safe to share between threads.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, enabled: bool = True) -> None:
+        # A disabled pin binds nothing: resolution is as if there were none.
+        # For work no gate is asked about, which has nothing to keep.
+        self._enabled = enabled
         self._lock = threading.Lock()
-        self._results: dict[Hashable, Any] = {}
-        self._failures: dict[Hashable, Exception] = {}
+        # key -> (result, None) or (None, the exception it raised)
+        self._outcomes: dict[Hashable, tuple[Any, Optional[Exception]]] = {}
 
     @contextmanager
     def bound(self) -> Iterator["ModelResolutionPin"]:
         """Bind this pin for the body of a ``with`` block."""
+        if not self._enabled:
+            yield self
+            return
         token = _active_pin.set(self)
         try:
             yield self
@@ -57,25 +84,37 @@ class ModelResolutionPin:
 
     def _resolve(self, key: Hashable, compute: Callable[[], _T]) -> _T:
         with self._lock:
-            known = key in self._results or key in self._failures
-        if not known:
+            outcome = self._outcomes.get(key)
+        if outcome is None:
             # Outside the lock: resolution may hop threads. Two threads racing
             # on one key both compute, and both use whichever lands first.
             try:
-                outcome: tuple[Any, Exception | None] = (compute(), None)
+                computed: tuple[Any, Optional[Exception]] = (compute(), None)
             except Exception as exc:  # noqa: BLE001 - replayed below
-                outcome = (None, exc)
+                computed = (None, exc)
             with self._lock:
-                if key not in self._results and key not in self._failures:
-                    if outcome[1] is None:
-                        self._results[key] = outcome[0]
-                    else:
-                        self._failures[key] = outcome[1]
-        with self._lock:
-            failure = self._failures.get(key)
-            if failure is not None:
-                raise failure
-            return cast(_T, self._results[key])
+                outcome = self._outcomes.setdefault(key, computed)
+        result, failure = outcome
+        if failure is not None:
+            _raise_copy(failure)
+        return cast(_T, result)
+
+
+def _raise_copy(failure: Exception) -> NoReturn:
+    """Raise ``failure`` again as a copy, chained to the kept original.
+
+    One kept exception may be replayed many times, from many threads;
+    raising that instance each time would keep growing its traceback. The
+    copy is built without ``__init__``, which may reformat the message.
+    """
+    cls = type(failure)
+    try:
+        replay = cls.__new__(cls, *failure.args)
+        replay.__dict__.update(vars(failure))
+        replay.args = failure.args
+    except Exception:  # noqa: BLE001 - not copyable: raise the original
+        raise failure.with_traceback(None)
+    raise replay from failure
 
 
 def pinned_resolution(key: Hashable, compute: Callable[[], _T]) -> _T:

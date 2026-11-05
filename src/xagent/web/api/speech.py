@@ -450,7 +450,9 @@ async def stream_tts(
     # The metering scope opens once the response is being sent, too late for a
     # status code; refuse here, before the provider is reached. The scope
     # checks again, for a gate that turns in between.
-    await check_standalone_gate_async(user_id, "speech_synthesize", (config.model_id,))
+    await check_standalone_gate_async(
+        user_id, "speech_synthesize", model_ids=(config.model_id,)
+    )
     try:
         model = get_tts_model_instance(config)
     except ValueError as exc:

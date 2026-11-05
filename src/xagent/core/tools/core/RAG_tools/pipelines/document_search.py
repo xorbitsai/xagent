@@ -868,8 +868,10 @@ def resolve_search_model_ids(
     model is listed when one is requested and resolves. A model configured
     from the environment carries no id and is left out.
 
-    Never raises: a resolution that fails here fails the search the same way,
-    before it calls that model.
+    Never raises. An embedding resolution that fails here fails the search
+    the same way, before it calls any model, and nothing is listed. A rerank
+    resolution that fails leaves the rerank out: the search still embeds,
+    and never calls a rerank model.
     """
     from ..management.collection_manager import resolve_effective_embedding_model_sync
 
@@ -891,8 +893,11 @@ def resolve_search_model_ids(
         return ()
     if cfg.search_type != SearchType.SPARSE:
         model_ids.append(embedding_config.usage_model_id)
-    with user_scope_context(scope.user_id, scope.is_admin):
-        rerank_model = _resolve_unified_rerank(cfg)
+    try:
+        with user_scope_context(scope.user_id, scope.is_admin):
+            rerank_model = _resolve_unified_rerank(cfg)
+    except Exception:  # noqa: BLE001 - the search calls no rerank either
+        rerank_model = None
     if rerank_model is not None:
         model_ids.append(getattr(rerank_model, "model_id", "") or "")
     return tuple(model_id for model_id in model_ids if model_id)

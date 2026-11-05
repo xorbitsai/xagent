@@ -190,9 +190,16 @@ def set_standalone_gate_hook(
     ``model_id`` and has never been priced, so a host gating priced models
     should allow it.
 
+    A model whose resolution failed is left out as well: the work then fails
+    the same way, or skips that model, before calling it. So the tuple is
+    also empty when no model could be resolved.
+
     A hook registered with the earlier two-argument signature,
-    ``hook(user_id, source)``, keeps being called that way; which one applies
-    is decided here, at registration.
+    ``hook(user_id, source)``, keeps being called that way. Which one applies
+    is decided here, at registration, from the hook's required positional
+    parameters: three or exactly two. A hook whose signature leaves it
+    ambiguous (``*args``, a defaulted third parameter, no readable signature)
+    is refused with a ``TypeError``; wrap it in a plain function.
 
     Return ``None`` to allow the work, or a reason to refuse it: a message
     ``str`` or a structured mapping (e.g. ``{"code", "metric", "message"}``)
@@ -218,31 +225,52 @@ def set_standalone_gate_hook(
 def _as_three_argument_gate(
     hook: Callable[..., StandaloneGateReason],
 ) -> StandaloneGate:
+    """``hook`` called as ``(user_id, source, model_ids)``, whichever it takes.
+
+    Decided from the signature, and only when it is unambiguous: three
+    required positional parameters take ``model_ids``; exactly two, with no
+    other positional parameter, are the earlier form. Anything else -- a
+    ``*args`` wrapper that hides the real arity, a defaulted third parameter
+    that may or may not mean ``model_ids``, a callable whose signature cannot
+    be read -- is refused here rather than guessed, since a gate called the
+    wrong way fails on every call, and a failing gate allows the work.
+    """
     try:
         signature = inspect.signature(hook)
     except (TypeError, ValueError):
-        # Not introspectable: hold it to the current contract.
-        return hook
-    try:
-        signature.bind(0, "", ())
-    except TypeError:
-        pass
-    else:
-        return hook
-    try:
-        signature.bind(0, "")
-    except TypeError:
         raise TypeError(
-            "A standalone gate hook takes (user_id, source, model_ids) "
-            "or (user_id, source)"
+            "A standalone gate hook must have a readable signature; "
+            f"wrap {hook!r} in a function taking (user_id, source, model_ids)"
         ) from None
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    required = [p for p in positional if p.default is inspect.Parameter.empty]
+    ambiguous = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL
+        or (
+            parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            and parameter.default is inspect.Parameter.empty
+        )
+        for parameter in signature.parameters.values()
+    )
+    if not ambiguous and len(required) == 3:
+        return hook
+    if not ambiguous and len(required) == 2 and len(positional) == 2:
 
-    def two_argument_gate(
-        user_id: int, source: str, model_ids: Sequence[str]
-    ) -> StandaloneGateReason:
-        return hook(user_id, source)
+        def two_argument_gate(
+            user_id: int, source: str, model_ids: Sequence[str]
+        ) -> StandaloneGateReason:
+            return hook(user_id, source)
 
-    return two_argument_gate
+        return two_argument_gate
+    raise TypeError(
+        "A standalone gate hook takes exactly (user_id, source, model_ids) or "
+        f"(user_id, source) as required positional parameters; got {signature}"
+    )
 
 
 def get_standalone_gate_hook() -> Callable[..., StandaloneGateReason] | None:

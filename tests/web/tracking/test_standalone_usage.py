@@ -45,7 +45,7 @@ def _embed(texts: int = 1) -> None:
 
 
 def test_sync_scope_delivers_its_rows_once(hook):
-    with usage_scope(7, usage_source="kb_ingest_job") as usage:
+    with usage_scope(7, usage_source="kb_ingest_job", model_ids=()) as usage:
         _embed(2)
         _embed(3)
         assert get_token_usage() is usage
@@ -57,7 +57,7 @@ def test_sync_scope_delivers_its_rows_once(hook):
 
 def test_rows_recorded_before_the_body_raises_are_delivered_once(hook):
     with pytest.raises(RuntimeError, match="after billing"):
-        with usage_scope(7, usage_source="kb_search"):
+        with usage_scope(7, usage_source="kb_search", model_ids=()):
             _embed()
             raise RuntimeError("after billing")
 
@@ -67,7 +67,7 @@ def test_rows_recorded_before_the_body_raises_are_delivered_once(hook):
 
 async def test_async_scope_delivers_off_the_event_loop(hook):
     loop_thread = threading.get_ident()
-    async with usage_scope(3, usage_source="speech_transcribe"):
+    async with usage_scope(3, usage_source="speech_transcribe", model_ids=()):
         _embed()
         # asyncio.to_thread carries the scope into the worker.
         await asyncio.to_thread(_embed)
@@ -79,7 +79,7 @@ async def test_async_scope_delivers_off_the_event_loop(hook):
 
 async def test_async_scope_raising_body_delivers_once(hook):
     with pytest.raises(ValueError):
-        async with usage_scope(3, usage_source="telegram_voice"):
+        async with usage_scope(3, usage_source="telegram_voice", model_ids=()):
             _embed()
             raise ValueError("transcript empty")
 
@@ -98,7 +98,7 @@ async def test_cancelled_delivery_still_delivers_once(hook):
     quota_hooks.set_standalone_usage_hook(slow_hook)
 
     async def scoped():
-        async with usage_scope(3, usage_source="kb_search"):
+        async with usage_scope(3, usage_source="kb_search", model_ids=()):
             _embed()
 
     task = asyncio.create_task(scoped())
@@ -117,7 +117,7 @@ async def test_cancelled_delivery_still_delivers_once(hook):
 def test_run_in_executor_needs_the_context_handed_over(hook):
     async def ingest(handed_over: bool):
         loop = asyncio.get_running_loop()
-        async with usage_scope(5, usage_source="kb_ingest"):
+        async with usage_scope(5, usage_source="kb_ingest", model_ids=()):
             if handed_over:
                 await loop.run_in_executor(None, contextvars.copy_context().run, _embed)
             else:
@@ -130,21 +130,21 @@ def test_run_in_executor_needs_the_context_handed_over(hook):
 
 
 def test_nothing_recorded_means_no_call(hook):
-    with usage_scope(1, usage_source="memory_api"):
+    with usage_scope(1, usage_source="memory_api", model_ids=()):
         pass
     assert hook.calls == []
 
 
 def test_without_a_hook_the_scope_is_inert():
     quota_hooks.set_standalone_usage_hook(None)
-    with usage_scope(1, usage_source="memory_api") as usage:
+    with usage_scope(1, usage_source="memory_api", model_ids=()) as usage:
         _embed()
     assert len(usage.details) == 1
 
 
 def test_unattributed_usage_is_delivered_and_logged(hook, caplog):
     caplog.set_level(logging.INFO, logger="xagent.web.tracking.standalone_usage")
-    with usage_scope(None, usage_source="kb_ingest_job"):
+    with usage_scope(None, usage_source="kb_ingest_job", model_ids=()):
         _embed()
 
     assert hook.calls[0][0] is None
@@ -157,7 +157,7 @@ def test_a_failing_hook_never_fails_the_work(caplog):
 
     quota_hooks.set_standalone_usage_hook(broken)
     try:
-        with usage_scope(1, usage_source="kb_search"):
+        with usage_scope(1, usage_source="kb_search", model_ids=()):
             _embed()
     finally:
         quota_hooks.set_standalone_usage_hook(None)
@@ -166,9 +166,9 @@ def test_a_failing_hook_never_fails_the_work(caplog):
 
 def test_scope_restores_the_previous_binding_and_nests(hook):
     with TokenContextManager() as outer:
-        with usage_scope(1, usage_source="outer"):
+        with usage_scope(1, usage_source="outer", model_ids=()):
             _embed(1)
-            with usage_scope(2, usage_source="inner"):
+            with usage_scope(2, usage_source="inner", model_ids=()):
                 _embed(2)
         assert token_context.get() is outer.get_usage()
 
@@ -180,14 +180,14 @@ def test_scope_restores_the_previous_binding_and_nests(hook):
 
 
 def test_delivered_rows_are_copies(hook):
-    with usage_scope(1, usage_source="kb_search") as usage:
+    with usage_scope(1, usage_source="kb_search", model_ids=()) as usage:
         _embed()
     hook.calls[0][1][0]["quantity"] = 99
     assert usage.details[0]["quantity"] == 1.0
 
 
 def test_pool_threads_do_not_inherit_the_scope(hook):
-    with usage_scope(1, usage_source="kb_search"):
+    with usage_scope(1, usage_source="kb_search", model_ids=()):
         with ThreadPoolExecutor(1) as pool:
             pool.submit(_embed).result()
     assert hook.calls == []
@@ -242,7 +242,7 @@ async def test_delivery_after_executor_shutdown_still_delivers(hook, monkeypatch
     monkeypatch.setattr(asyncio, "to_thread", shut_down)
     # The body's own exception survives, and the rows are delivered once.
     with pytest.raises(ValueError, match="body failed"):
-        async with usage_scope(3, usage_source="kb_search"):
+        async with usage_scope(3, usage_source="kb_search", model_ids=()):
             _embed()
             raise ValueError("body failed")
 

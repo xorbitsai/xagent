@@ -39,6 +39,7 @@ from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
 from ..services.kb_reference_protection import coordinate_ingest_job
+from ..services.quota_hooks import get_standalone_gate
 from ..tracking.standalone_usage import StandaloneUsageRefused, usage_scope
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
@@ -199,7 +200,11 @@ def _resolve_job_ingestion_models(
     """Resolve the job's embedding model under a fresh pin, for its gate.
 
     Run the ingestion under the pin and it embeds with the models returned.
+    With no gate registered nothing is resolved, the ids are empty and the
+    pin binds nothing.
     """
+    if get_standalone_gate() is None:
+        return ModelResolutionPin(enabled=False), ()
     pin = ModelResolutionPin()
     model_ids = pin.run(
         resolve_ingestion_model_ids,

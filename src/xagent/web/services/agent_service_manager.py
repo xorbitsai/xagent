@@ -23,6 +23,7 @@ from ...core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.structured_output import StructuredOutputFormat
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -4086,6 +4087,7 @@ class AgentServiceManager:
             asyncio.Task[TaskLeaseHeartbeatOutcome] | None
         ) = None,
         turn_usage_sink: Callable[[TurnUsage], None] | None = None,
+        structured_output_format: StructuredOutputFormat | None = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
@@ -4125,6 +4127,9 @@ class AgentServiceManager:
                 completion raises (a pool timeout), or when this method has
                 already seen lease ownership lost and only stops the tracker.
                 Its own failure is logged and never changes the run's result.
+            structured_output_format: The result shape to extract from the
+                final answer. It is handed to ``agent_service.execute_task``
+                only when it is not None.
 
         Returns:
             Execution result dictionary
@@ -4413,18 +4418,26 @@ class AgentServiceManager:
             # reused service observes the exact current run.
             execution_lease = lease or task_lease
 
+            format_kwargs: Dict[str, Any] = (
+                {}
+                if structured_output_format is None
+                else {"structured_output_format": structured_output_format}
+            )
+
             async def execute_agent_task() -> Dict[str, Any]:
                 if execution_lease is None:
                     return await agent_service.execute_task(
                         task=task,
                         context=context,
                         task_id=task_id,
+                        **format_kwargs,
                     )
                 with bind_task_lease_context(execution_lease):
                     return await agent_service.execute_task(
                         task=task,
                         context=context,
                         task_id=task_id,
+                        **format_kwargs,
                     )
 
             async def execute_owned_turn() -> Dict[str, Any]:

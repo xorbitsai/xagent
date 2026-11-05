@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -13,6 +14,8 @@ from xagent.core.agent.structured_output import StructuredOutputFormat
 from xagent.core.model.chat.exceptions import LLMRetryableError
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import structured_output_projection as projection
+from xagent.web.services.agent_service_manager import AgentServiceManager
+from xagent.web.services.task_lease_service import TaskLease
 
 STRING = {"type": "string"}
 
@@ -140,3 +143,75 @@ async def test_a_format_that_could_not_be_used_reads_back_as_a_failure(fmt) -> N
     )
     assert fields.structured_output_status == "failed"
     assert fields.structured_output_reason["code"] == expected
+
+
+class RecordingAgentService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute_task(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {"success": True}
+
+    def set_interrupt_checker(self, _checker: Any) -> None:
+        pass
+
+
+async def _run_manager(
+    service: RecordingAgentService, *, leased: bool, **extra: Any
+) -> None:
+    manager = AgentServiceManager()
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="attempt"
+    )
+    with (
+        patch.object(
+            manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=False,
+        ),
+    ):
+        await manager.execute_task(
+            agent_service=service,  # type: ignore[arg-type]
+            task="hello",
+            context={"k": "v"},
+            task_id="42",
+            manage_task_lease=False,
+            task_lease=lease if leased else None,
+            **extra,
+        )
+
+
+@pytest.mark.parametrize("leased", [True, False])
+async def test_the_manager_hands_the_format_to_the_agent_service(leased: bool) -> None:
+    service = RecordingAgentService()
+    fmt = StructuredOutputFormat("shape", None, SHAPE)
+
+    await _run_manager(service, leased=leased, structured_output_format=fmt)
+
+    (call,) = service.calls
+    assert call["structured_output_format"] is fmt
+    assert (call["task"], call["context"], call["task_id"]) == (
+        "hello",
+        {"k": "v"},
+        "42",
+    )
+
+
+@pytest.mark.parametrize("leased", [True, False])
+async def test_the_manager_passes_nothing_extra_without_a_format(leased: bool) -> None:
+    service = RecordingAgentService()
+
+    await _run_manager(service, leased=leased)
+    await _run_manager(service, leased=leased, structured_output_format=None)
+
+    for call in service.calls:
+        assert set(call) == {"task", "context", "task_id"}

@@ -56,3 +56,13 @@ def test_add_tool_error_usage_counts_on_the_current_context() -> None:
     assert get_token_usage() is usage
     assert usage.tool_errors == 3
     assert usage.tool_calls == 0
+
+
+def test_tool_errors_is_keyword_only() -> None:
+    details: list = []
+    usage = TokenUsage(10, 5, 2, 3, details)
+
+    assert usage.tool_calls == 3
+    assert usage.details is details
+    assert usage.tool_errors == 0
+    assert TokenUsage(tool_errors=4).tool_errors == 4

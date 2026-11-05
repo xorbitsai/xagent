@@ -47,7 +47,8 @@ MAX_EXPANDED_DEPTH = 32
 MAX_EXPANDED_BYTES = 65536
 MAX_EXPANDED_ENUM_VALUES = 5000
 ALLOWED_VALUES_MAX_CHARS = 500
-# The most instance positions one judgement visits.
+# The most positions one judgement may count: the instance positions it visits
+# plus the positions that expanding empty required objects adds to the result.
 MAX_JUDGED_STEPS = 200_000
 # The most bytes of canonical JSON a judged result may take.
 MAX_RESULT_BYTES = 2_097_152
@@ -944,16 +945,18 @@ class CompiledNode:
     stores an integral float as an int), and ``single_bytes`` its canonical
     JSON size.
 
-    The remaining fields describe the node when its value is empty and it is
-    not nullable and has no ``single``: ``missing_total`` counts the positions
-    that stay unfilled below it and ``missing_paths`` holds the first
-    ``MAX_LISTED_FIELDS`` of them relative to the node, in document order. A
-    node with nothing missing has a template: its node count, its canonical
-    JSON size and the entries that build it, ``(name, mode, value)`` where mode
-    0 is a null, mode 1 the only allowed value ``value`` and mode 2 the
-    template of node number ``value``. Templates refer to each other by node
-    number, so their storage grows with the number of nodes, not with the size
-    of the expansion.
+    The remaining fields describe what the node stands for when its value is
+    empty. A nullable node is one null (1 node, 4 bytes) and a node with a
+    ``single`` is that value (1 node, ``single_bytes``); neither has a
+    ``template``. Otherwise ``missing_total`` counts the positions that stay
+    unfilled below the node and ``missing_paths`` holds the first
+    ``MAX_LISTED_FIELDS`` of them relative to the node, in document order. An
+    object with nothing missing has a ``template``: its node count, its
+    canonical JSON size and the entries that build it, ``(name, mode, value)``
+    where mode 0 is a null, mode 1 the only allowed value ``value`` and mode 2
+    the template of node number ``value``. Templates refer to each other by
+    node number, so their storage grows with the number of nodes, not with the
+    size of the expansion.
     """
 
     kind: str
@@ -1006,8 +1009,7 @@ def _position_of(
     """The node a schema position stands for and the nullable union that made
     it nullable, if any: references and aliases are followed and a union is
     read as its value node."""
-    while "$ref" in node:
-        node = defs[node["$ref"][len(REF_PREFIX) :]]
+    node = resolve_alias(node, defs)
     if "anyOf" in node:
         branches = node["anyOf"]
         value = branches[1] if _is_null_branch(branches[0]) else branches[0]
@@ -1185,7 +1187,8 @@ def model_facing_schema(compiled: CompiledSchema) -> dict[str, Any]:
 class Ready:
     """A value that fills the caller's schema.
 
-    ``output`` is built from the value alone; its keys follow the order of the
+    ``output`` is built from the value, the schema's only allowed values and
+    the templates of empty required objects; its keys follow the order of the
     schema's properties. The counts hold what was seen on the way: the gaps
     (always 0 here), the blank strings read as null, the instance positions
     visited and the positions added by expanding empty required objects.
@@ -1523,7 +1526,9 @@ def judge_instance(
     are empty. What each empty position stands for, and whether the result is
     :class:`Ready`, :class:`Incomplete` or :class:`TooComplex`, follows from
     the compiled nodes. The instance must hold only finite numbers and no NUL
-    or lone surrogate; it is read, never changed.
+    or lone surrogate, and no integer too long for the interpreter to turn into
+    text (``str`` raises ``ValueError`` past 4300 digits); it is read, never
+    changed.
     """
     try:
         reduced, steps, blanks = _reduce(compiled.nodes, compiled.root, instance)

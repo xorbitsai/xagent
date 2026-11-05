@@ -1146,9 +1146,10 @@ async def test_resume_without_any_turn_id_is_counted_and_still_reported(
 async def test_scheduled_turn_cancelled_after_its_result_committed_is_reported(
     canonical,
 ) -> None:
-    """The result committed COMPLETED and released the lease; the run was
-    cancelled during its completion broadcast, so the scheduler's own
-    settlement is fenced out. The committed outcome is still reported."""
+    """The result committed COMPLETED, then the run was cancelled during its
+    completion broadcast. The scheduler's settlement carries that error for a
+    task already terminal, so it releases the lease but returns False. The
+    committed outcome is still reported."""
     received = _capture()
 
     async def cancelled_broadcast(_event: Any, _task_id: Any) -> None:
@@ -1190,9 +1191,9 @@ async def test_scheduled_turn_cancelled_after_its_result_committed_is_reported(
 async def test_channel_result_committed_but_unreported_is_reported_by_scheduler(
     canonical,
 ) -> None:
-    """The channel finalizer committed, but its own report failed inside the
-    entry (which only logs that failure) and the entry returned normally.
-    The scheduler's settlement returns True and reports the run once."""
+    """The channel finalizer committed and recorded its status, but its own
+    report failed inside the entry (which only logs that failure) and the
+    entry returned normally. The scheduler reports the run once."""
     received = _capture()
 
     async def channel_run(**kwargs: Any) -> None:
@@ -1211,12 +1212,6 @@ async def test_channel_result_committed_but_unreported_is_reported_by_scheduler(
         # before ``report_turn_settled`` and was only logged.
         kwargs["turn_facts"].finalized_status = "completed"
 
-    settle = orchestrator.settle_task_lease_isolated
-
-    def settle_as_coordinator(*args: Any, **kwargs: Any) -> bool:
-        settle(*args, **kwargs)
-        return True
-
     _lease, payload, _raised = await _schedule_turn(
         canonical,
         _result_manager({"success": True}),
@@ -1226,9 +1221,6 @@ async def test_channel_result_committed_but_unreported_is_reported_by_scheduler(
                 "xagent.web.services.shared_channel_execution."
                 "execute_channel_background",
                 new=channel_run,
-            ),
-            patch.object(
-                orchestrator, "settle_task_lease_isolated", new=settle_as_coordinator
             ),
         ),
     )
@@ -1366,3 +1358,87 @@ async def test_resume_restored_to_its_prior_status_reports_nothing(
 
     restore.assert_called_once()
     assert received == []
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_channel_report_failing_before_its_status_is_reported_nothing(
+    canonical,
+) -> None:
+    """In coordinator context the channel finalizer committed, but the
+    entry's report failed before recording any status and the entry returned
+    normally. The scheduler's settlement returns True; with no committed
+    status and no failure to report, nothing is reported rather than a
+    completed run reported as failed."""
+    received = _capture()
+
+    async def channel_run(**kwargs: Any) -> None:
+        from xagent.web.services.managed_task_lease import (
+            finalize_managed_task_lease_result_sync,
+        )
+
+        assert await asyncio.to_thread(
+            finalize_managed_task_lease_result_sync,
+            kwargs["lease"],
+            status=TaskStatus.COMPLETED,
+            assistant_content="ok",
+            turn_id="cmd",
+        )
+
+    settle = orchestrator.settle_task_lease_isolated
+
+    def settle_as_coordinator(*args: Any, **kwargs: Any) -> bool:
+        settle(*args, **kwargs)
+        return True
+
+    await _schedule_turn(
+        canonical,
+        _result_manager({"success": True}),
+        channel_command=SimpleNamespace(task_id=canonical[1], command_id="cmd"),
+        extra_patches=(
+            patch(
+                "xagent.web.services.shared_channel_execution."
+                "execute_channel_background",
+                new=channel_run,
+            ),
+            patch.object(
+                orchestrator, "settle_task_lease_isolated", new=settle_as_coordinator
+            ),
+        ),
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        assert db.get(Task, tid).status == TaskStatus.COMPLETED
+    assert received == []
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_committed_run_whose_settlement_is_deferred_is_reported(
+    canonical,
+) -> None:
+    """The result committed COMPLETED; the heartbeat then reports the lease
+    needs recovery, so the scheduler leaves the lease for lease recovery,
+    which only handles RUNNING rows. The committed status is reported."""
+    from xagent.web.services.task_lease_service import TaskLeaseHeartbeatOutcome
+
+    received = _capture()
+    settle = MagicMock()
+
+    _lease, payload, _raised = await _schedule_turn(
+        canonical,
+        _result_manager({"success": True, "output": "4"}),
+        extra_patches=(
+            patch.object(
+                orchestrator,
+                "stop_task_lease_heartbeat",
+                new=AsyncMock(return_value=TaskLeaseHeartbeatOutcome(lease_lost=True)),
+            ),
+            patch.object(orchestrator, "settle_task_lease_isolated", new=settle),
+        ),
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        assert db.get(Task, tid).status == TaskStatus.COMPLETED
+    settle.assert_not_called()
+    assert [(s.status, s.turn_id) for s in received] == [("completed", payload.turn_id)]

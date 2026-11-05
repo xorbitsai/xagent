@@ -3240,17 +3240,27 @@ def _schedule_bg(
                                 task_id,
                                 exc_info=True,
                             )
-            # Report the run once its outcome is settled: either this run
-            # committed its own result (even when the settlement here was
-            # then fenced out because that commit already released the
-            # lease), or the settlement here committed. Skipped when the turn
-            # body never ran and nothing failed (a pre-execution
-            # short-circuit), and for a run already reported through the
-            # shared facts bag -- a channel run's own finalizer reports it.
+            # Report the run once its outcome is settled. A run that committed
+            # its own result is reported with that status whatever the
+            # settlement here returned: a settlement carrying an error for a
+            # task already terminal releases the lease but returns False, and
+            # a settlement deferred to lease recovery leaves the committed
+            # terminal row alone. Otherwise the settlement here must have
+            # committed; a channel run is then only reported when it failed,
+            # because a channel run that returned normally was settled by its
+            # own finalizer, which reports it. Skipped when the turn body
+            # never ran and nothing failed (a pre-execution short-circuit),
+            # and for a run already reported through the shared facts bag.
             if (
                 lease is not None
                 and not facts.notified
-                and (facts.finalized_status is not None or lease_settled)
+                and (
+                    facts.finalized_status is not None
+                    or (
+                        lease_settled
+                        and (channel_command is None or settlement_error is not None)
+                    )
+                )
                 and (execution_started or settlement_error is not None)
             ):
                 try:

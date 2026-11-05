@@ -1004,6 +1004,7 @@ def test_an_unreferenced_entry_is_refused_before_any_expansion_is_measured(
         raise AssertionError("the expansion was measured")
 
     monkeypatch.setattr(structured_schema, "measure_expansion", fail)
+    monkeypatch.setattr(structured_schema, "compile_schema", fail)
     schema = _obj({"a": STRING}, **{"$defs": _doubling_defs(41)})
 
     assert _violation(schema) == ("S7", "/$defs/d0")

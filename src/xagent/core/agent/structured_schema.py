@@ -1,18 +1,23 @@
-"""Structural checks for the JSON Schema subset accepted for structured output.
+"""The JSON Schema subset accepted for structured output: checking, compiling
+and judging.
 
-:func:`check_schema_structure` is the single entry point. It runs the schema
-rules S1 to S13 in a fixed order and returns the first violation as a
-:class:`SchemaViolation` (a rule id and the path of the offending value), or
-``None`` when the schema is acceptable. It never raises for any JSON value and
-never echoes a value of the schema: callers render the path with
-:func:`render_error_path`.
+:func:`check_schema_structure` runs the schema rules S1 to S13 in a fixed
+order and returns the first violation as a :class:`SchemaViolation` (a rule id
+and the path of the offending value), or ``None`` when the schema is
+acceptable. It never raises for any JSON value and never echoes a value of the
+schema: callers render the path with :func:`render_error_path`.
+
+:func:`compile_schema` turns a schema that passed those rules into the nodes
+used for judging. Compiling, like every other function here, is pure: it
+neither mutates its arguments nor reads or writes anything outside them.
 
 Every judgement about a JSON value goes through :func:`json_kind` first. A
 bool is never a number, ``0`` is never ``False``, and a tuple or a dict
 subclass is never an array or an object. Name rules always use
 ``re.fullmatch`` so that a trailing newline cannot slip through. All walks use
-an explicit stack; only the serialization in S1 relies on the interpreter's
-recursion limit, and it turns a ``RecursionError`` into a violation.
+an explicit stack; only the serialization in S1 and in
+:func:`canonical_json_bytes` relies on the interpreter's recursion limit, and
+S1 turns a ``RecursionError`` into a violation.
 """
 
 from __future__ import annotations
@@ -37,6 +42,12 @@ MAX_EXPANDED_DEPTH = 32
 MAX_EXPANDED_BYTES = 65536
 MAX_EXPANDED_ENUM_VALUES = 5000
 ALLOWED_VALUES_MAX_CHARS = 500
+# The most instance positions one judgement visits.
+MAX_JUDGED_STEPS = 200_000
+# The most bytes of canonical JSON a judged result may take.
+MAX_RESULT_BYTES = 2_097_152
+# The most field paths a judgement lists for one reason.
+MAX_LISTED_FIELDS = 20
 
 # Rewritten schemas carry this marker as one more allowed value of a string
 # enum, so a caller's own enum value can never be the marker.
@@ -882,4 +893,210 @@ def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
     nodes, height, enums, size = measured[id(schema)]
     return ExpansionMetrics(
         nodes=nodes, depth=height, enum_values=enums, rewritten_bytes=size
+    )
+
+
+# --- compiling ------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledNode:
+    """One position of the caller's schema, ready for judging.
+
+    ``$ref`` is resolved (an alias chain to its end) and a nullable union is
+    folded into its value node, so the same target used directly and inside a
+    union gives two nodes that share their children. ``types`` is the node's
+    ``type`` as written, as a list. ``enum_keys`` holds the canonical keys of
+    the non-null enum values. ``single`` is the only allowed value of a node
+    that is not nullable and lists exactly one non-null value (an integer node
+    stores an integral float as an int), and ``single_bytes`` its canonical
+    JSON size.
+
+    The remaining fields describe the node when its value is empty and it is
+    not nullable and has no ``single``: ``missing_total`` counts the positions
+    that stay unfilled below it and ``missing_paths`` holds the first
+    ``MAX_LISTED_FIELDS`` of them relative to the node, in document order. A
+    node with nothing missing has a template: its node count, its canonical
+    JSON size and the entries that build it, ``(name, mode, value)`` where mode
+    0 is a null, mode 1 the only allowed value ``value`` and mode 2 the
+    template of node number ``value``. Templates refer to each other by node
+    number, so their storage grows with the number of nodes, not with the size
+    of the expansion.
+    """
+
+    kind: str
+    types: list[str]
+    nullable: bool
+    enum_keys: frozenset[tuple[Any, ...]] | None
+    single: Any
+    single_bytes: int
+    properties: tuple[tuple[str, int, int], ...]
+    items: int | None
+    missing_total: int
+    missing_paths: tuple[str, ...]
+    template_nodes: int
+    template_bytes: int
+    template: tuple[tuple[str, int, Any], ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledSchema:
+    """A schema that passed the structural checks, compiled for judging.
+
+    ``schema`` is the caller's schema itself, kept for the copy shown to the
+    model; ``nodes`` lists every compiled node with the children of a node
+    before the node, and ``root`` is the number of the root node.
+    """
+
+    schema: dict[str, Any]
+    nodes: tuple[CompiledNode, ...]
+    root: int
+
+
+def canonical_json_bytes(value: Any) -> int:
+    """The size in bytes of the canonical JSON text of ``value``.
+
+    The text is compact, keeps the key order, writes non-ASCII characters as
+    they are and is encoded as UTF-8. It raises ``ValueError`` for a NaN or an
+    infinity; the value must also hold no NUL and no lone surrogate.
+    """
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return len(text.encode("utf-8"))
+
+
+def _pointer_segment(name: str) -> str:
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+def _position_of(
+    node: dict[str, Any], defs: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """The node a schema position stands for and whether a union made it
+    nullable: references and aliases are followed and a nullable union is read
+    as its value node."""
+    while "$ref" in node:
+        node = defs[node["$ref"][len(REF_PREFIX) :]]
+    if "anyOf" in node:
+        branches = node["anyOf"]
+        value = branches[1] if _is_null_branch(branches[0]) else branches[0]
+        return resolve_alias(value, defs), True
+    return node, False
+
+
+def _canonical_value_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _compile_node(
+    target: dict[str, Any], from_union: bool, kids: list[int], nodes: list[CompiledNode]
+) -> CompiledNode:
+    declared = target["type"]
+    types = list(declared) if type(declared) is list else [declared]
+    kind = next(t for t in types if t != "null")
+    nullable = from_union or "null" in types
+
+    enum_keys = None
+    single = None
+    single_bytes = 0
+    enum = normalized_enum(target)
+    if enum is not None:
+        values = [v for v in enum if v is not None]
+        enum_keys = frozenset(canon(v) for v in values)
+        if not nullable and len(values) == 1:
+            single = values[0]
+            if kind == "integer" and type(single) is float:
+                single = int(single)
+            single_bytes = _canonical_value_bytes(single)
+
+    declared_properties = target.get("properties")
+    names = list(declared_properties) if type(declared_properties) is dict else []
+    properties = tuple((name, len(name) + 2, kids[i]) for i, name in enumerate(names))
+    items = kids[len(names)] if "items" in target else None
+
+    missing_total = 0
+    missing_paths: tuple[str, ...] = ()
+    template_nodes = 0
+    template_bytes = 0
+    template = None
+    if nullable:
+        template_nodes, template_bytes = 1, 4
+    elif kind == "object":
+        paths: list[str] = []
+        for name, _, index in properties:
+            child = nodes[index]
+            missing_total += child.missing_total
+            for relative in child.missing_paths:
+                if len(paths) < MAX_LISTED_FIELDS:
+                    paths.append("/" + _pointer_segment(name) + relative)
+        missing_paths = tuple(paths)
+        if missing_total == 0:
+            entries: list[tuple[str, int, Any]] = []
+            template_nodes = 1
+            template_bytes = 2 + max(len(properties) - 1, 0)
+            for name, key_bytes, index in properties:
+                child = nodes[index]
+                template_nodes += child.template_nodes
+                template_bytes += key_bytes + 1 + child.template_bytes
+                if child.nullable:
+                    entries.append((name, 0, None))
+                elif child.kind == "object":
+                    entries.append((name, 2, index))
+                else:
+                    entries.append((name, 1, child.single))
+            template = tuple(entries)
+    elif single is not None:
+        template_nodes, template_bytes = 1, single_bytes
+    else:
+        missing_total, missing_paths = 1, ("",)
+
+    return CompiledNode(
+        kind=kind,
+        types=types,
+        nullable=nullable,
+        enum_keys=enum_keys,
+        single=single,
+        single_bytes=single_bytes,
+        properties=properties,
+        items=items,
+        missing_total=missing_total,
+        missing_paths=missing_paths,
+        template_nodes=template_nodes,
+        template_bytes=template_bytes,
+        template=template,
+    )
+
+
+def compile_schema(schema: dict[str, Any]) -> CompiledSchema:
+    """Compile a schema that passed :func:`check_schema_structure`.
+
+    Every position the root reaches becomes one node, built bottom-up so that
+    a node is built once however often it is referenced. The schema is read,
+    never changed.
+    """
+    defs = _defs_of(schema)
+
+    def kids_of(target: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
+        return [_position_of(child, defs) for child in _children_of(target)]
+
+    nodes: list[CompiledNode] = []
+    index_of: dict[tuple[int, bool], int] = {}
+    root_target, root_union = _position_of(schema, defs)
+    stack: list[list[Any]] = [[root_target, root_union, kids_of(root_target), 0]]
+    while stack:
+        frame = stack[-1]
+        target, from_union, kids, position = frame
+        if position < len(kids):
+            frame[3] = position + 1
+            kid_target, kid_union = kids[position]
+            if (id(kid_target), kid_union) not in index_of:
+                stack.append([kid_target, kid_union, kids_of(kid_target), 0])
+            continue
+        stack.pop()
+        indexes = [index_of[(id(t), u)] for t, u in kids]
+        index_of[(id(target), from_union)] = len(nodes)
+        nodes.append(_compile_node(target, from_union, indexes, nodes))
+    return CompiledSchema(
+        schema=schema,
+        nodes=tuple(nodes),
+        root=index_of[(id(root_target), root_union)],
     )

@@ -1340,10 +1340,12 @@ class TestMemoryApiUsage:
         mock_memory_store.get.return_value = MemoryResponse(
             success=True, content=sample_memory_notes[0]
         )
+        # The deployment's memory authority, under its billing id.
+        mock_memory_store.embedding_usage_model_id = "platform/text-embedding-v4"
         gate_calls: list = []
 
-        def gate(user_id, source):
-            gate_calls.append((user_id, source))
+        def gate(user_id, source, model_ids):
+            gate_calls.append((user_id, source, model_ids))
             return "Out of AI credits"
 
         quota_hooks.set_standalone_gate_hook(gate)
@@ -1357,8 +1359,37 @@ class TestMemoryApiUsage:
 
         assert response.status_code == 402
         assert response.json()["detail"]["code"] == "standalone_usage_refused"
-        assert gate_calls == [(test_db.id, "memory_api")]
+        assert gate_calls == [
+            (test_db.id, "memory_api", ("platform/text-embedding-v4",))
+        ]
         mock_memory_store.search.assert_not_called()
         mock_memory_store.add.assert_not_called()
         mock_memory_store.update.assert_not_called()
         assert hook == []
+
+
+@pytest.mark.parametrize(
+    "billing_model_id,expected",
+    [("platform/text-embedding-v4", "platform/text-embedding-v4"), ("", "")],
+)
+def test_a_lancedb_store_reports_the_id_its_embeddings_are_billed_under(
+    billing_model_id, expected
+):
+    from xagent.core.memory.lancedb import LanceDBMemoryStore
+    from xagent.core.model.embedding.adapter import create_embedding_adapter
+    from xagent.core.model.model import EmbeddingModelConfig
+
+    store = LanceDBMemoryStore.__new__(LanceDBMemoryStore)
+    store._embedding_model = create_embedding_adapter(
+        EmbeddingModelConfig(
+            id="memory-authority",
+            billing_model_id=billing_model_id,
+            model_name="text-embedding-v4",
+            model_provider="openai",
+            api_key="test-key",
+        )
+    )
+    assert store.embedding_usage_model_id == expected
+
+    store._embedding_model = None
+    assert store.embedding_usage_model_id == ""

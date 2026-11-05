@@ -209,7 +209,7 @@ async def test_a_thread_scope_delivers_after_its_await_timed_out(hook):
     quota_hooks.set_standalone_usage_hook(finish)
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(
-            asyncio.to_thread(run_in_usage_scope, 4, "model_probe", slow_call),
+            asyncio.to_thread(run_in_usage_scope, 4, "model_probe", (), slow_call),
             timeout=0.05,
         )
     assert hook.calls == []
@@ -227,7 +227,7 @@ def test_run_in_usage_scope_passes_every_argument_through(hook):
         return path, user_id
 
     # The work's own user_id (the storage tenant) is not the scope's.
-    assert run_in_usage_scope(5, "kb_ingest_cloud", ingest, "a.txt", user_id=9) == (
+    assert run_in_usage_scope(5, "kb_ingest_cloud", (), ingest, "a.txt", user_id=9) == (
         "a.txt",
         9,
     )

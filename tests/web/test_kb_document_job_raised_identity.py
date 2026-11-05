@@ -616,13 +616,18 @@ def test_web_job_refused_by_the_gate_fails_without_a_retry():
     )
     gate_calls: list = []
 
-    def gate(user_id: int, source: str) -> str:
-        gate_calls.append((user_id, source))
+    def gate(user_id: int, source: str, model_ids: tuple[str, ...]) -> str:
+        gate_calls.append((user_id, source, model_ids))
         return "Out of AI credits"
 
     quota_hooks.set_standalone_gate_hook(gate)
     try:
         with (
+            patch.object(
+                kb_tasks,
+                "resolve_ingestion_model_ids",
+                return_value=("platform/text-embedding-v4",),
+            ) as resolve,
             patch.object(kb_tasks, "update_job_progress"),
             patch.object(
                 kb_tasks, "_cleanup_failed_web_collection_metadata_if_new"
@@ -634,8 +639,66 @@ def test_web_job_refused_by_the_gate_fails_without_a_retry():
     finally:
         quota_hooks.set_standalone_gate_hook(None)
 
-    assert gate_calls == [(101, "kb_ingest_web_job")]
+    # Resolved for the storage tenant, as the crawl resolves; gated for the
+    # submitter, who is billed.
+    assert resolve.call_args.kwargs["user_id"] == 999
+    assert gate_calls == [(101, "kb_ingest_web_job", ("platform/text-embedding-v4",))]
     assert str(failed.value) == "Out of AI credits"
     assert failed.value.retryable is False
     crawl.assert_not_called()
     cleanup.assert_called_once()
+
+
+def _active_pin() -> Any:
+    from xagent.core.tools.core.RAG_tools.utils import model_resolution_pin
+
+    return model_resolution_pin._active_pin.get()
+
+
+def test_jobs_ingest_under_the_resolution_they_were_gated_on(test_env, temp_uploads):
+    from xagent.web.jobs import kb_tasks
+
+    pins: list = []
+
+    def resolve(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+        pins.append(_active_pin())
+        return ()
+
+    def ingest(**_kwargs: Any) -> Any:
+        pins.append(_active_pin())
+        raise RuntimeError("stop")
+
+    async def crawl(**_kwargs: Any) -> Any:
+        pins.append(_active_pin())
+        raise RuntimeError("stop")
+
+    web_job = BackgroundJob(
+        user_id=101,
+        payload={
+            "user_id": 999,
+            "collection": "web_coll",
+            "crawl_config": {"start_url": "https://example.com"},
+            "ingestion_config": {},
+        },
+    )
+    db = test_env[3]()
+    try:
+        job_id = _submit(test_env, b"pinned")
+        job = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).one()
+        with (
+            patch.object(kb_tasks, "resolve_ingestion_model_ids", side_effect=resolve),
+            patch(_INGEST, side_effect=ingest),
+            patch.object(kb_tasks, "run_web_ingestion", side_effect=crawl),
+            patch.object(kb_tasks, "update_job_progress"),
+            patch.object(kb_tasks, "_cleanup_failed_web_collection_metadata_if_new"),
+        ):
+            with pytest.raises(Exception):  # noqa: B017
+                handle_kb_ingest_document(db, job)
+            with pytest.raises(RuntimeError):
+                kb_tasks.handle_kb_ingest_web(MagicMock(), web_job)
+    finally:
+        db.close()
+
+    document_pins, web_pins = pins[:2], pins[2:]
+    assert document_pins[0] is not None and document_pins[0] is document_pins[1]
+    assert web_pins[0] is not None and web_pins[0] is web_pins[1]

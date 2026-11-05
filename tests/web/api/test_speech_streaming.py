@@ -1255,3 +1255,32 @@ def test_capability_endpoint_rejects_invalid_model_configuration(
     assert response.status_code == 400
     assert "synthetic-provider-secret" not in response.text + caplog.text
     assert "Speech stream failed" in caplog.text
+
+
+def test_the_gate_is_told_which_speech_model_each_request_calls(api):
+    calls = []
+
+    def gate(user_id, source, model_ids):
+        calls.append((user_id, source, model_ids))
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    try:
+        response = api.client.post(
+            TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hi"}
+        )
+        assert response.status_code == 200
+        with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+            ws.send_json({"type": "start", "model_id": "live"})
+            assert ws.receive_json()["type"] == "session_started"
+            ws.send_json({"type": "close"})
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+
+    # TTS is checked by the endpoint and again by the scope it streams in.
+    assert calls == [
+        (1, "speech_synthesize", ("voice",)),
+        (1, "speech_synthesize", ("voice",)),
+        (1, "speech_transcribe", ("live",)),
+    ]

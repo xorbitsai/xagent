@@ -90,7 +90,15 @@ from ...core.tools.core.RAG_tools.kb.models import (
     RollbackFailedUploadIngestionRequest,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
+from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
+    resolve_ingestion_model_ids,
+)
+from ...core.tools.core.RAG_tools.pipelines.document_search import (
+    resolve_search_model_ids,
+)
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
+from ...core.tools.core.RAG_tools.utils.config_utils import IngestionConfigInput
+from ...core.tools.core.RAG_tools.utils.model_resolution_pin import ModelResolutionPin
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from ...core.tools.core.RAG_tools.storage.factory import (
@@ -3323,6 +3331,29 @@ def _enforce_storage_gate(db: Session, user: Any) -> None:
         raise HTTPException(status_code=402, detail=reason)
 
 
+async def _resolve_kb_ingestion_models(
+    collection: str,
+    ingestion_config: IngestionConfigInput,
+    user: Any,
+) -> tuple[ModelResolutionPin, tuple[str, ...]]:
+    """Resolve the embedding model an ingestion will use, for its usage gate.
+
+    Returns a fresh pin holding the resolution and the model ids to gate on.
+    Run the ingestion under the pin and it embeds with exactly those models.
+    ``user`` is the collection's storage tenant, whom the pipeline resolves for.
+    """
+    pin = ModelResolutionPin()
+    model_ids = await asyncio.to_thread(
+        pin.run,
+        resolve_ingestion_model_ids,
+        collection,
+        ingestion_config=ingestion_config,
+        user_id=int(user.id),
+        is_admin=bool(user.is_admin),
+    )
+    return pin, model_ids
+
+
 @kb_router.post(
     "/ingest",
     response_model=IngestionResult,
@@ -3453,7 +3484,10 @@ async def ingest(
     _enforce_storage_gate(db, actor_user)
     # Before the upload is written: the scope around the ingestion checks
     # too, but refusing there means rolling the upload back.
-    await check_standalone_gate_async(int(actor_user.id), "kb_ingest")
+    model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
+        safe_collection, {"embedding_model_id": embedding_model_id}, _user
+    )
+    await check_standalone_gate_async(int(actor_user.id), "kb_ingest", ingest_model_ids)
 
     existing_file_record = (
         db.query(UploadedFile)
@@ -3600,6 +3634,8 @@ async def ingest(
             run_in_usage_scope,
             int(actor_user.id),
             "kb_ingest",
+            ingest_model_ids,
+            model_pin.run,
             _run_ingestion,
         )
         result = api_result.result
@@ -3800,8 +3836,14 @@ async def create_ingest_job(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
     await _ensure_background_job_queue_available_async()
-    # Before the upload is staged; the job checks again when it runs.
-    await check_standalone_gate_async(int(actor_user.id), "kb_ingest_job")
+    # Before the upload is staged; the job resolves and checks again when it
+    # runs.
+    _, ingest_model_ids = await _resolve_kb_ingestion_models(
+        safe_collection, {"embedding_model_id": embedding_model_id}, _user
+    )
+    await check_standalone_gate_async(
+        int(actor_user.id), "kb_ingest_job", ingest_model_ids
+    )
 
     try:
         get_collection_sync(safe_collection)
@@ -3971,7 +4013,6 @@ async def ingest_cloud(
 ) -> Union[List[IngestionResult], JSONResponse]:
     """Ingest files from cloud storage."""
     _enforce_storage_gate(db, _user)
-    await check_standalone_gate_async(int(_user.id), "kb_ingest_cloud")
 
     try:
         safe_collection = sanitize_path_component(request.collection, "collection")
@@ -4009,6 +4050,14 @@ async def ingest_cloud(
         embedding_batch_size=request.embedding_batch_size or 10,
         max_retries=request.max_retries or 3,
         retry_delay=request.retry_delay or 1.0,
+    )
+    # Before the collection can be created; every file is ingested under this
+    # resolution and checked again as it starts.
+    model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
+        safe_collection, config, _user
+    )
+    await check_standalone_gate_async(
+        int(actor_user.id), "kb_ingest_cloud", ingest_model_ids
     )
 
     progress_manager = get_progress_manager()
@@ -4323,10 +4372,14 @@ async def ingest_cloud(
                         )
                         # Billed to the requesting member. The scope lives in
                         # the worker, so a cancelled request still delivers it.
-                        api_result = await asyncio.to_thread(
+                        api_result: KBApiOperationResult[
+                            IngestionResult
+                        ] = await asyncio.to_thread(
                             run_in_usage_scope,
                             actor_user_id,
                             "kb_ingest_cloud",
+                            ingest_model_ids,
+                            model_pin.run,
                             run_document_ingestion_with_outcome,
                             collection=safe_collection,
                             source_path=str(file_path),
@@ -5000,8 +5053,21 @@ async def search(
     )
 
     progress_manager = get_progress_manager()
-    async with usage_scope(actor_user_id, usage_source="kb_search"):
-        result = run_document_search(
+    # Resolved once: the search runs under the pin, so it calls the models
+    # the gate was told about.
+    model_pin = ModelResolutionPin()
+    search_model_ids = model_pin.run(
+        resolve_search_model_ids,
+        safe_collection,
+        config=config,
+        user_id=int(_user.id),
+        is_admin=bool(_user.is_admin),
+    )
+    async with usage_scope(
+        actor_user_id, usage_source="kb_search", model_ids=search_model_ids
+    ):
+        result = model_pin.run(
+            run_document_search,
             collection=safe_collection,
             query_text=query_text,
             config=config,
@@ -5428,13 +5494,19 @@ async def ingest_web(
             finally:
                 db_session.close()
 
+        model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
+            safe_collection, ingestion_config, _user
+        )
         # The scope lives in the worker, so a cancelled request still
-        # delivers it; asyncio.run carries it into the crawl's tasks.
+        # delivers it; asyncio.run carries it and the pin into the crawl's
+        # tasks.
         api_result = await asyncio.get_running_loop().run_in_executor(
             None,
             run_in_usage_scope,
             int(actor_user.id),
             "kb_ingest_web",
+            ingest_model_ids,
+            model_pin.run,
             lambda: asyncio.run(
                 run_web_ingestion_with_outcome(
                     collection=safe_collection,
@@ -5612,8 +5684,13 @@ async def create_ingest_web_job(
             detail = detail.removeprefix("Value error, ")
         raise HTTPException(status_code=422, detail=detail) from exc
     await _ensure_background_job_queue_available_async()
-    # Before the job is queued; the job checks again when it runs.
-    await check_standalone_gate_async(int(actor_user.id), "kb_ingest_web_job")
+    # Before the job is queued; the job resolves and checks again when it runs.
+    _, ingest_model_ids = await _resolve_kb_ingestion_models(
+        safe_collection, {"embedding_model_id": embedding_model_id}, _user
+    )
+    await check_standalone_gate_async(
+        int(actor_user.id), "kb_ingest_web_job", ingest_model_ids
+    )
 
     try:
         get_collection_sync(safe_collection)

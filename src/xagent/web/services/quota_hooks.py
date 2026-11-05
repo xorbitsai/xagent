@@ -10,7 +10,8 @@ Follows the same setter/getter idiom as set_user_tool_overrides_hook etc.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import inspect
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Protocol
 
 
@@ -86,11 +87,13 @@ _trigger_record_hook: Callable[[Any], None] | None = None
 _standalone_usage_hook: (
     Callable[[int | None, list[dict[str, Any]], str], None] | None
 ) = None
-# (user_id, source) -> reason if non-run work may not spend for this user now,
-# else None. See ``set_standalone_gate_hook``.
-_standalone_gate_hook: Callable[[int, str], str | Mapping[str, Any] | None] | None = (
-    None
-)
+# (user_id, source, model_ids) -> reason if non-run work may not spend for this
+# user now, else None. See ``set_standalone_gate_hook``.
+StandaloneGateReason = str | Mapping[str, Any] | None
+StandaloneGate = Callable[[int, str, Sequence[str]], StandaloneGateReason]
+_standalone_gate_hook: Callable[..., StandaloneGateReason] | None = None
+# (hook, the hook called with three arguments) for the hook last adapted.
+_standalone_gate_adapter: tuple[Callable[..., Any], StandaloneGate] | None = None
 
 
 def set_run_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None:
@@ -160,16 +163,36 @@ def get_standalone_usage_hook() -> (
 
 
 def set_standalone_gate_hook(
-    hook: Callable[[int, str], str | Mapping[str, Any] | None] | None,
+    hook: Callable[..., StandaloneGateReason] | None,
 ) -> None:
     """Register the gate checked before usage is incurred outside an agent run.
 
-    Called as ``hook(user_id, source)`` when a
-    :func:`xagent.web.tracking.standalone_usage.usage_scope` opens, before the
-    work inside it reaches a provider, and by the entry points that would
-    otherwise refuse only after writing state (KB ingest, TTS streaming).
-    ``user_id`` and ``source`` mean what they mean for
+    Called as ``hook(user_id, source, model_ids)`` before the work reaches a
+    provider: when a
+    :func:`xagent.web.tracking.standalone_usage.usage_scope` opens, and by the
+    entry points that would otherwise refuse only after writing state (KB
+    ingest, TTS streaming). ``user_id`` and ``source`` mean what they mean for
     :func:`set_standalone_usage_hook`.
+
+    ``model_ids`` is a tuple of the ``models.model_id`` of each configured
+    model the work will call, resolved the way the work resolves it: the
+    same id its usage rows carry, so a host that prices by model id can tell
+    billed work from work on a team's own key. A knowledge-base request lists
+    the embedding model the collection is bound to (not the id or bare name
+    in the request; none for a sparse search) and, for a search, the rerank
+    model; the work then runs on exactly that resolution. A job is checked
+    when it is queued and again when it runs, each against the resolution of
+    that moment.
+
+    An empty ``model_ids`` means the work calls no configured model: the
+    model comes from ``DASHSCOPE_*`` environment variables, or is the memory
+    authority with no billing id set. Such usage is recorded with no
+    ``model_id`` and has never been priced, so a host gating priced models
+    should allow it.
+
+    A hook registered with the earlier two-argument signature,
+    ``hook(user_id, source)``, keeps being called that way; which one applies
+    is decided here, at registration.
 
     Return ``None`` to allow the work, or a reason to refuse it: a message
     ``str`` or a structured mapping (e.g. ``{"code", "metric", "message"}``)
@@ -187,13 +210,59 @@ def set_standalone_gate_hook(
     feature down with it.
     """
     global _standalone_gate_hook
+    if hook is not None:
+        _adapt_standalone_gate(hook)  # rejects any other signature, here
     _standalone_gate_hook = hook
 
 
-def get_standalone_gate_hook() -> (
-    Callable[[int, str], str | Mapping[str, Any] | None] | None
-):
+def _as_three_argument_gate(
+    hook: Callable[..., StandaloneGateReason],
+) -> StandaloneGate:
+    try:
+        signature = inspect.signature(hook)
+    except (TypeError, ValueError):
+        # Not introspectable: hold it to the current contract.
+        return hook
+    try:
+        signature.bind(0, "", ())
+    except TypeError:
+        pass
+    else:
+        return hook
+    try:
+        signature.bind(0, "")
+    except TypeError:
+        raise TypeError(
+            "A standalone gate hook takes (user_id, source, model_ids) "
+            "or (user_id, source)"
+        ) from None
+
+    def two_argument_gate(
+        user_id: int, source: str, model_ids: Sequence[str]
+    ) -> StandaloneGateReason:
+        return hook(user_id, source)
+
+    return two_argument_gate
+
+
+def get_standalone_gate_hook() -> Callable[..., StandaloneGateReason] | None:
+    """The hook as registered; see :func:`get_standalone_gate` to call it."""
     return _standalone_gate_hook
+
+
+def get_standalone_gate() -> StandaloneGate | None:
+    """The registered gate, callable as ``gate(user_id, source, model_ids)``."""
+    hook = _standalone_gate_hook
+    return None if hook is None else _adapt_standalone_gate(hook)
+
+
+def _adapt_standalone_gate(hook: Callable[..., StandaloneGateReason]) -> StandaloneGate:
+    global _standalone_gate_adapter
+    adapter = _standalone_gate_adapter
+    if adapter is None or adapter[0] is not hook:
+        adapter = (hook, _as_three_argument_gate(hook))
+        _standalone_gate_adapter = adapter
+    return adapter[1]
 
 
 def check_run_gate(db: Any, user_id: Any) -> str | Mapping[str, Any] | None:

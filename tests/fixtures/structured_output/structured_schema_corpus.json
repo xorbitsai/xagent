@@ -426,6 +426,902 @@
      }
     }
    }
+  },
+  {
+   "id": "enum-of-500-defined-once-referenced-by-10-properties",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p0": {
+        "$ref": "#/$defs/E"
+       },
+       "p1": {
+        "$ref": "#/$defs/E"
+       },
+       "p2": {
+        "$ref": "#/$defs/E"
+       },
+       "p3": {
+        "$ref": "#/$defs/E"
+       },
+       "p4": {
+        "$ref": "#/$defs/E"
+       },
+       "p5": {
+        "$ref": "#/$defs/E"
+       },
+       "p6": {
+        "$ref": "#/$defs/E"
+       },
+       "p7": {
+        "$ref": "#/$defs/E"
+       },
+       "p8": {
+        "$ref": "#/$defs/E"
+       },
+       "p9": {
+        "$ref": "#/$defs/E"
+       }
+      },
+      "required": [
+       "p0",
+       "p1",
+       "p2",
+       "p3",
+       "p4",
+       "p5",
+       "p6",
+       "p7",
+       "p8",
+       "p9"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "E": {
+        "type": "string",
+        "enum": [
+         "v0",
+         "v1",
+         "v2",
+         "v3",
+         "v4",
+         "v5",
+         "v6",
+         "v7",
+         "v8",
+         "v9",
+         "v10",
+         "v11",
+         "v12",
+         "v13",
+         "v14",
+         "v15",
+         "v16",
+         "v17",
+         "v18",
+         "v19",
+         "v20",
+         "v21",
+         "v22",
+         "v23",
+         "v24",
+         "v25",
+         "v26",
+         "v27",
+         "v28",
+         "v29",
+         "v30",
+         "v31",
+         "v32",
+         "v33",
+         "v34",
+         "v35",
+         "v36",
+         "v37",
+         "v38",
+         "v39",
+         "v40",
+         "v41",
+         "v42",
+         "v43",
+         "v44",
+         "v45",
+         "v46",
+         "v47",
+         "v48",
+         "v49",
+         "v50",
+         "v51",
+         "v52",
+         "v53",
+         "v54",
+         "v55",
+         "v56",
+         "v57",
+         "v58",
+         "v59",
+         "v60",
+         "v61",
+         "v62",
+         "v63",
+         "v64",
+         "v65",
+         "v66",
+         "v67",
+         "v68",
+         "v69",
+         "v70",
+         "v71",
+         "v72",
+         "v73",
+         "v74",
+         "v75",
+         "v76",
+         "v77",
+         "v78",
+         "v79",
+         "v80",
+         "v81",
+         "v82",
+         "v83",
+         "v84",
+         "v85",
+         "v86",
+         "v87",
+         "v88",
+         "v89",
+         "v90",
+         "v91",
+         "v92",
+         "v93",
+         "v94",
+         "v95",
+         "v96",
+         "v97",
+         "v98",
+         "v99",
+         "v100",
+         "v101",
+         "v102",
+         "v103",
+         "v104",
+         "v105",
+         "v106",
+         "v107",
+         "v108",
+         "v109",
+         "v110",
+         "v111",
+         "v112",
+         "v113",
+         "v114",
+         "v115",
+         "v116",
+         "v117",
+         "v118",
+         "v119",
+         "v120",
+         "v121",
+         "v122",
+         "v123",
+         "v124",
+         "v125",
+         "v126",
+         "v127",
+         "v128",
+         "v129",
+         "v130",
+         "v131",
+         "v132",
+         "v133",
+         "v134",
+         "v135",
+         "v136",
+         "v137",
+         "v138",
+         "v139",
+         "v140",
+         "v141",
+         "v142",
+         "v143",
+         "v144",
+         "v145",
+         "v146",
+         "v147",
+         "v148",
+         "v149",
+         "v150",
+         "v151",
+         "v152",
+         "v153",
+         "v154",
+         "v155",
+         "v156",
+         "v157",
+         "v158",
+         "v159",
+         "v160",
+         "v161",
+         "v162",
+         "v163",
+         "v164",
+         "v165",
+         "v166",
+         "v167",
+         "v168",
+         "v169",
+         "v170",
+         "v171",
+         "v172",
+         "v173",
+         "v174",
+         "v175",
+         "v176",
+         "v177",
+         "v178",
+         "v179",
+         "v180",
+         "v181",
+         "v182",
+         "v183",
+         "v184",
+         "v185",
+         "v186",
+         "v187",
+         "v188",
+         "v189",
+         "v190",
+         "v191",
+         "v192",
+         "v193",
+         "v194",
+         "v195",
+         "v196",
+         "v197",
+         "v198",
+         "v199",
+         "v200",
+         "v201",
+         "v202",
+         "v203",
+         "v204",
+         "v205",
+         "v206",
+         "v207",
+         "v208",
+         "v209",
+         "v210",
+         "v211",
+         "v212",
+         "v213",
+         "v214",
+         "v215",
+         "v216",
+         "v217",
+         "v218",
+         "v219",
+         "v220",
+         "v221",
+         "v222",
+         "v223",
+         "v224",
+         "v225",
+         "v226",
+         "v227",
+         "v228",
+         "v229",
+         "v230",
+         "v231",
+         "v232",
+         "v233",
+         "v234",
+         "v235",
+         "v236",
+         "v237",
+         "v238",
+         "v239",
+         "v240",
+         "v241",
+         "v242",
+         "v243",
+         "v244",
+         "v245",
+         "v246",
+         "v247",
+         "v248",
+         "v249",
+         "v250",
+         "v251",
+         "v252",
+         "v253",
+         "v254",
+         "v255",
+         "v256",
+         "v257",
+         "v258",
+         "v259",
+         "v260",
+         "v261",
+         "v262",
+         "v263",
+         "v264",
+         "v265",
+         "v266",
+         "v267",
+         "v268",
+         "v269",
+         "v270",
+         "v271",
+         "v272",
+         "v273",
+         "v274",
+         "v275",
+         "v276",
+         "v277",
+         "v278",
+         "v279",
+         "v280",
+         "v281",
+         "v282",
+         "v283",
+         "v284",
+         "v285",
+         "v286",
+         "v287",
+         "v288",
+         "v289",
+         "v290",
+         "v291",
+         "v292",
+         "v293",
+         "v294",
+         "v295",
+         "v296",
+         "v297",
+         "v298",
+         "v299",
+         "v300",
+         "v301",
+         "v302",
+         "v303",
+         "v304",
+         "v305",
+         "v306",
+         "v307",
+         "v308",
+         "v309",
+         "v310",
+         "v311",
+         "v312",
+         "v313",
+         "v314",
+         "v315",
+         "v316",
+         "v317",
+         "v318",
+         "v319",
+         "v320",
+         "v321",
+         "v322",
+         "v323",
+         "v324",
+         "v325",
+         "v326",
+         "v327",
+         "v328",
+         "v329",
+         "v330",
+         "v331",
+         "v332",
+         "v333",
+         "v334",
+         "v335",
+         "v336",
+         "v337",
+         "v338",
+         "v339",
+         "v340",
+         "v341",
+         "v342",
+         "v343",
+         "v344",
+         "v345",
+         "v346",
+         "v347",
+         "v348",
+         "v349",
+         "v350",
+         "v351",
+         "v352",
+         "v353",
+         "v354",
+         "v355",
+         "v356",
+         "v357",
+         "v358",
+         "v359",
+         "v360",
+         "v361",
+         "v362",
+         "v363",
+         "v364",
+         "v365",
+         "v366",
+         "v367",
+         "v368",
+         "v369",
+         "v370",
+         "v371",
+         "v372",
+         "v373",
+         "v374",
+         "v375",
+         "v376",
+         "v377",
+         "v378",
+         "v379",
+         "v380",
+         "v381",
+         "v382",
+         "v383",
+         "v384",
+         "v385",
+         "v386",
+         "v387",
+         "v388",
+         "v389",
+         "v390",
+         "v391",
+         "v392",
+         "v393",
+         "v394",
+         "v395",
+         "v396",
+         "v397",
+         "v398",
+         "v399",
+         "v400",
+         "v401",
+         "v402",
+         "v403",
+         "v404",
+         "v405",
+         "v406",
+         "v407",
+         "v408",
+         "v409",
+         "v410",
+         "v411",
+         "v412",
+         "v413",
+         "v414",
+         "v415",
+         "v416",
+         "v417",
+         "v418",
+         "v419",
+         "v420",
+         "v421",
+         "v422",
+         "v423",
+         "v424",
+         "v425",
+         "v426",
+         "v427",
+         "v428",
+         "v429",
+         "v430",
+         "v431",
+         "v432",
+         "v433",
+         "v434",
+         "v435",
+         "v436",
+         "v437",
+         "v438",
+         "v439",
+         "v440",
+         "v441",
+         "v442",
+         "v443",
+         "v444",
+         "v445",
+         "v446",
+         "v447",
+         "v448",
+         "v449",
+         "v450",
+         "v451",
+         "v452",
+         "v453",
+         "v454",
+         "v455",
+         "v456",
+         "v457",
+         "v458",
+         "v459",
+         "v460",
+         "v461",
+         "v462",
+         "v463",
+         "v464",
+         "v465",
+         "v466",
+         "v467",
+         "v468",
+         "v469",
+         "v470",
+         "v471",
+         "v472",
+         "v473",
+         "v474",
+         "v475",
+         "v476",
+         "v477",
+         "v478",
+         "v479",
+         "v480",
+         "v481",
+         "v482",
+         "v483",
+         "v484",
+         "v485",
+         "v486",
+         "v487",
+         "v488",
+         "v489",
+         "v490",
+         "v491",
+         "v492",
+         "v493",
+         "v494",
+         "v495",
+         "v496",
+         "v497",
+         "v498",
+         "v499"
+        ]
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "alias-chain-expanding-to-depth-32",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/A1"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A1": {
+        "$ref": "#/$defs/A2"
+       },
+       "A2": {
+        "$ref": "#/$defs/A3"
+       },
+       "A3": {
+        "$ref": "#/$defs/A4"
+       },
+       "A4": {
+        "$ref": "#/$defs/A5"
+       },
+       "A5": {
+        "$ref": "#/$defs/A6"
+       },
+       "A6": {
+        "$ref": "#/$defs/A7"
+       },
+       "A7": {
+        "$ref": "#/$defs/A8"
+       },
+       "A8": {
+        "$ref": "#/$defs/A9"
+       },
+       "A9": {
+        "$ref": "#/$defs/A10"
+       },
+       "A10": {
+        "$ref": "#/$defs/A11"
+       },
+       "A11": {
+        "$ref": "#/$defs/A12"
+       },
+       "A12": {
+        "$ref": "#/$defs/A13"
+       },
+       "A13": {
+        "$ref": "#/$defs/A14"
+       },
+       "A14": {
+        "$ref": "#/$defs/A15"
+       },
+       "A15": {
+        "$ref": "#/$defs/A16"
+       },
+       "A16": {
+        "$ref": "#/$defs/A17"
+       },
+       "A17": {
+        "$ref": "#/$defs/A18"
+       },
+       "A18": {
+        "$ref": "#/$defs/A19"
+       },
+       "A19": {
+        "$ref": "#/$defs/A20"
+       },
+       "A20": {
+        "$ref": "#/$defs/A21"
+       },
+       "A21": {
+        "$ref": "#/$defs/A22"
+       },
+       "A22": {
+        "$ref": "#/$defs/A23"
+       },
+       "A23": {
+        "$ref": "#/$defs/A24"
+       },
+       "A24": {
+        "$ref": "#/$defs/A25"
+       },
+       "A25": {
+        "$ref": "#/$defs/A26"
+       },
+       "A26": {
+        "$ref": "#/$defs/A27"
+       },
+       "A27": {
+        "$ref": "#/$defs/A28"
+       },
+       "A28": {
+        "$ref": "#/$defs/A29"
+       },
+       "A29": {
+        "$ref": "#/$defs/A30"
+       },
+       "A30": {
+        "$ref": "#/$defs/A31"
+       },
+       "A31": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "nullable-value-is-a-short-alias-chain",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "anyOf": [
+         {
+          "$ref": "#/$defs/A1"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A1": {
+        "$ref": "#/$defs/A2"
+       },
+       "A2": {
+        "$ref": "#/$defs/A3"
+       },
+       "A3": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "expansion-of-exactly-2000-nodes",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "h0": {
+        "$ref": "#/$defs/H"
+       },
+       "h1": {
+        "$ref": "#/$defs/H"
+       },
+       "h2": {
+        "$ref": "#/$defs/H"
+       },
+       "h3": {
+        "$ref": "#/$defs/H"
+       },
+       "h4": {
+        "$ref": "#/$defs/H"
+       },
+       "h5": {
+        "$ref": "#/$defs/H"
+       },
+       "g0": {
+        "$ref": "#/$defs/G"
+       },
+       "g1": {
+        "$ref": "#/$defs/G"
+       },
+       "g2": {
+        "$ref": "#/$defs/G"
+       },
+       "g3": {
+        "$ref": "#/$defs/G"
+       },
+       "n0": {
+        "$ref": "#/$defs/N"
+       },
+       "n1": {
+        "$ref": "#/$defs/N"
+       },
+       "n2": {
+        "$ref": "#/$defs/N"
+       }
+      },
+      "required": [
+       "h0",
+       "h1",
+       "h2",
+       "h3",
+       "h4",
+       "h5",
+       "g0",
+       "g1",
+       "g2",
+       "g3",
+       "n0",
+       "n1",
+       "n2"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "N": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "G": {
+        "type": "object",
+        "properties": {
+         "a0": {
+          "$ref": "#/$defs/N"
+         },
+         "a1": {
+          "$ref": "#/$defs/N"
+         },
+         "a2": {
+          "$ref": "#/$defs/N"
+         },
+         "a3": {
+          "$ref": "#/$defs/N"
+         },
+         "a4": {
+          "$ref": "#/$defs/N"
+         },
+         "a5": {
+          "$ref": "#/$defs/N"
+         },
+         "a6": {
+          "$ref": "#/$defs/N"
+         },
+         "a7": {
+          "$ref": "#/$defs/N"
+         },
+         "a8": {
+          "$ref": "#/$defs/N"
+         },
+         "a9": {
+          "$ref": "#/$defs/N"
+         }
+        },
+        "required": [
+         "a0",
+         "a1",
+         "a2",
+         "a3",
+         "a4",
+         "a5",
+         "a6",
+         "a7",
+         "a8",
+         "a9"
+        ],
+        "additionalProperties": false
+       },
+       "H": {
+        "type": "object",
+        "properties": {
+         "a0": {
+          "$ref": "#/$defs/G"
+         },
+         "a1": {
+          "$ref": "#/$defs/G"
+         },
+         "a2": {
+          "$ref": "#/$defs/G"
+         },
+         "a3": {
+          "$ref": "#/$defs/G"
+         },
+         "a4": {
+          "$ref": "#/$defs/G"
+         },
+         "a5": {
+          "$ref": "#/$defs/G"
+         },
+         "a6": {
+          "$ref": "#/$defs/G"
+         },
+         "a7": {
+          "$ref": "#/$defs/G"
+         },
+         "a8": {
+          "$ref": "#/$defs/G"
+         },
+         "a9": {
+          "$ref": "#/$defs/G"
+         }
+        },
+        "required": [
+         "a0",
+         "a1",
+         "a2",
+         "a3",
+         "a4",
+         "a5",
+         "a6",
+         "a7",
+         "a8",
+         "a9"
+        ],
+        "additionalProperties": false
+       }
+      }
+     }
+    }
+   }
   }
  ],
  "reject": [
@@ -5946,6 +6842,4145 @@
        "b"
       ],
       "additionalProperties": false
+     }
+    }
+   }
+  },
+  {
+   "id": "s12b-enum-values-5500-after-expansion",
+   "rule": "S12b",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p0": {
+        "$ref": "#/$defs/E"
+       },
+       "p1": {
+        "$ref": "#/$defs/E"
+       },
+       "p2": {
+        "$ref": "#/$defs/E"
+       },
+       "p3": {
+        "$ref": "#/$defs/E"
+       },
+       "p4": {
+        "$ref": "#/$defs/E"
+       },
+       "p5": {
+        "$ref": "#/$defs/E"
+       },
+       "p6": {
+        "$ref": "#/$defs/E"
+       },
+       "p7": {
+        "$ref": "#/$defs/E"
+       },
+       "p8": {
+        "$ref": "#/$defs/E"
+       },
+       "p9": {
+        "$ref": "#/$defs/E"
+       },
+       "p10": {
+        "$ref": "#/$defs/E"
+       }
+      },
+      "required": [
+       "p0",
+       "p1",
+       "p2",
+       "p3",
+       "p4",
+       "p5",
+       "p6",
+       "p7",
+       "p8",
+       "p9",
+       "p10"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "E": {
+        "type": "string",
+        "enum": [
+         "v0",
+         "v1",
+         "v2",
+         "v3",
+         "v4",
+         "v5",
+         "v6",
+         "v7",
+         "v8",
+         "v9",
+         "v10",
+         "v11",
+         "v12",
+         "v13",
+         "v14",
+         "v15",
+         "v16",
+         "v17",
+         "v18",
+         "v19",
+         "v20",
+         "v21",
+         "v22",
+         "v23",
+         "v24",
+         "v25",
+         "v26",
+         "v27",
+         "v28",
+         "v29",
+         "v30",
+         "v31",
+         "v32",
+         "v33",
+         "v34",
+         "v35",
+         "v36",
+         "v37",
+         "v38",
+         "v39",
+         "v40",
+         "v41",
+         "v42",
+         "v43",
+         "v44",
+         "v45",
+         "v46",
+         "v47",
+         "v48",
+         "v49",
+         "v50",
+         "v51",
+         "v52",
+         "v53",
+         "v54",
+         "v55",
+         "v56",
+         "v57",
+         "v58",
+         "v59",
+         "v60",
+         "v61",
+         "v62",
+         "v63",
+         "v64",
+         "v65",
+         "v66",
+         "v67",
+         "v68",
+         "v69",
+         "v70",
+         "v71",
+         "v72",
+         "v73",
+         "v74",
+         "v75",
+         "v76",
+         "v77",
+         "v78",
+         "v79",
+         "v80",
+         "v81",
+         "v82",
+         "v83",
+         "v84",
+         "v85",
+         "v86",
+         "v87",
+         "v88",
+         "v89",
+         "v90",
+         "v91",
+         "v92",
+         "v93",
+         "v94",
+         "v95",
+         "v96",
+         "v97",
+         "v98",
+         "v99",
+         "v100",
+         "v101",
+         "v102",
+         "v103",
+         "v104",
+         "v105",
+         "v106",
+         "v107",
+         "v108",
+         "v109",
+         "v110",
+         "v111",
+         "v112",
+         "v113",
+         "v114",
+         "v115",
+         "v116",
+         "v117",
+         "v118",
+         "v119",
+         "v120",
+         "v121",
+         "v122",
+         "v123",
+         "v124",
+         "v125",
+         "v126",
+         "v127",
+         "v128",
+         "v129",
+         "v130",
+         "v131",
+         "v132",
+         "v133",
+         "v134",
+         "v135",
+         "v136",
+         "v137",
+         "v138",
+         "v139",
+         "v140",
+         "v141",
+         "v142",
+         "v143",
+         "v144",
+         "v145",
+         "v146",
+         "v147",
+         "v148",
+         "v149",
+         "v150",
+         "v151",
+         "v152",
+         "v153",
+         "v154",
+         "v155",
+         "v156",
+         "v157",
+         "v158",
+         "v159",
+         "v160",
+         "v161",
+         "v162",
+         "v163",
+         "v164",
+         "v165",
+         "v166",
+         "v167",
+         "v168",
+         "v169",
+         "v170",
+         "v171",
+         "v172",
+         "v173",
+         "v174",
+         "v175",
+         "v176",
+         "v177",
+         "v178",
+         "v179",
+         "v180",
+         "v181",
+         "v182",
+         "v183",
+         "v184",
+         "v185",
+         "v186",
+         "v187",
+         "v188",
+         "v189",
+         "v190",
+         "v191",
+         "v192",
+         "v193",
+         "v194",
+         "v195",
+         "v196",
+         "v197",
+         "v198",
+         "v199",
+         "v200",
+         "v201",
+         "v202",
+         "v203",
+         "v204",
+         "v205",
+         "v206",
+         "v207",
+         "v208",
+         "v209",
+         "v210",
+         "v211",
+         "v212",
+         "v213",
+         "v214",
+         "v215",
+         "v216",
+         "v217",
+         "v218",
+         "v219",
+         "v220",
+         "v221",
+         "v222",
+         "v223",
+         "v224",
+         "v225",
+         "v226",
+         "v227",
+         "v228",
+         "v229",
+         "v230",
+         "v231",
+         "v232",
+         "v233",
+         "v234",
+         "v235",
+         "v236",
+         "v237",
+         "v238",
+         "v239",
+         "v240",
+         "v241",
+         "v242",
+         "v243",
+         "v244",
+         "v245",
+         "v246",
+         "v247",
+         "v248",
+         "v249",
+         "v250",
+         "v251",
+         "v252",
+         "v253",
+         "v254",
+         "v255",
+         "v256",
+         "v257",
+         "v258",
+         "v259",
+         "v260",
+         "v261",
+         "v262",
+         "v263",
+         "v264",
+         "v265",
+         "v266",
+         "v267",
+         "v268",
+         "v269",
+         "v270",
+         "v271",
+         "v272",
+         "v273",
+         "v274",
+         "v275",
+         "v276",
+         "v277",
+         "v278",
+         "v279",
+         "v280",
+         "v281",
+         "v282",
+         "v283",
+         "v284",
+         "v285",
+         "v286",
+         "v287",
+         "v288",
+         "v289",
+         "v290",
+         "v291",
+         "v292",
+         "v293",
+         "v294",
+         "v295",
+         "v296",
+         "v297",
+         "v298",
+         "v299",
+         "v300",
+         "v301",
+         "v302",
+         "v303",
+         "v304",
+         "v305",
+         "v306",
+         "v307",
+         "v308",
+         "v309",
+         "v310",
+         "v311",
+         "v312",
+         "v313",
+         "v314",
+         "v315",
+         "v316",
+         "v317",
+         "v318",
+         "v319",
+         "v320",
+         "v321",
+         "v322",
+         "v323",
+         "v324",
+         "v325",
+         "v326",
+         "v327",
+         "v328",
+         "v329",
+         "v330",
+         "v331",
+         "v332",
+         "v333",
+         "v334",
+         "v335",
+         "v336",
+         "v337",
+         "v338",
+         "v339",
+         "v340",
+         "v341",
+         "v342",
+         "v343",
+         "v344",
+         "v345",
+         "v346",
+         "v347",
+         "v348",
+         "v349",
+         "v350",
+         "v351",
+         "v352",
+         "v353",
+         "v354",
+         "v355",
+         "v356",
+         "v357",
+         "v358",
+         "v359",
+         "v360",
+         "v361",
+         "v362",
+         "v363",
+         "v364",
+         "v365",
+         "v366",
+         "v367",
+         "v368",
+         "v369",
+         "v370",
+         "v371",
+         "v372",
+         "v373",
+         "v374",
+         "v375",
+         "v376",
+         "v377",
+         "v378",
+         "v379",
+         "v380",
+         "v381",
+         "v382",
+         "v383",
+         "v384",
+         "v385",
+         "v386",
+         "v387",
+         "v388",
+         "v389",
+         "v390",
+         "v391",
+         "v392",
+         "v393",
+         "v394",
+         "v395",
+         "v396",
+         "v397",
+         "v398",
+         "v399",
+         "v400",
+         "v401",
+         "v402",
+         "v403",
+         "v404",
+         "v405",
+         "v406",
+         "v407",
+         "v408",
+         "v409",
+         "v410",
+         "v411",
+         "v412",
+         "v413",
+         "v414",
+         "v415",
+         "v416",
+         "v417",
+         "v418",
+         "v419",
+         "v420",
+         "v421",
+         "v422",
+         "v423",
+         "v424",
+         "v425",
+         "v426",
+         "v427",
+         "v428",
+         "v429",
+         "v430",
+         "v431",
+         "v432",
+         "v433",
+         "v434",
+         "v435",
+         "v436",
+         "v437",
+         "v438",
+         "v439",
+         "v440",
+         "v441",
+         "v442",
+         "v443",
+         "v444",
+         "v445",
+         "v446",
+         "v447",
+         "v448",
+         "v449",
+         "v450",
+         "v451",
+         "v452",
+         "v453",
+         "v454",
+         "v455",
+         "v456",
+         "v457",
+         "v458",
+         "v459",
+         "v460",
+         "v461",
+         "v462",
+         "v463",
+         "v464",
+         "v465",
+         "v466",
+         "v467",
+         "v468",
+         "v469",
+         "v470",
+         "v471",
+         "v472",
+         "v473",
+         "v474",
+         "v475",
+         "v476",
+         "v477",
+         "v478",
+         "v479",
+         "v480",
+         "v481",
+         "v482",
+         "v483",
+         "v484",
+         "v485",
+         "v486",
+         "v487",
+         "v488",
+         "v489",
+         "v490",
+         "v491",
+         "v492",
+         "v493",
+         "v494",
+         "v495",
+         "v496",
+         "v497",
+         "v498",
+         "v499"
+        ]
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s11-doubling-chain-of-100-entries",
+   "rule": "S11",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/d0"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "d0": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d1"
+         },
+         "y": {
+          "$ref": "#/$defs/d1"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d1": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d2"
+         },
+         "y": {
+          "$ref": "#/$defs/d2"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d2": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d3"
+         },
+         "y": {
+          "$ref": "#/$defs/d3"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d3": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d4"
+         },
+         "y": {
+          "$ref": "#/$defs/d4"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d4": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d5"
+         },
+         "y": {
+          "$ref": "#/$defs/d5"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d5": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d6"
+         },
+         "y": {
+          "$ref": "#/$defs/d6"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d6": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d7"
+         },
+         "y": {
+          "$ref": "#/$defs/d7"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d7": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d8"
+         },
+         "y": {
+          "$ref": "#/$defs/d8"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d8": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d9"
+         },
+         "y": {
+          "$ref": "#/$defs/d9"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d9": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d10"
+         },
+         "y": {
+          "$ref": "#/$defs/d10"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d10": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d11"
+         },
+         "y": {
+          "$ref": "#/$defs/d11"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d11": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d12"
+         },
+         "y": {
+          "$ref": "#/$defs/d12"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d12": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d13"
+         },
+         "y": {
+          "$ref": "#/$defs/d13"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d13": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d14"
+         },
+         "y": {
+          "$ref": "#/$defs/d14"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d14": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d15"
+         },
+         "y": {
+          "$ref": "#/$defs/d15"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d15": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d16"
+         },
+         "y": {
+          "$ref": "#/$defs/d16"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d16": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d17"
+         },
+         "y": {
+          "$ref": "#/$defs/d17"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d17": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d18"
+         },
+         "y": {
+          "$ref": "#/$defs/d18"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d18": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d19"
+         },
+         "y": {
+          "$ref": "#/$defs/d19"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d19": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d20"
+         },
+         "y": {
+          "$ref": "#/$defs/d20"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d20": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d21"
+         },
+         "y": {
+          "$ref": "#/$defs/d21"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d21": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d22"
+         },
+         "y": {
+          "$ref": "#/$defs/d22"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d22": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d23"
+         },
+         "y": {
+          "$ref": "#/$defs/d23"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d23": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d24"
+         },
+         "y": {
+          "$ref": "#/$defs/d24"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d24": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d25"
+         },
+         "y": {
+          "$ref": "#/$defs/d25"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d25": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d26"
+         },
+         "y": {
+          "$ref": "#/$defs/d26"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d26": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d27"
+         },
+         "y": {
+          "$ref": "#/$defs/d27"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d27": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d28"
+         },
+         "y": {
+          "$ref": "#/$defs/d28"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d28": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d29"
+         },
+         "y": {
+          "$ref": "#/$defs/d29"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d29": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d30"
+         },
+         "y": {
+          "$ref": "#/$defs/d30"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d30": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d31"
+         },
+         "y": {
+          "$ref": "#/$defs/d31"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d31": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d32"
+         },
+         "y": {
+          "$ref": "#/$defs/d32"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d32": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d33"
+         },
+         "y": {
+          "$ref": "#/$defs/d33"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d33": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d34"
+         },
+         "y": {
+          "$ref": "#/$defs/d34"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d34": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d35"
+         },
+         "y": {
+          "$ref": "#/$defs/d35"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d35": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d36"
+         },
+         "y": {
+          "$ref": "#/$defs/d36"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d36": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d37"
+         },
+         "y": {
+          "$ref": "#/$defs/d37"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d37": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d38"
+         },
+         "y": {
+          "$ref": "#/$defs/d38"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d38": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d39"
+         },
+         "y": {
+          "$ref": "#/$defs/d39"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d39": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d40"
+         },
+         "y": {
+          "$ref": "#/$defs/d40"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d40": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d41"
+         },
+         "y": {
+          "$ref": "#/$defs/d41"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d41": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d42"
+         },
+         "y": {
+          "$ref": "#/$defs/d42"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d42": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d43"
+         },
+         "y": {
+          "$ref": "#/$defs/d43"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d43": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d44"
+         },
+         "y": {
+          "$ref": "#/$defs/d44"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d44": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d45"
+         },
+         "y": {
+          "$ref": "#/$defs/d45"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d45": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d46"
+         },
+         "y": {
+          "$ref": "#/$defs/d46"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d46": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d47"
+         },
+         "y": {
+          "$ref": "#/$defs/d47"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d47": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d48"
+         },
+         "y": {
+          "$ref": "#/$defs/d48"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d48": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d49"
+         },
+         "y": {
+          "$ref": "#/$defs/d49"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d49": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d50"
+         },
+         "y": {
+          "$ref": "#/$defs/d50"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d50": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d51"
+         },
+         "y": {
+          "$ref": "#/$defs/d51"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d51": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d52"
+         },
+         "y": {
+          "$ref": "#/$defs/d52"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d52": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d53"
+         },
+         "y": {
+          "$ref": "#/$defs/d53"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d53": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d54"
+         },
+         "y": {
+          "$ref": "#/$defs/d54"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d54": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d55"
+         },
+         "y": {
+          "$ref": "#/$defs/d55"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d55": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d56"
+         },
+         "y": {
+          "$ref": "#/$defs/d56"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d56": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d57"
+         },
+         "y": {
+          "$ref": "#/$defs/d57"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d57": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d58"
+         },
+         "y": {
+          "$ref": "#/$defs/d58"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d58": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d59"
+         },
+         "y": {
+          "$ref": "#/$defs/d59"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d59": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d60"
+         },
+         "y": {
+          "$ref": "#/$defs/d60"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d60": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d61"
+         },
+         "y": {
+          "$ref": "#/$defs/d61"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d61": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d62"
+         },
+         "y": {
+          "$ref": "#/$defs/d62"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d62": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d63"
+         },
+         "y": {
+          "$ref": "#/$defs/d63"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d63": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d64"
+         },
+         "y": {
+          "$ref": "#/$defs/d64"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d64": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d65"
+         },
+         "y": {
+          "$ref": "#/$defs/d65"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d65": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d66"
+         },
+         "y": {
+          "$ref": "#/$defs/d66"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d66": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d67"
+         },
+         "y": {
+          "$ref": "#/$defs/d67"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d67": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d68"
+         },
+         "y": {
+          "$ref": "#/$defs/d68"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d68": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d69"
+         },
+         "y": {
+          "$ref": "#/$defs/d69"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d69": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d70"
+         },
+         "y": {
+          "$ref": "#/$defs/d70"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d70": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d71"
+         },
+         "y": {
+          "$ref": "#/$defs/d71"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d71": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d72"
+         },
+         "y": {
+          "$ref": "#/$defs/d72"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d72": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d73"
+         },
+         "y": {
+          "$ref": "#/$defs/d73"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d73": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d74"
+         },
+         "y": {
+          "$ref": "#/$defs/d74"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d74": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d75"
+         },
+         "y": {
+          "$ref": "#/$defs/d75"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d75": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d76"
+         },
+         "y": {
+          "$ref": "#/$defs/d76"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d76": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d77"
+         },
+         "y": {
+          "$ref": "#/$defs/d77"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d77": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d78"
+         },
+         "y": {
+          "$ref": "#/$defs/d78"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d78": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d79"
+         },
+         "y": {
+          "$ref": "#/$defs/d79"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d79": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d80"
+         },
+         "y": {
+          "$ref": "#/$defs/d80"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d80": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d81"
+         },
+         "y": {
+          "$ref": "#/$defs/d81"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d81": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d82"
+         },
+         "y": {
+          "$ref": "#/$defs/d82"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d82": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d83"
+         },
+         "y": {
+          "$ref": "#/$defs/d83"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d83": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d84"
+         },
+         "y": {
+          "$ref": "#/$defs/d84"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d84": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d85"
+         },
+         "y": {
+          "$ref": "#/$defs/d85"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d85": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d86"
+         },
+         "y": {
+          "$ref": "#/$defs/d86"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d86": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d87"
+         },
+         "y": {
+          "$ref": "#/$defs/d87"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d87": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d88"
+         },
+         "y": {
+          "$ref": "#/$defs/d88"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d88": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d89"
+         },
+         "y": {
+          "$ref": "#/$defs/d89"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d89": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d90"
+         },
+         "y": {
+          "$ref": "#/$defs/d90"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d90": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d91"
+         },
+         "y": {
+          "$ref": "#/$defs/d91"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d91": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d92"
+         },
+         "y": {
+          "$ref": "#/$defs/d92"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d92": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d93"
+         },
+         "y": {
+          "$ref": "#/$defs/d93"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d93": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d94"
+         },
+         "y": {
+          "$ref": "#/$defs/d94"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d94": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d95"
+         },
+         "y": {
+          "$ref": "#/$defs/d95"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d95": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d96"
+         },
+         "y": {
+          "$ref": "#/$defs/d96"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d96": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d97"
+         },
+         "y": {
+          "$ref": "#/$defs/d97"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d97": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d98"
+         },
+         "y": {
+          "$ref": "#/$defs/d98"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d98": {
+        "type": "object",
+        "properties": {
+         "x": {
+          "$ref": "#/$defs/d99"
+         },
+         "y": {
+          "$ref": "#/$defs/d99"
+         }
+        },
+        "required": [
+         "x",
+         "y"
+        ],
+        "additionalProperties": false
+       },
+       "d99": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s11-alias-chain-of-500-entries",
+   "rule": "S11",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/a0"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "a0": {
+        "$ref": "#/$defs/a1"
+       },
+       "a1": {
+        "$ref": "#/$defs/a2"
+       },
+       "a2": {
+        "$ref": "#/$defs/a3"
+       },
+       "a3": {
+        "$ref": "#/$defs/a4"
+       },
+       "a4": {
+        "$ref": "#/$defs/a5"
+       },
+       "a5": {
+        "$ref": "#/$defs/a6"
+       },
+       "a6": {
+        "$ref": "#/$defs/a7"
+       },
+       "a7": {
+        "$ref": "#/$defs/a8"
+       },
+       "a8": {
+        "$ref": "#/$defs/a9"
+       },
+       "a9": {
+        "$ref": "#/$defs/a10"
+       },
+       "a10": {
+        "$ref": "#/$defs/a11"
+       },
+       "a11": {
+        "$ref": "#/$defs/a12"
+       },
+       "a12": {
+        "$ref": "#/$defs/a13"
+       },
+       "a13": {
+        "$ref": "#/$defs/a14"
+       },
+       "a14": {
+        "$ref": "#/$defs/a15"
+       },
+       "a15": {
+        "$ref": "#/$defs/a16"
+       },
+       "a16": {
+        "$ref": "#/$defs/a17"
+       },
+       "a17": {
+        "$ref": "#/$defs/a18"
+       },
+       "a18": {
+        "$ref": "#/$defs/a19"
+       },
+       "a19": {
+        "$ref": "#/$defs/a20"
+       },
+       "a20": {
+        "$ref": "#/$defs/a21"
+       },
+       "a21": {
+        "$ref": "#/$defs/a22"
+       },
+       "a22": {
+        "$ref": "#/$defs/a23"
+       },
+       "a23": {
+        "$ref": "#/$defs/a24"
+       },
+       "a24": {
+        "$ref": "#/$defs/a25"
+       },
+       "a25": {
+        "$ref": "#/$defs/a26"
+       },
+       "a26": {
+        "$ref": "#/$defs/a27"
+       },
+       "a27": {
+        "$ref": "#/$defs/a28"
+       },
+       "a28": {
+        "$ref": "#/$defs/a29"
+       },
+       "a29": {
+        "$ref": "#/$defs/a30"
+       },
+       "a30": {
+        "$ref": "#/$defs/a31"
+       },
+       "a31": {
+        "$ref": "#/$defs/a32"
+       },
+       "a32": {
+        "$ref": "#/$defs/a33"
+       },
+       "a33": {
+        "$ref": "#/$defs/a34"
+       },
+       "a34": {
+        "$ref": "#/$defs/a35"
+       },
+       "a35": {
+        "$ref": "#/$defs/a36"
+       },
+       "a36": {
+        "$ref": "#/$defs/a37"
+       },
+       "a37": {
+        "$ref": "#/$defs/a38"
+       },
+       "a38": {
+        "$ref": "#/$defs/a39"
+       },
+       "a39": {
+        "$ref": "#/$defs/a40"
+       },
+       "a40": {
+        "$ref": "#/$defs/a41"
+       },
+       "a41": {
+        "$ref": "#/$defs/a42"
+       },
+       "a42": {
+        "$ref": "#/$defs/a43"
+       },
+       "a43": {
+        "$ref": "#/$defs/a44"
+       },
+       "a44": {
+        "$ref": "#/$defs/a45"
+       },
+       "a45": {
+        "$ref": "#/$defs/a46"
+       },
+       "a46": {
+        "$ref": "#/$defs/a47"
+       },
+       "a47": {
+        "$ref": "#/$defs/a48"
+       },
+       "a48": {
+        "$ref": "#/$defs/a49"
+       },
+       "a49": {
+        "$ref": "#/$defs/a50"
+       },
+       "a50": {
+        "$ref": "#/$defs/a51"
+       },
+       "a51": {
+        "$ref": "#/$defs/a52"
+       },
+       "a52": {
+        "$ref": "#/$defs/a53"
+       },
+       "a53": {
+        "$ref": "#/$defs/a54"
+       },
+       "a54": {
+        "$ref": "#/$defs/a55"
+       },
+       "a55": {
+        "$ref": "#/$defs/a56"
+       },
+       "a56": {
+        "$ref": "#/$defs/a57"
+       },
+       "a57": {
+        "$ref": "#/$defs/a58"
+       },
+       "a58": {
+        "$ref": "#/$defs/a59"
+       },
+       "a59": {
+        "$ref": "#/$defs/a60"
+       },
+       "a60": {
+        "$ref": "#/$defs/a61"
+       },
+       "a61": {
+        "$ref": "#/$defs/a62"
+       },
+       "a62": {
+        "$ref": "#/$defs/a63"
+       },
+       "a63": {
+        "$ref": "#/$defs/a64"
+       },
+       "a64": {
+        "$ref": "#/$defs/a65"
+       },
+       "a65": {
+        "$ref": "#/$defs/a66"
+       },
+       "a66": {
+        "$ref": "#/$defs/a67"
+       },
+       "a67": {
+        "$ref": "#/$defs/a68"
+       },
+       "a68": {
+        "$ref": "#/$defs/a69"
+       },
+       "a69": {
+        "$ref": "#/$defs/a70"
+       },
+       "a70": {
+        "$ref": "#/$defs/a71"
+       },
+       "a71": {
+        "$ref": "#/$defs/a72"
+       },
+       "a72": {
+        "$ref": "#/$defs/a73"
+       },
+       "a73": {
+        "$ref": "#/$defs/a74"
+       },
+       "a74": {
+        "$ref": "#/$defs/a75"
+       },
+       "a75": {
+        "$ref": "#/$defs/a76"
+       },
+       "a76": {
+        "$ref": "#/$defs/a77"
+       },
+       "a77": {
+        "$ref": "#/$defs/a78"
+       },
+       "a78": {
+        "$ref": "#/$defs/a79"
+       },
+       "a79": {
+        "$ref": "#/$defs/a80"
+       },
+       "a80": {
+        "$ref": "#/$defs/a81"
+       },
+       "a81": {
+        "$ref": "#/$defs/a82"
+       },
+       "a82": {
+        "$ref": "#/$defs/a83"
+       },
+       "a83": {
+        "$ref": "#/$defs/a84"
+       },
+       "a84": {
+        "$ref": "#/$defs/a85"
+       },
+       "a85": {
+        "$ref": "#/$defs/a86"
+       },
+       "a86": {
+        "$ref": "#/$defs/a87"
+       },
+       "a87": {
+        "$ref": "#/$defs/a88"
+       },
+       "a88": {
+        "$ref": "#/$defs/a89"
+       },
+       "a89": {
+        "$ref": "#/$defs/a90"
+       },
+       "a90": {
+        "$ref": "#/$defs/a91"
+       },
+       "a91": {
+        "$ref": "#/$defs/a92"
+       },
+       "a92": {
+        "$ref": "#/$defs/a93"
+       },
+       "a93": {
+        "$ref": "#/$defs/a94"
+       },
+       "a94": {
+        "$ref": "#/$defs/a95"
+       },
+       "a95": {
+        "$ref": "#/$defs/a96"
+       },
+       "a96": {
+        "$ref": "#/$defs/a97"
+       },
+       "a97": {
+        "$ref": "#/$defs/a98"
+       },
+       "a98": {
+        "$ref": "#/$defs/a99"
+       },
+       "a99": {
+        "$ref": "#/$defs/a100"
+       },
+       "a100": {
+        "$ref": "#/$defs/a101"
+       },
+       "a101": {
+        "$ref": "#/$defs/a102"
+       },
+       "a102": {
+        "$ref": "#/$defs/a103"
+       },
+       "a103": {
+        "$ref": "#/$defs/a104"
+       },
+       "a104": {
+        "$ref": "#/$defs/a105"
+       },
+       "a105": {
+        "$ref": "#/$defs/a106"
+       },
+       "a106": {
+        "$ref": "#/$defs/a107"
+       },
+       "a107": {
+        "$ref": "#/$defs/a108"
+       },
+       "a108": {
+        "$ref": "#/$defs/a109"
+       },
+       "a109": {
+        "$ref": "#/$defs/a110"
+       },
+       "a110": {
+        "$ref": "#/$defs/a111"
+       },
+       "a111": {
+        "$ref": "#/$defs/a112"
+       },
+       "a112": {
+        "$ref": "#/$defs/a113"
+       },
+       "a113": {
+        "$ref": "#/$defs/a114"
+       },
+       "a114": {
+        "$ref": "#/$defs/a115"
+       },
+       "a115": {
+        "$ref": "#/$defs/a116"
+       },
+       "a116": {
+        "$ref": "#/$defs/a117"
+       },
+       "a117": {
+        "$ref": "#/$defs/a118"
+       },
+       "a118": {
+        "$ref": "#/$defs/a119"
+       },
+       "a119": {
+        "$ref": "#/$defs/a120"
+       },
+       "a120": {
+        "$ref": "#/$defs/a121"
+       },
+       "a121": {
+        "$ref": "#/$defs/a122"
+       },
+       "a122": {
+        "$ref": "#/$defs/a123"
+       },
+       "a123": {
+        "$ref": "#/$defs/a124"
+       },
+       "a124": {
+        "$ref": "#/$defs/a125"
+       },
+       "a125": {
+        "$ref": "#/$defs/a126"
+       },
+       "a126": {
+        "$ref": "#/$defs/a127"
+       },
+       "a127": {
+        "$ref": "#/$defs/a128"
+       },
+       "a128": {
+        "$ref": "#/$defs/a129"
+       },
+       "a129": {
+        "$ref": "#/$defs/a130"
+       },
+       "a130": {
+        "$ref": "#/$defs/a131"
+       },
+       "a131": {
+        "$ref": "#/$defs/a132"
+       },
+       "a132": {
+        "$ref": "#/$defs/a133"
+       },
+       "a133": {
+        "$ref": "#/$defs/a134"
+       },
+       "a134": {
+        "$ref": "#/$defs/a135"
+       },
+       "a135": {
+        "$ref": "#/$defs/a136"
+       },
+       "a136": {
+        "$ref": "#/$defs/a137"
+       },
+       "a137": {
+        "$ref": "#/$defs/a138"
+       },
+       "a138": {
+        "$ref": "#/$defs/a139"
+       },
+       "a139": {
+        "$ref": "#/$defs/a140"
+       },
+       "a140": {
+        "$ref": "#/$defs/a141"
+       },
+       "a141": {
+        "$ref": "#/$defs/a142"
+       },
+       "a142": {
+        "$ref": "#/$defs/a143"
+       },
+       "a143": {
+        "$ref": "#/$defs/a144"
+       },
+       "a144": {
+        "$ref": "#/$defs/a145"
+       },
+       "a145": {
+        "$ref": "#/$defs/a146"
+       },
+       "a146": {
+        "$ref": "#/$defs/a147"
+       },
+       "a147": {
+        "$ref": "#/$defs/a148"
+       },
+       "a148": {
+        "$ref": "#/$defs/a149"
+       },
+       "a149": {
+        "$ref": "#/$defs/a150"
+       },
+       "a150": {
+        "$ref": "#/$defs/a151"
+       },
+       "a151": {
+        "$ref": "#/$defs/a152"
+       },
+       "a152": {
+        "$ref": "#/$defs/a153"
+       },
+       "a153": {
+        "$ref": "#/$defs/a154"
+       },
+       "a154": {
+        "$ref": "#/$defs/a155"
+       },
+       "a155": {
+        "$ref": "#/$defs/a156"
+       },
+       "a156": {
+        "$ref": "#/$defs/a157"
+       },
+       "a157": {
+        "$ref": "#/$defs/a158"
+       },
+       "a158": {
+        "$ref": "#/$defs/a159"
+       },
+       "a159": {
+        "$ref": "#/$defs/a160"
+       },
+       "a160": {
+        "$ref": "#/$defs/a161"
+       },
+       "a161": {
+        "$ref": "#/$defs/a162"
+       },
+       "a162": {
+        "$ref": "#/$defs/a163"
+       },
+       "a163": {
+        "$ref": "#/$defs/a164"
+       },
+       "a164": {
+        "$ref": "#/$defs/a165"
+       },
+       "a165": {
+        "$ref": "#/$defs/a166"
+       },
+       "a166": {
+        "$ref": "#/$defs/a167"
+       },
+       "a167": {
+        "$ref": "#/$defs/a168"
+       },
+       "a168": {
+        "$ref": "#/$defs/a169"
+       },
+       "a169": {
+        "$ref": "#/$defs/a170"
+       },
+       "a170": {
+        "$ref": "#/$defs/a171"
+       },
+       "a171": {
+        "$ref": "#/$defs/a172"
+       },
+       "a172": {
+        "$ref": "#/$defs/a173"
+       },
+       "a173": {
+        "$ref": "#/$defs/a174"
+       },
+       "a174": {
+        "$ref": "#/$defs/a175"
+       },
+       "a175": {
+        "$ref": "#/$defs/a176"
+       },
+       "a176": {
+        "$ref": "#/$defs/a177"
+       },
+       "a177": {
+        "$ref": "#/$defs/a178"
+       },
+       "a178": {
+        "$ref": "#/$defs/a179"
+       },
+       "a179": {
+        "$ref": "#/$defs/a180"
+       },
+       "a180": {
+        "$ref": "#/$defs/a181"
+       },
+       "a181": {
+        "$ref": "#/$defs/a182"
+       },
+       "a182": {
+        "$ref": "#/$defs/a183"
+       },
+       "a183": {
+        "$ref": "#/$defs/a184"
+       },
+       "a184": {
+        "$ref": "#/$defs/a185"
+       },
+       "a185": {
+        "$ref": "#/$defs/a186"
+       },
+       "a186": {
+        "$ref": "#/$defs/a187"
+       },
+       "a187": {
+        "$ref": "#/$defs/a188"
+       },
+       "a188": {
+        "$ref": "#/$defs/a189"
+       },
+       "a189": {
+        "$ref": "#/$defs/a190"
+       },
+       "a190": {
+        "$ref": "#/$defs/a191"
+       },
+       "a191": {
+        "$ref": "#/$defs/a192"
+       },
+       "a192": {
+        "$ref": "#/$defs/a193"
+       },
+       "a193": {
+        "$ref": "#/$defs/a194"
+       },
+       "a194": {
+        "$ref": "#/$defs/a195"
+       },
+       "a195": {
+        "$ref": "#/$defs/a196"
+       },
+       "a196": {
+        "$ref": "#/$defs/a197"
+       },
+       "a197": {
+        "$ref": "#/$defs/a198"
+       },
+       "a198": {
+        "$ref": "#/$defs/a199"
+       },
+       "a199": {
+        "$ref": "#/$defs/a200"
+       },
+       "a200": {
+        "$ref": "#/$defs/a201"
+       },
+       "a201": {
+        "$ref": "#/$defs/a202"
+       },
+       "a202": {
+        "$ref": "#/$defs/a203"
+       },
+       "a203": {
+        "$ref": "#/$defs/a204"
+       },
+       "a204": {
+        "$ref": "#/$defs/a205"
+       },
+       "a205": {
+        "$ref": "#/$defs/a206"
+       },
+       "a206": {
+        "$ref": "#/$defs/a207"
+       },
+       "a207": {
+        "$ref": "#/$defs/a208"
+       },
+       "a208": {
+        "$ref": "#/$defs/a209"
+       },
+       "a209": {
+        "$ref": "#/$defs/a210"
+       },
+       "a210": {
+        "$ref": "#/$defs/a211"
+       },
+       "a211": {
+        "$ref": "#/$defs/a212"
+       },
+       "a212": {
+        "$ref": "#/$defs/a213"
+       },
+       "a213": {
+        "$ref": "#/$defs/a214"
+       },
+       "a214": {
+        "$ref": "#/$defs/a215"
+       },
+       "a215": {
+        "$ref": "#/$defs/a216"
+       },
+       "a216": {
+        "$ref": "#/$defs/a217"
+       },
+       "a217": {
+        "$ref": "#/$defs/a218"
+       },
+       "a218": {
+        "$ref": "#/$defs/a219"
+       },
+       "a219": {
+        "$ref": "#/$defs/a220"
+       },
+       "a220": {
+        "$ref": "#/$defs/a221"
+       },
+       "a221": {
+        "$ref": "#/$defs/a222"
+       },
+       "a222": {
+        "$ref": "#/$defs/a223"
+       },
+       "a223": {
+        "$ref": "#/$defs/a224"
+       },
+       "a224": {
+        "$ref": "#/$defs/a225"
+       },
+       "a225": {
+        "$ref": "#/$defs/a226"
+       },
+       "a226": {
+        "$ref": "#/$defs/a227"
+       },
+       "a227": {
+        "$ref": "#/$defs/a228"
+       },
+       "a228": {
+        "$ref": "#/$defs/a229"
+       },
+       "a229": {
+        "$ref": "#/$defs/a230"
+       },
+       "a230": {
+        "$ref": "#/$defs/a231"
+       },
+       "a231": {
+        "$ref": "#/$defs/a232"
+       },
+       "a232": {
+        "$ref": "#/$defs/a233"
+       },
+       "a233": {
+        "$ref": "#/$defs/a234"
+       },
+       "a234": {
+        "$ref": "#/$defs/a235"
+       },
+       "a235": {
+        "$ref": "#/$defs/a236"
+       },
+       "a236": {
+        "$ref": "#/$defs/a237"
+       },
+       "a237": {
+        "$ref": "#/$defs/a238"
+       },
+       "a238": {
+        "$ref": "#/$defs/a239"
+       },
+       "a239": {
+        "$ref": "#/$defs/a240"
+       },
+       "a240": {
+        "$ref": "#/$defs/a241"
+       },
+       "a241": {
+        "$ref": "#/$defs/a242"
+       },
+       "a242": {
+        "$ref": "#/$defs/a243"
+       },
+       "a243": {
+        "$ref": "#/$defs/a244"
+       },
+       "a244": {
+        "$ref": "#/$defs/a245"
+       },
+       "a245": {
+        "$ref": "#/$defs/a246"
+       },
+       "a246": {
+        "$ref": "#/$defs/a247"
+       },
+       "a247": {
+        "$ref": "#/$defs/a248"
+       },
+       "a248": {
+        "$ref": "#/$defs/a249"
+       },
+       "a249": {
+        "$ref": "#/$defs/a250"
+       },
+       "a250": {
+        "$ref": "#/$defs/a251"
+       },
+       "a251": {
+        "$ref": "#/$defs/a252"
+       },
+       "a252": {
+        "$ref": "#/$defs/a253"
+       },
+       "a253": {
+        "$ref": "#/$defs/a254"
+       },
+       "a254": {
+        "$ref": "#/$defs/a255"
+       },
+       "a255": {
+        "$ref": "#/$defs/a256"
+       },
+       "a256": {
+        "$ref": "#/$defs/a257"
+       },
+       "a257": {
+        "$ref": "#/$defs/a258"
+       },
+       "a258": {
+        "$ref": "#/$defs/a259"
+       },
+       "a259": {
+        "$ref": "#/$defs/a260"
+       },
+       "a260": {
+        "$ref": "#/$defs/a261"
+       },
+       "a261": {
+        "$ref": "#/$defs/a262"
+       },
+       "a262": {
+        "$ref": "#/$defs/a263"
+       },
+       "a263": {
+        "$ref": "#/$defs/a264"
+       },
+       "a264": {
+        "$ref": "#/$defs/a265"
+       },
+       "a265": {
+        "$ref": "#/$defs/a266"
+       },
+       "a266": {
+        "$ref": "#/$defs/a267"
+       },
+       "a267": {
+        "$ref": "#/$defs/a268"
+       },
+       "a268": {
+        "$ref": "#/$defs/a269"
+       },
+       "a269": {
+        "$ref": "#/$defs/a270"
+       },
+       "a270": {
+        "$ref": "#/$defs/a271"
+       },
+       "a271": {
+        "$ref": "#/$defs/a272"
+       },
+       "a272": {
+        "$ref": "#/$defs/a273"
+       },
+       "a273": {
+        "$ref": "#/$defs/a274"
+       },
+       "a274": {
+        "$ref": "#/$defs/a275"
+       },
+       "a275": {
+        "$ref": "#/$defs/a276"
+       },
+       "a276": {
+        "$ref": "#/$defs/a277"
+       },
+       "a277": {
+        "$ref": "#/$defs/a278"
+       },
+       "a278": {
+        "$ref": "#/$defs/a279"
+       },
+       "a279": {
+        "$ref": "#/$defs/a280"
+       },
+       "a280": {
+        "$ref": "#/$defs/a281"
+       },
+       "a281": {
+        "$ref": "#/$defs/a282"
+       },
+       "a282": {
+        "$ref": "#/$defs/a283"
+       },
+       "a283": {
+        "$ref": "#/$defs/a284"
+       },
+       "a284": {
+        "$ref": "#/$defs/a285"
+       },
+       "a285": {
+        "$ref": "#/$defs/a286"
+       },
+       "a286": {
+        "$ref": "#/$defs/a287"
+       },
+       "a287": {
+        "$ref": "#/$defs/a288"
+       },
+       "a288": {
+        "$ref": "#/$defs/a289"
+       },
+       "a289": {
+        "$ref": "#/$defs/a290"
+       },
+       "a290": {
+        "$ref": "#/$defs/a291"
+       },
+       "a291": {
+        "$ref": "#/$defs/a292"
+       },
+       "a292": {
+        "$ref": "#/$defs/a293"
+       },
+       "a293": {
+        "$ref": "#/$defs/a294"
+       },
+       "a294": {
+        "$ref": "#/$defs/a295"
+       },
+       "a295": {
+        "$ref": "#/$defs/a296"
+       },
+       "a296": {
+        "$ref": "#/$defs/a297"
+       },
+       "a297": {
+        "$ref": "#/$defs/a298"
+       },
+       "a298": {
+        "$ref": "#/$defs/a299"
+       },
+       "a299": {
+        "$ref": "#/$defs/a300"
+       },
+       "a300": {
+        "$ref": "#/$defs/a301"
+       },
+       "a301": {
+        "$ref": "#/$defs/a302"
+       },
+       "a302": {
+        "$ref": "#/$defs/a303"
+       },
+       "a303": {
+        "$ref": "#/$defs/a304"
+       },
+       "a304": {
+        "$ref": "#/$defs/a305"
+       },
+       "a305": {
+        "$ref": "#/$defs/a306"
+       },
+       "a306": {
+        "$ref": "#/$defs/a307"
+       },
+       "a307": {
+        "$ref": "#/$defs/a308"
+       },
+       "a308": {
+        "$ref": "#/$defs/a309"
+       },
+       "a309": {
+        "$ref": "#/$defs/a310"
+       },
+       "a310": {
+        "$ref": "#/$defs/a311"
+       },
+       "a311": {
+        "$ref": "#/$defs/a312"
+       },
+       "a312": {
+        "$ref": "#/$defs/a313"
+       },
+       "a313": {
+        "$ref": "#/$defs/a314"
+       },
+       "a314": {
+        "$ref": "#/$defs/a315"
+       },
+       "a315": {
+        "$ref": "#/$defs/a316"
+       },
+       "a316": {
+        "$ref": "#/$defs/a317"
+       },
+       "a317": {
+        "$ref": "#/$defs/a318"
+       },
+       "a318": {
+        "$ref": "#/$defs/a319"
+       },
+       "a319": {
+        "$ref": "#/$defs/a320"
+       },
+       "a320": {
+        "$ref": "#/$defs/a321"
+       },
+       "a321": {
+        "$ref": "#/$defs/a322"
+       },
+       "a322": {
+        "$ref": "#/$defs/a323"
+       },
+       "a323": {
+        "$ref": "#/$defs/a324"
+       },
+       "a324": {
+        "$ref": "#/$defs/a325"
+       },
+       "a325": {
+        "$ref": "#/$defs/a326"
+       },
+       "a326": {
+        "$ref": "#/$defs/a327"
+       },
+       "a327": {
+        "$ref": "#/$defs/a328"
+       },
+       "a328": {
+        "$ref": "#/$defs/a329"
+       },
+       "a329": {
+        "$ref": "#/$defs/a330"
+       },
+       "a330": {
+        "$ref": "#/$defs/a331"
+       },
+       "a331": {
+        "$ref": "#/$defs/a332"
+       },
+       "a332": {
+        "$ref": "#/$defs/a333"
+       },
+       "a333": {
+        "$ref": "#/$defs/a334"
+       },
+       "a334": {
+        "$ref": "#/$defs/a335"
+       },
+       "a335": {
+        "$ref": "#/$defs/a336"
+       },
+       "a336": {
+        "$ref": "#/$defs/a337"
+       },
+       "a337": {
+        "$ref": "#/$defs/a338"
+       },
+       "a338": {
+        "$ref": "#/$defs/a339"
+       },
+       "a339": {
+        "$ref": "#/$defs/a340"
+       },
+       "a340": {
+        "$ref": "#/$defs/a341"
+       },
+       "a341": {
+        "$ref": "#/$defs/a342"
+       },
+       "a342": {
+        "$ref": "#/$defs/a343"
+       },
+       "a343": {
+        "$ref": "#/$defs/a344"
+       },
+       "a344": {
+        "$ref": "#/$defs/a345"
+       },
+       "a345": {
+        "$ref": "#/$defs/a346"
+       },
+       "a346": {
+        "$ref": "#/$defs/a347"
+       },
+       "a347": {
+        "$ref": "#/$defs/a348"
+       },
+       "a348": {
+        "$ref": "#/$defs/a349"
+       },
+       "a349": {
+        "$ref": "#/$defs/a350"
+       },
+       "a350": {
+        "$ref": "#/$defs/a351"
+       },
+       "a351": {
+        "$ref": "#/$defs/a352"
+       },
+       "a352": {
+        "$ref": "#/$defs/a353"
+       },
+       "a353": {
+        "$ref": "#/$defs/a354"
+       },
+       "a354": {
+        "$ref": "#/$defs/a355"
+       },
+       "a355": {
+        "$ref": "#/$defs/a356"
+       },
+       "a356": {
+        "$ref": "#/$defs/a357"
+       },
+       "a357": {
+        "$ref": "#/$defs/a358"
+       },
+       "a358": {
+        "$ref": "#/$defs/a359"
+       },
+       "a359": {
+        "$ref": "#/$defs/a360"
+       },
+       "a360": {
+        "$ref": "#/$defs/a361"
+       },
+       "a361": {
+        "$ref": "#/$defs/a362"
+       },
+       "a362": {
+        "$ref": "#/$defs/a363"
+       },
+       "a363": {
+        "$ref": "#/$defs/a364"
+       },
+       "a364": {
+        "$ref": "#/$defs/a365"
+       },
+       "a365": {
+        "$ref": "#/$defs/a366"
+       },
+       "a366": {
+        "$ref": "#/$defs/a367"
+       },
+       "a367": {
+        "$ref": "#/$defs/a368"
+       },
+       "a368": {
+        "$ref": "#/$defs/a369"
+       },
+       "a369": {
+        "$ref": "#/$defs/a370"
+       },
+       "a370": {
+        "$ref": "#/$defs/a371"
+       },
+       "a371": {
+        "$ref": "#/$defs/a372"
+       },
+       "a372": {
+        "$ref": "#/$defs/a373"
+       },
+       "a373": {
+        "$ref": "#/$defs/a374"
+       },
+       "a374": {
+        "$ref": "#/$defs/a375"
+       },
+       "a375": {
+        "$ref": "#/$defs/a376"
+       },
+       "a376": {
+        "$ref": "#/$defs/a377"
+       },
+       "a377": {
+        "$ref": "#/$defs/a378"
+       },
+       "a378": {
+        "$ref": "#/$defs/a379"
+       },
+       "a379": {
+        "$ref": "#/$defs/a380"
+       },
+       "a380": {
+        "$ref": "#/$defs/a381"
+       },
+       "a381": {
+        "$ref": "#/$defs/a382"
+       },
+       "a382": {
+        "$ref": "#/$defs/a383"
+       },
+       "a383": {
+        "$ref": "#/$defs/a384"
+       },
+       "a384": {
+        "$ref": "#/$defs/a385"
+       },
+       "a385": {
+        "$ref": "#/$defs/a386"
+       },
+       "a386": {
+        "$ref": "#/$defs/a387"
+       },
+       "a387": {
+        "$ref": "#/$defs/a388"
+       },
+       "a388": {
+        "$ref": "#/$defs/a389"
+       },
+       "a389": {
+        "$ref": "#/$defs/a390"
+       },
+       "a390": {
+        "$ref": "#/$defs/a391"
+       },
+       "a391": {
+        "$ref": "#/$defs/a392"
+       },
+       "a392": {
+        "$ref": "#/$defs/a393"
+       },
+       "a393": {
+        "$ref": "#/$defs/a394"
+       },
+       "a394": {
+        "$ref": "#/$defs/a395"
+       },
+       "a395": {
+        "$ref": "#/$defs/a396"
+       },
+       "a396": {
+        "$ref": "#/$defs/a397"
+       },
+       "a397": {
+        "$ref": "#/$defs/a398"
+       },
+       "a398": {
+        "$ref": "#/$defs/a399"
+       },
+       "a399": {
+        "$ref": "#/$defs/a400"
+       },
+       "a400": {
+        "$ref": "#/$defs/a401"
+       },
+       "a401": {
+        "$ref": "#/$defs/a402"
+       },
+       "a402": {
+        "$ref": "#/$defs/a403"
+       },
+       "a403": {
+        "$ref": "#/$defs/a404"
+       },
+       "a404": {
+        "$ref": "#/$defs/a405"
+       },
+       "a405": {
+        "$ref": "#/$defs/a406"
+       },
+       "a406": {
+        "$ref": "#/$defs/a407"
+       },
+       "a407": {
+        "$ref": "#/$defs/a408"
+       },
+       "a408": {
+        "$ref": "#/$defs/a409"
+       },
+       "a409": {
+        "$ref": "#/$defs/a410"
+       },
+       "a410": {
+        "$ref": "#/$defs/a411"
+       },
+       "a411": {
+        "$ref": "#/$defs/a412"
+       },
+       "a412": {
+        "$ref": "#/$defs/a413"
+       },
+       "a413": {
+        "$ref": "#/$defs/a414"
+       },
+       "a414": {
+        "$ref": "#/$defs/a415"
+       },
+       "a415": {
+        "$ref": "#/$defs/a416"
+       },
+       "a416": {
+        "$ref": "#/$defs/a417"
+       },
+       "a417": {
+        "$ref": "#/$defs/a418"
+       },
+       "a418": {
+        "$ref": "#/$defs/a419"
+       },
+       "a419": {
+        "$ref": "#/$defs/a420"
+       },
+       "a420": {
+        "$ref": "#/$defs/a421"
+       },
+       "a421": {
+        "$ref": "#/$defs/a422"
+       },
+       "a422": {
+        "$ref": "#/$defs/a423"
+       },
+       "a423": {
+        "$ref": "#/$defs/a424"
+       },
+       "a424": {
+        "$ref": "#/$defs/a425"
+       },
+       "a425": {
+        "$ref": "#/$defs/a426"
+       },
+       "a426": {
+        "$ref": "#/$defs/a427"
+       },
+       "a427": {
+        "$ref": "#/$defs/a428"
+       },
+       "a428": {
+        "$ref": "#/$defs/a429"
+       },
+       "a429": {
+        "$ref": "#/$defs/a430"
+       },
+       "a430": {
+        "$ref": "#/$defs/a431"
+       },
+       "a431": {
+        "$ref": "#/$defs/a432"
+       },
+       "a432": {
+        "$ref": "#/$defs/a433"
+       },
+       "a433": {
+        "$ref": "#/$defs/a434"
+       },
+       "a434": {
+        "$ref": "#/$defs/a435"
+       },
+       "a435": {
+        "$ref": "#/$defs/a436"
+       },
+       "a436": {
+        "$ref": "#/$defs/a437"
+       },
+       "a437": {
+        "$ref": "#/$defs/a438"
+       },
+       "a438": {
+        "$ref": "#/$defs/a439"
+       },
+       "a439": {
+        "$ref": "#/$defs/a440"
+       },
+       "a440": {
+        "$ref": "#/$defs/a441"
+       },
+       "a441": {
+        "$ref": "#/$defs/a442"
+       },
+       "a442": {
+        "$ref": "#/$defs/a443"
+       },
+       "a443": {
+        "$ref": "#/$defs/a444"
+       },
+       "a444": {
+        "$ref": "#/$defs/a445"
+       },
+       "a445": {
+        "$ref": "#/$defs/a446"
+       },
+       "a446": {
+        "$ref": "#/$defs/a447"
+       },
+       "a447": {
+        "$ref": "#/$defs/a448"
+       },
+       "a448": {
+        "$ref": "#/$defs/a449"
+       },
+       "a449": {
+        "$ref": "#/$defs/a450"
+       },
+       "a450": {
+        "$ref": "#/$defs/a451"
+       },
+       "a451": {
+        "$ref": "#/$defs/a452"
+       },
+       "a452": {
+        "$ref": "#/$defs/a453"
+       },
+       "a453": {
+        "$ref": "#/$defs/a454"
+       },
+       "a454": {
+        "$ref": "#/$defs/a455"
+       },
+       "a455": {
+        "$ref": "#/$defs/a456"
+       },
+       "a456": {
+        "$ref": "#/$defs/a457"
+       },
+       "a457": {
+        "$ref": "#/$defs/a458"
+       },
+       "a458": {
+        "$ref": "#/$defs/a459"
+       },
+       "a459": {
+        "$ref": "#/$defs/a460"
+       },
+       "a460": {
+        "$ref": "#/$defs/a461"
+       },
+       "a461": {
+        "$ref": "#/$defs/a462"
+       },
+       "a462": {
+        "$ref": "#/$defs/a463"
+       },
+       "a463": {
+        "$ref": "#/$defs/a464"
+       },
+       "a464": {
+        "$ref": "#/$defs/a465"
+       },
+       "a465": {
+        "$ref": "#/$defs/a466"
+       },
+       "a466": {
+        "$ref": "#/$defs/a467"
+       },
+       "a467": {
+        "$ref": "#/$defs/a468"
+       },
+       "a468": {
+        "$ref": "#/$defs/a469"
+       },
+       "a469": {
+        "$ref": "#/$defs/a470"
+       },
+       "a470": {
+        "$ref": "#/$defs/a471"
+       },
+       "a471": {
+        "$ref": "#/$defs/a472"
+       },
+       "a472": {
+        "$ref": "#/$defs/a473"
+       },
+       "a473": {
+        "$ref": "#/$defs/a474"
+       },
+       "a474": {
+        "$ref": "#/$defs/a475"
+       },
+       "a475": {
+        "$ref": "#/$defs/a476"
+       },
+       "a476": {
+        "$ref": "#/$defs/a477"
+       },
+       "a477": {
+        "$ref": "#/$defs/a478"
+       },
+       "a478": {
+        "$ref": "#/$defs/a479"
+       },
+       "a479": {
+        "$ref": "#/$defs/a480"
+       },
+       "a480": {
+        "$ref": "#/$defs/a481"
+       },
+       "a481": {
+        "$ref": "#/$defs/a482"
+       },
+       "a482": {
+        "$ref": "#/$defs/a483"
+       },
+       "a483": {
+        "$ref": "#/$defs/a484"
+       },
+       "a484": {
+        "$ref": "#/$defs/a485"
+       },
+       "a485": {
+        "$ref": "#/$defs/a486"
+       },
+       "a486": {
+        "$ref": "#/$defs/a487"
+       },
+       "a487": {
+        "$ref": "#/$defs/a488"
+       },
+       "a488": {
+        "$ref": "#/$defs/a489"
+       },
+       "a489": {
+        "$ref": "#/$defs/a490"
+       },
+       "a490": {
+        "$ref": "#/$defs/a491"
+       },
+       "a491": {
+        "$ref": "#/$defs/a492"
+       },
+       "a492": {
+        "$ref": "#/$defs/a493"
+       },
+       "a493": {
+        "$ref": "#/$defs/a494"
+       },
+       "a494": {
+        "$ref": "#/$defs/a495"
+       },
+       "a495": {
+        "$ref": "#/$defs/a496"
+       },
+       "a496": {
+        "$ref": "#/$defs/a497"
+       },
+       "a497": {
+        "$ref": "#/$defs/a498"
+       },
+       "a498": {
+        "$ref": "#/$defs/a499"
+       },
+       "a499": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s11-alias-chain-expanding-to-depth-33",
+   "rule": "S11",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "$ref": "#/$defs/A1"
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A1": {
+        "$ref": "#/$defs/A2"
+       },
+       "A2": {
+        "$ref": "#/$defs/A3"
+       },
+       "A3": {
+        "$ref": "#/$defs/A4"
+       },
+       "A4": {
+        "$ref": "#/$defs/A5"
+       },
+       "A5": {
+        "$ref": "#/$defs/A6"
+       },
+       "A6": {
+        "$ref": "#/$defs/A7"
+       },
+       "A7": {
+        "$ref": "#/$defs/A8"
+       },
+       "A8": {
+        "$ref": "#/$defs/A9"
+       },
+       "A9": {
+        "$ref": "#/$defs/A10"
+       },
+       "A10": {
+        "$ref": "#/$defs/A11"
+       },
+       "A11": {
+        "$ref": "#/$defs/A12"
+       },
+       "A12": {
+        "$ref": "#/$defs/A13"
+       },
+       "A13": {
+        "$ref": "#/$defs/A14"
+       },
+       "A14": {
+        "$ref": "#/$defs/A15"
+       },
+       "A15": {
+        "$ref": "#/$defs/A16"
+       },
+       "A16": {
+        "$ref": "#/$defs/A17"
+       },
+       "A17": {
+        "$ref": "#/$defs/A18"
+       },
+       "A18": {
+        "$ref": "#/$defs/A19"
+       },
+       "A19": {
+        "$ref": "#/$defs/A20"
+       },
+       "A20": {
+        "$ref": "#/$defs/A21"
+       },
+       "A21": {
+        "$ref": "#/$defs/A22"
+       },
+       "A22": {
+        "$ref": "#/$defs/A23"
+       },
+       "A23": {
+        "$ref": "#/$defs/A24"
+       },
+       "A24": {
+        "$ref": "#/$defs/A25"
+       },
+       "A25": {
+        "$ref": "#/$defs/A26"
+       },
+       "A26": {
+        "$ref": "#/$defs/A27"
+       },
+       "A27": {
+        "$ref": "#/$defs/A28"
+       },
+       "A28": {
+        "$ref": "#/$defs/A29"
+       },
+       "A29": {
+        "$ref": "#/$defs/A30"
+       },
+       "A30": {
+        "$ref": "#/$defs/A31"
+       },
+       "A31": {
+        "$ref": "#/$defs/A32"
+       },
+       "A32": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s11-nullable-value-is-a-33-hop-alias-chain",
+   "rule": "S11",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "p": {
+        "anyOf": [
+         {
+          "$ref": "#/$defs/A1"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       }
+      },
+      "required": [
+       "p"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "A1": {
+        "$ref": "#/$defs/A2"
+       },
+       "A2": {
+        "$ref": "#/$defs/A3"
+       },
+       "A3": {
+        "$ref": "#/$defs/A4"
+       },
+       "A4": {
+        "$ref": "#/$defs/A5"
+       },
+       "A5": {
+        "$ref": "#/$defs/A6"
+       },
+       "A6": {
+        "$ref": "#/$defs/A7"
+       },
+       "A7": {
+        "$ref": "#/$defs/A8"
+       },
+       "A8": {
+        "$ref": "#/$defs/A9"
+       },
+       "A9": {
+        "$ref": "#/$defs/A10"
+       },
+       "A10": {
+        "$ref": "#/$defs/A11"
+       },
+       "A11": {
+        "$ref": "#/$defs/A12"
+       },
+       "A12": {
+        "$ref": "#/$defs/A13"
+       },
+       "A13": {
+        "$ref": "#/$defs/A14"
+       },
+       "A14": {
+        "$ref": "#/$defs/A15"
+       },
+       "A15": {
+        "$ref": "#/$defs/A16"
+       },
+       "A16": {
+        "$ref": "#/$defs/A17"
+       },
+       "A17": {
+        "$ref": "#/$defs/A18"
+       },
+       "A18": {
+        "$ref": "#/$defs/A19"
+       },
+       "A19": {
+        "$ref": "#/$defs/A20"
+       },
+       "A20": {
+        "$ref": "#/$defs/A21"
+       },
+       "A21": {
+        "$ref": "#/$defs/A22"
+       },
+       "A22": {
+        "$ref": "#/$defs/A23"
+       },
+       "A23": {
+        "$ref": "#/$defs/A24"
+       },
+       "A24": {
+        "$ref": "#/$defs/A25"
+       },
+       "A25": {
+        "$ref": "#/$defs/A26"
+       },
+       "A26": {
+        "$ref": "#/$defs/A27"
+       },
+       "A27": {
+        "$ref": "#/$defs/A28"
+       },
+       "A28": {
+        "$ref": "#/$defs/A29"
+       },
+       "A29": {
+        "$ref": "#/$defs/A30"
+       },
+       "A30": {
+        "$ref": "#/$defs/A31"
+       },
+       "A31": {
+        "$ref": "#/$defs/A32"
+       },
+       "A32": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "s11-expansion-of-2001-nodes",
+   "rule": "S11",
+   "path": "",
+   "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+     "name": "result",
+     "schema": {
+      "type": "object",
+      "properties": {
+       "h0": {
+        "$ref": "#/$defs/H"
+       },
+       "h1": {
+        "$ref": "#/$defs/H"
+       },
+       "h2": {
+        "$ref": "#/$defs/H"
+       },
+       "h3": {
+        "$ref": "#/$defs/H"
+       },
+       "h4": {
+        "$ref": "#/$defs/H"
+       },
+       "h5": {
+        "$ref": "#/$defs/H"
+       },
+       "g0": {
+        "$ref": "#/$defs/G"
+       },
+       "g1": {
+        "$ref": "#/$defs/G"
+       },
+       "g2": {
+        "$ref": "#/$defs/G"
+       },
+       "g3": {
+        "$ref": "#/$defs/G"
+       },
+       "n0": {
+        "$ref": "#/$defs/N"
+       },
+       "n1": {
+        "$ref": "#/$defs/N"
+       },
+       "n2": {
+        "$ref": "#/$defs/N"
+       },
+       "s0": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "h0",
+       "h1",
+       "h2",
+       "h3",
+       "h4",
+       "h5",
+       "g0",
+       "g1",
+       "g2",
+       "g3",
+       "n0",
+       "n1",
+       "n2",
+       "s0"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+       "N": {
+        "anyOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "G": {
+        "type": "object",
+        "properties": {
+         "a0": {
+          "$ref": "#/$defs/N"
+         },
+         "a1": {
+          "$ref": "#/$defs/N"
+         },
+         "a2": {
+          "$ref": "#/$defs/N"
+         },
+         "a3": {
+          "$ref": "#/$defs/N"
+         },
+         "a4": {
+          "$ref": "#/$defs/N"
+         },
+         "a5": {
+          "$ref": "#/$defs/N"
+         },
+         "a6": {
+          "$ref": "#/$defs/N"
+         },
+         "a7": {
+          "$ref": "#/$defs/N"
+         },
+         "a8": {
+          "$ref": "#/$defs/N"
+         },
+         "a9": {
+          "$ref": "#/$defs/N"
+         }
+        },
+        "required": [
+         "a0",
+         "a1",
+         "a2",
+         "a3",
+         "a4",
+         "a5",
+         "a6",
+         "a7",
+         "a8",
+         "a9"
+        ],
+        "additionalProperties": false
+       },
+       "H": {
+        "type": "object",
+        "properties": {
+         "a0": {
+          "$ref": "#/$defs/G"
+         },
+         "a1": {
+          "$ref": "#/$defs/G"
+         },
+         "a2": {
+          "$ref": "#/$defs/G"
+         },
+         "a3": {
+          "$ref": "#/$defs/G"
+         },
+         "a4": {
+          "$ref": "#/$defs/G"
+         },
+         "a5": {
+          "$ref": "#/$defs/G"
+         },
+         "a6": {
+          "$ref": "#/$defs/G"
+         },
+         "a7": {
+          "$ref": "#/$defs/G"
+         },
+         "a8": {
+          "$ref": "#/$defs/G"
+         },
+         "a9": {
+          "$ref": "#/$defs/G"
+         }
+        },
+        "required": [
+         "a0",
+         "a1",
+         "a2",
+         "a3",
+         "a4",
+         "a5",
+         "a6",
+         "a7",
+         "a8",
+         "a9"
+        ],
+        "additionalProperties": false
+       }
+      }
      }
     }
    }

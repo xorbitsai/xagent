@@ -32,6 +32,11 @@ MAX_SCHEMA_DEPTH = 32
 MAX_ENUM_VALUES = 500
 MAX_ENUM_STRING_CHARS = 256
 MAX_TEXT_CHARS = 1024
+MAX_EXPANDED_NODES = 2000
+MAX_EXPANDED_DEPTH = 32
+MAX_EXPANDED_BYTES = 65536
+MAX_EXPANDED_ENUM_VALUES = 5000
+ALLOWED_VALUES_MAX_CHARS = 500
 
 # Rewritten schemas carry this marker as one more allowed value of a string
 # enum, so a caller's own enum value can never be the marker.
@@ -198,7 +203,8 @@ def check_schema_structure(schema: object) -> SchemaViolation | None:
     """Run S1 to S13 on the value of ``json_schema.schema``.
 
     The rules run in the order S2, S1, S3 to S6, S7 (names and placement), S8,
-    S9, S7 (every ``$defs`` entry is reachable), S10, S12a and S13. A rule scans
+    S9, S7 (every ``$defs`` entry is reachable), S10, S11, S12a, S12b and S13.
+    A rule scans
     the whole schema before the next rule runs, and within a rule the first
     violation in document order (pre-order, keys in the order they were
     written) is reported.
@@ -220,10 +226,22 @@ def check_schema_structure(schema: object) -> SchemaViolation | None:
         or _check_no_recursion(root_dict)
         or _check_defs_reachable(root_dict)
         or _check_nullable_anyof(root_dict)
-        or _check_enums(root_dict)
-        or _check_property_names(root_dict)
     )
-    return violation
+    if violation is not None:
+        return violation
+    expansion = measure_expansion(root_dict)
+    if (
+        expansion.nodes > MAX_EXPANDED_NODES
+        or expansion.depth > MAX_EXPANDED_DEPTH
+        or expansion.rewritten_bytes > MAX_EXPANDED_BYTES
+    ):
+        return SchemaViolation("S11")
+    violation = _check_enums(root_dict)
+    if violation is not None:
+        return violation
+    if expansion.enum_values > MAX_EXPANDED_ENUM_VALUES:
+        return SchemaViolation("S12b")
+    return _check_property_names(root_dict)
 
 
 # --- traversal ---------------------------------------------------------------
@@ -694,3 +712,174 @@ def _check_property_names(root: dict[str, Any]) -> SchemaViolation | None:
             ):
                 return SchemaViolation("S13", path + ("properties", name))
     return None
+
+
+# --- S11, S12b: the size of the schema after $ref references are expanded ------
+
+
+@dataclass(frozen=True)
+class ExpansionMetrics:
+    """What the schema measures once every ``$ref`` is replaced by its target.
+
+    ``depth`` counts one level per nesting step and one more per ``$ref`` hop,
+    with the root at 0. ``enum_values`` counts the values as the caller wrote
+    them. ``rewritten_bytes`` is the size, as compact UTF-8 JSON, of the copy
+    shown to the model.
+    """
+
+    nodes: int
+    depth: int
+    enum_values: int
+    rewritten_bytes: int
+
+
+def allowed_values_suffix(values: list[Any]) -> str:
+    """The text appended to a description to list the values of its enum.
+
+    Only the JSON text of the list is cut: past 500 characters (code points)
+    it keeps the first 500 and adds an ellipsis. The leading space and the
+    label are never counted.
+    """
+    text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    if len(text) > ALLOWED_VALUES_MAX_CHARS:
+        text = text[:ALLOWED_VALUES_MAX_CHARS] + "\u2026"
+    return " Allowed values: " + text
+
+
+def is_string_typed(node: dict[str, Any]) -> bool:
+    """Whether a node's ``type`` is ``"string"`` or an array naming it."""
+    declared = node.get("type")
+    return declared == "string" or (type(declared) is list and "string" in declared)
+
+
+def _children_of(node: dict[str, Any]) -> list[dict[str, Any]]:
+    children: list[dict[str, Any]] = []
+    properties = node.get("properties")
+    if type(properties) is dict:
+        children.extend(properties.values())
+    if "items" in node:
+        children.append(node["items"])
+    return children
+
+
+def _expansion_dependencies(
+    node: dict[str, Any], defs: dict[str, Any]
+) -> list[dict[str, Any]]:
+    if "$ref" in node:
+        return [defs[node["$ref"][len(REF_PREFIX) :]]]
+    if "anyOf" in node:
+        return list(node["anyOf"])
+    return _children_of(node)
+
+
+def _own_bytes(
+    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
+) -> int:
+    """The size of one node of the copy with every child replaced by a single
+    byte, minus those bytes: the node's own contribution to the copy.
+
+    Every node but the root is made nullable: a single type ``T`` becomes
+    ``[T, "null"]``, an enum gains ``null`` if it has none, and a string enum
+    gains the reserved marker. A node with an enum then lists its values at the
+    end of its description. A nullable union is merged into its value node
+    first: the union supplies the title unless the value node has one, and the
+    two descriptions are joined by a space.
+    """
+    own: dict[str, Any] = {}
+    children = 0
+    for key, value in node.items():
+        if key == "properties":
+            own[key] = dict.fromkeys(value, 0)
+            children += len(value)
+        elif key == "items":
+            own[key] = 0
+            children += 1
+        elif key not in ("$defs", "const"):
+            own[key] = value
+    enum = normalized_enum(node)
+    if enum is not None:
+        own["enum"] = enum
+    if not root:
+        if any_of is not None:
+            if "title" not in node and "title" in any_of:
+                own["title"] = any_of["title"]
+            descriptions = [
+                d["description"] for d in (any_of, node) if "description" in d
+            ]
+            if descriptions:
+                own["description"] = " ".join(descriptions)
+        if type(own["type"]) is str:
+            own["type"] = [own["type"], "null"]
+        if enum is not None:
+            values = list(enum)
+            if not any(v is None for v in values):
+                values.append(None)
+            if is_string_typed(node):
+                values.append(NOT_EXPRESSIBLE_MARKER)
+            own["enum"] = values
+            own["description"] = own.get("description", "") + allowed_values_suffix(
+                values
+            )
+    text = json.dumps(own, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return len(text.encode("utf-8")) - children
+
+
+def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
+    """Measure the expansion of a schema that passed S1 to S10.
+
+    One bottom-up pass over the nodes, each measured once however many times
+    it is referenced: the node count, the depth and the enum values of a node
+    follow from its children, and so does the size of its copy, because a
+    node's own bytes are known without building the copy. Nothing is copied or
+    rewritten, so a schema that expands to millions of nodes costs as much as
+    its original size.
+    """
+    defs = _defs_of(schema)
+    order: list[dict[str, Any]] = []
+    seen = {id(schema)}
+    stack = [(schema, iter(_expansion_dependencies(schema, defs)))]
+    while stack:
+        node, pending = stack[-1]
+        for dependency in pending:
+            if id(dependency) not in seen:
+                seen.add(id(dependency))
+                stack.append(
+                    (dependency, iter(_expansion_dependencies(dependency, defs)))
+                )
+                break
+        else:
+            stack.pop()
+            order.append(node)
+
+    # id(node) -> (nodes, height, enum values, bytes of the copy)
+    measured: dict[int, tuple[int, int, int, int]] = {}
+    for node in order:
+        if "$ref" in node:
+            nodes, height, enums, size = measured[
+                id(defs[node["$ref"][len(REF_PREFIX) :]])
+            ]
+            measured[id(node)] = (nodes, height + 1, enums, size)
+        elif "anyOf" in node:
+            branches = node["anyOf"]
+            value = branches[1] if _is_null_branch(branches[0]) else branches[0]
+            nodes, height, enums, _ = measured[id(value)]
+            target = resolve_alias(value, defs)
+            size = _own_bytes(target, root=False, any_of=node) + sum(
+                measured[id(child)][3] for child in _children_of(target)
+            )
+            measured[id(node)] = (nodes + 2, height + 1, enums, size)
+        else:
+            child_measures = [measured[id(child)] for child in _children_of(node)]
+            enum = normalized_enum(node)
+            measured[id(node)] = (
+                1 + sum(m[0] for m in child_measures),
+                max((m[1] + 1 for m in child_measures), default=0),
+                (len(enum) if enum is not None else 0)
+                + sum(m[2] for m in child_measures),
+                _own_bytes(node, root=node is schema)
+                + sum(m[3] for m in child_measures),
+            )
+    nodes, height, enums, size = measured[id(schema)]
+    return ExpansionMetrics(
+        nodes=nodes, depth=height, enum_values=enums, rewritten_bytes=size
+    )

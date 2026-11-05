@@ -14,10 +14,13 @@ import pytest
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import (
     ERROR_PATH_MAX_CHARS,
+    NOT_EXPRESSIBLE_MARKER,
     SchemaViolation,
+    allowed_values_suffix,
     canon,
     check_schema_structure,
     json_kind,
+    measure_expansion,
     normalized_enum,
     render_error_path,
 )
@@ -104,7 +107,9 @@ def test_every_rule_checked_here_has_a_rejection_in_the_corpus() -> None:
         "S8",
         "S9",
         "S10",
+        "S11",
         "S12a",
+        "S12b",
         "S13",
     }
 
@@ -661,3 +666,400 @@ def test_the_check_never_raises_for_a_root_that_is_not_an_object() -> None:
         found = check_schema_structure(root)
         assert found is not None
         assert found.rule in {"S6", "S3", "S2", "S1"}
+
+
+# --- the size of the schema after $ref references are expanded (S11, S12b) --------
+
+
+def _ref(name: str) -> dict[str, Any]:
+    return {"$ref": f"#/$defs/{name}"}
+
+
+def _nullable(node: dict[str, Any]) -> dict[str, Any]:
+    return {"anyOf": [node, {"type": "null"}]}
+
+
+def _compact_bytes(value: Any) -> int:
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return len(text.encode("utf-8"))
+
+
+def _allowed_values(values: list[Any]) -> str:
+    text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    return " Allowed values: " + (text if len(text) <= 500 else text[:500] + "\u2026")
+
+
+def _expanded_copy(
+    node: dict[str, Any],
+    defs: dict[str, Any],
+    *,
+    root: bool = False,
+    any_of: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The copy handed to the model, built the long way: every node except the
+    root is made nullable, references and nullable unions are expanded, and an
+    enum lists its values in the description."""
+    if "$ref" in node:
+        return _expanded_copy(defs[node["$ref"].removeprefix("#/$defs/")], defs)
+    if "anyOf" in node:
+        value_branch = next(b for b in node["anyOf"] if b != {"type": "null"})
+        target = value_branch
+        while "$ref" in target:
+            target = defs[target["$ref"].removeprefix("#/$defs/")]
+        return _expanded_copy(target, defs, any_of=node)
+    copy_: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "properties":
+            copy_[key] = {k: _expanded_copy(v, defs) for k, v in value.items()}
+        elif key == "items":
+            copy_[key] = _expanded_copy(value, defs)
+        elif key not in ("$defs", "const"):
+            copy_[key] = value
+    enum = [node["const"]] if "const" in node else node.get("enum")
+    if root:
+        if enum is not None:
+            copy_["enum"] = enum
+        return copy_
+    if any_of is not None:
+        if "title" in node or "title" in any_of:
+            copy_["title"] = node.get("title", any_of.get("title"))
+        descriptions = [d["description"] for d in (any_of, node) if "description" in d]
+        if descriptions:
+            copy_["description"] = " ".join(descriptions)
+    if isinstance(copy_["type"], str):
+        copy_["type"] = [copy_["type"], "null"]
+    if enum is not None:
+        values = list(enum)
+        if None not in values:
+            values.append(None)
+        node_type = node["type"]
+        if node_type == "string" or (
+            isinstance(node_type, list) and "string" in node_type
+        ):
+            values.append(NOT_EXPRESSIBLE_MARKER)
+        copy_["enum"] = values
+        copy_["description"] = copy_.get("description", "") + _allowed_values(values)
+    return copy_
+
+
+def _size_of_copy(schema: dict[str, Any]) -> int:
+    return _compact_bytes(_expanded_copy(schema, schema.get("$defs", {}), root=True))
+
+
+def _count_nodes(schema: dict[str, Any]) -> int:
+    """Nodes of the expanded tree: a reference and an alias count for nothing and
+    a nullable union counts for itself plus its two branches."""
+    defs = schema.get("$defs", {})
+
+    def count(node: dict[str, Any]) -> int:
+        if "$ref" in node:
+            return count(defs[node["$ref"].removeprefix("#/$defs/")])
+        if "anyOf" in node:
+            return 2 + sum(count(b) for b in node["anyOf"] if b != {"type": "null"})
+        total = 1
+        for child in (node.get("properties") or {}).values():
+            total += count(child)
+        if "items" in node:
+            total += count(node["items"])
+        return total
+
+    return count(schema)
+
+
+def test_a_nullable_union_counts_as_three_nodes_and_an_alias_as_none() -> None:
+    nullable = _obj({"a": _nullable(STRING)})
+    aliased = _obj({"a": _ref("A")}, **{"$defs": {"A": _ref("B"), "B": STRING}})
+
+    assert measure_expansion(nullable).nodes == 4
+    assert measure_expansion(aliased).nodes == 2
+
+
+def test_the_root_is_at_depth_zero_and_each_reference_adds_a_level() -> None:
+    assert measure_expansion(_obj({})).depth == 0
+    assert measure_expansion(_obj({"a": STRING})).depth == 1
+    assert measure_expansion(_obj({"a": _nullable(STRING)})).depth == 2
+    aliased = _obj({"a": _ref("A")}, **{"$defs": {"A": _ref("B"), "B": STRING}})
+    # The property is at level 1; the reference to A and the alias A to B are
+    # two hops, so the string sits at level 3.
+    assert measure_expansion(aliased).depth == 3
+
+
+def test_enum_values_are_counted_as_written_without_the_added_null_and_marker() -> None:
+    schema = _obj(
+        {
+            "a": {"type": "string", "enum": ["x", "y", "z"]},
+            "b": {"type": ["string", "null"], "enum": ["x", None]},
+            "c": {"type": "string", "const": "k"},
+        }
+    )
+
+    assert measure_expansion(schema).enum_values == 6
+
+
+def test_a_reference_repeats_the_enum_of_its_target() -> None:
+    schema = _obj(
+        {"a": _ref("E"), "b": _ref("E"), "c": _ref("E")},
+        **{"$defs": {"E": {"type": "string", "enum": ["x", "y"]}}},
+    )
+
+    assert measure_expansion(schema).enum_values == 6
+
+
+SIZE_SCHEMAS = {
+    "plain": _obj({"a": STRING, "b": {"type": "integer"}, "c": {"type": "boolean"}}),
+    "described": _obj(
+        {"a": {"type": "string", "title": "T", "description": "the a"}},
+        description="root",
+    ),
+    "string-enum": _obj({"a": {"type": "string", "enum": ["x", "y"]}}),
+    "integer-enum": _obj({"a": {"type": "integer", "enum": [1, 2, 3.0]}}),
+    "const": _obj({"a": {"type": "string", "const": "k"}}),
+    "nullable-enum": _obj({"a": {"type": ["string", "null"], "enum": ["x", None]}}),
+    "nullable-type-array": _obj({"a": {"type": ["integer", "null"]}}),
+    "non-ascii": _obj(
+        {"a": {"type": "string", "description": "\u4e2d\u6587", "enum": ["\u00e9"]}}
+    ),
+    "array": _obj({"a": {"type": "array", "items": {"type": "number"}}}),
+    "array-of-nullable": _obj({"a": {"type": "array", "items": _nullable(STRING)}}),
+    "nullable-union": _obj({"a": _nullable({"type": "integer"})}),
+    "union-with-both-descriptions": _obj(
+        {
+            "a": {
+                "description": "outer",
+                "title": "Outer",
+                "anyOf": [
+                    {"type": "string", "description": "inner", "enum": ["x"]},
+                    {"type": "null"},
+                ],
+            }
+        }
+    ),
+    "union-with-outer-description-only": _obj(
+        {
+            "a": {
+                "description": "outer",
+                "anyOf": [{"type": "string", "enum": ["x", "y"]}, {"type": "null"}],
+            }
+        }
+    ),
+    "union-over-a-reference": _obj(
+        {"a": {"description": "d", "anyOf": [_ref("A"), {"type": "null"}]}},
+        **{"$defs": {"A": _ref("B"), "B": {"type": "string", "enum": ["p", "q"]}}},
+    ),
+    "union-over-an-object": _obj(
+        {"a": _nullable(_obj({"x": STRING, "y": _nullable({"type": "integer"})}))}
+    ),
+    "references-and-aliases": _obj(
+        {"a": _ref("A"), "b": _ref("O"), "c": {"type": "array", "items": _ref("O")}},
+        **{
+            "$defs": {
+                "A": _ref("S"),
+                "S": {"type": "string", "enum": ["m", "n"]},
+                "O": _obj({"s": _ref("S"), "t": _nullable(_ref("S"))}),
+            }
+        },
+    ),
+    "long-enum-with-truncated-suffix": _obj(
+        {"a": {"type": "string", "enum": [f"value-{i:03d}" for i in range(120)]}}
+    ),
+    "surrogate-pair-and-escapes": _obj(
+        {"a": {"type": "string", "enum": ["\U0001f600", 'q"\\', "tab\t"]}}
+    ),
+}
+
+
+@pytest.mark.parametrize("schema", SIZE_SCHEMAS.values(), ids=SIZE_SCHEMAS.keys())
+def test_the_estimated_size_equals_the_size_of_the_copy_built_in_full(
+    schema: dict[str, Any],
+) -> None:
+    assert check_schema_structure(schema) is None
+
+    measured = measure_expansion(schema)
+
+    assert measured.rewritten_bytes == _size_of_copy(schema)
+    assert measured.nodes == _count_nodes(schema)
+
+
+def test_the_estimate_does_not_change_the_schema() -> None:
+    schema = SIZE_SCHEMAS["references-and-aliases"]
+    before = copy.deepcopy(schema)
+
+    measure_expansion(schema)
+
+    assert schema == before
+
+
+def test_the_allowed_values_text_is_cut_at_500_characters() -> None:
+    short = ["a", None]
+    assert allowed_values_suffix(short) == ' Allowed values: ["a",null]'
+
+    def enum_text_of_length(length: int) -> list[Any]:
+        # ["xxx..."] is the characters plus four: two quotes and two brackets.
+        return ["x" * (length - 4)]
+
+    exactly = enum_text_of_length(500)
+    over = enum_text_of_length(501)
+    assert len(json.dumps(exactly, separators=(",", ":"))) == 500
+    assert allowed_values_suffix(exactly) == (
+        " Allowed values: " + json.dumps(exactly, separators=(",", ":"))
+    )
+    cut = allowed_values_suffix(over)
+    assert (
+        cut
+        == " Allowed values: "
+        + json.dumps(over, separators=(",", ":"))[:500]
+        + "\u2026"
+    )
+
+
+def test_the_allowed_values_text_is_cut_by_characters_not_bytes() -> None:
+    values = ["\u4e2d" * 600]
+
+    suffix = allowed_values_suffix(values)
+
+    text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    assert suffix == " Allowed values: " + text[:500] + "\u2026"
+    assert len(suffix) == len(" Allowed values: ") + 500 + 1
+
+
+def test_the_allowed_values_text_keeps_non_ascii_characters() -> None:
+    assert allowed_values_suffix(["\u00e9"]) == ' Allowed values: ["\u00e9"]'
+
+
+def test_the_expansion_limits_are_inclusive() -> None:
+    assert measure_expansion(_alias_schema(31)).depth == 32
+    assert check_schema_structure(_alias_schema(31)) is None
+    assert measure_expansion(_alias_schema(32)).depth == 33
+    assert _violation(_alias_schema(32)) == ("S11", "")
+
+
+def _alias_schema(aliases: int) -> dict[str, Any]:
+    defs: dict[str, Any] = {f"A{i}": _ref(f"A{i + 1}") for i in range(1, aliases)}
+    defs[f"A{aliases}"] = STRING
+    return _obj({"p": _ref("A1")}, **{"$defs": defs})
+
+
+def _counted_schema(extra_plain: int) -> dict[str, Any]:
+    defs: dict[str, Any] = {
+        "N": _nullable(STRING),
+        "G": _obj({f"a{i}": _ref("N") for i in range(10)}),
+    }
+    defs["H"] = _obj({f"a{i}": _ref("G") for i in range(10)})
+    properties: dict[str, Any] = {f"h{i}": _ref("H") for i in range(6)}
+    properties.update({f"g{i}": _ref("G") for i in range(4)})
+    properties.update({f"n{i}": _ref("N") for i in range(3)})
+    properties.update({f"s{i}": STRING for i in range(extra_plain)})
+    return _obj(properties, **{"$defs": defs})
+
+
+def test_2000_expanded_nodes_pass_and_2001_do_not() -> None:
+    assert measure_expansion(_counted_schema(0)).nodes == 2000
+    assert check_schema_structure(_counted_schema(0)) is None
+    assert measure_expansion(_counted_schema(1)).nodes == 2001
+    assert _violation(_counted_schema(1)) == ("S11", "")
+
+
+def test_the_nullable_value_of_a_33_hop_alias_chain_is_too_deep() -> None:
+    defs: dict[str, Any] = {f"A{i}": _ref(f"A{i + 1}") for i in range(1, 32)}
+    defs["A32"] = STRING
+    schema = _obj({"p": {"anyOf": [_ref("A1"), {"type": "null"}]}}, **{"$defs": defs})
+
+    assert _violation(schema) == ("S11", "")
+
+
+def _layered_schema(layers: int, leaf: dict[str, Any]) -> dict[str, Any]:
+    """A leaf under ``layers`` objects, each with two properties that both refer
+    to the next layer down; the root is the top layer."""
+    defs: dict[str, Any] = {"L0": leaf}
+    for layer in range(1, layers):
+        defs[f"L{layer}"] = _obj(
+            {"x": _ref(f"L{layer - 1}"), "y": _ref(f"L{layer - 1}")}
+        )
+    return _obj(
+        {"x": _ref(f"L{layers - 1}"), "y": _ref(f"L{layers - 1}")}, **{"$defs": defs}
+    )
+
+
+def test_a_small_schema_whose_copy_would_be_over_a_megabyte_is_refused() -> None:
+    leaf = {"type": "string", "title": "t" * 1024, "description": "d" * 1000}
+    schema = _layered_schema(9, leaf)
+    original = len(json.dumps(schema, separators=(",", ":")).encode())
+
+    assert original < 16384
+    assert measure_expansion(schema).nodes == 1023
+    assert measure_expansion(schema).rewritten_bytes > 1_000_000
+    assert _violation(schema) == ("S11", "")
+
+
+def test_a_500_value_enum_expanded_nine_times_is_refused_within_50_ms() -> None:
+    values = [f"{i:04d}-" + "v" * 14 for i in range(500)]
+    schema = _layered_schema(9, {"type": "string", "enum": values})
+    original = len(json.dumps(schema, separators=(",", ":")).encode())
+    assert 8000 < original < 16384
+
+    start = time.perf_counter()
+    found = _violation(schema)
+    elapsed = time.perf_counter() - start
+
+    assert found == ("S11", "")
+    assert elapsed < 0.05, f"took {elapsed * 1000:.1f} ms"
+
+
+def test_an_unreferenced_entry_is_refused_before_any_expansion_is_measured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(_schema: object) -> None:
+        raise AssertionError("the expansion was measured")
+
+    monkeypatch.setattr(structured_schema, "measure_expansion", fail)
+    schema = _obj({"a": STRING}, **{"$defs": _doubling_defs(41)})
+
+    assert _violation(schema) == ("S7", "/$defs/d0")
+
+
+def test_enum_values_over_5000_after_expansion_are_refused_by_s12b() -> None:
+    values = [f"v{i}" for i in range(500)]
+    defs = {"E": {"type": "string", "enum": values}}
+
+    ten = _obj({f"p{i}": _ref("E") for i in range(10)}, **{"$defs": defs})
+    eleven = _obj({f"p{i}": _ref("E") for i in range(11)}, **{"$defs": defs})
+
+    assert check_schema_structure(ten) is None
+    assert measure_expansion(ten).enum_values == 5000
+    assert _violation(eleven) == ("S12b", "")
+
+
+def test_the_expanded_size_is_judged_before_the_enum_rules() -> None:
+    schema = _obj(
+        {
+            "a": {"type": "string", "enum": [f"v{i}" for i in range(501)]},
+            "p": _ref("d0"),
+        },
+        **{"$defs": _doubling_defs(60)},
+    )
+
+    assert _violation(schema) == ("S11", "")
+
+
+def test_a_500_layer_alias_chain_is_refused_quickly() -> None:
+    defs: dict[str, Any] = {f"a{i}": _ref(f"a{i + 1}") for i in range(499)}
+    defs["a499"] = STRING
+    schema = _obj({"p": _ref("a0")}, **{"$defs": defs})
+
+    start = time.perf_counter()
+    found = _violation(schema)
+    elapsed = time.perf_counter() - start
+
+    assert found == ("S11", "")
+    assert elapsed < 1.0
+
+
+def test_a_100_layer_doubling_chain_is_refused_quickly() -> None:
+    schema = _obj({"p": _ref("d0")}, **{"$defs": _doubling_defs(100)})
+
+    start = time.perf_counter()
+    found = _violation(schema)
+    elapsed = time.perf_counter() - start
+
+    assert found == ("S11", "")
+    assert elapsed < 1.0

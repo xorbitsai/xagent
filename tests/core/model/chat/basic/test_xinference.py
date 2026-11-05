@@ -1,16 +1,55 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from xagent.core.model.chat.basic.xinference import XinferenceLLM, _create_async_client
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMTimeoutError
+from xagent.core.model.chat.routing_context import xinference_routing_key
 from xagent.core.model.chat.timeout_config import TimeoutConfig
 from xagent.core.model.chat.types import ChunkType
 
 
 class TestXinferenceLLM:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("supports_affinity", [False, True])
+    async def test_chat_uses_discovered_session_affinity(
+        self, monkeypatch, supports_affinity: bool
+    ) -> None:
+        description = {"model_type": "LLM", "model_ability": ["chat"]}
+        if supports_affinity:
+            description["supports_chat_session_affinity"] = True
+
+        def response(body):
+            return MagicMock(
+                status=200,
+                json=AsyncMock(return_value=body),
+                wait_for_close=AsyncMock(),
+            )
+
+        get = AsyncMock(return_value=response(description))
+        post = AsyncMock(return_value=response({"content": "OK"}))
+        monkeypatch.setattr(aiohttp.ClientSession, "get", get)
+        monkeypatch.setattr(aiohttp.ClientSession, "post", post)
+        llm = XinferenceLLM(model_name="model", base_url="https://xinference.example")
+        token = xinference_routing_key.set("task-key")
+        try:
+            for _ in range(2):
+                await llm.chat(messages=[{"role": "user", "content": "Reply OK"}])
+        finally:
+            xinference_routing_key.reset(token)
+            await llm.close()
+        get.assert_awaited_once()
+        assert get.await_args.args == ("https://xinference.example/v1/models/model",)
+        assert post.await_count == 2
+        for call in post.await_args_list:
+            if supports_affinity:
+                assert call.kwargs["json"]["routing_key"] == "task-key"
+            else:
+                assert "routing_key" not in call.kwargs["json"]
+
     @pytest.mark.asyncio
     async def test_stream_chat_does_not_block_event_loop_before_first_token(
         self,
@@ -194,7 +233,7 @@ class TestXinferenceLLM:
         self, blocking_phase: str
     ) -> None:
         class BlockingClient:
-            async def get_model(self, model_uid: str):
+            async def get_chat_model(self, model_uid: str):
                 await asyncio.Event().wait()
 
         class BlockingModelHandle:

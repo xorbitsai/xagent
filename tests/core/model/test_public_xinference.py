@@ -96,6 +96,32 @@ async def test_async_sdk_never_probes_sync_and_all_handles_use_public_connectors
 
 
 @pytest.mark.asyncio
+async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatch):
+    client = PublicAsyncXinferenceClient(
+        "https://xinference.example", api_key="test-key"
+    )
+    describe = AsyncMock(
+        return_value={
+            "model_type": "LLM",
+            "model_ability": ["chat"],
+            "supports_chat_session_affinity": True,
+        }
+    )
+    monkeypatch.setattr(client, "describe_model", describe)
+    try:
+        handle, supports_affinity = await client.get_chat_model("model-id")
+        try:
+            assert isinstance(handle.session.connector, PublicTCPConnector)
+            assert handle.auth_headers == {"Authorization": "Bearer test-key"}
+            assert supports_affinity is True
+            describe.assert_awaited_once_with("model-id")
+        finally:
+            await handle.close()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "client_class", [PublicXinferenceClient, PublicAsyncXinferenceClient]
 )

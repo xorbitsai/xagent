@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
 from ..exceptions import LLMTimeoutError
+from ..routing_context import xinference_routing_key
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -133,6 +134,7 @@ class XinferenceLLM(BaseLLM):
         # Initialize the Xinference client (lazy initialization)
         self._client: Optional[Any] = None
         self._model_handle: Optional[Any] = None
+        self._supports_session_affinity = False
         self._client_lock = asyncio.Lock()
 
     @property
@@ -156,8 +158,10 @@ class XinferenceLLM(BaseLLM):
                 raise RuntimeError("Failed to initialize Xinference client")
 
             if self._model_handle is None:
-                # Get the model handle (assumes model is already launched on the server)
-                self._model_handle = await client.get_model(self._model_uid)
+                (
+                    self._model_handle,
+                    self._supports_session_affinity,
+                ) = await client.get_chat_model(self._model_uid)
 
             return self._model_handle
 
@@ -195,6 +199,11 @@ class XinferenceLLM(BaseLLM):
         config.update(kwargs)
 
         return config
+
+    def _apply_session_affinity(self, config: dict[str, Any]) -> None:
+        key = xinference_routing_key.get()
+        if self._supports_session_affinity and key is not None:
+            config.setdefault("routing_key", key)
 
     async def chat(
         self,
@@ -257,6 +266,7 @@ class XinferenceLLM(BaseLLM):
 
         async def call_model() -> Any:
             model_handle = await self._ensure_client()
+            self._apply_session_affinity(generate_config)
             return await model_handle.chat(
                 messages=sanitized_messages,
                 tools=tools,
@@ -497,6 +507,7 @@ class XinferenceLLM(BaseLLM):
                 deadline=first_deadline,
                 timeout_message=first_timeout_message,
             )
+            self._apply_session_affinity(generate_config)
             stream = await _await_before_deadline(
                 model_handle.chat(
                     messages=sanitized_messages,

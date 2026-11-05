@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
+import json
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -16,18 +18,22 @@ from uuid import uuid4
 from ...config import (
     COMPACT_THRESHOLD_DEFAULT,
     get_compact_threshold_default,
+    get_session_secret,
 )
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
+from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
 from ..inline_file_delivery import InlineFileDelivery
 from ..model.chat.exceptions import ModelProviderError
+from ..model.chat.routing_context import xinference_routing_key
 from ..model.chat.token_context import token_usage_observer
 from ..model.intent import enter_goal, exit_goal
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ..user_context import current_user_id
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .budget import (
@@ -300,6 +306,22 @@ def classify_injection(
     return InjectionDisposition.DEFER
 
 
+def _session_routing_key(context: ExecutionContext, execution_id: str) -> str:
+    scope = get_execution_scope()
+    owner = current_user_id.get()
+    identity = json.dumps(
+        [
+            "xinference-session-affinity",
+            str(owner) if owner is not None else context.user_id,
+            scope.workspace_segments if scope is not None else (),
+            execution_id,
+        ]
+    )
+    return hmac.new(
+        get_session_secret().encode(), identity.encode(), "sha256"
+    ).hexdigest()
+
+
 class AgentRunner:
     """Execute an agent by materializing an execution context and invoking patterns."""
 
@@ -526,8 +548,12 @@ class AgentRunner:
         budget_token = None
         usage_token = None
         warning_token = None
+        routing_token = None
 
         try:
+            routing_token = xinference_routing_key.set(
+                _session_routing_key(context, execution_id)
+            )
             if inherited_budget is None:
                 policy = (
                     self.budget_policy_provider()
@@ -842,6 +868,8 @@ class AgentRunner:
                 active_execution_budget.reset(budget_token)
             if warning_token is not None:
                 budget_warning_handler.reset(warning_token)
+            if routing_token is not None:
+                xinference_routing_key.reset(routing_token)
 
     async def _finish_budget_stop(
         self,

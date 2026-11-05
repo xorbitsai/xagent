@@ -5126,6 +5126,8 @@ async def execute_durable_task_command(
 
                 return await execute_resume_input(command)
             if command.kind == TaskCommandKind.START:
+                if not get_shared_task_execution_enabled():
+                    return await _execute_local_existing_start(command)
                 from .task_start_consumer import execute_task_start
 
                 return await execute_task_start(command)
@@ -5140,6 +5142,27 @@ async def execute_durable_task_command(
         if current_task_coordinator(command.task_id) is None:
             return await execute_coordinated_command(command, execute)
     return await execute()
+
+
+async def _execute_local_existing_start(
+    command: ClaimedTaskCommand,
+) -> dict[str, Any]:
+    """Combined-mode consumer of a legacy ``execute_task`` START.
+
+    Nothing else tells the client a refused START did not run (the WebSocket
+    acknowledged it when it was staged), so a rejection is broadcast.
+    """
+    from .task_existing_command import execute_existing_start_local
+
+    try:
+        return await execute_existing_start_local(command)
+    except TaskCommandRejected as exc:
+        finish_task_command_delivery(command.command_id, command.task_id)
+        bind_terminal_event_draft(
+            exc, await _terminal_command_event_draft(command, exc)
+        )
+        await _broadcast_terminal_command_error(command, exc)
+        raise
 
 
 async def _execute_and_report_task_command(

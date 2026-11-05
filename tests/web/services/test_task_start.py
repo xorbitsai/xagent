@@ -13,7 +13,11 @@ import pytest
 
 from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from xagent.web.models.task import TaskStatus
-from xagent.web.services import task_start
+from xagent.web.services import (
+    task_command_transport,
+    task_existing_command,
+    task_start,
+)
 from xagent.web.services.file_turn import prompt_context_from_agent_config
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 
@@ -75,6 +79,7 @@ def test_task_starts_execute_without_api_routes() -> None:
             from xagent.web.models.agent import Agent
             from xagent.web.models.task import Task, TaskStatus
             from xagent.web.models.chat_message import TaskChatMessage
+            from xagent.web.models.task_command import TaskExecutionCommand
             from xagent.web.services import task_start, task_orchestrator
 
             async def main():
@@ -134,12 +139,16 @@ def test_task_starts_execute_without_api_routes() -> None:
                             agent_id=agent_id, task_owner_user_id=owner, agent_execution_mode="balanced",
                             key_prefix="key-one", text="a2a first", message_id="message-1", context_id=None, task_id=None,
                         )
-                        legacy_handle_index = len(background)
                         await task_start.execute_existing_task(
                             task_id=legacy_id, task_owner_user_id=owner, task_source="internal",
                             task_description="saved task", context={}, actor_user_id=owner,
                         )
-                        assert background[legacy_handle_index].done()
+                        # The legacy command is accepted durably as a START; a
+                        # dispatcher (not under test here) executes it.
+                        with get_session_local()() as db:
+                            staged = db.query(TaskExecutionCommand).filter_by(task_id=legacy_id).one()
+                            assert staged.kind == "start"
+                            assert staged.payload["kind"] == "existing"
                         await asyncio.gather(*background)
                     with get_session_local()() as db:
                         sdk_messages = db.query(TaskChatMessage).filter_by(task_id=created.task_id, role="user").order_by(TaskChatMessage.id).all()
@@ -239,33 +248,29 @@ async def test_sdk_start_cancellation_after_claim_still_schedules(monkeypatch, k
 
 
 @pytest.mark.asyncio
-async def test_legacy_execute_waits_for_background_completion(monkeypatch):
-    scheduled = asyncio.Event()
-    background = asyncio.get_running_loop().create_future()
+async def test_legacy_execute_returns_after_durable_acceptance(monkeypatch):
+    """The START is staged and dispatched; the caller does not await the run."""
+    staged = []
+    dispatched = []
 
-    async def schedule(**kwargs):
-        scheduled.set()
-        return background
+    def stage(**kwargs):
+        staged.append(kwargs)
+        return "run-1", 41
 
+    async def dispatch(executor, *, command_db_id):
+        dispatched.append(command_db_id)
+
+    monkeypatch.setattr(task_existing_command, "stage_existing_execution", stage)
     monkeypatch.setattr(
-        task_start.TaskTurnOrchestrator, "schedule_existing_task_execution", schedule
+        task_command_transport, "dispatch_task_command_promptly", dispatch
     )
-    execution = asyncio.create_task(
-        task_start.execute_existing_task(
-            task_id=91,
-            task_owner_user_id=3,
-            task_source="internal",
-            task_description="saved task",
-            context={},
-            actor_user_id=3,
-        )
+    await task_start.execute_existing_task(
+        task_id=91,
+        task_owner_user_id=3,
+        task_source="internal",
+        task_description="saved task",
+        context={},
+        actor_user_id=3,
     )
-    try:
-        await asyncio.wait_for(scheduled.wait(), timeout=GUARD_TIMEOUT)
-        assert not execution.done()
-        background.set_result(None)
-        await asyncio.wait_for(execution, timeout=GUARD_TIMEOUT)
-    finally:
-        if not background.done():
-            background.set_result(None)
-        await asyncio.gather(execution, return_exceptions=True)
+    assert [call["task_id"] for call in staged] == [91]
+    assert dispatched == [41]

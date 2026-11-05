@@ -49,9 +49,18 @@ from xagent.web.services.task_execution import (
     _rewrite_file_links_to_file_id,
     execute_task_background,
 )
+from xagent.web.services.task_command_transport import (
+    ClaimedTaskCommand,
+    TaskCommandKind,
+)
+from xagent.web.services.task_existing_command import execute_existing_start_local
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
+from xagent.web.services.task_start_protocol import (
+    ExistingExecutionContext,
+    TaskStartPayload,
+)
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
@@ -1741,13 +1750,27 @@ async def test_execute_existing_task_gets_prompt_context_at_run_start(
     monkeypatch.setattr(task_execution_host, "enqueues_task_turns", lambda: False)
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
 
-    await task_start.execute_existing_task(
-        task_id=10,
-        task_owner_user_id=int(user.id),
-        task_source="internal",
-        task_description="saved task",
-        context={},
-        actor_user_id=int(user.id),
+    start = TaskStartPayload(
+        version=1,
+        run_id="run-existing",
+        state_version=0,
+        turn_id="turn-existing",
+        kind="existing",
+        message="saved task",
+        execution_message="saved task",
+        existing_context=ExistingExecutionContext(),
+    )
+    await execute_existing_start_local(
+        ClaimedTaskCommand(
+            id=1,
+            task_id=10,
+            actor_user_id=int(user.id),
+            command_id="turn-existing",
+            kind=TaskCommandKind.START,
+            payload=start.model_dump(mode="json"),
+            target_run_id="run-existing",
+            attempt_count=1,
+        )
     )
 
     assert captured["payload"].transcript_message == "saved task"

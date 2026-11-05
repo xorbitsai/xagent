@@ -75,6 +75,7 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services import task_command_execution as command_execution_service
 from ..services import task_start as task_start_service
+from ..services.task_orchestrator import TaskTurnError
 from ..services.assistant_history_safety import (
     TASK_FAILURE_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
@@ -2297,24 +2298,19 @@ async def send_execution_paused(
 async def handle_execute_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
-    """Admit the legacy direct execution command, then run it.
+    """Durably accept ``execute_task``; the command dispatcher runs it.
 
-    ``execute_task`` starts an execution directly (no durable command), so a
-    planned restart's hold refuses it before the legacy acknowledgement or any
-    lookup, and an admitted one is counted until the execution is registered.
+    Like ``chat``, the execution is a durable command, so a planned restart's
+    hold leaves it pending for the successor instead of refusing it, and no
+    execution starts inside this socket's handler.
     """
-    admitted = release_hold.try_admit("ws_execute_task", f"task:{task_id}")
-    if admitted is None:
-        await send_execution_paused(websocket)
-        return
-    with admitted:
-        await _handle_admitted_execute_task(websocket, task_id, message_data)
+    await _handle_admitted_execute_task(websocket, task_id, message_data)
 
 
 async def _handle_admitted_execute_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
-    """Handle the legacy execution command without retaining a DB Session."""
+    """Accept the execution command without retaining a DB Session."""
     try:
         user = message_data.get("user")
         authorized_task_id: int | None = None
@@ -2369,6 +2365,19 @@ async def _handle_admitted_execute_task(
             actor_user_id=actor_user_id,
         )
 
+    except TaskTurnError as e:
+        if e.reason != "busy":
+            raise
+        # The task is already running or already has an execution command
+        # waiting (a duplicate frame, or one racing a restart hold). Nothing
+        # new is staged, so the execution cannot run twice; the first command
+        # keeps the client's attention and the socket stays open.
+        logger.info(
+            "execute_task for task %s not staged (%s): execution already "
+            "accepted or running",
+            task_id,
+            e.reason,
+        )
     except (
         MCPBuiltinOAuthActorPolicyRequiredError,
         ValueError,

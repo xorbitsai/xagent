@@ -8,7 +8,7 @@ from jsonschema import Draft202012Validator
 from xagent.core.model.chat.basic.claude import (
     ClaudeLLM,
     _anthropic_input_usage,
-    _anthropic_progress_tool_calls,
+    _anthropic_stream_tool_calls,
     _fix_pydantic_schema_for_claude,
 )
 from xagent.core.model.chat.stream_progress import (
@@ -248,17 +248,18 @@ class TestClaudeLLM:
         assert stream.closed is False
 
     def test_progress_tool_calls_do_not_invent_complete_arguments(self):
-        calls = _anthropic_progress_tool_calls(
+        calls = _anthropic_stream_tool_calls(
             {
                 "toolu_1": {
                     "id": "toolu_1",
                     "name": "search",
                     "arguments": "",
                 }
-            }
+            },
+            empty_arguments="",
         )
 
-        assert calls["toolu_1"]["function"]["arguments"] == ""
+        assert calls[0]["function"]["arguments"] == ""
 
     @pytest.mark.asyncio
     async def test_stream_empty_model_deltas_abort(self, llm, mocker, monkeypatch):
@@ -357,6 +358,66 @@ class TestClaudeLLM:
         assert stream.closed is False
 
     @pytest.mark.asyncio
+    async def test_stream_separates_reasoning_from_interleaved_thinking_blocks(
+        self, llm, mocker, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+        stream = _AsyncEventStream(
+            [
+                _event(
+                    "content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(type="thinking", thinking=""),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=0,
+                    delta=SimpleNamespace(
+                        type="thinking_delta", thinking="First thought"
+                    ),
+                ),
+                _event(
+                    "content_block_start",
+                    index=1,
+                    content_block=SimpleNamespace(type="text", text=""),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=1,
+                    delta=SimpleNamespace(type="text_delta", text="Answer"),
+                ),
+                _event(
+                    "content_block_start",
+                    index=2,
+                    content_block=SimpleNamespace(type="thinking", thinking=""),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=2,
+                    delta=SimpleNamespace(
+                        type="thinking_delta", thinking="Second thought"
+                    ),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=3,
+                    delta=SimpleNamespace(type="text_delta", text=" done"),
+                ),
+            ]
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = stream
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        assert chunks[-1].content == "Answer done"
+        assert chunks[-1].raw["reasoning_content"] == "First thought\n\nSecond thought"
+
+    @pytest.mark.asyncio
     async def test_stream_repeated_thinking_aborts_and_closes(
         self, llm, mocker, monkeypatch
     ):
@@ -438,6 +499,182 @@ class TestClaudeLLM:
         assert final.raw[STREAM_ABORTED_KEY] == "tool_call_trailing_bytes"
         assert final.tool_calls[0]["function"]["arguments"] == '{"q":"x"}'
         assert stream.consumed == 3
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_abort_keeps_text_already_yielded(
+        self, llm, mocker, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+        stream = _AsyncEventStream(
+            [
+                _event(
+                    "content_block_delta",
+                    index=0,
+                    delta=SimpleNamespace(type="text_delta", text="Already sent"),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=0,
+                    delta=SimpleNamespace(type="text_delta", text=""),
+                ),
+            ]
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = stream
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        assert [chunk.type for chunk in chunks] == [ChunkType.TOKEN, ChunkType.END]
+        assert chunks[0].content == "Already sent"
+        assert chunks[0].delta == "Already sent"
+        assert chunks[-1].finish_reason == "no_progress"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_trailing_bytes_trim_only_the_affected_tool(
+        self, llm, mocker, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+        events = [
+            _event(
+                "content_block_start",
+                index=0,
+                content_block=SimpleNamespace(
+                    type="tool_use", id="toolu_first", name="first"
+                ),
+            ),
+            _event(
+                "content_block_delta",
+                index=0,
+                delta=SimpleNamespace(
+                    type="input_json_delta", partial_json='{"value":1}'
+                ),
+            ),
+            _event(
+                "content_block_start",
+                index=1,
+                content_block=SimpleNamespace(
+                    type="tool_use", id="toolu_second", name="second"
+                ),
+            ),
+            _event(
+                "content_block_delta",
+                index=1,
+                delta=SimpleNamespace(
+                    type="input_json_delta", partial_json='{"value":2}'
+                ),
+            ),
+            _event(
+                "content_block_delta",
+                index=1,
+                delta=SimpleNamespace(type="input_json_delta", partial_json="junk"),
+            ),
+        ]
+        stream = _AsyncEventStream(events)
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = stream
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        final = chunks[-1]
+        assert final.finish_reason == "no_progress"
+        assert [call["function"]["arguments"] for call in final.tool_calls] == [
+            '{"value":1}',
+            '{"value":2}',
+        ]
+        assert stream.consumed == 5
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_trailing_whitespace_restores_last_valid_snapshot(
+        self, llm, mocker, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "2")
+        stream = _AsyncEventStream(
+            [
+                _event(
+                    "content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(
+                        type="tool_use", id="toolu_1", name="search"
+                    ),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=0,
+                    delta=SimpleNamespace(
+                        type="input_json_delta", partial_json='{"q":"x"}'
+                    ),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=0,
+                    delta=SimpleNamespace(type="input_json_delta", partial_json="  "),
+                ),
+            ]
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = stream
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        final = chunks[-1]
+        assert final.finish_reason == "no_progress"
+        assert final.raw[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+        assert final.tool_calls[0]["function"]["arguments"] == '{"q":"x"}'
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_first_tool_delta_with_trailing_bytes_keeps_empty_shape(
+        self, llm, mocker, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+        stream = _AsyncEventStream(
+            [
+                _event(
+                    "content_block_start",
+                    index=0,
+                    content_block=SimpleNamespace(
+                        type="tool_use", id="toolu_1", name="search"
+                    ),
+                ),
+                _event(
+                    "content_block_delta",
+                    index=0,
+                    delta=SimpleNamespace(
+                        type="input_json_delta", partial_json='{"q":"x"}junk'
+                    ),
+                ),
+            ]
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.messages.create.return_value = stream
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0].finish_reason == "no_progress"
+        assert chunks[0].raw[STREAM_ABORTED_KEY] == "tool_call_trailing_bytes"
+        assert chunks[0].tool_calls[0]["function"]["arguments"] == "{}"
+        assert stream.consumed == 2
         assert stream.closed is True
 
     @pytest.mark.asyncio
@@ -636,8 +873,10 @@ class TestClaudeLLM:
         assert stream.consumed == (2 if has_tool else 1)
         assert stream.closed is True
         if not has_tool:
-            # One warning for the orphan delta and one for the abort itself.
-            assert warning.call_count == 2
+            assert any(
+                "event.index %s has no accumulated tool call" in str(call.args)
+                for call in warning.call_args_list
+            )
 
     @pytest.mark.asyncio
     async def test_stream_abort_with_zero_argument_tool_uses_public_empty_object(

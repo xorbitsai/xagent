@@ -394,12 +394,10 @@ def no_progress_tail_chunk(
     """
     if abort.tool_call_id is not None and abort.keep_length is not None:
         call = accumulated_tool_calls.get(abort.tool_call_id)
-        if isinstance(call, dict):
-            function = call.get("function")
-            if isinstance(function, dict):
-                arguments = function.get("arguments")
-                if isinstance(arguments, str):
-                    function["arguments"] = arguments[: abort.keep_length]
+        if call:
+            call["function"]["arguments"] = call["function"]["arguments"][
+                : abort.keep_length
+            ]
 
     if hasattr(raw_payload, "model_dump"):
         raw_payload = raw_payload.model_dump()

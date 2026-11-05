@@ -479,7 +479,8 @@ async def _extract(
             if parsed.reason == "too_long":
                 logger.warning(
                     "Structured output is too large. task_id=%s run_id=%s "
-                    "stage=arguments arguments_bytes=%d",
+                    "stage=arguments arguments_bytes=%d r1_steps=0 "
+                    "expansion_nodes=0 output_bytes=0",
                     task_id,
                     run_id,
                     parsed.arguments_bytes,
@@ -619,7 +620,8 @@ async def _attach_structured_output(
     message may hold text of the answer. A
     missing result or format comes back as it is. The trace event is written
     after the outcome is settled and outside the guarded part, and only when the
-    model was asked.
+    extraction was started (the eligibility check chose to extract), whether or
+    not the model was reached.
     """
     if result is None or fmt is None:
         return result

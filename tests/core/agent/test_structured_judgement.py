@@ -456,24 +456,20 @@ def test_the_size_of_a_small_template_is_the_size_of_its_json() -> None:
     assert root.template_bytes == 49
 
 
-def test_the_template_sizes_of_a_chain_of_seven_doubled_layers() -> None:
-    long_a, long_b = "a" * 64, "b" * 64
+def _p4b_schema() -> dict[str, Any]:
+    """A list whose elements each hold a required object that expands to a
+    template of 17,911 bytes."""
     defs: dict[str, Any] = {
-        f"D{i}": _obj({long_a: _ref(f"D{i + 1}"), long_b: _ref(f"D{i + 1}")})
+        f"D{i}": _obj({"a" * 64: _ref(f"D{i + 1}"), "b" * 64: _ref(f"D{i + 1}")})
         for i in range(7)
     }
     defs["D7"] = {"type": ["string", "null"]}
-    compiled = _compile(
-        _obj(
-            {
-                "items": {
-                    "type": "array",
-                    "items": _obj({"i": {"type": "integer"}, "b": _ref("D0")}),
-                }
-            },
-            **{"$defs": defs},
-        )
-    )
+    element = _obj({"i": {"type": "integer"}, "b": _ref("D0")})
+    return _obj({"items": {"type": "array", "items": element}}, **{"$defs": defs})
+
+
+def test_the_template_sizes_of_a_chain_of_seven_doubled_layers() -> None:
+    compiled = _compile(_p4b_schema())
     element = _items(compiled, _child(compiled, _root(compiled), "items"))
     d0 = _child(compiled, element, "b")
 
@@ -763,6 +759,8 @@ def test_different_ways_of_writing_one_answer_give_one_outcome(
             ]
             assert not any(_failed(r) for r in results), (schema, decision)
             if max(r.r1_steps + r.expansion_nodes for r in results) > 100_000:
+                continue
+            if max(getattr(r, "output_bytes", 0) for r in results) > 2**20:
                 continue
             compared += 1
             assert len({_outcome(r) for r in results}) == 1, (schema, decision)
@@ -1122,3 +1120,132 @@ def test_integers_with_one_hash_are_judged_as_fast_as_integers_with_many() -> No
         return statistics.median(runs)
 
     assert median_seconds(same_hash) < 2 * median_seconds(spread)
+
+
+# --- the size of the result ----------------------------------------------------------------
+
+SPECIAL = _obj(
+    {
+        "s": {"type": ["string", "null"]},
+        "n": {"type": "number"},
+        "i": {"type": "integer"},
+        "kind": {"type": "string", "const": "k\u00e9"},
+        "flag": {"type": "boolean", "const": False},
+        "opts": _obj(
+            {"v": {"type": ["boolean", "null"]}, "w": {"type": ["integer", "null"]}}
+        ),
+    }
+)
+SPECIAL_WRITINGS = [
+    {"s": "\u00e9\u4e2d\U0001f600", "n": 5e-324, "i": 1e20},
+    {"s": 'q"\\\n\t\x01', "n": 1e308, "i": 2.0},
+    {"s": None, "n": -0.0, "i": -3},
+    {"s": "plain", "n": 1.5, "i": 0, "kind": None, "flag": None, "opts": None},
+]
+
+
+@pytest.mark.parametrize("writing", SPECIAL_WRITINGS)
+def test_the_counted_bytes_equal_the_bytes_of_the_serialized_output(
+    writing: dict[str, Any],
+) -> None:
+    instance = {
+        "kind": "k\u00e9",
+        "flag": None,
+        "opts": {"v": True, "w": None},
+    } | writing
+    instance = {k: instance.get(k) for k in SPECIAL["properties"]}
+
+    result = _judge(SPECIAL, instance)
+
+    assert isinstance(result, ss.Ready)
+    assert result.output_bytes == ss.canonical_json_bytes(result.output)
+
+
+def test_the_counted_bytes_equal_the_serialized_bytes_of_random_results(
+    random_cases: Any,
+) -> None:
+    rng = random.Random(7)
+    ready = 0
+    for _, compiled, _, rnode in random_cases:
+        for _ in range(8):
+            result = ss.judge_instance(compiled, gen_instance(rng, rnode))
+            if isinstance(result, ss.Ready):
+                ready += 1
+                assert result.output_bytes == ss.canonical_json_bytes(result.output)
+    assert ready > 100
+
+
+def test_the_judgement_does_not_serialize_the_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(_value: object) -> int:
+        raise AssertionError("the output was serialized")
+
+    monkeypatch.setattr(ss, "canonical_json_bytes", fail)
+
+    assert isinstance(
+        _judge(
+            SPECIAL, SPECIAL_WRITINGS[0] | {"kind": None, "flag": None, "opts": None}
+        ),
+        ss.Ready,
+    )
+
+
+def test_an_empty_answer_counts_the_bytes_of_its_output() -> None:
+    result = ss.judge_empty_answer(
+        _compile(_obj({"o": ALL_NULLABLE, "k": SPECIAL["properties"]["kind"]}))
+    )
+
+    assert isinstance(result, ss.Ready)
+    assert result.output_bytes == ss.canonical_json_bytes(result.output)
+
+
+def test_a_small_result_is_counted_to_the_byte() -> None:
+    options = _obj(
+        {
+            "verbose": {"type": ["boolean", "null"]},
+            "limit": {"type": ["integer", "null"]},
+        }
+    )
+    result = _judge(_obj({"name": STRING, "opt": options}), {"name": "Bo", "opt": None})
+
+    assert isinstance(result, ss.Ready) and result.output_bytes == 49
+
+
+@pytest.mark.parametrize("count", [1, 117])
+def test_a_list_of_big_empty_objects_is_counted_to_the_byte(count: int) -> None:
+    result = _judge(_p4b_schema(), {"items": [{"i": 1, "b": None}] * count})
+
+    assert isinstance(result, ss.Ready)
+    assert (
+        result.output_bytes
+        == 17_924 * count + 11
+        == ss.canonical_json_bytes(result.output)
+    )
+    assert count != 117 or result.output_bytes == 2_097_119
+
+
+def test_a_result_over_2_mib_is_too_complex_even_when_its_nodes_are_few() -> None:
+    result = _judge(_p4b_schema(), {"items": [{"i": 1, "b": None}] * 118})
+
+    assert result == ss.TooComplex(
+        stage="r4",
+        r1_steps=2 + 118 * 3,
+        expansion_nodes=118 * 255,
+        output_bytes=2_115_043,
+    )
+
+
+def test_775_such_elements_pass_the_node_check_and_fail_the_byte_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object) -> None:
+        raise AssertionError("the template was copied")
+
+    monkeypatch.setattr(ss, "_copy_template", fail)
+
+    result = _judge(_p4b_schema(), {"items": [{"i": 1, "b": None}] * 775})
+
+    assert isinstance(result, ss.TooComplex) and result.stage == "r4"
+    assert result.r1_steps + result.expansion_nodes == 199_952
+    assert result.output_bytes == 13_891_111

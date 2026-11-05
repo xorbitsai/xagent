@@ -1189,6 +1189,8 @@ class Ready:
     schema's properties. The counts hold what was seen on the way: the gaps
     (always 0 here), the blank strings read as null, the instance positions
     visited and the positions added by expanding empty required objects.
+    ``output_bytes`` is the size of ``output`` as canonical JSON, counted while
+    the output is built.
     """
 
     output: Any
@@ -1197,6 +1199,7 @@ class Ready:
     blank_as_null_count: int
     r1_steps: int
     expansion_nodes: int
+    output_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1230,11 +1233,13 @@ class Err:
 class TooComplex:
     """A value too big to judge or to return. ``stage`` is ``"r1"`` when the
     shape check passed the step limit and ``"r4"`` when a result that is
-    complete would be too large."""
+    complete would pass ``MAX_JUDGED_STEPS`` positions or ``MAX_RESULT_BYTES``
+    of canonical JSON; ``output_bytes`` is 0 for ``"r1"``."""
 
     stage: str
     r1_steps: int
     expansion_nodes: int
+    output_bytes: int
 
 
 class _Empty:
@@ -1302,7 +1307,7 @@ def _reduce(
         nonlocal steps, blanks
         steps += 1
         if steps > MAX_JUDGED_STEPS:
-            raise _Stop(TooComplex("r1", steps, 0))
+            raise _Stop(TooComplex("r1", steps, 0, 0))
         if value is None:
             if is_root:
                 raise _Stop(Err(_pointer_of(link), "type"))
@@ -1368,6 +1373,19 @@ def _reduce(
     return done, steps, blanks
 
 
+def _scalar_bytes(value: Any) -> int:
+    """The canonical JSON size of a scalar of an output."""
+    if value is None or value is True:
+        return 4
+    if value is False:
+        return 5
+    if type(value) is int:
+        return len(str(value))
+    if type(value) is float:
+        return len(repr(value))
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
 def _copy_template(compiled: CompiledSchema, index: int) -> dict[str, Any]:
     """A fresh output for node ``index`` when it is empty, built from its
     template without recursion."""
@@ -1394,11 +1412,14 @@ def _decide(
     """Turn a reduced tree into the output and the lists of gaps, then decide
     the status. An empty position is null when its node is nullable, an object
     of empty positions when it is an object, its only allowed value when it has
-    one, and a gap otherwise; a marker is a position that cannot be written."""
+    one, and a gap otherwise; a marker is a position that cannot be written.
+    The canonical JSON size of the output is added up position by position, a
+    template counting for its precomputed size, so the output is never
+    serialized."""
     nodes = compiled.nodes
     missing: list[str] = []
     unexpressible: list[str] = []
-    missing_count = unexpressible_count = expansion_nodes = 0
+    missing_count = unexpressible_count = expansion_nodes = output_bytes = 0
     holder: list[Any] = [None]
     slots: list[tuple[Any, Any, int]] = []
     work: list[tuple[int, Any, Any, Any, Any]] = [
@@ -1409,6 +1430,7 @@ def _decide(
         node = nodes[index]
         if item is _EMPTY:
             if node.nullable:
+                output_bytes += 4
                 continue
             if node.kind == "object":
                 if node.missing_total:
@@ -1421,9 +1443,11 @@ def _decide(
                         )
                 else:
                     expansion_nodes += node.template_nodes
+                    output_bytes += node.template_bytes
                     slots.append((parent, key, index))
             elif node.single is not None:
                 parent[key] = node.single
+                output_bytes += node.single_bytes
             else:
                 missing_count += 1
                 if len(missing) < MAX_LISTED_FIELDS:
@@ -1435,6 +1459,8 @@ def _decide(
         elif type(item) is _Obj:
             out = dict.fromkeys(name for name, _, _ in node.properties)
             parent[key] = out
+            output_bytes += 2 + max(len(out) - 1, 0)
+            output_bytes += sum(key_bytes + 1 for _, key_bytes, _ in node.properties)
             for (name, _, child), kid in reversed(
                 list(zip(node.properties, item.kids))
             ):
@@ -1443,6 +1469,7 @@ def _decide(
             assert node.items is not None
             items_out: list[Any] = [None] * len(item.kids)
             parent[key] = items_out
+            output_bytes += 2 + max(len(items_out) - 1, 0)
             for position in reversed(range(len(item.kids))):
                 work.append(
                     (
@@ -1458,6 +1485,7 @@ def _decide(
             if node.kind == "integer" and type(value) is float:
                 value = int(value)
             parent[key] = value
+            output_bytes += _scalar_bytes(value)
     if missing_count or unexpressible_count:
         return Incomplete(
             missing_fields=missing,
@@ -1468,8 +1496,8 @@ def _decide(
             r1_steps=steps,
             expansion_nodes=expansion_nodes,
         )
-    if steps + expansion_nodes > MAX_JUDGED_STEPS:
-        return TooComplex("r4", steps, expansion_nodes)
+    if steps + expansion_nodes > MAX_JUDGED_STEPS or output_bytes > MAX_RESULT_BYTES:
+        return TooComplex("r4", steps, expansion_nodes, output_bytes)
     for target, key, index in slots:
         target[key] = _copy_template(compiled, index)
     return Ready(
@@ -1479,6 +1507,7 @@ def _decide(
         blank_as_null_count=blanks,
         r1_steps=steps,
         expansion_nodes=expansion_nodes,
+        output_bytes=output_bytes,
     )
 
 

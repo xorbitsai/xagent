@@ -32,7 +32,7 @@ def idempotency_scope(principal: ApiKeyPrincipal) -> tuple[str, int]:
     raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
 
-def _raise_rejection(exc: api_idempotency.IdempotencyRejected) -> None:
+def raise_idempotency_rejection(exc: api_idempotency.IdempotencyRejected) -> None:
     if exc.reason == "reused":
         raise V1ApiError(V1ErrorCode.IDEMPOTENCY_KEY_REUSED, 422)
     if exc.reason == "in_progress":
@@ -91,7 +91,7 @@ async def run_with_idempotency(
             )
         )
     except api_idempotency.IdempotencyRejected as exc:
-        _raise_rejection(exc)
+        raise_idempotency_rejection(exc)
         raise
     if isinstance(outcome, api_idempotency.IdempotencyReplay):
         return JSONResponse(

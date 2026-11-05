@@ -1471,6 +1471,14 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
                 os.environ["PYTEST_CURRENT_TEST"] = saved
 
     monkeypatch.setattr(web_app_module, "start_temp_file_cleanup_task", _start_ungated)
+    # The Composio reconcile pass has the same executor-thread shape, so it
+    # must not be scheduled before the failing step either.
+    reconcile_reached = []
+    monkeypatch.setattr(
+        web_app_module,
+        "start_composio_reconcile_task",
+        lambda app_instance: reconcile_reached.append(app_instance),
+    )
 
     async def _selective_to_thread(fn, *args, **kwargs):
         # The sweep must run in a real thread: the stub above blocks until the
@@ -1496,6 +1504,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         # comes first, so the sweep was never scheduled. Without this, moving
         # the scheduling earlier could still satisfy it and pass on luck.
         assert scheduling_reached == []
+        assert reconcile_reached == []
 
         task = getattr(app.state, "temp_file_cleanup_task", None)
         stop = getattr(app.state, "temp_file_cleanup_stop", None)

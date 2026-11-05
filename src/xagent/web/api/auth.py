@@ -3176,6 +3176,75 @@ def _lock_actor_link(db: Session, *, user_id: int, provider: str, app_id: str) -
     _require_one_actor_link(links, app_id)
 
 
+class ActorOAuthFlowRejected(ValueError):
+    """An actor OAuth flow failed one of its checks; ``reason`` names which."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def check_actor_oauth_flow(
+    db: Session,
+    request: Any,
+    *,
+    provider: str,
+    user_id: Any,
+    app_id: Any,
+    nonce: Any,
+    owner_claim: Any,
+) -> str:
+    """Run the actor-flow checks shared by every actor OAuth callback.
+
+    Checks the signed claims' shape, decrypts the owner, compares the browser
+    proof cookie, and requires the user and its personal link to still exist.
+    Returns the owner key, or raises ``ActorOAuthFlowRejected`` naming the
+    failed check. The caller owns the transaction and the flow row.
+    """
+    if (
+        not isinstance(nonce, str)
+        or len(nonce) != 64
+        or any(character not in "0123456789abcdef" for character in nonce)
+        or not isinstance(app_id, str)
+        or not app_id
+        or user_id is None
+    ):
+        raise ActorOAuthFlowRejected("claims_invalid")
+    try:
+        if not isinstance(owner_claim, str):
+            raise ValueError("missing actor owner")
+        owner_key = normalize_user_oauth_resource_owner_key(
+            _decrypt_actor_owner_claim(owner_claim)
+        )
+        if owner_key is None:
+            raise ValueError("missing actor owner")
+    except ValueError:
+        raise ActorOAuthFlowRejected("owner_invalid") from None
+    cookie_value = request.cookies.get(_actor_oauth_cookie_name(nonce))
+    cookie_digest = (
+        hashlib.sha256(cookie_value.encode()).hexdigest()
+        if isinstance(cookie_value, str)
+        else ""
+    )
+    if not secrets.compare_digest(cookie_digest, nonce):
+        raise ActorOAuthFlowRejected(
+            "cookie_mismatch"
+            if isinstance(cookie_value, str) and cookie_value
+            else "cookie_missing"
+        )
+    if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
+        raise ActorOAuthFlowRejected("user_missing")
+    try:
+        _require_actor_oauth_personal_link(
+            db, user_id=user_id, provider=provider, app_id=app_id
+        )
+    except BuiltinOAuthServerDefinitionError:
+        raise ActorOAuthFlowRejected("catalog_invalid") from None
+    except ValueError:
+        raise ActorOAuthFlowRejected("link_invalid") from None
+    return owner_key
+
+
 # Only values of this shape are shown or logged from a callback request. An
 # OAuth `error` is a short ASCII code by spec (RFC 6749 section 4.1.2.1), so
 # anything else is replaced instead of being echoed back.
@@ -4720,59 +4789,20 @@ def generic_oauth_callback(
     resource_owner_key: str | None = None
 
     if is_actor_flow:
-        # Each step names the check it is about to make, so a rejection can
-        # be logged by reason without logging any value of the flow itself.
-        rejection_reason = "claims_invalid"
+        # A rejection is logged by reason, without any value of the flow itself.
         try:
-            if (
-                not isinstance(actor_flow_nonce, str)
-                or len(actor_flow_nonce) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in actor_flow_nonce
-                )
-                or not isinstance(app_id, str)
-                or not app_id
-                or user_id is None
-            ):
-                raise ValueError("invalid actor OAuth claims")
-            rejection_reason = "owner_invalid"
-            if not isinstance(actor_owner_claim, str):
-                raise ValueError("missing actor owner")
-            resource_owner_key = normalize_user_oauth_resource_owner_key(
-                _decrypt_actor_owner_claim(actor_owner_claim)
-            )
-            if resource_owner_key is None:
-                raise ValueError("missing actor owner")
-            cookie_value = request.cookies.get(
-                _actor_oauth_cookie_name(actor_flow_nonce)
-            )
-            rejection_reason = (
-                "cookie_mismatch"
-                if isinstance(cookie_value, str) and cookie_value
-                else "cookie_missing"
-            )
-            cookie_digest = (
-                hashlib.sha256(cookie_value.encode()).hexdigest()
-                if isinstance(cookie_value, str)
-                else ""
-            )
-            if not secrets.compare_digest(cookie_digest, actor_flow_nonce):
-                raise ValueError("actor OAuth browser cookie mismatch")
-            rejection_reason = "user_missing"
-            if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
-                raise ValueError("actor OAuth user no longer exists")
-            rejection_reason = "link_invalid"
-            _require_actor_oauth_personal_link(
+            resource_owner_key = check_actor_oauth_flow(
                 db,
-                user_id=user_id,
+                request,
                 provider=provider,
+                user_id=user_id,
                 app_id=app_id,
+                nonce=actor_flow_nonce,
+                owner_claim=actor_owner_claim,
             )
-        except ValueError as exc:
+        except ActorOAuthFlowRejected as exc:
             db.rollback()
-            if isinstance(exc, BuiltinOAuthServerDefinitionError):
-                rejection_reason = "catalog_invalid"
+            rejection_reason = exc.reason
             _log_oauth_callback_rejection(
                 provider,
                 rejection_reason,

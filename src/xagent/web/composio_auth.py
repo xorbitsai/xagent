@@ -28,22 +28,30 @@ cookie is sent to:
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
    of its app's auth config and toolkit. ``GET /me`` through the proxy gives
    the Facebook user id or the Instagram ``user_id``, and the grant is stored
-   for #3531 to execute. A refused completion spends nothing. When the outcome is lost,
-   an open flow whose link Composio now reports ``ACTIVE`` was completed by
-   this session: it is spent and its account deleted. An account is deleted
-   only when this request has spent the flow that created it, or when no
-   open flow claims a just-activated account and Composio confirms it is
-   this actor's.
+   for #3531 to execute. A refused completion spends nothing.
 
-The three steps are told apart by their parameters only: a ``session_uri``
-never begins a flow and a ``state`` never completes one. A denied or failed
-authorization comes back to ``callback_url`` with a ``connected_account_id``
-and no ``state``; it gets the native "Permission was not granted" page.
+A begin needs a state carrying the Composio marker, a verification carries a
+``session_uri``, and a denied or failed authorization comes back to
+``callback_url`` with a ``connected_account_id`` and no ``state`` (handled only
+while an app's switch is on; it gets the native "Permission was not granted"
+page). Native Meta callbacks keep their own handling.
 
-Disconnect: every local delete of a Composio grant goes through
-``delete_scoped_user_oauth_accounts``, which schedules the Composio account for
-deletion once the caller's outermost transaction commits
-(``schedule_account_deletions``); a rolled-back SAVEPOINT cancels it.
+Cleanup: the connect flow deletes an account only when the request that spent
+its flow fails to bind it. Every other unbound account (a lost complete_auth
+answer, an expired flow cookie, a replaced link, a failed delete) is removed
+by ``reconcile_orphan_accounts``. The app runs it on an interval only when
+``XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS`` is set: it treats every xagent
+account in the apps' auth configs that this database does not reference as
+unbound, so it must only be enabled where no other database uses the same
+auth configs. It only lists the auth configs that are still set: to retire an
+app, switch its backend back to ``native`` first and remove its auth config
+only after its Composio grants are gone and a pass has run.
+
+Disconnect: deleting a grant through ``delete_scoped_user_oauth_accounts``
+schedules its Composio account for deletion once the caller's outermost
+transaction commits (``schedule_account_deletions``); a rolled-back SAVEPOINT
+cancels it. A grant removed another way, such as by the database cascade when
+an admin deletes a user, leaves its account to the reconciler.
 
 Nothing here logs or returns the API key, a connected account id, the
 Composio user id or a ``session_uri``.
@@ -53,13 +61,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import re
-import secrets
+import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
@@ -150,15 +157,12 @@ FLOW_COOKIE_PREFIX = "xagent_composio_flow_"
 # a begin past this is refused rather than evicting a flow whose session could
 # still come back and be activated with no way to bind it.
 _MAX_OPEN_FLOWS = 3
-_FLOW_COOKIE_VERSION = 1
-_FLOW_TTL_SECONDS = 600
 _REQUEST_TIMEOUT_SECONDS = 10
 # Composio ids are short nanoid-style strings. Anything else is refused before
 # it is put in a URL path or stored.
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _PROVIDER_USER_ID_RE = re.compile(r"[0-9]{1,32}")
 _MAX_SESSION_URI_LENGTH = 4096
-_NONCE_RE = re.compile(r"[0-9a-f]{64}")
 
 Step = Literal["begin", "verify", "denied"]
 
@@ -197,11 +201,33 @@ def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
     from .mcp_apps import _normalize_oauth_grant_key
 
     app = COMPOSIO_APPS.get(_normalize_oauth_grant_key(app_id) or "")
-    if app is None:
-        return None
-    if (_env(app.backend_env) or "native").lower() != AUTH_BACKEND:
+    if app is None or not _uses_composio(app):
         return None
     return app
+
+
+def _uses_composio(app: ComposioApp) -> bool:
+    backend = (_env(app.backend_env) or "native").lower()
+    if (
+        backend not in ("native", AUTH_BACKEND)
+        and (
+            app.backend_env,
+            backend,
+        )
+        not in _WARNED_BACKENDS
+    ):
+        _WARNED_BACKENDS.add((app.backend_env, backend))
+        logger.warning(
+            "%s=%r is neither 'native' nor %r; %s connects stay native",
+            app.backend_env,
+            backend,
+            AUTH_BACKEND,
+            app.label,
+        )
+    return backend == AUTH_BACKEND
+
+
+_WARNED_BACKENDS: set[tuple[str, str]] = set()
 
 
 def connector_oauth_route_enabled() -> bool:
@@ -316,10 +342,10 @@ def begin_location(redirect_uri: str, state: str) -> str:
 def callback_step(provider: str, query: Mapping[str, Any]) -> Step | None:
     """Which Composio trip a Meta callback request is, if any.
 
-    A native Meta callback always carries ``code`` or ``error`` with
-    ``state``. A request with ``state`` and neither of them was refused as
-    "missing code or state" before; begin still refuses it unless the state
-    carries the Composio marker, now with an actor-flow page.
+    Native Meta callbacks keep their own handling: a begin needs a state that
+    carries the Composio marker, and a denial is only taken while an app
+    connects through Composio. A ``session_uri`` is never part of a native
+    callback.
     """
     if provider.lower() != META_PROVIDER:
         return None
@@ -330,15 +356,36 @@ def callback_step(provider: str, query: Mapping[str, Any]) -> Step | None:
     if has("session_uri"):
         return "verify"
     # Composio sends a denied or failed authorization back to callback_url
-    # with its connected_account_id and no state (seen live, #3532); a
-    # native Meta callback always carries state.
-    if has("connected_account_id") and not has("state") and not has("code"):
+    # with its connected_account_id and no state (seen live, #3532).
+    if (
+        has("connected_account_id")
+        and not has("state")
+        and not has("code")
+        and any(_uses_composio(app) for app in COMPOSIO_APPS.values())
+    ):
         return "denied"
     if has("code") or has("error"):
         return None
-    if has("state"):
+    if has("state") and _carries_composio_marker(str(query.get("state"))):
         return "begin"
     return None
+
+
+def _carries_composio_marker(state: str) -> bool:
+    """Whether a genuinely signed state, expired or not, is a Composio one."""
+    from .api.auth import JWT_ALGORITHM, JWT_SECRET_KEY
+    from .jwt_codec import JWTError, decode
+
+    try:
+        payload = decode(
+            state,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except JWTError:
+        return False
+    return isinstance(payload, dict) and payload.get(AUTH_BACKEND_CLAIM) == AUTH_BACKEND
 
 
 # --- Composio API ------------------------------------------------------------
@@ -442,6 +489,15 @@ def complete_auth(config: ComposioConfig, *, session_uri: str, user_id: str) -> 
     return account_id
 
 
+def _get_account(config: ComposioConfig, account_id: str) -> dict[str, Any] | None:
+    """One connected account as Composio reports it, or None when unreadable."""
+    status, payload = _call(config.api_key, "GET", f"/connected_accounts/{account_id}")
+    if not 200 <= status < 300 or not isinstance(payload, dict):
+        logger.warning("Composio account lookup failed (status=%s)", status)
+        return None
+    return payload
+
+
 def verify_account(
     config: ComposioConfig,
     *,
@@ -450,9 +506,8 @@ def verify_account(
     toolkit_slug: str,
 ) -> None:
     """Require the account to be ACTIVE, ours, of our auth config and toolkit."""
-    status, payload = _call(config.api_key, "GET", f"/connected_accounts/{account_id}")
-    if not 200 <= status < 300 or not isinstance(payload, dict):
-        logger.warning("Composio account lookup failed (status=%s)", status)
+    payload = _get_account(config, account_id)
+    if payload is None:
         raise ComposioError("account_lookup_failed")
     toolkit = payload.get("toolkit")
     auth_config = payload.get("auth_config")
@@ -526,11 +581,6 @@ def delete_account(api_key: str, account_id: str) -> bool:
     try:
         status, _ = _call(api_key, "DELETE", f"/connected_accounts/{account_id}")
     except ComposioError:
-        return False
-    except Exception as exc:  # pragma: no cover - _call already narrows
-        logger.warning(
-            "Composio account deletion failed (exception_type=%s)", type(exc).__name__
-        )
         return False
     if 200 <= status < 300 or status == 404:
         # 404: Composio already considers it gone.
@@ -687,6 +737,183 @@ def _delete_after_commit(account_ids: list[str]) -> None:
         )
 
 
+# --- Reconciler: the one place unbound accounts are removed -----------------
+
+# Composio user ids xagent derives (composio_user_id). Any other account in an
+# auth config, such as one connected from Composio's dashboard, is not ours.
+_XAGENT_USER_ID_PREFIX = "xagent-"
+# Past the flow TTL: a connect still in progress spends its flow within the
+# TTL of its start, and the account is created after that start. Binding after
+# the spend takes a few bounded Composio and Graph calls; a bind still not
+# committed after the grace period could lose its account to a pass.
+_RECONCILE_GRACE_SECONDS = 30 * 60
+_RECONCILE_PAGE_SIZE = 100
+
+
+def _created_at(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _unbound_candidates(
+    config: ComposioConfig, *, cutoff: float, stopping: Callable[[], bool]
+) -> list[str]:
+    """xagent's accounts of one auth config created before ``cutoff``.
+
+    Follows every page and stops on a repeated cursor. A failed page ends the
+    listing; what the earlier pages gave is still returned.
+    """
+    candidates: list[str] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    while not stopping():
+        query: dict[str, Any] = {
+            "auth_config_ids": config.auth_config_id,
+            "limit": _RECONCILE_PAGE_SIZE,
+        }
+        if cursor:
+            query["cursor"] = cursor
+        try:
+            status, payload = _call(
+                config.api_key, "GET", f"/connected_accounts?{urlencode(query)}"
+            )
+        except ComposioError:
+            break
+        if not 200 <= status < 300 or not isinstance(payload, dict):
+            logger.warning("Composio account listing failed (status=%s)", status)
+            break
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            account_id = _valid_account_id(item.get("id"))
+            user_id = item.get("user_id")
+            auth_config = item.get("auth_config")
+            created = _created_at(item.get("created_at"))
+            if (
+                account_id is not None
+                and isinstance(user_id, str)
+                and user_id.startswith(_XAGENT_USER_ID_PREFIX)
+                and isinstance(auth_config, dict)
+                and auth_config.get("id") == config.auth_config_id
+                and created is not None
+                and created.timestamp() < cutoff
+            ):
+                candidates.append(account_id)
+        next_cursor = payload.get("next_cursor")
+        cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
+        if cursor is None:
+            break
+        if cursor in seen_cursors:
+            logger.warning("Composio account listing repeated a cursor; stopping")
+            break
+        seen_cursors.add(cursor)
+    return candidates
+
+
+def reconcile_orphan_accounts(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Delete xagent's Composio accounts that no stored grant uses.
+
+    The connect flow deletes an account only when the request that spent its
+    flow fails to bind it. Everything else that can leave an unbound account
+    (a lost complete_auth answer, an expired flow cookie, a replaced link, a
+    failed delete after disconnect, a user deleted with their grants) is
+    cleaned up here, for every app whose Composio config is complete. Only
+    accounts of an app's auth config whose Composio user id xagent derived,
+    and that are older than the flow TTL plus a grace period, are considered;
+    an account without a user id is never deleted. A grant of any app counts
+    as a reference. The list is used for cleanup only, never for binding. A
+    pass deletes nothing when a stored grant cannot be decrypted (its account
+    would look unused), and stops between requests once ``stop_event`` is
+    set. Returns how many were deleted.
+    """
+    from .models.user_oauth import UserOAuth, is_undecryptable_oauth_token
+
+    def stopping() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    cutoff = (now or datetime.now(timezone.utc)).timestamp() - (
+        _flow_ttl_seconds() + _RECONCILE_GRACE_SECONDS
+    )
+    candidates: dict[str, str] = {}  # account id -> API key
+    for config in _configured_apps().values():
+        for account_id in _unbound_candidates(config, cutoff=cutoff, stopping=stopping):
+            candidates.setdefault(account_id, config.api_key)
+    if not candidates or stopping():
+        return 0
+    tokens = [
+        row[0]
+        for row in db.query(UserOAuth.access_token)
+        .filter(UserOAuth.token_type == COMPOSIO_TOKEN_TYPE)
+        .all()
+    ]
+    db.rollback()
+    if any(is_undecryptable_oauth_token(token) for token in tokens):
+        logger.warning(
+            "Skipping Composio reconcile: a stored grant cannot be decrypted"
+        )
+        return 0
+    referenced = {str(token) for token in tokens if token}
+    deleted = 0
+    for account_id, api_key in candidates.items():
+        if stopping():
+            break
+        if account_id not in referenced and delete_account(api_key, account_id):
+            deleted += 1
+    if deleted:
+        logger.info("Deleted %d unbound Composio accounts", deleted)
+    return deleted
+
+
+def reconcile_orphan_accounts_isolated(
+    session_factory: Callable[[], Session] | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Run one reconcile pass in its own short-lived Session."""
+    if session_factory is None:
+        from .models.database import get_session_local
+
+        session_factory = get_session_local()
+    with session_factory() as db:
+        return reconcile_orphan_accounts(db, stop_event=stop_event)
+
+
+async def run_reconcile_loop(
+    *, interval_seconds: int, stop_event: threading.Event
+) -> None:
+    """Reconcile on an interval; a failed pass is logged and retried later.
+
+    Cancelling the task does not stop a pass already handed to a worker
+    thread, so shutdown sets ``stop_event`` first and the pass returns at its
+    next request boundary.
+    """
+    import asyncio
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.to_thread(
+                reconcile_orphan_accounts_isolated, stop_event=stop_event
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Composio reconcile pass failed (exception_type=%s)",
+                type(exc).__name__,
+            )
+        await asyncio.sleep(interval_seconds)
+
+
 # --- Browser trips -------------------------------------------------------------
 
 
@@ -730,15 +957,11 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
     """Run every check that does not need Composio. Raises ``_Rejected``."""
     from .api.auth import (
         _MAX_USER_ID,
-        _actor_oauth_cookie_name,
-        _decrypt_actor_owner_claim,
+        ActorOAuthFlowRejected,
         _expired_actor_oauth_state,
-        _require_actor_oauth_personal_link,
+        check_actor_oauth_flow,
         verify_token,
     )
-    from .mcp_apps import BuiltinOAuthServerDefinitionError
-    from .models.user import User
-    from .services.user_oauth import normalize_user_oauth_resource_owner_key
 
     payload = verify_token(state)
     if payload is None:
@@ -750,52 +973,34 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
     user_id = payload.get("user_id")
     expires_at = payload.get("exp")
     app_id = payload.get("app_id")
+    # The Composio-specific claims; the shared actor checks follow.
     if (
         payload.get("type") != "oauth_state"
         or payload.get("provider") != META_PROVIDER
         or payload.get(AUTH_BACKEND_CLAIM) != AUTH_BACKEND
         or not isinstance(app_id, str)
         or app_id not in COMPOSIO_APPS
-        or not isinstance(nonce, str)
-        or not _NONCE_RE.fullmatch(nonce)
         or type(user_id) is not int
         or not 0 < user_id <= _MAX_USER_ID
         or not isinstance(expires_at, (int, float))
     ):
         raise _reject("claims_invalid")
-    owner_claim = payload.get("resource_owner_key")
     try:
-        if not isinstance(owner_claim, str):
-            raise ValueError("missing actor owner")
-        owner_key = normalize_user_oauth_resource_owner_key(
-            _decrypt_actor_owner_claim(owner_claim)
+        owner_key = check_actor_oauth_flow(
+            db,
+            request,
+            provider=META_PROVIDER,
+            user_id=user_id,
+            app_id=app_id,
+            nonce=nonce,
+            owner_claim=payload.get("resource_owner_key"),
         )
-        if owner_key is None:
-            raise ValueError("missing actor owner")
-    except ValueError:
-        raise _reject("owner_invalid") from None
-
-    cookie_value = request.cookies.get(_actor_oauth_cookie_name(nonce))
-    if not isinstance(cookie_value, str) or not cookie_value:
-        raise _reject("cookie_missing")
-    if not secrets.compare_digest(
-        hashlib.sha256(cookie_value.encode()).hexdigest(), nonce
-    ):
-        raise _reject("cookie_mismatch")
-    if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
-        raise _reject("user_missing")
-    try:
-        _require_actor_oauth_personal_link(
-            db, user_id=user_id, provider=META_PROVIDER, app_id=app_id
-        )
-    except BuiltinOAuthServerDefinitionError:
-        raise _reject("catalog_invalid") from None
-    except ValueError:
-        raise _reject("link_invalid") from None
+    except ActorOAuthFlowRejected as exc:
+        raise _reject(exc.reason) from None
     redirect = payload.get("redirect")
     return _Flow(
         state=state,
-        nonce=nonce,
+        nonce=str(nonce),
         user_id=user_id,
         owner_key=owner_key,
         redirect=redirect if isinstance(redirect, str) else None,
@@ -823,35 +1028,30 @@ def _flow_cookie_name(nonce: str) -> str:
     return f"{FLOW_COOKIE_PREFIX}{nonce[:24]}"
 
 
+def _flow_ttl_seconds() -> int:
+    from .api.auth import _ACTOR_OAUTH_FLOW_TTL
+
+    return int(_ACTOR_OAUTH_FLOW_TTL.total_seconds())
+
+
 def _encode_flow_cookie(state: str, account_id: str) -> str:
     from ..core.utils.encryption import get_cipher
 
-    envelope = json.dumps(
-        {"account": account_id, "state": state, "version": _FLOW_COOKIE_VERSION},
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return get_cipher().encrypt(envelope.encode()).decode()
+    # Fernet already authenticates the value and dates it for the TTL check.
+    return get_cipher().encrypt(f"{account_id} {state}".encode()).decode()
 
 
 def _decode_flow_cookie(value: str) -> tuple[str, str] | None:
     from ..core.utils.encryption import get_cipher
 
     try:
-        envelope = json.loads(
-            get_cipher().decrypt(value.encode(), ttl=_FLOW_TTL_SECONDS)
-        )
+        plain = get_cipher().decrypt(value.encode(), ttl=_flow_ttl_seconds()).decode()
     except (InvalidToken, ValueError, TypeError):
         return None
-    if (
-        not isinstance(envelope, dict)
-        or set(envelope) != {"account", "state", "version"}
-        or envelope.get("version") != _FLOW_COOKIE_VERSION
-        or not isinstance(envelope.get("state"), str)
-        or _valid_account_id(envelope.get("account")) is None
-    ):
+    account_id, _, state = plain.partition(" ")
+    if _valid_account_id(account_id) is None or not state:
         return None
-    return envelope["state"], envelope["account"]
+    return state, account_id
 
 
 @dataclass(frozen=True)
@@ -989,9 +1189,8 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
         _log_rejection(exc.reason, flow.app_id)
         return _unavailable_page(flow.app_id)
     # A reloaded begin replaces this flow's link. The previous link is not
-    # deleted here: the original window may be completing it right now. If its
-    # session still comes back, no open flow claims the account and it is
-    # removed there; otherwise it stays paused and is never activated.
+    # deleted here: the original window may be completing it right now. If it
+    # ends up unbound, the reconciler removes it.
 
     response = RedirectResponse(redirect_url, status_code=302)
     # Our URL carries the state; Composio's page must not receive it.
@@ -1002,7 +1201,7 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     response.set_cookie(
         _flow_cookie_name(flow.nonce),
         _encode_flow_cookie(flow.state, account_id),
-        max_age=max(1, min(_FLOW_TTL_SECONDS, int(flow.expires_at - time.time()))),
+        max_age=max(1, min(_flow_ttl_seconds(), int(flow.expires_at - time.time()))),
         secure=secure,
         httponly=True,
         samesite="lax",
@@ -1015,8 +1214,8 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     """Say what to do after Composio returns a denied or failed authorization.
 
     The returned id is trusted only to find the open flow whose encrypted
-    cookie names the same account; that flow is ended and its unfinished
-    account deleted. Anything else is left alone.
+    cookie names the same account; that flow is ended. Its unfinished account
+    is left to the reconciler (``reconcile_orphan_accounts``).
     """
     from .api.auth import (
         _actor_oauth_provider_error_response,
@@ -1031,14 +1230,9 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     matches = [f for f in browser_flows.open if returned and f.account_id == returned]
     app_ids = sorted({match.flow.app_id for match in matches})
     log_app = app_ids[0] if len(app_ids) == 1 else None
-    # The API key is shared, so a flow's account is deleted even when its
-    # own app's config went away after the flow began.
-    shared = next(iter(_configured_apps().values()), None)
     for match in matches:
         dead.append(match.cookie_name)
-        # Unfinished, or (without verification) active but never bound here.
-        if _spend(db, match) and shared is not None:
-            delete_account(shared.api_key, match.account_id)
+        _spend(db, match)
     if query.get("status") == "success":
         # Composio activated the connection without handing it to us: its
         # project has no OAuth user verification pointed at this callback.
@@ -1068,72 +1262,10 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     )
 
 
-def _account_status(config: ComposioConfig, account_id: str) -> str | None:
-    """The account's status at Composio, or None when it cannot be read."""
-    try:
-        status, payload = _call(
-            config.api_key, "GET", f"/connected_accounts/{account_id}"
-        )
-    except ComposioError:
-        return None
-    if not 200 <= status < 300 or not isinstance(payload, dict):
-        return None
-    value = payload.get("status")
-    return value if isinstance(value, str) else None
-
-
-def _belongs_to(
-    config: ComposioConfig,
-    *,
-    account_id: str,
-    user_id: str,
-    auth_config_ids: set[str],
-) -> bool:
-    """Whether Composio reports the account as this actor's, of our configs."""
-    try:
-        status, payload = _call(
-            config.api_key, "GET", f"/connected_accounts/{account_id}"
-        )
-    except ComposioError:
-        return False
-    if not 200 <= status < 300 or not isinstance(payload, dict):
-        return False
-    auth_config = payload.get("auth_config")
-    return (
-        payload.get("user_id") == user_id
-        and isinstance(auth_config, dict)
-        and auth_config.get("id") in auth_config_ids
-    )
-
-
 def _spend(db: Session, open_flow: _OpenFlow) -> bool:
     """Spend one flow; False when it was spent or expired meanwhile."""
     deleted = _flow_row_query(db, open_flow.flow.nonce).delete(
         synchronize_session=False
-    )
-    if deleted != 1:
-        db.rollback()
-        return False
-    db.commit()
-    return True
-
-
-def _spend_expired_for_cleanup(db: Session, open_flow: _OpenFlow) -> bool:
-    """Claim an expired, unspent flow for cleanup, never for storing a grant.
-
-    The deadline can pass during complete_auth. Deleting the remaining row
-    atomically distinguishes that case from a flow another request consumed.
-    Every successful binding consumes this same row first.
-    """
-    from .models.actor_oauth_flow import ActorOAuthFlowState
-
-    deleted = (
-        db.query(ActorOAuthFlowState)
-        .filter(
-            ActorOAuthFlowState.nonce == open_flow.flow.nonce,
-            ActorOAuthFlowState.expires_at <= datetime.now(timezone.utc),
-        )
-        .delete(synchronize_session=False)
     )
     if deleted != 1:
         db.rollback()
@@ -1197,58 +1329,35 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             return _clear_flow_cookies(
                 _reject("composio_rejected").response, db_provider, dead
             )
-        # Composio may have activated an account before the answer was lost.
-        # Each open flow's link stays paused until its own session completes,
-        # so one that is now ACTIVE was completed here. A stored grant needs
-        # its flow spent first, so an open flow's account is never bound: it
-        # is deleted once this request has spent that flow. Unfinished links
-        # are left alone, and their flows stay open.
-        for open_flow in open_flows:
-            if _account_status(shared, open_flow.account_id) == "ACTIVE" and (
-                _spend(db, open_flow) or _spend_expired_for_cleanup(db, open_flow)
-            ):
-                delete_account(shared.api_key, open_flow.account_id)
-                dead.append(open_flow.cookie_name)
+        # Composio may have activated an account before the answer was lost;
+        # which one cannot be told here. Nothing is spent or deleted: an
+        # account that ends up unbound is removed by the reconciler.
         return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
 
     matches = [
         open_flow for open_flow in open_flows if open_flow.account_id == account_id
     ]
     if not matches:
-        # No open flow created it: a flow whose cookie already expired, or an
-        # id that is not ours at all. Composio answers 404 for a session that
-        # was already used, so an account complete_auth has just activated is
-        # never one that is already bound. It is deleted when Composio
-        # confirms it is this actor's, and left alone otherwise.
+        # No open flow created it (for example, its cookie expired while the
+        # member was signing in). It is not bound here; if it is ours and
+        # stays unbound, the reconciler removes it.
         logger.warning("Composio completed a connection no open flow created")
         _log_rejection("account_invalid", log_app)
-        if _belongs_to(
-            shared,
-            account_id=account_id,
-            user_id=composio_user,
-            # Any configured app's: the flow it came from may be gone.
-            auth_config_ids={
-                app_config.auth_config_id for app_config in configs.values()
-            },
-        ):
-            delete_account(shared.api_key, account_id)
         return _clear_flow_cookies(
             _reject("composio_rejected").response, db_provider, dead
         )
     match = matches[0]
     app_id = match.flow.app_id
     dead.append(match.cookie_name)
-    # From here on the account is the one this flow created for this actor:
-    # if it cannot be bound, it is deleted rather than left unbound.
     if not _spend(db, match):
-        # An expired row can still be claimed for cleanup. A missing row was
-        # consumed by another request, whose account must be left alone.
-        if _spend_expired_for_cleanup(db, match):
-            delete_account(shared.api_key, account_id)
+        # Spent by another request (which binds it) or expired meanwhile (the
+        # reconciler then removes the unbound account). Never delete here.
         _log_rejection("flow_used_or_expired", app_id)
         return _clear_flow_cookies(
             _reject("flow_used_or_expired").response, db_provider, dead
         )
+    # This request spent the flow that created the account, so the account is
+    # its own: if it cannot be bound, it is deleted rather than left unbound.
     config = configs.get(app_id)
     if config is None:
         # This app's config went away after its flow began.

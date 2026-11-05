@@ -334,6 +334,7 @@ def test_media_container_polling_honors_wall_clock_deadline(monkeypatch):
         "/container-deadline",
         params={"fields": "status_code,status"},
         timeout=instagram.meta_graph.DEFAULT_TIMEOUT_SECONDS,
+        base_url=instagram.meta_graph.GRAPH_BASE_URL,
     )
     sleep.assert_not_called()
 
@@ -489,3 +490,181 @@ def test_graph_api_error_message_truncates_large_response_text(monkeypatch):
     assert result["status"] == "error"
     assert "... [truncated]" in result["message"]
     assert "x" * 1001 not in result["message"]
+
+
+# Instagram Login mode (#3533): a Composio-backed Instagram grant uses
+# Instagram Login, so every call goes through Composio to graph.instagram.com.
+IG_HOST = "https://graph.instagram.com/v25.0"
+
+
+@pytest.fixture()
+def instagram_login_env(monkeypatch):
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    monkeypatch.setenv("COMPOSIO_CONNECTED_ACCOUNT_ID", "ca_ig")
+    monkeypatch.setenv("COMPOSIO_USER_ID", "actor-hmac")
+    monkeypatch.setattr(
+        instagram.meta_graph, "_proxy_response_secrets", set(), raising=False
+    )
+
+
+def _proxied(data):
+    body = {"data": data, "status": 200, "headers": {}}
+    return MockResponse(body, text=json.dumps(body))
+
+
+def _graph_calls(mock_request):
+    """(endpoint, method, query, body) of every proxied call."""
+    calls = []
+    for call in mock_request.call_args_list:
+        payload = call.kwargs["json"]
+        query = {
+            item["name"]: item["value"]
+            for item in payload.get("parameters", [])
+            if item["type"] == "query"
+        }
+        calls.append(
+            (payload["endpoint"], payload["method"], query, payload.get("body"))
+        )
+    return calls
+
+
+def test_instagram_login_auth_status_reads_the_instagram_account(
+    monkeypatch, instagram_login_env
+):
+    """Instagram Login has no email field; asking for it fails (code 100)."""
+    mock_request = Mock(
+        return_value=_proxied(
+            {
+                "user_id": "1784140000",
+                "username": "cafe",
+                "name": "Cafe",
+                "account_type": "BUSINESS",
+                "id": "app-scoped-1",
+            }
+        )
+    )
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    result = _payload(instagram.instagram_auth_status())
+
+    assert result == {
+        "status": "success",
+        "authenticated": True,
+        "user": {
+            "id": "1784140000",
+            "username": "cafe",
+            "name": "Cafe",
+            "account_type": "BUSINESS",
+        },
+    }
+    assert _graph_calls(mock_request) == [
+        (
+            f"{IG_HOST}/me",
+            "GET",
+            {"fields": "user_id,username,name,account_type"},
+            None,
+        )
+    ]
+
+
+def test_instagram_login_lists_the_one_account_without_a_page(
+    monkeypatch, instagram_login_env
+):
+    """An Instagram Login token has no Facebook Pages to walk."""
+    mock_request = Mock(
+        return_value=_proxied(
+            {
+                "user_id": "1784140000",
+                "username": "cafe",
+                "name": "Cafe",
+                "profile_picture_url": "https://cdn.example/p.jpg",
+            }
+        )
+    )
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    result = _payload(instagram.instagram_list_linked_accounts())
+
+    assert result == {
+        "status": "success",
+        "accounts": [
+            {
+                "instagram_account": {
+                    "id": "1784140000",
+                    "username": "cafe",
+                    "name": "Cafe",
+                    "profile_picture_url": "https://cdn.example/p.jpg",
+                }
+            }
+        ],
+    }
+    assert _graph_calls(mock_request) == [
+        (
+            f"{IG_HOST}/me",
+            "GET",
+            {"fields": "user_id,username,name,profile_picture_url"},
+            None,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "call, endpoint",
+    [
+        (lambda: instagram.instagram_get_profile("1784140000"), "/1784140000"),
+        (lambda: instagram.instagram_list_media("1784140000"), "/1784140000/media"),
+    ],
+)
+def test_instagram_login_reads_go_to_the_instagram_host(
+    monkeypatch, instagram_login_env, call, endpoint
+):
+    """Same fields as Facebook Login (none is rejected), other host."""
+    mock_request = Mock(return_value=_proxied({"id": "1784140000", "data": []}))
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    assert _payload(call())["status"] == "success"
+
+    ((called_endpoint, method, _, _),) = _graph_calls(mock_request)
+    assert (called_endpoint, method) == (f"{IG_HOST}{endpoint}", "GET")
+
+
+def test_instagram_login_publish_runs_every_step_on_the_instagram_host(
+    monkeypatch, instagram_login_env
+):
+    responses = iter(
+        [
+            _proxied({"id": "container-1"}),
+            _proxied({"status_code": "FINISHED"}),
+            _proxied({"id": "media-1"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda **kwargs: next(responses))
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    result = _payload(
+        instagram.instagram_publish_image(
+            "1784140000", image_url="https://example.com/a.png", caption="New"
+        )
+    )
+
+    assert result == {
+        "status": "success",
+        "container_id": "container-1",
+        "media_id": "media-1",
+    }
+    assert _graph_calls(mock_request) == [
+        (
+            f"{IG_HOST}/1784140000/media",
+            "POST",
+            {},
+            {"image_url": "https://example.com/a.png", "caption": "New"},
+        ),
+        (f"{IG_HOST}/container-1", "GET", {"fields": "status_code,status"}, None),
+        (
+            f"{IG_HOST}/1784140000/media_publish",
+            "POST",
+            {},
+            {"creation_id": "container-1"},
+        ),
+    ]

@@ -39,6 +39,8 @@ OWNER = "toby:workspace-7:member-alice"
 OTHER_OWNER = "toby:workspace-7:member-bob"
 API_KEY = "test-composio-api-key-value"
 AUTH_CONFIG_ID = "ac_facebook_test"
+INSTAGRAM_AUTH_CONFIG_ID = "ac_instagram_test"
+INSTAGRAM_USER_ID = "17841400000000001"
 USER_ID_SECRET = "test-user-id-secret"
 CALLBACK_URL = "https://app.example.com/api/auth/meta/callback"
 CALLBACK_PATH = "/api/auth/meta/callback"
@@ -72,6 +74,8 @@ class FakeComposio:
         # Composio binds each link to the user id it was created for, and a
         # session can be completed once, only with that user id.
         self.owners: dict[str, str] = {}
+        # The auth config each link was created with decides its app.
+        self.auth_configs: dict[str, str] = {}
         self.completed: set[str] = set()
         self.complete_status = 200
         # Composio activates the account, then the answer never arrives.
@@ -98,6 +102,7 @@ class FakeComposio:
             account_id = f"ca_created_{len(self.created) + 1}"
             self.created.append(account_id)
             self.owners[account_id] = json["user_id"]
+            self.auth_configs[account_id] = json["auth_config_id"]
             return _Response(
                 201,
                 {
@@ -131,18 +136,28 @@ class FakeComposio:
             )
         if method == "GET" and path.startswith("/connected_accounts/"):
             account_id = path.rsplit("/", 1)[1]
+            auth_config_id = self.auth_configs.get(account_id, AUTH_CONFIG_ID)
+            toolkit = (
+                "instagram"
+                if auth_config_id == INSTAGRAM_AUTH_CONFIG_ID
+                else "facebook"
+            )
             account = {
                 "id": account_id,
                 "status": "ACTIVE" if account_id in self.completed else "INITIALIZING",
                 "user_id": self.owners.get(account_id),
-                "toolkit": {"slug": "facebook"},
-                "auth_config": {"id": AUTH_CONFIG_ID},
+                "toolkit": {"slug": toolkit},
+                "auth_config": {"id": auth_config_id},
             }
             account.update(self.account_overrides)
             return _Response(200, account)
         if method == "POST" and path == "/tools/execute/proxy":
             if self.me_response is not None:
                 return _Response(*self.me_response)
+            if json["endpoint"].startswith("https://graph.instagram.com/"):
+                return _Response(
+                    200, {"data": {"user_id": INSTAGRAM_USER_ID}, "status": 200}
+                )
             return _Response(200, {"data": {"id": FACEBOOK_USER_ID}, "status": 200})
         if method == "DELETE" and path.startswith("/connected_accounts/"):
             return _Response(200, {"success": True})
@@ -158,6 +173,9 @@ def composio_env(monkeypatch):
     )
     monkeypatch.setenv(composio_auth.COMPOSIO_USER_ID_SECRET_ENV, USER_ID_SECRET)
     monkeypatch.delenv(composio_auth.CONNECTOR_OAUTH_ROUTE_ENV, raising=False)
+    # Instagram stays off unless a test switches it on.
+    monkeypatch.delenv("XAGENT_INSTAGRAM_AUTH_BACKEND", raising=False)
+    monkeypatch.delenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID", raising=False)
 
 
 @pytest.fixture
@@ -261,10 +279,16 @@ class Browser:
         return response
 
 
-def _start(db: Session, user: User, browser: Browser, owner: str = OWNER) -> Any:
+def _start(
+    db: Session,
+    user: User,
+    browser: Browser,
+    owner: str = OWNER,
+    app_id: str = "facebook",
+) -> Any:
     response = auth_api.start_builtin_oauth_for_resource_owner(
         provider="meta",
-        app_id="facebook",
+        app_id=app_id,
         user=user,
         resource_owner_key=owner,
         redirect="https://toby.example.com/settings",
@@ -276,9 +300,11 @@ def _start(db: Session, user: User, browser: Browser, owner: str = OWNER) -> Any
     return response
 
 
-def _connect_until_verification(db: Session, user: User, owner: str = OWNER):
+def _connect_until_verification(
+    db: Session, user: User, owner: str = OWNER, app_id: str = "facebook"
+):
     browser = Browser()
-    start = _start(db, user, browser, owner)
+    start = _start(db, user, browser, owner, app_id)
     begin = browser.get(db, start.headers["location"])
     assert begin.status_code == 302, begin.body
     return browser, start
@@ -311,7 +337,7 @@ def _grants(db: Session) -> list[UserOAuth]:
 
 
 def _expected_composio_user(user: User, owner: str = OWNER) -> str:
-    config = composio_auth.load_config()
+    config = composio_auth.load_config(composio_auth.FACEBOOK_APP_ID)
     assert config is not None
     return composio_auth.composio_user_id(config, user_id=int(user.id), owner_key=owner)
 
@@ -319,17 +345,26 @@ def _expected_composio_user(user: User, owner: str = OWNER) -> str:
 # --- Switch ---------------------------------------------------------------------
 
 
-def test_only_facebook_on_meta_follows_the_switch(composio_env, monkeypatch):
-    assert composio_auth.facebook_uses_composio("meta", "facebook")
-    assert composio_auth.facebook_uses_composio("META", "Facebook")
-    for app_id in ("instagram", "meta-ads", "whatsapp", None):
-        assert not composio_auth.facebook_uses_composio("meta", app_id)
-    assert not composio_auth.facebook_uses_composio("google", "facebook")
+def _via_composio(provider: str, app_id: str | None) -> str | None:
+    app = composio_auth.composio_app(provider, app_id)
+    return app.app_id if app else None
 
+
+def test_each_app_follows_only_its_own_switch(composio_env, monkeypatch):
+    """Facebook and Instagram each have their own switch (#3533); Meta Ads
+    and WhatsApp share the meta provider and have none."""
+    assert _via_composio("meta", "facebook") == "facebook"
+    assert _via_composio("META", "Facebook") == "facebook"
+    for app_id in ("instagram", "meta-ads", "whatsapp", None):
+        assert _via_composio("meta", app_id) is None
+    assert _via_composio("google", "facebook") is None
+
+    monkeypatch.setenv("XAGENT_INSTAGRAM_AUTH_BACKEND", "composio")
     monkeypatch.setenv(composio_auth.FACEBOOK_AUTH_BACKEND_ENV, "native")
-    assert not composio_auth.facebook_uses_composio("meta", "facebook")
+    assert _via_composio("meta", "instagram") == "instagram"
+    assert _via_composio("meta", "facebook") is None
     monkeypatch.delenv(composio_auth.FACEBOOK_AUTH_BACKEND_ENV)
-    assert not composio_auth.facebook_uses_composio("meta", "facebook")
+    assert _via_composio("meta", "facebook") is None
 
 
 # --- Start ----------------------------------------------------------------------
@@ -429,7 +464,7 @@ def test_begin_creates_the_link_and_keeps_the_flow(db_session, composio_env, com
 
 
 def test_composio_user_id_is_per_actor_and_opaque(composio_env):
-    config = composio_auth.load_config()
+    config = composio_auth.load_config(composio_auth.FACEBOOK_APP_ID)
     assert config is not None
     alice = composio_auth.composio_user_id(config, user_id=3, owner_key=OWNER)
     bob = composio_auth.composio_user_id(config, user_id=3, owner_key=OTHER_OWNER)
@@ -635,8 +670,14 @@ def test_a_reused_session_uri_is_not_completed_twice(
     assert len(_grants(db)) == 1
 
 
-def _begin(db: Session, user: User, browser: Browser, owner: str = OWNER) -> None:
-    start = _start(db, user, browser, owner)
+def _begin(
+    db: Session,
+    user: User,
+    browser: Browser,
+    owner: str = OWNER,
+    app_id: str = "facebook",
+) -> None:
+    start = _start(db, user, browser, owner, app_id)
     assert browser.get(db, start.headers["location"]).status_code == 302
 
 
@@ -1322,3 +1363,251 @@ def test_an_account_still_referenced_is_not_deleted(db_session, composio_env, co
 
     assert composio.calls == []
     assert len(_grants(db)) == 1
+
+
+# --- Instagram (#3533) -----------------------------------------------------------
+
+
+@pytest.fixture
+def instagram_connect(db_session, composio_env, composio, monkeypatch):
+    """Instagram switched to Composio, its connector installed, and Composio
+    answering for an Instagram account."""
+    monkeypatch.setenv("XAGENT_INSTAGRAM_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID", INSTAGRAM_AUTH_CONFIG_ID)
+    db, user = db_session
+    app = get_builtin_public_mcp_app("instagram")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    db.commit()
+    server = ensure_builtin_oauth_server_definition(db, app_id="instagram")
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return db, user, composio
+
+
+@pytest.fixture
+def instagram_only(instagram_connect, monkeypatch):
+    """A deployment that turned only Instagram over to Composio."""
+    monkeypatch.delenv(composio_auth.FACEBOOK_AUTH_BACKEND_ENV)
+    monkeypatch.delenv(composio_auth.COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV)
+    return instagram_connect
+
+
+def test_an_instagram_only_deployment_connects_instagram(instagram_only):
+    """Nothing in start, begin or verify needs the Facebook config."""
+    db, user, composio = instagram_only
+    browser, _ = _connect_until_verification(db, user, app_id="instagram")
+
+    assert browser.get(db, _verify_url(composio)).status_code == 200
+
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.provider_user_id) == ("instagram", INSTAGRAM_USER_ID)
+    assert composio.paths("DELETE") == []
+
+
+def test_an_instagram_only_deployment_deletes_an_unclaimed_account(instagram_only):
+    """The first flow's cookie is gone when its session returns; the account
+    is recognised by the Instagram auth config and deleted."""
+    db, user, composio = instagram_only
+    browser = Browser()
+    _begin(db, user, browser, app_id="instagram")
+    (lost,) = composio.created
+    for name in _flow_cookies(browser):
+        browser.cookies.pop(name)
+    _begin(db, user, browser, app_id="instagram")
+
+    response = browser.get(db, _verify_url(composio, lost))
+
+    assert response.status_code == 400
+    assert _grants(db) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{lost}"]
+
+
+def test_instagram_start_refuses_without_its_auth_config(
+    instagram_connect, monkeypatch
+):
+    """Instagram's own auth config is required, even with Facebook's set."""
+    db, user, composio = instagram_connect
+    monkeypatch.delenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID")
+
+    response = _start(db, user, Browser(), app_id="instagram")
+
+    assert response.status_code == 500
+    assert "COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID" in response.body.decode()
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert composio.calls == []
+
+
+def test_the_open_flow_limit_counts_facebook_and_instagram_together(
+    instagram_connect,
+):
+    db, user, composio = instagram_connect
+    browser = Browser()
+    _begin(db, user, browser)
+    _begin(db, user, browser)
+    _begin(db, user, browser, app_id="instagram")
+    start = _start(db, user, browser, app_id="instagram")
+
+    response = browser.get(db, start.headers["location"])
+
+    assert response.status_code == 400
+    assert "Too many" in response.body.decode()
+    assert composio.paths().count("/connected_accounts/link") == 3
+
+
+@pytest.mark.parametrize(
+    "config_removed", [False, True], ids=["configured", "config-removed"]
+)
+def test_a_denied_instagram_flow_ends_and_deletes_its_account(
+    instagram_connect, monkeypatch, config_removed
+):
+    """The account is deleted with the shared API key, so it is cleaned up
+    even when Instagram's auth config went away after the flow began."""
+    db, user, composio = instagram_connect
+    browser, _ = _connect_until_verification(db, user, app_id="instagram")
+    if config_removed:
+        monkeypatch.delenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID")
+
+    response = browser.get(db, _denied_url(composio.created[0]))
+
+    assert response.status_code == 400
+    assert "Permission was not granted" in response.body.decode()
+    assert _grants(db) == []
+    assert _flow_cookies(browser) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+
+
+def test_instagram_connect_stores_an_instagram_grant(instagram_connect):
+    """The flow is the same as Facebook's; the app's own auth config, toolkit
+    and Instagram Login identity are used, and the grant is keyed
+    ``instagram`` for the Instagram connector."""
+    db, user, composio = instagram_connect
+    browser, _ = _connect_until_verification(db, user, app_id="instagram")
+    link = [body for _, path, body in composio.calls if path.endswith("/link")]
+    assert link[0]["auth_config_id"] == INSTAGRAM_AUTH_CONFIG_ID
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 200, response.body
+    assert '"instagram"' in response.body.decode()
+    proxy = [body for _, path, body in composio.calls if path == "/tools/execute/proxy"]
+    assert proxy[0]["endpoint"] == "https://graph.instagram.com/v25.0/me"
+    assert proxy[0]["parameters"] == [
+        {"name": "fields", "value": "user_id", "type": "query"}
+    ]
+    (grant,) = _grants(db)
+    assert grant.provider == "instagram"
+    assert grant.resource_owner_key == OWNER
+    assert grant.token_type == "composio"
+    assert grant.access_token == composio.created[0]
+    assert grant.provider_user_id == INSTAGRAM_USER_ID
+    assert grant.expires_at is None
+
+
+def test_facebook_and_instagram_connects_in_one_browser_each_complete(
+    instagram_connect,
+):
+    """Begin Facebook, then Instagram, in one browser; the Instagram session
+    returns while the Facebook flow is still open. Each flow is checked
+    against its own app's auth config and toolkit and stored under its own
+    app, and the other flow stays usable."""
+    db, user, composio = instagram_connect
+    browser = Browser()
+    _begin(db, user, browser)
+    _begin(db, user, browser, app_id="instagram")
+    facebook, instagram = composio.created
+    assert len(_flow_cookies(browser)) == 2
+
+    assert browser.get(db, _verify_url(composio, instagram)).status_code == 200
+    assert len(_flow_cookies(browser)) == 1
+    assert browser.get(db, _verify_url(composio, facebook)).status_code == 200
+
+    grants = {grant.provider: grant for grant in _grants(db)}
+    assert set(grants) == {"facebook", "instagram"}
+    assert (grants["facebook"].access_token, grants["facebook"].provider_user_id) == (
+        facebook,
+        FACEBOOK_USER_ID,
+    )
+    assert (
+        grants["instagram"].access_token,
+        grants["instagram"].provider_user_id,
+    ) == (instagram, INSTAGRAM_USER_ID)
+    proxy = [body for _, path, body in composio.calls if path == "/tools/execute/proxy"]
+    assert [body["endpoint"] for body in proxy] == [
+        "https://graph.instagram.com/v25.0/me",
+        "https://graph.facebook.com/v25.0/me",
+    ]
+    assert composio.paths("DELETE") == []
+
+
+def test_one_apps_missing_config_does_not_block_the_others_verification(
+    instagram_connect, monkeypatch
+):
+    """Instagram's auth config is removed while both flows are open: the
+    Facebook connect still completes, and the Instagram one is refused with
+    its just-activated account deleted rather than left unbound."""
+    db, user, composio = instagram_connect
+    browser = Browser()
+    _begin(db, user, browser)
+    _begin(db, user, browser, app_id="instagram")
+    facebook, instagram = composio.created
+    monkeypatch.delenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID")
+
+    assert browser.get(db, _verify_url(composio, facebook)).status_code == 200
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.access_token) == ("facebook", facebook)
+
+    response = browser.get(db, _verify_url(composio, instagram))
+    assert response.status_code == 503
+    assert "Instagram" in response.body.decode()
+    assert [grant.provider for grant in _grants(db)] == ["facebook"]
+    assert composio.paths("DELETE") == [f"/connected_accounts/{instagram}"]
+    assert _flow_cookies(browser) == []
+
+
+def test_an_unclaimed_account_of_the_other_app_is_deleted(instagram_connect):
+    """The Instagram flow's cookie is gone and only a Facebook flow is open
+    when the Instagram session returns: the activated Instagram account is
+    still recognised as this actor's and deleted."""
+    db, user, composio = instagram_connect
+    browser = Browser()
+    _begin(db, user, browser, app_id="instagram")
+    (instagram,) = composio.created
+    for name in _flow_cookies(browser):
+        browser.cookies.pop(name)
+    _begin(db, user, browser)
+
+    response = browser.get(db, _verify_url(composio, instagram))
+
+    assert response.status_code == 400
+    assert _grants(db) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{instagram}"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"toolkit": {"slug": "facebook"}},
+        {"auth_config": {"id": AUTH_CONFIG_ID}},
+    ],
+    ids=["facebook-toolkit", "facebook-auth-config"],
+)
+def test_an_instagram_flow_refuses_a_facebook_account(instagram_connect, override):
+    """Each app checks its own toolkit and auth config, so a Facebook account
+    is never bound as an Instagram grant."""
+    db, user, composio = instagram_connect
+    browser, _ = _connect_until_verification(db, user, app_id="instagram")
+    composio.account_overrides = {**composio.account_overrides, **override}
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 400
+    assert _grants(db) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]

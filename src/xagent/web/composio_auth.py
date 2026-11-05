@@ -1,9 +1,11 @@
-"""Connect Facebook through Composio-hosted auth (#3532).
+"""Connect Facebook and Instagram through Composio-hosted auth (#3532, #3533).
 
-While our Meta App Review is pending, Toby's Facebook connector can use
-Composio's own Meta App. ``XAGENT_FACEBOOK_AUTH_BACKEND=composio`` selects this
-flow for new Facebook connects only; Meta Ads, WhatsApp and Instagram share the
-``meta`` provider and stay native.
+While our Meta App Review is pending, Toby's Facebook and Instagram connectors
+can use Composio's own Meta App. Each app has its own switch
+(``XAGENT_FACEBOOK_AUTH_BACKEND``, ``XAGENT_INSTAGRAM_AUTH_BACKEND``; set to
+``composio``) and selects this flow for its new connects only; Meta Ads and
+WhatsApp share the ``meta`` provider and stay native. Composio's Instagram
+toolkit uses Instagram Login, so its identity comes from ``graph.instagram.com``.
 
 The browser makes three trips, all on the Meta callback path, because that is
 the only path xagent-saas routes per region and the only path the actor proof
@@ -24,9 +26,9 @@ cookie is sent to:
    checks run first, then ``complete_auth`` is called with that actor's
    Composio user id, derived from *our* session. The account it activates
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
-   of our auth config and of the Facebook toolkit. ``GET /me`` through the
-   proxy gives the Facebook user id, and the grant is stored for #3531 to
-   execute. A refused completion spends nothing. When the outcome is lost,
+   of its app's auth config and toolkit. ``GET /me`` through the proxy gives
+   the Facebook user id or the Instagram ``user_id``, and the grant is stored
+   for #3531 to execute. A refused completion spends nothing. When the outcome is lost,
    an open flow whose link Composio now reports ``ACTIVE`` was completed by
    this session: it is spent and its account deleted. An account is deleted
    only when this request has spent the flow that created it, or when no
@@ -91,7 +93,49 @@ COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 GRAPH_ME_URL = "https://graph.facebook.com/v25.0/me"
 FACEBOOK_APP_ID = "facebook"
 FACEBOOK_TOOLKIT_SLUG = "facebook"
+INSTAGRAM_AUTH_BACKEND_ENV = "XAGENT_INSTAGRAM_AUTH_BACKEND"
+COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID_ENV = "COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID"
+INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v25.0/me"
+INSTAGRAM_APP_ID = "instagram"
+INSTAGRAM_TOOLKIT_SLUG = "instagram"
 META_PROVIDER = "meta"
+
+
+class ComposioApp(NamedTuple):
+    """What differs between the apps that can connect through Composio."""
+
+    app_id: str
+    label: str
+    backend_env: str
+    auth_config_env: str
+    toolkit_slug: str
+    # GET this through the proxy; ``identity_field`` of the reply is stored as
+    # the grant's provider_user_id.
+    identity_url: str
+    identity_field: str
+
+
+COMPOSIO_APPS: dict[str, ComposioApp] = {
+    FACEBOOK_APP_ID: ComposioApp(
+        app_id=FACEBOOK_APP_ID,
+        label="Facebook",
+        backend_env=FACEBOOK_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV,
+        toolkit_slug=FACEBOOK_TOOLKIT_SLUG,
+        identity_url=GRAPH_ME_URL,
+        identity_field="id",
+    ),
+    INSTAGRAM_APP_ID: ComposioApp(
+        app_id=INSTAGRAM_APP_ID,
+        label="Instagram",
+        backend_env=INSTAGRAM_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID_ENV,
+        toolkit_slug=INSTAGRAM_TOOLKIT_SLUG,
+        identity_url=INSTAGRAM_GRAPH_ME_URL,
+        # The professional account id the Instagram tools address.
+        identity_field="user_id",
+    ),
+}
 
 # Marks a state minted for this flow. The native callback refuses it, so a
 # Composio state can never be spent on a Meta code exchange, and begin refuses
@@ -112,7 +156,7 @@ _REQUEST_TIMEOUT_SECONDS = 10
 # Composio ids are short nanoid-style strings. Anything else is refused before
 # it is put in a URL path or stored.
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
-_FACEBOOK_USER_ID_RE = re.compile(r"[0-9]{1,32}")
+_PROVIDER_USER_ID_RE = re.compile(r"[0-9]{1,32}")
 _MAX_SESSION_URI_LENGTH = 4096
 _NONCE_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -142,15 +186,22 @@ def _env(name: str) -> str | None:
     return value.strip() or None
 
 
-def facebook_uses_composio(provider: str, app_id: str | None) -> bool:
-    """Whether a new connect of this app goes through Composio."""
+def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
+    """The app whose new connects go through Composio, if this one does.
+
+    Each app follows only its own switch, so turning Facebook over never
+    moves Instagram, and Meta Ads and WhatsApp have no switch at all.
+    """
     if provider.lower() != META_PROVIDER or not app_id:
-        return False
+        return None
     from .mcp_apps import _normalize_oauth_grant_key
 
-    if _normalize_oauth_grant_key(app_id) != FACEBOOK_APP_ID:
-        return False
-    return (_env(FACEBOOK_AUTH_BACKEND_ENV) or "native").lower() == AUTH_BACKEND
+    app = COMPOSIO_APPS.get(_normalize_oauth_grant_key(app_id) or "")
+    if app is None:
+        return None
+    if (_env(app.backend_env) or "native").lower() != AUTH_BACKEND:
+        return None
+    return app
 
 
 def connector_oauth_route_enabled() -> bool:
@@ -159,21 +210,32 @@ def connector_oauth_route_enabled() -> bool:
     return value is not None and value.lower() == "true"
 
 
-def load_config() -> ComposioConfig | None:
+def load_config(app_id: str) -> ComposioConfig | None:
     api_key = _env(COMPOSIO_API_KEY_ENV)
-    auth_config_id = _env(COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV)
+    auth_config_id = _env(COMPOSIO_APPS[app_id].auth_config_env)
     user_id_secret = _env(COMPOSIO_USER_ID_SECRET_ENV)
     if not api_key or not auth_config_id or not user_id_secret:
         return None
     return ComposioConfig(api_key, auth_config_id, user_id_secret)
 
 
-def _missing_config_names() -> list[str]:
+def _configured_apps() -> dict[str, ComposioConfig]:
+    """Every app whose Composio config is complete. The API key and the
+    user-id secret are shared, so any of them can complete or delete an
+    account; the auth config is the app's own."""
+    return {
+        app_id: config
+        for app_id in COMPOSIO_APPS
+        if (config := load_config(app_id)) is not None
+    }
+
+
+def _missing_config_names(app_id: str) -> list[str]:
     return [
         name
         for name in (
             COMPOSIO_API_KEY_ENV,
-            COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV,
+            COMPOSIO_APPS[app_id].auth_config_env,
             COMPOSIO_USER_ID_SECRET_ENV,
         )
         if not _env(name)
@@ -201,41 +263,47 @@ def _page(title: str, *paragraphs: str, status_code: int) -> HTMLResponse:
     return response
 
 
-def _unavailable_page() -> HTMLResponse:
+def _unavailable_page(*app_ids: str) -> HTMLResponse:
+    """``app_ids`` are the apps the browser's flows were for, when known."""
+    label = " or ".join(
+        COMPOSIO_APPS[app_id].label for app_id in (app_ids or tuple(COMPOSIO_APPS))
+    )
     return _page(
-        "Facebook can't be connected right now",
-        "The Facebook connection service could not complete the request.",
+        f"{label} can't be connected right now",
+        f"The {label} connection service could not complete the request.",
         "Close this window and select Connect again in a few minutes.",
         status_code=503,
     )
 
 
-def start_preflight() -> HTMLResponse | None:
+def start_preflight(app_id: str) -> HTMLResponse | None:
     """Refuse a Composio start this deployment cannot finish."""
+    label = COMPOSIO_APPS[app_id].label
     if connector_oauth_route_enabled():
         # Fail closed instead of letting the verification trip be routed by
         # region preference (xorbitsai/xagent-saas#2461).
         logger.warning(
-            "Composio Facebook connect refused: %s is on, and the verification "
+            "Composio %s connect refused: %s is on, and the verification "
             "step cannot be routed per connection",
+            label,
             CONNECTOR_OAUTH_ROUTE_ENV,
         )
         return HTMLResponse(
             content=(
-                "<h1>Facebook connection is unavailable</h1>"
-                "<p>Facebook connections through Composio are not supported "
+                f"<h1>{label} connection is unavailable</h1>"
+                f"<p>{label} connections through Composio are not supported "
                 "while per-connection OAuth routing is enabled.</p>"
             ),
             status_code=503,
         )
-    missing = _missing_config_names()
+    missing = _missing_config_names(app_id)
     if missing:
         logger.error(
-            "Composio Facebook connect refused: missing %s", ", ".join(missing)
+            "Composio %s connect refused: missing %s", label, ", ".join(missing)
         )
         from .api.auth import _oauth_provider_config_error
 
-        return _oauth_provider_config_error(FACEBOOK_APP_ID, missing)
+        return _oauth_provider_config_error(app_id, missing)
     return None
 
 
@@ -374,8 +442,14 @@ def complete_auth(config: ComposioConfig, *, session_uri: str, user_id: str) -> 
     return account_id
 
 
-def verify_account(config: ComposioConfig, *, account_id: str, user_id: str) -> None:
-    """Require the account to be ACTIVE, ours, of our auth config and Facebook."""
+def verify_account(
+    config: ComposioConfig,
+    *,
+    account_id: str,
+    user_id: str,
+    toolkit_slug: str,
+) -> None:
+    """Require the account to be ACTIVE, ours, of our auth config and toolkit."""
     status, payload = _call(config.api_key, "GET", f"/connected_accounts/{account_id}")
     if not 200 <= status < 300 or not isinstance(payload, dict):
         logger.warning("Composio account lookup failed (status=%s)", status)
@@ -391,8 +465,7 @@ def verify_account(config: ComposioConfig, *, account_id: str, user_id: str) -> 
         "user_id": payload.get("user_id") is None or payload.get("user_id") == user_id,
         "auth_config": isinstance(auth_config, dict)
         and auth_config.get("id") == config.auth_config_id,
-        "toolkit": isinstance(toolkit, dict)
-        and toolkit.get("slug") == FACEBOOK_TOOLKIT_SLUG,
+        "toolkit": isinstance(toolkit, dict) and toolkit.get("slug") == toolkit_slug,
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -402,40 +475,48 @@ def verify_account(config: ComposioConfig, *, account_id: str, user_id: str) -> 
         raise ComposioError("account_invalid", rejected=True)
 
 
-def fetch_facebook_user_id(
-    config: ComposioConfig, *, account_id: str, user_id: str
+def fetch_provider_user_id(
+    config: ComposioConfig,
+    *,
+    account_id: str,
+    user_id: str,
+    app_id: str,
 ) -> str:
-    """Read the Facebook user id once through Composio's proxy."""
+    """Read the account's own id once through Composio's proxy."""
+    app = COMPOSIO_APPS[app_id]
     status, payload = _call(
         config.api_key,
         "POST",
         "/tools/execute/proxy",
         body={
-            "endpoint": GRAPH_ME_URL,
+            "endpoint": app.identity_url,
             "method": "GET",
             "connected_account_id": account_id,
             "user_id": user_id,
-            "parameters": [{"name": "fields", "value": "id", "type": "query"}],
+            "parameters": [
+                {"name": "fields", "value": app.identity_field, "type": "query"}
+            ],
         },
     )
     data = payload.get("data") if isinstance(payload, dict) else None
     upstream_status = payload.get("status") if isinstance(payload, dict) else None
-    facebook_id = data.get("id") if isinstance(data, dict) else None
+    provider_user_id = data.get(app.identity_field) if isinstance(data, dict) else None
     if (
         not 200 <= status < 300
         or type(upstream_status) is not int
         or not 200 <= upstream_status < 300
-        or not isinstance(facebook_id, str)
-        or not _FACEBOOK_USER_ID_RE.fullmatch(facebook_id)
+        or not isinstance(provider_user_id, str)
+        or not _PROVIDER_USER_ID_RE.fullmatch(provider_user_id)
     ):
         logger.warning(
-            "Composio proxy did not return a Facebook identity "
+            "Composio proxy did not return a %s identity "
             "(status=%s upstream_status=%s)",
+            app.label,
             status,
             upstream_status if type(upstream_status) is int else "-",
         )
         raise ComposioError("identity_missing")
-    return facebook_id
+    return provider_user_id
 
 
 def delete_account(api_key: str, account_id: str) -> bool:
@@ -617,6 +698,7 @@ class _Flow:
     owner_key: str
     redirect: str | None
     expires_at: float
+    app_id: str
 
 
 class _Rejected(Exception):
@@ -637,12 +719,11 @@ def _reject(reason: str) -> _Rejected:
     return _Rejected(reason, _actor_oauth_flow_rejected_response(reason))
 
 
-def _log_rejection(reason: str) -> None:
+def _log_rejection(reason: str, app_id: str | None = None) -> None:
+    """``app_id`` is unknown until the signed state has been read."""
     from .api.auth import _log_oauth_callback_rejection
 
-    _log_oauth_callback_rejection(
-        META_PROVIDER, reason, app_id=FACEBOOK_APP_ID, actor_flow=True
-    )
+    _log_oauth_callback_rejection(META_PROVIDER, reason, app_id=app_id, actor_flow=True)
 
 
 def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
@@ -668,11 +749,13 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
     nonce = payload.get("actor_flow_nonce")
     user_id = payload.get("user_id")
     expires_at = payload.get("exp")
+    app_id = payload.get("app_id")
     if (
         payload.get("type") != "oauth_state"
         or payload.get("provider") != META_PROVIDER
         or payload.get(AUTH_BACKEND_CLAIM) != AUTH_BACKEND
-        or payload.get("app_id") != FACEBOOK_APP_ID
+        or not isinstance(app_id, str)
+        or app_id not in COMPOSIO_APPS
         or not isinstance(nonce, str)
         or not _NONCE_RE.fullmatch(nonce)
         or type(user_id) is not int
@@ -703,7 +786,7 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
         raise _reject("user_missing")
     try:
         _require_actor_oauth_personal_link(
-            db, user_id=user_id, provider=META_PROVIDER, app_id=FACEBOOK_APP_ID
+            db, user_id=user_id, provider=META_PROVIDER, app_id=app_id
         )
     except BuiltinOAuthServerDefinitionError:
         raise _reject("catalog_invalid") from None
@@ -717,6 +800,7 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
         owner_key=owner_key,
         redirect=redirect if isinstance(redirect, str) else None,
         expires_at=float(expires_at),
+        app_id=app_id,
     )
 
 
@@ -844,12 +928,14 @@ def handle_callback(
     return _handle_verify(request, db, db_provider)
 
 
-def _too_many_flows_page() -> HTMLResponse:
+def _too_many_flows_page(app_id: str) -> HTMLResponse:
+    # The limit counts the actor's Facebook and Instagram windows together.
+    label = COMPOSIO_APPS[app_id].label
     return _page(
-        "Too many Facebook sign-in windows are open",
-        "Facebook was not connected.",
-        "Close the other Facebook sign-in windows, or wait ten minutes, and "
-        "then select Connect again.",
+        "Too many sign-in windows are open",
+        f"{label} was not connected.",
+        "Close the other Facebook or Instagram sign-in windows, or wait ten "
+        "minutes, and then select Connect again.",
         status_code=400,
     )
 
@@ -880,13 +966,15 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     ]
     kept = [open_flow for open_flow in existing if open_flow.cookie_name not in stale]
     if len(kept) >= _MAX_OPEN_FLOWS:
-        _log_rejection("too_many_open_flows")
-        return _clear_flow_cookies(_too_many_flows_page(), db_provider, stale)
+        _log_rejection("too_many_open_flows", flow.app_id)
+        return _clear_flow_cookies(
+            _too_many_flows_page(flow.app_id), db_provider, stale
+        )
 
-    config = load_config()
+    config = load_config(flow.app_id)
     if config is None:
-        _log_rejection("composio_not_configured")
-        return _unavailable_page()
+        _log_rejection("composio_not_configured", flow.app_id)
+        return _unavailable_page(flow.app_id)
     from .api.auth import _resolve_oauth_redirect_uri
 
     try:
@@ -898,8 +986,8 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
             callback_url=_resolve_oauth_redirect_uri(META_PROVIDER, db_provider),
         )
     except ComposioError as exc:
-        _log_rejection(exc.reason)
-        return _unavailable_page()
+        _log_rejection(exc.reason, flow.app_id)
+        return _unavailable_page(flow.app_id)
     # A reloaded begin replaces this flow's link. The previous link is not
     # deleted here: the original window may be completing it right now. If its
     # session still comes back, no open flow claims the account and it is
@@ -941,12 +1029,16 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     dead = browser_flows.dead
     returned = _valid_account_id(query.get("connected_account_id"))
     matches = [f for f in browser_flows.open if returned and f.account_id == returned]
-    config = load_config()
+    app_ids = sorted({match.flow.app_id for match in matches})
+    log_app = app_ids[0] if len(app_ids) == 1 else None
+    # The API key is shared, so a flow's account is deleted even when its
+    # own app's config went away after the flow began.
+    shared = next(iter(_configured_apps().values()), None)
     for match in matches:
         dead.append(match.cookie_name)
         # Unfinished, or (without verification) active but never bound here.
-        if _spend(db, match) and config is not None:
-            delete_account(config.api_key, match.account_id)
+        if _spend(db, match) and shared is not None:
+            delete_account(shared.api_key, match.account_id)
     if query.get("status") == "success":
         # Composio activated the connection without handing it to us: its
         # project has no OAuth user verification pointed at this callback.
@@ -956,8 +1048,8 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
             "Composio returned a connection without verification; set the "
             "project's OAuth user verification to this callback URL"
         )
-        _log_rejection("verification_not_configured")
-        return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
+        _log_rejection("verification_not_configured", log_app)
+        return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
     provider_error = _oauth_callback_provider_error(
         META_PROVIDER, query.get("error") or "access_denied", None
     )
@@ -965,7 +1057,7 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     _log_oauth_callback_rejection(
         META_PROVIDER,
         "provider_error",
-        app_id=FACEBOOK_APP_ID,
+        app_id=log_app,
         actor_flow=True,
         provider_error=provider_error,
     )
@@ -990,8 +1082,14 @@ def _account_status(config: ComposioConfig, account_id: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _belongs_to(config: ComposioConfig, *, account_id: str, user_id: str) -> bool:
-    """Whether Composio reports the account as this actor's, of our config."""
+def _belongs_to(
+    config: ComposioConfig,
+    *,
+    account_id: str,
+    user_id: str,
+    auth_config_ids: set[str],
+) -> bool:
+    """Whether Composio reports the account as this actor's, of our configs."""
     try:
         status, payload = _call(
             config.api_key, "GET", f"/connected_accounts/{account_id}"
@@ -1004,7 +1102,7 @@ def _belongs_to(config: ComposioConfig, *, account_id: str, user_id: str) -> boo
     return (
         payload.get("user_id") == user_id
         and isinstance(auth_config, dict)
-        and auth_config.get("id") == config.auth_config_id
+        and auth_config.get("id") in auth_config_ids
     )
 
 
@@ -1074,18 +1172,26 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             _reject("claims_invalid").response, db_provider, dead
         )
 
-    config = load_config()
-    if config is None:
-        _log_rejection("composio_not_configured")
-        return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
+    # A browser can hold Facebook and Instagram flows of the same actor at
+    # once. They share the API key and the Composio user id, so the session
+    # is completed with any configured app before knowing which app it was;
+    # the matched flow's own app then decides the auth config, toolkit and
+    # identity checked. One app's missing config never blocks the other's.
+    app_ids = sorted({open_flow.flow.app_id for open_flow in open_flows})
+    log_app = app_ids[0] if len(app_ids) == 1 else None
+    configs = _configured_apps()
+    if not configs:
+        _log_rejection("composio_not_configured", log_app)
+        return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
+    shared = next(iter(configs.values()))
     user_id, owner_key = actors.pop()
-    composio_user = composio_user_id(config, user_id=user_id, owner_key=owner_key)
+    composio_user = composio_user_id(shared, user_id=user_id, owner_key=owner_key)
     try:
         account_id = complete_auth(
-            config, session_uri=session_uri, user_id=composio_user
+            shared, session_uri=session_uri, user_id=composio_user
         )
     except ComposioError as exc:
-        _log_rejection(exc.reason)
+        _log_rejection(exc.reason, log_app)
         if exc.rejected:
             # Nothing was activated, so every open flow stays usable.
             return _clear_flow_cookies(
@@ -1098,12 +1204,12 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         # is deleted once this request has spent that flow. Unfinished links
         # are left alone, and their flows stay open.
         for open_flow in open_flows:
-            if _account_status(config, open_flow.account_id) == "ACTIVE" and (
+            if _account_status(shared, open_flow.account_id) == "ACTIVE" and (
                 _spend(db, open_flow) or _spend_expired_for_cleanup(db, open_flow)
             ):
-                delete_account(config.api_key, open_flow.account_id)
+                delete_account(shared.api_key, open_flow.account_id)
                 dead.append(open_flow.cookie_name)
-        return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
+        return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
 
     matches = [
         open_flow for open_flow in open_flows if open_flow.account_id == account_id
@@ -1115,13 +1221,22 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         # never one that is already bound. It is deleted when Composio
         # confirms it is this actor's, and left alone otherwise.
         logger.warning("Composio completed a connection no open flow created")
-        _log_rejection("account_invalid")
-        if _belongs_to(config, account_id=account_id, user_id=composio_user):
-            delete_account(config.api_key, account_id)
+        _log_rejection("account_invalid", log_app)
+        if _belongs_to(
+            shared,
+            account_id=account_id,
+            user_id=composio_user,
+            # Any configured app's: the flow it came from may be gone.
+            auth_config_ids={
+                app_config.auth_config_id for app_config in configs.values()
+            },
+        ):
+            delete_account(shared.api_key, account_id)
         return _clear_flow_cookies(
             _reject("composio_rejected").response, db_provider, dead
         )
     match = matches[0]
+    app_id = match.flow.app_id
     dead.append(match.cookie_name)
     # From here on the account is the one this flow created for this actor:
     # if it cannot be bound, it is deleted rather than left unbound.
@@ -1129,40 +1244,52 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         # An expired row can still be claimed for cleanup. A missing row was
         # consumed by another request, whose account must be left alone.
         if _spend_expired_for_cleanup(db, match):
-            delete_account(config.api_key, account_id)
-        _log_rejection("flow_used_or_expired")
+            delete_account(shared.api_key, account_id)
+        _log_rejection("flow_used_or_expired", app_id)
         return _clear_flow_cookies(
             _reject("flow_used_or_expired").response, db_provider, dead
         )
+    config = configs.get(app_id)
+    if config is None:
+        # This app's config went away after its flow began.
+        _log_rejection("composio_not_configured", app_id)
+        delete_account(shared.api_key, account_id)
+        return _clear_flow_cookies(_unavailable_page(app_id), db_provider, dead)
     try:
-        verify_account(config, account_id=account_id, user_id=composio_user)
-        facebook_id = fetch_facebook_user_id(
-            config, account_id=account_id, user_id=composio_user
+        verify_account(
+            config,
+            account_id=account_id,
+            user_id=composio_user,
+            toolkit_slug=COMPOSIO_APPS[app_id].toolkit_slug,
+        )
+        provider_user_id = fetch_provider_user_id(
+            config, account_id=account_id, user_id=composio_user, app_id=app_id
         )
         stored = _store_grant(
             db,
             flow=match.flow,
             account_id=account_id,
             composio_user=composio_user,
-            facebook_id=facebook_id,
+            provider_user_id=provider_user_id,
         )
     except ComposioError as exc:
-        _log_rejection(exc.reason)
+        _log_rejection(exc.reason, app_id)
         delete_account(config.api_key, account_id)
         response = (
             _reject("composio_rejected").response
             if exc.rejected
-            else _unavailable_page()
+            else _unavailable_page(app_id)
         )
         return _clear_flow_cookies(response, db_provider, dead)
     except _Rejected as rejected:
-        _log_rejection(rejected.reason)
+        _log_rejection(rejected.reason, app_id)
         delete_account(config.api_key, account_id)
         return _clear_flow_cookies(rejected.response, db_provider, dead)
     except Exception as exc:
         db.rollback()
         logger.warning(
-            "Composio Facebook grant could not be stored (exception_type=%s)",
+            "Composio %s grant could not be stored (exception_type=%s)",
+            COMPOSIO_APPS[app_id].label,
             type(exc).__name__,
         )
         delete_account(config.api_key, account_id)
@@ -1187,7 +1314,7 @@ def _store_grant(
     flow: _Flow,
     account_id: str,
     composio_user: str,
-    facebook_id: str,
+    provider_user_id: str,
 ) -> Response:
     from .api.auth import _lock_actor_link, _oauth_success_response
     from .models.user import User
@@ -1197,26 +1324,26 @@ def _store_grant(
     try:
         # Composio I/O can overlap a personal disconnect.
         _lock_actor_link(
-            db, user_id=flow.user_id, provider=META_PROVIDER, app_id=FACEBOOK_APP_ID
+            db, user_id=flow.user_id, provider=META_PROVIDER, app_id=flow.app_id
         )
     except ValueError:
         db.rollback()
         raise _reject("link_changed_after_exchange") from None
     db.query(User.id).filter(User.id == flow.user_id).with_for_update().one()
-    # Replaces this actor's previous Facebook grant; a previous Composio
+    # Replaces this actor's previous grant for the app; a previous Composio
     # account is deleted once this commits.
     delete_scoped_user_oauth_accounts(
         db,
         user_id=flow.user_id,
         resource_owner_key=flow.owner_key,
-        providers=[FACEBOOK_APP_ID],
+        providers=[flow.app_id],
     )
     db.add(
         UserOAuth(
             user_id=flow.user_id,
-            provider=FACEBOOK_APP_ID,
+            provider=flow.app_id,
             resource_owner_key=flow.owner_key,
-            provider_user_id=facebook_id,
+            provider_user_id=provider_user_id,
             access_token=account_id,
             token_type=COMPOSIO_TOKEN_TYPE,
             refresh_token=None,
@@ -1228,5 +1355,5 @@ def _store_grant(
     )
     db.commit()
     return _oauth_success_response(
-        redirect_url=flow.redirect, email=None, provider_label=FACEBOOK_APP_ID
+        redirect_url=flow.redirect, email=None, provider_label=flow.app_id
     )

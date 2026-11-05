@@ -477,3 +477,42 @@ def test_proxy_drops_the_page_token_graph_echoes_into_paging_links(
         "https://graph.facebook.com/v25.0/page-1/feed?fields=id&limit=1&after=CURSOR"
     )
     assert "page-token" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("proxied", [False, True])
+def test_graph_request_refuses_a_base_url_outside_the_graph_hosts(monkeypatch, proxied):
+    """The token (or the Composio key) is never sent to any other host."""
+    if proxied:
+        monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+        monkeypatch.setenv("COMPOSIO_CONNECTED_ACCOUNT_ID", "ca_123")
+        monkeypatch.setenv("COMPOSIO_USER_ID", "actor-hmac")
+    else:
+        monkeypatch.delenv("COMPOSIO_CONNECTED_ACCOUNT_ID", raising=False)
+        monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    request = Mock()
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    for base_url in (
+        "https://attacker.example/v25.0",
+        "http://graph.instagram.com/v25.0",
+        "https://graph.instagram.com/v25.0/",
+        "https://graph.instagram.com/v24.0",
+        "https://graph.instagram.com.evil/v25.0",
+        "https://graph.facebook.com.evil/v25.0",
+    ):
+        with pytest.raises(ValueError, match="base_url"):
+            meta_graph.graph_request("GET", "/me", base_url=base_url)
+    request.assert_not_called()
+
+
+def test_graph_request_accepts_the_instagram_host_natively(monkeypatch):
+    """The allowlist admits exactly the two Graph hosts; a later loosening
+    of the exact match is caught by the near misses above."""
+    monkeypatch.delenv("COMPOSIO_CONNECTED_ACCOUNT_ID", raising=False)
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    request = Mock(return_value=MockResponse({"id": "1"}, text="{}"))
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    meta_graph.graph_request("GET", "/me", base_url="https://graph.instagram.com/v25.0")
+
+    assert request.call_args.kwargs["url"] == "https://graph.instagram.com/v25.0/me"

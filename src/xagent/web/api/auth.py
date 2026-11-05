@@ -3475,8 +3475,11 @@ def start_builtin_oauth_for_resource_owner(
 
     from .. import composio_auth
 
-    via_composio = composio_auth.facebook_uses_composio(provider, app_id)
-    if via_composio and (refusal := composio_auth.start_preflight()):
+    composio_app = composio_auth.composio_app(provider, app_id)
+    via_composio = composio_app is not None
+    if composio_app is not None and (
+        refusal := composio_auth.start_preflight(composio_app.app_id)
+    ):
         return refusal
 
     browser_nonce = secrets.token_urlsafe(32)

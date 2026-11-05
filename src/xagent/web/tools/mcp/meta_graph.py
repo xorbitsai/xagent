@@ -7,6 +7,11 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from ....core.utils import public_requests as requests
 
 GRAPH_BASE_URL = "https://graph.facebook.com/v25.0"
+# Instagram Login (Composio's Instagram toolkit, #3533). Its tokens are not
+# valid on graph.facebook.com.
+INSTAGRAM_GRAPH_BASE_URL = "https://graph.instagram.com/v25.0"
+# graph_request never sends a token anywhere else.
+ALLOWED_GRAPH_BASE_URLS = frozenset({GRAPH_BASE_URL, INSTAGRAM_GRAPH_BASE_URL})
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 
@@ -138,8 +143,12 @@ def graph_request(
     json_body: dict[str, Any] | None = None,
     files: dict[str, Any] | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    base_url: str = GRAPH_BASE_URL,
 ) -> Any:
     """Issue a Graph API request and return the decoded JSON body.
+
+    ``base_url`` is one of ``ALLOWED_GRAPH_BASE_URLS``; Instagram Login calls
+    use ``INSTAGRAM_GRAPH_BASE_URL``.
 
     ``data`` is sent form-encoded (the shape the Pages/Instagram endpoints
     take). ``json_body`` is sent as an ``application/json`` body instead --
@@ -154,10 +163,13 @@ def graph_request(
         raise ValueError(
             "graph_request takes either json_body or form/multipart data, not both"
         )
+    if base_url not in ALLOWED_GRAPH_BASE_URLS:
+        raise ValueError("graph_request base_url is not an allowed Graph host")
     if uses_composio_proxy():
         return _composio_proxy_request(
             method,
             path,
+            base_url=base_url,
             token=token,
             params=params,
             data=data,
@@ -183,7 +195,7 @@ def graph_request(
         body_kwargs["files"] = files
     response = requests.request(
         method=method,
-        url=f"{GRAPH_BASE_URL}{path}",
+        url=f"{base_url}{path}",
         headers=graph_headers(request_token, content_type=content_type),
         params=params,
         timeout=timeout,
@@ -279,6 +291,8 @@ def _composio_proxy_request(
     json_body: dict[str, Any] | None,
     files: dict[str, Any] | None,
     timeout: float,
+    # Required: ``graph_request`` has already checked it against the allowlist.
+    base_url: str,
 ) -> Any:
     """Send one Graph call through Composio's Proxy Execute endpoint.
 
@@ -305,7 +319,7 @@ def _composio_proxy_request(
     if token:
         parameters.append({"name": "access_token", "value": token, "type": "query"})
     payload: dict[str, Any] = {
-        "endpoint": f"{GRAPH_BASE_URL}{path}",
+        "endpoint": f"{base_url}{path}",
         "method": method.upper(),
         "connected_account_id": connected_account_id,
         # Required: the Composio project enforces 2FA on private connections.

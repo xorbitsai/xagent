@@ -33,7 +33,14 @@ def test_matches_published_v0_8_5_body() -> None:
 
 def test_cli_reads_stdin_and_file() -> None:
     expected = _read("v0.8.5_published.md")
-    args = [sys.executable, str(SCRIPT), "--repo-name", "xagent", "--date", "2026-11-01"]
+    args = [
+        sys.executable,
+        str(SCRIPT),
+        "--repo-name",
+        "xagent",
+        "--date",
+        "2026-11-01",
+    ]
     from_file = subprocess.run(
         [*args, str(FIXTURES / "v0.8.5_generated.md")],
         capture_output=True,

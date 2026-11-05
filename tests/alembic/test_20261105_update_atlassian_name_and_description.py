@@ -4,7 +4,6 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
-import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -215,11 +214,35 @@ def test_upgrade_without_required_schema_is_a_noop(tmp_path):
         )
         _run(connection, migration, "upgrade", "downgrade")
 
-        columns = {
-            column["name"]
-            for column in sa.inspect(connection).get_columns("public_mcp_apps")
-        }
-        assert columns == {"id", "app_id"}
+
+def test_name_is_renamed_when_the_description_column_is_absent(tmp_path):
+    """Each column is guarded on its own, so a schema without description
+    must still have its name renamed and restored."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE public_mcp_apps "
+                "(id INTEGER PRIMARY KEY, app_id TEXT, name TEXT)"
+            )
+        )
+        connection.execute(
+            text("INSERT INTO public_mcp_apps (app_id, name) VALUES (:app_id, :name)"),
+            {"app_id": migration.APP_ID, "name": migration.PREVIOUS_NAME},
+        )
+
+        def name():
+            return connection.execute(
+                text("SELECT name FROM public_mcp_apps WHERE app_id = :app_id"),
+                {"app_id": migration.APP_ID},
+            ).scalar_one()
+
+        _run(connection, migration, "upgrade")
+        assert name() == migration.CURRENT_NAME
+
+        _run(connection, migration, "downgrade")
+        assert name() == migration.PREVIOUS_NAME
 
 
 def test_full_downgrade_through_the_seed_removes_the_row(tmp_path):

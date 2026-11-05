@@ -1372,3 +1372,11 @@ def test_the_byte_check_alone_turns_a_result_away_past_2_mib(
 
     assert isinstance(result, ss.Ready if ready else ss.TooComplex)
     assert result.output_bytes == 8 + size
+
+
+def test_a_tuple_in_the_instance_is_a_type_error() -> None:
+    schema = _obj({"xs": {"type": "array", "items": STRING}})
+
+    result = _judge(schema, {"xs": ("a\u0000",)})
+
+    assert result == ss.Err(path="/xs", rule="type")

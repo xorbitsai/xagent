@@ -31,6 +31,7 @@ import {
 } from "@/lib/files-disabled-presentation";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
+import { copyToClipboard } from '@/lib/clipboard';
 import { InlineFilePreview } from '@/components/file/inline-file-preview';
 import {
   isStoppedTraceProcessStatus,
@@ -1092,12 +1093,14 @@ const CopyButton = ({
   useEffect(() => () => {
     if (copiedTimeoutRef.current !== null) clearTimeout(copiedTimeoutRef.current);
   }, []);
-  const handleCopy = (e: React.MouseEvent) => {
+  const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
     const text = filesDisabled
       ? serializeFilesDisabledPresentation(value)
       : formatActionContent(value);
-    navigator.clipboard.writeText(text);
+    // Same cross-origin embed concern as ChatMessage's copy button: only show
+    // the check mark once the write has actually succeeded.
+    if (!(await copyToClipboard(text))) return;
     setCopied(true);
     if (copiedTimeoutRef.current !== null) clearTimeout(copiedTimeoutRef.current);
     copiedTimeoutRef.current = setTimeout(() => {

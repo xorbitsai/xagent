@@ -195,7 +195,7 @@ describe("TraceEventRenderer", () => {
     vi.restoreAllMocks()
   })
 
-  it.each(["expire", "unmount"])("cleans up the copy feedback timer on %s", (finish) => {
+  it.each(["expire", "unmount"])("cleans up the copy feedback timer on %s", async (finish) => {
     const timeoutSpy = vi.spyOn(globalThis, "setTimeout")
     const clearSpy = vi.spyOn(globalThis, "clearTimeout")
     try {
@@ -213,10 +213,11 @@ describe("TraceEventRenderer", () => {
         return { handle: timeoutSpy.mock.results[index].value, callback: timeoutSpy.mock.calls[index][0] as () => void }
       }
 
-      fireEvent.click(button)
+      // The copied state follows the awaited clipboard write, so flush it.
+      await act(async () => { fireEvent.click(button) })
       const firstTimer = lastCopyTimer()
       expect(button.querySelector("svg.text-green-500")).not.toBeNull()
-      fireEvent.click(button)
+      await act(async () => { fireEvent.click(button) })
       const secondTimer = lastCopyTimer()
       expect(secondTimer.handle).not.toBe(firstTimer.handle)
       expect(clearSpy).toHaveBeenCalledWith(firstTimer.handle)

@@ -20,6 +20,7 @@ import {
 } from "@/lib/files-disabled-presentation";
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
+import { copyToClipboard } from "@/lib/clipboard";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
 import type { ClarificationOnSend } from "./clarification-delivery";
@@ -533,9 +534,14 @@ export function ChatMessage({
     ? `${displayCopyableContent}\n${failureReference}`
     : displayCopyableContent;
 
-  const handleCopy = () => {
-    if (clipboardContent) {
-      navigator.clipboard.writeText(clipboardContent);
+  // The chat may render inside a cross-origin embed iframe, where the async
+  // Clipboard API is refused unless the host page opted in via the iframe's
+  // allow attribute. copyToClipboard falls back to execCommand there and
+  // reports the outcome, so the check mark only appears once text has
+  // actually landed on the clipboard.
+  const handleCopy = async () => {
+    if (!clipboardContent) return;
+    if (await copyToClipboard(clipboardContent)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }

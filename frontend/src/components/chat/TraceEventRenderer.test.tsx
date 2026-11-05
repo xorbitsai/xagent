@@ -27,6 +27,11 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
+const toastErrorMock = vi.hoisted(() => vi.fn())
+vi.mock("@/components/ui/sonner", () => ({
+  toast: { error: toastErrorMock },
+}))
+
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => appContextMock,
 }))
@@ -183,6 +188,7 @@ describe("TraceEventRenderer", () => {
     appContextMock.dispatch.mockReset()
     appContextMock.openFilePreview.mockReset()
     clipboardWriteTextMock.mockReset()
+    toastErrorMock.mockReset()
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: clipboardWriteTextMock },
@@ -195,7 +201,34 @@ describe("TraceEventRenderer", () => {
     vi.restoreAllMocks()
   })
 
-  it.each(["expire", "unmount"])("cleans up the copy feedback timer on %s", (finish) => {
+  it("reports a copy that never reached the clipboard instead of claiming it", async () => {
+    clipboardWriteTextMock.mockRejectedValue(new DOMException("blocked", "NotAllowedError"))
+    // jsdom has no execCommand; install a failing one so the legacy fallback
+    // copyToClipboard takes after a refused Clipboard API also fails.
+    const previous = Object.getOwnPropertyDescriptor(document, "execCommand")
+    Object.defineProperty(document, "execCommand", { configurable: true, value: () => false })
+    try {
+      render(
+        <TraceEventRenderer events={[
+          { event_id: "start", event_type: "react_task_start", step_id: "copy-step", timestamp: 1000, data: {} },
+          { event_id: "tool", event_type: "tool_execution_start", step_id: "copy-step", timestamp: 2000,
+            data: { tool_name: "inspect_output", tool_args: { query: "copy feedback" } } },
+        ]} />,
+      )
+      const button = screen.getAllByTitle("traceEventRenderer.copy")[0]
+
+      await act(async () => { fireEvent.click(button) })
+
+      expect(clipboardWriteTextMock).toHaveBeenCalledTimes(1)
+      expect(button.querySelector("svg.text-green-500")).toBeNull()
+      expect(toastErrorMock).toHaveBeenCalledWith("common.copyFailed")
+    } finally {
+      if (previous) Object.defineProperty(document, "execCommand", previous)
+      else delete (document as { execCommand?: unknown }).execCommand
+    }
+  })
+
+  it.each(["expire", "unmount"])("cleans up the copy feedback timer on %s", async (finish) => {
     const timeoutSpy = vi.spyOn(globalThis, "setTimeout")
     const clearSpy = vi.spyOn(globalThis, "clearTimeout")
     try {
@@ -213,10 +246,11 @@ describe("TraceEventRenderer", () => {
         return { handle: timeoutSpy.mock.results[index].value, callback: timeoutSpy.mock.calls[index][0] as () => void }
       }
 
-      fireEvent.click(button)
+      // The copied state follows the awaited clipboard write, so flush it.
+      await act(async () => { fireEvent.click(button) })
       const firstTimer = lastCopyTimer()
       expect(button.querySelector("svg.text-green-500")).not.toBeNull()
-      fireEvent.click(button)
+      await act(async () => { fireEvent.click(button) })
       const secondTimer = lastCopyTimer()
       expect(secondTimer.handle).not.toBe(firstTimer.handle)
       expect(clearSpy).toHaveBeenCalledWith(firstTimer.handle)

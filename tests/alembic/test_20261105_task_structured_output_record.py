@@ -23,6 +23,7 @@ from tests.shared.postgres_disposable import (
 from xagent.db.config import create_alembic_config
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
+from xagent.web.models.user import User
 
 REVISION = "20261105_task_structured_output_record"
 DOWN_REVISION = "20261107_split_tool_categories"
@@ -259,6 +260,9 @@ def test_postgresql_record_keeps_key_order_and_reports_the_stored_size(
     big_output = {"text": "\x7f" * (2 * 1024 * 1024 - 64)}
     big = {"run_id": "run-2", "status": "ready", "output": big_output, "reason": None}
     with engine.begin() as connection:
+        connection.execute(
+            User.__table__.insert().values(id=1, username="u", password_hash="x")
+        )
         for task_id, value in ((1, record), (2, big)):
             connection.execute(
                 Task.__table__.insert().values(

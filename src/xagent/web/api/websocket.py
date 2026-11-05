@@ -75,7 +75,6 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services import task_command_execution as command_execution_service
 from ..services import task_start as task_start_service
-from ..services.task_orchestrator import TaskTurnError
 from ..services.assistant_history_safety import (
     TASK_FAILURE_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
@@ -195,6 +194,7 @@ from ..services.task_execution_controller import (
     task_execution_controller as task_execution_controller,  # Tests patch this API module's controller.snapshot.
 )
 from ..services.task_interaction_read import get_pending_interaction_question
+from ..services.task_orchestrator import TaskTurnError
 from ..services.task_runtime import (
     mcp_runtime_authorization_policy_required,
     task_extension_bindings_from_agent_config,

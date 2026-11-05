@@ -44,27 +44,27 @@ from xagent.web.services.task_command_execution import (
     _prepare_task_message_sync,
     _selected_file_refs_from_task,
 )
+from xagent.web.services.task_command_transport import (
+    ClaimedTaskCommand,
+    TaskCommandKind,
+)
 from xagent.web.services.task_execution import (
     _register_uploaded_files_for_agent,
     _rewrite_file_links_to_file_id,
     execute_task_background,
 )
-from xagent.web.services.task_command_transport import (
-    ClaimedTaskCommand,
-    TaskCommandKind,
-)
 from xagent.web.services.task_existing_command import execute_existing_start_local
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
-from xagent.web.services.task_start_protocol import (
-    ExistingExecutionContext,
-    TaskStartPayload,
-)
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
+)
+from xagent.web.services.task_start_protocol import (
+    ExistingExecutionContext,
+    TaskStartPayload,
 )
 
 

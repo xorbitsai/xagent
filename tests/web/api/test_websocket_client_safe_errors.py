@@ -30,13 +30,13 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_existing_command
 from xagent.web.services.client_error_messages import (
     ClientErrorCode,
 )
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from xagent.web.services import task_existing_command
 
 from .conftest import _direct_db_session
 

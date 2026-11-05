@@ -3240,17 +3240,18 @@ def _schedule_bg(
                                 task_id,
                                 exc_info=True,
                             )
-            # Report the run once its lease is settled here. Skipped when the
-            # turn body never ran and nothing failed (a pre-execution
-            # short-circuit), for a channel run that ended normally (its own
-            # result finalizer reports it), and for a run already reported
-            # through the shared facts bag.
+            # Report the run once its outcome is settled: either this run
+            # committed its own result (even when the settlement here was
+            # then fenced out because that commit already released the
+            # lease), or the settlement here committed. Skipped when the turn
+            # body never ran and nothing failed (a pre-execution
+            # short-circuit), and for a run already reported through the
+            # shared facts bag -- a channel run's own finalizer reports it.
             if (
-                not facts.notified
-                and lease is not None
-                and lease_settled
+                lease is not None
+                and not facts.notified
+                and (facts.finalized_status is not None or lease_settled)
                 and (execution_started or settlement_error is not None)
-                and (channel_command is None or settlement_error is not None)
             ):
                 try:
                     status = facts.finalized_status

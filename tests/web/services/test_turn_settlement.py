@@ -279,21 +279,26 @@ async def test_drain_waits_for_deliveries_in_flight() -> None:
     assert turn_settlement._inflight == set()
 
 
-async def test_drain_cancels_deliveries_past_its_timeout() -> None:
+async def test_drain_cancels_deliveries_past_its_timeout(monkeypatch) -> None:
+    # The hook's own timeout is far away, so only the drain can stop it.
+    monkeypatch.setattr(turn_settlement, "HOOK_TIMEOUT_SECONDS", 1000.0)
     cancelled: list[bool] = []
 
     async def hook(_settlement: TurnSettlement) -> None:
         try:
-            await asyncio.Event().wait()
+            await asyncio.sleep(1000)
         except asyncio.CancelledError:
             cancelled.append(True)
             raise
 
     set_turn_settled_hook(hook)
     notify_turn_settled(_settlement())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
 
-    await drain_turn_settlement_hooks(timeout=0.01)
+    await asyncio.wait_for(drain_turn_settlement_hooks(timeout=0.1), timeout=5)
 
+    assert loop.time() - started < 1
     assert cancelled == [True]
     assert turn_settlement._inflight == set()
 
@@ -810,6 +815,7 @@ async def _drive_resume(
     settled: bool = True,
     trusted_task_source: str | None = "sdk",
     extra_patches: tuple[Any, ...] = (),
+    preacquired_prior_status: TaskStatus | None = None,
 ) -> type[BaseException] | None:
     from xagent.web.services.task_execution import execute_resume_background
 
@@ -896,6 +902,7 @@ async def _drive_resume(
                 preacquired_heartbeat_stop=heartbeat_stop,
                 preacquired_heartbeat_task=heartbeat_task,
                 trusted_task_source=trusted_task_source,
+                preacquired_prior_status=preacquired_prior_status,
             )
         except BaseException as error:  # noqa: BLE001 -- the outcome is the datum
             raised = type(error)
@@ -1133,3 +1140,229 @@ async def test_resume_without_any_turn_id_is_counted_and_still_reported(
 
     assert [(s.status, s.turn_id) for s in received] == [("completed", None)]
     assert _outcomes(counter).count("missing_turn_id") == 1
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_cancelled_after_its_result_committed_is_reported(
+    canonical,
+) -> None:
+    """The result committed COMPLETED and released the lease; the run was
+    cancelled during its completion broadcast, so the scheduler's own
+    settlement is fenced out. The committed outcome is still reported."""
+    received = _capture()
+
+    async def cancelled_broadcast(_event: Any, _task_id: Any) -> None:
+        raise asyncio.CancelledError()
+
+    settle = orchestrator.settle_task_lease_isolated
+    calls: list[bool] = []
+
+    def settle_spy(*args: Any, **kwargs: Any) -> bool:
+        settled = settle(*args, **kwargs)
+        calls.append(settled)
+        return settled
+
+    lease, payload, raised = await _schedule_turn(
+        canonical,
+        _result_manager({"success": True, "output": "4"}),
+        extra_patches=(
+            patch(
+                "xagent.web.services.task_event_display.publish_task_result",
+                new=cancelled_broadcast,
+            ),
+            patch.object(orchestrator, "settle_task_lease_isolated", new=settle_spy),
+        ),
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.COMPLETED
+        assert task.runner_id is None
+    assert raised is asyncio.CancelledError
+    assert calls == [False]
+    assert [(s.status, s.error_code, s.turn_id) for s in received] == [
+        ("completed", None, payload.turn_id)
+    ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_channel_result_committed_but_unreported_is_reported_by_scheduler(
+    canonical,
+) -> None:
+    """The channel finalizer committed, but its own report failed inside the
+    entry (which only logs that failure) and the entry returned normally.
+    The scheduler's settlement returns True and reports the run once."""
+    received = _capture()
+
+    async def channel_run(**kwargs: Any) -> None:
+        from xagent.web.services.managed_task_lease import (
+            finalize_managed_task_lease_result_sync,
+        )
+
+        assert await asyncio.to_thread(
+            finalize_managed_task_lease_result_sync,
+            kwargs["lease"],
+            status=TaskStatus.COMPLETED,
+            assistant_content="ok",
+            turn_id="cmd",
+        )
+        # The entry recorded the committed status, then its report raised
+        # before ``report_turn_settled`` and was only logged.
+        kwargs["turn_facts"].finalized_status = "completed"
+
+    settle = orchestrator.settle_task_lease_isolated
+
+    def settle_as_coordinator(*args: Any, **kwargs: Any) -> bool:
+        settle(*args, **kwargs)
+        return True
+
+    _lease, payload, _raised = await _schedule_turn(
+        canonical,
+        _result_manager({"success": True}),
+        channel_command=SimpleNamespace(task_id=canonical[1], command_id="cmd"),
+        extra_patches=(
+            patch(
+                "xagent.web.services.shared_channel_execution."
+                "execute_channel_background",
+                new=channel_run,
+            ),
+            patch.object(
+                orchestrator, "settle_task_lease_isolated", new=settle_as_coordinator
+            ),
+        ),
+    )
+
+    assert [(s.status, s.turn_id) for s in received] == [("completed", payload.turn_id)]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_failing_before_execution_is_reported(canonical) -> None:
+    received = _capture()
+    manager = _result_manager({"success": True, "output": "4"})
+
+    await _schedule_turn(
+        canonical,
+        manager,
+        extra_patches=(
+            patch.object(
+                orchestrator, "load_task_setup_snapshot_sync", return_value=None
+            ),
+        ),
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        assert db.get(Task, tid).status == TaskStatus.FAILED
+    manager.execute_task.assert_not_awaited()
+    assert [(s.status, s.error_code) for s in received] == [
+        ("failed", "task_execution_failed")
+    ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_with_a_dedicated_failure_code_reports_it(
+    canonical,
+) -> None:
+    from xagent.web.services.llm_utils import AutoModelUnavailableError
+
+    received = _capture()
+
+    await _schedule_turn(
+        canonical, _result_manager(AutoModelUnavailableError("no model"))
+    )
+
+    assert [(s.status, s.error_code) for s in received] == [
+        ("failed", "auto_model_unavailable")
+    ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_paused_by_its_settlement_reports_paused(
+    canonical, monkeypatch
+) -> None:
+    """A recoverable infrastructure failure settles the run PAUSED."""
+    from tests.core.agent.test_react import FakeTool
+    from tests.web.services.test_execution_event_persistence_settlement import (
+        _fail_once,
+        _react_execution,
+        _run_scheduled_turn,
+    )
+
+    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", "true")
+    factory, tid = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+    _fail_once(monkeypatch, "tool_execution_start")
+    received = _capture()
+
+    await _run_scheduled_turn(tid, lease, _react_execution(tid, FakeTool()))
+    await _settle_inflight()
+
+    with factory() as db:
+        assert db.get(Task, tid).status == TaskStatus.PAUSED
+    assert [(s.status, s.error_code) for s in received] == [("paused", None)]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_failing_hook_leaves_the_committed_task_unchanged(canonical) -> None:
+    def hook(_settlement: TurnSettlement) -> None:
+        raise RuntimeError("hook broke")
+
+    set_turn_settled_hook(hook)
+    with patch.object(turn_settlement, "increment_counter") as counter:
+        await _schedule_turn(
+            canonical, _result_manager({"success": True, "output": "4"})
+        )
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.COMPLETED
+        assert task.runner_id is None
+    assert _outcomes(counter) == ["failed"]
+
+
+async def test_resume_late_result_reports_nothing(monkeypatch) -> None:
+    received = _capture()
+    late = {"late_result": True, "lease_released": False}
+
+    await _drive_resume(
+        monkeypatch,
+        RESUME_OK,
+        extra_patches=(
+            patch(
+                "xagent.web.services.task_execution._finalize_resumed_task",
+                return_value=late,
+            ),
+        ),
+    )
+
+    assert received == []
+
+
+async def test_resume_restored_to_its_prior_status_reports_nothing(
+    monkeypatch,
+) -> None:
+    """An unreadable checkpoint returns the task to the status it rested in
+    before this resume; no run settled, so nothing is reported."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+
+    received = _capture()
+    restore = MagicMock(return_value=True)
+
+    await _drive_resume(
+        monkeypatch,
+        CheckpointUnavailableError("checkpoint store unavailable"),
+        preacquired_prior_status=TaskStatus.WAITING_FOR_USER,
+        extra_patches=(
+            patch(
+                "xagent.web.services.task_execution."
+                "_restore_resumed_task_lease_to_prior_status",
+                new=restore,
+            ),
+        ),
+    )
+
+    restore.assert_called_once()
+    assert received == []

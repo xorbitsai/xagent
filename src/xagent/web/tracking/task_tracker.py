@@ -584,8 +584,9 @@ class TaskTracker:
 
     def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
         """This turn's (detail entries, tool-call count) over the baseline seeded
-        in start_tracking. Single source for the completion meter and the mid-run
-        gate so they can't disagree on what 'this run's usage' means."""
+        in start_tracking. Single source for the completion meter, the mid-run
+        gate and ``turn_usage`` so they can't disagree on what 'this run's
+        usage' means."""
         if usage is None:
             usage = get_token_usage()
         return (

@@ -5,6 +5,9 @@ it in, and after the run's lease has been settled the entry point hands a
 frozen ``TurnSettlement`` to the hook registered with
 ``set_turn_settled_hook``. Delivery is detached: the entry point never waits
 for the hook, so a slow hook cannot delay the next turn of the same task.
+
+A synchronous hook is called on the event loop and must not block; a hook
+that does I/O should return an awaitable or move the work to a thread.
 """
 
 from __future__ import annotations
@@ -66,8 +69,9 @@ class TurnFacts:
     started_at: datetime
     usage: TurnUsage | None = None
     first_answer_delta_at: datetime | None = None
-    # The task status the result finalizer committed; None when no result
-    # was committed (the run raised, or was cancelled).
+    # The task status this run's result finalizer committed; None when no
+    # result was committed (the run raised, or was cancelled before its
+    # result was committed).
     finalized_status: str | None = None
     completion_outcome: str | None = None
     error_code: str | None = None

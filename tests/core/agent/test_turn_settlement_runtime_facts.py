@@ -76,6 +76,15 @@ async def test_finish_run_keeps_existing_metadata_and_skips_unstreamed_runs() ->
     assert result["metadata"]["finish_reason"] == "stop"
     assert "first_answer_delta_at" in result["metadata"]
 
+    # A time the pattern already put in the metadata is kept.
+    pattern_time = "2026-01-01T00:00:00+00:00"
+    pre_set: dict = {
+        "success": False,
+        "metadata": {"first_answer_delta_at": pattern_time},
+    }
+    await runner._finish_run(context, pre_set, runtime=streamed)
+    assert pre_set["metadata"]["first_answer_delta_at"] == pattern_time
+
     unstreamed: dict = {"success": False}
     await runner._finish_run(context, unstreamed, runtime=PatternRuntime())
     assert "first_answer_delta_at" not in unstreamed.get("metadata", {})

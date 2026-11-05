@@ -8,8 +8,10 @@ acceptable. It never raises for any JSON value and never echoes a value of the
 schema: callers render the path with :func:`render_error_path`.
 
 :func:`compile_schema` turns a schema that passed those rules into the nodes
-used for judging. Compiling, like every other function here, is pure: it
-neither mutates its arguments nor reads or writes anything outside them.
+used for judging, and :func:`model_facing_schema` writes the nullable copy
+of the schema that the model is shown. Compiling and copying, like every other
+function here, are pure: they neither mutate their arguments nor read or write
+anything outside them.
 
 Every judgement about a JSON value goes through :func:`json_kind` first. A
 bool is never a number, ``0`` is never ``False``, and a tuple or a dict
@@ -783,56 +785,83 @@ def _expansion_dependencies(
     return _children_of(node)
 
 
-def _own_bytes(
-    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
-) -> int:
-    """The size of one node of the copy with every child replaced by a single
-    byte, minus those bytes: the node's own contribution to the copy.
+def make_nullable(
+    node: dict[str, Any], any_of: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The copy of ``node`` that also allows null; ``node`` is not changed.
 
-    Every node but the root is made nullable: a single type ``T`` becomes
-    ``[T, "null"]``, an enum gains ``null`` if it has none, and a string enum
-    gains the reserved marker. A node with an enum then lists its values at the
-    end of its description. A nullable union is merged into its value node
-    first: the union supplies the title unless the value node has one, and the
-    two descriptions are joined by a space.
+    A single type ``T`` becomes ``[T, "null"]`` and an enum that lacks ``null``
+    gains it, so a node that is nullable already comes back equal. A node must
+    list an enum as ``enum``, never as ``const`` (see :func:`normalized_enum`).
+    Given the ``anyOf`` node whose value branch ``node`` is, the union supplies
+    the title unless ``node`` has one, and the two descriptions are joined by a
+    space.
+    """
+    nullable = dict(node)
+    if any_of is not None:
+        if "title" not in node and "title" in any_of:
+            nullable["title"] = any_of["title"]
+        descriptions = [d["description"] for d in (any_of, node) if "description" in d]
+        if descriptions:
+            nullable["description"] = " ".join(descriptions)
+    if type(nullable["type"]) is str:
+        nullable["type"] = [nullable["type"], "null"]
+    if "enum" in nullable:
+        values = list(nullable["enum"])
+        if not any(v is None for v in values):
+            values.append(None)
+        nullable["enum"] = values
+    return nullable
+
+
+def _rewritten_node(
+    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """One node of the copy shown to the model, with every child replaced by
+    the placeholder ``0``.
+
+    Every node but the root is made nullable by :func:`make_nullable`. A string
+    enum then gains the reserved marker, and a node with an enum lists its
+    values at the end of its description. ``$defs`` is dropped and ``const``
+    is written as an enum.
     """
     own: dict[str, Any] = {}
-    children = 0
     for key, value in node.items():
         if key == "properties":
             own[key] = dict.fromkeys(value, 0)
-            children += len(value)
         elif key == "items":
             own[key] = 0
-            children += 1
         elif key not in ("$defs", "const"):
             own[key] = value
     enum = normalized_enum(node)
     if enum is not None:
         own["enum"] = enum
-    if not root:
-        if any_of is not None:
-            if "title" not in node and "title" in any_of:
-                own["title"] = any_of["title"]
-            descriptions = [
-                d["description"] for d in (any_of, node) if "description" in d
-            ]
-            if descriptions:
-                own["description"] = " ".join(descriptions)
-        if type(own["type"]) is str:
-            own["type"] = [own["type"], "null"]
-        if enum is not None:
-            values = list(enum)
-            if not any(v is None for v in values):
-                values.append(None)
-            if is_string_typed(node):
-                values.append(NOT_EXPRESSIBLE_MARKER)
-            own["enum"] = values
-            own["description"] = own.get("description", "") + allowed_values_suffix(
-                values
-            )
+    if root:
+        return own
+    own = make_nullable(own, any_of)
+    if enum is not None:
+        if is_string_typed(own):
+            own["enum"].append(NOT_EXPRESSIBLE_MARKER)
+        own["description"] = own.get("description", "") + allowed_values_suffix(
+            own["enum"]
+        )
+    return own
+
+
+def _own_size(own: dict[str, Any]) -> int:
+    """The size of a node of the copy with every child replaced by a single
+    byte, minus those bytes: the node's own contribution to the copy."""
+    children = len(own.get("properties", ())) + ("items" in own)
     text = json.dumps(own, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     return len(text.encode("utf-8")) - children
+
+
+def _own_bytes(
+    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
+) -> int:
+    """The node's own contribution to the size of the copy shown to the model,
+    which :func:`model_facing_schema` writes from the same rewritten node."""
+    return _own_size(_rewritten_node(node, root=root, any_of=any_of))
 
 
 def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
@@ -970,17 +999,17 @@ def _pointer_segment(name: str) -> str:
 
 def _position_of(
     node: dict[str, Any], defs: dict[str, Any]
-) -> tuple[dict[str, Any], bool]:
-    """The node a schema position stands for and whether a union made it
-    nullable: references and aliases are followed and a nullable union is read
-    as its value node."""
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The node a schema position stands for and the nullable union that made
+    it nullable, if any: references and aliases are followed and a union is
+    read as its value node."""
     while "$ref" in node:
         node = defs[node["$ref"][len(REF_PREFIX) :]]
     if "anyOf" in node:
         branches = node["anyOf"]
         value = branches[1] if _is_null_branch(branches[0]) else branches[0]
-        return resolve_alias(value, defs), True
-    return node, False
+        return resolve_alias(value, defs), node
+    return node, None
 
 
 def _canonical_value_bytes(value: Any) -> int:
@@ -1076,11 +1105,13 @@ def compile_schema(schema: dict[str, Any]) -> CompiledSchema:
     defs = _defs_of(schema)
 
     def kids_of(target: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
-        return [_position_of(child, defs) for child in _children_of(target)]
+        positions = [_position_of(child, defs) for child in _children_of(target)]
+        return [(found, union is not None) for found, union in positions]
 
     nodes: list[CompiledNode] = []
     index_of: dict[tuple[int, bool], int] = {}
-    root_target, root_union = _position_of(schema, defs)
+    root_target, root_node = _position_of(schema, defs)
+    root_union = root_node is not None
     stack: list[list[Any]] = [[root_target, root_union, kids_of(root_target), 0]]
     while stack:
         frame = stack[-1]
@@ -1100,3 +1131,45 @@ def compile_schema(schema: dict[str, Any]) -> CompiledSchema:
         nodes=tuple(nodes),
         root=index_of[(id(root_target), root_union)],
     )
+
+
+# --- the copy shown to the model --------------------------------------------------
+
+
+def model_facing_schema(compiled: CompiledSchema) -> dict[str, Any]:
+    """The schema the model is shown: the caller's schema with every node but
+    the root made nullable.
+
+    The copy holds no ``$ref``, ``$defs`` or ``anyOf``; each reference is
+    expanded with its own copy of the target, so no two positions share a list
+    or a dict with each other or with the caller's schema, and a string enum
+    lists the reserved marker. It only tells the model what it may write; a
+    value is always judged against the caller's schema. The copy is built node
+    by node, and ``ValueError`` is raised as soon as it passes
+    ``MAX_EXPANDED_BYTES``, whatever the schema.
+    """
+    schema = compiled.schema
+    defs = _defs_of(schema)
+    limit = MAX_EXPANDED_BYTES
+    spent = 0
+    result: list[Any] = [None]
+    work: list[tuple[Any, Any, dict[str, Any], bool]] = [(result, 0, schema, True)]
+    while work:
+        holder, key, position, is_root = work.pop()
+        target, union = _position_of(position, defs)
+        node = _rewritten_node(target, root=is_root, any_of=union)
+        spent += _own_size(node)
+        if spent > limit:
+            raise ValueError("the copy of the schema is over the size limit")
+        for name, value in node.items():
+            if type(value) is list:
+                node[name] = list(value)
+        holder[key] = node
+        if "items" in target:
+            work.append((node, "items", target["items"], False))
+        properties = target.get("properties")
+        if type(properties) is dict:
+            for name in reversed(list(properties)):
+                work.append((node["properties"], name, properties[name], False))
+    copied: dict[str, Any] = result[0]
+    return copied

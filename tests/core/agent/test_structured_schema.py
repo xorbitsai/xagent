@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import time
 import tracemalloc
 from pathlib import Path
@@ -12,13 +13,14 @@ from typing import Any
 import pytest
 
 from tests.shared.structured_path_reference import reference_render
+from tests.shared.structured_schema_random import gen_schema
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import (
     ERROR_PATH_MAX_CHARS,
-    NOT_EXPRESSIBLE_MARKER,
     SchemaViolation,
     allowed_values_suffix,
     canon,
+    canonical_json_bytes,
     check_schema_structure,
     json_kind,
     measure_expansion,
@@ -671,73 +673,6 @@ def _nullable(node: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [node, {"type": "null"}]}
 
 
-def _compact_bytes(value: Any) -> int:
-    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return len(text.encode("utf-8"))
-
-
-def _allowed_values(values: list[Any]) -> str:
-    text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-    return " Allowed values: " + (text if len(text) <= 500 else text[:500] + "\u2026")
-
-
-def _expanded_copy(
-    node: dict[str, Any],
-    defs: dict[str, Any],
-    *,
-    root: bool = False,
-    any_of: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """The copy handed to the model, built the long way: every node except the
-    root is made nullable, references and nullable unions are expanded, and an
-    enum lists its values in the description."""
-    if "$ref" in node:
-        return _expanded_copy(defs[node["$ref"].removeprefix("#/$defs/")], defs)
-    if "anyOf" in node:
-        value_branch = next(b for b in node["anyOf"] if b != {"type": "null"})
-        target = value_branch
-        while "$ref" in target:
-            target = defs[target["$ref"].removeprefix("#/$defs/")]
-        return _expanded_copy(target, defs, any_of=node)
-    copy_: dict[str, Any] = {}
-    for key, value in node.items():
-        if key == "properties":
-            copy_[key] = {k: _expanded_copy(v, defs) for k, v in value.items()}
-        elif key == "items":
-            copy_[key] = _expanded_copy(value, defs)
-        elif key not in ("$defs", "const"):
-            copy_[key] = value
-    enum = [node["const"]] if "const" in node else node.get("enum")
-    if root:
-        if enum is not None:
-            copy_["enum"] = enum
-        return copy_
-    if any_of is not None:
-        if "title" in node or "title" in any_of:
-            copy_["title"] = node.get("title", any_of.get("title"))
-        descriptions = [d["description"] for d in (any_of, node) if "description" in d]
-        if descriptions:
-            copy_["description"] = " ".join(descriptions)
-    if isinstance(copy_["type"], str):
-        copy_["type"] = [copy_["type"], "null"]
-    if enum is not None:
-        values = list(enum)
-        if None not in values:
-            values.append(None)
-        node_type = node["type"]
-        if node_type == "string" or (
-            isinstance(node_type, list) and "string" in node_type
-        ):
-            values.append(NOT_EXPRESSIBLE_MARKER)
-        copy_["enum"] = values
-        copy_["description"] = copy_.get("description", "") + _allowed_values(values)
-    return copy_
-
-
-def _size_of_copy(schema: dict[str, Any]) -> int:
-    return _compact_bytes(_expanded_copy(schema, schema.get("$defs", {}), root=True))
-
-
 def _count_nodes(schema: dict[str, Any]) -> int:
     """Nodes of the expanded tree: a reference and an alias count for nothing and
     a nullable union counts for itself plus its two branches."""
@@ -857,6 +792,35 @@ SIZE_SCHEMAS = {
     "surrogate-pair-and-escapes": _obj(
         {"a": {"type": "string", "enum": ["\U0001f600", 'q"\\', "tab\t"]}}
     ),
+    "target-that-is-a-nullable-union": _obj(
+        {"a": _ref("N"), "b": {"type": "array", "items": _ref("N")}},
+        **{
+            "$defs": {
+                "N": {
+                    "anyOf": [
+                        {"type": "string", "description": "x"},
+                        {"type": "null"},
+                    ],
+                    "description": "y",
+                    "title": "T",
+                }
+            }
+        },
+    ),
+    "title-conflict": _obj(
+        {
+            "a": {
+                "title": "Outer",
+                "anyOf": [{"type": "string", "title": "Inner"}, {"type": "null"}],
+            }
+        }
+    ),
+    "ninety-nullable-references-to-one-enum": _obj(
+        {f"f{i:03d}": _nullable(_ref("E")) for i in range(90)},
+        **{
+            "$defs": {"E": {"type": "string", "enum": [f"v{i:02d}" for i in range(40)]}}
+        },
+    ),
 }
 
 
@@ -868,8 +832,36 @@ def test_the_estimated_size_equals_the_size_of_the_copy_built_in_full(
 
     measured = measure_expansion(schema)
 
-    assert measured.rewritten_bytes == _size_of_copy(schema)
+    assert measured.rewritten_bytes == canonical_json_bytes(
+        structured_schema.model_facing_schema(structured_schema.compile_schema(schema))
+    )
     assert measured.nodes == _count_nodes(schema)
+
+
+def test_the_estimated_size_of_a_hundred_such_references_is_over_the_limit() -> None:
+    schema = _obj(
+        {f"f{i:03d}": _nullable(_ref("E")) for i in range(100)},
+        **{
+            "$defs": {"E": {"type": "string", "enum": [f"v{i:02d}" for i in range(40)]}}
+        },
+    )
+
+    assert measure_expansion(schema).rewritten_bytes == 70_174
+    assert _violation(schema) == ("S11", "")
+
+
+def test_the_estimated_size_equals_the_copy_of_random_schemas() -> None:
+    rng = random.Random(20261104)
+    for _ in range(400):
+        schema = gen_schema(rng)
+        assert check_schema_structure(schema) is None, schema
+        copy_ = structured_schema.model_facing_schema(
+            structured_schema.compile_schema(schema)
+        )
+
+        measured = measure_expansion(schema)
+
+        assert measured.rewritten_bytes == canonical_json_bytes(copy_), schema
 
 
 def test_the_estimate_does_not_change_the_schema() -> None:
@@ -983,7 +975,13 @@ def test_a_small_schema_whose_copy_would_be_over_a_megabyte_is_refused() -> None
     assert _violation(schema) == ("S11", "")
 
 
-def test_a_500_value_enum_expanded_nine_times_is_refused_within_a_second() -> None:
+def test_a_500_value_enum_expanded_nine_times_is_refused_within_a_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(_compiled: object) -> None:
+        raise AssertionError("the copy was built")
+
+    monkeypatch.setattr(structured_schema, "model_facing_schema", fail)
     values = [f"{i:04d}-" + "v" * 14 for i in range(500)]
     schema = _layered_schema(9, {"type": "string", "enum": values})
     original = len(json.dumps(schema, separators=(",", ":")).encode())

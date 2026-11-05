@@ -11,10 +11,12 @@ from typing import Any, Dict, Optional
 
 from ...core.model.chat.token_context import (
     TokenUsage,
+    aggregate_token_usage_by_model,
     get_token_usage,
     set_token_usage,
 )
 from ..services.db_runtime import run_db_io_cancellation_safe
+from ..services.turn_settlement import TurnModelUsage, TurnUsage
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,7 @@ def _copy_usage(usage: TokenUsage) -> TokenUsage:
         output_tokens=usage.output_tokens,
         llm_calls=usage.llm_calls,
         tool_calls=usage.tool_calls,
+        tool_errors=usage.tool_errors,
         details=_copy_details(usage.details),
     )
 
@@ -381,6 +384,10 @@ class TaskTracker:
         # Per-turn baselines captured in start_tracking; used to meter deltas.
         self._initial_details_len = 0
         self._initial_tool_calls = 0
+        self._initial_tool_errors = 0
+        self._initial_llm_calls = 0
+        self._initial_input_tokens = 0
+        self._initial_output_tokens = 0
 
         # Compatibility callers may still hand us their request session. Read
         # and detach the primitive seed now, but never retain the Session or ORM
@@ -431,6 +438,10 @@ class TaskTracker:
         # everything past _initial_details_len.
         self._initial_details_len = len(initial_usage.details)
         self._initial_tool_calls = initial_usage.tool_calls
+        self._initial_tool_errors = initial_usage.tool_errors
+        self._initial_llm_calls = initial_usage.llm_calls
+        self._initial_input_tokens = initial_usage.input_tokens
+        self._initial_output_tokens = initial_usage.output_tokens
 
         logger.info(f"Started token tracking for task {self.task_id}")
 
@@ -573,6 +584,33 @@ class TaskTracker:
         return (
             usage.details[self._initial_details_len :],
             max(0, usage.tool_calls - self._initial_tool_calls),
+        )
+
+    def turn_usage(self, usage: TokenUsage | None = None) -> TurnUsage:
+        """This run's usage over the baseline seeded in ``start_tracking``.
+
+        Same delta the completion meter and the mid-run quota gate use, so the
+        three cannot disagree on what "this run's usage" means.
+        """
+        if usage is None:
+            usage = get_token_usage()
+        details, tool_calls = self._turn_delta(usage)
+        groups = aggregate_token_usage_by_model(details)
+        return TurnUsage(
+            input_tokens=max(0, usage.input_tokens - self._initial_input_tokens),
+            output_tokens=max(0, usage.output_tokens - self._initial_output_tokens),
+            llm_calls=max(0, usage.llm_calls - self._initial_llm_calls),
+            tool_calls=tool_calls,
+            tool_errors=max(0, usage.tool_errors - self._initial_tool_errors),
+            by_model=tuple(
+                TurnModelUsage(
+                    model_id=group["model_id"],
+                    model_name=group["model_name"],
+                    input_tokens=group["input_tokens"],
+                    output_tokens=group["output_tokens"],
+                )
+                for group in groups
+            ),
         )
 
     async def interrupt_reason_for_quota(self) -> str | None:

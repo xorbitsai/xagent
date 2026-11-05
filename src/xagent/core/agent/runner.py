@@ -2246,6 +2246,15 @@ class AgentRunner:
                     context.execution_id,
                     exc_info=True,
                 )
+        # When the answer started streaming, for the caller's turn timing.
+        # An existing value is kept: the pattern's own result wins.
+        first_delta_at = runtime.first_final_answer_delta_at
+        if first_delta_at is not None:
+            metadata = result.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                result["metadata"] = metadata
+            metadata.setdefault("first_answer_delta_at", first_delta_at.isoformat())
         await self._dispatch_callback(
             "on_run_end", runner=self, context=context, result=result
         )

@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import (
     task_command_transport,

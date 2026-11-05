@@ -86,6 +86,12 @@ OUTCOMES = [
     ("failed", "model_error", {}, Model(LLMRetryableError("boom"))),
     ("failed", "extraction_timeout", {}, Model(_sleep_forever)),
     ("failed", "internal_error", {"output": "x"}, Model(None)),
+    (
+        "failed",
+        "result_too_large",
+        {},
+        Model({"name": "x" * 262_200, "unit": "u", "note": None}),
+    ),
 ]
 
 

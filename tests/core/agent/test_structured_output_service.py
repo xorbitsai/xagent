@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -47,6 +48,7 @@ class ScriptedModel:
 
     def __init__(self, name: str = "model") -> None:
         self.model_name = name
+        self.arguments: dict[str, Any] = {"name": "Bo"}
         self.calls: list[dict[str, Any]] = []
 
     async def chat(self, **kwargs: Any) -> Any:
@@ -59,7 +61,7 @@ class ScriptedModel:
                     "type": "function",
                     "function": {
                         "name": "submit_result",
-                        "arguments": json.dumps({"name": "Bo"}),
+                        "arguments": json.dumps(self.arguments),
                     },
                 }
             ],
@@ -173,6 +175,49 @@ async def test_a_resumed_run_uses_the_model_of_the_live_handle(tmp_path):
     # The run finished and the handle is gone, but the model was taken before.
     assert rig.registry.get("task-1") is None
     assert rig.tracer.events[0]["task_id"] == "task-1"
+
+
+def _too_long_warnings(caplog: Any) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "stage=arguments" in r.getMessage()
+    ]
+
+
+async def test_a_new_run_hands_its_run_id_to_the_extraction(tmp_path, caplog):
+    rig = Rig(tmp_path, ScriptedPattern(DONE))
+    rig.service_model.arguments = {"name": "x" * 300_000}
+
+    with caplog.at_level(logging.WARNING):
+        result = await rig.service.execute_task(
+            "do it", {"run_id": "run-9"}, "task-1", structured_output_format=FMT
+        )
+
+    assert result[STRUCTURED_OUTPUT_RESULT_KEY]["reason"] == {
+        "code": "result_too_large"
+    }
+    (message,) = _too_long_warnings(caplog)
+    assert "task_id=task-1 run_id=run-9 " in message
+
+
+async def test_a_resumed_run_hands_its_run_id_to_the_extraction(tmp_path, caplog):
+    rig = Rig(tmp_path, ScriptedPattern(INTERRUPTED, DONE))
+    handle_model = ScriptedModel("handle")
+    handle_model.arguments = {"name": "x" * 300_000}
+    await rig.leave_resumable(handle_model, keep_handle=True)
+
+    with caplog.at_level(logging.WARNING):
+        result = await rig.service.resume_execution_by_id(
+            "task-1", structured_output_format=FMT, metadata={"run_id": "run-9"}
+        )
+
+    assert result is not None
+    assert result[STRUCTURED_OUTPUT_RESULT_KEY]["reason"] == {
+        "code": "result_too_large"
+    }
+    (message,) = _too_long_warnings(caplog)
+    assert "task_id=task-1 run_id=run-9 " in message
 
 
 async def test_a_resumed_run_without_a_handle_uses_the_configured_model(tmp_path):

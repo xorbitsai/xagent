@@ -269,8 +269,10 @@ def test_nul_and_a_lone_surrogate_are_invalid_characters_on_both_paths(escape):
     assert _bad(json.loads(key_text)) == "invalid_character"
 
 
-def test_an_invalid_character_is_reported_before_a_non_finite_number():
-    text = '{"a":NaN,"b":"\\u0000"}'
+@pytest.mark.parametrize("text", ['{"a":NaN,"b":"\\u0000"}', '{"b":"\\u0000","a":NaN}'])
+def test_an_invalid_character_is_reported_before_a_non_finite_number_in_any_key_order(
+    text,
+):
     assert _bad(text) == "invalid_character"
     assert _bad(json.loads(text)) == "invalid_character"
 
@@ -279,9 +281,13 @@ def test_a_non_finite_number_is_reported_before_a_type_that_json_has_not():
     assert _bad({"a": float("nan"), "b": {1, 2}}) == "non_finite_number"
 
 
-def test_one_thousand_han_characters_are_measured_the_same_on_both_paths():
-    text = json.dumps({"a": "汉" * 1000}, ensure_ascii=False)
-    assert _good(text) == _good(json.loads(text))
+def test_han_characters_near_the_limit_are_measured_the_same_on_both_paths():
+    # 87,000 characters are 261,000 bytes as UTF-8 (under the 256 KiB limit) but
+    # 522,000 bytes once escaped as \uXXXX, so only the canonical measure passes.
+    text = json.dumps({"a": "汉" * 87_000}, ensure_ascii=False)
+    value = json.loads(text)
+    assert ss.canonical_json_bytes(value) < 256 * 1024 < len(json.dumps(value))
+    assert _good(text) == _good(value)
 
 
 def _padded(total_bytes: int) -> dict[str, str]:
@@ -839,6 +845,7 @@ async def test_arguments_that_are_too_long_end_the_extraction_at_once(as_text, c
     (message,) = _warnings(caplog)
     assert "task_id=t-1" in message and "run_id=r-1" in message
     assert "stage=arguments" in message and "arguments_bytes=262" in message
+    assert message.endswith("r1_steps=0 expansion_nodes=0 output_bytes=0")
 
 
 async def test_a_too_long_reply_after_a_bad_one_still_ends_it():
@@ -992,14 +999,6 @@ async def test_the_output_limit_of_a_configured_model_is_the_configured_value(wi
     assert _max_tokens(llm) == [12000]
 
 
-async def test_a_configured_limit_is_not_capped_by_the_window():
-    llm = ScriptedModel(
-        [_args_reply(GOOD)], context_window=8000, default_max_tokens=12000
-    )
-    await _step(llm)
-    assert _max_tokens(llm) == [12000]
-
-
 async def test_the_window_is_read_from_the_prepared_model_and_the_limit_from_the_router():
     resolved = ScriptedModel([_args_reply(GOOD)], context_window=8000)
     await _step(RoutedModel(resolved, context_window=128000))
@@ -1088,55 +1087,45 @@ EXTRA_KEY_REPLY = {
 }
 
 
-async def test_the_real_deepseek_adapter_gives_a_protocol_response_the_loop_corrects(
-    monkeypatch,
-):
+def _deepseek_adapter() -> Any:
     from xagent.core.model.chat.basic.deepseek import DeepSeekLLM
-    from xagent.core.model.chat.basic.openai import OpenAICompatibleLLM
 
-    async def upstream(self: Any, *args: Any, **kwargs: Any) -> Any:
-        return copy.deepcopy(EXTRA_KEY_REPLY)
-
-    monkeypatch.setattr(OpenAICompatibleLLM, "chat", upstream)
-    llm = DeepSeekLLM(
+    return DeepSeekLLM(
         model_name="deepseek-flash", api_key="k", base_url="http://localhost:1"
     )
-    shape = await llm.chat(
-        messages=[{"role": "user", "content": "x"}], tools=TOOLS, tool_choice="required"
+
+
+def _openrouter_adapter() -> Any:
+    from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
+
+    return OpenRouterLLM(
+        model_name="deepseek/deepseek-chat", api_key="k", base_url="http://localhost:1"
     )
-    assert shape["type"] == "tool_protocol_error" and shape["tool_calls"] == []
-    sizes: list[int] = []
-    real_chat = llm.chat
-
-    async def spy(**kwargs: Any) -> Any:
-        sizes.append(len(kwargs["messages"]))
-        return await real_chat(**kwargs)
-
-    llm.chat = spy  # type: ignore[method-assign]
-    assert await _step(llm) == _failed("schema_mismatch")
-    assert sizes == [2, 2, 2]
 
 
-async def test_the_real_openrouter_adapter_raises_an_error_the_loop_corrects(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "build, raises", [(_deepseek_adapter, False), (_openrouter_adapter, True)]
+)
+async def test_a_real_adapter_turns_an_extra_key_into_a_protocol_failure_the_loop_corrects(
+    monkeypatch, build, raises
 ):
     from xagent.core.model.chat.basic.openai import OpenAICompatibleLLM
-    from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 
     async def upstream(self: Any, *args: Any, **kwargs: Any) -> Any:
         return copy.deepcopy(EXTRA_KEY_REPLY)
 
     monkeypatch.setattr(OpenAICompatibleLLM, "chat", upstream)
-    llm = OpenRouterLLM(
-        model_name="deepseek/deepseek-chat", api_key="k", base_url="http://localhost:1"
+    llm = build()
+    call = dict(
+        messages=[{"role": "user", "content": "x"}], tools=TOOLS, tool_choice="required"
     )
-    with pytest.raises(LLMToolProtocolError) as raised:
-        await llm.chat(
-            messages=[{"role": "user", "content": "x"}],
-            tools=TOOLS,
-            tool_choice="required",
-        )
-    assert raised.value.code == "unexpected_tool_arguments"
+    if raises:
+        with pytest.raises(LLMToolProtocolError) as raised:
+            await llm.chat(**call)
+        assert raised.value.code == "unexpected_tool_arguments"
+    else:
+        shape = await llm.chat(**call)
+        assert shape["type"] == "tool_protocol_error" and shape["tool_calls"] == []
     sizes: list[int] = []
     real_chat = llm.chat
 
@@ -1373,6 +1362,13 @@ async def test_the_event_holds_the_routing_keys_and_only_counts_and_fixed_names(
         "text_only_replies": 1,
     }
     assert type(data["duration_ms"]) is int and data["duration_ms"] >= 0
+
+
+async def test_the_answer_size_in_the_event_counts_characters_and_not_bytes():
+    answer = "汉字答案é"
+    assert len(answer.encode("utf-8")) > len(answer)
+    data = await _event([_args_reply(GOOD)], output=answer)
+    assert data["answer_chars"] == len(answer)
 
 
 async def test_the_event_never_holds_the_answer_or_what_the_model_wrote():

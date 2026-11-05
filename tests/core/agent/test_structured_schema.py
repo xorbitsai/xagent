@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from tests.shared.structured_path_reference import reference_render
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import (
     ERROR_PATH_MAX_CHARS,
@@ -430,21 +431,6 @@ def test_forbidden_characters_inside_enum_values_are_found() -> None:
 # --- the path in a message -------------------------------------------------------
 
 
-def _reference_render(segments: list[str | int]) -> str:
-    """Escape every segment completely, join, then cut the whole path."""
-    parts = []
-    for seg in segments:
-        if isinstance(seg, int):
-            parts.append(str(seg))
-        else:
-            escaped = seg.replace("~", "~0").replace("/", "~1")
-            parts.append(json.dumps(escaped, ensure_ascii=True)[1:-1])
-    path = "".join("/" + part for part in parts)
-    if len(path) > ERROR_PATH_MAX_CHARS:
-        path = "..." + path[-(ERROR_PATH_MAX_CHARS - 3) :]
-    return path
-
-
 def test_a_path_is_ascii_json_pointer_text() -> None:
     rendered = render_error_path(
         ["properties", "a/b~c", 3, "café", "\ud800", 'q"\\', "x\n", "\u0000"]
@@ -469,7 +455,7 @@ def test_a_property_name_of_5000_characters_cuts_the_path_to_its_end() -> None:
     assert len(path) == ERROR_PATH_MAX_CHARS
     assert path.startswith("...")
     assert path.endswith("/items")
-    assert path == _reference_render(["properties", "x" * 5000] + ["items"] * 32)
+    assert path == reference_render(["properties", "x" * 5000] + ["items"] * 32)
 
 
 def test_33_levels_of_64_character_names_are_not_cut() -> None:
@@ -499,8 +485,8 @@ def test_a_lone_surrogate_name_with_33_levels_renders_as_ascii() -> None:
 
 def test_rendering_a_huge_segment_matches_escaping_everything_then_cutting() -> None:
     segment = "\u0080" * 5_000_000
-    expected = _reference_render([segment])
-    expected_with_tail = _reference_render(["properties", segment, "items", 2])
+    expected = reference_render([segment])
+    expected_with_tail = reference_render(["properties", segment, "items", 2])
 
     tracemalloc.start()
     try:
@@ -531,7 +517,7 @@ def test_rendering_a_huge_segment_matches_escaping_everything_then_cutting() -> 
 def test_rendering_matches_the_reference_for_long_paths(
     segments: list[str | int],
 ) -> None:
-    assert render_error_path(segments) == _reference_render(segments)
+    assert render_error_path(segments) == reference_render(segments)
 
 
 # --- names are matched as whole strings ------------------------------------------

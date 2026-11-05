@@ -312,6 +312,7 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
             "__xagent_mcp_runtime_authorization_policy_allow_builtin_stdio",
             "selected_file_ids",
             "prompt_context",
+            "response_format",
             "question_cancelled",
             "__xagent_file_operation_access_version",
             # Public-channel identity/quota markers (#1108).

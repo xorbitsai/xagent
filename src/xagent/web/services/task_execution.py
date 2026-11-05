@@ -129,6 +129,7 @@ from .task_lease_service import (
     task_lease_attempt_predicate,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
+from .turn_settlement import TurnFacts, build_turn_settlement, notify_turn_settled
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -2634,11 +2635,15 @@ async def execute_task_background(
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    turn_facts: TurnFacts | None = None,
 ) -> None:
     """Execute one task without checking out a DB connection on the event loop.
 
     Setup and finalization use worker-owned short Sessions. The long-running
     agent await receives only detached runtime state and primitive identifiers.
+
+    ``turn_facts``, when given, receives this run's usage and, once the result
+    is committed, its committed outcome; the caller reports the settlement.
     """
     from .task_execution_context_service import (
         materialize_task_execution_recovery_state,
@@ -2839,6 +2844,9 @@ async def execute_task_background(
                 db_session=None,
                 manage_task_lease=False,
                 task_lease=task_lease,
+                turn_usage_sink=(
+                    turn_facts.record_usage if turn_facts is not None else None
+                ),
             )
 
         finalize_run_id = (
@@ -2868,6 +2876,17 @@ async def execute_task_background(
         with propagate_deferred_cancellation(finalization_cancellation):
             if finalized.late_result:
                 return
+            if turn_facts is not None:
+                turn_facts.finalized_status = finalized.final_task_status
+                turn_facts.completion_outcome = finalized.broadcast_meta.get(
+                    "completion_outcome"
+                )
+                turn_facts.error_code = finalized.error_code
+                turn_facts.empty_visible_answer = (
+                    not finalized.waiting_for_control
+                    and not safe_str(finalized.ai_response).strip()
+                )
+                turn_facts.absorb_result(result)
 
             normalized_outputs = finalized.normalized_outputs
             if normalized_outputs:
@@ -3677,17 +3696,35 @@ async def execute_resume_background(
     # never injected, so the message can be accepted as a new turn; any other
     # refusal keeps the ordinary failed-delivery answer.
     delivery_claimed_fresh: bool = False,
+    # Appended for the same reason. The facts bag this resume's settlement
+    # report is built from; None means this function creates its own.
+    turn_facts: TurnFacts | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
+
+    Once the resume's lease is settled -- by the result finalizer, or by the
+    failure/pause settlement in its cleanup -- the settlement is reported
+    once through ``notify_turn_settled``.
     """
     from .agent_service_manager import caller_facing_execution_metadata
 
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+
+    facts = (
+        turn_facts
+        if turn_facts is not None
+        else TurnFacts(started_at=datetime.now(timezone.utc))
+    )
+    # Set by the cleanup when its own settlement committed (a failure or a
+    # pause); the result finalizer's commit is recorded on ``facts``.
+    resume_settled_by_cleanup = False
+    resume_settled_paused = False
+    notified = False
 
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
@@ -4429,7 +4466,15 @@ async def execute_resume_background(
             tracker_to_complete = resume_tracker
             resume_tracker = None
             agent_service.set_interrupt_checker(None)
-            await tracker_to_complete.complete_tracking()
+            completed_usage = await tracker_to_complete.complete_tracking()
+            try:
+                facts.record_usage(tracker_to_complete.turn_usage(completed_usage))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "turn usage capture failed for task %s",
+                    task_id,
+                    exc_info=True,
+                )
 
         # Output object storage can be arbitrarily slow. Stage and checksum it
         # while this exact runner's heartbeat is still active; after heartbeat
@@ -4500,6 +4545,18 @@ async def execute_resume_background(
             return
         normalized_outputs = finalized["normalized_outputs"]
         output = finalized["output"]
+        facts.finalized_status = finalized["final_status"]
+        facts.completion_outcome = finalized.get("completion_outcome")
+        facts.error_code = finalized.get("error_code")
+        facts.empty_visible_answer = (
+            finalized["final_status"]
+            not in {
+                TaskStatus.PAUSED.value,
+                TaskStatus.WAITING_FOR_USER.value,
+            }
+            and not str(output or "").strip()
+        )
+        facts.absorb_result(result)
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
         task_title = finalized["task_title"]
@@ -4772,6 +4829,7 @@ async def execute_resume_background(
             nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
             nonlocal settlement_error
             nonlocal prepared_outputs
+            nonlocal resume_settled_by_cleanup, resume_settled_paused, notified
             settlement_returned = False
 
             try:
@@ -4974,6 +5032,13 @@ async def execute_resume_background(
                         settlement_returned = True
                         if settled:
                             lease_released = True
+                            resume_settled_by_cleanup = True
+                            # ``pause_unknown_task_lease`` pauses without
+                            # filling the report.
+                            resume_settled_paused = bool(
+                                settlement_report.paused
+                                or (pause_for_input and not explicit_cancel)
+                            )
                             if settlement_report.paused:
                                 from .task_orchestrator import (
                                     publish_settlement_pause,
@@ -5044,6 +5109,55 @@ async def execute_resume_background(
                 except Exception:
                     logger.warning(
                         "Settling the cached runtime for task %s failed",
+                        task_id,
+                        exc_info=True,
+                    )
+                # Report the settled run last, after every broadcast. The
+                # finalizer's commit and the cleanup settlement are exclusive:
+                # the cleanup only settles a lease the finalizer did not
+                # release.
+                try:
+                    if not notified and (
+                        facts.finalized_status is not None or resume_settled_by_cleanup
+                    ):
+                        notified = True
+                        status = facts.finalized_status
+                        if status is None:
+                            status = (
+                                TaskStatus.PAUSED.value
+                                if resume_settled_paused
+                                else TaskStatus.FAILED.value
+                            )
+                        error_code = facts.error_code
+                        if error_code is None and status == TaskStatus.FAILED.value:
+                            error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
+                        notify_turn_settled(
+                            build_turn_settlement(
+                                facts,
+                                task_id=task_id,
+                                run_id=(
+                                    lease.run_id
+                                    if lease is not None
+                                    else expected_run_id
+                                ),
+                                turn_id=(
+                                    history_turn_id
+                                    or (
+                                        _latest_result_user_turn_id(result)
+                                        if isinstance(result, dict)
+                                        else None
+                                    )
+                                    or None
+                                ),
+                                task_source=trusted_task_source,
+                                status=status,
+                                error_code=error_code,
+                                ended_at=datetime.now(timezone.utc),
+                            )
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "turn settlement notification failed for task %s",
                         task_id,
                         exc_info=True,
                     )

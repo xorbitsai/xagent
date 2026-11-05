@@ -158,6 +158,7 @@ from .task_runtime import (
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
+from .turn_settlement import TurnFacts, build_turn_settlement, notify_turn_settled
 
 logger = logging.getLogger(__name__)
 
@@ -2698,6 +2699,8 @@ def _schedule_bg(
         # retryable ``failed`` delivery (it would invite a double execution).
         execution_started = False
         cleanup_cancellation: asyncio.CancelledError | None = None
+        # What this run reports once its lease is settled.
+        facts = TurnFacts(started_at=datetime.now(timezone.utc))
         try:
             # A cancellation can land after the worker commits but before the
             # await returns. Drain that worker and settle any late lease before
@@ -2874,6 +2877,7 @@ def _schedule_bg(
                             mcp_runtime_authorization_policy=(
                                 mcp_runtime_authorization_policy
                             ),
+                            turn_facts=facts,
                         )
 
                 await run_while_task_lease_owned(
@@ -3032,6 +3036,10 @@ def _schedule_bg(
                     )
         finally:
             turn_id = getattr(payload, "turn_id", None)
+            # Whether this coroutine's own settlement committed, and what it
+            # reported; read by the settlement report below.
+            lease_settled = False
+            report = SettlementReport()
             if lease is not None:
                 try:
                     heartbeat_outcome = await stop_task_lease_heartbeat(
@@ -3098,8 +3106,6 @@ def _schedule_bg(
                         "settlement deferred; lease retained for TTL recovery",
                     )
                 else:
-                    lease_settled = False
-                    report = SettlementReport()
                     # An owned task, so the record below can follow what the
                     # settlement did even when this runner is cancelled again
                     # while it runs (that wait then ends in CancelledError
@@ -3233,6 +3239,50 @@ def _schedule_bg(
                                 task_id,
                                 exc_info=True,
                             )
+            # Report the run once its lease is settled here. Skipped when the
+            # turn body never ran and nothing failed (a pre-execution
+            # short-circuit), and for a channel run that ended normally: its
+            # own result finalizer reported it.
+            if (
+                lease is not None
+                and lease_settled
+                and (execution_started or settlement_error is not None)
+                and (channel_command is None or settlement_error is not None)
+            ):
+                try:
+                    status = facts.finalized_status
+                    if status is None:
+                        status = (
+                            TaskStatus.PAUSED.value
+                            if report.paused
+                            else TaskStatus.FAILED.value
+                        )
+                    error_code = facts.error_code
+                    if error_code is None and status == TaskStatus.FAILED.value:
+                        if broadcast_error_code is not None:
+                            error_code = broadcast_error_code
+                        elif settlement_error == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
+                            error_code = ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
+                        else:
+                            error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
+                    notify_turn_settled(
+                        build_turn_settlement(
+                            facts,
+                            task_id=task_id,
+                            run_id=lease.run_id,
+                            turn_id=turn_id,
+                            task_source=task_source,
+                            status=status,
+                            error_code=error_code,
+                            ended_at=datetime.now(timezone.utc),
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "turn settlement notification failed for task %s",
+                        task_id,
+                        exc_info=True,
+                    )
             try:
                 from .connector_runtime import pop_ephemeral_runtime_values
 

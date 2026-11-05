@@ -4138,3 +4138,647 @@ def test_create_or_update_file_never_retries_on_rate_limit(monkeypatch):
     assert "rate limit" in result["message"]
     assert mock_request.call_count == 1
     sleep_mock.assert_not_called()
+
+
+# --- release tooling -------------------------------------------------------
+
+API = "https://api.github.com/repos/octocat/Hello-World"
+SHA = "a" * 40
+OTHER_SHA = "b" * 40
+
+
+def _routes(monkeypatch, routes):
+    """Mock requests.request with a (METHOD, path-after-repo) -> response map.
+
+    A value may be a MockResponse, a list of them (consumed in order, for
+    paginated routes) or an exception. Unmapped routes fail the test loudly.
+    """
+    calls = []
+
+    def fake(method, url, **kwargs):
+        assert url.startswith(API), url
+        key = (method, url[len(API) :])
+        calls.append((key, kwargs))
+        assert key in routes, f"unexpected request {key}"
+        value = routes[key]
+        if isinstance(value, list):
+            value = value.pop(0)
+        return value
+
+    monkeypatch.setattr(github.requests, "request", fake)
+    return calls
+
+
+def _err(status, message="boom", **kwargs):
+    return MockResponse(json_data={"message": message}, status_code=status, **kwargs)
+
+
+def _check(name, status="completed", conclusion="success"):
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": f"https://github.com/x/{name}",
+    }
+
+
+def _status_routes(statuses=(), checks=(), combined_state="pending"):
+    return {
+        ("GET", "/commits/main/status"): MockResponse(
+            json_data={
+                "sha": SHA,
+                "state": combined_state,
+                "total_count": len(statuses),
+                "statuses": list(statuses),
+            }
+        ),
+        ("GET", "/commits/main/check-runs"): MockResponse(
+            json_data={"total_count": len(checks), "check_runs": list(checks)}
+        ),
+    }
+
+
+def _ref_status(**kwargs):
+    return json.loads(github.github_get_ref_status("octocat/Hello-World", "main"))
+
+
+def test_ref_status_all_green(monkeypatch):
+    _routes(
+        monkeypatch,
+        _status_routes(
+            statuses=[{"context": "ci/legacy", "state": "success"}],
+            checks=[_check("lint"), _check("test", conclusion="skipped")],
+            combined_state="success",
+        ),
+    )
+    result = _ref_status()
+    assert result["status"] == "success"
+    assert result["state"] == "success"
+    assert result["sha"] == SHA
+    assert result["check_runs"] == {
+        "total": 2,
+        "success": 2,
+        "failing": 0,
+        "pending": 0,
+    }
+    assert result["statuses"]["success"] == 1
+    assert result["failing"] == [] and result["pending"] == []
+
+
+def test_ref_status_failure_beats_pending_and_success(monkeypatch):
+    _routes(
+        monkeypatch,
+        _status_routes(
+            checks=[
+                _check("lint"),
+                _check("build", status="in_progress", conclusion=None),
+                _check("test", conclusion="failure"),
+            ]
+        ),
+    )
+    result = _ref_status()
+    assert result["state"] == "failure"
+    assert [c["name"] for c in result["failing"]] == ["test"]
+    assert result["failing"][0]["url"] == "https://github.com/x/test"
+    assert [c["name"] for c in result["pending"]] == ["build"]
+
+
+@pytest.mark.parametrize(
+    "conclusion", ["failure", "timed_out", "cancelled", "startup_failure"]
+)
+def test_ref_status_failing_check_conclusions(monkeypatch, conclusion):
+    _routes(monkeypatch, _status_routes(checks=[_check("x", conclusion=conclusion)]))
+    assert _ref_status()["state"] == "failure"
+
+
+def test_ref_status_legacy_status_failure_and_error(monkeypatch):
+    _routes(
+        monkeypatch,
+        _status_routes(
+            statuses=[{"context": "ci/a", "state": "error", "target_url": "http://a"}],
+            checks=[_check("lint")],
+        ),
+    )
+    result = _ref_status()
+    assert result["state"] == "failure"
+    assert result["failing"][0] == {
+        "kind": "status",
+        "name": "ci/a",
+        "state": "error",
+        "url": "http://a",
+    }
+
+
+def test_ref_status_pending_when_anything_unfinished(monkeypatch):
+    _routes(
+        monkeypatch,
+        _status_routes(
+            statuses=[{"context": "ci/a", "state": "pending"}],
+            checks=[_check("lint")],
+        ),
+    )
+    assert _ref_status()["state"] == "pending"
+
+
+def test_ref_status_action_required_is_not_green(monkeypatch):
+    _routes(
+        monkeypatch, _status_routes(checks=[_check("x", conclusion="action_required")])
+    )
+    assert _ref_status()["state"] == "pending"
+
+
+def test_ref_status_none_when_no_checks_or_statuses(monkeypatch):
+    # GitHub reports an empty combined status as "pending"; it must not leak.
+    _routes(monkeypatch, _status_routes())
+    result = _ref_status()
+    assert result["state"] == "none"
+    assert result["check_runs"]["total"] == 0
+
+
+def test_ref_status_paginates_check_runs_and_clamps_pages(monkeypatch):
+    routes = _status_routes()
+    next_link = {"Link": '<https://api.github.com/x?page=2>; rel="next"'}
+    routes[("GET", "/commits/main/check-runs")] = [
+        MockResponse(json_data={"check_runs": [_check(f"c{i}")]}, headers=next_link)
+        for i in range(github.MAX_CHECK_RUN_PAGES)
+    ]
+    calls = _routes(monkeypatch, routes)
+    result = _ref_status()
+    pages = [c[1]["params"]["page"] for c in calls if c[0][1].endswith("check-runs")]
+    assert pages == list(range(1, github.MAX_CHECK_RUN_PAGES + 1))
+    assert result["truncated"] is True
+    # Unseen checks may still fail: an all-green prefix is not reported green.
+    assert result["state"] == "pending"
+
+
+def test_ref_status_follows_next_page_to_the_end(monkeypatch):
+    routes = _status_routes()
+    routes[("GET", "/commits/main/check-runs")] = [
+        MockResponse(
+            json_data={"check_runs": [_check("a")]},
+            headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+        ),
+        MockResponse(json_data={"check_runs": [_check("b", conclusion="failure")]}),
+    ]
+    _routes(monkeypatch, routes)
+    result = _ref_status()
+    assert result["truncated"] is False
+    assert result["check_runs"]["total"] == 2
+    assert result["state"] == "failure"
+
+
+def test_ref_status_caps_reported_names_but_not_counts(monkeypatch):
+    checks = [_check(f"c{i}", conclusion="failure") for i in range(40)]
+    _routes(monkeypatch, _status_routes(checks=checks))
+    result = _ref_status()
+    assert result["check_runs"]["failing"] == 40
+    assert len(result["failing"]) == github.MAX_REPORTED_CHECKS
+
+
+def test_ref_status_404_and_403(monkeypatch):
+    _routes(monkeypatch, {("GET", "/commits/main/status"): _err(404, "Not Found")})
+    result = _ref_status()
+    assert result["status"] == "error" and "not found" in result["message"]
+    _routes(monkeypatch, {("GET", "/commits/main/status"): _err(403, "Forbidden")})
+    assert _ref_status()["status"] == "error"
+
+
+def test_ref_status_rejects_bad_ref(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    result = json.loads(github.github_get_ref_status("octocat/Hello-World", "a b"))
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+# latest release
+
+
+def test_latest_release_returns_summary_without_body(monkeypatch):
+    _routes(
+        monkeypatch,
+        {
+            ("GET", "/releases/latest"): MockResponse(
+                json_data={
+                    "id": 7,
+                    "tag_name": "v1.2.0",
+                    "name": "v1.2.0",
+                    "body": "notes",
+                    "published_at": "2026-01-01T00:00:00Z",
+                    "html_url": "https://github.com/x/releases/v1.2.0",
+                }
+            )
+        },
+    )
+    result = json.loads(github.github_get_latest_release("octocat/Hello-World"))
+    assert result["status"] == "success"
+    assert result["release"]["tag"] == "v1.2.0"
+    assert result["release"]["published_at"] == "2026-01-01T00:00:00Z"
+    assert "body" not in result["release"]
+    assert result["tags"] == []
+
+
+def test_latest_release_none_yet_is_not_an_error(monkeypatch):
+    _routes(
+        monkeypatch,
+        {
+            ("GET", "/releases/latest"): _err(404, "Not Found"),
+            ("GET", ""): MockResponse(json_data={"full_name": "octocat/Hello-World"}),
+            ("GET", "/tags"): MockResponse(
+                json_data=[{"name": "v0.3.0", "commit": {"sha": SHA}}]
+            ),
+        },
+    )
+    result = json.loads(github.github_get_latest_release("octocat/Hello-World", 5))
+    assert result["status"] == "success"
+    assert result["release"] is None
+    assert result["tags"] == [{"name": "v0.3.0", "sha": SHA}]
+
+
+def test_latest_release_missing_repo_is_an_error(monkeypatch):
+    _routes(
+        monkeypatch,
+        {
+            ("GET", "/releases/latest"): _err(404, "Not Found"),
+            ("GET", ""): _err(404, "Not Found"),
+        },
+    )
+    result = json.loads(github.github_get_latest_release("octocat/Hello-World"))
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+def test_latest_release_clamps_tag_limit(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        {
+            ("GET", "/releases/latest"): MockResponse(json_data={"tag_name": "v1"}),
+            ("GET", "/tags"): MockResponse(json_data=[]),
+        },
+    )
+    github.github_get_latest_release("octocat/Hello-World", 5000)
+    assert calls[1][1]["params"] == {"per_page": 100}
+
+
+def test_latest_release_403(monkeypatch):
+    _routes(monkeypatch, {("GET", "/releases/latest"): _err(403, "Forbidden")})
+    assert (
+        json.loads(github.github_get_latest_release("octocat/Hello-World"))["status"]
+        == "error"
+    )
+
+
+# create release
+
+
+def _release_payload(**extra):
+    return {
+        "id": 99,
+        "tag_name": "v1.0.0",
+        "name": "v1.0.0",
+        "body": "## What's Changed\n- stuff",
+        "draft": False,
+        "prerelease": False,
+        "html_url": "https://github.com/octocat/Hello-World/releases/tag/v1.0.0",
+        **extra,
+    }
+
+
+def _create_routes(overrides=None):
+    routes = {
+        ("GET", ""): MockResponse(json_data={"default_branch": "main"}),
+        ("GET", "/commits/main"): MockResponse(json_data={"sha": SHA}),
+        ("GET", "/git/ref/tags/v1.0.0"): _err(404, "Not Found"),
+        ("POST", "/releases"): MockResponse(
+            json_data=_release_payload(), status_code=201
+        ),
+    }
+    routes.update(overrides or {})
+    return routes
+
+
+def _create(**kwargs):
+    return json.loads(
+        github.github_create_release("octocat/Hello-World", "v1.0.0", **kwargs)
+    )
+
+
+def test_create_release_new_tag_uses_default_branch_sha(monkeypatch):
+    calls = _routes(monkeypatch, _create_routes())
+    result = _create()
+    assert result["status"] == "success"
+    assert result["tag"] == "v1.0.0"
+    assert result["sha"] == SHA
+    assert result["tag_created"] is True
+    assert result["release"]["html_url"].endswith("/v1.0.0")
+    assert "What's Changed" in result["release"]["body"]
+    post = calls[-1]
+    assert post[0] == ("POST", "/releases")
+    assert post[1]["json"] == {
+        "tag_name": "v1.0.0",
+        "name": "v1.0.0",
+        "draft": False,
+        "prerelease": False,
+        "generate_release_notes": True,
+        "target_commitish": SHA,
+    }
+
+
+def test_create_release_explicit_target_and_options(monkeypatch):
+    routes = _create_routes()
+    routes[("GET", "/commits/release/1.x")] = MockResponse(json_data={"sha": OTHER_SHA})
+    calls = _routes(monkeypatch, routes)
+    result = _create(
+        target="release/1.x",
+        name="One",
+        body="hi",
+        generate_release_notes=False,
+        draft=True,
+        prerelease=True,
+    )
+    assert result["sha"] == OTHER_SHA
+    assert not any(c[0] == ("GET", "") for c in calls)  # no default-branch lookup
+    assert calls[-1][1]["json"] == {
+        "tag_name": "v1.0.0",
+        "name": "One",
+        "body": "hi",
+        "draft": True,
+        "prerelease": True,
+        "generate_release_notes": False,
+        "target_commitish": OTHER_SHA,
+    }
+
+
+def test_create_release_refuses_tag_pointing_elsewhere(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        _create_routes(
+            {
+                ("GET", "/git/ref/tags/v1.0.0"): MockResponse(
+                    json_data={"object": {"sha": OTHER_SHA, "type": "commit"}}
+                )
+            }
+        ),
+    )
+    result = _create()
+    assert result["status"] == "error"
+    assert "already exists" in result["message"]
+    assert OTHER_SHA in result["message"]
+    assert not any(c[0][0] == "POST" for c in calls)
+
+
+def test_create_release_refuses_when_tag_already_has_release(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        _create_routes(
+            {
+                ("GET", "/git/ref/tags/v1.0.0"): MockResponse(
+                    json_data={"object": {"sha": SHA, "type": "commit"}}
+                ),
+                ("GET", "/releases/tags/v1.0.0"): MockResponse(
+                    json_data=_release_payload()
+                ),
+            }
+        ),
+    )
+    result = _create()
+    assert result["status"] == "error"
+    assert "already has a release" in result["message"]
+    assert not any(c[0][0] == "POST" for c in calls)
+
+
+def test_create_release_for_existing_tag_at_target_without_release(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        _create_routes(
+            {
+                ("GET", "/git/ref/tags/v1.0.0"): MockResponse(
+                    json_data={"object": {"sha": SHA, "type": "commit"}}
+                ),
+                ("GET", "/releases/tags/v1.0.0"): _err(404, "Not Found"),
+            }
+        ),
+    )
+    result = _create()
+    assert result["status"] == "success"
+    assert result["tag_created"] is False
+    assert "target_commitish" not in calls[-1][1]["json"]
+
+
+def test_create_release_peels_annotated_tag(monkeypatch):
+    _routes(
+        monkeypatch,
+        _create_routes(
+            {
+                ("GET", "/git/ref/tags/v1.0.0"): MockResponse(
+                    json_data={"object": {"sha": "t" * 40, "type": "tag"}}
+                ),
+                ("GET", "/git/tags/" + "t" * 40): MockResponse(
+                    json_data={"object": {"sha": SHA, "type": "commit"}}
+                ),
+                ("GET", "/releases/tags/v1.0.0"): _err(404, "Not Found"),
+            }
+        ),
+    )
+    assert _create()["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "tag", ["", "  ", "refs/tags/v1", "v1 0", "v1..0", "v1:0", "/v1"]
+)
+def test_create_release_rejects_invalid_tag(monkeypatch, tag):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    result = json.loads(github.github_create_release("octocat/Hello-World", tag))
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_release_unknown_target_404(monkeypatch):
+    routes = _create_routes()
+    routes[("GET", "/commits/nope")] = _err(404, "No commit found for SHA: nope")
+    _routes(monkeypatch, routes)
+    result = _create(target="nope")
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+def test_create_release_403_is_a_write_error(monkeypatch):
+    _routes(
+        monkeypatch, _create_routes({("POST", "/releases"): _err(403, "Forbidden")})
+    )
+    result = _create()
+    assert result["status"] == "error"
+    assert "push access" in result["message"]
+
+
+def test_create_release_422_is_labeled(monkeypatch):
+    _routes(
+        monkeypatch,
+        _create_routes({("POST", "/releases"): _err(422, "Validation Failed")}),
+    )
+    result = _create()
+    assert result["status"] == "error"
+    assert "rejected the release" in result["message"]
+
+
+def test_create_release_rejects_non_bool_flags(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    result = _create(draft="yes")
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+# update release
+
+
+def test_update_release_by_id_sends_only_given_fields(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        {
+            ("PATCH", "/releases/99"): MockResponse(
+                json_data=_release_payload(body="new")
+            )
+        },
+    )
+    result = json.loads(
+        github.github_update_release("octocat/Hello-World", "99", body="new")
+    )
+    assert result["status"] == "success"
+    assert result["release"]["body"] == "new"
+    assert calls[0][1]["json"] == {"body": "new"}
+
+
+def test_update_release_by_tag_looks_up_id(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        {
+            ("GET", "/releases/tags/v1.0.0"): MockResponse(json_data={"id": 99}),
+            ("PATCH", "/releases/99"): MockResponse(json_data=_release_payload()),
+        },
+    )
+    result = json.loads(
+        github.github_update_release(
+            "octocat/Hello-World", "v1.0.0", name="N", prerelease=False
+        )
+    )
+    assert result["status"] == "success"
+    assert calls[1][1]["json"] == {"name": "N", "prerelease": False}
+
+
+def test_update_release_requires_a_field(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    result = json.loads(github.github_update_release("octocat/Hello-World", "99"))
+    assert result["status"] == "error"
+    assert "Nothing to update" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_release_empty_body_is_a_valid_update(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        {("PATCH", "/releases/5"): MockResponse(json_data=_release_payload())},
+    )
+    github.github_update_release("octocat/Hello-World", "5", body="")
+    assert calls[0][1]["json"] == {"body": ""}
+
+
+@pytest.mark.parametrize(
+    "status,needle", [(404, "not found"), (403, "push access"), (422, "rejected")]
+)
+def test_update_release_error_mapping(monkeypatch, status, needle):
+    _routes(monkeypatch, {("PATCH", "/releases/5"): _err(status, "x")})
+    result = json.loads(
+        github.github_update_release("octocat/Hello-World", "5", body="b")
+    )
+    assert result["status"] == "error"
+    assert needle in result["message"]
+
+
+# workflow runs
+
+
+def _run(i, **extra):
+    return {
+        "id": i,
+        "name": "Publish",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+        "head_branch": "v1.0.0",
+        "head_sha": SHA,
+        "html_url": f"https://github.com/x/actions/runs/{i}",
+        "created_at": "2026-11-05T00:00:00Z",
+        **extra,
+    }
+
+
+def test_workflow_runs_returns_summaries_and_sends_filters(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        {
+            ("GET", "/actions/runs"): MockResponse(
+                json_data={"total_count": 1, "workflow_runs": [_run(1)]}
+            )
+        },
+    )
+    result = json.loads(
+        github.github_list_workflow_runs(
+            "octocat/Hello-World",
+            branch_or_tag="v1.0.0",
+            head_sha=SHA,
+            event="push",
+            limit=5,
+        )
+    )
+    assert result["status"] == "success"
+    assert result["runs"][0]["name"] == "Publish"
+    assert result["runs"][0]["conclusion"] == "success"
+    assert result["truncated"] is False
+    assert calls[0][1]["params"] == {
+        "per_page": 5,
+        "page": 1,
+        "branch": "v1.0.0",
+        "head_sha": SHA,
+        "event": "push",
+    }
+
+
+def test_workflow_runs_clamps_limit_and_reports_next_page(monkeypatch):
+    calls = _routes(
+        monkeypatch,
+        {
+            ("GET", "/actions/runs"): MockResponse(
+                json_data={"workflow_runs": []},
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        },
+    )
+    result = json.loads(
+        github.github_list_workflow_runs("octocat/Hello-World", limit=9999)
+    )
+    assert calls[0][1]["params"]["per_page"] == 100
+    assert result["truncated"] is True and result["next_page"] == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"head_sha": "xyz"}, {"event": "Push Event"}, {"branch_or_tag": "a b"}],
+)
+def test_workflow_runs_reject_bad_filters(monkeypatch, kwargs):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    result = json.loads(
+        github.github_list_workflow_runs("octocat/Hello-World", **kwargs)
+    )
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_workflow_runs_error_mapping(monkeypatch, status):
+    _routes(monkeypatch, {("GET", "/actions/runs"): _err(status, "x")})
+    result = json.loads(github.github_list_workflow_runs("octocat/Hello-World"))
+    assert result["status"] == "error"

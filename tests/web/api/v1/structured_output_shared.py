@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import event
@@ -52,7 +53,9 @@ def insert_task(
     record: Any = None,
     agent_config: Any = None,
     output: str | None = "final answer",
+    error: str | None = None,
     title: str = "structured output task",
+    moment: datetime | None = None,
 ) -> int:
     """One SDK task row, with its structured output record and agent_config."""
     db = _direct_db_session()
@@ -70,7 +73,11 @@ def insert_task(
             is_visible=False,
             run_id=run_id,
             agent_config=agent_config,
+            error_message=error,
         )
+        if moment is not None:
+            task.created_at = moment
+            task.updated_at = moment
         task.structured_output_record = record
         db.add(task)
         db.commit()
@@ -105,3 +112,31 @@ def task_selects(statements: list[str]) -> list[str]:
         and re.search(r"\bFROM tasks\b", s) is not None
         and "tasks.title" in s
     ]
+
+
+FORMAT_CONFIG = {"response_format": {"type": "json_schema", "name": "answer"}}
+MOMENT = datetime(2026, 11, 1, 8, 30, tzinfo=timezone.utc)
+RECORD = {
+    "run_id": "run-1",
+    "status": "ready",
+    "output": {"zeta": 1, "alpha": [3, 2, 1]},
+    "reason": None,
+}
+
+# Tasks whose GET response is fixed in structured_output_get_baseline.py:
+# (status, run_id, record, agent_config, output, error).
+BASELINE_TASKS: list[dict[str, Any]] = [
+    {"status": TaskStatus.COMPLETED, "output": "final answer"},
+    {
+        "status": TaskStatus.COMPLETED,
+        "output": "with a record",
+        "record": RECORD,
+        "agent_config": FORMAT_CONFIG,
+    },
+    {"status": TaskStatus.FAILED, "output": None, "error": "agent crashed"},
+    {"status": TaskStatus.RUNNING, "output": None},
+    {"status": TaskStatus.PENDING, "output": None, "run_id": None},
+    {"status": TaskStatus.WAITING_FOR_USER, "output": None},
+    {"status": TaskStatus.COMPLETED, "output": "\u00e9 \u4e2d\u6587 \U0001f600"},
+]
+NEW_KEYS = ("structured_output", "structured_output_status", "structured_output_reason")

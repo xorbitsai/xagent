@@ -11,12 +11,14 @@ question through each of the three finalizers, complete the same accepted
 answer (injected live, or deferred to the resumed execution), and let the
 resumed run publish its second question through the real finalizer. The
 first question must end retired and the second must be the one the read
-surface returns. Only the agent is a double; the handler, the interaction
-read, the close, ``execute_resume_background`` and the finalizers are real.
+surface returns. The agent and the websocket and background task managers are
+doubles; the handler, the interaction read, the close,
+``execute_resume_background`` and the finalizers are real.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -107,7 +109,8 @@ async def test_an_answer_accepted_before_publication_lets_the_next_question_reti
     )
     background = MagicMock()
     background.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
-    background.running_tasks.get.return_value = None
+    previous_execution = MagicMock()
+    background.running_tasks.get.return_value = previous_execution
     resume_call = AsyncMock()
 
     with get_session_local()() as db:
@@ -151,7 +154,7 @@ async def test_an_answer_accepted_before_publication_lets_the_next_question_reti
         assert observed == ["ActiveInteractionAbsent"]
         resume_call.assert_called_once()
         resume_kwargs = dict(resume_call.call_args.kwargs)
-        resume_kwargs.pop("previous_task", None)
+        assert resume_kwargs.pop("previous_task") is previous_execution
         after_handler = _rows(round_.task_id)
         assert [(status, reason) for _, status, reason, _ in after_handler] == [
             ("active", None)
@@ -187,3 +190,41 @@ async def test_an_answer_accepted_before_publication_lets_the_next_question_reti
     read = active_interaction_id_sync(round_.task_id)
     assert isinstance(read, ActiveInteractionFound)
     assert read.interaction_id == rows[1][0]
+
+
+@pytest.mark.asyncio
+async def test_a_resume_starts_only_after_the_previous_execution_ended(
+    database,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Executions under one coordinator share an attempt id, so the database
+    cannot tell an older finalizer from a newer one. What keeps the older one
+    from retiring the newer one's question is this wait: the resume claims
+    nothing, and so settles nothing, until the previous execution has ended."""
+    _native(monkeypatch)
+    round_ = _seed_round()
+    release = asyncio.Event()
+    previous_task = asyncio.create_task(release.wait())
+    acquire = MagicMock(return_value=None)
+
+    with (
+        patch("xagent.web.services.task_execution._acquire_resume_task_lease", acquire),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+    ):
+        resume = asyncio.create_task(
+            execute_resume_background(
+                task_id=round_.task_id,
+                agent_service=MagicMock(),
+                task_owner_user_id=round_.user_id,
+                expected_run_id=round_.lease.run_id,
+                previous_task=previous_task,
+            )
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+        acquire.assert_not_called()
+        release.set()
+        await resume
+    acquire.assert_called_once()

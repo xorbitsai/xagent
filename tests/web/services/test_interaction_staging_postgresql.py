@@ -599,6 +599,8 @@ def test_sp4_all_three_cells_preserve_callers_pending_write(
                         request_idempotency_key=key,
                         expires_at=_now() + timedelta(minutes=15),
                     )
+                if label == "slot-taken":
+                    assert h.staged is None
                 db.commit()
                 assert _caller_write_survived(db, task_id, f"pg-sp4-{label}")
             finally:

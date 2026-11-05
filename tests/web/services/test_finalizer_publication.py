@@ -27,6 +27,7 @@ Runs on SQLite only: the PostgreSQL cells live in
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -37,7 +38,8 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
 
 from tests.web.services.coordinator_command_shared import owning_coordinator
 from tests.web.services.interaction_marker_shared import (
@@ -861,6 +863,56 @@ def test_publication_failure_propagates_and_leaves_nothing(
     assert observed.status == TaskStatus.RUNNING
     if finalizer != "channel":
         assert _lease_columns(round_.task_id) == lease_before
+
+
+@pytest.mark.parametrize("failure", ["insert_conflict", "later_statement"])
+def test_a_failed_publication_keeps_the_question_it_would_have_retired(
+    database,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    """The retire and the new row share one transaction. When the new row
+    cannot be published, the first question stays active with its marker,
+    whether the handoff degrades or the whole settlement rolls back."""
+    _native(monkeypatch)
+    first = _seed_round()
+    _prepare("fresh", first)
+    _finalize("fresh", first, _waiting_result())
+    before = _rows(first.task_id)
+    resumed = _resume_same_run(first, close_id=None)
+    _prepare("resumed", resumed)
+    result = _second_question_result(resumed)
+
+    if failure == "insert_conflict":
+
+        def collide(session, _context, _instances):
+            if any(isinstance(row, TaskInteractionRequest) for row in session.new):
+                raise IntegrityError("simulated conflict", None, None)
+
+        event.listen(Session, "before_flush", collide)
+        try:
+            with caplog.at_level(logging.INFO):
+                _finalize("resumed", resumed, result)
+        finally:
+            event.remove(Session, "before_flush", collide)
+    else:
+
+        def supersede(_db, *, task_id):
+            raise _InjectedFailure()
+
+        monkeypatch.setattr(
+            chat_history_service, "supersede_legacy_question_rows", supersede
+        )
+        with caplog.at_level(logging.INFO), pytest.raises(_InjectedFailure):
+            _finalize("resumed", resumed, result)
+
+    assert any(
+        record.getMessage().startswith("Retiring interaction")
+        for record in caplog.records
+    )
+    assert _rows(first.task_id) == before
+    assert _observe(first.task_id).marker == 1
 
 
 def test_channel_commit_failure_without_a_witness_propagates_and_leaves_nothing(

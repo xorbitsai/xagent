@@ -547,6 +547,17 @@ class Task(Base):  # type: ignore
     # Last failure reason when status transitions to FAILED.
     error_message = Column(Text, nullable=True)
 
+    # The structured result of the latest COMPLETED run:
+    # ``{"run_id", "status", "output", "reason"}``, or NULL when that run
+    # produced none. Written in the transaction that settles the run as
+    # COMPLETED and read through the projection in
+    # ``web/services/structured_output_projection.py``. A plain json column on
+    # PostgreSQL, not jsonb, so the stored text keeps the key order of the
+    # output. Mapped as an ordinary column (not deferred): the task read that
+    # returns status and run_id returns the record from the same row read.
+    # ``none_as_null`` stores Python ``None`` as SQL NULL, not as JSON ``null``.
+    structured_output_record = Column(JSON(none_as_null=True), nullable=True)
+
     # Call origin classifier: 'internal' (web UI / WS / legacy),
     # 'sdk' (POST /v1/chat/tasks), 'a2a' (agent-to-agent calls),
     # 'trigger' (agent triggers), 'widget' (embedded chat widget), or

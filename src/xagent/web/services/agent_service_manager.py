@@ -174,6 +174,7 @@ from .task_workspace_cleanup import (
     capture_workspace_cleanup_target,
     remove_task_workspace,
 )
+from .turn_settlement import TurnUsage
 from .workforce_runtime import (
     WorkforceTaskRuntime,
     release_task_lease_with_workforce_sync,
@@ -4054,6 +4055,7 @@ class AgentServiceManager:
         task_lease_heartbeat_task: (
             asyncio.Task[TaskLeaseHeartbeatOutcome] | None
         ) = None,
+        turn_usage_sink: Callable[[TurnUsage], None] | None = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
@@ -4086,6 +4088,10 @@ class AgentServiceManager:
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
+            turn_usage_sink: Receives this run's usage once the tracker has
+                completed. Not called when tracking is off, when completing the
+                tracker raises, or when lease ownership was lost. Its own
+                failure is logged and never changes the run's result.
 
         Returns:
             Execution result dictionary
@@ -4467,11 +4473,20 @@ class AgentServiceManager:
                             if lease_ownership_lost:
                                 await tracker.stop_periodic_updates()
                             else:
-                                await tracker.complete_tracking()
+                                usage = await tracker.complete_tracking()
                                 logger.info(
                                     "Completed token tracking for task %s",
                                     tracker_task_id,
                                 )
+                                if turn_usage_sink is not None:
+                                    try:
+                                        turn_usage_sink(tracker.turn_usage(usage))
+                                    except Exception:  # noqa: BLE001
+                                        logger.warning(
+                                            "turn usage sink failed for task %s",
+                                            tracker_task_id,
+                                            exc_info=True,
+                                        )
                         except Exception as e:
                             if is_database_pool_timeout(e):
                                 tracker_pool_timeout = e

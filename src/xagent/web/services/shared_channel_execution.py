@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
@@ -44,6 +45,7 @@ from .channel_runtime import (
     _prepare_channel_task_sync,
 )
 from .chat_history_service import persist_user_message_no_commit
+from .client_error_messages import ClientErrorCode
 from .db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -72,6 +74,12 @@ from .task_start_protocol import (
     ChannelExecutionContext,
     TaskStartPayload,
     stage_task_start_command,
+)
+from .turn_settlement import (
+    TurnFacts,
+    build_error_code,
+    build_turn_settlement,
+    notify_turn_settled,
 )
 from .workspace_binding import canonical_workspace_base
 
@@ -753,6 +761,7 @@ async def execute_channel_background(
         materialize_task_execution_recovery_state,
     )
 
+    facts = TurnFacts(started_at=datetime.now(timezone.utc))
     manager = get_agent_manager()
     service = await manager.get_agent_for_task(
         command.task_id,
@@ -837,6 +846,7 @@ async def execute_channel_background(
                     manage_task_lease=False,
                     task_lease=lease,
                     task_lease_heartbeat_task=heartbeat_task,
+                    turn_usage_sink=facts.record_usage,
                 )
             # Drain before publishing the final state: observers must not treat
             # queued progress as an opportunity to deliver the final reply early.
@@ -868,6 +878,44 @@ async def execute_channel_background(
 
             if not await run_db_io_cancellation_safe(finalize):
                 raise TaskLeaseLostError("Channel result no longer owns its execution")
+            # The result and the lease are settled: report the run. Only this
+            # committed path reports; a run that raises settles in the
+            # scheduler, which does not report channel runs.
+            try:
+                facts.finalized_status = (
+                    projection.task_status.value
+                    if isinstance(projection.task_status, TaskStatus)
+                    else str(projection.task_status)
+                )
+                facts.completion_outcome = projection.completion_outcome
+                facts.empty_visible_answer = not (
+                    projection.transcript_content or ""
+                ).strip()
+                facts.absorb_result(result)
+                error_code = build_error_code(result.get("error_code"))
+                if (
+                    error_code is None
+                    and facts.finalized_status == TaskStatus.FAILED.value
+                ):
+                    error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
+                notify_turn_settled(
+                    build_turn_settlement(
+                        facts,
+                        task_id=command.task_id,
+                        run_id=lease.run_id,
+                        turn_id=command.command_id,
+                        task_source=getattr(snapshot.task, "source", None),
+                        status=facts.finalized_status,
+                        error_code=error_code,
+                        ended_at=datetime.now(timezone.utc),
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "turn settlement notification failed for task %s",
+                    command.task_id,
+                    exc_info=True,
+                )
             if report.paused:
                 # The channel has its "interrupted" reply, or waits for the
                 # automatic resume the pause scheduled; a web viewer of the

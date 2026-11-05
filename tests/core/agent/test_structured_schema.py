@@ -355,6 +355,12 @@ def test_nan_and_infinity_are_rejected_as_unserializable() -> None:
         assert _violation(schema) == ("S1", "")
 
 
+def test_a_nul_in_the_value_of_an_unsupported_keyword_is_reported_as_s1() -> None:
+    schema = _obj({"p": {"type": "string", "format": "a\u0000"}})
+
+    assert _violation(schema) == ("S1", "/properties/p/format")
+
+
 def test_nesting_that_cannot_be_serialized_is_rejected_not_raised() -> None:
     deep: list[Any] = []
     for _ in range(10000):

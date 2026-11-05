@@ -146,7 +146,12 @@ OAUTH_ACCOUNT_HOSTS: dict[str, OAuthAccountHost] = {
         userinfo_path=None,
         input_label="Shopify store",
         input_placeholder="your-store",
-        input_help="The part before .myshopify.com in your store's admin URL.",
+        # Current admin URLs are admin.shopify.com/store/<handle>; older ones
+        # and the storefront domain are <handle>.myshopify.com.
+        input_help=(
+            "Your store handle, as in acme.myshopify.com or "
+            "admin.shopify.com/store/acme."
+        ),
         # New public apps must use expiring offline tokens (a one-hour access
         # token and a 90-day refresh token), and every public app must from
         # 2027-01-01.

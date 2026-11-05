@@ -5,8 +5,10 @@ shop identity, and refresh on the stored store label.
 
 import hashlib
 import hmac
+import logging
 import socket
 from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -15,10 +17,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.datastructures import QueryParams
 
+from tests.shared.oauth_browser_fixture import create_access_token
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import oauth_account_hosts, shopify_oauth
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_login
+from xagent.web.api.auth import generic_oauth_login
 from xagent.web.models.database import Base
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -139,6 +142,39 @@ def test_known_shopify_hmac_vector_verifies():
     )
 
 
+def _escaped_signature(params: dict[str, str]) -> str:
+    """Sign as Shopify's Python library does: escape % and & in keys and
+    values, and = in keys, before joining (shopify.Session.calculate_hmac)."""
+
+    def escape(text: str) -> str:
+        return text.replace("%", "%25").replace("&", "%26")
+
+    message = "&".join(
+        sorted(
+            f"{escape(k).replace('=', '%3D')}={escape(v)}" for k, v in params.items()
+        )
+    )
+    return hmac.new(
+        CLIENT_SECRET.encode(), message.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def test_delimiters_in_signed_parameters_are_escaped_as_shopify_does():
+    params = {**_callback_params(), "note": "50%&more", "a=b": "c"}
+
+    verify_shopify_callback(
+        [*params.items(), ("hmac", _escaped_signature(params))],
+        client_secret=CLIENT_SECRET,
+        bound_account="acme",
+    )
+    with pytest.raises(ShopifyOAuthError):
+        verify_shopify_callback(
+            [*params.items(), ("hmac", _sign(params))],
+            client_secret=CLIENT_SECRET,
+            bound_account="acme",
+        )
+
+
 def _callback_params(**overrides: str) -> dict[str, str]:
     return {
         "code": "auth-code",
@@ -200,11 +236,29 @@ def test_shop_is_compared_case_insensitively():
         pytest.param(
             [
                 *_callback_params().items(),
-                ("code", "second"),
+                # The same value again, so the signature itself still matches
+                # and only the repeated-parameter rule can reject it.
+                ("code", "auth-code"),
                 ("hmac", _sign(_callback_params())),
             ],
             "hmac_invalid",
             id="repeated-param",
+        ),
+        pytest.param(
+            # host folded into code: "code=auth-code&host=..." would join to
+            # the same unescaped string as the two signed parameters.
+            [
+                *(
+                    (key, value)
+                    for key, value in _callback_params(
+                        code=f"auth-code&host={_callback_params()['host']}"
+                    ).items()
+                    if key != "host"
+                ),
+                ("hmac", _sign(_callback_params())),
+            ],
+            "hmac_invalid",
+            id="delimiter-in-value",
         ),
         pytest.param(
             list(_signed_query(_callback_params(shop="other.myshopify.com")).items()),
@@ -347,6 +401,43 @@ def test_unusable_identity_responses_are_rejected(monkeypatch, response, reason)
     assert "shpat-token" not in caught.value.message
 
 
+@pytest.mark.parametrize(
+    ("response", "logged"),
+    [
+        pytest.param(_Response({}, status_code=401), "status 401", id="401"),
+        pytest.param(
+            _Response(
+                {
+                    "errors": [
+                        {
+                            "message": "Access denied for shpat-token",
+                            "extensions": {"code": "ACCESS_DENIED"},
+                        },
+                        {"message": "no code"},
+                    ]
+                }
+            ),
+            "codes=ACCESS_DENIED",
+            id="graphql-errors",
+        ),
+    ],
+)
+def test_identity_failures_log_the_status_and_error_codes_only(
+    monkeypatch, caplog, response, logged
+):
+    """The live store check needs to know why Shopify refused, without the
+    response body or the token ever reaching the log."""
+    _mock_post(monkeypatch, response)
+
+    with caplog.at_level(logging.WARNING, logger=shopify_oauth.__name__):
+        with pytest.raises(ShopifyOAuthError):
+            fetch_shopify_shop_identity("acme", "shpat-token")
+
+    assert logged in caplog.text
+    assert "shpat-token" not in caplog.text
+    assert "Access denied" not in caplog.text
+
+
 def test_unreachable_identity_endpoint_does_not_echo_the_error(monkeypatch):
     def failing_post(url, **kwargs):
         raise shopify_oauth.requests.ConnectionError(f"boom {kwargs['headers']}")
@@ -410,29 +501,48 @@ def shopify_db(tmp_path):
     engine.dispose()
 
 
-def _db_provider(db) -> OAuthProvider:
-    return db.query(OAuthProvider).filter_by(provider_name="shopify").one()
+def _db_provider(db, provider: str = "shopify") -> OAuthProvider:
+    return db.query(OAuthProvider).filter_by(provider_name=provider).one()
 
 
-def _login(db, user, account: str = "acme"):
+def _login(
+    db,
+    user,
+    account: str = "acme",
+    provider: str = "shopify",
+    app_id: str = TEST_APP_ID,
+):
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
     return generic_oauth_login(
-        "shopify",
+        provider,
         token=token,
-        app_id=TEST_APP_ID,
+        app_id=app_id,
         redirect=None,
         db=db,
-        db_provider=_db_provider(db),
+        db_provider=_db_provider(db, provider),
         account=account,
     )
 
 
-def _login_state(db, user, account: str = "acme") -> str:
-    location = _login(db, user, account).headers["location"]
-    return parse_qs(urlparse(location).query)["state"][0]
+def _login_state(
+    db, user, account: str = "acme", **login: str
+) -> tuple[str, dict[str, str]]:
+    """The state and the browser cookie the login binds it to."""
+    response = _login(db, user, account, **login)
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    return (
+        parse_qs(urlparse(response.headers["location"]).query)["state"][0],
+        {name: morsel.value for name, morsel in cookie.items()},
+    )
 
 
 def _token_response(**overrides: object) -> dict:
@@ -465,9 +575,10 @@ def _mock_shopify_http(
     return calls
 
 
-def _callback(db, state: str, **overrides: str):
+def _callback(db, flow: tuple[str, dict[str, str]], **overrides: str):
+    state, cookies = flow
     params = _callback_params(state=state, **overrides)
-    request = SimpleNamespace(query_params=_signed_query(params), cookies={})
+    request = SimpleNamespace(query_params=_signed_query(params), cookies=cookies)
     return auth_api.generic_oauth_callback(
         "shopify", request, db=db, db_provider=_db_provider(db)
     )
@@ -532,7 +643,8 @@ def test_unverifiable_callback_never_reaches_the_token_endpoint(
 ):
     db, user = shopify_db
     calls = _mock_shopify_http(monkeypatch)
-    state = _login_state(db, user)
+    # The browser's own cookie is sent, so only the signature can fail.
+    state, cookies = _login_state(db, user)
     params = _callback_params(state=state)
     query = _signed_query(params)
     if "code" in overrides:
@@ -540,15 +652,33 @@ def test_unverifiable_callback_never_reaches_the_token_endpoint(
         query = QueryParams({**dict(query), **overrides})
     else:
         query = _signed_query({**params, **overrides})
-    request = SimpleNamespace(query_params=query, cookies={})
+    request = SimpleNamespace(query_params=query, cookies=cookies)
 
     response = auth_api.generic_oauth_callback(
         "shopify", request, db=db, db_provider=_db_provider(db)
     )
 
     assert response.status_code == 400
+    # Shopify's own refusal, not an earlier state, cookie or account one.
+    assert b"Cannot connect Shopify" in response.body
     assert calls == []
     assert _grant(db, user) is None
+
+
+def test_a_replayed_callback_never_reaches_the_token_endpoint(shopify_db, monkeypatch):
+    """#2810 acceptance: a replayed state fails. The first callback spends it,
+    so the same signed callback from the same browser is refused before any
+    second code exchange."""
+    db, user = shopify_db
+    calls = _mock_shopify_http(monkeypatch)
+    flow = _login_state(db, user)
+    assert _callback(db, flow).status_code == 200
+    exchanges = [url for url, _kwargs in calls].count(TOKEN_URL)
+
+    response = _callback(db, flow)
+
+    assert response.status_code == 400
+    assert [url for url, _kwargs in calls].count(TOKEN_URL) == exchanges
 
 
 def test_callback_missing_a_required_scope_stores_nothing(shopify_db, monkeypatch):
@@ -569,14 +699,110 @@ def test_callback_missing_a_required_scope_stores_nothing(shopify_db, monkeypatc
 
 def test_callback_for_a_token_of_another_store_stores_nothing(shopify_db, monkeypatch):
     db, user = shopify_db
-    _mock_shopify_http(
+    calls = _mock_shopify_http(
         monkeypatch, identity=_shop_payload(myshopifyDomain="other.myshopify.com")
     )
 
     response = _callback(db, _login_state(db, user))
 
     assert response.status_code == 400
+    # Refused by the identity check, after the exchange and the shop query.
+    assert b"Error verifying the connected account" in response.body
+    assert [url for url, _kwargs in calls] == [TOKEN_URL, GRAPHQL_URL]
     assert _grant(db, user) is None
+
+
+@pytest.mark.parametrize("failure", ["missing-scope", "other-store"])
+def test_a_rejected_reconnect_leaves_the_existing_grant_intact(
+    shopify_db, monkeypatch, failure
+):
+    """The scope and identity checks run before the delete-then-recreate
+    write, so a refused reconnect never costs the working grant."""
+    db, user = shopify_db
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="shopify",
+            access_token="kept-access",
+            refresh_token="kept-refresh",
+            instance_url="acme",
+            provider_user_id=SHOP_GID,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+    )
+    db.commit()
+    if failure == "missing-scope":
+        _mock_shopify_http(monkeypatch, token=_token_response(scope="write_products"))
+    else:
+        _mock_shopify_http(
+            monkeypatch, identity=_shop_payload(myshopifyDomain="other.myshopify.com")
+        )
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 400
+    db.expire_all()
+    grant = _grant(db, user)
+    assert grant is not None
+    assert (grant.access_token, grant.refresh_token) == ("kept-access", "kept-refresh")
+
+
+def test_a_shopify_variant_provider_row_gets_the_same_signature_check(
+    shopify_db, monkeypatch
+):
+    """An admin-created "shopify-*" provider takes the store-host path, so it
+    cannot skip the callback signature check."""
+    db, user = shopify_db
+    db.add(
+        OAuthProvider(
+            provider_name="shopify-acme",
+            name="Shopify Acme",
+            client_id=encrypt_value("client-id"),
+            client_secret=encrypt_value(CLIENT_SECRET),
+            auth_url="",
+            token_url="",
+            redirect_uri="https://xagent.example/api/auth/shopify-acme/callback",
+            userinfo_url="",
+            default_scopes=[],
+        )
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="shopify-acme",
+            name="Shopify Acme",
+            description="Shopify variant test app",
+            transport="oauth",
+            provider_name="shopify-acme",
+            oauth_scopes=REQUIRED,
+            launch_config={
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.shopify"],
+                "env_mapping": {
+                    "SHOPIFY_ACCESS_TOKEN": "access_token",
+                    "SHOPIFY_STORE_DOMAIN": "instance_url",
+                },
+            },
+            is_visible_in_connector=True,
+        )
+    )
+    db.commit()
+    calls = _mock_shopify_http(monkeypatch)
+    state, cookies = _login_state(
+        db, user, provider="shopify-acme", app_id="shopify-acme"
+    )
+    signed = _signed_query(_callback_params(state=state))
+    forged = QueryParams({**dict(signed), "code": "forged"})
+
+    response = auth_api.generic_oauth_callback(
+        "shopify-acme",
+        SimpleNamespace(query_params=forged, cookies=cookies),
+        db=db,
+        db_provider=_db_provider(db, "shopify-acme"),
+    )
+
+    assert response.status_code == 400
+    assert b"Cannot connect Shopify" in response.body
+    assert calls == []
 
 
 # ---------- refresh ------------------------------------------------------------
@@ -615,7 +841,7 @@ async def test_refresh_rotates_on_the_stored_store(shopify_db, monkeypatch):
                 }
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert await tool_config.refresh_oauth_token_if_needed(db, grant, "shopify")
 
@@ -623,6 +849,8 @@ async def test_refresh_rotates_on_the_stored_store(shopify_db, monkeypatch):
     assert url == TOKEN_URL
     assert kwargs["data"]["grant_type"] == "refresh_token"
     assert kwargs["data"]["refresh_token"] == "old-refresh"
+    # Refresh asks for an expiring token again, like the code exchange.
+    assert kwargs["data"]["expiring"] == "1"
     assert kwargs["follow_redirects"] is False
     assert kwargs["headers"]["Accept"] == "application/json"
     assert grant.access_token == "rotated-access"

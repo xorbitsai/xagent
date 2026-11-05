@@ -20,18 +20,21 @@ the three checks here, which are specific to Shopify:
 
 import hashlib
 import hmac
+import logging
 import re
 from collections.abc import Iterable
 
-import requests
-
+from ..core.utils import public_requests as requests
 from .oauth_provider_quirks import matches_provider_family
+
+logger = logging.getLogger(__name__)
 
 SHOPIFY_PROVIDER = "shopify"
 SHOPIFY_HOST_SUFFIX = "myshopify.com"
 # The same values as tools/mcp/shopify.py's SHOPIFY_REQUIRED_ADMIN_SCOPES and
-# SHOPIFY_API_VERSION. That module starts an MCP server when imported, so the
-# values are repeated here, and a test keeps the two in step.
+# SHOPIFY_API_VERSION. Importing that module builds its FastMCP instance and
+# calls logging.basicConfig, so the values are repeated here, and a test keeps
+# the two in step.
 SHOPIFY_REQUIRED_SCOPES = frozenset(
     {"write_products", "write_orders", "read_customers"}
 )
@@ -39,6 +42,9 @@ SHOPIFY_API_VERSION = "2026-07"
 
 _SHOP_GID_PREFIX = "gid://shopify/Shop/"
 _SCOPE_SEPARATOR = re.compile(r"[\s,]+")
+# GraphQL error codes (extensions.code) are short upper-case words; anything
+# else is not logged, since error bodies can echo request details.
+_GRAPHQL_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _IDENTITY_QUERY = "{ shop { id myshopifyDomain } }"
 
 
@@ -63,6 +69,14 @@ def _store_host(account: str) -> str:
     return f"{account}.{SHOPIFY_HOST_SUFFIX}"
 
 
+def _escape_hmac_part(text: str, *extra: str) -> str:
+    """Escape ``%`` and ``&`` (and ``extra``) so pairs join unambiguously."""
+    escaped = text.replace("%", "%25").replace("&", "%26")
+    for character in extra:
+        escaped = escaped.replace(character, f"%{ord(character):02X}")
+    return escaped
+
+
 def verify_shopify_callback(
     query_items: Iterable[tuple[str, str]], *, client_secret: str, bound_account: str
 ) -> None:
@@ -72,6 +86,10 @@ def verify_shopify_callback(
     key and joined as ``key=value`` pairs with ``&``, using HMAC-SHA256 with
     the client secret, as a hex digest. A repeated parameter has no single
     signed value, so it fails verification.
+
+    Delimiters inside keys and values are escaped first, as Shopify's Python
+    library does (``shopify.Session.calculate_hmac``): otherwise a value
+    such as ``C&host=H`` signs the same as two separate parameters.
     """
     params: dict[str, str] = {}
     repeated = False
@@ -83,7 +101,12 @@ def verify_shopify_callback(
         raise ShopifyOAuthError(
             "hmac_missing", "Shopify's callback was not signed. Please try again."
         )
-    message = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+    message = "&".join(
+        sorted(
+            f"{_escape_hmac_part(key, '=')}={_escape_hmac_part(value)}"
+            for key, value in params.items()
+        )
+    )
     expected = hmac.new(
         client_secret.encode(), message.encode(), hashlib.sha256
     ).hexdigest()
@@ -182,20 +205,35 @@ def fetch_shopify_shop_identity(account: str, access_token: str) -> str:
             "identity_unreachable",
             "Could not reach Shopify to confirm the connected store.",
         ) from None
+    # Only the status and GraphQL error codes are logged, never the body or
+    # the token, as the generic userinfo branch in auth.py does.
     if response.status_code != 200:
+        logger.warning(
+            "Shopify identity query returned status %s", response.status_code
+        )
         raise identity_unverified
     try:
         body = response.json()
     except ValueError:
+        logger.warning("Shopify identity query returned a non-JSON response")
         raise identity_unverified from None
-    if not isinstance(body, dict) or body.get("errors"):
+    if not isinstance(body, dict):
+        logger.warning("Shopify identity query returned a non-object body")
+        raise identity_unverified
+    if body.get("errors"):
+        logger.warning(
+            "Shopify identity query returned GraphQL errors (codes=%s)",
+            ",".join(_graphql_error_codes(body["errors"])) or "-",
+        )
         raise identity_unverified
     data = body.get("data")
     shop = data.get("shop") if isinstance(data, dict) else None
     if not isinstance(shop, dict):
+        logger.warning("Shopify identity query returned no shop")
         raise identity_unverified
     shop_id = shop.get("id")
     if not isinstance(shop_id, str) or not shop_id.startswith(_SHOP_GID_PREFIX):
+        logger.warning("Shopify identity query returned no shop id")
         raise identity_unverified
     domain = shop.get("myshopifyDomain")
     if not isinstance(domain, str) or domain.strip().lower() != store_host:
@@ -204,3 +242,14 @@ def fetch_shopify_shop_identity(account: str, access_token: str) -> str:
             "Shopify issued access for a different store than the one you entered.",
         )
     return shop_id
+
+
+def _graphql_error_codes(errors: object) -> list[str]:
+    """The distinct, well-formed ``extensions.code`` values in ``errors``."""
+    codes: set[str] = set()
+    for error in errors if isinstance(errors, list) else []:
+        extensions = error.get("extensions") if isinstance(error, dict) else None
+        code = extensions.get("code") if isinstance(extensions, dict) else None
+        if isinstance(code, str) and _GRAPHQL_ERROR_CODE.fullmatch(code):
+            codes.add(code)
+    return sorted(codes)

@@ -33,6 +33,7 @@ from ..model.chat.basic.call_boundary import (
     BUDGET_INSENSITIVE_FAILURE_CODES,
     ProviderCallError,
 )
+from ..model.chat.cache_lifecycle import AgentCacheSession
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import (
     LLMContextLengthError,
@@ -395,6 +396,26 @@ class PatternRuntime:
         init=False,
         repr=False,
     )
+    _cache_session: AgentCacheSession = field(
+        default_factory=AgentCacheSession, init=False, repr=False
+    )
+    _cache_pattern_count: int = field(default=0, init=False, repr=False)
+
+    async def _sync_cache_phase(self) -> None:
+        phase = (
+            "waiting"
+            if self._active_tool_tasks and not self._active_llm_tasks
+            else "active"
+        )
+        await self._cache_session.transition(phase)
+
+    async def finish_cache_session(self) -> None:
+        await self._cache_session.transition("finished")
+
+    async def _cache_pattern_finished(self) -> None:
+        self._cache_pattern_count = max(0, self._cache_pattern_count - 1)
+        if not self._cache_pattern_count:
+            await self.finish_cache_session()
 
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt_requested = True
@@ -505,9 +526,10 @@ class PatternRuntime:
         if not inspect.isawaitable(call):
             return call
 
-        task: asyncio.Future[Any] = asyncio.ensure_future(call)
+        task: asyncio.Future[Any] = self._cache_session.create_task(call)
         self._active_llm_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -522,7 +544,10 @@ class PatternRuntime:
                 raise LLMContextLengthError(str(exc)) from exc
             raise
         finally:
+            if not task.done():
+                task.cancel()
             self._active_llm_tasks.discard(task)
+            await self._sync_cache_phase()
 
     async def run_tool_call(self, invoke: Callable[[], Any]) -> Any:
         """Run a tool call as a cancellable subtask owned by this runtime."""
@@ -539,6 +564,7 @@ class PatternRuntime:
         task: asyncio.Future[Any] = asyncio.ensure_future(call)
         self._active_tool_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -550,6 +576,7 @@ class PatternRuntime:
             if not task.done():
                 task.cancel()
             self._active_tool_tasks.discard(task)
+            await self._sync_cache_phase()
 
     async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         """Stream only the final user-facing answer through the outbound boundary."""
@@ -751,9 +778,10 @@ class PatternRuntime:
                 return stamp_stream_markers({"content": content, **provider_payload})
             return content
 
-        task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
+        task: asyncio.Future[Any] = self._cache_session.create_task(consume_stream())
         self._active_llm_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -762,7 +790,10 @@ class PatternRuntime:
                 ) from exc
             raise
         finally:
+            if not task.done():
+                task.cancel()
             self._active_llm_tasks.discard(task)
+            await self._sync_cache_phase()
 
     def _stamp_stream_fallback(
         self,
@@ -1216,6 +1247,9 @@ class PatternRuntime:
         return payload
 
     async def on_pattern_start(self, *, context: Any, pattern: Any) -> None:
+        if not self._cache_pattern_count and self._cache_session.phase == "finished":
+            self._cache_session = AgentCacheSession()
+        self._cache_pattern_count += 1
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = f"react_{uuid4().hex[:8]}"
             self.active_turn_id = self._dag_turn_id(context)
@@ -1247,6 +1281,7 @@ class PatternRuntime:
         pattern: Any,
         result: dict[str, Any],
     ) -> None:
+        await self._cache_pattern_finished()
         await self._emit_pattern_trace(
             context=context,
             pattern=pattern,
@@ -1287,6 +1322,7 @@ class PatternRuntime:
         # ``CheckpointPersistenceError`` guard) checks this to decide
         # whether it still needs to report the abort itself.
         self.pattern_error_reported = True
+        await self._cache_pattern_finished()
         data: dict[str, Any] = {
             "error_type": "agent_pattern_error",
             "error_message": str(error),

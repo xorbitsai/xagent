@@ -105,6 +105,7 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
             "model_type": "LLM",
             "model_ability": ["chat"],
             "supports_chat_session_affinity": True,
+            "supports_agent_cache_lifecycle": True,
         }
     )
     monkeypatch.setattr(client, "describe_model", describe)
@@ -114,9 +115,39 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
             assert isinstance(handle.session.connector, PublicTCPConnector)
             assert handle.auth_headers == {"Authorization": "Bearer test-key"}
             assert supports_affinity is True
+            assert client.supports_agent_cache_lifecycle("model-id")
             describe.assert_awaited_once_with("model-id")
         finally:
             await handle.close()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_control_uses_guarded_session_and_auth_headers(monkeypatch):
+    from unittest.mock import MagicMock
+
+    client = PublicAsyncXinferenceClient(
+        "https://xinference.example", api_key="test-key"
+    )
+    response = MagicMock()
+    response.read = AsyncMock(return_value=b'{"accepted": true}')
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=False)
+    post = MagicMock(return_value=context)
+    monkeypatch.setattr(client.session, "post", post)
+    try:
+        assert isinstance(client.session.connector, PublicTCPConnector)
+        payload = {"id": "run", "revision": 1, "phase": "waiting"}
+        await client.update_cache_session("model-id", payload)
+        assert post.call_args.args == (
+            "https://xinference.example/v1/models/model-id/cache_sessions",
+        )
+        assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer test-key"}
+        assert post.call_args.kwargs["json"] == payload
+        assert post.call_args.kwargs["timeout"].total == 0.5
+        response.raise_for_status.assert_called_once()
     finally:
         await client.close()
 

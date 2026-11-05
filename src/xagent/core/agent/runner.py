@@ -870,6 +870,9 @@ class AgentRunner:
                 budget_warning_handler.reset(warning_token)
             if routing_token is not None:
                 xinference_routing_key.reset(routing_token)
+            finish_cache = getattr(runtime, "finish_cache_session", None)
+            if callable(finish_cache):
+                await finish_cache()
 
     async def _finish_budget_stop(
         self,

@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
+from ..cache_lifecycle import agent_cache_session
 from ..exceptions import LLMTimeoutError
 from ..routing_context import xinference_routing_key
 from ..timeout_config import TimeoutConfig
@@ -135,6 +136,7 @@ class XinferenceLLM(BaseLLM):
         self._client: Optional[Any] = None
         self._model_handle: Optional[Any] = None
         self._supports_session_affinity = False
+        self._supports_cache_lifecycle = False
         self._client_lock = asyncio.Lock()
 
     @property
@@ -162,6 +164,10 @@ class XinferenceLLM(BaseLLM):
                     self._model_handle,
                     self._supports_session_affinity,
                 ) = await client.get_chat_model(self._model_uid)
+                supports = getattr(client, "supports_agent_cache_lifecycle", None)
+                self._supports_cache_lifecycle = (
+                    callable(supports) and supports(self._model_uid) is True
+                )
 
             return self._model_handle
 
@@ -204,6 +210,19 @@ class XinferenceLLM(BaseLLM):
         key = xinference_routing_key.get()
         if self._supports_session_affinity and key is not None:
             config.setdefault("routing_key", key)
+
+    def _apply_cache_lifecycle(self, config: dict[str, Any]) -> None:
+        session = agent_cache_session.get()
+        if getattr(self, "_supports_cache_lifecycle", False) and session is not None:
+            metadata = session.register(
+                (self.base_url, self._model_uid), self._update_cache_session
+            )
+            if metadata is not None:
+                config["cache_session"] = metadata
+
+    async def _update_cache_session(self, session: dict[str, Any]) -> None:
+        if self._client is not None:
+            await self._client.update_cache_session(self._model_uid, session)
 
     async def chat(
         self,
@@ -267,6 +286,7 @@ class XinferenceLLM(BaseLLM):
         async def call_model() -> Any:
             model_handle = await self._ensure_client()
             self._apply_session_affinity(generate_config)
+            self._apply_cache_lifecycle(generate_config)
             return await model_handle.chat(
                 messages=sanitized_messages,
                 tools=tools,
@@ -508,6 +528,7 @@ class XinferenceLLM(BaseLLM):
                 timeout_message=first_timeout_message,
             )
             self._apply_session_affinity(generate_config)
+            self._apply_cache_lifecycle(generate_config)
             stream = await _await_before_deadline(
                 model_handle.chat(
                     messages=sanitized_messages,

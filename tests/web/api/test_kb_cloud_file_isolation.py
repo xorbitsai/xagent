@@ -226,9 +226,8 @@ def test_each_cloud_file_bills_the_requesting_member(
     test_env, temp_uploads, monkeypatch
 ) -> None:
     from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
-    from xagent.web.services import quota_hooks
-
     from xagent.core.tools.core.RAG_tools.utils import model_resolution_pin
+    from xagent.web.services import quota_hooks
 
     app, headers, user, _ = test_env
     _connect_drive(test_env, monkeypatch)

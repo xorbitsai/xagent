@@ -17,6 +17,7 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
+from ..revocable_memory_store import unwrap_memory_store
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.memory_binding import (
     MemoryBindingResolutionError,
@@ -24,7 +25,6 @@ from ..services.memory_binding import (
     MemoryStoreBinding,
     resolve_trusted_memory_binding_async,
 )
-from ..revocable_memory_store import unwrap_memory_store
 from ..tracking.standalone_usage import usage_scope
 from ..user_isolated_memory import UserContext
 

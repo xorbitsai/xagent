@@ -1587,7 +1587,10 @@ async def stream_chat_task_events(
     types (each a ``event: <name>`` / ``data: <json>`` frame pair). Four
     are lifecycle-only:
       - ``task.status``: ``{status}``.
-      - ``task.completed``: ``{status, output, error}``. A failed task
+      - ``task.completed``: ``{status, output, error, structured_output,
+        structured_output_status, structured_output_reason}``. The three
+        structured fields carry the same values as the fields of the
+        same name on ``GET /v1/chat/tasks/{task_id}``. A failed task
         also ends the stream with this event rather than a separate
         one -- ``status`` is ``"failed"`` and ``error`` is set.
       - ``task.input_required``: ``{task_id, prompt}``. ``prompt`` is the

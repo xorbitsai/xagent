@@ -32,6 +32,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
 import { copyToClipboard } from '@/lib/clipboard';
+import { toast } from '@/components/ui/sonner';
 import { InlineFilePreview } from '@/components/file/inline-file-preview';
 import {
   isStoppedTraceProcessStatus,
@@ -1099,8 +1100,12 @@ const CopyButton = ({
       ? serializeFilesDisabledPresentation(value)
       : formatActionContent(value);
     // Same cross-origin embed concern as ChatMessage's copy button: only show
-    // the check mark once the write has actually succeeded.
-    if (!(await copyToClipboard(text))) return;
+    // the check mark once the write has actually succeeded, and report a
+    // failed write instead of leaving the click without any reaction.
+    if (!(await copyToClipboard(text))) {
+      toast.error(t('common.copyFailed'));
+      return;
+    }
     setCopied(true);
     if (copiedTimeoutRef.current !== null) clearTimeout(copiedTimeoutRef.current);
     copiedTimeoutRef.current = setTimeout(() => {

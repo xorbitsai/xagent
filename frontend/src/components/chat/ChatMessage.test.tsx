@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const clipboardWriteTextMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
 const appContextMock = vi.hoisted(() => ({
   filesDisabled: false,
   openFilePreview: vi.fn(),
@@ -18,6 +19,10 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => appContextMock,
+}))
+
+vi.mock("@/components/ui/sonner", () => ({
+  toast: { error: toastErrorMock },
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -94,6 +99,7 @@ describe("ChatMessage Session file capability", () => {
     clarificationFormMock.mockReset()
     apiRequestMock.mockReset()
     clipboardWriteTextMock.mockReset()
+    toastErrorMock.mockReset()
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: clipboardWriteTextMock },
@@ -278,6 +284,7 @@ describe("ChatMessage Session file capability", () => {
 
       expect(clipboardWriteTextMock).toHaveBeenCalledWith("copy me")
       expect(button.querySelector("svg.text-green-500")).not.toBeNull()
+      expect(toastErrorMock).not.toHaveBeenCalled()
     })
 
     it("falls back to execCommand when the Clipboard API is refused, as in a cross-origin embed", async () => {
@@ -293,10 +300,11 @@ describe("ChatMessage Session file capability", () => {
 
         expect(execCommand).toHaveBeenCalledWith("copy")
         expect(button.querySelector("svg.text-green-500")).not.toBeNull()
+        expect(toastErrorMock).not.toHaveBeenCalled()
       })
     })
 
-    it("does not claim a copy that never reached the clipboard", async () => {
+    it("reports a copy that never reached the clipboard instead of claiming it", async () => {
       clipboardWriteTextMock.mockRejectedValue(new DOMException("blocked", "NotAllowedError"))
       await withExecCommand(() => false, async () => {
         render(<ChatMessage role="assistant" content="copy me" />)
@@ -305,6 +313,7 @@ describe("ChatMessage Session file capability", () => {
         await act(async () => { fireEvent.click(button) })
 
         expect(button.querySelector("svg.text-green-500")).toBeNull()
+        expect(toastErrorMock).toHaveBeenCalledWith("common.copyFailed")
       })
     })
   })

@@ -21,6 +21,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { copyToClipboard } from "@/lib/clipboard";
+import { toast } from "@/components/ui/sonner";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
 import type { ClarificationOnSend } from "./clarification-delivery";
@@ -538,12 +539,15 @@ export function ChatMessage({
   // Clipboard API is refused unless the host page opted in via the iframe's
   // allow attribute. copyToClipboard falls back to execCommand there and
   // reports the outcome, so the check mark only appears once text has
-  // actually landed on the clipboard.
+  // actually landed on the clipboard. When both paths fail, say so: a
+  // click with no visible reaction reads as a missed click.
   const handleCopy = async () => {
     if (!clipboardContent) return;
     if (await copyToClipboard(clipboardContent)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+    } else {
+      toast.error(t("common.copyFailed"));
     }
   };
 

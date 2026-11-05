@@ -220,6 +220,9 @@ from .websocket_auth import (
 
 logger = logging.getLogger(__name__)
 
+# RFC 6455 1012: the server is restarting; clients reconnect and resync.
+WS_CLOSE_SERVICE_RESTART = 1012
+
 
 def _make_command_reply(websocket: WebSocket) -> CommandReply:
     async def reply(message: dict[str, Any]) -> None:
@@ -1137,6 +1140,10 @@ class _CommandOriginRegistry:
         for key in [k for k, ws in self._origins.items() if ws is websocket]:
             del self._origins[key]
 
+    def has_pending_for_socket(self, websocket: Any) -> bool:
+        """Whether a command submitted on this socket still awaits its outcome."""
+        return any(ws is websocket for ws in self._origins.values())
+
 
 _command_origins = _CommandOriginRegistry()
 
@@ -1510,6 +1517,72 @@ class ConnectionManager:
             report_delivery_check_failure(ledger.task_id, horizon=horizon, error=exc)
             return
         _report_delivery(ledger, expected)
+
+    async def close_for_restart(
+        self,
+        *,
+        reply_deadline_seconds: float = 5.0,
+        close_timeout_seconds: float = 2.0,
+    ) -> int:
+        """Close every registered WebSocket with ``1012 Service Restart``.
+
+        Meant for a planned restart or release hand-over, callable by a
+        release controller as well as by process shutdown. Clients treat 1012
+        as "reconnect and resync from the snapshot", so queued frames are
+        dropped rather than flushed. A socket with no command awaiting its
+        reply is closed at once; one that has such a command is closed after
+        the reply settled, or when ``reply_deadline_seconds`` passes. SSE
+        sinks (``is_broadcast_only``) are not WebSockets and stay open.
+
+        Idempotent and best-effort: a socket that cannot be closed is only
+        dropped from the registry. Returns the number of sockets handled.
+        """
+        sockets = [
+            ws
+            for ws in list(self._connection_task_ids)
+            if not getattr(ws, "is_broadcast_only", False)
+        ]
+        waiting = [ws for ws in sockets if _command_origins.has_pending_for_socket(ws)]
+        waiting_ids = {id(ws) for ws in waiting}
+        immediate = [ws for ws in sockets if id(ws) not in waiting_ids]
+        await asyncio.gather(
+            *(self._close_for_restart(ws, close_timeout_seconds) for ws in immediate)
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, reply_deadline_seconds)
+        while waiting:
+            ready = [
+                ws
+                for ws in waiting
+                if not _command_origins.has_pending_for_socket(ws)
+                or loop.time() >= deadline
+            ]
+            if ready:
+                await asyncio.gather(
+                    *(
+                        self._close_for_restart(ws, close_timeout_seconds)
+                        for ws in ready
+                    )
+                )
+                ready_ids = {id(ws) for ws in ready}
+                waiting = [ws for ws in waiting if id(ws) not in ready_ids]
+            if waiting:
+                await asyncio.sleep(0.05)
+        return len(sockets)
+
+    async def _close_for_restart(self, websocket: WebSocket, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(
+                websocket.close(
+                    code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
+                ),
+                timeout=timeout,
+            )
+        except Exception:
+            # Already closed, or the peer is gone; either way it is leaving.
+            pass
+        finally:
+            self.disconnect(websocket)
 
     async def stop_delivery_checks(self) -> None:
         """Cancel pending disconnect checks, wait for them, schedule no more."""

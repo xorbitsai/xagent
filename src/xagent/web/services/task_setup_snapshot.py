@@ -208,6 +208,9 @@ class TaskModelOverride:
     (``model_override``), where the tool build reads this set to decide
     whether an actor-marked task may re-add ``mcp``.
 
+    ``excluded_model_ids`` removes the named media models and re-picks an excluded
+    kind's default; LLM, vision, embedding and rerank slots are untouched.
+
     Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
     applied to rebuilds a cached service for the task unless that service
     was built from this same override object, so a later turn cannot run on
@@ -219,6 +222,7 @@ class TaskModelOverride:
     llm: BaseLLM
     vision_llm: BaseLLM | None = None
     excluded_tool_categories: frozenset[str] = frozenset()
+    excluded_model_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.llm, BaseLLM):
@@ -237,6 +241,18 @@ class TaskModelOverride:
         if not all(isinstance(category, str) for category in normalized):
             raise TypeError("excluded_tool_categories must hold category names")
         object.__setattr__(self, "excluded_tool_categories", normalized)
+        model_ids: Any = self.excluded_model_ids
+        # Same reasoning as the categories above: a bare string would be read
+        # character by character instead of naming one model id.
+        if isinstance(model_ids, (str, bytes)):
+            raise TypeError(
+                "excluded_model_ids must be a collection of model ids, "
+                "not a single string"
+            )
+        normalized_model_ids = frozenset(model_ids)
+        if not all(isinstance(model_id, str) for model_id in normalized_model_ids):
+            raise TypeError("excluded_model_ids must hold model ids")
+        object.__setattr__(self, "excluded_model_ids", normalized_model_ids)
 
 
 def apply_task_model_override(
@@ -248,10 +264,11 @@ def apply_task_model_override(
     from a selection that is not an explicit list.
 
     The returned snapshot also carries ``override`` as ``model_override``: the
-    requested exclusion set stays reachable there for the tool build, which
+    requested exclusion sets stay reachable there for the tool build, which
     needs the intent (an old agent's list may never have listed ``mcp``, yet
     this run still excludes it) to decide whether an actor-marked task may
-    re-add ``mcp``. See :class:`TaskModelOverride` for the exact-name /
+    re-add ``mcp``, and filters the media model dicts by the excluded model
+    ids. See :class:`TaskModelOverride` for the exact-name /
     scoped-``mcp:<server>`` semantics. The vision-category removal is
     deliberately not part of that set: it already has its own stand-in
     mechanism.

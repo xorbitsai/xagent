@@ -546,6 +546,7 @@ class PatternRuntime:
         finally:
             if not task.done():
                 task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             self._active_llm_tasks.discard(task)
             await self._sync_cache_phase()
 
@@ -575,6 +576,7 @@ class PatternRuntime:
         finally:
             if not task.done():
                 task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             self._active_tool_tasks.discard(task)
             await self._sync_cache_phase()
 
@@ -792,6 +794,7 @@ class PatternRuntime:
         finally:
             if not task.done():
                 task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             self._active_llm_tasks.discard(task)
             await self._sync_cache_phase()
 

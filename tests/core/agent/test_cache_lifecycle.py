@@ -135,3 +135,45 @@ async def test_concurrent_executions_keep_separate_cache_sessions() -> None:
     )
     assert len(set(ids)) == 2
     assert agent_cache_session.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["llm", "tool"])
+async def test_cancellation_during_hint_drains_started_work(kind: str) -> None:
+    runtime = PatternRuntime()
+    hint_entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    blocked_phase = "active" if kind == "llm" else "waiting"
+    runtime._cache_session.phase = "waiting" if kind == "llm" else "active"
+
+    async def notify(body: dict) -> None:
+        if body["phase"] == blocked_phase:
+            hint_entered.set()
+            await asyncio.Event().wait()
+
+    async def work(**kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_entered.set()
+            await cleanup_release.wait()
+
+    runtime._cache_session.register(("server", "model"), notify)
+    call = (
+        runtime.run_llm_call(SimpleNamespace(chat=work))
+        if kind == "llm"
+        else runtime.run_tool_call(work)
+    )
+    task = asyncio.create_task(call)
+    await hint_entered.wait()
+    task.cancel()
+    try:
+        await asyncio.wait_for(cleanup_entered.wait(), 1)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.03)
+    finally:
+        cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not runtime._active_llm_tasks and not runtime._active_tool_tasks

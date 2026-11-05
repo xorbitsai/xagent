@@ -45,9 +45,9 @@ account in the apps' auth configs that this database does not reference as
 unbound, so it must only be enabled where no other database uses the same
 auth configs. It only lists the auth configs that are still set: to retire an
 app, switch its backend back to ``native`` first, and remove its auth config
-only after its Composio grants are gone and a pass has run once accounts from
-sign-ins started before the switch are past the TTL plus grace (see
-``example.env``).
+only after its Composio grants are gone and a pass has started after
+accounts from sign-ins begun before the switch are past the TTL plus grace
+(see ``example.env``).
 
 Disconnect: deleting a grant through ``delete_scoped_user_oauth_accounts``
 schedules its Composio account for deletion once the caller's outermost

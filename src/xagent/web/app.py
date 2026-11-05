@@ -1888,7 +1888,6 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
         start_task_auto_resume_task(app_instance)
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
-    start_composio_reconcile_task(app_instance)
     start_retention_purge_task(app_instance)
     start_task_cleanup_retry_task(app_instance)
 
@@ -2469,6 +2468,9 @@ async def startup_event() -> None:
     # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
     if auto_migrate:
         start_temp_file_cleanup_task(app)
+    # Last for the same reason: a Composio reconcile pass runs in an executor
+    # thread that only its stop event (set by shutdown_event) can end.
+    start_composio_reconcile_task(app)
     start_runtime_performance_monitor(app)
     start_app_process_diagnostics(app)
 

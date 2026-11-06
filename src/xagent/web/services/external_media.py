@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from enum import Enum
 from io import BytesIO
 from math import ceil, floor
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
@@ -303,13 +304,11 @@ def _validate_instagram_source(image: Image.Image) -> None:
         )
 
 
-def local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
-    """Whether a local copy may be delivered externally instead of the durable one.
+def _below_user_root(record: UploadedFile, path: Path) -> tuple[Path, Path] | None:
+    """The owner's upload root a path lies in, and the part of the path below it.
 
-    The path must lie inside the record owner's upload root, and nothing below
-    that root may be a symbolic link: a registered file replaced by a link
-    would otherwise deliver another task's image. The root itself may be a
-    link, as a mounted volume can be.
+    The root may be a link (a mounted volume can be), so it is tried both as
+    configured and resolved; it must still resolve inside the uploads directory.
     """
     uploads_root = get_uploads_dir().resolve()
     user_root = scoped_user_root(get_uploads_dir(), int(record.user_id))
@@ -320,14 +319,79 @@ def local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
         except ValueError:
             continue
         if not base.resolve().is_relative_to(uploads_root):
+            return None
+        return base, below
+    return None
+
+
+def local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
+    """Whether a local copy may be delivered externally instead of the durable one.
+
+    The path must lie inside the record owner's upload root, and nothing below
+    that root may be a symbolic link: a registered file replaced by a link
+    would otherwise deliver another task's image. The root itself may be a
+    link, as a mounted volume can be. Delivery opens the file again with
+    ``open_delivery_file``, which holds the same rule at the moment of opening.
+    """
+    anchored = _below_user_root(record, path)
+    if anchored is None:
+        return False
+    current, below = anchored
+    for part in below.parts:
+        current = current / part
+        if current.is_symlink():
             return False
-        current = base
-        for part in below.parts:
-            current = current / part
-            if current.is_symlink():
-                return False
-        return True
-    return False
+    return True
+
+
+def open_delivery_file(record: UploadedFile, path: Path) -> BinaryIO:
+    """Open the file an external-media response will send, without following links.
+
+    Checking a path and opening it are separate steps, and a file replaced by a
+    link in between would send the link's target. Below the owner's upload root
+    each component is opened relative to its parent's descriptor with
+    ``O_NOFOLLOW``, so the bytes come from the file the check allowed, or the
+    open fails. The root itself may be a link. Any other path is a host-private
+    copy from durable storage; only the file itself must not be a link.
+
+    Raises ``OSError`` when the file cannot be opened this way or is not a
+    regular file.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    anchored = _below_user_root(record, path)
+    names: tuple[str, ...]
+    if anchored is None:
+        directory, names = Path(os.path.abspath(path)).parent, (path.name,)
+    else:
+        directory, below = anchored
+        names = below.parts
+    if not names:
+        raise IsADirectoryError(str(path))
+    current_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in names[:-1]:
+            next_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=current_fd
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            names[-1],
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow,
+            dir_fd=current_fd,
+        )
+    finally:
+        os.close(current_fd)
+    if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+        os.close(file_fd)
+        raise FileNotFoundError(str(path))
+    return os.fdopen(file_fd, "rb")
+
+
+def _source_size(source: Path | BinaryIO) -> int:
+    if isinstance(source, Path):
+        return source.stat().st_size
+    return os.fstat(source.fileno()).st_size
 
 
 def _validate_instagram_header(path: Path) -> None:
@@ -402,12 +466,12 @@ def _validate_facebook_record(record: UploadedFile) -> None:
         ) from exc
 
 
-def instagram_image_requires_normalization(path: Path) -> bool:
+def instagram_image_requires_normalization(source: Path | BinaryIO) -> bool:
     """Return whether a local image must be normalized before Instagram fetches it."""
 
     try:
-        file_size = path.stat().st_size
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+        file_size = _source_size(source)
+        with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
             if image.format != "JPEG":
                 return True
@@ -473,11 +537,11 @@ def _resize_for_instagram_canvas(image: Image.Image) -> Image.Image:
     return image
 
 
-def instagram_jpeg_bytes(path: Path) -> bytes:
+def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
     """Normalize a local image to Instagram's JPEG and aspect-ratio contract."""
 
     try:
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
+        with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
             _validate_instagram_source(opened)
             if opened.format == "JPEG":
                 opened.draft("RGB", (INSTAGRAM_MAX_WIDTH, 1800))

@@ -75,12 +75,15 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.external_media import (
+    FACEBOOK_MAX_IMAGE_BYTES,
+    INSTAGRAM_MAX_JPEG_BYTES,
     ExternalMediaPurpose,
     ExternalMediaTicketRejected,
     ExternalMediaUnavailable,
     instagram_image_requires_normalization,
     instagram_jpeg_bytes,
     local_record_path_is_trusted,
+    open_delivery_file,
     redeem_external_media_ticket,
 )
 from ..services.kb_file_service import (
@@ -1819,41 +1822,44 @@ def external_media_file(
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
     }
+    instagram = redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+    # Everything sent comes from this one descriptor, opened without following
+    # links, so a path replaced after the checks above cannot change the bytes.
     try:
-        normalize_for_instagram = (
-            redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
-            and instagram_image_requires_normalization(path)
-        )
-    except ExternalMediaUnavailable as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    if normalize_for_instagram:
+        delivered = open_delivery_file(record, path)
+    except OSError:
+        raise HTTPException(status_code=404, detail="File not found") from None
+    with delivered:
         try:
-            content = instagram_jpeg_bytes(path)
+            normalize_for_instagram = (
+                instagram and instagram_image_requires_normalization(delivered)
+            )
+            delivered.seek(0)
+            if normalize_for_instagram:
+                content = instagram_jpeg_bytes(delivered)
+            else:
+                limit = (
+                    INSTAGRAM_MAX_JPEG_BYTES if instagram else FACEBOOK_MAX_IMAGE_BYTES
+                )
+                content = delivered.read(limit + 1)
+                if len(content) > limit:
+                    raise ExternalMediaUnavailable(
+                        "Registered image exceeds the delivery size limit"
+                    )
         except ExternalMediaUnavailable as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
-        return Response(
-            content=content,
-            media_type="image/jpeg",
-            headers={
-                **response_headers,
-                "Content-Disposition": _content_disposition_header(
-                    "inline", f"{Path(str(record.filename)).stem}.jpg"
-                ),
-            },
-        )
+        except OSError:
+            raise HTTPException(status_code=404, detail="File not found") from None
 
-    return FileResponse(
-        path,
-        media_type=(
-            "image/jpeg"
-            if redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
-            else redeemed.media_type
-        ),
+    filename = str(record.filename)
+    if normalize_for_instagram:
+        filename = f"{Path(filename).stem}.jpg"
+    return Response(
+        content=content,
+        media_type="image/jpeg" if instagram else redeemed.media_type,
         headers={
             **response_headers,
-            "Content-Disposition": _content_disposition_header(
-                "inline", str(record.filename)
-            ),
+            "Content-Disposition": _content_disposition_header("inline", filename),
         },
     )
 

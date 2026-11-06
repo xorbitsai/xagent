@@ -481,3 +481,112 @@ def test_route_does_not_serve_a_file_swapped_for_a_link_after_issue(
 
     assert response.status_code != 200
     assert response.content != other.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    [
+        external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+    ],
+)
+@pytest.mark.parametrize("swapped", ["file", "directory"])
+def test_route_does_not_serve_a_path_swapped_after_its_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+    purpose: external_media.ExternalMediaPurpose,
+    swapped: str,
+):
+    # Why: the trust check and the response must cover the same bytes. A path
+    # replaced by a link after the check passes, before the response opens it,
+    # must not send the link's target.
+    uploads_dir = tmp_path / "uploads"
+    task_dir = uploads_dir / "user_7" / "web_task_11"
+    image_path = task_dir / "post.png"
+    task_dir.mkdir(parents=True)
+    Image.new("RGB", (64, 64), "blue").save(image_path)
+    other_dir = uploads_dir / "user_7" / "web_task_99"
+    other_dir.mkdir(parents=True)
+    Image.new("RGB", (64, 64), "red").save(other_dir / "post.png")
+    other_bytes = (other_dir / "post.png").read_bytes()
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="post.png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(
+        external_media.issue_external_media_url(
+            db, file_id=file_id, user_id=7, task_id=11, purpose=purpose
+        ).url
+    )
+    original_materialize = files.ManagedFileRef.materialize
+
+    def materialize_then_swap(self, *args, **kwargs):
+        path = original_materialize(self, *args, **kwargs)
+        assert path == image_path
+        if swapped == "file":
+            image_path.unlink()
+            image_path.symlink_to(other_dir / "post.png")
+        else:
+            task_dir.rename(tmp_path / "moved_task")
+            task_dir.symlink_to(other_dir)
+        return path
+
+    monkeypatch.setattr(files.ManagedFileRef, "materialize", materialize_then_swap)
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code == 404
+    assert response.content != other_bytes
+
+
+def test_route_serves_through_a_linked_upload_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    # Why: an operator may mount the upload root as a link; only links below
+    # the user root are refused when the response opens the file.
+    volume = tmp_path / "volume"
+    (volume / "user_7" / "web_task_11").mkdir(parents=True)
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.symlink_to(volume)
+    image_path = uploads_dir / "user_7" / "web_task_11" / "post.png"
+    Image.new("RGB", (64, 64), "blue").save(image_path)
+    expected = image_path.read_bytes()
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="post.png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        ).url
+    )
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code == 200
+    assert response.content == expected

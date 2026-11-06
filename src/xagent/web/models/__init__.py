@@ -2,6 +2,7 @@ from .actor_mcp_connection import ActorMCPServerConnection
 from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
+from .api_idempotency_key import ApiIdempotencyKey
 from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
 from .chat_message import TaskChatMessage
@@ -88,6 +89,7 @@ __all__ = [
     "TaskAdmissionTicket",
     "TaskExecutionCommand",
     "TaskInputReceipt",
+    "ApiIdempotencyKey",
     "TaskAutoRecovery",
     "TaskRecoveryEvent",
     "TaskCommandTerminalEvent",

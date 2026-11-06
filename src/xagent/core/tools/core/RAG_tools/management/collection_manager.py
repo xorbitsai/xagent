@@ -30,6 +30,7 @@ from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.contracts import MetadataStore
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import list_table_names
+from ..utils.model_resolution_pin import pinned_resolution
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.tag_mapping import register_tag_mapping
 
@@ -1289,10 +1290,15 @@ def resolve_effective_embedding_model_sync(
     Raises:
         ValueError: If model cannot be resolved or collection not found.
     """
-    return (
-        _get_maintenance_compatibility_facade().resolve_effective_embedding_model_sync(
-            collection_name, config_model_id
-        )
+    # Once per request under a ModelResolutionPin: a binding written between
+    # the usage gate and the pipeline must not change the model called.
+    return pinned_resolution(
+        ("effective_embedding_model", collection_name, config_model_id),
+        lambda: (
+            _get_maintenance_compatibility_facade().resolve_effective_embedding_model_sync(
+                collection_name, config_model_id
+            )
+        ),
     )
 
 

@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.web.api import auth
+from xagent.web.auth_sessions import hash_refresh_token
 from xagent.web.models import auth_database
 from xagent.web.models.user import User
 
@@ -176,7 +177,9 @@ async def test_concurrent_refresh_consumes_token_once(worker_db, monkeypatch):
     assert losers[0].status_code == 401
     assert winners[0].refresh_token != token
     with Session(engine) as session:
-        assert session.scalar(select(User.refresh_token)) == winners[0].refresh_token
+        assert session.scalar(select(User.refresh_token)) == hash_refresh_token(
+            winners[0].refresh_token
+        )
     monkeypatch.setattr(auth, "_prepare_refresh_response", prepare)
     with pytest.raises(HTTPException) as caught:
         await auth.refresh_token(auth.RefreshTokenRequest(refresh_token=token), factory)
@@ -243,7 +246,9 @@ async def test_long_username_login_and_legacy_refresh(worker_db, username):
         auth.RefreshTokenRequest(refresh_token=legacy), factory
     )
     with Session(engine) as session:
-        assert session.scalar(select(User.refresh_token)) == renewed.refresh_token
+        assert session.scalar(select(User.refresh_token)) == hash_refresh_token(
+            renewed.refresh_token
+        )
 
 
 @pytest.mark.asyncio
@@ -264,7 +269,7 @@ async def test_refresh_commit_failure_preserves_old_token(worker_db, monkeypatch
     assert "private-db-detail" not in caught.value.detail
     assert events[-1][0] == "close"
     with Session(engine) as session:
-        assert session.scalar(select(User.refresh_token)) == token
+        assert session.scalar(select(User.refresh_token)) == hash_refresh_token(token)
 
 
 @pytest.mark.asyncio
@@ -353,7 +358,7 @@ async def test_cancelled_auth_drains_commit_and_close(
         persisted = session.scalar(select(User.refresh_token))
         assert persisted is not None
         if operation == "refresh":
-            assert persisted != token
+            assert persisted != hash_refresh_token(token)
 
 
 @pytest.mark.asyncio

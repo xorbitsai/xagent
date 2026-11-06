@@ -1404,8 +1404,8 @@ export function ChatInput({
               contentEditable
               data-voice-input="false"
               className={cn(
-                "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
-                compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
+                "w-full rounded-md border-0 bg-transparent text-base sm:text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
+                compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[min(400px,40dvh)] sm:max-h-[400px]"),
                 isInputBusy ? "opacity-50 pointer-events-none" : ""
               )}
               onInput={handleInput}
@@ -1423,7 +1423,7 @@ export function ChatInput({
               aria-multiline="true"
             />
             {!message && (
-              <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
+              <div className="pointer-events-none absolute left-4 top-3 text-base sm:text-[14px] text-muted-foreground/60">
                 {placeholder ?? t("chatPage.input.placeholder")}
               </div>
             )}
@@ -1493,8 +1493,8 @@ export function ChatInput({
               )}
             </div>
           ) : (
-            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">
-              <div className="flex items-center gap-2">
+            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-1 bg-card px-2 py-2 sm:px-4 sm:py-3">
+              <div className="flex min-w-0 items-center gap-1 sm:gap-2">
                 {/* Settings button - left of upload */}
                 {!hideConfig && (
                   <>
@@ -1609,7 +1609,7 @@ export function ChatInput({
                 ) : null}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-1 sm:gap-2">
                 {shouldShowPauseButton && (
                   <Button
                     type="button"
@@ -1621,7 +1621,7 @@ export function ChatInput({
                     <Pause className="h-4 w-4" />
                   </Button>
                 )}
-                <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
+                <span className="hidden sm:inline text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
                 {voiceInputButton}
@@ -1630,6 +1630,8 @@ export function ChatInput({
                   type="submit"
                   size="icon"
                   disabled={!canSubmit()}
+                  aria-label={sendButtonLabel}
+                  title={sendButtonLabel}
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
                     !canSubmit() && "bg-muted text-muted-foreground/50"

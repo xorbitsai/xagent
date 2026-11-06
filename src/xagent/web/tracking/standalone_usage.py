@@ -23,7 +23,9 @@ handed to those must be submitted through ``contextvars.copy_context().run``.
 A scope checks the gate registered with
 :func:`xagent.web.services.quota_hooks.set_standalone_gate_hook` when it opens,
 so a refused user never reaches the provider: entering raises
-:class:`StandaloneUsageRefused` and the body does not run.
+:class:`StandaloneUsageRefused` and the body does not run. The scope is opened
+once the models are resolved, and passes the ids of the configured ones
+(:func:`gate_model_ids`) to the gate.
 
 A scope delivers what was recorded when it exits. Blocking work handed to a
 thread from a coroutine outlives the coroutine when the await is cancelled or
@@ -36,9 +38,9 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from types import TracebackType
-from typing import Any, Callable, Literal, Optional, TypeVar
+from typing import Any, Callable, Literal, Optional, Sequence, TypeVar
 
 from fastapi import HTTPException
 
@@ -108,27 +110,60 @@ class StandaloneUsageRefused(HTTPException):
         return self.message
 
 
-def _gate_hook(
+def gate_model_ids(*model_ids: Any) -> tuple[str, ...]:
+    """The ``model_ids`` to pass the gate for models identified as given.
+
+    Takes the ids the usage rows will carry (a config's ``usage_model_id``, a
+    speech model row's ``model_id``) and drops the empty ones -- a model
+    configured from the environment, which is recorded with no id -- and
+    repeats, keeping the order.
+    """
+    seen: dict[str, None] = {}
+    for model_id in model_ids:
+        if isinstance(model_id, str) and model_id.strip():
+            seen.setdefault(model_id.strip(), None)
+    return tuple(seen)
+
+
+def _model_ids_tuple(model_ids: Iterable[str]) -> tuple[str, ...]:
+    # A bare string is a sequence too, and would gate on its characters.
+    if isinstance(model_ids, (str, bytes)):
+        raise TypeError(
+            f"model_ids must be a collection of model ids, not {model_ids!r}"
+        )
+    return tuple(model_ids)
+
+
+def _gate(
     user_id: Optional[int], usage_source: str
-) -> Optional[Callable[[int, str], Any]]:
+) -> Optional[Callable[[int, str, Sequence[str]], Any]]:
     if user_id is None or usage_source in _UNGATED_SOURCES:
         return None
-    from ..services.quota_hooks import get_standalone_gate_hook
+    from ..services.quota_hooks import get_standalone_gate
 
-    return get_standalone_gate_hook()
+    return get_standalone_gate()
 
 
-def check_standalone_gate(user_id: Optional[int], usage_source: UsageSource) -> None:
+def check_standalone_gate(
+    user_id: Optional[int],
+    usage_source: UsageSource,
+    *,
+    model_ids: Iterable[str],
+) -> None:
     """Raise :class:`StandaloneUsageRefused` if the gate refuses the work.
 
-    Synchronous; the hook may block. Coroutines use
-    :func:`check_standalone_gate_async`. A no-op when no gate is registered.
+    ``model_ids`` are the configured models the work will call; see
+    :func:`gate_model_ids`. Required: an empty collection tells the gate the
+    work calls no priced model. Synchronous; the hook may block. Coroutines
+    use :func:`check_standalone_gate_async`. A no-op when no gate is
+    registered.
     """
-    hook = _gate_hook(user_id, usage_source)
-    if hook is None or user_id is None:
+    ids = _model_ids_tuple(model_ids)
+    gate = _gate(user_id, usage_source)
+    if gate is None or user_id is None:
         return
     try:
-        reason = hook(int(user_id), usage_source)
+        reason = gate(int(user_id), usage_source, gate_model_ids(*ids))
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "Standalone gate failed for %s; allowing the work: %s",
@@ -142,20 +177,31 @@ def check_standalone_gate(user_id: Optional[int], usage_source: UsageSource) -> 
 
 
 async def check_standalone_gate_async(
-    user_id: Optional[int], usage_source: UsageSource
+    user_id: Optional[int],
+    usage_source: UsageSource,
+    *,
+    model_ids: Iterable[str],
 ) -> None:
     """:func:`check_standalone_gate` with the hook run off the event loop."""
-    if _gate_hook(user_id, usage_source) is None:
+    ids = _model_ids_tuple(model_ids)
+    if _gate(user_id, usage_source) is None:
         return
-    await asyncio.to_thread(check_standalone_gate, user_id, usage_source)
+    await asyncio.to_thread(check_standalone_gate, user_id, usage_source, model_ids=ids)
 
 
 class UsageScope:
     """One unit of non-run work, metered for one user. See :func:`usage_scope`."""
 
-    def __init__(self, user_id: Optional[int], usage_source: UsageSource) -> None:
+    def __init__(
+        self,
+        user_id: Optional[int],
+        usage_source: UsageSource,
+        *,
+        model_ids: Iterable[str],
+    ) -> None:
         self.user_id = user_id
         self.usage_source = usage_source
+        self.model_ids = _model_ids_tuple(model_ids)
         self.usage = TokenUsage()
         self._token: Optional[contextvars.Token[Optional[TokenUsage]]] = None
         self._previous: Optional[TokenUsage] = None
@@ -223,7 +269,7 @@ class UsageScope:
             )
 
     def __enter__(self) -> TokenUsage:
-        check_standalone_gate(self.user_id, self.usage_source)
+        check_standalone_gate(self.user_id, self.usage_source, model_ids=self.model_ids)
         return self._bind()
 
     def __exit__(
@@ -238,7 +284,9 @@ class UsageScope:
             self._deliver(details)
 
     async def __aenter__(self) -> TokenUsage:
-        await check_standalone_gate_async(self.user_id, self.usage_source)
+        await check_standalone_gate_async(
+            self.user_id, self.usage_source, model_ids=self.model_ids
+        )
         return self._bind()
 
     async def __aexit__(
@@ -262,12 +310,20 @@ class UsageScope:
                 self._deliver(details)
 
 
-def usage_scope(user_id: Optional[int], *, usage_source: UsageSource) -> UsageScope:
+def usage_scope(
+    user_id: Optional[int],
+    *,
+    usage_source: UsageSource,
+    model_ids: Iterable[str],
+) -> UsageScope:
     """Meter one unit of non-run work for ``user_id``.
 
     ``user_id`` is the user the work is done for; pass ``None`` when there is
     none to attribute it to, and the usage is still delivered.
-    ``usage_source`` names the entry point for the hook.
+    ``usage_source`` names the entry point for the hook. ``model_ids`` are
+    the configured models the work will call, for the gate; see
+    :func:`gate_model_ids`. Required: an empty collection tells the gate the
+    work calls no priced model.
 
     Scopes nest: an inner scope's usage is delivered on its own and never
     reaches the outer one.
@@ -276,12 +332,13 @@ def usage_scope(user_id: Optional[int], *, usage_source: UsageSource) -> UsageSc
     :class:`StandaloneUsageRefused` when it refuses; see
     :func:`check_standalone_gate`.
     """
-    return UsageScope(user_id, usage_source)
+    return UsageScope(user_id, usage_source, model_ids=model_ids)
 
 
 def run_in_usage_scope(
     user_id: Optional[int],
     usage_source: UsageSource,
+    model_ids: Iterable[str],
     fn: Callable[..., _T],
     /,
     *args: Any,
@@ -289,9 +346,10 @@ def run_in_usage_scope(
 ) -> _T:
     """Call ``fn(*args, **kwargs)`` inside a synchronous :func:`usage_scope`.
 
+    ``model_ids`` are passed to the scope for the gate; see :func:`usage_scope`.
     For submitting blocking work to a thread: the scope lives in the thread,
     so its rows are delivered when the work finishes, even after the
     coroutine that awaited it was cancelled or timed out.
     """
-    with usage_scope(user_id, usage_source=usage_source):
+    with usage_scope(user_id, usage_source=usage_source, model_ids=model_ids):
         return fn(*args, **kwargs)

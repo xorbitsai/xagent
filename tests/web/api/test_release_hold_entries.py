@@ -1,8 +1,9 @@
 """WebSocket message handlers that reach the planned-restart execution hold.
 
 Each test drives a real handler. Direct WS executions are refused in band
-before any side effect and, when admitted, are counted until the handler
-returns; follow-ups that already have a durable command path keep it. The
+before any side effect; ``execute_task`` is a durable command like the
+follow-ups, so a hold leaves it pending instead (its pending-under-hold
+behaviour is covered in ``test_execute_task_durable_command``). The
 trigger HTTP entries are covered beside their own fixtures in
 ``test_agent_triggers`` / ``test_workforce_triggers``.
 """
@@ -58,46 +59,35 @@ def _user() -> Any:
     return SimpleNamespace(id=7, is_admin=False)
 
 
-async def test_execute_task_frame_is_refused_before_side_effects(
+def _loaded_request() -> Any:
+    return SimpleNamespace(
+        task_id=5,
+        task_owner_user_id=7,
+        task_source=None,
+        task_description="d",
+        task_context={},
+        task_info={},
+        created_at=None,
+    )
+
+
+async def test_execute_task_frame_is_accepted_not_refused_while_held(
     hold, monkeypatch
 ) -> None:
     frames = _Frames(monkeypatch)
     started = AsyncMock()
     monkeypatch.setattr(ws_api.task_start_service, "execute_existing_task", started)
-    hold.close("release r1")
-    await ws_api.handle_execute_task(_socket(), 5, {"user": _user()})
-    started.assert_not_called()
-    # No legacy "execution_started" acknowledgement was sent first.
-    assert [frame["type"] for frame in frames.sent] == ["error"]
-    assert frames.codes() == ["execution_paused"]
-
-
-async def test_admitted_execute_task_is_counted_until_registered(
-    hold, monkeypatch
-) -> None:
-    _Frames(monkeypatch)
-    seen: list[list[str]] = []
-
-    async def start(**_kwargs: Any) -> None:
-        seen.append([r["kind"] for r in hold.snapshot()["responsibilities"]])
-
-    monkeypatch.setattr(ws_api.task_start_service, "execute_existing_task", start)
     monkeypatch.setattr(
         ws_api,
         "_load_legacy_execute_task_request_sync",
-        lambda *_a, **_k: SimpleNamespace(
-            task_id=5,
-            task_owner_user_id=7,
-            task_source=None,
-            task_description="d",
-            task_context={},
-            task_info={},
-            created_at=None,
-        ),
+        lambda *_a, **_k: _loaded_request(),
     )
+    hold.close("release r1")
     await ws_api.handle_execute_task(_socket(), 5, {"user": _user()})
-    assert seen == [["ws_execute_task"]]
-    assert hold.snapshot()["responsibilities"] == []
+    # Accepted durably (the dispatcher keeps it pending under the hold).
+    started.assert_awaited_once()
+    assert [frame["type"] for frame in frames.sent] == ["execution_started"]
+    assert hold.snapshot()["refused"] == {}
 
 
 async def test_new_preview_frame_is_refused_without_creating_a_task(
@@ -179,7 +169,7 @@ class _OneFrameSocket:
 
 
 @pytest.mark.parametrize("endpoint_kind", ["widget", "share"])
-async def test_legacy_widget_and_share_execute_task_reach_the_hold(
+async def test_legacy_widget_and_share_execute_task_are_accepted_while_held(
     hold, monkeypatch, endpoint_kind
 ) -> None:
     """``/api/widget/chat/ws`` and ``/api/share/chat/ws`` run the shared handler."""
@@ -197,6 +187,11 @@ async def test_legacy_widget_and_share_execute_task_reach_the_hold(
     monkeypatch.setattr(public_chat_access, "handle_status_request", AsyncMock())
     started = AsyncMock()
     monkeypatch.setattr(ws_api.task_start_service, "execute_existing_task", started)
+    monkeypatch.setattr(
+        ws_api,
+        "_load_legacy_execute_task_request_sync",
+        lambda *_a, **_k: _loaded_request(),
+    )
     hold.close("release r1")
     socket = _OneFrameSocket({"type": "execute_task"})
     if endpoint_kind == "widget":
@@ -207,9 +202,9 @@ async def test_legacy_widget_and_share_execute_task_reach_the_hold(
         await public_chat_access.share_chat_websocket_endpoint(
             websocket=socket, task_id=42, token="t"
         )
-    started.assert_not_called()
-    assert frames.codes() == ["execution_paused"]
-    assert hold.snapshot()["refused"] == {"ws_execute_task": 1}
+    started.assert_awaited_once()
+    assert "execution_paused" not in frames.codes()
+    assert hold.snapshot()["refused"] == {}
 
 
 class _FramesSocket(_OneFrameSocket):

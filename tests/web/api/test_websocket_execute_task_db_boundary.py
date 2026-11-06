@@ -122,6 +122,11 @@ async def test_legacy_execute_uses_worker_snapshot_and_primitive_scheduler_bound
         event.remove(engine, "checkout", record_checkout)
         event.remove(engine, "checkin", record_checkin)  # codespell:ignore checkin
 
+    # The handler only accepts the command; the dispatcher schedules it.
+    for _ in range(100):
+        if schedule.await_count:
+            break
+        await asyncio.sleep(0.05)
     assert database_thread_ids
     assert all(thread_id != main_thread_id for thread_id in database_thread_ids)
     schedule.assert_awaited_once()

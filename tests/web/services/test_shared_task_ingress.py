@@ -191,8 +191,17 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
 
 
 @pytest.mark.asyncio
-async def test_legacy_existing_execution_returns_after_durable_acceptance(ingress):
+async def test_legacy_existing_execution_returns_after_durable_acceptance(
+    ingress, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
     owner, _ = ingress
+    # Acceptance is what is asserted; consumption is dispatched separately.
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.dispatch_task_command_promptly",
+        AsyncMock(),
+    )
     with get_session_local()() as db:
         task = Task(user_id=owner, title="legacy", status=TaskStatus.PENDING)
         db.add(task)

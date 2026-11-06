@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
@@ -226,12 +227,24 @@ def test_each_cloud_file_bills_the_requesting_member(
     test_env, temp_uploads, monkeypatch
 ) -> None:
     from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
+    from xagent.core.tools.core.RAG_tools.utils import model_resolution_pin
     from xagent.web.services import quota_hooks
 
     app, headers, user, _ = test_env
     _connect_drive(test_env, monkeypatch)
+    pins: list = []
+
+    def _resolve(*_args, **_kwargs):
+        pins.append(model_resolution_pin._active_pin.get())
+        return ("team-embedding",)
+
+    gate_calls: list = []
+
+    def _gate(user_id: int, source: str, model_ids: tuple[str, ...]) -> None:
+        gate_calls.append((user_id, source, model_ids))
 
     def _ingest(**_kwargs):
+        pins.append(model_resolution_pin._active_pin.get())
         add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=2, model_id="e")
         return IngestionResult(
             status="success",
@@ -264,6 +277,7 @@ def test_each_cloud_file_bills_the_requesting_member(
     quota_hooks.set_standalone_usage_hook(
         lambda user_id, details, source: calls.append((user_id, details, source))
     )
+    quota_hooks.set_standalone_gate_hook(_gate)
     try:
         with ExitStack() as stack:
             for p in (
@@ -276,6 +290,10 @@ def test_each_cloud_file_bills_the_requesting_member(
                 ),
                 patch("xagent.web.api.kb.MediaIoBaseDownload", _Downloader),
                 patch("xagent.web.api.kb.run_document_ingestion", side_effect=_ingest),
+                patch(
+                    "xagent.web.api.kb.resolve_ingestion_model_ids",
+                    side_effect=_resolve,
+                ),
                 patch(
                     "xagent.web.api.kb._ensure_collection_access",
                     new_callable=AsyncMock,
@@ -294,8 +312,14 @@ def test_each_cloud_file_bills_the_requesting_member(
             )
     finally:
         quota_hooks.set_standalone_usage_hook(None)
+        quota_hooks.set_standalone_gate_hook(None)
 
     assert [e["status"] for e in response.json()] == ["success", "success"]
+    # Resolved once; every file is ingested under that resolution.
+    assert len(pins) == 3 and pins[0] is not None
+    assert pins[1] is pins[0] and pins[2] is pins[0]
+    # Checked up front and again as each file starts, on that resolution.
+    assert gate_calls == [(int(user.id), "kb_ingest_cloud", ("team-embedding",))] * 3
     # One delivery per file, each from the thread that ran its ingestion.
     assert sorted((u, s, len(d), d[0]["quantity"]) for u, d, s in calls) == [
         (int(user.id), "kb_ingest_cloud", 1, 2.0),
@@ -344,13 +368,20 @@ def test_a_cloud_ingest_refused_by_the_gate_downloads_nothing(
     _connect_drive(test_env, monkeypatch)
     gate_calls: list = []
 
-    def gate(user_id: int, source: str) -> str:
-        gate_calls.append((user_id, source))
+    def gate(user_id: int, source: str, model_ids: tuple[str, ...]) -> str:
+        gate_calls.append((user_id, source, model_ids))
         return "Out of AI credits"
 
     quota_hooks.set_standalone_gate_hook(gate)
     try:
         with (
+            patch(
+                "xagent.web.api.kb.resolve_ingestion_model_ids",
+                return_value=("platform/text-embedding-v4",),
+            ),
+            patch(
+                "xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock
+            ) as access,
             patch("xagent.web.api.kb.build") as build,
             patch("xagent.web.api.kb.run_document_ingestion") as ingest,
         ):
@@ -364,6 +395,47 @@ def test_a_cloud_ingest_refused_by_the_gate_downloads_nothing(
 
     assert response.status_code == 402
     assert response.json()["detail"]["source"] == "kb_ingest_cloud"
-    assert gate_calls == [(int(user.id), "kb_ingest_cloud")]
+    assert gate_calls == [
+        (int(user.id), "kb_ingest_cloud", ("platform/text-embedding-v4",))
+    ]
+    # Refused once access was confirmed, before anything was downloaded.
+    access.assert_awaited_once()
     build.assert_not_called()
     ingest.assert_not_called()
+
+
+def test_a_cloud_ingest_into_a_collection_out_of_reach_resolves_nothing(
+    test_env, temp_uploads, monkeypatch
+) -> None:
+    # Collection names are global: resolving the model would read, and could
+    # record, another tenant's binding, and tell the gate about its model.
+    from xagent.web.services import quota_hooks
+
+    app, headers, _user, _ = test_env
+    _connect_drive(test_env, monkeypatch)
+    gate_calls: list = []
+    quota_hooks.set_standalone_gate_hook(
+        lambda user_id, source, model_ids: gate_calls.append(model_ids)
+    )
+    try:
+        with (
+            patch("xagent.web.api.kb.resolve_ingestion_model_ids") as resolve,
+            patch(
+                "xagent.web.api.kb._ensure_collection_access",
+                new_callable=AsyncMock,
+                side_effect=HTTPException(status_code=403, detail="Forbidden"),
+            ),
+            patch("xagent.web.api.kb.build") as build,
+        ):
+            response = TestClient(app).post(
+                "/api/kb/ingest-cloud",
+                json={"collection": "someone_elses", "files": _drive_files(1)},
+                headers=headers,
+            )
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+
+    assert response.status_code == 403
+    resolve.assert_not_called()
+    assert gate_calls == []
+    build.assert_not_called()

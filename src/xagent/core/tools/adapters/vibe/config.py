@@ -581,6 +581,10 @@ class BaseToolConfig(ABC):
         """Get agent ID to exclude from agent tools."""
         return None
 
+    def get_excluded_model_ids(self) -> frozenset[str]:
+        """Media model ids this task excludes, inherited by delegated agents."""
+        return frozenset()
+
     @abstractmethod
     def get_db(self) -> Optional[Any]:
         """Get database session. Returns None for standalone usage."""

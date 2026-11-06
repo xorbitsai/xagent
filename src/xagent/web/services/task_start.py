@@ -29,6 +29,7 @@ from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
 from .a2a_task_read import load_a2a_task_snapshot
 from .agent_store import AgentStore
+from .api_idempotency import IdempotencyClaim, bind_task_no_commit
 from .connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -309,6 +310,7 @@ def _prepare_created_task_isolated(
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
     credential_kind: SdkCredentialKind,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
@@ -416,6 +418,9 @@ def _prepare_created_task_isolated(
                     )
                 ).scalar_one(),
             )
+        if idempotency_claim is not None:
+            # Same transaction as the task: the key is bound to it or to nothing.
+            bind_task_no_commit(db, idempotency_claim, task_id)
         commit_claimed_turn_or_reconcile(
             db,
             task_id=task_id,
@@ -515,6 +520,7 @@ def _prepare_append_turn_isolated(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedAppendTurn:
     """Resolve append authorization and runtime inputs into detached values."""
 
@@ -602,6 +608,8 @@ def _prepare_append_turn_isolated(
             payload=payload,
             claimed_turn=claimed_turn,
         )
+        if idempotency_claim is not None:
+            bind_task_no_commit(db, idempotency_claim, int(task.id))
         commit_claimed_turn_or_reconcile(
             db,
             task_id=int(task.id),
@@ -776,6 +784,7 @@ async def create_sdk_task(
     requested_priority: int | None = None,
     prompt_context: dict[str, Any] | None = None,
     credential_kind: SdkCredentialKind,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     """Create an SDK task and schedule its first turn.
 
@@ -799,6 +808,7 @@ async def create_sdk_task(
                 requested_dispatch_class=requested_dispatch_class,
                 requested_priority=requested_priority,
                 credential_kind=credential_kind,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -847,6 +857,7 @@ async def append_sdk_turn(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
         # A runner may still be finishing local cleanup after its terminal
@@ -867,6 +878,7 @@ async def append_sdk_turn(
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
                 prompt_context=prompt_context,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -1200,35 +1212,27 @@ async def execute_existing_task(
     context: dict[str, Any],
     actor_user_id: int,
 ) -> None:
-    """Submit shared execution, or await the legacy local execution handle."""
-    from .task_execution_host import enqueues_task_turns
+    """Durably accept the legacy ``execute_task``, then dispatch it promptly.
 
-    if enqueues_task_turns():
-        from .task_existing_command import enqueue_existing_execution
+    Both execution modes stage the same START (kind ``existing``). The command
+    dispatcher executes it, so a closed release hold leaves it pending for the
+    successor, and the WebSocket returns once the command is accepted instead
+    of waiting for the execution. ``task_source`` is read again by the
+    consumer from the task row.
+    """
+    from .task_command_execution import execute_durable_task_command
+    from .task_command_transport import dispatch_task_command_promptly
+    from .task_existing_command import stage_existing_execution
 
-        await run_db_io_cancellation_safe(
-            lambda: enqueue_existing_execution(
-                task_id=task_id,
-                task_owner_user_id=task_owner_user_id,
-                task_description=task_description,
-                context=context,
-                actor_user_id=actor_user_id,
-            )
+    _run_id, command_db_id = await run_db_io_cancellation_safe(
+        lambda: stage_existing_execution(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            task_description=task_description,
+            context=context,
+            actor_user_id=actor_user_id,
         )
-        # The WebSocket must keep receiving pause/resume commands while the
-        # worker executes. Completion arrives through the shared event bridge.
-        return
-    background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
-        task_id=task_id,
-        task_owner_user_id=task_owner_user_id,
-        task_source=task_source,
-        payload=TaskTurnPayload(
-            transcript_message=task_description,
-            execution_message=task_description,
-        ),
-        context=context,
-        actor_user_id=actor_user_id,
     )
-    # Legacy WebSocket execute_task must not return until execution finishes.
-    # Keep that ordering even though scheduling owns the background handle.
-    await background_task
+    await dispatch_task_command_promptly(
+        execute_durable_task_command, command_db_id=command_db_id
+    )

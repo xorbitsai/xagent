@@ -1,6 +1,7 @@
 """Public-only sessions at the Xinference SDK's client and model boundaries."""
 
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 from xinference_client import RESTfulClient
@@ -56,6 +57,7 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
         )
         self._cluster_authed = api_key is not None
         self.timeout = aiohttp.ClientTimeout(total=1800)
+        self._cache_lifecycle_support: dict[str, bool] = {}
         self.session = create_public_model_aiohttp_session(timeout=self.timeout)
 
     async def get_model(self, model_uid: str) -> Any:
@@ -65,6 +67,9 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
     async def get_chat_model(self, model_uid: str) -> tuple[Any, bool]:
         """Discover the chat handle and its routing support in one request."""
         description = await self.describe_model(model_uid)
+        self._cache_lifecycle_support[model_uid] = (
+            description.get("supports_agent_cache_lifecycle") is True
+        )
         if description.get("model_type") != "LLM" or "chat" not in description.get(
             "model_ability", []
         ):
@@ -76,6 +81,27 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
             await self._guard_model_handle(handle),
             description.get("supports_chat_session_affinity") is True,
         )
+
+    def supports_agent_cache_lifecycle(self, model_uid: str) -> bool:
+        return self._cache_lifecycle_support.get(model_uid, False)
+
+    async def update_cache_session(
+        self, model_uid: str, session: dict[str, Any]
+    ) -> None:
+        url = (
+            self.base_url.rstrip("/")
+            + "/v1/models/"
+            + quote(model_uid, safe="")
+            + "/cache_sessions"
+        )
+        async with self.session.post(
+            url,
+            json=session,
+            headers=self._headers,
+            timeout=aiohttp.ClientTimeout(total=0.5),
+        ) as response:
+            response.raise_for_status()
+            await response.read()
 
     async def _guard_model_handle(self, handle: Any) -> Any:
         await handle.session.close()

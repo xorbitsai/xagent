@@ -10,7 +10,9 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import partial
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from functools import partial, wraps
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import (
@@ -1293,6 +1295,10 @@ class ConnectionManager:
         # closed with 1012 at once. ``end_restart_drain`` reverses it.
         self._restart_draining = False
         self._restart_closes: set[asyncio.Task[None]] = set()
+        # socket -> command handlers still between accepting a frame and
+        # sending its first reply; no origin exists yet, but a close now would
+        # lose that reply.
+        self._ingress: dict[WebSocket, int] = {}
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -1526,12 +1532,32 @@ class ConnectionManager:
             return
         _report_delivery(ledger, expected)
 
+    @asynccontextmanager
+    async def ingress(self, websocket: WebSocket) -> AsyncIterator[None]:
+        """Mark a command handler as in flight on this socket.
+
+        A restart close waits for it (up to its reply deadline), so the
+        acceptance or rejection reply is sent before 1012.
+        """
+        self._ingress[websocket] = self._ingress.get(websocket, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._ingress.get(websocket, 1) - 1
+            if remaining > 0:
+                self._ingress[websocket] = remaining
+            else:
+                self._ingress.pop(websocket, None)
+
     def _has_pending_command(self, websocket: Any) -> bool:
         """Whether a command from this socket still awaits its reply.
 
-        Non-shared execution records the origin in ``_command_origins``;
-        shared execution records it in the task event bridge instead.
+        True while a command handler is in flight (``ingress``), and while an
+        origin awaits its outcome: non-shared execution records it in
+        ``_command_origins``, shared execution in the task event bridge.
         """
+        if self._ingress.get(websocket):
+            return True
         if _command_origins.has_pending_for_socket(websocket):
             return True
         if get_shared_task_execution_enabled():
@@ -1806,6 +1832,17 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _holds_ingress(handler: Any) -> Any:
+    """Keep ``manager.ingress`` held for a command handler's whole run."""
+
+    @wraps(handler)
+    async def wrapper(websocket: WebSocket, *args: Any, **kwargs: Any) -> Any:
+        async with manager.ingress(websocket):
+            return await handler(websocket, *args, **kwargs)
+
+    return wrapper
+
+
 # The execution service publishes events; this process owns socket delivery.
 async def _deliver_task_event(message: dict[str, Any], task_id: int) -> None:
     await manager.broadcast_to_task(message, task_id)
@@ -1878,6 +1915,7 @@ async def handle_file_upload_for_task(
         raise
 
 
+@_holds_ingress
 async def handle_chat_message(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -3774,6 +3812,7 @@ async def handle_intervention(
         raise
 
 
+@_holds_ingress
 async def handle_pause_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -3841,6 +3880,7 @@ async def handle_pause_task(
     )
 
 
+@_holds_ingress
 async def handle_resume_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:

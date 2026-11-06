@@ -18,7 +18,9 @@ class FeaturesResponse(BaseModel):
         description=(
             "Names of the optional features the presented key can use. "
             '"structured_output" means the key can set, change or clear the '
-            "response_format of a task."
+            "response_format of a task. An empty list does not mean the tasks "
+            "the key can read have no format: a format set with another key "
+            "on the same task is still returned."
         ),
     )
 

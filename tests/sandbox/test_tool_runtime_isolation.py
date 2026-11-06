@@ -562,7 +562,13 @@ def test_noneditable_install_also_protects_retained_build_checkout(
             else None,
         ),
     )
-    for source in (installed, checkout / "src", checkout / "tests"):
+    for source in (
+        installed,
+        checkout / "src",
+        checkout / "tests",
+        checkout / ".git",
+        checkout / ".git" / "objects",
+    ):
         with pytest.raises(SandboxRuntimeConflictError):
             _reject_platform_source_mounts([(str(source), "/data", "ro")])
     assert tmp_path / "venv" / "tests" not in config.get_platform_source_roots()
@@ -600,7 +606,10 @@ async def test_configured_sandbox_allows_tasks_without_selected_code_tools(
     safe = FunctionTool(add)
     code = CommandExecutorToolForBasic()
     config = ToolConfig(
-        {"allowed_tools": [] if selection == "no_tools" else [safe.name]}
+        {
+            "workspace": {"task_id": "preview_test"},
+            "allowed_tools": [] if selection == "no_tools" else [safe.name],
+        }
     )
     with (
         patch(
@@ -676,3 +685,93 @@ async def test_javascript_generated_file_suffix_survives_registration_failure():
         result = await wrapper.run_json_async({})
     assert result["output"] == "done\n\nGenerated files: report.csv"
     assert len(result["artifacts"]) == len(result["file_refs"]) == 1
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None, reason="Requires Git for the object-store regression"
+)
+@pytest.mark.parametrize("layout", ["directory", "separate", "worktree", "alternates"])
+@pytest.mark.parametrize("origin", ["cwd", "host"])
+def test_git_object_store_mounts_cannot_recover_platform_source(
+    tmp_path, monkeypatch, layout, origin
+):
+    from xagent.sandbox.base import SandboxRuntimeConflictError
+    from xagent.web.sandbox_manager import _reject_platform_source_mounts
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Sandbox Test",
+                "-c",
+                "user.email=sandbox-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-C",
+                str(cwd),
+                *args,
+            ],
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    checkout = tmp_path / "checkout"
+    source = checkout / "src" / "xagent" / "fixture.py"
+    source.parent.mkdir(parents=True)
+    source_text = "backend_fixture = 'source recovered from Git objects'\n"
+    source.write_text(source_text)
+    (checkout / "pyproject.toml").write_text('[project]\nname = "xagent-ai"\n')
+    init_args = ["init", "--quiet"]
+    if layout == "separate":
+        init_args += ["--separate-git-dir", str(tmp_path / "metadata")]
+    git(*init_args, str(checkout))
+    git("add", "pyproject.toml", "src", cwd=checkout)
+    git("commit", "--quiet", "-m", "Fixture", cwd=checkout)
+    if layout == "worktree":
+        linked = tmp_path / "linked"
+        git("worktree", "add", "--quiet", "--detach", str(linked), "HEAD", cwd=checkout)
+        checkout = linked
+
+    git_dir = Path(git("rev-parse", "--absolute-git-dir", cwd=checkout))
+    common_dir = (
+        checkout / git("rev-parse", "--git-common-dir", cwd=checkout)
+    ).resolve()
+    stores = {checkout / ".git", git_dir, common_dir, common_dir / "objects"}
+    if layout == "alternates":
+        objects = common_dir / "objects"
+        pool = tmp_path / "shared objects-λ"
+        shutil.move(str(objects), str(pool))
+        (objects / "info").mkdir(parents=True)
+        quoted = '"' + "".join(f"\\{byte:03o}" for byte in os.fsencode(str(pool))) + '"'
+        (objects / "info" / "alternates").write_text(quoted + "\n")
+        stores.add(pool)
+
+    source.unlink(missing_ok=True)
+    (checkout / "src" / "xagent" / "fixture.py").unlink(missing_ok=True)
+
+    # This reads only the fixture's object database, not a mounted worktree:
+    # a read-only metadata mount can supply the same tracked backend bytes.
+    assert (
+        git("--git-dir", str(common_dir), "show", "HEAD:src/xagent/fixture.py")
+        == source_text.strip()
+    )
+    if origin == "host":
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("XAGENT_SANDBOX_HOST_PROJECT_ROOT", str(checkout))
+    else:
+        monkeypatch.chdir(checkout)
+        monkeypatch.delenv("XAGENT_SANDBOX_HOST_PROJECT_ROOT", raising=False)
+    for store in stores:
+        with pytest.raises(SandboxRuntimeConflictError, match="Platform source"):
+            _reject_platform_source_mounts([(str(store), "/repository-metadata", "ro")])
+    alias = tmp_path / "metadata-alias"
+    alias.symlink_to(common_dir, target_is_directory=True)
+    with pytest.raises(SandboxRuntimeConflictError):
+        _reject_platform_source_mounts([(str(alias), "/repository-metadata", "ro")])

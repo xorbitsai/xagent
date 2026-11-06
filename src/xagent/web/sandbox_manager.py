@@ -23,7 +23,6 @@ from ..config import (
     get_sandbox_cpus,
     get_sandbox_enabled,
     get_sandbox_env,
-    get_sandbox_host_project_root,
     get_sandbox_host_storage_root,
     get_sandbox_idle_ttl,
     get_sandbox_image,
@@ -2881,9 +2880,6 @@ def _reject_platform_source_mounts(volumes: list[tuple[str, str, str]]) -> None:
         if legacy_data.resolve() == legacy_data and data.is_relative_to(legacy_data)
         else []
     )
-    host_project = get_sandbox_host_project_root()
-    if host_project is not None:
-        roots += [host_project / "src" / "xagent", host_project / "tests"]
     roots = [root.resolve() for root in roots]
     for host, _guest, _mode in volumes:
         candidate = Path(host).resolve()

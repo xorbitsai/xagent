@@ -1393,3 +1393,32 @@ class TestGetOrCreateLeaseProvider:
 
         assert first is providers[0]
         assert second is providers[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_spec_supported", [False, True])
+@pytest.mark.parametrize("subpath", [".git", ".git/objects"])
+async def test_configured_git_mount_is_rejected_before_backend_creation(
+    tmp_path, runtime_spec_supported, subpath
+):
+    service = FakeSandboxService(runtime_spec_supported=runtime_spec_supported)
+    manager = SandboxManager(service)
+    checkout = tmp_path / "checkout"
+    metadata = checkout / subpath
+    metadata.mkdir(parents=True)
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "XAGENT_SANDBOX_HOST_PROJECT_ROOT": str(checkout),
+                "XAGENT_UPLOADS_DIR": str(tmp_path / "uploads"),
+                "SANDBOX_VOLUMES": f"{metadata}:/repository-metadata:ro",
+            },
+            clear=True,
+        ),
+        patch.object(service, "create", new=AsyncMock()) as create,
+        pytest.raises(SandboxRuntimeConflictError, match="Platform source"),
+    ):
+        await manager.get_or_create_sandbox("task", "git-mount-regression")
+    service.get_or_create.assert_not_awaited()
+    create.assert_not_awaited()

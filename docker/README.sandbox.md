@@ -58,10 +58,14 @@ Custom `@sandbox_config` tools that require arbitrary application imports are
 not supported by this runtime. They must be adapted to an execution-only
 protocol; unsupported tools fail rather than falling back to backend execution.
 
-Custom volume mounts that expose backend source or tests, including parent paths
-and symlink aliases, are rejected. Do not install the full Xagent package in a
-custom sandbox image: execution refuses an environment where that package or the
-former `/app/src` and `/app/tests` directories are visible.
+Custom volume mounts that expose known backend source, tests, or Git metadata
+and object stores are rejected, including parent paths and aliases resolvable
+in the backend's filesystem. In sibling-Docker deployments, operators must
+audit host-only aliases and Git storage paths that the backend cannot inspect;
+see [Sandbox Runtime Overlays](README.md#sandbox-runtime-overlays).
+Do not install the full Xagent package in a custom sandbox image: execution
+refuses an environment where that package or the former `/app/src` and
+`/app/tests` directories are visible.
 
 On upgrade, drain running work and restart the backend. Docker reconciles the
 changed mount spec when resolving a sandbox. Boxlite recreates environments
@@ -72,8 +76,9 @@ Source copies already made into task files or disclosed to users need separate
 incident handling; changing mounts cannot erase them.
 
 The obsolete `XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY` flag no longer
-permits task execution on the backend. When sandboxing is enabled, outages and
-capacity exhaustion fail the task for all entry points, including ordinary chat.
+permits task execution on the backend. When sandbox-required tools are selected,
+outages and capacity exhaustion fail their execution for all entry points,
+including ordinary chat.
 
 ## Tags
 

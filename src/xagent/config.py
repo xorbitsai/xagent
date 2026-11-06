@@ -2764,13 +2764,77 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     return absolute
 
 
+def _platform_git_roots(checkout: Path) -> set[Path]:
+    """Git metadata and readable object stores for a known application checkout.
+
+    Worktrees and separate-git-dir installs put the object database outside the
+    checkout. Resolve their gitdir/commondir pointers and object alternates using
+    files only; a wheel installation need not have the Git executable installed.
+    """
+    import codecs
+
+    entry = checkout / ".git"
+    roots = {entry.resolve()}
+    git_dir = entry
+    try:
+        if entry.is_file():
+            marker = entry.read_text(errors="surrogateescape").strip()
+            if not marker.startswith("gitdir:"):
+                return roots
+            target = marker.removeprefix("gitdir:").strip()
+            if not target:
+                return roots
+            git_dir = (checkout / target).resolve()
+            roots.add(git_dir)
+    except OSError:
+        return roots
+
+    git_dirs = {git_dir}
+    try:
+        common = (git_dir / "commondir").read_text(errors="surrogateescape").strip()
+        if common:
+            git_dirs.add((git_dir / common).resolve())
+    except OSError:
+        pass
+    roots.update(path.resolve() for path in git_dirs)
+    pending = [path / "objects" for path in git_dirs]
+    visited: set[Path] = set()
+    while pending:
+        objects = pending.pop().resolve()
+        if objects in visited:
+            continue
+        visited.add(objects)
+        roots.add(objects)
+        try:
+            alternates = (objects / "info" / "alternates").read_text(
+                errors="surrogateescape"
+            )
+        except OSError:
+            continue
+        for alternate in alternates.splitlines():
+            if not alternate:
+                continue
+            # Git's quoted paths use C byte escapes, including octal UTF-8.
+            if alternate.startswith('"'):
+                if not alternate.endswith('"'):
+                    continue
+                try:
+                    alternate = os.fsdecode(
+                        codecs.escape_decode(os.fsencode(alternate[1:-1]))[0]
+                    )
+                except ValueError:
+                    continue
+            pending.append(objects / alternate)
+    return roots
+
+
 def get_platform_source_roots() -> list[Path]:
-    """Known installed and checkout code paths, including noneditable builds.
+    """Known installed code, checkout sources and Git object stores.
 
     The backend image retains its build checkout separately from site-packages.
     Find that checkout through the local installation origin and working tree;
     never infer a tests directory from an arbitrary site-packages parent.
-    Docker-host paths are supplied separately by SANDBOX_HOST_PROJECT_ROOT.
+    SANDBOX_HOST_PROJECT_ROOT supplies the sibling Docker host's checkout.
     """
     import json
     import tomllib
@@ -2796,9 +2860,14 @@ def get_platform_source_roots() -> list[Path]:
             if (checkout / "src" / "xagent").is_dir():
                 roots.add((checkout / "src" / "xagent").resolve())
                 roots.add((checkout / "tests").resolve())
+                roots.update(_platform_git_roots(checkout))
         except (OSError, ValueError):
             continue
-    return sorted(roots)
+    host_checkout = get_sandbox_host_project_root()
+    if host_checkout is not None:
+        roots.update({host_checkout / "src" / "xagent", host_checkout / "tests"})
+        roots.update(_platform_git_roots(host_checkout))
+    return sorted(root.resolve() for root in roots)
 
 
 def get_legacy_source_uploads_dir() -> Path:

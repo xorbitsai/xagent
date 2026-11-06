@@ -344,10 +344,12 @@ docker compose \
 
 The source-mount guard rejects the installed platform package, detected local
 build checkouts (including the backend image's retained source), and the host
-checkout configured by `XAGENT_SANDBOX_HOST_PROJECT_ROOT`. It resolves aliases
+checkout configured by `XAGENT_SANDBOX_HOST_PROJECT_ROOT`. The checks include
+their `.git` metadata and locally readable Git object stores, including linked
+worktree/common directories and alternates. It resolves aliases
 visible in the backend's filesystem. For a sibling Docker daemon, operators must
-also check host-only symlinks and alternate host paths: the backend cannot resolve
-aliases that exist only on the daemon host. Custom sandbox images must not contain
+also check host-only symlinks, Git storage paths and alternate host paths: the
+backend cannot resolve aliases that exist only on the daemon host. Custom sandbox images must not contain
 the platform package or a separate copy of its source.
 
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use

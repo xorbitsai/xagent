@@ -17,6 +17,7 @@ function send(source: MessageEventSource | null, data: unknown = ready, origin =
 describe("resolveHtmlPreviewRunnerUrl", () => {
   it.each([
     ["https://cloud.xagent.co", "https://preview.xagent.co/render"],
+    ["https://tobybot.ai", "https://preview.xagent.co/render"],
     ["https://stage.cloud.xagent.co", "https://preview-stage.xagent.co/render"],
     ["https://dev.cloud.xagent.co", "https://preview-dev.xagent.co/render"],
   ])("maps %s to %s", (appOrigin, expected) => {
@@ -74,6 +75,7 @@ describe("IsolatedHtmlPreview", () => {
 
   it.each([
     ["https://cloud.xagent.co", "https://preview.xagent.co/render"],
+    ["https://tobybot.ai", "https://preview.xagent.co/render"],
     ["https://stage.cloud.xagent.co", "https://preview-stage.xagent.co/render"],
     ["https://dev.cloud.xagent.co", "https://preview-dev.xagent.co/render"],
   ])("resolves auto on %s in the component", (origin, expected) => {

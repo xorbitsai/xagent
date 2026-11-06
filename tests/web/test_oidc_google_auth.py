@@ -114,6 +114,11 @@ def _install_google_fakes(monkeypatch, claims: dict[str, object]) -> None:
 class FakeAuthlibGoogleClient:
     def __init__(self, expires_in: int = 3600) -> None:
         self.expires_in = expires_in
+        from authlib.integrations.starlette_client.integration import (
+            StarletteIntegration,
+        )
+
+        self.framework = StarletteIntegration("google")
 
     async def authorize_redirect(self, request, redirect_uri, **authorize_params):
         from authlib.common.security import generate_token
@@ -486,4 +491,93 @@ def test_google_oidc_login_uses_configured_state_ttl(oidc_client, monkeypatch):
     assert request.session["_state_google_short-state"]["exp"] == pytest.approx(
         started_at + 7,
         abs=2,
+    )
+
+
+@pytest.mark.parametrize("origin", ["https://legacy.example", "https://new.example"])
+def test_dual_entry_google_error_returns_to_bound_entry(
+    oidc_client, monkeypatch, origin
+):
+    import json
+
+    client, _ = oidc_client
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://legacy.example")
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": o,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": o + "/api/auth/oidc/google/callback",
+                }
+                for o in ["https://legacy.example", "https://new.example"]
+            ]
+        ),
+    )
+    _install_authlib_login_fake(monkeypatch)
+    started = client.get(origin + "/api/auth/oidc/google/login", follow_redirects=False)
+    query = parse_qs(urlparse(started.headers["location"]).query)
+    assert query["redirect_uri"] == [origin + "/api/auth/oidc/google/callback"]
+    callback = client.get(
+        origin + "/api/auth/oidc/google/callback",
+        params={"state": query["state"][0], "error": "access_denied"},
+        follow_redirects=False,
+    )
+    assert callback.headers["location"] == origin + "/login?oidc_error=provider_error"
+
+
+def test_new_exchange_entry_rejection_does_not_consume_code(oidc_client, monkeypatch):
+    import json
+
+    from xagent.web.api.oidc_google import _create_exchange_code
+
+    client, sessions = oidc_client
+    user = _create_admin(sessions)
+    old, new = "https://legacy.example", "https://new.example"
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", old)
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": o,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": o + "/api/auth/oidc/google/callback",
+                }
+                for o in [old, new]
+            ]
+        ),
+    )
+    code = _create_exchange_code(user.id, user.session_epoch, new)
+    assert (
+        client.post(
+            old + "/api/auth/oidc/google/exchange", json={"code": code}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            new + "/api/auth/oidc/google/exchange", json={"code": code}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            new + "/api/auth/oidc/google/exchange", json={"code": code}
+        ).status_code
+        == 400
+    )
+    old_code = _create_exchange_code(user.id, user.session_epoch)
+    assert (
+        client.post(
+            new + "/api/auth/oidc/google/exchange", json={"code": old_code}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            old + "/api/auth/oidc/google/exchange", json={"code": old_code}
+        ).status_code
+        == 200
     )

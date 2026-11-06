@@ -106,6 +106,7 @@ from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
+from .oauth_handoff import router as oauth_handoff_router
 from .runtime_telemetry import (
     start_process_runtime_telemetry,
     stop_process_runtime_telemetry,
@@ -1740,6 +1741,8 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 
 # API routers
 app.include_router(auth_router)
+
+app.include_router(oauth_handoff_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
 app.include_router(computer_router)

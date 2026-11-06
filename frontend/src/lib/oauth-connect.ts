@@ -1,3 +1,5 @@
+
+import { mcpAuthorizationURL } from "@/lib/oauth-bootstrap"
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { MCP_OAUTH_POPUP_WINDOW_NAME, parseMcpOAuthErrorMessage } from "@/lib/mcp-utils";
@@ -162,12 +164,12 @@ export async function openMcpOAuthPopup(options: {
       const message = await parseMcpOAuthErrorMessage(response, "");
       return { connected: false, message: message || undefined };
     }
-    const data = (await response.json()) as { authorization_url?: string };
+    const data = (await response.json()) as { authorization_url?: string; launch_mode?: string };
     if (!data.authorization_url) {
       popup.close();
       return { connected: false };
     }
-    popup.location.href = data.authorization_url;
+    popup.location.href = await mcpAuthorizationURL(data);
   } catch {
     popup.close();
     return { connected: false };

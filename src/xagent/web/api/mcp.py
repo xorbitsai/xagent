@@ -685,6 +685,8 @@ def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
 
 def _mcp_oauth_redirect_after_url(value: str | None) -> str:
     redirect_after = _safe_mcp_oauth_redirect_after(value)
+    if urlsplit(redirect_after).path == "/auth/mcp-complete":
+        return redirect_after
     app_base_url = get_app_base_url()
     if app_base_url:
         return f"{app_base_url}{redirect_after}"
@@ -786,6 +788,8 @@ def _mcp_oauth_callback_error_redirect_for_path(
         # provider's refusal without parsing mcp_oauth_error_message. The web
         # UI only strips it.
         params += (("mcp_oauth_provider_error", provider_error),)
+    if raw_redirect_after == "/auth/mcp-complete":
+        params = (("mcp_oauth_error", "authorization_failed"),)
     redirect_path = _redirect_after_with_params(raw_redirect_after, params)
     response = RedirectResponse(_mcp_oauth_redirect_after_url(redirect_path))
     _clear_mcp_oauth_state_cookie(response)
@@ -4518,6 +4522,7 @@ async def connect_mcp_oauth_app(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     accept: Annotated[str | None, Header()] = None,
+    request: Request = None,  # type: ignore[assignment]
 ) -> RedirectResponse | JSONResponse:
     """Connect a remote-MCP OAuth (DCR-capable) catalog app for the current user.
 
@@ -4542,7 +4547,7 @@ async def connect_mcp_oauth_app(
         app_info["id"],
     )
     return await connect_mcp_oauth(
-        cast(int, server.id), request_data, current_user, db, accept
+        cast(int, server.id), request_data, current_user, db, accept, request=request
     )
 
 
@@ -6636,8 +6641,20 @@ async def connect_mcp_oauth(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     accept: Annotated[str | None, Header()] = None,
+    request: Request = None,  # type: ignore[assignment]
 ) -> RedirectResponse | JSONResponse:
     """Start MCP OAuth Authorization Code + PKCE for the current user."""
+    from ..oauth_handoff import handoff_context, regional_launch_requested
+
+    regional_request = (
+        request if request is not None and regional_launch_requested(request) else None
+    )
+    if regional_request:
+        handoff_context(request)
+        request_data = request_data.model_copy(
+            update={"redirect_after": "/auth/mcp-complete"}
+        )
+
     return await _connect_mcp_oauth_for_owner(
         server_id,
         request_data,
@@ -6646,6 +6663,7 @@ async def connect_mcp_oauth(
         resource_owner_key=_default_resource_owner_key(cast(int, current_user.id)),
         accept=accept,
         persistence=_OAuthPersistence.COMMIT,
+        regional_request=regional_request,
     )
 
 
@@ -6658,6 +6676,7 @@ async def _connect_mcp_oauth_for_owner(
     resource_owner_key: str,
     accept: str | None,
     persistence: _OAuthPersistence,
+    regional_request: Request | None = None,
 ) -> RedirectResponse | JSONResponse:
     """Start OAuth for one exact owner with an explicit transaction owner."""
     user_id = cast(int, current_user.id)
@@ -6790,6 +6809,25 @@ async def _connect_mcp_oauth_for_owner(
             },
         )
     persisted_client_id, state_value, code_verifier = persisted
+    if regional_request is not None:
+        from ..oauth_handoff import HEADERS, issue_handoff
+
+        flow = (
+            db.query(MCPOAuthFlowState)
+            .filter(MCPOAuthFlowState.state == state_value)
+            .one()
+        )
+        result = issue_handoff(
+            regional_request,
+            current_user,
+            kind="mcp",
+            resource={
+                "state": state_value,
+                "client_id": flow.mcp_oauth_client_id,
+                "server_id": server_id,
+            },
+        )
+        return JSONResponse(result, headers=HEADERS)
 
     params = {
         "response_type": "code",

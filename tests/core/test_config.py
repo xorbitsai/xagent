@@ -4795,3 +4795,20 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+def test_public_site_configuration_is_opt_in(monkeypatch):
+    from xagent.config import (
+        get_dual_entry_oauth_enabled,
+        get_primary_public_site_url,
+        get_public_entries,
+    )
+
+    monkeypatch.delenv("XAGENT_PUBLIC_ENTRIES_JSON", raising=False)
+    monkeypatch.delenv("XAGENT_PRIMARY_PUBLIC_SITE_URL", raising=False)
+    monkeypatch.delenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://legacy.example")
+    monkeypatch.setenv("XAGENT_REGION_COOKIE_DOMAIN", ".legacy.example")
+    assert get_primary_public_site_url() == "https://legacy.example"
+    assert get_public_entries()[0].region_cookie_domain == ".legacy.example"
+    assert not get_dual_entry_oauth_enabled()

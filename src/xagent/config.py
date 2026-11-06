@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -4779,3 +4780,156 @@ def get_zendesk_marketplace_headers() -> dict[str, str]:
             continue
         headers[header] = value
     return headers
+
+
+# Public browser entries are deliberately independent of protocol/API bases.
+PUBLIC_ENTRIES_JSON = "XAGENT_PUBLIC_ENTRIES_JSON"
+PRIMARY_PUBLIC_SITE_URL = "XAGENT_PRIMARY_PUBLIC_SITE_URL"
+DUAL_ENTRY_OAUTH_ENABLED = "XAGENT_DUAL_ENTRY_OAUTH_ENABLED"
+OAUTH_AUTHORIZATION_ENTRY_BASE_URL = "XAGENT_OAUTH_AUTHORIZATION_ENTRY_BASE_URL"
+OAUTH_CALLBACK_ORIGIN_MAP = "XAGENT_OAUTH_CALLBACK_ORIGIN_MAP"
+
+
+def normalize_public_origin(value: str) -> str:
+    """Validate an exact HTTP origin, normalizing case and default ports."""
+    if not isinstance(value, str) or any(c.isspace() for c in value) or "\\" in value:
+        raise ValueError("Invalid public origin")
+    parts = urlsplit(value)
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.path not in {"", "/"}
+        or parts.query
+        or parts.fragment
+        or "?" in value
+        or "#" in value
+    ):
+        raise ValueError("Invalid public origin")
+    host = parts.hostname.lower()
+    if not re.fullmatch(r"[a-z0-9.-]+", host) or ".." in host:
+        raise ValueError("Invalid public origin host")
+    port = parts.port
+    suffix = (
+        ""
+        if port is None or (parts.scheme, port) in {("https", 443), ("http", 80)}
+        else f":{port}"
+    )
+    return f"{parts.scheme}://{host}{suffix}"
+
+
+@dataclass(frozen=True)
+class PublicEntry:
+    origin: str
+    region_cookie_domain: str | None
+    google_oidc_redirect_uri: str | None
+
+
+def public_entries_configured() -> bool:
+    return bool(os.getenv(PUBLIC_ENTRIES_JSON))
+
+
+def get_legacy_public_origin() -> str:
+    """Extract the legacy origin without changing configured frontend path prefixes."""
+    parts = urlsplit(get_app_base_url() or get_frontend_url())
+    return normalize_public_origin(f"{parts.scheme}://{parts.netloc}")
+
+
+def get_public_entries() -> tuple[PublicEntry, ...]:
+    """Return trusted entries; explicit null cookie domains remain host-only."""
+    raw = os.getenv(PUBLIC_ENTRIES_JSON)
+    if not raw:
+        return (
+            PublicEntry(
+                get_legacy_public_origin(),
+                os.getenv("XAGENT_REGION_COOKIE_DOMAIN", ".cloud.xagent.co"),
+                get_google_oidc_redirect_uri(),
+            ),
+        )
+    records = json.loads(raw)
+    if not isinstance(records, list) or not records:
+        raise ValueError("Public entries must be a nonempty array")
+    entries = []
+    hosts = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "origin",
+            "region_cookie_domain",
+            "google_oidc_redirect_uri",
+        }:
+            raise ValueError("Invalid public entry fields")
+        origin = normalize_public_origin(record["origin"])
+        host = urlsplit(origin).netloc
+        if host in hosts:
+            raise ValueError("Duplicate public entry host")
+        hosts.add(host)
+        domain = record["region_cookie_domain"]
+        if domain is not None:
+            if not isinstance(domain, str) or not domain or domain.lower() != domain:
+                raise ValueError("Invalid cookie domain")
+            bare = domain.lstrip(".")
+            hostname = urlsplit(origin).hostname
+            assert hostname is not None
+            if not bare or not (hostname == bare or hostname.endswith("." + bare)):
+                raise ValueError("Cookie domain does not match entry")
+        callback = record["google_oidc_redirect_uri"]
+        if not isinstance(callback, str):
+            raise ValueError("Invalid Google callback")
+        callback_parts = urlsplit(callback)
+        if (
+            normalize_public_origin(
+                f"{callback_parts.scheme}://{callback_parts.netloc}"
+            )
+            != origin
+            or callback_parts.path != "/api/auth/oidc/google/callback"
+            or callback_parts.query
+            or callback_parts.fragment
+            or "?" in callback
+            or "#" in callback
+        ):
+            raise ValueError("Google callback must belong to entry")
+        entries.append(PublicEntry(origin, domain, callback))
+    legacy = get_legacy_public_origin()
+    if legacy not in {entry.origin for entry in entries}:
+        raise ValueError("Public entries must retain the legacy entry")
+    return tuple(entries)
+
+
+def get_primary_public_site_url() -> str | None:
+    value = os.getenv(PRIMARY_PUBLIC_SITE_URL)
+    if not value:
+        return get_app_base_url()
+    origin = normalize_public_origin(value)
+    if origin not in {entry.origin for entry in get_public_entries()}:
+        raise ValueError("Primary site must be a trusted public entry")
+    return origin
+
+
+def get_dual_entry_oauth_enabled() -> bool:
+    return _get_bool_env(DUAL_ENTRY_OAUTH_ENABLED, False)
+
+
+def get_oauth_authorization_entry_origin() -> str:
+    origin = normalize_public_origin(
+        os.getenv(OAUTH_AUTHORIZATION_ENTRY_BASE_URL)
+        or get_public_api_base_url()
+        or get_app_base_url()
+        or get_frontend_url()
+    )
+    if origin not in {entry.origin for entry in get_public_entries()}:
+        raise ValueError("Authorization origin must be a trusted public entry")
+    return origin
+
+
+def get_oauth_callback_origin_map() -> dict[str, str]:
+    values = json.loads(os.getenv(OAUTH_CALLBACK_ORIGIN_MAP) or "{}")
+    if not isinstance(values, dict):
+        raise ValueError("Callback origin map must be an object")
+    result = {
+        normalize_public_origin(k): normalize_public_origin(v)
+        for k, v in values.items()
+    }
+    if any(v not in {e.origin for e in get_public_entries()} for v in result.values()):
+        raise ValueError("Callback completion origin must be trusted")
+    return result

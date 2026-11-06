@@ -1,3 +1,5 @@
+
+import { mcpAuthorizationURL } from "@/lib/oauth-bootstrap"
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -306,7 +308,7 @@ export function CustomMcpForm({
         method: "POST",
         credentials: "include",
         headers: {
-          "Accept": "application/json",
+          "Accept": "application/json", "X-XAgent-OAuth-Launch-Version": "2",
           "Content-Type": "application/json"
         },
         body: JSON.stringify(buildOAuthRequestBody(true))
@@ -333,9 +335,9 @@ export function CustomMcpForm({
         return
       }
       if (popup) {
-        popup.location.href = data.authorization_url
+        popup.location.href = await mcpAuthorizationURL(data)
       } else {
-        popup = window.open(data.authorization_url, "_blank", "noopener,noreferrer")
+        popup = window.open(await mcpAuthorizationURL(data), "_blank", "noopener,noreferrer")
       }
       const startedAt = Date.now()
       const maxWaitMs = 5 * 60 * 1000

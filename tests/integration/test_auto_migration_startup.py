@@ -1379,15 +1379,11 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
     # The sweep only runs under the auto-migrate gate, so it has to be on for
     # the failure path under test to be reachable at all.
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
-    # The same genuine SANDBOX_VOLUMES/code-mount conflict as
+    # The same genuine custom-volume conflict as
     # test_startup_event_raises_on_readiness_conflict_with_probe_true. Static
     # readiness runs well before the sweep is scheduled, so this failure lands
     # ahead of every position the sweep must not be scheduled at.
-    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
-    monkeypatch.setattr(
-        "xagent.web.sandbox_manager.build_code_mount_volumes",
-        lambda: [("/foo", "/guest2", "ro")],
-    )
+    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro;/foo:/guest2:ro")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
         web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
@@ -1620,7 +1616,7 @@ async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
 async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
     monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
 ):
-    """probe=True plus a genuine SANDBOX_VOLUMES/code-mount conflict must
+    """probe=True plus a genuine custom-volume conflict must
     fail startup outright, before cleanup()/warmup() ever run -- the actual
     static-conflict path ``check_sandbox_static_readiness`` exists to guard,
     not just the probe=False short-circuit the sibling test above covers."""
@@ -1671,14 +1667,10 @@ async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
         pass
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
-    # A genuine host-path conflict between SANDBOX_VOLUMES and the code
-    # mounts, same shape as test_sandbox_manager_readiness.py's
+    # A genuine host-path conflict between two SANDBOX_VOLUMES
+    # entries, same shape as test_sandbox_manager_readiness.py's
     # test_readiness_raises_on_host_conflict.
-    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
-    monkeypatch.setattr(
-        "xagent.web.sandbox_manager.build_code_mount_volumes",
-        lambda: [("/foo", "/guest2", "ro")],
-    )
+    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro;/foo:/guest2:ro")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
         web_app_module, "start_file_storage_startup_sync_task", lambda _app: None

@@ -20,7 +20,7 @@ from typing import (
 
 from sqlalchemy.orm import Session
 
-from .....config import get_uploads_dir
+from .....config import get_sandbox_enabled, get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
@@ -775,6 +775,23 @@ class ToolFactory:
                         )
                     claimed_names.add(name)
 
+        from .sandboxed_tool.sandbox_config import resolve_sandbox_config
+
+        sandbox = config.get_sandbox()
+        needs_sandbox = any(
+            (policy := resolve_sandbox_config(tool)) is not None and policy.enabled
+            for tool in tools
+        )
+        if (
+            get_sandbox_enabled()
+            and sandbox is None
+            and needs_sandbox
+            and apply_user_override_filter
+        ):
+            raise RuntimeError(
+                "Configured sandbox is unavailable; backend execution is disabled."
+            )
+
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
@@ -832,6 +849,14 @@ class ToolFactory:
 
                     setup_sandbox = resolve_primary_sandbox(sandbox)
                     await create_workspace_in_sandbox(setup_sandbox, workspace)
+            from .agent_tool import AgentTool
+
+            tools = [
+                tool.with_sandbox(sandbox, workspace)
+                if isinstance(tool, AgentTool)
+                else tool
+                for tool in tools
+            ]
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools
@@ -984,10 +1009,14 @@ class ToolFactory:
                     wrapped_tools.append(wrapped)
                     logger.info(f"Wrapped tool '{tool.name}' with sandbox")
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to wrap tool '{tool.name}' with sandbox: {e}, using original tool"
+                    logger.error(
+                        "Failed to prepare sandboxed tool '%s'",
+                        tool.name,
+                        exc_info=True,
                     )
-                    wrapped_tools.append(tool)
+                    raise RuntimeError(
+                        "Sandboxed tool could not be prepared; backend execution is disabled."
+                    ) from e
             else:
                 wrapped_tools.append(tool)
         return wrapped_tools

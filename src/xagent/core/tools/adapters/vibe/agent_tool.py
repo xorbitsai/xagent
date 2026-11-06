@@ -2069,6 +2069,7 @@ class AgentTool(AbstractBaseTool):
         self._voice = voice
         self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
         self._excluded_model_ids = excluded_model_ids
+        self._sandbox: Any = None
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2086,6 +2087,16 @@ class AgentTool(AbstractBaseTool):
             execution_scope if execution_scope is not None else get_execution_scope()
         )
         self._visibility = ToolVisibility.PUBLIC
+
+    def with_sandbox(self, sandbox: Any, workspace: Any) -> "AgentTool":
+        """Bind a task-local copy; delegated files stay under the parent's mount."""
+        import copy
+
+        bound = copy.copy(self)
+        bound._sandbox = sandbox
+        if workspace is not None:
+            bound._workspace_base_dir = str(workspace.temp_dir)
+        return bound
 
     @property
     def name(self) -> str:
@@ -2592,6 +2603,7 @@ class AgentTool(AbstractBaseTool):
                 else ()
             )
             tool_config = WebToolConfig(
+                sandbox=self._sandbox,
                 db=None,
                 db_factory=self._session_factory,
                 request=MinimalRequest(self._user_id),

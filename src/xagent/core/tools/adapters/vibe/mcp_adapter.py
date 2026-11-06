@@ -1966,14 +1966,9 @@ def _strict_http_401_responses(
 
 def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
     try:
-        # Lazy import keeps the core adapter independent from the web layer
-        # at import time -- and, since this runs inside MCPToolAdapter.
-        # run_json_async, which tool_runner.py reconstructs and calls for
-        # every sandboxed npx/uvx MCP tool call, from crashing with
-        # ModuleNotFoundError on a 401 (mcp_oauth.py needs sqlalchemy,
-        # which the sandbox never installs) instead of just skipping the
-        # refresh attempt the same way an unparsable challenge already
-        # does below.
+        # Keep the web OAuth parser optional for standalone core consumers.
+        # Authorization and refresh execute on the host, including for MCP
+        # calls whose stdio transport is delegated into a sandbox.
         from .....web.services.mcp_oauth import parse_www_authenticate_bearer
     except ImportError:
         parse_www_authenticate_bearer = None  # type: ignore[assignment]
@@ -2349,6 +2344,9 @@ class MCPToolAdapter(AbstractBaseTool):
         self.mcp_tool = mcp_tool
         self._raw_annotations = raw_annotations
         self.connection = connection
+        # Bound by SandboxedToolWrapper. Authorization and runtime bindings
+        # remain in this adapter; only transport work crosses into the guest.
+        self._sandbox_transport: Any = None
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
@@ -3806,25 +3804,32 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any]:
-        async with create_session(connection) as session:
-            await session.initialize()
-            result = await session.call_tool(
-                self.mcp_tool.name,
-                dict(tool_args),
-                meta=dict(tool_meta) or None,
-            )
+        if self._sandbox_transport is not None:
+            from mcp.types import CallToolResult
 
-            normalized = _normalized_mcp_call_result(
-                result,
-                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
+            payload = await self._sandbox_transport(
+                connection, self.mcp_tool.name, tool_args, tool_meta
             )
-            if self._is_excel_tool:
-                failure_code = _excel_failure_code(normalized)
-                if failure_code is not None:
-                    normalized["failure_code"] = failure_code
-                    normalized["success"] = False
-                    normalized["is_error"] = True
-            return normalized
+            result = CallToolResult.model_validate(payload)
+        else:
+            async with create_session(connection) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    self.mcp_tool.name,
+                    dict(tool_args),
+                    meta=dict(tool_meta) or None,
+                )
+        normalized = _normalized_mcp_call_result(
+            result,
+            detect_legacy_plain_text_error=self._detect_legacy_plain_text_error,
+        )
+        if self._is_excel_tool:
+            failure_code = _excel_failure_code(normalized)
+            if failure_code is not None:
+                normalized["failure_code"] = failure_code
+                normalized["success"] = False
+                normalized["is_error"] = True
+        return normalized
 
     async def _retry_after_authorization_failure(
         self,
@@ -5618,7 +5623,10 @@ async def load_mcp_tools_as_agent_tools(
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
             sandbox_required = should_sandbox_mcp_connection(connection)
-            if requires_sandbox_mcp_connection(connection) and sandbox is None:
+            if sandbox is None and (
+                requires_sandbox_mcp_connection(connection)
+                or (_root_config.get_sandbox_enabled() and sandbox_required)
+            ):
                 raise RuntimeError(
                     "This stdio MCP connection requires a sandbox, but no sandbox "
                     "is available"

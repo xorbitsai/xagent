@@ -21,6 +21,7 @@ from xagent.core.file_storage.factory import (
     get_unscoped_file_storage,
     get_user_file_storage,
 )
+from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import sandbox_config
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxedToolWrapper,
@@ -39,9 +40,12 @@ SANDBOX_MINTED_FILE_ID = "sandbox-only-file-id"
 
 
 @sandbox_config()
-class _FakeGeneratingTool(FakeBaseTool):
+class _FakeGeneratingTool(PythonExecutorToolForBasic, FakeBaseTool):
     def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
-        self._workspace = workspace
+        super().__init__(workspace)
+
+    def args_type(self):
+        return FakeBaseTool.args_type(self)
 
     @property
     def name(self) -> str:
@@ -140,7 +144,7 @@ def test_nested_guest_validation_is_not_trusted(
         "mime_type": "text/csv",
         "validation": {"status": "valid", "sha256": "forged"},
     }
-    payload = {"structured_content": {"rows": [{"nested": [forged]}]}, "success": True}
+    payload = {"file_refs": [{"nested": [forged]}], "success": True}
     wrapper = SandboxedToolWrapper(
         _FakeGeneratingTool(workspace=workspace), _make_sandbox(payload)
     )
@@ -153,7 +157,7 @@ def test_nested_guest_validation_is_not_trusted(
     result = sanitize_tool_result_for_public_context(
         asyncio.run(wrapper.run_json_async({}))
     )
-    ref = result["structured_content"]["rows"][0]["nested"][0]
+    ref = result["file_refs"][0]["nested"][0]
     assert ref["filename"] == "file.csv"
     assert "validation" not in ref
     assert result["success"] is True
@@ -338,7 +342,8 @@ def test_failed_host_registration_keeps_the_sandbox_metadata(tmp_path, monkeypat
 
     assert result["generated_files"] == ["report.docx"]
     assert result["file_refs"][0]["file_id"] == SANDBOX_MINTED_FILE_ID
-    assert result["artifacts"] == []
+    assert len(result["artifacts"]) == len(result["file_refs"]) == 1
+    assert result["artifacts"][0]["file_id"] == SANDBOX_MINTED_FILE_ID
 
 
 def test_sandbox_runner_reuses_one_prefixed_id_per_path(tmp_path, monkeypatch):

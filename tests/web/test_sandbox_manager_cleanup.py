@@ -8,9 +8,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tests.web.sandbox_fakes import FakeSandboxService, _FakeReconcileContainer
-from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    build_code_mount_volumes,
-)
 from xagent.sandbox.base import (
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
@@ -59,19 +56,10 @@ def manager(service: FakeSandboxService) -> SandboxManager:
     return SandboxManager(service)
 
 
-def test_build_code_mount_volumes_uses_host_project_root(tmp_path: Path):
-    """Docker sibling mode should mount source paths from the Docker host."""
-    with patch.dict(
-        "os.environ",
-        {"XAGENT_SANDBOX_HOST_PROJECT_ROOT": str(tmp_path)},
-        clear=True,
-    ):
-        volumes = build_code_mount_volumes()
-
-    assert volumes == [
-        (str(tmp_path / "src"), "/app/src", "ro"),
-        (str(tmp_path / "tests"), "/app/tests", "ro"),
-    ]
+def test_default_volumes_do_not_mount_platform_source(manager):
+    with patch.dict("os.environ", {}, clear=True):
+        volumes = manager._make_default_volumes("task", "source-isolation")
+    assert not any(guest in {"/app/src", "/app/tests"} for _, guest, _ in volumes)
 
 
 def test_default_volumes_map_user_workspace_to_host_storage(
@@ -92,10 +80,6 @@ def test_default_volumes_map_user_workspace_to_host_storage(
             },
             clear=True,
         ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
-        ),
     ):
         volumes = manager._make_default_volumes(
             "user",
@@ -107,7 +91,6 @@ def test_default_volumes_map_user_workspace_to_host_storage(
         )
 
     assert volumes == [
-        ("/repo/src", "/app/src", "ro"),
         (
             str(host_storage_root / "uploads" / "user_42"),
             str(backend_user_dir),
@@ -135,10 +118,6 @@ def test_default_volumes_resolve_symlinked_backend_paths_locally(
                 "XAGENT_UPLOADS_DIR": str(backend_alias / "uploads"),
             },
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
         ),
     ):
         volumes = manager._make_default_volumes(
@@ -294,10 +273,6 @@ def test_default_volumes_preserve_internal_symlink_for_sibling_host_translation(
             },
             clear=True,
         ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
-        ),
     ):
         volumes = manager._make_default_volumes(
             "user",
@@ -336,10 +311,6 @@ def test_default_volumes_translate_external_alias_back_into_storage(
             },
             clear=True,
         ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
-        ),
     ):
         volumes = manager._make_default_volumes(
             "user",
@@ -374,10 +345,6 @@ def test_default_volumes_include_build_preview_and_user_dirs(
             },
             clear=True,
         ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
-        ),
     ):
         volumes = manager._make_default_volumes(
             "user",
@@ -389,7 +356,6 @@ def test_default_volumes_include_build_preview_and_user_dirs(
         )
 
     assert volumes == [
-        ("/repo/src", "/app/src", "ro"),
         (
             str(host_storage_root / "uploads" / "build_preview"),
             str(build_preview_dir),
@@ -416,10 +382,6 @@ def test_default_volumes_keep_external_dirs_outside_storage(
                 "XAGENT_SANDBOX_HOST_STORAGE_ROOT": str(host_storage_root),
             },
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
         ),
     ):
         volumes = manager._make_default_volumes(
@@ -450,10 +412,6 @@ def test_default_volumes_mount_workspace_owner_not_current_user(
                 "XAGENT_SANDBOX_HOST_STORAGE_ROOT": str(host_storage_root),
             },
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
         ),
     ):
         volumes = manager._make_default_volumes(
@@ -574,14 +532,13 @@ async def test_cleanup_stops_when_config_matches(
     user_dir.mkdir(parents=True)
     resolved = str(user_dir.resolve())
 
-    # Build expected volumes: code mounts (ro) + user workspace (rw)
-    code_volumes = build_code_mount_volumes()
+    # Only the managed user workspace is mounted.
     sb = _make_sb_info(
         "user::6",
         image="img:v1",
         cpus=1,
         memory=512,
-        volumes=code_volumes + [(resolved, resolved, "rw")],
+        volumes=[(resolved, resolved, "rw")],
     )
 
     mock_box = AsyncMock()
@@ -612,13 +569,12 @@ async def test_cleanup_stops_worker_when_base_user_config_matches(
     user_dir.mkdir(parents=True)
     resolved = str(user_dir.resolve())
 
-    code_volumes = build_code_mount_volumes()
     sb = _make_sb_info(
         "user::6::worker::0",
         image="img:v1",
         cpus=1,
         memory=512,
-        volumes=code_volumes + [(resolved, resolved, "rw")],
+        volumes=[(resolved, resolved, "rw")],
     )
 
     mock_box = AsyncMock()

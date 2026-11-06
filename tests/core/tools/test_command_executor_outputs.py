@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,7 +16,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-import xagent.config as xagent_config
 from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.file_storage.factory import (
     get_unscoped_file_storage,
@@ -365,8 +365,10 @@ def test_overwrite_serves_the_revised_bytes(durable_workspace):
     assert _served_bytes(user_id, db, file_id) == b"PK\x03\x04 revised"
 
 
-def _fake_sandbox(payload: dict) -> MagicMock:
+def _fake_sandbox(payload: dict, on_execute: Callable[[], None]) -> MagicMock:
     def _exec(*args, **kwargs):
+        if args[0] == "python" and "--request-file" in args:
+            on_execute()
         result = MagicMock()
         result.exit_code = 0
         result.stdout = json.dumps(payload) if args[0] == "cat" else ""
@@ -380,24 +382,52 @@ def _fake_sandbox(payload: dict) -> MagicMock:
     return sandbox
 
 
-def test_sandbox_refs_are_re_registered_on_the_host(workspace, monkeypatch):
-    monkeypatch.setattr(xagent_config, "_IN_SANDBOX_TOOL_RUNNER", True)
-    guest_result = _run(
-        CommandExecutorToolForBasic(workspace=workspace),
-        "printf 'PK\\003\\004 deck' > deck.pptx",
-    )
-    guest_id = guest_result["file_refs"][0]["file_id"]
-    assert guest_id.startswith(SANDBOX_FILE_ID_PREFIX)
+@pytest.mark.parametrize("file_change", ["new", "overwritten", "unchanged"])
+def test_sandbox_command_registers_only_changed_files_on_host(
+    workspace, registrations, file_change
+):
+    generated = workspace.output_dir / "deck.pptx"
+    if file_change != "new":
+        generated.write_bytes(b"PK\x03\x04 previous deck")
 
-    monkeypatch.setattr(xagent_config, "_IN_SANDBOX_TOOL_RUNNER", False)
+    def execute():
+        if file_change != "unchanged":
+            generated.write_bytes(b"PK\x03\x04 revised deck content")
+
+    guest_id = SANDBOX_FILE_ID_PREFIX + "forged"
+    guest_validation = {"status": "valid", "sha256": "forged"}
+    guest_result = {
+        "success": True,
+        "output": "done",
+        "error": "",
+        "return_code": 0,
+        "generated_files": ["guest-name.csv"],
+        "file_refs": [
+            {
+                "file_id": guest_id,
+                "file_path": str(generated),
+                "filename": "guest-name.csv",
+                "validation": guest_validation,
+            }
+        ],
+        "artifacts": [{"file_id": guest_id}],
+    }
     wrapper = SandboxedToolWrapper(
         CommandExecutorToolForBasic(workspace=workspace),
-        _fake_sandbox(guest_result),
+        _fake_sandbox(guest_result, execute),
     )
     result = asyncio.run(wrapper.run_json_async({"command": "ignored"}))
 
+    if file_change == "unchanged":
+        assert registrations == []
+        assert set(result) == {"success", "output", "error", "return_code"}
+        return
+
+    assert registrations == [str(generated.resolve())]
     host_id = result["file_refs"][0]["file_id"]
     assert not host_id.startswith(SANDBOX_FILE_ID_PREFIX)
+    assert host_id != guest_id
+    assert result["file_refs"][0]["validation"] != guest_validation
     assert result["artifacts"][0]["file_id"] == host_id
     assert result["generated_files"] == ["deck.pptx"]
 

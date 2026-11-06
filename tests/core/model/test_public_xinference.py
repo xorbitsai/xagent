@@ -105,6 +105,7 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
             "model_type": "LLM",
             "model_ability": ["chat"],
             "supports_chat_session_affinity": True,
+            "supports_agent_cache_lifecycle": True,
         }
     )
     monkeypatch.setattr(client, "describe_model", describe)
@@ -114,9 +115,59 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
             assert isinstance(handle.session.connector, PublicTCPConnector)
             assert handle.auth_headers == {"Authorization": "Bearer test-key"}
             assert supports_affinity is True
+            assert client.supports_agent_cache_lifecycle("model-id")
             describe.assert_awaited_once_with("model-id")
         finally:
             await handle.close()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_key", [None, "test-key"])
+@pytest.mark.parametrize(
+    "model_uid,quoted", [("model-id", "model-id"), ("a/b ?", "a%2Fb%20%3F")]
+)
+@pytest.mark.parametrize("status", [200, 401, 404, 503])
+async def test_cache_control_uses_guarded_session_and_auth_headers(
+    monkeypatch, api_key, model_uid, quoted, status
+):
+    from unittest.mock import MagicMock
+
+    client = PublicAsyncXinferenceClient("https://xinference.example", api_key=api_key)
+    response = MagicMock()
+    response.read = AsyncMock(return_value=b'{"accepted": true}')
+    if status != 200:
+        response.raise_for_status.side_effect = aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=status,
+        )
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=False)
+    post = MagicMock(return_value=context)
+    monkeypatch.setattr(client.session, "post", post)
+    try:
+        assert isinstance(client.session.connector, PublicTCPConnector)
+        payload = {"id": "run", "revision": 1, "phase": "waiting"}
+        if status == 200:
+            await client.update_cache_session(model_uid, payload)
+            response.read.assert_awaited_once()
+        else:
+            with pytest.raises(aiohttp.ClientResponseError) as exc:
+                await client.update_cache_session(model_uid, payload)
+            assert exc.value.status == status
+            response.read.assert_not_awaited()
+        assert post.call_args.args == (
+            f"https://xinference.example/v1/models/{quoted}/cache_sessions",
+        )
+        assert post.call_args.kwargs["headers"] == (
+            {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        )
+        assert post.call_args.kwargs["json"] == payload
+        assert post.call_args.kwargs["timeout"].total == 0.5
+        response.raise_for_status.assert_called_once()
     finally:
         await client.close()
 

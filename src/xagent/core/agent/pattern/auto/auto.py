@@ -208,6 +208,9 @@ class _AutoChildRuntime:
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 
+    async def finish_cache_session(self) -> None:
+        await self.parent.finish_cache_session()
+
     def clear_interrupt(self) -> None:
         self.parent.clear_interrupt()
 

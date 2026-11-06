@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { markOnboardingSaveEscaped, updateUserPreferences, type UserPreferences } from "@/lib/user-preferences";
 import { readAuthSessionSnapshot } from "@/lib/auth-cache";
+import { userFirstName } from "@/lib/user-display";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { categoryLabel } from "@/lib/template-categories";
@@ -89,6 +90,28 @@ export default function OnboardingPage() {
   const router = useRouter();
   const { user } = useAuth();
   const { t, locale } = useI18n();
+  const [profileName, setProfileName] = useState<{ userId: string; firstName: string } | null>(null);
+  const needsProfileName = !user?.first_name && Boolean(
+    user?.email || user?.username?.includes("@") || /^acct_[a-f0-9]{32}$/.test(user?.username ?? "")
+  );
+  // Older sessions predate first_name in the login payload. Resolve the
+  // stored profile without making onboarding wait for this optional request.
+  useEffect(() => {
+    if (!user?.id || !needsProfileName) return;
+    let active = true;
+    const userId = user.id;
+    void (async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/auth/me`);
+        if (!active || !response.ok) return;
+        const profile = (await response.json())?.user;
+        if (active && String(profile?.id) === userId && typeof profile?.first_name === "string") {
+          setProfileName({ userId, firstName: profile.first_name });
+        }
+      } catch { /* The cached identity remains usable when the profile is unavailable. */ }
+    })();
+    return () => { active = false; };
+  }, [user?.id, needsProfileName]);
   // The identity this wizard was opened for - a PR review finding caught
   // that this page's own state (work/industry/goals/voice, the selected
   // template, etc.) has no identity binding of its own, unlike the escape
@@ -280,7 +303,10 @@ export default function OnboardingPage() {
   const selectedVoice = ONBOARDING_VOICES.find((option) => option.id === voice)!;
   const appNames = [...new Set((selectedTemplate?.connections ?? []).map((connection) => connection.name.trim()).filter(Boolean))];
 
-  const firstName = user?.username?.trim() || t("onboarding.welcome.fallbackName");
+  const firstName = userFirstName({
+    ...user,
+    first_name: user?.first_name || (profileName?.userId === user?.id ? profileName?.firstName : undefined),
+  }, t("onboarding.welcome.fallbackName"));
 
   const isGoalsValid = goals.length > 0;
   const isTeamValid = !templatesLoading && !templatesError && !!selectedTemplate?.persona;
@@ -688,7 +714,7 @@ export default function OnboardingPage() {
             <>
               <Orb />
               <h1 ref={stepHeadingRef} tabIndex={-1}>
-                {t("onboarding.need.greeting", { name: firstName.split(/\s+/)[0] })}<br />
+                {t("onboarding.need.greeting", { name: firstName })}<br />
                 {t("onboarding.need.title")}
               </h1>
               <p className="ob-sub">{t("onboarding.need.subtitle")}</p>

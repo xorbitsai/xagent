@@ -1298,7 +1298,7 @@ class ConnectionManager:
         # socket -> command handlers still between accepting a frame and
         # sending its first reply; no origin exists yet, but a close now would
         # lose that reply.
-        self._ingress: dict[WebSocket, int] = {}
+        self._ingress: dict[int, int] = {}
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -1539,15 +1539,17 @@ class ConnectionManager:
         A restart close waits for it (up to its reply deadline), so the
         acceptance or rejection reply is sent before 1012.
         """
-        self._ingress[websocket] = self._ingress.get(websocket, 0) + 1
+        # Keyed by identity: some callers hand in unhashable socket stand-ins.
+        key = id(websocket)
+        self._ingress[key] = self._ingress.get(key, 0) + 1
         try:
             yield
         finally:
-            remaining = self._ingress.get(websocket, 1) - 1
+            remaining = self._ingress.get(key, 1) - 1
             if remaining > 0:
-                self._ingress[websocket] = remaining
+                self._ingress[key] = remaining
             else:
-                self._ingress.pop(websocket, None)
+                self._ingress.pop(key, None)
 
     def _has_pending_command(self, websocket: Any) -> bool:
         """Whether a command from this socket still awaits its reply.
@@ -1556,7 +1558,7 @@ class ConnectionManager:
         origin awaits its outcome: non-shared execution records it in
         ``_command_origins``, shared execution in the task event bridge.
         """
-        if self._ingress.get(websocket):
+        if self._ingress.get(id(websocket)):
             return True
         if _command_origins.has_pending_for_socket(websocket):
             return True

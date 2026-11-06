@@ -341,7 +341,13 @@ def _validate_instagram_record(record: UploadedFile) -> None:
 
 
 def _validate_facebook_record(record: UploadedFile) -> None:
-    """Facebook fetches the image as stored: PNG or JPEG within its size limit."""
+    """Facebook fetches the image as stored: a whole PNG or JPEG within 10 MB.
+
+    Reading and decoding fail differently on purpose. An unreadable file is a
+    storage problem (base ``ExternalMediaUnavailable``); a file that reads but
+    is the wrong type, too large or does not decode is an unsupported image,
+    which a connector able to upload the bytes itself may still take.
+    """
 
     _image_media_type(record)
     path = _materialize_record(record)
@@ -350,11 +356,19 @@ def _validate_facebook_record(record: UploadedFile) -> None:
             raise ExternalMediaUnsupportedImage(
                 "Registered image exceeds the 10 MB limit"
             )
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS):
-            pass
-    except ExternalMediaUnavailable:
-        raise
-    except _INSTAGRAM_PROCESSING_ERRORS as exc:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be read for external delivery"
+        ) from exc
+    if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
+        raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
+    try:
+        # verify() checks the whole stream (a truncated body fails) without
+        # decoding pixels. The bytes are in memory, so any error is a decode error.
+        with Image.open(BytesIO(content), formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+            image.verify()
+    except Exception as exc:
         raise ExternalMediaUnsupportedImage(
             "Registered image could not be decoded as PNG or JPEG"
         ) from exc

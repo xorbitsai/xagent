@@ -3367,6 +3367,12 @@ class MCPToolAdapter(AbstractBaseTool):
                 return prepared, {}
             raise _ExternalMediaPreparationError(str(exc)) from None
         except FileNotFoundError:
+            if binding.upload_fallback:
+                # Issuance only sees files of this exact task; staging also
+                # accepts task-less uploads, internal-* ids and workspace
+                # records. Staging resolves the id again in its own scope and
+                # still reports a file that is really missing.
+                return prepared, {}
             raise _ExternalMediaPreparationError(
                 _EXTERNAL_MEDIA_FILE_NOT_FOUND
             ) from None

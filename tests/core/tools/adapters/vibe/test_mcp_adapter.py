@@ -990,6 +990,132 @@ async def test_facebook_unregistered_workspace_path_is_left_to_the_connector(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_ref",
+    ["file:5b0e2d4c-3a7f-4c11-9a54-0d2f6c1e8b21", "file:internal-upload-7"],
+    ids=["task-less upload", "internal id"],
+)
+async def test_facebook_file_outside_issuance_scope_falls_back_to_staging(
+    monkeypatch, file_ref
+):
+    # Why: issuance only sees files of this exact task, but staging also takes
+    # task-less uploads and internal-* ids; native grants staged those before
+    # the binding and must keep doing so (#3588 review).
+    def outside_scope(_file_id):
+        raise FileNotFoundError("Registered image was not found")
+
+    workspace = _FacebookWorkspace(issue=outside_scope)
+
+    _, arguments, result = await _run_facebook_publish(monkeypatch, workspace, file_ref)
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "file_path": _FACEBOOK_STAGED_PATH}
+    assert workspace.staged == [file_ref.removeprefix("file:")]
+
+
+@pytest.mark.asyncio
+async def test_facebook_missing_file_still_errors_after_the_fallback(monkeypatch):
+    # Why: falling back on "not found" must not hide a file that is really
+    # missing; staging resolves it again and reports it, and nothing runs.
+    class Workspace(_FacebookWorkspace):
+        def stage_file_for_external_upload(self, file_id):
+            raise FileNotFoundError(file_id)
+
+    def missing(_file_id):
+        raise FileNotFoundError("Registered image was not found")
+
+    workspace = Workspace(issue=missing)
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, f"file:{_FACEBOOK_FILE_ID}"
+    )
+
+    assert result["is_error"] is True
+    assert "not found or not accessible" in result["content"][0]["text"]
+    assert arguments is None
+
+
+@pytest.mark.asyncio
+async def test_facebook_other_issuance_errors_do_not_fall_back(monkeypatch):
+    # Why: only "cannot issue" and "not in issuance scope" may fall back; any
+    # other failure must surface, with nothing staged and no connector call.
+    def broken(_file_id):
+        raise ValueError("Registered image could not be read for external delivery")
+
+    workspace = _FacebookWorkspace(issue=broken)
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, f"file:{_FACEBOOK_FILE_ID}"
+    )
+
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == (
+        "Registered image could not be read for external delivery"
+    )
+    assert workspace.staged == []
+    assert arguments is None
+
+
+@pytest.mark.asyncio
+async def test_facebook_rejects_both_image_url_and_file_path(monkeypatch):
+    # Why: the binding replaces file_path with image_url; with both supplied
+    # it must refuse rather than pick one or post twice.
+    workspace = _FacebookWorkspace(issue=lambda _file_id: "unused")
+    adapter = _build_mcp_tool_adapter(
+        "Facebook Pages",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="facebook_publish_image_post",
+            description="Publish an image post",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "image_url": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+            },
+        ),
+        workspace=workspace,
+    )
+
+    result = await adapter.run_json_async(
+        {
+            "page_id": "p-1",
+            "image_url": "https://example.test/a.png",
+            "file_path": f"file:{_FACEBOOK_FILE_ID}",
+        }
+    )
+
+    assert result["is_error"] is True
+    assert (
+        result["content"][0]["text"] == "Provide exactly one of image_url or file_path."
+    )
+    assert workspace.issued == []
+    assert workspace.staged == []
+
+
+@pytest.mark.asyncio
+async def test_facebook_registered_workspace_path_becomes_a_url(monkeypatch):
+    # Why: the model often passes the workspace path of a generated image
+    # rather than file:<id>; a registered path must also go out as a URL.
+    temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+    workspace = _FacebookWorkspace(
+        issue=lambda _file_id: temporary_url,
+        registered_paths={"/task/output/generated.png": _FACEBOOK_FILE_ID},
+    )
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, "/task/output/generated.png"
+    )
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "image_url": temporary_url}
+    assert workspace.issued == [(_FACEBOOK_FILE_ID, "facebook-publish")]
+    assert workspace.staged == []
+
+
+@pytest.mark.asyncio
 async def test_instagram_still_fails_without_a_public_base_url(monkeypatch):
     # Why: only Facebook has an upload to fall back to; Instagram must keep
     # reporting the missing base URL instead of passing file_path through.

@@ -644,3 +644,34 @@ def test_issue_without_a_public_https_base_is_not_configured(monkeypatch, base):
             task_id=11,
             purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
         )
+
+
+def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path):
+    # Why: a header that parses is not enough; Meta would fail to fetch a
+    # truncated body, and it must fall back while the native upload still can.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+
+    def truncated_png(path):
+        Image.new("RGB", (640, 640), "blue").save(path)
+        path.write_bytes(path.read_bytes()[:-40])
+
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, write=truncated_png)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
+        issue()
+
+
+def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tmp_path):
+    # Why: an IO failure is a storage problem, not the image's fault; it must
+    # stay base ExternalMediaUnavailable so the adapter does not fall back.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path)
+
+    def unreadable(self):
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr(external_media.Path, "read_bytes", unreadable)
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="read") as raised:
+        issue()
+    assert not isinstance(raised.value, external_media.ExternalMediaUnsupportedImage)

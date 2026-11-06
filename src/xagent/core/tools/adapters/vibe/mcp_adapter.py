@@ -549,6 +549,10 @@ class _ExternalMediaBinding:
     file_argument: str
     url_argument: str
     purpose: str
+    # When no URL can be issued for the file (no public base URL, or a type or
+    # size the purpose does not deliver), leave the file argument for the
+    # connector's own upload instead of failing.
+    upload_fallback: bool = False
 
 
 # These built-in tools do not upload bytes themselves. The host converts one
@@ -559,6 +563,16 @@ _EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
         file_argument="file_path",
         url_argument="image_url",
         purpose="instagram-publish",
+    ),
+    # A Composio-proxied grant cannot send multipart bytes, so Meta fetches the
+    # image from a URL for every grant (#3586). When no URL can be issued (no
+    # public base URL, or GIF/BMP/TIFF or over 10 MB), native grants keep the
+    # connector's own multipart upload, staged as before.
+    ("facebook-pages", "facebook_publish_image_post"): _ExternalMediaBinding(
+        file_argument="file_path",
+        url_argument="image_url",
+        purpose="facebook-publish",
+        upload_fallback=True,
     ),
 }
 _EXTERNAL_MEDIA_FILE_NOT_FOUND = "file_id not found or not accessible."
@@ -2431,7 +2445,11 @@ class MCPToolAdapter(AbstractBaseTool):
         description += _provider_tool_description_guidance(
             self.source_server, self.mcp_tool.name
         )
-        if self._workspace is not None and self._durable_upload_fields:
+        if (
+            self._workspace is not None
+            and self._durable_upload_fields
+            and self._external_media_binding is None
+        ):
             description += _durable_upload_note(
                 self._durable_upload_fields,
                 own_file_id=self._durable_upload_own_file_id,
@@ -3331,14 +3349,30 @@ class MCPToolAdapter(AbstractBaseTool):
             except (FileNotFoundError, OSError, ValueError):
                 file_id = None
         if file_id is None:
+            if binding.upload_fallback:
+                # Not a registered file: the connector reads the path itself,
+                # as it did before this binding existed.
+                return prepared, {}
             raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_FILE_REF_REQUIRED)
+        from ....workspace import ExternalMediaNotIssuableError
+
         try:
             external_url = await self._run_upload_staging_operation(
                 workspace.issue_external_media_url_detached,
                 file_id,
                 binding.purpose,
             )
+        except ExternalMediaNotIssuableError as exc:
+            if binding.upload_fallback:
+                return prepared, {}
+            raise _ExternalMediaPreparationError(str(exc)) from None
         except FileNotFoundError:
+            if binding.upload_fallback:
+                # Issuance only sees files of this exact task; staging also
+                # accepts task-less uploads, internal-* ids and workspace
+                # records. Staging resolves the id again in its own scope and
+                # still reports a file that is really missing.
+                return prepared, {}
             raise _ExternalMediaPreparationError(
                 _EXTERNAL_MEDIA_FILE_NOT_FOUND
             ) from None
@@ -3558,6 +3592,15 @@ class MCPToolAdapter(AbstractBaseTool):
                 redact_sensitive=True, log_skipped=False
             )
             tool_meta = self._runtime_mcp_meta()
+            # External media first: when it takes the file argument, there is
+            # nothing left to stage; when it falls back, staging runs as usual.
+            try:
+                (
+                    tool_args,
+                    external_media_replacements,
+                ) = await self._substitute_external_media_args(tool_args)
+            except _ExternalMediaPreparationError as exc:
+                return {"content": [{"text": str(exc)}], "is_error": True}
             try:
                 (
                     tool_args,
@@ -3570,14 +3613,6 @@ class MCPToolAdapter(AbstractBaseTool):
                     own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
-            try:
-                (
-                    tool_args,
-                    external_media_replacements,
-                ) = await self._substitute_external_media_args(tool_args)
-            except _ExternalMediaPreparationError as exc:
-                await self._discard_external_upload_args(staged_uploads)
-                return {"content": [{"text": str(exc)}], "is_error": True}
 
             # Pydantic inserts declared defaults before this point. Validate
             # only values supplied by the model. Runtime-bound fields are

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from mcp.types import Tool as MCPTool
 
 from ......sandbox.base import Sandbox
+from ......sandbox.tool_runtime.bundle import build_runtime_command, sandbox_connection
 from ....core.mcp.sessions import Connection
 from ....core.mcp.tools import (
     SANDBOX_RAW_ANNOTATIONS_KEY,
@@ -22,7 +23,6 @@ from ..base import AbstractBaseTool
 from .sandbox_config import SandboxConfig, set_instance_sandbox_config
 from .sandboxed_tool_wrapper import (
     SANDBOX_BASE_DEPENDENCIES,
-    SANDBOX_SRC_ROOT,
     SandboxDependencyManager,
     _SandboxLeaseProviderLike,
     _write_sandbox_file_cancellation_safe,
@@ -31,10 +31,6 @@ from .sandboxed_tool_wrapper import (
 )
 
 logger = logging.getLogger(__name__)
-
-_MCP_RUNNER_PATH = (
-    f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/mcp_runner.py"
-)
 
 _MCP_SANDBOX_COMMANDS = {"npx", "uvx"}
 _MCP_SANDBOX_TIMEOUT_SECONDS = 60
@@ -121,21 +117,19 @@ async def list_tools_in_sandbox(
         # survive this listing attempt.
         await _write_sandbox_file_cancellation_safe(
             target_sandbox,
-            _serialize_connection(connection),
+            json.dumps(
+                {"kind": "mcp_list", "connection": sandbox_connection(connection)},
+                ensure_ascii=False,
+            ),
             connection_file,
             overwrite=False,
         )
         try:
+            command = build_runtime_command(
+                {}, result_file, request_file=connection_file
+            )
             result = await asyncio.wait_for(
-                target_sandbox.exec(
-                    "python",
-                    _MCP_RUNNER_PATH,
-                    "--connection-file",
-                    connection_file,
-                    "--result-file",
-                    result_file,
-                    env={"PYTHONPATH": SANDBOX_SRC_ROOT},
-                ),
+                target_sandbox.exec(command[0], *command[1:], env={"PYTHONPATH": ""}),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError as exc:

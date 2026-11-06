@@ -123,7 +123,11 @@ class TestChromeDaemonClient:
         assert result == {"running": True}
         run = sandbox.exec.await_args_list[0]
         assert run.args[0] == "python"
-        assert "chrome_daemon_runner.py" in run.args[1]
+        assert run.args[1:3] == ("-I", "-c")
+        assert "--request-file" in run.args
+        request = json.loads(sandbox.write_file.await_args.args[0])
+        assert request["kind"] == "chrome"
+        assert request["arguments"][:3] == ["status", "--session-id", "a" * 32]
         assert run.kwargs["env"] == {
             "NPM_CONFIG_CACHE": "/opt/npm-cache",
             "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",

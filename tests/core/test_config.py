@@ -4795,3 +4795,16 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, False), ("true", True), ("false", False)]
+)
+def test_get_sandbox_enabled(monkeypatch, value, expected):
+    from xagent.config import get_sandbox_enabled
+
+    if value is None:
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SANDBOX_ENABLED", value)
+    assert get_sandbox_enabled() is expected

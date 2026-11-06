@@ -47,6 +47,35 @@ restricted Docker broker maintained in
 [`xagent-saas`](https://github.com/xorbitsai/xagent-saas/blob/main/docs/sandbox-broker.md).
 Change it only together with that parser and its real-Docker upload smoke test.
 
+## Platform source isolation
+
+Task sandboxes do not mount the backend `src/` or `tests/` trees. Each call
+receives a small, fixed execution runtime containing only the shell, Python,
+JavaScript, stdio MCP transport and Chrome daemon implementations. Authorization, connector
+bindings, application configuration and file registration stay in the backend.
+The guest receives JSON arguments, never pickled backend application objects.
+Custom `@sandbox_config` tools that require arbitrary application imports are
+not supported by this runtime. They must be adapted to an execution-only
+protocol; unsupported tools fail rather than falling back to backend execution.
+
+Custom volume mounts that expose backend source or tests, including parent paths
+and symlink aliases, are rejected. Do not install the full Xagent package in a
+custom sandbox image: execution refuses an environment where that package or the
+former `/app/src` and `/app/tests` directories are visible.
+
+On upgrade, drain running work and restart the backend. Startup cleanup detects
+changed mounts and recreates affected Boxlite environments; Docker also checks
+the desired spec when resolving a sandbox. Managed bind-mounted task files
+survive, but the disposable writable layer does not. Boxlite recreates environments
+whose stored configuration is missing or changed.
+Do not restore old snapshots without auditing them for copied platform source.
+Source copies already made into task files or disclosed to users need separate
+incident handling; changing mounts cannot erase them.
+
+The obsolete `XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY` flag no longer
+permits task execution on the backend. When sandboxing is enabled, outages and
+capacity exhaustion fail the task for all entry points, including ordinary chat.
+
 ## Tags
 
 - `latest` — the most recently published build

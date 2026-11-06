@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.core.tools.adapters.sandboxed_tool.conftest import FakeBaseTool
+from xagent.core.tools.adapters.vibe.command_executor import CommandExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     sandbox_config,
 )
@@ -66,14 +66,14 @@ class FakeLeaseProvider:
 
 
 @sandbox_config()
-class UnsafeSandboxTool(FakeBaseTool):
+class UnsafeSandboxTool(CommandExecutorToolForBasic):
     @property
     def name(self) -> str:
         return "unsafe_sandbox_tool"
 
 
 @sandbox_config()
-class SafeSandboxTool(FakeBaseTool):
+class SafeSandboxTool(CommandExecutorToolForBasic):
     concurrency_safe = True
 
     @property
@@ -93,7 +93,7 @@ async def test_safe_tool_executes_through_worker_sandbox() -> None:
         "SandboxDependencyManager.ensure_requirements",
         new=AsyncMock(),
     ) as ensure_requirements:
-        result = await wrapper.run_json_async({"code": "print('ok')"})
+        result = await wrapper.run_json_async({"command": "true"})
 
     assert result == {"sandbox": "worker"}
     assert provider.lease_calls == [True]
@@ -115,7 +115,7 @@ async def test_unsafe_tool_executes_through_primary_sandbox() -> None:
         "SandboxDependencyManager.ensure_requirements",
         new=AsyncMock(),
     ) as ensure_requirements:
-        result = await wrapper.run_json_async({"code": "print('ok')"})
+        result = await wrapper.run_json_async({"command": "true"})
 
     assert result == {"sandbox": "primary"}
     assert provider.lease_calls == [False]

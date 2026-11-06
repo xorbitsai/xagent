@@ -20,7 +20,6 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     sandbox_config,
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    SANDBOX_SRC_ROOT,
     SandboxedToolWrapper,
     _extract_init_params,
     _serialize_init_params,
@@ -156,79 +155,43 @@ class TestSerializeInitParams:
 
 
 class TestBuildExecutionCommand:
-    """Tests for _build_execution_command()."""
+    """Only execution data and reviewed runtime code enter the sandbox."""
 
-    def test_with_init_params(self):
-        """Command should include init params when they exist."""
-        wrapper = _create_test_wrapper(_FakeToolWithWorkspace(workspace=None))
+    def test_native_tool_sends_json_without_application_objects(self, tmp_path):
+        from xagent.core.tools.adapters.vibe.python_executor import (
+            PythonExecutorToolForBasic,
+        )
+
+        workspace = TaskWorkspace(id="isolated", base_dir=str(tmp_path))
+        wrapper = _create_test_wrapper(PythonExecutorToolForBasic(workspace))
         command = wrapper._build_execution_command(
             {"code": "print(1)"}, "/tmp/result.json"
         )
-        assert command[:2] == [
-            "python",
-            f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/tool_runner.py",
-        ]
-        assert "--execution-spec-b64" in command
-        spec_idx = command.index("--execution-spec-b64")
-        execution_spec = json.loads(
-            base64.b64decode(command[spec_idx + 1]).decode("utf-8")
+        assert command[:3] == ["python", "-I", "-c"]
+        request = json.loads(
+            base64.b64decode(command[command.index("--request-b64") + 1])
         )
-        assert execution_spec == {
-            "kind": "tool",
-            "tool_class": (
-                f"{_FakeToolWithWorkspace.__module__}:{_FakeToolWithWorkspace.__name__}"
-            ),
-        }
-        assert "--init-params-b64" in command
-        # Verify the b64 value can be deserialized
-        idx = command.index("--init-params-b64")
-        restored = cloudpickle.loads(base64.b64decode(command[idx + 1]))
-        assert restored == {"workspace": None}
-
-    def test_without_init_params(self):
-        """Command should omit init params for no-arg tools."""
-        wrapper = _create_test_wrapper(_FakeToolNoParams())
-        command = wrapper._build_execution_command(
-            {"code": "print(1)"}, "/tmp/result.json"
+        assert request["kind"] == "python"
+        assert request["arguments"]["code"] == "print(1)"
+        assert request["working_directory"] == str(workspace.output_dir)
+        assert request["workspace_variables"]["WORKSPACE_OUTPUT_DIR"] == str(
+            workspace.output_dir
         )
+        assert "tool_class" not in request
         assert "--init-params-b64" not in command
 
-    def test_functiontool_bound_method_auto_infers_method_execution(self):
-        """Bound methods on tool subclasses should serialize as method execution."""
-        wrapper = _create_test_wrapper(
-            _make_abstract_tool_bound_method_function_tool(workspace=None)
-        )
-        command = wrapper._build_execution_command({"code": "x"}, "/tmp/result.json")
-        spec_idx = command.index("--execution-spec-b64")
-        execution_spec = json.loads(
-            base64.b64decode(command[spec_idx + 1]).decode("utf-8")
-        )
-        assert execution_spec == {
-            "kind": "method",
-            "tool_class": (
-                f"{_AbstractToolMethodOwner.__module__}:"
-                f"{_AbstractToolMethodOwner.__name__}"
-            ),
-            "method_name": "say",
-        }
-
-    def test_plain_functiontool_bound_method_auto_infers_method_execution(self):
-        """Bound methods on regular classes should serialize the same way."""
-        wrapper = _create_test_wrapper(
-            _make_plain_bound_method_function_tool(workspace=None)
-        )
-        command = wrapper._build_execution_command({"code": "x"}, "/tmp/result.json")
-        spec_idx = command.index("--execution-spec-b64")
-        execution_spec = json.loads(
-            base64.b64decode(command[spec_idx + 1]).decode("utf-8")
-        )
-        assert execution_spec == {
-            "kind": "method",
-            "tool_class": (
-                f"{_PlainMethodOwner.__module__}:{_PlainMethodOwner.__name__}"
-            ),
-            "method_name": "say",
-        }
+    @pytest.mark.parametrize(
+        "make_tool",
+        [
+            _FakeToolNoParams,
+            _make_abstract_tool_bound_method_function_tool,
+            _make_plain_bound_method_function_tool,
+        ],
+    )
+    def test_arbitrary_application_classes_cannot_be_loaded_in_guest(self, make_tool):
+        wrapper = _create_test_wrapper(make_tool())
+        with pytest.raises(RuntimeError, match="not supported by the isolated"):
+            wrapper._build_execution_command({"code": "x"}, "/tmp/result.json")
 
 
 class TestBuildExecutionEnv:
@@ -237,7 +200,7 @@ class TestBuildExecutionEnv:
     def test_always_includes_pythonpath(self):
         wrapper = _create_test_wrapper(_FakeToolNoParams())
         env = wrapper._build_execution_env()
-        assert env["PYTHONPATH"] == SANDBOX_SRC_ROOT
+        assert env["PYTHONPATH"] == ""
 
     def test_tool_env_vars_cannot_override_the_sandbox_seeds(self, monkeypatch):
         """A host PYTHONPATH would point the runner outside the sandbox."""
@@ -250,7 +213,7 @@ class TestBuildExecutionEnv:
 
         env = wrapper._build_execution_env()
 
-        assert env["PYTHONPATH"] == SANDBOX_SRC_ROOT
+        assert env["PYTHONPATH"] == ""
         assert env[SANDBOX_TOOL_RUNNER] == "1"
 
     def test_picks_up_host_env(self, monkeypatch):

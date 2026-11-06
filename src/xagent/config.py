@@ -4082,12 +4082,21 @@ def get_sandbox_volumes(
     return volumes
 
 
+def get_sandbox_enabled() -> bool:
+    """Whether task execution requires a sandbox (SANDBOX_ENABLED, default false).
+
+    When enabled, an unavailable sandbox must fail closed rather than executing
+    generated commands in the application process.
+    """
+    return _get_bool_env("SANDBOX_ENABLED", False)
+
+
 def get_sandbox_host_project_root() -> Path | None:
-    """Get the host project root used for Docker sibling sandbox code mounts.
+    """Get the host checkout root used to reject unsafe sandbox source mounts.
 
     Priority:
     1. XAGENT_SANDBOX_HOST_PROJECT_ROOT environment variable
-    2. None, which lets callers use their local runtime project root
+    2. None, which checks only the local application source paths
 
     Returns:
         Path to the project root as resolved from the Docker host's perspective,

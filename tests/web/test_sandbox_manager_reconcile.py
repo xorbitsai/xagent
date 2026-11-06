@@ -1605,3 +1605,46 @@ class TestReadinessReservedUploadsSubtree:
             manager, _service = _make_manager()
             with pytest.raises(SandboxContractError):
                 await check_sandbox_static_readiness(manager)
+
+
+@pytest.mark.asyncio
+async def test_removing_legacy_source_mount_rebuilds_guest_and_preserves_workspace(
+    tmp_path,
+):
+    """A pre-fix Docker spec converges before any task gets its sandbox."""
+    from dataclasses import replace
+
+    with patch.dict("os.environ", {}, clear=True):
+        manager, service = _make_manager()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        document = workspace / "keep.txt"
+        document.write_text("user data")
+        intent = SandboxMountIntent(mount_root=str(workspace))
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        old = replace(
+            desired,
+            volumes=tuple(
+                sorted(
+                    (*desired.volumes, ("/legacy/backend/src", "/app/src", "ro")),
+                )
+            ),
+        )
+        template, config = old.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=old,
+            fingerprint_label=old.fingerprint(),
+            version_label=str(SPEC_CONTRACT_VERSION),
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1",
+            state="stopped",
+            template=template,
+            config=config,
+        )
+        await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+        assert service._containers["user::1"].spec == desired
+        assert document.read_text() == "user data"

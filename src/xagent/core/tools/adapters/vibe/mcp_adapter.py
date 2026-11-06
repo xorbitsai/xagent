@@ -2335,6 +2335,9 @@ class MCPToolAdapter(AbstractBaseTool):
         self.mcp_tool = mcp_tool
         self._raw_annotations = raw_annotations
         self.connection = connection
+        # Bound by SandboxedToolWrapper. Authorization and runtime bindings
+        # remain in this adapter; only transport work crosses into the guest.
+        self._sandbox_transport: Any = None
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
@@ -3771,25 +3774,32 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any]:
-        async with create_session(connection) as session:
-            await session.initialize()
-            result = await session.call_tool(
-                self.mcp_tool.name,
-                dict(tool_args),
-                meta=dict(tool_meta) or None,
-            )
+        if self._sandbox_transport is not None:
+            from mcp.types import CallToolResult
 
-            normalized = _normalized_mcp_call_result(
-                result,
-                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
+            payload = await self._sandbox_transport(
+                connection, self.mcp_tool.name, tool_args, tool_meta
             )
-            if self._is_excel_tool:
-                failure_code = _excel_failure_code(normalized)
-                if failure_code is not None:
-                    normalized["failure_code"] = failure_code
-                    normalized["success"] = False
-                    normalized["is_error"] = True
-            return normalized
+            result = CallToolResult.model_validate(payload)
+        else:
+            async with create_session(connection) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    self.mcp_tool.name,
+                    dict(tool_args),
+                    meta=dict(tool_meta) or None,
+                )
+        normalized = _normalized_mcp_call_result(
+            result,
+            detect_legacy_plain_text_error=self._detect_legacy_plain_text_error,
+        )
+        if self._is_excel_tool:
+            failure_code = _excel_failure_code(normalized)
+            if failure_code is not None:
+                normalized["failure_code"] = failure_code
+                normalized["success"] = False
+                normalized["is_error"] = True
+        return normalized
 
     async def _retry_after_authorization_failure(
         self,

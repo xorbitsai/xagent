@@ -19,7 +19,9 @@ from ..config import (
     get_boxlite_home_dir,
     get_external_upload_dirs,
     get_sandbox_cpus,
+    get_sandbox_enabled,
     get_sandbox_env,
+    get_sandbox_host_project_root,
     get_sandbox_host_storage_root,
     get_sandbox_idle_ttl,
     get_sandbox_image,
@@ -1216,7 +1218,7 @@ class SandboxManager:
     ) -> ResolvedSandboxRuntimeSpec:
         """Build the single canonical desired-state spec for one sandbox name.
 
-        The sole normalizer from environment config + code mounts + intent
+        The sole normalizer from environment config + custom mounts + intent
         mounts to ``ResolvedSandboxRuntimeSpec``: both the legacy and the
         reconciliation routes compare against this same spec via the
         process-local ``_config_cache``, and the reconciliation route also
@@ -1233,6 +1235,7 @@ class SandboxManager:
         mounts = self._make_workspace_volume_mounts(
             lifecycle_type, lifecycle_id, mount_intent=mount_intent
         )
+        _reject_platform_source_mounts(volumes)
         return ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image",
             image=image,
@@ -1258,7 +1261,7 @@ class SandboxManager:
         """
         Build default volume mounts.
 
-        Code directories are always mounted read-only.
+        Platform source and tests are never mounted into the guest.
         User workspace is additionally mounted read-write for user lifecycle type.
 
         Args:
@@ -1266,7 +1269,7 @@ class SandboxManager:
             lifecycle_id: e.g. task_id|user_id
             mount_intent: Actual sandbox mount intent, when known
         """
-        # Code mounts are always present (at least src/)
+        # No platform source is mounted; calls carry an execution-only runtime.
         volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
         path_mapper = SandboxPathMapper.from_env()
 
@@ -2848,6 +2851,38 @@ class SandboxManager:
             )
 
 
+def _reject_platform_source_mounts(volumes: list[tuple[str, str, str]]) -> None:
+    """Reject custom mounts that would put backend code back into the guest.
+
+    Check ancestors as well as descendants, including symlink spellings. The
+    managed uploads subtree is data, even in legacy installations that put it
+    below web/. Sibling Docker's configured host checkout is checked in its own
+    path domain; its source directories are no longer mounted automatically.
+    """
+    package_root = Path(__file__).resolve().parents[1]
+    roots = [package_root, package_root.parent.parent / "tests"]
+    allowed_data = [Path(get_uploads_dir()).resolve()]
+    host_project = get_sandbox_host_project_root()
+    if host_project is not None:
+        roots += [host_project / "src" / "xagent", host_project / "tests"]
+    roots = [root.resolve() for root in roots]
+    for host, _guest, _mode in volumes:
+        candidate = Path(host).resolve()
+        for root in roots:
+            covers_code = root.is_relative_to(candidate)
+            contains_code = candidate.is_relative_to(root)
+            managed_data = any(
+                data != root
+                and data.is_relative_to(root)
+                and candidate.is_relative_to(data)
+                for data in allowed_data
+            )
+            if covers_code or (contains_code and not managed_data):
+                raise SandboxRuntimeConflictError(
+                    "Platform source and test directories cannot be mounted into a task sandbox."
+                )
+
+
 def _check_no_conflicting_readiness_volumes(
     volumes: list[tuple[str, str, str]],
 ) -> None:
@@ -3056,26 +3091,13 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     ``volume_subpath`` mode, the named-volume configuration and its physical
     root are validated before serving traffic. The later bind-mount conflict
     scan is skipped when neither ``SANDBOX_VOLUMES`` nor
-    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
-    conflict with themselves, and they never land under the uploads guest
-    root either (``build_code_mount_volumes`` mounts fixed ``/app/src`` and
-    ``/app/tests`` paths), so with nothing operator-configured the per-user
-    reserved-subtree check below has nothing to reject; that is also why the
-    reserved-subtree check runs after this early return rather than before
-    it. When the check does run, code mounts are still part of the scanned
-    volume list along with everything else — they are not specially exempted,
-    they simply do not match the reserved shape.
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured. Platform source and tests
+    are never default mounts; configured volumes are checked for source exposure
+    before any sandbox is created.
 
-    Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
-    using the same ``host_side_sources`` flag the runtime build path uses)
-    and code mounts (``build_code_mount_volumes``) are already host-domain
-    triples and are compared as-is. External upload dirs are backend-domain
-    paths: they are normalized and deduplicated by backend physical identity
-    through ``dedupe_backend_mount_paths`` before being converted to host
-    domain through the same ``SandboxPathMapper`` the runtime mount-building
-    path uses. One stable lexical spelling is retained for sibling-Docker host
-    translation. Conflict detection itself always runs in the post-mapper host
-    domain, over the combined triple set from all three sources.
+    ``SANDBOX_VOLUMES`` already uses host-domain sources. External upload paths
+    are normalized and converted through ``SandboxPathMapper`` before conflict
+    detection over the combined set of mount triples.
 
     Beyond mutual conflicts among the configured mounts, one configured
     mount can also collide with a mount that does not exist yet: every
@@ -3160,6 +3182,7 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     for backend_dir in folded_external:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
 
+    _reject_platform_source_mounts(volumes)
     _check_no_conflicting_readiness_volumes(volumes)
     _check_no_reserved_uploads_conflict(volumes, guest_uploads_root, reserved_prefix)
 
@@ -3185,7 +3208,7 @@ def _create_sandbox_service() -> Optional[SandboxService]:
         SandboxService instance or None if disabled
     """
     # Check if sandbox is enabled
-    sandbox_enabled = os.getenv("SANDBOX_ENABLED", "false").lower() == "true"
+    sandbox_enabled = get_sandbox_enabled()
     if not sandbox_enabled:
         logger.info("Sandbox is disabled via SANDBOX_ENABLED environment variable")
         return None

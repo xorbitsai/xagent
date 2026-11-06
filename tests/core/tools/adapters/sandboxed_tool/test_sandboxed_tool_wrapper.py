@@ -22,7 +22,6 @@ from xagent.core.tools.adapters.vibe.javascript_executor import (
 )
 from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    SANDBOX_SRC_ROOT,
     build_code_mount_volumes,
     create_sandboxed_tool,
 )
@@ -296,248 +295,47 @@ class TestSandboxedToolWrapper:
 
 @requires_boxlite
 class TestTools:
-    """Test tool execution in sandbox"""
-
     @pytest.mark.asyncio(loop_scope="module")
-    async def test_python_executor_in_sandbox(self):
-        """
-        Launch a sandbox, upload code + tests via create_sandboxed_tool,
-        then run tests/core/tools/test_python_executor.py inside the sandbox.
-        """
-        print("\n=== Test python_executor test suite in sandbox ===")
-
+    async def test_execution_runtime_has_no_platform_source(self):
         service = BoxliteSandboxService(MemBoxliteStore())
-        sandbox_name = "test_py_executor_suite"
-
+        sandbox_name = "test_isolated_tool_runtime"
         try:
-            # Cleanup
-            try:
-                await service.delete(sandbox_name)
-            except Exception:
-                pass
-
-            # Create sandbox
             sandbox = await _create_sandbox(service, sandbox_name)
-
-            # Create sandboxed tool with contain_tests=True to upload tests
-            sandboxed_tool = await create_sandboxed_tool(
-                tool=PythonExecutorToolForBasic(None),
-                sandbox=sandbox,
+            for path in ("/app/src", "/app/tests"):
+                assert (await sandbox.exec("test", "-e", path)).exit_code != 0
+            tool = await create_sandboxed_tool(
+                PythonExecutorToolForBasic(None), sandbox
             )
-
-            # Get sandbox instance for direct exec
-            sb = await sandboxed_tool.get_sandbox_for_test()
-
-            # Verify tests were uploaded
-            check = await sb.exec(
-                "test", "-f", "/app/tests/core/tools/test_python_executor.py"
+            result = await tool.run_json_async(
+                {
+                    "code": "import importlib.util; print(importlib.util.find_spec('xagent'))"
+                }
             )
-            assert check.exit_code == 0, (
-                "test_python_executor.py should exist in sandbox"
+            assert result["success"], result
+            assert "None" in result["output"]
+            command_tool = await create_sandboxed_tool(
+                CommandExecutorToolForBasic(None), sandbox
             )
-
-            # Install pytest in sandbox
-            install_result = await sb.exec(
-                "pip",
-                "install",
-                "--user",
-                "--break-system-packages",
-                "pytest",
-                "pytest-asyncio",
+            command_result = await command_tool.run_json_async(
+                {
+                    "command": "test ! -e /app/src && test ! -e /app/tests && printf isolated-shell"
+                }
             )
-            assert install_result.exit_code == 0, (
-                f"Failed to install pytest: {install_result.stderr}"
+            assert command_result["success"], command_result
+            assert "isolated-shell" in command_result["output"]
+            js_tool = await create_sandboxed_tool(
+                JavaScriptExecutorToolForBasic(None), sandbox
             )
-
-            # Run test_python_executor.py in sandbox
-            test_result = await sb.exec(
-                "python",
-                "-m",
-                "pytest",
-                "/app/tests/core/tools/test_python_executor.py",
-                "-v",
-                "--tb=short",
-                env={"PYTHONPATH": SANDBOX_SRC_ROOT},
+            js_result = await js_tool.run_json_async(
+                {
+                    "code": "const fs = require('fs'); if (fs.existsSync('/app/src') || "
+                    "fs.existsSync('/app/tests')) throw new Error('source visible'); console.log(6 * 7);"
+                }
             )
-
-            print(f"\n--- pytest stdout ---\n{test_result.stdout}")
-            if test_result.stderr:
-                print(f"\n--- pytest stderr ---\n{test_result.stderr}")
-            print(f"\nExit code: {test_result.exit_code}")
-
-            assert test_result.exit_code == 0, (
-                f"pytest failed with exit code {test_result.exit_code}\n"
-                f"stdout:\n{test_result.stdout}\n"
-                f"stderr:\n{test_result.stderr}"
-            )
-
-            print("✅ Python executor test suite passed in sandbox")
-
+            assert js_result["success"], js_result
+            assert "42" in js_result["output"]
         finally:
-            try:
-                await service.delete(sandbox_name)
-            except Exception:
-                pass
-
-    @pytest.mark.asyncio(loop_scope="module")
-    async def test_javascript_executor_in_sandbox(self):
-        """
-        Launch a sandbox, upload code + tests via create_sandboxed_tool,
-        then run tests/core/tools/test_javascript_executor.py inside the sandbox.
-        """
-        print("\n=== Test javascript_executor test suite in sandbox ===")
-
-        service = BoxliteSandboxService(MemBoxliteStore())
-        sandbox_name = "test_js_executor_suite"
-
-        try:
-            # Cleanup
-            try:
-                await service.delete(sandbox_name)
-            except Exception:
-                pass
-
-            # Create sandbox
-            sandbox = await _create_sandbox(service, sandbox_name)
-
-            # Create sandboxed tool with contain_tests=True to upload tests
-            sandboxed_tool = await create_sandboxed_tool(
-                tool=JavaScriptExecutorToolForBasic(None),
-                sandbox=sandbox,
-            )
-
-            # Get sandbox instance for direct exec
-            sb = await sandboxed_tool.get_sandbox_for_test()
-
-            # Verify tests were uploaded
-            check = await sb.exec(
-                "test", "-f", "/app/tests/core/tools/test_javascript_executor.py"
-            )
-            assert check.exit_code == 0, (
-                "test_javascript_executor.py should exist in sandbox"
-            )
-
-            # Install pytest and Node.js dependencies in sandbox
-            install_result = await sb.exec(
-                "pip", "install", "--user", "--break-system-packages", "pytest"
-            )
-            assert install_result.exit_code == 0, (
-                f"Failed to install pytest: {install_result.stderr}"
-            )
-
-            # Run test_javascript_executor.py in sandbox
-            # Skip TestJavaScriptExecutorTool which requires langchain_core
-            test_result = await sb.exec(
-                "python",
-                "-m",
-                "pytest",
-                "/app/tests/core/tools/test_javascript_executor.py",
-                "-v",
-                "--tb=short",
-                "-k",
-                "not TestJavaScriptExecutorTool",
-                env={"PYTHONPATH": SANDBOX_SRC_ROOT},
-            )
-
-            print(f"\n--- pytest stdout ---\n{test_result.stdout}")
-            if test_result.stderr:
-                print(f"\n--- pytest stderr ---\n{test_result.stderr}")
-            print(f"\nExit code: {test_result.exit_code}")
-
-            assert test_result.exit_code == 0, (
-                f"pytest failed with exit code {test_result.exit_code}\n"
-                f"stdout:\n{test_result.stdout}\n"
-                f"stderr:\n{test_result.stderr}"
-            )
-
-            print("✅ JavaScript executor test suite passed in sandbox")
-
-        finally:
-            try:
-                await service.delete(sandbox_name)
-            except Exception:
-                pass
-
-    @pytest.mark.asyncio(loop_scope="module")
-    async def test_command_executor_in_sandbox(self):
-        """
-        Launch a sandbox, upload code + tests via create_sandboxed_tool,
-        then run tests/core/tools/test_command_executor.py inside the sandbox.
-        """
-        print("\n=== Test command_executor test suite in sandbox ===")
-
-        service = BoxliteSandboxService(MemBoxliteStore())
-        sandbox_name = "test_cmd_executor_suite"
-
-        try:
-            # Cleanup
-            try:
-                await service.delete(sandbox_name)
-            except Exception:
-                pass
-
-            # Create sandbox
-            sandbox = await _create_sandbox(service, sandbox_name)
-
-            # Create sandboxed tool with contain_tests=True to upload tests
-            sandboxed_tool = await create_sandboxed_tool(
-                tool=CommandExecutorToolForBasic(None),
-                sandbox=sandbox,
-            )
-
-            # Get sandbox instance for direct exec
-            sb = await sandboxed_tool.get_sandbox_for_test()
-
-            # Verify tests were uploaded
-            check = await sb.exec(
-                "test", "-f", "/app/tests/core/tools/test_command_executor.py"
-            )
-            assert check.exit_code == 0, (
-                "test_command_executor.py should exist in sandbox"
-            )
-
-            # Install pytest in sandbox
-            install_result = await sb.exec(
-                "pip",
-                "install",
-                "--user",
-                "--break-system-packages",
-                "pytest",
-                "pytest-asyncio",
-            )
-            assert install_result.exit_code == 0, (
-                f"Failed to install pytest: {install_result.stderr}"
-            )
-
-            # Run test_command_executor.py in sandbox
-            test_result = await sb.exec(
-                "python",
-                "-m",
-                "pytest",
-                "/app/tests/core/tools/test_command_executor.py",
-                "-v",
-                "--tb=short",
-                env={"PYTHONPATH": SANDBOX_SRC_ROOT},
-            )
-
-            print(f"\n--- pytest stdout ---\n{test_result.stdout}")
-            if test_result.stderr:
-                print(f"\n--- pytest stderr ---\n{test_result.stderr}")
-            print(f"\nExit code: {test_result.exit_code}")
-
-            assert test_result.exit_code == 0, (
-                f"pytest failed with exit code {test_result.exit_code}\n"
-                f"stdout:\n{test_result.stdout}\n"
-                f"stderr:\n{test_result.stderr}"
-            )
-
-            print("✅ Command executor test suite passed in sandbox")
-
-        finally:
-            try:
-                await service.delete(sandbox_name)
-            except Exception:
-                pass
+            await service.delete(sandbox_name)
 
 
 @requires_boxlite

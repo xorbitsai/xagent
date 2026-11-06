@@ -20,7 +20,7 @@ from typing import (
 
 from sqlalchemy.orm import Session
 
-from .....config import get_uploads_dir
+from .....config import get_sandbox_enabled, get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
@@ -480,6 +480,16 @@ class ToolFactory:
             TaskRuntimeContribution,
             reconcile_task_runtime_contribution_tools,
         )
+
+        workspace_config = config.get_workspace_config() or {}
+        if (
+            get_sandbox_enabled()
+            and config.get_sandbox() is None
+            and workspace_config.get("task_id") not in (None, "tools_list", "_mock_")
+        ):
+            raise RuntimeError(
+                "Configured sandbox is unavailable; backend execution is disabled."
+            )
 
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
@@ -984,10 +994,14 @@ class ToolFactory:
                     wrapped_tools.append(wrapped)
                     logger.info(f"Wrapped tool '{tool.name}' with sandbox")
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to wrap tool '{tool.name}' with sandbox: {e}, using original tool"
+                    logger.error(
+                        "Failed to prepare sandboxed tool '%s'",
+                        tool.name,
+                        exc_info=True,
                     )
-                    wrapped_tools.append(tool)
+                    raise RuntimeError(
+                        "Sandboxed tool could not be prepared; backend execution is disabled."
+                    ) from e
             else:
                 wrapped_tools.append(tool)
         return wrapped_tools

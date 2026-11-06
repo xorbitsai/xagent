@@ -21,6 +21,7 @@ from xagent.core.file_storage.factory import (
     get_unscoped_file_storage,
     get_user_file_storage,
 )
+from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import sandbox_config
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxedToolWrapper,
@@ -39,9 +40,12 @@ SANDBOX_MINTED_FILE_ID = "sandbox-only-file-id"
 
 
 @sandbox_config()
-class _FakeGeneratingTool(FakeBaseTool):
+class _FakeGeneratingTool(PythonExecutorToolForBasic, FakeBaseTool):
     def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
-        self._workspace = workspace
+        super().__init__(workspace)
+
+    def args_type(self):
+        return FakeBaseTool.args_type(self)
 
     @property
     def name(self) -> str:

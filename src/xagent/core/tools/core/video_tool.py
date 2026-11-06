@@ -874,9 +874,9 @@ The generated video URL is temporary on the provider side, so completed videos a
                 result = await video_model.generate_video(**generate_params)
             except Exception as e:
                 # The model that failed is a diagnostic, not something the
-                # caller can act on: it stays in the log line (and in the
-                # trace's copy of the result) rather than in what the model
-                # reads, where it was one paraphrase away from the user.
+                # caller can act on: it stays in the log line rather than in
+                # what the model reads, where it was one paraphrase away from
+                # the user.
                 return {
                     "success": False,
                     **media_failure_fields(

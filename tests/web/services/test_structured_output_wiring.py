@@ -30,7 +30,7 @@ from xagent.web.services.task_execution import (
     execute_resume_background,
     execute_task_background,
 )
-from xagent.web.services.task_lease_service import acquire_task_lease
+from xagent.web.services.task_lease_service import TaskLease, acquire_task_lease
 from xagent.web.services.task_setup_snapshot import load_task_setup_snapshot_sync
 
 INVALID = StructuredOutputFormat.INVALID
@@ -187,6 +187,19 @@ async def _run_new_turn(
     with get_db_session() as lease_db:
         lease = acquire_task_lease(lease_db, task_id, new_run=True)
     assert lease is not None
+    return task_id, await run_turn(monkeypatch, task_id, owner_id, lease, llm)
+
+
+async def run_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    task_id: int,
+    owner_id: int,
+    lease: TaskLease,
+    llm: ScriptedModel,
+    message: str = "first turn",
+) -> dict[str, Any]:
+    """Run ``execute_task_background`` for a task that holds ``lease`` and
+    return the keywords the agent manager received."""
     snapshot = load_task_setup_snapshot_sync(task_id, owner_id)
     assert snapshot is not None
     seen: dict[str, Any] = {}
@@ -212,23 +225,26 @@ async def _run_new_turn(
                 tracer=Tracer(),
             )
 
-    monkeypatch.setattr(
-        task_execution_service, "background_task_manager", _NoopBackgroundTaskManager()
-    )
-    monkeypatch.setattr(websocket_api, "manager", _NoopBroadcastManager())
-    await execute_task_background(
-        task_id=task_id,
-        user_message="first turn",
-        context={},
-        agent_manager=AgentManager(),
-        task_owner_user_id=owner_id,
-        llm_user_message=None,
-        task_setup_snapshot=snapshot,
-        expected_run_id=lease.run_id,
-        task_lease=lease,
-        resolved_execution_scope=None,
-    )
-    return task_id, seen
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            task_execution_service,
+            "background_task_manager",
+            _NoopBackgroundTaskManager(),
+        )
+        scoped.setattr(websocket_api, "manager", _NoopBroadcastManager())
+        await execute_task_background(
+            task_id=task_id,
+            user_message=message,
+            context={},
+            agent_manager=AgentManager(),
+            task_owner_user_id=owner_id,
+            llm_user_message=None,
+            task_setup_snapshot=snapshot,
+            expected_run_id=lease.run_id,
+            task_lease=lease,
+            resolved_execution_scope=None,
+        )
+    return seen
 
 
 def get_db_session():

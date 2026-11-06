@@ -319,6 +319,7 @@ EXCLUDE = {
     ("GET", "/v1/chat/tasks/{task_id}/files"),
     ("GET", "/v1/chat/tasks/{task_id}/steps"),
     ("GET", "/v1/me"),
+    ("GET", "/v1/features"),
     ("GET", "/v1/templates"),
     ("GET", "/v1/templates/{template_id}"),
     ("GET", "/v1/agents"),

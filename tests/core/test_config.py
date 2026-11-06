@@ -4795,3 +4795,46 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, False), ("true", True), ("false", False)]
+)
+def test_get_sandbox_enabled(monkeypatch, value, expected):
+    from xagent.config import get_sandbox_enabled
+
+    if value is None:
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SANDBOX_ENABLED", value)
+    assert get_sandbox_enabled() is expected
+
+
+def test_legacy_source_uploads_boundary_ignores_operator_overrides(monkeypatch):
+    from xagent.config import get_legacy_source_uploads_dir
+
+    expected = get_legacy_source_uploads_dir()
+    monkeypatch.setenv("XAGENT_WEB_DIR", "/unrelated")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", "/")
+    assert get_legacy_source_uploads_dir() == expected
+
+
+def test_platform_git_roots_follow_relative_alternates_without_looping(
+    tmp_path, monkeypatch
+):
+    from xagent.config import get_platform_source_roots
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "xagent").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text('[project]\nname = "xagent-ai"\n')
+    objects = checkout / ".git" / "objects"
+    pool = tmp_path / "pool"
+    for path in (objects, pool):
+        (path / "info").mkdir(parents=True)
+    (objects / "info" / "alternates").write_text(os.path.relpath(pool, objects) + "\n")
+    (pool / "info" / "alternates").write_text(os.path.relpath(objects, pool) + "\n")
+    monkeypatch.chdir(checkout)
+    roots = get_platform_source_roots()
+    assert (checkout / ".git").resolve() in roots
+    assert objects.resolve() in roots
+    assert pool.resolve() in roots

@@ -70,7 +70,7 @@ class APICallResult(BaseModel):
 class APITool(AbstractBaseTool):
     """Framework wrapper for the API client tool"""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.WEB_TOOLS
 
     def __init__(self) -> None:
         self._visibility = ToolVisibility.PUBLIC

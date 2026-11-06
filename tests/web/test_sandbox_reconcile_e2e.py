@@ -104,21 +104,10 @@ def docker_service():
 
 
 @pytest.fixture
-def _env(tmp_path):
-    """Isolate sandbox env config; code mounts point at a real, existing dir.
-
-    Real Docker rejects (or silently misbehaves on) bind sources that don't
-    exist on the host, so the code-mount stand-in must be a real directory,
-    unlike the FakeSandboxService tests that can use a bogus path.
-    """
-    code_src = tmp_path / "code-src"
-    code_src.mkdir()
+def _env():
+    """Isolate sandbox environment configuration."""
     with (
         patch.dict("os.environ", {}, clear=True),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[(str(code_src), "/app/src", "ro")],
-        ),
     ):
         yield
 

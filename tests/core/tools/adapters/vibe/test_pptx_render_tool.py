@@ -149,7 +149,7 @@ def test_registry_dispatches_the_render_creator_only_for_the_ppt_category(tmp_pa
         basic_config = _SandboxEnabledToolConfig(
             workspace,
             _RecordingSandbox(),
-            ToolSelectionSpec(categories=frozenset({"basic"})),
+            ToolSelectionSpec(categories=frozenset({"basic_tools"})),
         )
         basic_names = [
             tool.name

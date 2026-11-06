@@ -361,7 +361,7 @@ class ToolSelectionSpec(ABC):
             )
 
         # ``tool_categories`` mixes two orthogonal shapes:
-        #   - plain category names (``"basic"``, ``"file"``, ``"mcp"``);
+        #   - plain category names (``"basic_tools"``, ``"file"``, ``"mcp"``);
         #     ``"other"`` is an internal fallback, not an assignable category
         #   - ``"mcp:<server>"`` — a specific MCP server (or the
         #     Custom-API tool fronting it)

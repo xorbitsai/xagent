@@ -278,8 +278,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # The pause pre-check's not-applicable reply adds one: 58.
     # The planned-restart hold refusal's plain error frame adds one: 59.
     # The resume seam's refusal when it cannot read the active interaction row adds one: 60.
-    assert result.error_payloads == 60, (
-        f"expected exactly 60 error payloads, matched {result.error_payloads}; "
+    # The execute_task handler's non-busy TaskTurnError arm answers the client
+    # with one coded frame instead of re-raising silently: 61.
+    assert result.error_payloads == 61, (
+        f"expected exactly 61 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

@@ -413,7 +413,7 @@ def _javascript_function_tool(workspace):
 @pytest.mark.parametrize(
     "factory",
     [JavaScriptExecutorTool, JavaScriptExecutorToolForBasic, _javascript_function_tool],
-    ids=["adapter", "basic", "function"],
+    ids=["adapter", "basic_tools", "function"],
 )
 class TestJavaScriptWorkingDirectoryDescription:
     def test_description_includes_resolved_working_directory(self, tmp_path, factory):

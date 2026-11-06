@@ -79,6 +79,7 @@ from ....file_ref import (
 from ....model.chat.basic.base import compatible_tool_choice_for_llm
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.adapters.vibe.base import ToolCategory
 from ....tools.adapters.vibe.interaction_types import (
     CLARIFICATION_GUIDANCE,
     DEFAULT_WAITING_INTERACTION,
@@ -208,7 +209,9 @@ REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
-UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
+UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset(
+    {ToolCategory.BASIC.value, ToolCategory.OTHER.value}
+)
 # Argument names that mark a call as one page of a larger list. A repeated run
 # of such calls has not read the whole list just because several pages came back.
 PAGINATION_ARGUMENT_NAMES = frozenset(

@@ -1024,9 +1024,14 @@ def acquire_task_lease_no_commit(
     expected_run_id: str | None = None,
     expected_status: TaskStatus | None = None,
     new_run: bool = False,
+    new_run_id: str | None = None,
     claim_predicates: Sequence[ColumnElement[bool]] = (),
 ) -> TaskLease | None:
     """Stage one atomic claim; the caller owns commit/rollback.
+
+    ``new_run_id`` names the run a ``new_run`` claim opens (a staged START
+    already told its client this id); it never constrains the row's current
+    ``run_id`` the way ``expected_run_id`` does.
 
     In coordinator context, transition execution state under the existing
     owner and return its fixed run fence. Otherwise, existing entry-point
@@ -1039,7 +1044,7 @@ def acquire_task_lease_no_commit(
     runner = runner_id or get_runner_id()
     now = utc_now()
     expires_at = task_lease_expires_at(now)
-    candidate_run_id = expected_run_id or str(uuid.uuid4())
+    candidate_run_id = new_run_id or expected_run_id or str(uuid.uuid4())
     attempt_id = str(uuid.uuid4())
     current_version = func.coalesce(Task.state_version, 0)
     running_control_state = control_state_for_status(TaskStatus.RUNNING).value

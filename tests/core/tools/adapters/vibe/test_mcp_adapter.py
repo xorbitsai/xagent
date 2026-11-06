@@ -266,7 +266,7 @@ async def test_mcp_loader_direct_retry_exhaustion_logs_debug_traceback(
 
     monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
     monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
-    caplog.set_level("DEBUG")
+    caplog.set_level("DEBUG", logger="xagent.core.tools.adapters.vibe.mcp_adapter")
 
     result = await load_mcp_tools_as_agent_tools(
         {"broken": {"transport": "stdio", "command": "python", "args": []}}
@@ -2003,7 +2003,7 @@ def test_resolver_401_evidence_degrades_when_mcp_oauth_unimportable():
     which needs sqlalchemy (directly, and transitively through
     xagent.web.services.__init__'s other eager imports). That's fine on
     the backend host, but this function runs inside MCPToolAdapter.
-    run_json_async -- the exact class/method tool_runner.py reconstructs
+    run_json_async -- the host-owned adapter entrypoint
     and calls for every sandboxed npx/uvx MCP tool call (see PR #1710) --
     and the sandbox never installs sqlalchemy. A 401 from a sandboxed
     OAuth-protected connector (e.g. Xero, once its access token expires

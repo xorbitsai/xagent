@@ -1051,10 +1051,10 @@ describe("AgentBuilder preview", () => {
     }
 
     it.each([
-      ["an unsaved connector pick", ["file"], ["github"], ["file", "web_search"], ["file", "web_search", "mcp:github"]],
-      ["an unsaved connector removal", ["file", "mcp:github"], [], ["file", "web_search"], ["file", "web_search"]],
-      ["a bare mcp grant", ["file", "mcp"], null, ["web_search"], ["web_search", "mcp"]],
-      ["stored connectors on an empty result", ["basic", "mcp:github"], null, [], ["mcp:github"]],
+      ["an unsaved connector pick", ["file"], ["github"], ["file", "web_tools"], ["file", "web_tools", "mcp:github"]],
+      ["an unsaved connector removal", ["file", "mcp:github"], [], ["file", "web_tools"], ["file", "web_tools"]],
+      ["a bare mcp grant", ["file", "mcp"], null, ["web_tools"], ["web_tools", "mcp"]],
+      ["stored connectors on an empty result", ["basic_tools", "mcp:github"], null, [], ["mcp:github"]],
     ])("keeps %s", async (_label, stored, picked, chatResult, expected) => {
       storedToolCategories = stored
       render(<AgentBuilder agentId="42" />)
@@ -1069,7 +1069,7 @@ describe("AgentBuilder preview", () => {
 
     it("keeps unsaved picks when the chat call leaves tool_categories null", async () => {
       storedToolCategories = ["file"]
-      availableTools = ["basic", "file"].map((category) => ({ name: category, category, enabled: true }))
+      availableTools = ["basic_tools", "file"].map((category) => ({ name: category, category, enabled: true }))
       render(<AgentBuilder agentId="42" />)
       await screen.findByDisplayValue("Existing SSH agent")
       const toolPicker = () =>
@@ -1077,13 +1077,13 @@ describe("AgentBuilder preview", () => {
           .filter(([props]) => props.placeholder === "builds.configForm.tools.placeholder")
           .pop()?.[0]
       await waitFor(() => expect(toolPicker()?.values).toEqual(["file"]))
-      act(() => toolPicker().onValuesChange(["file", "basic"]))
+      act(() => toolPicker().onValuesChange(["file", "basic_tools"]))
       act(() => connectMcpDialogMock.mock.lastCall?.[0].onConnectSelected(["github"]))
 
       await chatUpdatesCategories(["file"], { name: "Renamed", tool_categories: null })
 
-      expect(await previewCategories()).toEqual(["file", "basic", "mcp:github"])
-      expect(await saveCategories()).toEqual(["file", "basic", "mcp:github"])
+      expect(await previewCategories()).toEqual(["file", "basic_tools", "mcp:github"])
+      expect(await saveCategories()).toEqual(["file", "basic_tools", "mcp:github"])
     })
   })
 

@@ -858,7 +858,7 @@ class CreateAgentTool(AbstractBaseTool):
             "- name: A short, descriptive name for the agent (e.g., 'researcher', 'data_analyzer')\n"
             "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose. Write this in the same natural language as the current output language policy unless the user explicitly asks for another language.\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
-            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"  Example: ['file', 'knowledge', 'basic_tools']\n"
             "  Any other value, including a connector ('mcp' or 'mcp:<server>'), rejects "
             "the whole call; the user manages connectors in the agent builder.\n"
             f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
@@ -1233,7 +1233,7 @@ class UpdateAgentTool(AbstractBaseTool):
             "- name (optional): New name for the agent\n"
             "- description (optional): New description of when to use this agent\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
-            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"  Example: ['file', 'knowledge', 'basic_tools']\n"
             "  Replaces the agent's non-connector categories; any other value, including a "
             "connector ('mcp' or 'mcp:<server>'), rejects the whole call. The user manages "
             "connectors in the agent builder and they are kept automatically; do not pass them.\n"
@@ -2069,6 +2069,7 @@ class AgentTool(AbstractBaseTool):
         self._voice = voice
         self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
         self._excluded_model_ids = excluded_model_ids
+        self._sandbox: Any = None
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2086,6 +2087,16 @@ class AgentTool(AbstractBaseTool):
             execution_scope if execution_scope is not None else get_execution_scope()
         )
         self._visibility = ToolVisibility.PUBLIC
+
+    def with_sandbox(self, sandbox: Any, workspace: Any) -> "AgentTool":
+        """Bind a task-local copy; delegated files stay under the parent's mount."""
+        import copy
+
+        bound = copy.copy(self)
+        bound._sandbox = sandbox
+        if workspace is not None:
+            bound._workspace_base_dir = str(workspace.temp_dir)
+        return bound
 
     @property
     def name(self) -> str:
@@ -2592,6 +2603,7 @@ class AgentTool(AbstractBaseTool):
                 else ()
             )
             tool_config = WebToolConfig(
+                sandbox=self._sandbox,
                 db=None,
                 db_factory=self._session_factory,
                 request=MinimalRequest(self._user_id),

@@ -2764,6 +2764,121 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     return absolute
 
 
+def _platform_git_roots(checkout: Path) -> set[Path]:
+    """Git metadata and readable object stores for a known application checkout.
+
+    Worktrees and separate-git-dir installs put the object database outside the
+    checkout. Resolve their gitdir/commondir pointers and object alternates using
+    files only; a wheel installation need not have the Git executable installed.
+    """
+    import codecs
+
+    entry = checkout / ".git"
+    roots = {entry.resolve()}
+    git_dir = entry
+    try:
+        if entry.is_file():
+            marker = entry.read_text(errors="surrogateescape").strip()
+            if not marker.startswith("gitdir:"):
+                return roots
+            target = marker.removeprefix("gitdir:").strip()
+            if not target:
+                return roots
+            git_dir = (checkout / target).resolve()
+            roots.add(git_dir)
+    except OSError:
+        return roots
+
+    git_dirs = {git_dir}
+    try:
+        common = (git_dir / "commondir").read_text(errors="surrogateescape").strip()
+        if common:
+            git_dirs.add((git_dir / common).resolve())
+    except OSError:
+        pass
+    roots.update(path.resolve() for path in git_dirs)
+    pending = [path / "objects" for path in git_dirs]
+    visited: set[Path] = set()
+    while pending:
+        objects = pending.pop().resolve()
+        if objects in visited:
+            continue
+        visited.add(objects)
+        roots.add(objects)
+        try:
+            alternates = (objects / "info" / "alternates").read_text(
+                errors="surrogateescape"
+            )
+        except OSError:
+            continue
+        for alternate in alternates.splitlines():
+            if not alternate:
+                continue
+            # Git's quoted paths use C byte escapes, including octal UTF-8.
+            if alternate.startswith('"'):
+                if not alternate.endswith('"'):
+                    continue
+                try:
+                    alternate = os.fsdecode(
+                        codecs.escape_decode(os.fsencode(alternate[1:-1]))[0]
+                    )
+                except ValueError:
+                    continue
+            pending.append(objects / alternate)
+    return roots
+
+
+def get_platform_source_roots() -> list[Path]:
+    """Known installed code, checkout sources and Git object stores.
+
+    The backend image retains its build checkout separately from site-packages.
+    Find that checkout through the local installation origin and working tree;
+    never infer a tests directory from an arbitrary site-packages parent.
+    SANDBOX_HOST_PROJECT_ROOT supplies the sibling Docker host's checkout.
+    """
+    import json
+    import tomllib
+    from importlib.metadata import PackageNotFoundError, distribution
+    from urllib.parse import unquote, urlparse
+
+    package = Path(__file__).resolve().parent
+    candidates = {package.parent.parent, *Path.cwd().parents, Path.cwd()}
+    try:
+        origin = distribution("xagent-ai").read_text("direct_url.json")
+        if origin:
+            url = urlparse(json.loads(origin).get("url", ""))
+            if url.scheme == "file" and url.netloc in ("", "localhost"):
+                candidates.add(Path(unquote(url.path)))
+    except (PackageNotFoundError, OSError, ValueError):
+        pass
+    roots = {package}
+    for checkout in candidates:
+        try:
+            project = tomllib.loads((checkout / "pyproject.toml").read_text())
+            if project.get("project", {}).get("name") != "xagent-ai":
+                continue
+            if (checkout / "src" / "xagent").is_dir():
+                roots.add((checkout / "src" / "xagent").resolve())
+                roots.add((checkout / "tests").resolve())
+                roots.update(_platform_git_roots(checkout))
+        except (OSError, ValueError):
+            continue
+    host_checkout = get_sandbox_host_project_root()
+    if host_checkout is not None:
+        roots.update({host_checkout / "src" / "xagent", host_checkout / "tests"})
+        roots.update(_platform_git_roots(host_checkout))
+    return sorted(root.resolve() for root in roots)
+
+
+def get_legacy_source_uploads_dir() -> Path:
+    """Fixed historical data subtree, used only by source-isolation checks.
+
+    This is not an operator-configurable root. Upload configuration must not
+    turn arbitrary application directories into exempt data mounts.
+    """
+    return Path(__file__).resolve().parent / "web" / "uploads"
+
+
 def get_uploads_dir() -> Path:
     """Get the uploads directory path.
 
@@ -4082,12 +4197,21 @@ def get_sandbox_volumes(
     return volumes
 
 
+def get_sandbox_enabled() -> bool:
+    """Whether task execution requires a sandbox (SANDBOX_ENABLED, default false).
+
+    When enabled, an unavailable sandbox must fail closed rather than executing
+    generated commands in the application process.
+    """
+    return _get_bool_env("SANDBOX_ENABLED", False)
+
+
 def get_sandbox_host_project_root() -> Path | None:
-    """Get the host project root used for Docker sibling sandbox code mounts.
+    """Get the host checkout root used to reject unsafe sandbox source mounts.
 
     Priority:
     1. XAGENT_SANDBOX_HOST_PROJECT_ROOT environment variable
-    2. None, which lets callers use their local runtime project root
+    2. None, which checks only the local application source paths
 
     Returns:
         Path to the project root as resolved from the Docker host's perspective,

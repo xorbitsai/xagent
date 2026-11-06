@@ -2,7 +2,7 @@
 
 Domain discipline under test: ``SANDBOX_VOLUMES`` (host-domain triples,
 built with the same ``host_side_sources`` flag the runtime mount-building
-path uses) and code mounts (also already host-domain) are compared as-is;
+path uses) are compared as-is;
 external upload dirs are backend-domain paths, folded then mapped through
 the same ``SandboxPathMapper`` before the conflict check runs -- entirely
 in the post-mapper host domain, over the combined triple set.
@@ -38,16 +38,12 @@ class _ProbeStub:
 @pytest.mark.asyncio
 async def test_readiness_skipped_when_backend_does_not_support_reconciliation():
     """Legacy (Boxlite) backends never reconcile a spec; nothing to protect
-    here even when SANDBOX_VOLUMES and code mounts would otherwise conflict."""
+    here even when SANDBOX_VOLUMES would otherwise conflict."""
     with (
         patch.dict(
             "os.environ",
             {"SANDBOX_VOLUMES": "/foo:/guest1:ro"},
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/foo", "/guest2", "ro")],
         ),
     ):
         await check_sandbox_static_readiness(_ProbeStub(False))
@@ -133,16 +129,9 @@ async def test_volume_subpath_readiness_rejects_external_dir_outside_root(tmp_pa
 
 @pytest.mark.asyncio
 async def test_readiness_skipped_when_no_relevant_env_configured():
-    """Code mounts alone are never checked when neither SANDBOX_VOLUMES nor
-    XAGENT_EXTERNAL_UPLOAD_DIRS is configured -- the self-conflicting code
-    mounts below would raise if the empty-env skip did not short-circuit
-    before the triple set is ever built."""
+    """No custom mounts or external directories is a valid empty topology."""
     with (
         patch.dict("os.environ", {}, clear=True),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/foo", "/guest1", "ro"), ("/foo", "/guest2", "ro")],
-        ),
     ):
         await check_sandbox_static_readiness(_ProbeStub(True))
 
@@ -153,12 +142,8 @@ async def test_readiness_raises_on_host_conflict():
     with (
         patch.dict(
             "os.environ",
-            {"SANDBOX_VOLUMES": "/foo:/guest1:ro"},
+            {"SANDBOX_VOLUMES": "/foo:/guest1:ro;/foo:/guest2:ro"},
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/foo", "/guest2", "ro")],
         ),
     ):
         with pytest.raises(SandboxRuntimeConflictError):
@@ -172,12 +157,8 @@ async def test_readiness_raises_on_guest_crash():
     with (
         patch.dict(
             "os.environ",
-            {"SANDBOX_VOLUMES": "/foo:/guest:ro"},
+            {"SANDBOX_VOLUMES": "/foo:/guest:ro;/bar:/guest:ro"},
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/bar", "/guest", "ro")],
         ),
     ):
         with pytest.raises(SandboxRuntimeConflictError):
@@ -191,12 +172,8 @@ async def test_readiness_allows_identical_triple_duplicated_across_sources():
     with (
         patch.dict(
             "os.environ",
-            {"SANDBOX_VOLUMES": "/foo:/guest:ro"},
+            {"SANDBOX_VOLUMES": "/foo:/guest:ro;/foo:/guest:ro"},
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/foo", "/guest", "ro")],
         ),
     ):
         await check_sandbox_static_readiness(_ProbeStub(True))
@@ -215,12 +192,8 @@ async def test_readiness_groups_paths_the_backend_would_collapse():
     with (
         patch.dict(
             "os.environ",
-            {"SANDBOX_VOLUMES": "//foo:/guest1:ro"},
+            {"SANDBOX_VOLUMES": "//foo:/guest1:ro;/foo:/guest2:ro"},
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/foo", "/guest2", "ro")],
         ),
     ):
         with pytest.raises(SandboxRuntimeConflictError):
@@ -256,10 +229,6 @@ async def test_readiness_checks_folded_external_dirs_against_host_domain(
             },
             clear=True,
         ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
-        ),
     ):
         with pytest.raises(SandboxRuntimeConflictError):
             await check_sandbox_static_readiness(_ProbeStub(True))
@@ -282,10 +251,6 @@ async def test_readiness_allows_non_conflicting_external_dir(tmp_path: Path):
                 "XAGENT_SANDBOX_HOST_STORAGE_ROOT": str(host_storage_root),
             },
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
         ),
     ):
         await check_sandbox_static_readiness(_ProbeStub(True))
@@ -321,10 +286,6 @@ async def test_readiness_dedupes_external_aliases_by_physical_identity(
                 "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/docker-host/storage",
             },
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
         ),
         patch(
             "xagent.web.sandbox_manager._check_no_conflicting_readiness_volumes",
@@ -370,10 +331,6 @@ async def test_readiness_keeps_real_conflict_after_external_alias_dedupe(
             },
             clear=True,
         ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
-        ),
     ):
         with pytest.raises(SandboxRuntimeConflictError):
             await check_sandbox_static_readiness(_ProbeStub(True))
@@ -406,10 +363,6 @@ async def test_readiness_absolutizes_relative_external_dir(
                 "XAGENT_EXTERNAL_UPLOAD_DIRS": "shared-kb",
             },
             clear=True,
-        ),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[],
         ),
     ):
         with pytest.raises(SandboxRuntimeConflictError):

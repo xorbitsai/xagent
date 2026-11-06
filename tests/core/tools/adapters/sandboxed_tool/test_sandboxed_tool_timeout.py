@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import shutil
@@ -14,13 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import cloudpickle
 import pytest
 
-from tests.core.tools.adapters.sandboxed_tool.conftest import FakeBaseTool
 from xagent.core.tools.adapters.vibe.command_executor import CommandExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
-from xagent.core.tools.adapters.vibe.sandboxed_tool import sandboxed_tool_wrapper
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     sandbox_config,
 )
@@ -61,7 +57,9 @@ class RecordingSandbox:
     async def exec(self, command: str, *args: str, env=None, **_: object):
         self.commands.append([command, *args])
         if command == "cat":
-            return FakeExecResult(stdout='{"ok": true}')
+            return FakeExecResult(
+                stdout='{"success": true, "output": "ok", "error": "", "return_code": 0}'
+            )
         if command == "rm":
             return FakeExecResult()
         await asyncio.sleep(self.tool_delay)
@@ -69,23 +67,27 @@ class RecordingSandbox:
 
 
 @sandbox_config(exec_timeout=lambda: 30)
-class BoundedTool(FakeBaseTool):
+class BoundedTool(PythonExecutorToolForBasic):
     @property
     def name(self) -> str:
         return "bounded_tool"
 
 
 @sandbox_config(exec_timeout=lambda: 1)
-class ShortBoundedTool(FakeBaseTool):
+class ShortBoundedTool(PythonExecutorToolForBasic):
     @property
     def name(self) -> str:
         return "short_bounded_tool"
 
 
 @sandbox_config()
-class SecretInitTool(FakeBaseTool):
+class SecretInitTool(PythonExecutorToolForBasic):
     def __init__(self, secret: str) -> None:
+        super().__init__(None)
         self.secret = secret
+
+    def _get_workspace_env(self):
+        return {"CONNECTION_SECRET": self.secret}
 
     @property
     def name(self) -> str:
@@ -115,7 +117,8 @@ async def test_tools_without_exec_timeout_stay_unbounded():
     sandbox = RecordingSandbox()
     wrapper = SandboxedToolWrapper(CommandExecutorToolForBasic(None), sandbox)
 
-    await _run(wrapper, code="")
+    with patch(_ENSURE_REQUIREMENTS, new=AsyncMock()):
+        await wrapper.run_json_async({"command": "true"})
 
     assert sandbox.commands[0][0] == "python"
 
@@ -129,18 +132,13 @@ async def test_runtime_payloads_are_private_files_not_process_arguments():
 
     tool_command = sandbox.commands[0]
     command_text = " ".join(tool_command)
-    assert "--args-file" in tool_command
-    assert "--init-params-file" in tool_command
+    assert "--request-file" in tool_command
     assert "--args-b64" not in tool_command
     assert "--init-params-b64" not in tool_command
     assert "connection-secret" not in command_text
     assert "argument-secret" not in command_text
     assert any("argument-secret" in content for content in sandbox.files.values())
-    assert any(
-        "connection-secret" in repr(cloudpickle.loads(base64.b64decode(content)))
-        for path, content in sandbox.files.items()
-        if path.endswith(".b64")
-    )
+    assert any("connection-secret" in content for content in sandbox.files.values())
 
 
 @pytest.mark.asyncio
@@ -154,11 +152,12 @@ async def test_private_payloads_are_removed_when_tool_execution_fails():
     cleanup_command = sandbox.commands[-1]
     assert cleanup_command[:2] == ["rm", "-f"]
     assert any(path.endswith(".json") for path in cleanup_command[2:])
-    assert any(path.endswith(".b64") for path in cleanup_command[2:])
+    assert len(cleanup_command[2:]) == 3
+    assert cleanup_command[-1].endswith(".runtime.pyz")
 
 
 @pytest.mark.asyncio
-async def test_cancellation_drains_init_upload_before_payload_cleanup():
+async def test_cancellation_drains_request_upload_before_payload_cleanup():
     class DelayedInitUploadSandbox(RecordingSandbox):
         def __init__(self) -> None:
             super().__init__()
@@ -171,7 +170,7 @@ async def test_cancellation_drains_init_upload_before_payload_cleanup():
             self, content: str, remote_path: str, overwrite: bool = False
         ) -> None:
             self.upload_count += 1
-            if self.upload_count == 2:
+            if self.upload_count == 1:
                 self.upload_started.set()
                 await self.release_upload.wait()
                 self.events.append("upload_finished")
@@ -249,10 +248,15 @@ class LocalProcessSandbox:
             argv = [sys.executable, *args]
         else:
             argv = [command, *args]
+        if "-I" in argv:
+            argv[argv.index("-I")] = "-S"
+            bootstrap = argv.index("-c") + 1
+            argv[bootstrap] = (
+                f"import sys; sys.path.extend({[p for p in sys.path if Path(p).name == 'site-packages']!r})\n"
+                + argv[bootstrap]
+            )
         process_env = {**os.environ, **(env or {})}
-        process_env["PYTHONPATH"] = str(
-            Path(sandboxed_tool_wrapper.__file__).parents[6]
-        )
+        process_env["PYTHONPATH"] = ""
         process = await asyncio.create_subprocess_exec(
             *argv,
             env=process_env,
@@ -288,11 +292,6 @@ async def test_timeout_kills_runner_and_its_children(
 ):
     # Leaves room for the runner's cold xagent and pandas imports on CI.
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", "15")
-    monkeypatch.setattr(
-        sandboxed_tool_wrapper,
-        "_TOOL_RUNNER_PATH",
-        str(Path(sandboxed_tool_wrapper.__file__).with_name("tool_runner.py")),
-    )
     pid_file = tmp_path / "child.pid"
     # Written via rename so a kill mid-write never leaves an empty pid file.
     grandchild = (
@@ -327,19 +326,66 @@ async def test_timeout_kills_runner_and_its_children(
 def test_tool_runner_returns_output_with_undecodable_filenames(tmp_path):
     wrapper = SandboxedToolWrapper(PythonExecutorToolForBasic(None), RecordingSandbox())
     result_file = tmp_path / "result.json"
-    command = wrapper._build_execution_command(
-        {"code": "print(b'\\xff'.decode('utf-8', 'surrogateescape'))"},
-        str(result_file),
+    from xagent.sandbox.tool_runtime.bundle import build_runtime_command
+
+    request_file = tmp_path / "request.json"
+    request_file.write_text(
+        json.dumps(
+            wrapper._build_runtime_request(
+                {"code": "print(b'\\xff'.decode('utf-8', 'surrogateescape'))"}
+            )
+        )
+    )
+    command = build_runtime_command(
+        request_file=str(request_file), result_file=str(result_file)
     )
     command[0] = sys.executable
-    command[1] = str(Path(sandboxed_tool_wrapper.__file__).with_name("tool_runner.py"))
+    command[1] = "-S"
+    command[3] = (
+        f"import sys; sys.path.extend({[p for p in sys.path if Path(p).name == 'site-packages']!r})\n"
+        + command[3]
+    )
     env = {
         **os.environ,
         **wrapper._build_execution_env(),
-        "PYTHONPATH": str(Path(sandboxed_tool_wrapper.__file__).parents[6]),
+        "PYTHONPATH": "",
     }
 
     completed = subprocess.run(command, env=env, capture_output=True, text=True)
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(result_file.read_text())["output"] == "\udcff\n"
+
+
+@pytest.mark.asyncio
+async def test_sigkill_cleans_uploaded_runtime_and_private_request():
+    class RecordingLocalSandbox(LocalProcessSandbox):
+        uploaded = []
+        exits = []
+
+        async def write_file(self, content, remote_path, overwrite=False):
+            self.uploaded.append(Path(remote_path))
+            await super().write_file(content, remote_path, overwrite=overwrite)
+
+        async def exec(self, command, *args, **kwargs):
+            result = await super().exec(command, *args, **kwargs)
+            if command == "python":
+                self.exits.append(result.exit_code)
+            return result
+
+    sandbox = RecordingLocalSandbox()
+    wrapper = SandboxedToolWrapper(PythonExecutorToolForBasic(None), sandbox)
+    wrapper._exec_timeout = None
+    with pytest.raises(RuntimeError, match="Tool execution failed"):
+        await _run(
+            wrapper, code="import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+        )
+    assert sandbox.exits == [-9]
+    assert len(sandbox.uploaded) == 1
+    request_file = sandbox.uploaded[0]
+    result_file = request_file.with_name(
+        request_file.name.replace("xagent_args_", "xagent_result_")
+    )
+    assert not request_file.exists()
+    assert not result_file.exists()
+    assert not Path(str(result_file) + ".runtime.pyz").exists()

@@ -1379,7 +1379,11 @@ class TelegramBotInstance(BatchChannelControl[int]):
         # provider's usage is delivered here, for the channel owner whose ASR
         # model is used.
         try:
-            async with usage_scope(owner_user_id, usage_source="telegram_voice"):
+            async with usage_scope(
+                owner_user_id,
+                usage_source="telegram_voice",
+                model_ids=(getattr(asr_model, "model_id", ""),),
+            ):
                 return await self._transcribe_voice_files_in_scope(
                     voice_file_ids, uploaded_info, asr_model
                 )

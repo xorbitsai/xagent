@@ -24,6 +24,8 @@ _CHECK_NAME_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
 # The longest app id a result shows as itself; ``<label>.<check name>`` must
 # still fit a code.
 _MAX_LABEL_LENGTH = 64
+# Every generated label starts with this, and no pass-through label does.
+_GENERATED_LABEL_PREFIX = "custom-"
 
 
 def is_code(value: object) -> bool:
@@ -45,11 +47,18 @@ def connector_label(app_id: str) -> str:
 
     A builtin app id is its own label. An admin-created app's id is free
     text (any string, up to the column's 100 characters), so one that is not
-    a short kebab-case id is named ``custom-<16 hex digits>`` from its
-    SHA-256: stable across runs, so the result diff still matches it, and
-    never the text itself.
+    a short kebab-case id, or that starts with ``custom-``, is named
+    ``custom-<16 hex digits>`` from its SHA-256: stable across runs, so the
+    result diff still matches it, and never the text itself. Generated labels
+    always start with ``custom-`` and pass-through labels never do, so the two
+    cannot collide; only a 64-bit SHA-256 prefix collision between two hashed
+    ids remains.
     """
-    if len(app_id) <= _MAX_LABEL_LENGTH and APP_ID_PATTERN.fullmatch(app_id):
+    if (
+        len(app_id) <= _MAX_LABEL_LENGTH
+        and APP_ID_PATTERN.fullmatch(app_id)
+        and not app_id.startswith(_GENERATED_LABEL_PREFIX)
+    ):
         return app_id
     digest = hashlib.sha256(app_id.encode("utf-8")).hexdigest()[:16]
-    return f"custom-{digest}"
+    return f"{_GENERATED_LABEL_PREFIX}{digest}"

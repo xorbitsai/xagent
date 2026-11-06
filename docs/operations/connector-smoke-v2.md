@@ -115,7 +115,7 @@ The engine runs as an identity through an `IdentityAdapter` (`identity.py`):
 ```
 
 - **Rows.** Each connector has one `session` row (starting it and listing its tools), followed by one `check` row per declared check. The diff keys on `(identity, connector, check)`, with `check` null for the session row. When a session does not pass, none of its checks runs: each is `skip` with `session_unavailable` (`writes_disabled` for a write check) or stays `unprobeable`, so one broken connector is one failure.
-- **`connector`** is the catalog app id. An admin-created app's id is free text, so one that is not a kebab-case id of at most 64 characters is named `custom-<16 hex digits>` from its SHA-256 (`ConnectorTarget.connector`): stable across runs, and never the text itself.
+- **`connector`** is the catalog app id. An admin-created app's id is free text, so one that is not a kebab-case id of at most 64 characters, or that starts with `custom-`, is named `custom-<16 hex digits>` from its SHA-256 (`ConnectorTarget.connector`): stable across runs, and never the text itself. Hashing ids that start with `custom-` too means a generated label never names another app.
 - **`environment`** is the deployment's label, or null when the caller gives none, so the diff can confirm it compares runs of one environment.
 - **`complete`** is false when the run's total timeout cut it, or when it failed to set up; connectors not reached fail with `not_reached`.
 - **`failure`** is a code for a run that could not be set up (`<stage>:<reason>`, such as `enumeration:no_connectors`), and null otherwise. Such a run has no rows; the diff reads it as no data, never as every connector recovering.

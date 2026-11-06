@@ -230,6 +230,8 @@ def _read(**changes: Any) -> ReadCheck:
             _checks(reads=(_read(assertions=(Equals(("a",), float("nan")),)),)),
             "finite",
         ),
+        (ConnectorChecks("custom-foo"), "result label"),
+        (ConnectorChecks("a" * 65), "result label"),
     ],
 )
 def test_a_declaration_breaking_a_rule_is_refused(

@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
 from ..connector_probes import UNPROBEABLE_REASONS, UnprobeableReason
-from .codes import APP_ID_PATTERN, TOOL_NAME_PATTERN, is_check_id
+from .codes import APP_ID_PATTERN, TOOL_NAME_PATTERN, connector_label, is_check_id
 from .fixtures import FixtureRef, FixtureValue
 
 # Bumped on any change a declared check or a consumer must adapt to.
@@ -246,6 +246,8 @@ def validate_connector_checks(checks: ConnectorChecks) -> None:
     app_id = checks.app_id
     if not APP_ID_PATTERN.fullmatch(app_id):
         raise DeclarationError(f"invalid app id: {app_id!r}")
+    if connector_label(app_id) != app_id:
+        raise DeclarationError(f"app id {app_id!r} would not be its own result label")
 
     seen: set[str] = set()
     for check in (*checks.reads, *checks.writes):

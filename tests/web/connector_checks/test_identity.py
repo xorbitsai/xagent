@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from xagent.web.connector_checks.identity import ConnectorTarget
-from xagent.web.connector_checks.results import CheckRow, FailureClass, Outcome
+from xagent.web.connector_checks.results import (
+    CheckRow,
+    FailureClass,
+    Outcome,
+    RunResult,
+    SessionRow,
+)
 
 
 @pytest.mark.parametrize(
@@ -16,6 +24,8 @@ from xagent.web.connector_checks.results import CheckRow, FailureClass, Outcome
         ("acme_crm", "custom-9ac3cd146cf9290a"),
         ("Acme CRM", "custom-31365de30849a645"),
         ("a" * 65, "custom-635361c48bb9eab1"),
+        ("custom-9ac3cd146cf9290a", "custom-99365d0083e712b0"),
+        ("custom-foo", "custom-56c0afbf51db36ac"),
     ],
 )
 def test_a_target_is_named_by_its_app_id_or_a_stable_custom_label(
@@ -25,6 +35,32 @@ def test_a_target_is_named_by_its_app_id_or_a_stable_custom_label(
 
     assert target.connector == connector
     assert ConnectorTarget(app_id).connector == connector
+
+
+def test_a_generated_label_never_names_another_app() -> None:
+    generated = ConnectorTarget("acme_crm")
+    literal = ConnectorTarget("custom-9ac3cd146cf9290a")
+    assert generated.connector != literal.connector
+
+    started = datetime(2026, 11, 6, 10, 0, tzinfo=timezone.utc)
+    result = RunResult(
+        identity="toby",
+        environment="production-au",
+        started_at=started,
+        finished_at=started + timedelta(seconds=5),
+        complete=True,
+        rows=(
+            SessionRow(generated.connector, Outcome.PASS),
+            SessionRow(literal.connector, Outcome.PASS),
+        ),
+    )
+
+    rows = result.to_document()["rows"]
+    assert [row["row"] for row in rows] == ["session", "session"]
+    assert [row["connector"] for row in rows] == [
+        generated.connector,
+        literal.connector,
+    ]
 
 
 @pytest.mark.parametrize("app_id", ["acme_crm", "Acme CRM", "a" * 100, "a" * 64])

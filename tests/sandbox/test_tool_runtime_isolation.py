@@ -25,7 +25,6 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxedToolWrapper,
-    build_code_mount_volumes,
 )
 from xagent.sandbox.tool_runtime.bundle import (
     build_runtime_archive,
@@ -38,15 +37,24 @@ _GUEST_PACKAGES = f"import sys; sys.path.extend({[p for p in sys.path if Path(p)
 _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src"
 
 
-def _invoke(request, tmp_path, *, deny_source=False, extra_path=None):
+def _invoke(request, tmp_path, *, deny_source=False, extra_path=None, user_site=None):
     result_file = tmp_path / "result.json"
-    command = build_runtime_command(request, str(result_file))
+    request_file = tmp_path / "request.json"
+    request_file.write_text(json.dumps(request))
+    command = build_runtime_command(
+        request_file=str(request_file), result_file=str(result_file)
+    )
     command[0] = sys.executable
     command[1] = "-S"
     prefix = _GUEST_PACKAGES
     if extra_path is not None:
         prefix += f"sys.path.insert(0, {str(extra_path)!r})\n"
     command[3] = prefix + command[3]
+    if user_site is not None:
+        command[3] = (
+            f"import site; site.getusersitepackages = lambda: {str(user_site)!r}\n"
+            + command[3]
+        )
     if deny_source:
         profile = (
             f'(version 1)(allow default)(deny file-read* (subpath "{_SOURCE_ROOT}"))'
@@ -64,14 +72,16 @@ def test_runtime_archive_contains_execution_code_only():
     with zipfile.ZipFile(io.BytesIO(build_runtime_archive())) as archive:
         names = set(archive.namelist())
         assert not any(name.startswith("xagent/") for name in names)
-        assert not any(part in names for part in ("config.py", "web/", "tests/"))
+        assert not any(
+            set(Path(name).parts) & {"config.py", "web", "tests", "providers", "agent"}
+            for name in names
+        )
         assert "tool_runtime/runner.py" in names
         for name in names:
             source = archive.read(name)
             assert b"from xagent" not in source
             assert b"import xagent" not in source
             assert b"JWT_SECRET_KEY" not in source
-    assert build_code_mount_volumes() == []
 
 
 def test_python_runs_and_collects_artifacts_without_platform_imports(tmp_path):
@@ -371,7 +381,13 @@ async def test_configured_sandbox_missing_fails_before_tool_creation(monkeypatch
 
     monkeypatch.setenv("SANDBOX_ENABLED", "true")
     config = ToolConfig({"workspace": {"task_id": "live-task"}})
-    with pytest.raises(RuntimeError, match="backend execution is disabled"):
+    with (
+        patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+            new=AsyncMock(return_value=[CommandExecutorToolForBasic()]),
+        ),
+        pytest.raises(RuntimeError, match="backend execution is disabled"),
+    ):
         await ToolFactory.create_all_tools(config)
 
 
@@ -387,10 +403,16 @@ async def test_shell_outputs_keep_host_registration_and_bulk_limits(tmp_path):
         (workspace.output_dir / "report.csv").write_text("answer\n42\n")
         return {"success": True, "output": "", "error": "", "return_code": 0}
 
-    with patch.object(wrapper, "_execute_runtime_request", side_effect=execute):
+    with (
+        patch.object(wrapper, "_execute_runtime_request", side_effect=execute),
+        patch.object(
+            workspace, "register_file", wraps=workspace.register_file
+        ) as register,
+    ):
         result = await wrapper.run_json_async({"command": "create report"})
     assert result["generated_files"] == ["report.csv"]
     assert result["file_refs"][0]["file_id"]
+    register.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -454,3 +476,203 @@ def test_legacy_uploads_symlink_cannot_exempt_source(tmp_path, monkeypatch):
     )
     with pytest.raises(SandboxRuntimeConflictError):
         _reject_platform_source_mounts([(str(alias), "/data", "rw")])
+
+
+def test_every_bundled_module_imports_from_zip_without_backend(tmp_path):
+    process, result = _invoke(
+        {
+            "kind": "python",
+            "arguments": {
+                "code": """import importlib, pkgutil, tool_runtime
+modules = sorted(item.name for item in pkgutil.walk_packages(tool_runtime.__path__, 'tool_runtime.'))
+for name in modules:
+    module = importlib.import_module(name)
+    assert '.runtime.pyz/' in module.__file__, (name, module.__file__)
+assert 'tool_runtime.command_executor' in modules
+assert 'tool_runtime.chrome_daemon_runner' in modules
+assert 'tool_runtime.mcp.sessions' in modules
+print('all imported')
+"""
+            },
+            "working_directory": str(tmp_path),
+        },
+        tmp_path,
+    )
+    assert process.returncode == 0, process.stderr
+    assert result["success"], result
+    assert result["output"].strip() == "all imported"
+    assert not list(tmp_path.glob("*.runtime.pyz"))
+
+
+def test_native_command_runs_in_isolated_zip_on_all_platforms(tmp_path):
+    process, result = _invoke(
+        {
+            "kind": "command",
+            "arguments": {"command": "printf native-command"},
+            "working_directory": str(tmp_path),
+        },
+        tmp_path,
+    )
+    assert process.returncode == 0, process.stderr
+    assert result["success"], result
+    assert result["output"] == "native-command"
+
+
+def test_user_installed_xagent_does_not_brick_existing_guest(tmp_path):
+    user_site = tmp_path / "user-site"
+    package = user_site / "xagent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    process, result = _invoke(
+        {
+            "kind": "python",
+            "arguments": {"code": "print('still usable')"},
+            "working_directory": str(tmp_path),
+        },
+        tmp_path,
+        user_site=user_site,
+    )
+    assert process.returncode == 0, process.stderr
+    assert result["success"]
+    assert result["output"].strip() == "still usable"
+
+
+@pytest.mark.parametrize("origin", ["cwd", "installation"])
+def test_noneditable_install_also_protects_retained_build_checkout(
+    tmp_path, monkeypatch, origin
+):
+    from types import SimpleNamespace
+
+    from xagent import config
+    from xagent.sandbox.base import SandboxRuntimeConflictError
+    from xagent.web.sandbox_manager import _reject_platform_source_mounts
+
+    installed = tmp_path / "venv" / "site-packages" / "xagent"
+    installed.mkdir(parents=True)
+    monkeypatch.setattr(config, "__file__", str(installed / "config.py"))
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "xagent").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text('[project]\nname = "xagent-ai"\n')
+    monkeypatch.chdir(checkout if origin == "cwd" else tmp_path)
+    monkeypatch.setattr(
+        "importlib.metadata.distribution",
+        lambda name: SimpleNamespace(
+            read_text=lambda filename: json.dumps({"url": checkout.as_uri()})
+            if origin == "installation"
+            else None,
+        ),
+    )
+    for source in (installed, checkout / "src", checkout / "tests"):
+        with pytest.raises(SandboxRuntimeConflictError):
+            _reject_platform_source_mounts([(str(source), "/data", "ro")])
+    assert tmp_path / "venv" / "tests" not in config.get_platform_source_roots()
+
+
+def test_case_alias_cannot_exempt_platform_source(tmp_path, monkeypatch):
+    from xagent.sandbox.base import SandboxRuntimeConflictError
+    from xagent.web.sandbox_manager import _reject_platform_source_mounts
+
+    root = tmp_path / "BackendSource"
+    root.mkdir()
+    alias = tmp_path / "backendsource"
+    if not alias.exists():
+        pytest.skip("Filesystem has case-sensitive paths")
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_platform_source_roots", lambda: [root]
+    )
+    with pytest.raises(SandboxRuntimeConflictError):
+        _reject_platform_source_mounts([(str(alias / "web"), "/data", "ro")])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["no_tools", "safe_only"])
+async def test_configured_sandbox_allows_tasks_without_selected_code_tools(
+    monkeypatch, selection
+):
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+    from xagent.core.tools.adapters.vibe.function import FunctionTool
+
+    monkeypatch.setenv("SANDBOX_ENABLED", "true")
+
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    safe = FunctionTool(add)
+    code = CommandExecutorToolForBasic()
+    config = ToolConfig(
+        {"allowed_tools": [] if selection == "no_tools" else [safe.name]}
+    )
+    with (
+        patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+            new=AsyncMock(return_value=[safe, code]),
+        ),
+        patch.object(
+            ToolFactory,
+            "_apply_output_filters",
+            side_effect=lambda tools, _config: tools,
+        ),
+    ):
+        tools = await ToolFactory.create_all_tools(config)
+    assert tools == ([] if selection == "no_tools" else [safe])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["python", "javascript"])
+async def test_executor_result_contract_is_normalized_on_host(kind):
+    from xagent.core.tools.adapters.vibe.javascript_executor import (
+        JavaScriptExecutorToolForBasic,
+    )
+    from xagent.core.tools.adapters.vibe.python_executor import (
+        PythonExecutorToolForBasic,
+    )
+
+    tool = (
+        PythonExecutorToolForBasic()
+        if kind == "python"
+        else JavaScriptExecutorToolForBasic()
+    )
+    wrapper = SandboxedToolWrapper(tool, object())
+    with patch.object(
+        wrapper,
+        "_run_json_in_sandbox",
+        new=AsyncMock(return_value={"success": False, "error": "Execution timed out"}),
+    ):
+        result = await wrapper.run_json_async({})
+    assert result == {
+        "success": False,
+        "output": "",
+        "error": "Execution timed out",
+        "generated_files": [],
+        "file_refs": [],
+        "artifacts": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_javascript_generated_file_suffix_survives_registration_failure():
+    from xagent.core.tools.adapters.vibe.javascript_executor import (
+        JavaScriptExecutorToolForBasic,
+    )
+
+    wrapper = SandboxedToolWrapper(JavaScriptExecutorToolForBasic(), object())
+    payload = {
+        "success": True,
+        "output": "done",
+        "generated_files": ["report.csv"],
+        "file_refs": [{"filename": "report.csv", "file_path": "/guest/report.csv"}],
+        "artifacts": [],
+    }
+    with (
+        patch.object(
+            wrapper, "_run_json_in_sandbox", new=AsyncMock(return_value=payload)
+        ),
+        patch.object(
+            wrapper,
+            "_register_sandbox_outputs",
+            new=AsyncMock(side_effect=RuntimeError("registration unavailable")),
+        ),
+    ):
+        result = await wrapper.run_json_async({})
+    assert result["output"] == "done\n\nGenerated files: report.csv"
+    assert len(result["artifacts"]) == len(result["file_refs"]) == 1

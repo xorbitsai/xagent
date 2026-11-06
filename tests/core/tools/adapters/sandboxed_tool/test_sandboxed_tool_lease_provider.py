@@ -39,7 +39,9 @@ class FakeSandbox:
     async def exec(self, command: str, *args: str, env: dict[str, str] | None = None):
         self.exec_calls.append((command, args))
         if command == "cat":
-            return FakeExecResult(stdout=f'{{"sandbox": "{self.name}"}}')
+            return FakeExecResult(
+                stdout=f'{{"success": true, "output": "{self.name}", "return_code": 0}}'
+            )
         return FakeExecResult()
 
 
@@ -95,7 +97,7 @@ async def test_safe_tool_executes_through_worker_sandbox() -> None:
     ) as ensure_requirements:
         result = await wrapper.run_json_async({"command": "true"})
 
-    assert result == {"sandbox": "worker"}
+    assert result["success"] and result["output"] == "worker"
     assert provider.lease_calls == [True]
     ensure_requirements.assert_awaited_once()
     assert ensure_requirements.await_args.args[0] is worker
@@ -117,7 +119,7 @@ async def test_unsafe_tool_executes_through_primary_sandbox() -> None:
     ) as ensure_requirements:
         result = await wrapper.run_json_async({"command": "true"})
 
-    assert result == {"sandbox": "primary"}
+    assert result["success"] and result["output"] == "primary"
     assert provider.lease_calls == [False]
     ensure_requirements.assert_awaited_once()
     assert ensure_requirements.await_args.args[0] is primary

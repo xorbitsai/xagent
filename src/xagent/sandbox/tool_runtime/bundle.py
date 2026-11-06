@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import zipfile
 from collections.abc import Mapping
 from functools import lru_cache
@@ -30,17 +29,20 @@ _RUNTIME_FILES = {
 # -I ignores PYTHONPATH and the caller's cwd. Restore the guest's user-installed
 # dependencies explicitly: Boxlite executes as the sandbox user, whose declared
 # packages may have been installed with pip --user. No backend path is added.
-_BOOTSTRAP = """import base64, importlib.util, pathlib, runpy, site, sys, tempfile
-site.addsitedir(site.getusersitepackages())
+_BOOTSTRAP = """import base64, importlib.util, os, pathlib, runpy, site, sys
 if any(pathlib.Path(path).exists() for path in ('/app/src', '/app/tests')):
     raise RuntimeError('Legacy source is visible; recreate this sandbox before execution')
 if importlib.util.find_spec('xagent') is not None:
     raise RuntimeError('The platform application is installed; use a clean tool image')
-with tempfile.TemporaryDirectory(prefix='tool-runtime-') as directory:
-    archive = pathlib.Path(directory) / 'runtime.pyz'
-    archive.write_bytes(base64.b64decode(sys.argv[1]))
+site.addsitedir(site.getusersitepackages())
+archive = pathlib.Path(sys.argv[-1] + '.runtime.pyz')
+try:
+    with os.fdopen(os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+        output.write(base64.b64decode(sys.argv[1]))
     sys.argv = [str(archive), *sys.argv[2:]]
     runpy.run_path(str(archive), run_name='__main__')
+finally:
+    archive.unlink(missing_ok=True)
 """
 
 
@@ -102,30 +104,20 @@ def build_runtime_archive() -> bytes:
     return output.getvalue()
 
 
-def build_runtime_command(
-    request: Mapping[str, Any],
-    result_file: str,
-    *,
-    request_file: str | None = None,
-) -> list[str]:
-    """Production callers pass private files; argv carries only public runtime code."""
-    payload = (
-        ["--request-file", request_file]
-        if request_file is not None
-        else [
-            "--request-b64",
-            base64.b64encode(
-                json.dumps(dict(request), ensure_ascii=False).encode()
-            ).decode("ascii"),
-        ]
-    )
+def build_runtime_command(*, request_file: str, result_file: str) -> list[str]:
+    """Run private JSON input; argv carries only public execution runtime code.
+
+    The caller also removes ``result_file + '.runtime.pyz'`` in its cleanup
+    scope so SIGKILL cannot leave an archive in a long-lived sandbox.
+    """
     return [
         "python",
         "-I",
         "-c",
         _BOOTSTRAP,
         base64.b64encode(build_runtime_archive()).decode("ascii"),
-        *payload,
+        "--request-file",
+        request_file,
         "--result-file",
         result_file,
     ]

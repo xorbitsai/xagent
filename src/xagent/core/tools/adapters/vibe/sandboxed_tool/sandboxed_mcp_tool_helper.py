@@ -87,11 +87,6 @@ def requires_sandbox_mcp_connection(connection: Connection) -> bool:
     )
 
 
-def _serialize_connection(connection: Connection) -> str:
-    """Serialize a connection dict for a private sandbox-side file."""
-    return json.dumps(connection, ensure_ascii=False)
-
-
 async def list_tools_in_sandbox(
     sandbox: Sandbox | _SandboxLeaseProviderLike,
     connection: Connection,
@@ -126,7 +121,7 @@ async def list_tools_in_sandbox(
         )
         try:
             command = build_runtime_command(
-                {}, result_file, request_file=connection_file
+                request_file=connection_file, result_file=result_file
             )
             result = await asyncio.wait_for(
                 target_sandbox.exec(command[0], *command[1:], env={"PYTHONPATH": ""}),
@@ -186,7 +181,9 @@ async def list_tools_in_sandbox(
         return tools
     finally:
         try:
-            await target_sandbox.exec("rm", "-f", connection_file, result_file)
+            await target_sandbox.exec(
+                "rm", "-f", connection_file, result_file, result_file + ".runtime.pyz"
+            )
         except Exception:
             pass
 

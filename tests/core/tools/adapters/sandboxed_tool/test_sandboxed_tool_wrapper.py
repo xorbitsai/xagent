@@ -22,7 +22,6 @@ from xagent.core.tools.adapters.vibe.javascript_executor import (
 )
 from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    build_code_mount_volumes,
     create_sandboxed_tool,
 )
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
@@ -71,7 +70,7 @@ async def _create_sandbox(service: BoxliteSandboxService, name: str):
     config = SandboxConfig(
         cpus=1,
         memory=1024,
-        volumes=build_code_mount_volumes(),
+        volumes=[],
     )
     sandbox = await service.get_or_create(name, template=template, config=config)
     return sandbox

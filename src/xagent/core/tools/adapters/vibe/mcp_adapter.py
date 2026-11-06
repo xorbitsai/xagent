@@ -1952,14 +1952,9 @@ def _strict_http_401_responses(
 
 def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
     try:
-        # Lazy import keeps the core adapter independent from the web layer
-        # at import time -- and, since this runs inside MCPToolAdapter.
-        # run_json_async, which tool_runner.py reconstructs and calls for
-        # every sandboxed npx/uvx MCP tool call, from crashing with
-        # ModuleNotFoundError on a 401 (mcp_oauth.py needs sqlalchemy,
-        # which the sandbox never installs) instead of just skipping the
-        # refresh attempt the same way an unparsable challenge already
-        # does below.
+        # Keep the web OAuth parser optional for standalone core consumers.
+        # Authorization and refresh execute on the host, including for MCP
+        # calls whose stdio transport is delegated into a sandbox.
         from .....web.services.mcp_oauth import parse_www_authenticate_bearer
     except ImportError:
         parse_www_authenticate_bearer = None  # type: ignore[assignment]
@@ -5593,7 +5588,10 @@ async def load_mcp_tools_as_agent_tools(
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
             sandbox_required = should_sandbox_mcp_connection(connection)
-            if requires_sandbox_mcp_connection(connection) and sandbox is None:
+            if sandbox is None and (
+                requires_sandbox_mcp_connection(connection)
+                or (_root_config.get_sandbox_enabled() and sandbox_required)
+            ):
                 raise RuntimeError(
                     "This stdio MCP connection requires a sandbox, but no sandbox "
                     "is available"

@@ -57,7 +57,9 @@ class RecordingSandbox:
     async def exec(self, command: str, *args: str, env=None, **_: object):
         self.commands.append([command, *args])
         if command == "cat":
-            return FakeExecResult(stdout='{"ok": true}')
+            return FakeExecResult(
+                stdout='{"success": true, "output": "ok", "error": "", "return_code": 0}'
+            )
         if command == "rm":
             return FakeExecResult()
         await asyncio.sleep(self.tool_delay)
@@ -150,7 +152,8 @@ async def test_private_payloads_are_removed_when_tool_execution_fails():
     cleanup_command = sandbox.commands[-1]
     assert cleanup_command[:2] == ["rm", "-f"]
     assert any(path.endswith(".json") for path in cleanup_command[2:])
-    assert len(cleanup_command[2:]) == 2
+    assert len(cleanup_command[2:]) == 3
+    assert cleanup_command[-1].endswith(".runtime.pyz")
 
 
 @pytest.mark.asyncio
@@ -323,9 +326,18 @@ async def test_timeout_kills_runner_and_its_children(
 def test_tool_runner_returns_output_with_undecodable_filenames(tmp_path):
     wrapper = SandboxedToolWrapper(PythonExecutorToolForBasic(None), RecordingSandbox())
     result_file = tmp_path / "result.json"
-    command = wrapper._build_execution_command(
-        {"code": "print(b'\\xff'.decode('utf-8', 'surrogateescape'))"},
-        str(result_file),
+    from xagent.sandbox.tool_runtime.bundle import build_runtime_command
+
+    request_file = tmp_path / "request.json"
+    request_file.write_text(
+        json.dumps(
+            wrapper._build_runtime_request(
+                {"code": "print(b'\\xff'.decode('utf-8', 'surrogateescape'))"}
+            )
+        )
+    )
+    command = build_runtime_command(
+        request_file=str(request_file), result_file=str(result_file)
     )
     command[0] = sys.executable
     command[1] = "-S"
@@ -343,3 +355,37 @@ def test_tool_runner_returns_output_with_undecodable_filenames(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(result_file.read_text())["output"] == "\udcff\n"
+
+
+@pytest.mark.asyncio
+async def test_sigkill_cleans_uploaded_runtime_and_private_request():
+    class RecordingLocalSandbox(LocalProcessSandbox):
+        uploaded = []
+        exits = []
+
+        async def write_file(self, content, remote_path, overwrite=False):
+            self.uploaded.append(Path(remote_path))
+            await super().write_file(content, remote_path, overwrite=overwrite)
+
+        async def exec(self, command, *args, **kwargs):
+            result = await super().exec(command, *args, **kwargs)
+            if command == "python":
+                self.exits.append(result.exit_code)
+            return result
+
+    sandbox = RecordingLocalSandbox()
+    wrapper = SandboxedToolWrapper(PythonExecutorToolForBasic(None), sandbox)
+    wrapper._exec_timeout = None
+    with pytest.raises(RuntimeError, match="Tool execution failed"):
+        await _run(
+            wrapper, code="import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+        )
+    assert sandbox.exits == [-9]
+    assert len(sandbox.uploaded) == 1
+    request_file = sandbox.uploaded[0]
+    result_file = request_file.with_name(
+        request_file.name.replace("xagent_args_", "xagent_result_")
+    )
+    assert not request_file.exists()
+    assert not result_file.exists()
+    assert not Path(str(result_file) + ".runtime.pyz").exists()

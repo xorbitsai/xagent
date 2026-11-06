@@ -202,15 +202,23 @@ class ChromeDaemonClient:
             *args,
         ]
         try:
-            await _write_sandbox_file_cancellation_safe(
-                self._sandbox,
-                json.dumps(
-                    {"kind": "chrome", "arguments": command_args}, ensure_ascii=False
-                ),
-                request_file,
-                overwrite=False,
+            try:
+                await _write_sandbox_file_cancellation_safe(
+                    self._sandbox,
+                    json.dumps(
+                        {"kind": "chrome", "arguments": command_args},
+                        ensure_ascii=False,
+                    ),
+                    request_file,
+                    overwrite=False,
+                )
+            except Exception as exc:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} request upload failed"
+                ) from exc
+            command = build_runtime_command(
+                request_file=request_file, result_file=result_file
             )
-            command = build_runtime_command({}, result_file, request_file=request_file)
             try:
                 execution = await asyncio.wait_for(
                     self._sandbox.exec(
@@ -289,7 +297,13 @@ class ChromeDaemonClient:
         finally:
             try:
                 cleanup = await asyncio.wait_for(
-                    self._sandbox.exec("rm", "-f", result_file, request_file),
+                    self._sandbox.exec(
+                        "rm",
+                        "-f",
+                        result_file,
+                        request_file,
+                        result_file + ".runtime.pyz",
+                    ),
                     timeout=_RESULT_CLEANUP_TIMEOUT_SECONDS,
                 )
                 if cleanup.exit_code != 0:

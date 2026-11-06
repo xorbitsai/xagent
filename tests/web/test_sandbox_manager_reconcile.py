@@ -45,13 +45,9 @@ from xagent.web.services.workspace_binding import build_chat_workspace_binding
 
 @pytest.fixture
 def _env(tmp_path):
-    """Isolate sandbox env config and neutralize code mounts."""
+    """Isolate sandbox environment configuration."""
     with (
         patch.dict("os.environ", {}, clear=True),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
-        ),
         patch("xagent.web.sandbox_manager.grant_sandbox_runtime_access"),
     ):
         yield
@@ -1316,10 +1312,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1343,10 +1335,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1367,10 +1355,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1386,10 +1370,6 @@ class TestReadinessReservedUploadsSubtree:
                     "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:/shared:rw",
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
         ):
             manager, _service = _make_manager()
@@ -1412,10 +1392,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1437,10 +1413,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
@@ -1461,10 +1433,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
@@ -1480,10 +1448,6 @@ class TestReadinessReservedUploadsSubtree:
                     "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:rw",
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
         ):
             manager, _service = _make_manager()
@@ -1534,10 +1498,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
@@ -1557,10 +1517,6 @@ class TestReadinessReservedUploadsSubtree:
                     "SANDBOX_VOLUMES": (f"{unrelated_source}:{tmp_path}:rw"),
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
         ):
             manager, _service = _make_manager()
@@ -1592,10 +1548,6 @@ class TestReadinessReservedUploadsSubtree:
                     ),
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
             patch(
                 "xagent.web.sandbox_manager.scoped_user_root",

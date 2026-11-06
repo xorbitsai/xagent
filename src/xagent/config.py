@@ -2764,6 +2764,43 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     return absolute
 
 
+def get_platform_source_roots() -> list[Path]:
+    """Known installed and checkout code paths, including noneditable builds.
+
+    The backend image retains its build checkout separately from site-packages.
+    Find that checkout through the local installation origin and working tree;
+    never infer a tests directory from an arbitrary site-packages parent.
+    Docker-host paths are supplied separately by SANDBOX_HOST_PROJECT_ROOT.
+    """
+    import json
+    import tomllib
+    from importlib.metadata import PackageNotFoundError, distribution
+    from urllib.parse import unquote, urlparse
+
+    package = Path(__file__).resolve().parent
+    candidates = {package.parent.parent, *Path.cwd().parents, Path.cwd()}
+    try:
+        origin = distribution("xagent-ai").read_text("direct_url.json")
+        if origin:
+            url = urlparse(json.loads(origin).get("url", ""))
+            if url.scheme == "file" and url.netloc in ("", "localhost"):
+                candidates.add(Path(unquote(url.path)))
+    except (PackageNotFoundError, OSError, ValueError):
+        pass
+    roots = {package}
+    for checkout in candidates:
+        try:
+            project = tomllib.loads((checkout / "pyproject.toml").read_text())
+            if project.get("project", {}).get("name") != "xagent-ai":
+                continue
+            if (checkout / "src" / "xagent").is_dir():
+                roots.add((checkout / "src" / "xagent").resolve())
+                roots.add((checkout / "tests").resolve())
+        except (OSError, ValueError):
+            continue
+    return sorted(roots)
+
+
 def get_legacy_source_uploads_dir() -> Path:
     """Fixed historical data subtree, used only by source-isolation checks.
 

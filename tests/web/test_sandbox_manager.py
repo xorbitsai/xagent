@@ -712,10 +712,6 @@ class TestSandboxConfigParsing:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager = SandboxManager(FakeSandboxService())
             manager._backend_probe = True
@@ -746,10 +742,6 @@ class TestSandboxLifecycleConfig:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             await manager.get_or_create_sandbox(
                 "user",
@@ -778,10 +770,6 @@ class TestSandboxLifecycleConfig:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             await manager.get_or_create_sandbox(
                 "user",
@@ -810,10 +798,6 @@ class TestSandboxLifecycleConfig:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             first = await manager.get_or_create_sandbox(
                 "user", "42", mount_intent=mount_intent
@@ -842,10 +826,6 @@ class TestSandboxLifecycleConfig:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             first = await manager.get_or_create_sandbox(
                 "user", "42", mount_intent=mount_intent
@@ -878,10 +858,6 @@ class TestSandboxLeaseProvider:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             provider = await manager.create_lease_provider(
                 "user",
@@ -910,10 +886,6 @@ class TestSandboxLeaseProvider:
         with (
             patch.dict(
                 "os.environ", {"XAGENT_SANDBOX_MAX_CONCURRENCY": "2"}, clear=True
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
             ),
         ):
             provider = await manager.create_lease_provider(
@@ -950,10 +922,6 @@ class TestSandboxLeaseProvider:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             provider = await manager.create_lease_provider(
                 "user",
@@ -982,10 +950,6 @@ class TestSandboxLeaseProvider:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             provider = await manager.create_lease_provider(
                 "user",
@@ -1028,10 +992,6 @@ class TestSandboxLeaseProvider:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             provider = await manager.create_lease_provider(
                 "user",
@@ -1052,10 +1012,6 @@ class TestSandboxLeaseProvider:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             provider = await manager.create_lease_provider(
                 "user",
@@ -1084,10 +1040,6 @@ class TestSandboxLeaseProvider:
         with (
             patch.dict(
                 "os.environ", {"XAGENT_SANDBOX_MAX_CONCURRENCY": "2"}, clear=True
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
             ),
         ):
             provider = await manager.create_lease_provider(
@@ -1363,10 +1315,6 @@ class TestGetOrCreateLeaseProvider:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             first = await manager.get_or_create_lease_provider(
                 "user", "7", mount_intent=mount_intent
@@ -1397,10 +1345,6 @@ class TestGetOrCreateLeaseProvider:
 
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/repo/src", "/app/src", "ro")],
-            ),
         ):
             provider = await manager.get_or_create_lease_provider(
                 "user", "7", mount_intent=mount_intent

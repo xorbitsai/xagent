@@ -19,6 +19,7 @@ from ..config import (
     get_boxlite_home_dir,
     get_external_upload_dirs,
     get_legacy_source_uploads_dir,
+    get_platform_source_roots,
     get_sandbox_cpus,
     get_sandbox_enabled,
     get_sandbox_env,
@@ -39,9 +40,6 @@ from ..config import (
     get_sandbox_workspace_volume_root,
     get_storage_root,
     get_uploads_dir,
-)
-from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    build_code_mount_volumes,
 )
 from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
@@ -1271,7 +1269,7 @@ class SandboxManager:
             mount_intent: Actual sandbox mount intent, when known
         """
         # No platform source is mounted; calls carry an execution-only runtime.
-        volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
+        volumes: list[tuple[str, str, str]] = []
         path_mapper = SandboxPathMapper.from_env()
 
         if get_sandbox_workspace_mount_mode() == "bind":
@@ -2852,16 +2850,28 @@ class SandboxManager:
             )
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Compare lexical paths and existing filesystem aliases (including case)."""
+    if path.is_relative_to(root):
+        return True
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.samefile(root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _reject_platform_source_mounts(volumes: list[tuple[str, str, str]]) -> None:
     """Reject custom mounts that would put backend code back into the guest.
 
-    Check ancestors as well as descendants, including symlink spellings. The
+    Check ancestors and descendants, including locally resolvable aliases. The
     managed uploads subtree is data, even in legacy installations that put it
     below web/. Sibling Docker's configured host checkout is checked in its own
     path domain; its source directories are no longer mounted automatically.
     """
-    package_root = Path(__file__).resolve().parents[1]
-    roots = [package_root, package_root.parent.parent / "tests"]
+    roots = get_platform_source_roots()
     data = Path(get_uploads_dir()).resolve()
     legacy_data = get_legacy_source_uploads_dir()
     # A configured uploads root must never exempt web/, core/, or a symlink
@@ -2878,8 +2888,8 @@ def _reject_platform_source_mounts(volumes: list[tuple[str, str, str]]) -> None:
     for host, _guest, _mode in volumes:
         candidate = Path(host).resolve()
         for root in roots:
-            covers_code = root.is_relative_to(candidate)
-            contains_code = candidate.is_relative_to(root)
+            covers_code = _path_is_within(root, candidate)
+            contains_code = _path_is_within(candidate, root)
             managed_data = any(
                 data != root
                 and data.is_relative_to(root)
@@ -3185,7 +3195,6 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
         path_mapper,
     )
     volumes = list(custom_volumes)
-    volumes.extend(build_code_mount_volumes())
 
     folded_external = dedupe_backend_mount_paths(external_dirs)
     for backend_dir in folded_external:

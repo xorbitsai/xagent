@@ -12,7 +12,6 @@ from __future__ import annotations
 # intentionally absent from the backend package tree.
 import argparse
 import asyncio
-import base64
 import json
 import mimetypes
 import os
@@ -145,16 +144,10 @@ def main() -> None:
         str(Path(site.getuserbase()) / "bin") + os.pathsep + os.environ.get("PATH", "")
     )
     parser = argparse.ArgumentParser()
-    payload = parser.add_mutually_exclusive_group(required=True)
-    payload.add_argument("--request-b64")
-    payload.add_argument("--request-file")
+    parser.add_argument("--request-file", required=True)
     parser.add_argument("--result-file", required=True)
     parsed = parser.parse_args()
-    request = (
-        json.loads(Path(parsed.request_file).read_text(encoding="utf-8"))
-        if parsed.request_file
-        else json.loads(base64.b64decode(parsed.request_b64))
-    )
+    request = json.loads(Path(parsed.request_file).read_text(encoding="utf-8"))
     if request.get("kind") == "chrome":
         import sys
 

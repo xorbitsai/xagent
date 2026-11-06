@@ -31,6 +31,7 @@ from ...utils.media_download import (
     resolve_workspace_media_path,
 )
 from ...workspace import TaskWorkspace
+from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
 
@@ -610,6 +611,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         **kwargs: Any,
     ) -> Dict[str, Any]:
         actual_model_id = model_id or "default"
+        video_model: Optional[BaseVideoModel] = None
         try:
             kwargs = self._normalize_extra_kwargs(kwargs)
             kwargs.pop("allowed_local_media_roots", None)
@@ -737,7 +739,24 @@ The generated video URL is temporary on the provider side, so completed videos a
                     self._workspace.workspace_dir
                 ]
 
-            result = await video_model.generate_video(**generate_params)
+            # The provider is the only thing in this method that speaks for
+            # somebody else, so it is also the only failure whose text cannot
+            # be handed on. Everything that fails before or after it is our
+            # own argument check or file handling, and keeps its message.
+            try:
+                result = await video_model.generate_video(**generate_params)
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Video generation failed",
+                        model=video_model,
+                    ),
+                    "video_path": None,
+                    "model_used": actual_model_id,
+                }
 
             video_url = result.get("video_url")
             video_path = None
@@ -789,7 +808,6 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "frames": result.get("frames"),
                 "model_used": actual_model_id,
                 "saved_to_workspace": video_path is not None,
-                "raw_response": result.get("raw_response"),
             }
             if download_error is not None:
                 response["download_error"] = download_error
@@ -824,10 +842,13 @@ The generated video URL is temporary on the provider side, so completed videos a
             }
 
         except Exception as e:
-            logger.error("Failed to list available video models: %s", e)
             return {
                 "success": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list available video models",
+                ),
                 "models": [],
                 "count": 0,
             }

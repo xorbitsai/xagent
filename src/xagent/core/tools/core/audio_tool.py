@@ -30,8 +30,14 @@ from .audio_tool_descriptions import (
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
     TRANSCRIBE_AUDIO_DESCRIPTION,
 )
+from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
+
+# The output formats the synthesize_speech description documents. Reported
+# back when a provider rejects the request, so the model can pick one of these
+# instead of guessing at what the provider wanted.
+_TTS_AUDIO_FORMATS = ("mp3", "wav", "pcm")
 
 
 class AudioToolCore:
@@ -724,12 +730,30 @@ class AudioToolCore:
 
             # Always request provider timing detail. The public verbose flag controls
             # whether callers receive raw provider segments or processed cues.
-            result = await asr_model.transcribe(
-                audio=audio_path,
-                language=language,
-                verbose=True,
-                **kwargs,
-            )
+            try:
+                result = await asr_model.transcribe(
+                    audio=audio_path,
+                    language=language,
+                    verbose=True,
+                    **kwargs,
+                )
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Audio transcription failed",
+                        model=asr_model,
+                    ),
+                    "file_id": None,
+                    "transcription_path": None,
+                    "model_used": (
+                        model_id
+                        if model_id and model_id in self._asr_models
+                        else "default"
+                    ),
+                }
 
             # Determine the actual model used
             actual_model_id = (
@@ -926,13 +950,31 @@ class AudioToolCore:
                 )
 
             # Synthesize the speech (async)
-            result = await tts_model.synthesize(
-                text=text,
-                voice=voice,
-                language=language,
-                format=audio_format,
-                **synthesis_kwargs,
-            )
+            try:
+                result = await tts_model.synthesize(
+                    text=text,
+                    voice=voice,
+                    language=language,
+                    format=audio_format,
+                    **synthesis_kwargs,
+                )
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Speech synthesis failed",
+                        model=tts_model,
+                        allowed_values={"audio_format": list(_TTS_AUDIO_FORMATS)},
+                    ),
+                    "audio_path": None,
+                    "model_used": (
+                        model_id
+                        if model_id and model_id in self._tts_models
+                        else "default"
+                    ),
+                }
 
             # Determine the actual model used
             actual_model_id = (
@@ -1083,10 +1125,13 @@ class AudioToolCore:
             }
 
         except Exception as e:
-            logger.error(f"Failed to list available models: {e}")
             return {
                 "success": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list available audio models",
+                ),
                 "models": [],
                 "asr_count": 0,
                 "tts_count": 0,
@@ -1807,12 +1852,32 @@ class AudioToolCore:
                 kwargs["reference_audio"] = self._resolve_audio_path(ref_audio_id)
 
             # Synthesize speech
-            audio_data = await tts_model.synthesize(
-                text=text,
-                voice=voice,
-                language=language,
-                **kwargs,
-            )
+            try:
+                audio_data = await tts_model.synthesize(
+                    text=text,
+                    voice=voice,
+                    language=language,
+                    **kwargs,
+                )
+            except Exception as e:
+                failure = media_failure_fields(
+                    e,
+                    logger=logger,
+                    action=f"Segment {index} synthesis failed",
+                    model=tts_model,
+                    allowed_values={"audio_format": list(_TTS_AUDIO_FORMATS)},
+                )
+                # The batch aggregates these into its own ``errors`` list,
+                # where the segment number is the only thing that says which
+                # input failed; the sentence itself carries no provider text.
+                failure["error"] = f"Segment {index}: {failure['error']}"
+                return {
+                    "success": False,
+                    **failure,
+                    "index": index,
+                    "text": text,
+                    "saved_to_workspace": False,
+                }
 
             # Handle result
             if isinstance(audio_data, bytes):

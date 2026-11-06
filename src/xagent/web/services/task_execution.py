@@ -2866,9 +2866,12 @@ async def execute_task_background(
                     llm_user_message or user_message, prompt_context
                 )
             else:
+                requirement_block = await asyncio.to_thread(
+                    output_requirement_block, output_format
+                )
                 task_for_agent = insert_before_prompt_context_block(
                     llm_user_message or user_message,
-                    output_requirement_block(output_format),
+                    requirement_block,
                     prompt_context,
                 )
             if prompt_context_block is not None:
@@ -2903,7 +2906,8 @@ async def execute_task_background(
                 agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
             # The model text may carry server-added context (uploaded files, the
-            # prompt-context block). Whenever it differs from the transcript text,
+            # output requirement block, the prompt-context block). Whenever it
+            # differs from the transcript text,
             # record the transcript text as the display message for the
             # user_message trace event; a display message the caller set wins.
             if task_for_agent != user_message and not _has_display_message_override(

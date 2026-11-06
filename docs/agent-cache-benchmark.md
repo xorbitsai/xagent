@@ -122,3 +122,70 @@ performance:
 PYTHONPATH=src:. uv run --frozen pytest -q \
   tests/core/agent/test_prompt_prefix.py tests/core/agent/test_agent_cache_benchmark.py
 ```
+
+## Concurrent agents and foreground traffic
+
+The concurrent harness runs independent real ReAct audits together, with a fresh
+scope at the beginning of each system prompt. Each audit checks two invoices,
+retries a transient error, uses the sum tool and verifies its saved output. The
+first successful invoice tool waits for a configured duration; agents alternate
+between the listed short/long waits. Sessions, contexts, receipts and output
+files remain separate. A fixed number of unrelated foreground requests arrive
+at a fixed cadence, independently of how quickly the agents finish.
+
+```bash
+PYTHONPATH=src:. uv run --frozen python -m scripts.agent_cache_concurrency_benchmark \
+  --endpoint https://xinference.example.com --model your-model-uid \
+  --api-key-file /secure/xinference-key \
+  --tokenizer-json /models/checkpoint/tokenizer.json \
+  --variant lifecycle --agents 4 --max-inflight 2 \
+  --context-tokens 65536 --context-window 131072 \
+  --tool-delays 2 20 --probes 8 --probe-tokens 8192 \
+  --probe-start 5 --probe-interval 10 --output /tmp/agent-cache-concurrent-4
+```
+
+Run two-agent and four-agent batches in fresh directories. Keep model weights,
+replicas, engine sequence limits, GPU KV budgets and workload arguments identical
+between these configurations:
+
+| Variant | Agent behavior | Operator-configured server |
+| --- | --- | --- |
+| `baseline` | Suppress affinity/lifecycle metadata in this harness only | Native Xavier cache |
+| `lifecycle` | Real runner routing scope and automatic lifecycle metadata | Same native Xavier cache |
+| `lmcache` | Same client behavior as `lifecycle` | Xavier with LMCache RAM/filesystem tiers |
+
+The variant label does **not** enable Xavier, launch models, select a storage
+backend, or introduce a production feature switch. Record server configuration,
+source commits and hardware telemetry independently. Optimized audits fail their
+protocol check if the deployed adapter does not send the expected metadata or
+acknowledge waiting/finished transitions. First agent and foreground calls must
+report zero cached tokens. Foreground responses must contain `OK`.
+
+All calls share a FIFO client admission queue with `--max-inflight` slots. Set
+this deliberately, for example two slots for two replicas each configured with
+one active engine sequence. This measures multiple agent sessions with bounded
+inference concurrency, not unrestricted engine admission. Every call records
+`admission_wait_s` separately from its model-call duration. Foreground latency
+runs from its scheduled arrival through admission and response completion, so
+queueing is not hidden. The workload finishes after both audits and the fixed
+foreground workload finish. Task throughput uses successful audits divided by
+that complete batch duration; failed tasks remain in attempted counts and make
+the batch fail. Per-agent durations, raw calls, traces and saved audits remain
+available even when another agent fails. A partially failed batch must not be
+published as an all-success performance sample.
+
+The optional `--gpu-telemetry-json` accepts a continuously refreshed mapping of
+GPU index to rows containing `utc` (timezone-aware ISO 8601), `temperature_C`,
+`sw_thermal_throttle` and `hw_thermal_throttle`. Missing/stale telemetry fails
+closed. Above 70 C or with a thermal flag, new calls wait, in-flight calls drain,
+and admission resumes at 60 C. The harness changes no GPU settings. Any run with
+thermal throttling must be retained and excluded from clean timing comparisons.
+Use a separate start-temperature gate and external monitor for repeatable runs.
+
+Only shared cooldown intervals with zero in-flight requests are counted in
+`cooling_idle_s`; never sum overlapping per-request admission waits. Reports keep
+both actual batch wall time and a wait-subtracted experimental measurement.
+Neither subtracting waits nor limiting admission establishes production capacity:
+extra pauses affect cache lifetime and queueing, and can overlap tool delays.
+Small batches report foreground median/max, not a production p95. Repeat batches,
+retain failures/exclusions, and compare foreground delay alongside agent throughput.

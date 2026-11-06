@@ -3314,8 +3314,8 @@ class TestModelAPI:
         handle = AsyncMock()
         gate_calls: list = []
 
-        def gate(user_id, source):
-            gate_calls.append((user_id, source))
+        def gate(user_id, source, model_ids):
+            gate_calls.append((user_id, source, model_ids))
             return {"code": "ai_credits_exhausted", "message": "Out of AI credits"}
 
         quota_hooks.set_standalone_gate_hook(gate)
@@ -3333,7 +3333,8 @@ class TestModelAPI:
         detail = response.json()["detail"]
         assert detail["code"] == "standalone_usage_refused"
         assert detail["reason"]["code"] == "ai_credits_exhausted"
-        assert gate_calls == [(regular_user["id"], "speech_transcribe")]
+        # The request names no model: the gate gets the user's default.
+        assert gate_calls == [(regular_user["id"], "speech_transcribe", ("test-asr",))]
         handle.assert_not_called()
         assert standalone_hook.calls == []
 

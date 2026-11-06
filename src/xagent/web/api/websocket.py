@@ -1833,11 +1833,16 @@ manager = ConnectionManager()
 
 
 def _holds_ingress(handler: Any) -> Any:
-    """Keep ``manager.ingress`` held for a command handler's whole run."""
+    """Keep ``manager.ingress`` held for a command handler's whole run.
+
+    Bound to the connection manager that exists at import time, so replacing
+    the module-level ``manager`` (tests do) cannot disturb the tracking.
+    """
+    connections = manager
 
     @wraps(handler)
     async def wrapper(websocket: WebSocket, *args: Any, **kwargs: Any) -> Any:
-        async with manager.ingress(websocket):
+        async with connections.ingress(websocket):
             return await handler(websocket, *args, **kwargs)
 
     return wrapper

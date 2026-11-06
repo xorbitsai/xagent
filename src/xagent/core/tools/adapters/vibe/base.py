@@ -24,8 +24,10 @@ class ToolCategory(str, Enum):
     AUDIO = "audio"
     KNOWLEDGE = "knowledge"
     FILE = "file"
-    WEB_SEARCH = "web_search"
-    BASIC = "basic"
+    WEB_TOOLS = "web_tools"
+    WEB_SEARCH = WEB_TOOLS  # Compatibility name for existing integrations.
+    BASIC = "basic_tools"
+    CODE_EXECUTION = "code_execution"
     BROWSER = "browser"
     PPT = "ppt"
     AGENT = "agent"
@@ -34,6 +36,14 @@ class ToolCategory(str, Enum):
     SKILL = "skill"
     SSH = "ssh"
     OTHER = "other"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "ToolCategory | None":
+        # Old metadata/checkpoints still decode; permission selectors are
+        # resolved separately so legacy grants keep their original scope.
+        if isinstance(value, str):
+            return {"basic": cls.BASIC, "web_search": cls.WEB_TOOLS}.get(value)
+        return None
 
 
 # Tool categories that users may not assign to an agent configuration.

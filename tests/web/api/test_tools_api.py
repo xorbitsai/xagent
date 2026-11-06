@@ -732,8 +732,8 @@ class TestToolsAvailableAPI:
         assert tool_display_categories.get("browser_navigate") == "Browser"
         assert tool_categories.get("browser_navigate") == "browser"
 
-        assert tool_display_categories.get("fetch_web_content") == "Web Search"
-        assert tool_categories.get("fetch_web_content") == "web_search"
+        assert tool_display_categories.get("fetch_web_content") == "Web Tools"
+        assert tool_categories.get("fetch_web_content") == "web_tools"
 
     def test_get_available_tools_marks_always_available_tools(self) -> None:
         from xagent.core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
@@ -1763,3 +1763,45 @@ class TestAvailableToolsSandboxLifecycle:
         sandbox_manager.release.assert_awaited_once()
         release_args = sandbox_manager.release.await_args.args
         assert release_args[0] == "tools"
+
+
+@pytest.mark.asyncio
+async def test_available_tools_exposes_canonical_and_legacy_category_catalogs(
+    monkeypatch,
+):
+    from xagent.core.tools.adapters.vibe.categories import (
+        category_catalog,
+        legacy_category_catalog,
+    )
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness()
+    db = harness.install(monkeypatch)
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False), db=db
+    )
+    assert response["categories"] == category_catalog()
+    assert response["legacy_categories"] == legacy_category_catalog()
+
+
+@pytest.mark.asyncio
+async def test_configurable_search_provider_returns_its_runtime_category(monkeypatch):
+    from xagent.core.tools.adapters.vibe.api_tool import APITool
+    from xagent.web.api.tools import get_configurable_tools
+
+    monkeypatch.setattr(
+        "xagent.web.api.tools.list_configurable_tool_names",
+        lambda: ["tavily_web_search"],
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.tools.get_tool_credential_view",
+        lambda *_args: {"configured": False, "fields": {}},
+    )
+    response = await get_configurable_tools(
+        current_user=SimpleNamespace(is_admin=True), db=object()
+    )
+    assert (
+        response["tools"][0]["category"]
+        == APITool().metadata.category.value
+        == "web_tools"
+    )

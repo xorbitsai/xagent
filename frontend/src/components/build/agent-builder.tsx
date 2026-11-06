@@ -1,5 +1,7 @@
 "use client"
 
+import { formatToolCategory, describeToolCategory, toolMatchesCategory } from "@/lib/tool-category-labels"
+
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
 import { AgentBuilderChat } from "./agent-builder-chat"
@@ -354,7 +356,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     models, modelsStatus, retryModels, userDefaultGeneral, modelDefaultsSettled,
     kbs, kbsStatus, reloadKbs,
     skills, skillsStatus, retrySkills,
-    tools, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
+    tools, toolCategoryDefinitions, legacyToolCategories, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
     mcpServers, setMcpServers, mcpSettled,
   } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
@@ -1058,14 +1060,19 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp' && isAssignableToolCategory(c)))
   ).sort()
 
-  const toolCategoryOptions = toolCategories.map(category => {
-    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(t => t.category === category)
-    const categoryDesc = getCategoryDescription(category)
+  // Keep existing selectors explicit until the user changes those grants.
+  // Replacing legacy basic with Web Tools would also grant search access.
+  const retainedLegacyCategories = legacyToolCategories.filter(category => selectedToolCategories.includes(category.id))
+  const categoryIds = Array.from(new Set([...toolCategories, ...retainedLegacyCategories.map(category => category.id)]))
+  const toolCategoryOptions = categoryIds.map(category => {
+    const legacy = retainedLegacyCategories.find(item => item.id === category)
+    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(tool => toolMatchesCategory(tool, category, legacyToolCategories))
+    const categoryDesc = legacy ? t('builds.configForm.tools.existingPermissions') : getCategoryDescription(category)
     return {
       value: category,
-      label: getCategoryLabel(category),
+      label: getCategoryLabel(category) + (legacy ? ` (${t('builds.configForm.tools.existingPermissions')})` : ''),
       count: toolsInCategory.length,
-      description: (categoryDesc ? `**${categoryDesc}**\n\n` : '') + `${toolsInCategory.map(t => t.name).join(', ')}`
+      description: (categoryDesc ? `**${categoryDesc}**\n\n` : '') + toolsInCategory.map(tool => tool.name).join(', '),
     }
   })
 
@@ -1102,46 +1109,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     ...(skillLoaderTool && selectedSkills.length > 0 ? [skillLoaderTool] : []),
   ]
 
-  // Helper function for category descriptions
-  function getCategoryDescription(category: string): string {
-    const descriptions: Record<string, string> = {
-      'basic': t('builds.configForm.tools.categoryDescriptions.basic'),
-      'web_search': t('builds.configForm.tools.categoryDescriptions.webSearch'),
-      'file': t('builds.configForm.tools.categoryDescriptions.file'),
-      'vision': t('builds.configForm.tools.categoryDescriptions.vision'),
-      'image': t('builds.configForm.tools.categoryDescriptions.image'),
-      'video': t('builds.configForm.tools.categoryDescriptions.video'),
-      'knowledge': t('builds.configForm.tools.categoryDescriptions.knowledge'),
-      'mcp': t('builds.configForm.tools.categoryDescriptions.mcp'),
-      'browser': t('builds.configForm.tools.categoryDescriptions.browser'),
-      'ppt': t('builds.configForm.tools.categoryDescriptions.ppt'),
-      'office': t('builds.configForm.tools.categoryDescriptions.office'),
-      'special_image': t('builds.configForm.tools.categoryDescriptions.specialImage'),
-      'database': t('builds.configForm.tools.categoryDescriptions.database'),
-      'skill': t('builds.configForm.tools.categoryDescriptions.skill'),
-    }
-    return descriptions[category] || ""
+  function translateCategory(key: string) {
+    return t(key as Parameters<typeof t>[0])
   }
 
-  // Helper function for category labels
+  function getCategoryDescription(category: string): string {
+    return describeToolCategory(category, translateCategory)
+  }
+
   function getCategoryLabel(category: string): string {
-    const labels: Record<string, string> = {
-      'basic': t('builds.configForm.tools.categories.basic'),
-      'web_search': t('builds.configForm.tools.categories.webSearch'),
-      'file': t('builds.configForm.tools.categories.file'),
-      'vision': t('builds.configForm.tools.categories.vision'),
-      'image': t('builds.configForm.tools.categories.image'),
-      'video': t('builds.configForm.tools.categories.video'),
-      'knowledge': t('builds.configForm.tools.categories.knowledge'),
-      'mcp': t('builds.configForm.tools.categories.mcp'),
-      'browser': t('builds.configForm.tools.categories.browser'),
-      'ppt': t('builds.configForm.tools.categories.ppt'),
-      'office': t('builds.configForm.tools.categories.office'),
-      'special_image': t('builds.configForm.tools.categories.specialImage'),
-      'database': t('builds.configForm.tools.categories.database'),
-      'skill': t('builds.configForm.tools.categories.skill'),
-    }
-    return labels[category] || category
+    const definition = toolCategoryDefinitions.find(item => item.id === category)
+    return formatToolCategory(category, translateCategory, definition?.label)
   }
 
   const handlePreviewSendMessage = async (content: string, config?: any, files?: Array<File | PreviewAttachment>, fresh = false) => {
@@ -2652,7 +2630,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             <div className="text-xs text-muted-foreground">
               {t("builds.configForm.tools.selectedCount", {
                 count: selectedToolCategories.length,
-                tools: tools.filter(t => selectedToolCategories.includes(t.category)).length
+                tools: tools.filter(tool => selectedToolCategories.some(category => toolMatchesCategory(tool, category, legacyToolCategories))).length
               })}
             </div>
           )}

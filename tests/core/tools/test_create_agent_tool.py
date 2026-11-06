@@ -250,7 +250,9 @@ class TestCreateAgentTool:
             assert hidden not in categories
             assert hidden not in advertised(create_categories_line)
             assert hidden not in advertised(update_categories_line)
-        assert "basic" in categories
+        assert {"basic_tools", "code_execution", "web_tools"} <= set(categories)
+        assert "basic" not in categories
+        assert "web_search" not in categories
 
     def test_resolve_llm_tool_categories_trims_and_deduplicates(self) -> None:
         assert resolve_llm_tool_categories([" file", "file", "basic "], "x") == [

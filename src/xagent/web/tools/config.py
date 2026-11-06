@@ -3054,7 +3054,7 @@ class WebToolConfig(BaseToolConfig):
             connector_runtime_turn_id=self._connector_runtime_turn_id,
             connector_team_id=self._connector_team_id,
             load_policy=(self._user_id is not None and has_user_tool_policy_hooks()),
-            load_basic=(wants_category("basic") or wants_category("web_search")),
+            load_basic=wants_category("web_tools"),
             load_sql=wants_category("database"),
             load_custom_api=(
                 True

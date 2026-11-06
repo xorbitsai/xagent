@@ -61,6 +61,7 @@ from .base import (
     BINDING_AUTHORIZED_CATEGORIES,
     INTRINSIC_TOOL_NAMES,
 )
+from .categories import LEGACY_CATEGORY_DISPATCH, legacy_category_admits
 
 logger = logging.getLogger(__name__)
 
@@ -448,7 +449,9 @@ class ToolSelectionSpec(ABC):
         categories: frozenset[str] = getattr(self, "categories", frozenset())
         if cat in BINDING_AUTHORIZED_CATEGORIES:
             return self.includes_binding_authorized()
-        return cat in categories
+        return cat in categories or any(
+            cat in LEGACY_CATEGORY_DISPATCH.get(selected, ()) for selected in categories
+        )
 
 
 def should_load_mcp_server_configs(
@@ -785,9 +788,13 @@ class _SpecByCategories(ToolSelectionSpec):
             category = str(tool.metadata.category.value)
 
             # Plain category admit (categories holds only plain names).
-            if category in self.categories or (
-                category in BINDING_AUTHORIZED_CATEGORIES
-                and self.includes_binding_authorized()
+            if (
+                category in self.categories
+                or legacy_category_admits(self.categories, tool_name, category)
+                or (
+                    category in BINDING_AUTHORIZED_CATEGORIES
+                    and self.includes_binding_authorized()
+                )
             ):
                 names.add(tool_name)
                 continue

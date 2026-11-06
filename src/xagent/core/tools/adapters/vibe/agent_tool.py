@@ -36,6 +36,7 @@ from .base import (
     ToolCategory,
     ToolVisibility,
 )
+from .categories import LEGACY_CATEGORY_TOOL_NAMES
 from .config import (
     NESTED_DELEGATION_NOT_APPROVABLE_REASON,
     run_with_tool_runtime_cleanup,
@@ -85,7 +86,7 @@ def resolve_llm_tool_categories(raw: Any, connector_error: str) -> list[str]:
         name = category.strip()
         if _is_connector_category(name):
             connectors.append(category)
-        elif name not in choices:
+        elif name not in choices and name not in LEGACY_CATEGORY_TOOL_NAMES:
             invalid.append(category)
         elif name not in selected:
             selected.append(name)
@@ -858,7 +859,7 @@ class CreateAgentTool(AbstractBaseTool):
             "- name: A short, descriptive name for the agent (e.g., 'researcher', 'data_analyzer')\n"
             "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose. Write this in the same natural language as the current output language policy unless the user explicitly asks for another language.\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
-            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"  Example: ['file', 'knowledge', 'basic_tools']\n"
             "  Any other value, including a connector ('mcp' or 'mcp:<server>'), rejects "
             "the whole call; the user manages connectors in the agent builder.\n"
             f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
@@ -1233,7 +1234,7 @@ class UpdateAgentTool(AbstractBaseTool):
             "- name (optional): New name for the agent\n"
             "- description (optional): New description of when to use this agent\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
-            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"  Example: ['file', 'knowledge', 'basic_tools']\n"
             "  Replaces the agent's non-connector categories; any other value, including a "
             "connector ('mcp' or 'mcp:<server>'), rejects the whole call. The user manages "
             "connectors in the agent builder and they are kept automatically; do not pass them.\n"

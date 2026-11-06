@@ -4,6 +4,9 @@
  * so the two surfaces can't drift out of sync with each other. */
 export const TOOL_CATEGORY_I18N_KEYS: Record<string, string> = {
   basic: "builds.configForm.tools.categories.basic",
+  basic_tools: "builds.configForm.tools.categories.basic",
+  code_execution: "builds.configForm.tools.categories.codeExecution",
+  web_tools: "builds.configForm.tools.categories.webSearch",
   web_search: "builds.configForm.tools.categories.webSearch",
   file: "builds.configForm.tools.categories.file",
   vision: "builds.configForm.tools.categories.vision",
@@ -14,6 +17,7 @@ export const TOOL_CATEGORY_I18N_KEYS: Record<string, string> = {
   browser: "builds.configForm.tools.categories.browser",
   ppt: "builds.configForm.tools.categories.ppt",
   office: "builds.configForm.tools.categories.office",
+  special_image: "builds.configForm.tools.categories.specialImage",
   database: "builds.configForm.tools.categories.database",
   skill: "builds.configForm.tools.categories.skill",
   ssh: "builds.configForm.tools.categories.ssh",
@@ -32,7 +36,7 @@ export function capitalize(value: string): string {
  * headline (`browser`, `knowledge`) - then appends skill names verbatim
  * (they're author-chosen slugs, not translated categories).
  */
-const CARD_TAG_EXCLUDED_CATEGORIES = new Set(["basic", "browser", "knowledge"]);
+const CARD_TAG_EXCLUDED_CATEGORIES = new Set(["basic", "basic_tools", "browser", "knowledge"]);
 
 export function getCardCapabilityTags(
   toolCategories: string[] | undefined,
@@ -46,4 +50,40 @@ export function getCardCapabilityTags(
     )
     .map(formatCategory);
   return [...categoryTags, ...(skills || [])];
+}
+
+export interface ToolCategoryDefinition {
+  id: string;
+  label: string;
+}
+
+export interface LegacyToolCategoryDefinition {
+  id: string;
+  tool_names: string[];
+}
+
+export function formatToolCategory(
+  category: string,
+  translate: (key: string, fallback: string) => string,
+  fallback = category.split("_").map(capitalize).join(" "),
+): string {
+  const key = TOOL_CATEGORY_I18N_KEYS[category];
+  return key ? translate(key, fallback) : fallback;
+}
+
+export function describeToolCategory(
+  category: string,
+  translate: (key: string, fallback: string) => string,
+): string {
+  const key = category === "ssh" ? undefined : TOOL_CATEGORY_I18N_KEYS[category];
+  return key ? translate(key.replace(".categories.", ".categoryDescriptions."), "") : "";
+}
+
+export function toolMatchesCategory(
+  tool: { name: string; category: string },
+  category: string,
+  legacyCategories: LegacyToolCategoryDefinition[],
+): boolean {
+  const legacy = legacyCategories.find(item => item.id === category);
+  return legacy ? legacy.tool_names.includes(tool.name) : tool.category === category;
 }

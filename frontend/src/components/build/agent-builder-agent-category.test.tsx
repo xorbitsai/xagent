@@ -114,7 +114,7 @@ vi.mock("@/hooks/use-file-mention", () => ({
 // tool-category selector actually offers.
 vi.mock("@/components/ui/multi-select", () => ({
   MultiSelect: (props: any) => (
-    <div data-testid="multi-select" data-placeholder={props.placeholder}>
+    <div data-testid="multi-select" data-placeholder={props.placeholder} data-option-labels={(props.options || []).map((option: any) => option.label).join("|")}>
       {(props.options || []).map((o: any) => o.value).join("|")}
     </div>
   ),
@@ -469,5 +469,32 @@ describe("AgentBuilder extra built-in tools (issue #306)", () => {
     fireEvent.click(document.getElementById("selectAllSkills")!)
 
     await waitFor(() => expect(block()?.textContent).toBe(`${PREFIX}skill_loader_x`))
+  })
+})
+
+it("preserves an existing Basic selector without converting it to broader Web Tools", async () => {
+  installApi(["basic"], undefined, {
+    tools: [
+      { name: "ask_user_question", description: "Ask", category: "basic_tools", enabled: true },
+      { name: "execute_python_code", description: "Python", category: "code_execution", enabled: true },
+      { name: "api_call", description: "HTTP", category: "web_tools", enabled: true },
+      { name: "fetch_web_content", description: "Fetch", category: "web_tools", enabled: true },
+    ],
+    categories: [
+      { id: "basic_tools", label: "Basic Tools" },
+      { id: "code_execution", label: "Code Execution" },
+      { id: "web_tools", label: "Web Tools" },
+    ],
+    legacy_categories: [{ id: "basic", tool_names: ["ask_user_question", "execute_python_code", "api_call"] }],
+  })
+  render(<AgentBuilder agentId={AGENT_ID} />)
+  await waitFor(() => expect(screen.getByDisplayValue("Legacy Agent")).toBeInTheDocument())
+  expect(toolCategorySelector()).toHaveAttribute("data-option-labels", expect.stringContaining("builds.configForm.tools.categories.basic (builds.configForm.tools.existingPermissions)"))
+  fireEvent.change(screen.getByDisplayValue("Legacy Agent"), { target: { value: "Renamed Legacy Agent" } })
+  fireEvent.click(screen.getByText("builds.editor.header.update"))
+  await waitFor(() => {
+    const put = apiRequestMock.mock.calls.find(([, options]) => (options as any)?.method === "PUT")
+    expect(put).toBeTruthy()
+    expect(JSON.parse((put![1] as any).body).tool_categories).toEqual(["basic"])
   })
 })

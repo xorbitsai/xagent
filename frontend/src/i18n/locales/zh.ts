@@ -1604,7 +1604,7 @@ const zh = {
     },
     categories: {
       basic: "基础工具",
-      web_search: "网页搜索",
+      web_search: "网络工具",
       browser: "浏览器工具",
       vision: "视觉工具",
       image: "图像工具",
@@ -3213,7 +3213,8 @@ const zh = {
         selectAll: "全选",
         categories: {
           basic: "基础工具",
-          webSearch: "网页搜索",
+          codeExecution: "代码执行",
+          webSearch: "网络工具",
           file: "文件操作",
           vision: "视觉",
           image: "图像生成",
@@ -3229,9 +3230,11 @@ const zh = {
           skill: "技能工具",
           ssh: "SSH",
         },
+        existingPermissions: "原有权限",
         categoryDescriptions: {
-          basic: "系统基础能力：执行 Python/JavaScript 代码和命令行命令、调用 HTTP API、翻译 JSON 字段。",
-          webSearch: "网页搜索与网页内容抓取，用于查找资料并按需读取网页正文。",
+          codeExecution: "在执行环境中运行 Python、JavaScript 和命令行命令。",
+          basic: "结构化提问和 JSON 字段翻译。启用任意工具时，时间查询和时区校验始终内置可用。",
+          webSearch: "搜索网页、抓取网页内容、下载网络资源和调用 HTTP API。",
           file: "文件系统操作，支持文件的读写、搜索、列表和管理。",
           vision: "计算机视觉能力，支持图像识别、分析和内容提取。",
           image: "图像生成与处理，支持文生图、图像编辑等创意功能。",

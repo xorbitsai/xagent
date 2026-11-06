@@ -14,6 +14,12 @@ from sqlalchemy.orm import Query, Session
 from ...config import get_uploads_dir
 from ...core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
 from ...core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
+from ...core.tools.adapters.vibe.categories import (
+    CATEGORY_DISPLAY_NAMES,
+    category_catalog,
+    configurable_tool_category,
+    legacy_category_catalog,
+)
 from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
 from ..init_tool_configs import get_default_tool_configs
@@ -95,26 +101,6 @@ def _require_user_id(current_user: User) -> int:
         return user_id
     raise HTTPException(status_code=500, detail="Authenticated user is missing an id")
 
-
-# Category display names (for frontend display)
-CATEGORY_DISPLAY_NAMES = {
-    "vision": "Vision",
-    "image": "Image",
-    "video": "Video",
-    "audio": "Audio",
-    "knowledge": "Knowledge",
-    "file": "File",
-    "web_search": "Web Search",
-    "basic": "Basic",
-    "browser": "Browser",
-    "ppt": "PPT",
-    "agent": "Agent",
-    "mcp": "MCP",
-    "skill": "Skill",
-    "ssh": "SSH",
-    "database": "Database",
-    "other": "Other",
-}
 
 # 创建路由器
 tools_router = APIRouter(prefix="/api/tools", tags=["tools"])
@@ -509,6 +495,8 @@ async def get_available_tools(
             "tools": tools,
             "count": len(tools),
             "skill_loader_tool": LOAD_SKILL_TOOL_NAME,
+            "categories": category_catalog(),
+            "legacy_categories": legacy_category_catalog(),
         }
 
     return await run_with_tool_runtime_cleanup(
@@ -536,6 +524,7 @@ async def get_configurable_tools(
             {
                 "tool_name": tool_name,
                 "display_name": view.get("display_name", tool_name),
+                "category": configurable_tool_category(tool_name),
                 "configured": view["configured"],
                 "fields": view["fields"],
             }

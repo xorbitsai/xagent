@@ -34,7 +34,7 @@ class TavilyWebSearchResult(BaseModel):
 class TavilyWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the Tavily web search tool."""
 
-    category = ToolCategory.WEB_SEARCH
+    category = ToolCategory.WEB_TOOLS
     read_only = True  # read-only HTTP search ⇒ concurrency-safe
 
     def __init__(self, api_key: str | None = None) -> None:

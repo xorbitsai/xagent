@@ -63,11 +63,10 @@ and symlink aliases, are rejected. Do not install the full Xagent package in a
 custom sandbox image: execution refuses an environment where that package or the
 former `/app/src` and `/app/tests` directories are visible.
 
-On upgrade, drain running work and restart the backend. Startup cleanup detects
-changed mounts and recreates affected Boxlite environments; Docker also checks
-the desired spec when resolving a sandbox. Managed bind-mounted task files
-survive, but the disposable writable layer does not. Boxlite recreates environments
-whose stored configuration is missing or changed.
+On upgrade, drain running work and restart the backend. Docker reconciles the
+changed mount spec when resolving a sandbox. Boxlite recreates environments
+whose stored configuration is missing or changed. Managed bind-mounted task
+files survive recreation, but the disposable writable layer does not.
 Do not restore old snapshots without auditing them for copied platform source.
 Source copies already made into task files or disclosed to users need separate
 incident handling; changing mounts cannot erase them.

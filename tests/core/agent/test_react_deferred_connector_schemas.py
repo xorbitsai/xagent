@@ -477,16 +477,20 @@ async def test_a_follow_up_message_preloads_the_connector_it_names() -> None:
 
 @pytest.mark.asyncio
 async def test_a_quoted_exact_tool_name_is_preloaded() -> None:
+    # The tool's name has nothing to do with its source, and a sibling shares
+    # the source, so only exact-name matching can load this one tool.
+    tools = [
+        ConnectorTool("lookup_roadmap", "wiki"),
+        ConnectorTool("archive_page", "wiki"),
+    ]
     llm = ScriptedLLM([{"content": "hi"}])
     await _pattern().run(
-        context=_ctx("please call notion_search for the roadmap"),
-        tools=_tools(),
-        llm=llm,
+        context=_ctx("please call lookup_roadmap for me"), tools=tools, llm=llm
     )
 
     names = _names(llm.calls[0])
-    assert "notion_search" in names
-    assert "hubspot_search_contacts" not in names
+    assert "lookup_roadmap" in names
+    assert "archive_page" not in names
 
 
 @pytest.mark.asyncio
@@ -521,8 +525,7 @@ async def test_a_forced_answer_turn_sends_no_loaded_connector_schema() -> None:
     tools = _tools()
     llm = ScriptedLLM(
         [
-            _call(LOAD_TOOLS_NAME, {"names": ["notion_search"]}, "c1"),
-            _call("notion_search", {"query": "plan"}, "c2"),
+            _call("notion_search", {"query": "plan"}, "c1"),
             _call(
                 "final_answer",
                 {
@@ -530,17 +533,21 @@ async def test_a_forced_answer_turn_sends_no_loaded_connector_schema() -> None:
                     "answer": "done",
                     "outcome": "completed",
                 },
-                "c3",
+                "c2",
             ),
         ]
     )
-    await ReActPattern(max_iterations=2, defer_connector_schemas=True).run(
-        context=_ctx(), tools=tools, llm=llm
-    )
+    # The message names Notion, so its schema is sent on the work call.
+    # finalize_after_tool_result then forces the answer turn that follows the
+    # tool result: the in-loop forced-answer branch, not the iteration limit.
+    await ReActPattern(
+        max_iterations=6, defer_connector_schemas=True, finalize_after_tool_result=True
+    ).run(context=_ctx("search Notion for the plan"), tools=tools, llm=llm)
 
-    assert "notion_search" in _names(llm.calls[1])
-    forced = _names(llm.calls[-1])
-    assert "notion_search" not in forced and "final_answer" in forced
+    work_call, forced = llm.calls
+    assert "notion_search" in _names(work_call)
+    assert "notion_search" not in _names(forced)
+    assert "final_answer" in _names(forced)
 
 
 @pytest.mark.asyncio
@@ -664,3 +671,179 @@ async def test_loaded_schemas_go_after_the_stored_result_reader() -> None:
     assert SPILL_READ_TOOL_NAME in first
     assert second[: len(first)] == first
     assert second[-1] == "notion_search"
+
+
+def _component(context: ExecutionContext) -> LoadedToolsComponent:
+    component = context.get_component(LOADED_TOOLS_COMPONENT)
+    assert isinstance(component, LoadedToolsComponent)
+    return component
+
+
+def test_a_mention_preload_does_not_promote_a_pending_load() -> None:
+    """Interrupted after load_tools(X), resumed by a message that never names X.
+
+    X's sibling call is still saved; it must be refused until a model call has
+    actually been sent X's schema.
+    """
+    tools = _tools()
+    context = _ctx("add a note")
+    pattern = _pattern()
+    pattern._tools_with_deferral(tools, context)
+    pattern._request_loads(context, ["notion_search"])  # the loader ran
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed.add_user_message("ok, continue")
+    resumed_pattern = _pattern()
+    resumed_pattern._tools_with_deferral(tools, resumed)
+
+    assert resumed_pattern._deferred_tool_unloaded("notion_search", resumed)
+    # The next schema-bearing model call is where it becomes available.
+    schemas = resumed_pattern._normal_tool_schemas([], None, tools, resumed)
+    assert [s["function"]["name"] for s in schemas] == ["notion_search"]
+    assert not resumed_pattern._deferred_tool_unloaded("notion_search", resumed)
+
+
+async def _replay(
+    result: dict[str, Any],
+    args: dict[str, Any],
+    context: ExecutionContext,
+    pattern: Any,
+    tools: list[Any],
+) -> Any:
+    from xagent.core.agent.runtime import PatternRuntime
+
+    runtime = PatternRuntime(execution_id="replay")
+
+    async def committed(_call: dict[str, Any]) -> dict[str, Any]:
+        return {"result": result, "error": result.get("error")}
+
+    runtime.load_committed_tool_outcome = committed  # type: ignore[method-assign]
+    call = {"id": "r1", "name": LOAD_TOOLS_NAME, "args": args}
+    return await pattern._execute_tool_safely(call, tools, runtime, context=context)
+
+
+@pytest.mark.asyncio
+async def test_replaying_a_committed_failed_load_returns_the_saved_failure() -> None:
+    tools = _tools()
+    pattern = _pattern()
+    context = _ctx()
+    prepared = pattern._tools_with_deferral(tools, context)
+    saved = {
+        "success": False,
+        "error": "load_tools requires names",
+        "tool_name": "load_tools",
+    }
+
+    result = await _replay(
+        saved,
+        {"names": [{"name": "notion_search"}, "hubspot_create_note"]},
+        context,
+        pattern,
+        prepared,
+    )
+
+    assert result == saved
+    # A failed outcome loads nothing.
+    assert not _component(context).pending and not _component(context).names
+
+
+@pytest.mark.asyncio
+async def test_replaying_a_committed_load_applies_the_cap_to_new_names_only() -> None:
+    many = [ConnectorTool(f"hubspot_tool_{i}", "hubspot") for i in range(14)]
+    names = [t.name for t in many]
+    pattern = _pattern()
+    context = _ctx()
+    prepared = pattern._tools_with_deferral(many, context)
+    _component(context).names.extend(names[:12])  # twelve already loaded
+
+    await _replay(
+        {"success": True, "output": "Loaded: hubspot_tool_12, hubspot_tool_13."},
+        {"names": names},
+        context,
+        pattern,
+        prepared,
+    )
+
+    assert _component(context).pending == ["hubspot_tool_12", "hubspot_tool_13"]
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_hide_a_later_mention_from_the_scan() -> None:
+    tools = _tools()
+    context = _ctx("hello")
+    for text in ("one", "two"):
+        await _pattern().run(
+            context=context, tools=tools, llm=ScriptedLLM([{"content": "hi"}])
+        )
+        context.add_user_message(text)
+    await _pattern().run(
+        context=context, tools=tools, llm=ScriptedLLM([{"content": "hi"}])
+    )
+    # Compaction replaces the transcript with fewer messages than were scanned.
+    context.messages[:] = context.messages[-1:]
+    context.add_user_message("now use HubSpot")
+
+    llm = ScriptedLLM([{"content": "ok"}])
+    await _pattern().run(context=context, tools=tools, llm=llm)
+
+    assert "hubspot_search_contacts" in _names(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_an_explicitly_empty_display_message_is_not_replaced_by_injected_text() -> (
+    None
+):
+    context = ExecutionContext()
+    context.add_user_message(
+        "[attachment: HubSpot export.csv]", metadata={"display_message": ""}
+    )
+    llm = ScriptedLLM([{"content": "hi"}])
+    await _pattern().run(context=context, tools=_tools(), llm=llm)
+
+    assert "hubspot_search_contacts" not in _names(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_allows_preloaded_connector_tools() -> None:
+    llm = ScriptedLLM([{"content": "hi"}])
+    await _pattern().run(context=_ctx("look in HubSpot"), tools=_tools(), llm=llm)
+
+    assert "whether preloaded or loaded" in _system_text(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_replaying_a_committed_failed_load_with_valid_names_loads_nothing() -> (
+    None
+):
+    tools = _tools()
+    pattern = _pattern()
+    context = _ctx()
+    prepared = pattern._tools_with_deferral(tools, context)
+
+    await _replay(
+        {"success": False, "error": "tool failed", "tool_name": "load_tools"},
+        {"names": ["notion_search"]},
+        context,
+        pattern,
+        prepared,
+    )
+
+    assert not _component(context).pending and not _component(context).names
+
+
+@pytest.mark.asyncio
+async def test_replaying_a_committed_load_with_malformed_names_returns_the_saved_result() -> (
+    None
+):
+    tools = _tools()
+    pattern = _pattern()
+    context = _ctx()
+    prepared = pattern._tools_with_deferral(tools, context)
+    saved = {"success": True, "output": "saved"}
+
+    result = await _replay(
+        saved, {"names": [{"name": "notion_search"}]}, context, pattern, prepared
+    )
+
+    assert result == saved
+    assert not _component(context).pending and not _component(context).names

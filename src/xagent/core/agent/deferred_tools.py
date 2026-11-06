@@ -85,7 +85,8 @@ DEFERRED_RULE = (
 # Appended to the "Available tool names" sentence so it stays true, and stays
 # the same text, whatever has been loaded.
 AVAILABLE_NAMES_SUFFIX = (
-    f" Connector tools you have loaded with {LOAD_TOOLS_NAME} are also available."
+    " Connector tools whose schemas are included in this call, whether "
+    f"preloaded or loaded with {LOAD_TOOLS_NAME}, are also available."
 )
 
 

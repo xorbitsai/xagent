@@ -4514,20 +4514,45 @@ class ReActPattern(AgentPattern):
         """Estimated tokens of one tool's schema (characters / 4)."""
         return len(json.dumps(self._build_tool_schema(tool), default=str)) // 4
 
+    def _preload_text(self, context: Any) -> tuple[str | None, str]:
+        """Timestamp and typed text of the newest user message, or (None, "").
+
+        An explicit ``display_message`` is what the user typed even when it is
+        empty (an attachment-only turn); only a message without one falls back
+        to its content, which can carry injected context.
+        """
+        for message in reversed(getattr(context, "messages", []) or []):
+            if getattr(message, "role", None) != "user":
+                continue
+            stamp = getattr(message, "timestamp", None)
+            metadata = getattr(message, "metadata", None)
+            if isinstance(metadata, dict) and isinstance(
+                metadata.get("display_message"), str
+            ):
+                text = metadata["display_message"]
+            else:
+                text = str(getattr(message, "content", "") or "")
+            return (stamp.isoformat() if stamp is not None else None), text
+        return None, ""
+
     def _preload_mentioned(
         self, tools: list[Any], sources: dict[str, str], context: Any
     ) -> None:
-        """Pre-load connectors, and exact tool names, new user messages name.
+        """Pre-load connectors, and exact tool names, a new user message names.
 
-        Scans only user messages not yet scanned, so a follow-up message in
-        the same execution is scanned too, and a resumed run does not rescan.
+        Scans the newest user message only when it is newer than the last one
+        scanned, so a follow-up message is scanned, a resume without a new
+        message is not rescanned, and compaction cannot hide a later message.
+        These loads are effective at once: they happen before a model call and
+        are not requests from a response, so they never touch ``pending``.
         """
         component = self._loaded_component(context)
-        user_turns = len(context.get_messages_by_role("user"))
-        if user_turns <= component.scanned_user_turns:
+        stamp, text = self._preload_text(context)
+        if stamp is None or (
+            component.last_scanned_at is not None and stamp <= component.last_scanned_at
+        ):
             return
-        component.scanned_user_turns = user_turns
-        text = latest_user_text(context, prefer_display=True)
+        component.last_scanned_at = stamp
         if not text:
             return
         by_name = {self._tool_name(t): t for t in tools}
@@ -4554,8 +4579,7 @@ class ReActPattern(AgentPattern):
             if group and cost <= remaining:
                 to_load.extend(group)
                 remaining -= cost
-        self._request_loads(context, to_load)
-        self._promote_pending_loads(context)
+        component.names.extend(n for n in to_load if n not in component.names)
 
     def _normal_tool_schemas(
         self,
@@ -4596,21 +4620,31 @@ class ReActPattern(AgentPattern):
             *(self._build_tool_schema(by_name[n]) for n in loaded if n in by_name),
         ]
 
+    def _plan_load(
+        self, requested: list[str], context: Any
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Split ``requested`` into (accepted, already, skipped, unknown).
+
+        Already-loaded and pending names are set aside before the per-call cap
+        is applied, so they never use up its slots. Shared by live execution
+        and replay of a committed outcome, which must agree on what loaded.
+        """
+        component = self._loaded_component(context)
+        taken = set(component.names) | set(component.pending)
+        requested = list(dict.fromkeys(requested))
+        known = [n for n in requested if n in self._deferred_tool_names]
+        unknown = [n for n in requested if n not in self._deferred_tool_names]
+        already = [n for n in known if n in taken]
+        new = [n for n in known if n not in taken]
+        return new[:MAX_TOOLS_PER_LOAD], already, new[MAX_TOOLS_PER_LOAD:], unknown
+
     def _execute_load_tools(self, args: dict[str, Any], context: Any) -> str:
         requested = args.get("names")
         if not isinstance(requested, list) or not all(
             isinstance(n, str) for n in requested
         ):
             raise ValueError("load_tools requires names: a list of tool names.")
-        requested = list(dict.fromkeys(requested))
-        component = self._loaded_component(context)
-        taken = set(component.names) | set(component.pending)
-        known = [n for n in requested if n in self._deferred_tool_names]
-        unknown = [n for n in requested if n not in self._deferred_tool_names]
-        already = [n for n in known if n in taken]
-        new = [n for n in known if n not in taken]
-        accepted = new[:MAX_TOOLS_PER_LOAD]
-        skipped = new[MAX_TOOLS_PER_LOAD:]
+        accepted, already, skipped, unknown = self._plan_load(requested, context)
         self._request_loads(context, accepted)
         parts = []
         if accepted:
@@ -4635,29 +4669,29 @@ class ReActPattern(AgentPattern):
             )
         return " ".join(parts) or "No tool names given."
 
-    def _reapply_committed_load(self, tool_call: dict[str, Any], context: Any) -> None:
+    def _reapply_committed_load(
+        self, tool_call: dict[str, Any], result: Any, context: Any
+    ) -> None:
         """Re-apply a load whose outcome was committed but whose state was not.
 
         A crash between committing the outcome and the checkpoint replays the
         stored "Loaded: X" without running the tool; the load has to be put
-        back or X is reported loaded while its schema is never sent.
+        back or X is reported loaded while its schema is never sent. Only a
+        successful outcome loaded anything, and the same plan as live
+        execution decides what.
         """
         if (
             context is None
             or tool_call.get("name") != LOAD_TOOLS_NAME
             or not self._deferred_tool_names
+            or not self._tool_result_success(result)
         ):
             return
         names = self._tool_call_args_dict(tool_call).get("names")
-        if isinstance(names, list):
-            self._request_loads(
-                context,
-                [
-                    n
-                    for n in dict.fromkeys(names)
-                    if isinstance(n, str) and n in self._deferred_tool_names
-                ][:MAX_TOOLS_PER_LOAD],
-            )
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            return
+        accepted, _, _, _ = self._plan_load(names, context)
+        self._request_loads(context, accepted)
 
     def _tool_schemas_with_spill_read(
         self,
@@ -6621,7 +6655,7 @@ class ReActPattern(AgentPattern):
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
             committed = await runtime.load_committed_tool_outcome(tool_call)
             if committed is not None:
-                self._reapply_committed_load(tool_call, context)
+                self._reapply_committed_load(tool_call, committed["result"], context)
                 result = committed["result"]
                 self._record_tool_call(
                     tool_call,

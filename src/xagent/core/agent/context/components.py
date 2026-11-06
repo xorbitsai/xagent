@@ -102,26 +102,27 @@ class LoadedToolsComponent:
     asked for in the current model response: they become part of ``names`` at
     the start of the next iteration, so a call in the same response as its
     load is refused instead of running with arguments written blind.
-    ``scanned_user_turns`` counts the user messages already scanned for
-    connector names to pre-load.
+    ``last_scanned_at`` is the timestamp of the newest user message already
+    scanned for connector names to pre-load. A timestamp, not a count, so a
+    compaction that shrinks the transcript cannot hide a later message.
     """
 
     names: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
-    scanned_user_turns: int = 0
+    last_scanned_at: str | None = None
 
     def clone(self) -> "LoadedToolsComponent":
         return LoadedToolsComponent(
             names=list(self.names),
             pending=list(self.pending),
-            scanned_user_turns=self.scanned_user_turns,
+            last_scanned_at=self.last_scanned_at,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "names": list(self.names),
             "pending": list(self.pending),
-            "scanned_user_turns": self.scanned_user_turns,
+            "last_scanned_at": self.last_scanned_at,
         }
 
     @classmethod
@@ -132,11 +133,11 @@ class LoadedToolsComponent:
                 return []
             return list(dict.fromkeys(n for n in raw if isinstance(n, str)))
 
-        scanned = data.get("scanned_user_turns")
+        scanned = data.get("last_scanned_at")
         return cls(
             names=_names("names"),
             pending=_names("pending"),
-            scanned_user_turns=scanned if isinstance(scanned, int) else 0,
+            last_scanned_at=scanned if isinstance(scanned, str) else None,
         )
 
 

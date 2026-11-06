@@ -19,7 +19,6 @@ token budget, so the common "do X in HubSpot" turn needs no extra model call.
 from __future__ import annotations
 
 import difflib
-import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -86,22 +85,21 @@ def tool_source(tool: Any) -> str:
     return str(getattr(getattr(tool, "metadata", None), "source_server", "") or "")
 
 
-def deferred_index(sources: Mapping[str, str], names: Iterable[str]) -> str:
-    """Static, order-stable index text; unchanged as tools get loaded."""
-    grouped: dict[str, list[str]] = {}
-    for name in names:
-        source = sources.get(name)
-        if source:
-            grouped.setdefault(source, []).append(name)
-    if not grouped:
+def deferred_rule(sources: Mapping[str, str], names: Iterable[str]) -> str:
+    """Static rule text for the deferred connector tools; empty when none.
+
+    It repeats no names: the connector inventory built from the same tool set
+    (``tool_access_context``) already lists every deferred name by source, and
+    both texts are unchanged as tools get loaded.
+    """
+    if not any(sources.get(name) for name in names):
         return ""
-    index = json.dumps(grouped, ensure_ascii=True, sort_keys=True)
     return (
-        "Connector-tool index (source -> tool names). These tools' schemas are "
+        "Connector tools in the inventory above are deferred: their schemas are "
         f"not sent with every call. To use one, first call {LOAD_TOOLS_NAME} "
         "with the exact names you need; they can be called from the next step. "
         "A tool that is not loaded cannot be called. Load only what the request "
-        f"needs. Index: {index}."
+        "needs."
     )
 
 

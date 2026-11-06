@@ -163,7 +163,7 @@ from ...deferred_tools import (
     MAX_TOOLS_PER_LOAD,
     LoadToolsTool,
     close_names,
-    deferred_index,
+    deferred_rule,
     is_deferrable_tool,
     servers_mentioned,
     tool_names_mentioned,
@@ -2167,11 +2167,9 @@ class ReActPattern(AgentPattern):
             if access_context:
                 instruction = f"{instruction}\n\n{access_context}"
             if self._deferred_tool_names:
-                index = deferred_index(
-                    self._connector_tool_sources, self._deferred_order
-                )
-                if index:
-                    instruction = f"{instruction}\n\n{index}"
+                rule = deferred_rule(self._connector_tool_sources, self._deferred_order)
+                if rule:
+                    instruction = f"{instruction}\n\n{rule}"
         else:
             # Reachable only with tool_choice="none", which no production
             # construction site sets. If that ever changes, this branch needs

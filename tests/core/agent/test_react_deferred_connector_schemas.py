@@ -118,7 +118,7 @@ async def test_off_by_default_sends_every_schema() -> None:
         names
     )
     assert LOAD_TOOLS_NAME not in names
-    assert "Connector-tool index" not in _system_text(llm.calls[0])
+    assert "are deferred" not in _system_text(llm.calls[0])
 
 
 @pytest.mark.asyncio
@@ -135,7 +135,7 @@ async def test_on_withholds_connector_schemas_and_lists_an_index() -> None:
         "notion_search",
     } & set(names)
     system = _system_text(llm.calls[0])
-    assert "Connector-tool index" in system
+    assert "are deferred" in system and system.count("notion_search") == 1
     for name in ("hubspot_search_contacts", "hubspot_create_note", "notion_search"):
         assert name in system
 

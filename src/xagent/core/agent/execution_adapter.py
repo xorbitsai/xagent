@@ -500,6 +500,19 @@ class AgentExecutionAdapter:
         failure_code = normalize_tool_failure_code(result.get("failure_code"))
         if failure_code is not None:
             normalized["failure_code"] = failure_code
+        # Run classification for whatever reports the settled run. Each value
+        # crosses this boundary only in its expected type; ``metadata`` above
+        # stays config-only because the resume path sends it to the browser.
+        finish_reason = result.get("finish_reason")
+        if type(finish_reason) is str and finish_reason.strip():
+            normalized["finish_reason"] = finish_reason
+        if result.get("empty_final_answer") is True:
+            normalized["empty_final_answer"] = True
+        raw_metadata = result.get("metadata")
+        if isinstance(raw_metadata, dict):
+            first_delta_at = raw_metadata.get("first_answer_delta_at")
+            if type(first_delta_at) is str:
+                normalized["first_answer_delta_at"] = first_delta_at
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

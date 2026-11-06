@@ -24,6 +24,11 @@ from tests.web.services.test_task_execution_event_writer import engine as engine
 from tests.web.services.test_task_execution_event_writer import (
     task_id as task_id_fixture,
 )
+from xagent.core.agent import (
+    AgentExecutionAdapter,
+    AgentExecutionConfig,
+    PatternResult,
+)
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import (
     agent_service_manager,
@@ -150,12 +155,10 @@ def test_absorb_result_keeps_only_allowlisted_fields() -> None:
 
     facts.absorb_result(
         {
-            "metadata": {
-                "finish_reason": "length",
-                "empty_final_answer": True,
-                "failure_code": "not-an-allowlisted-code",
-                "first_answer_delta_at": first.isoformat(),
-            },
+            "finish_reason": "length",
+            "empty_final_answer": True,
+            "failure_code": "not-an-allowlisted-code",
+            "first_answer_delta_at": first.isoformat(),
             "model_error": {"kind": "rate_limited", "message": "provider text"},
         }
     )
@@ -168,12 +171,43 @@ def test_absorb_result_keeps_only_allowlisted_fields() -> None:
 
     facts.absorb_result(
         {
-            "metadata": {"first_answer_delta_at": "not a time"},
+            "first_answer_delta_at": "not a time",
             "model_error": {"kind": "invented"},
         }
     )
     assert facts.first_answer_delta_at is None
     assert facts.model_error_kind is None
+
+
+def test_absorb_result_reads_real_adapter_output() -> None:
+    first = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    raw = PatternResult(
+        success=False,
+        error="x",
+        metadata={
+            "status": "invalid_tool_protocol",
+            "empty_final_answer": True,
+            "finish_reason": "length",
+            "failure_code": "authentication_required",
+        },
+    ).to_dict()
+    # ``AgentRunner`` records the first answer delta in the raw result's metadata.
+    raw["metadata"] = {"first_answer_delta_at": first.isoformat()}
+    normalized = AgentExecutionAdapter(
+        AgentExecutionConfig(name="a", pattern="react", llm=None)
+    )._normalize_result(result=raw, execution_type="agent_react", execution_id="1")
+    facts = TurnFacts(started_at=datetime.now(timezone.utc))
+
+    facts.absorb_result(normalized)
+
+    assert (
+        facts.llm_finish_reason,
+        facts.empty_final_answer,
+        facts.tool_failure_code,
+        facts.first_answer_delta_at,
+    ) == ("length", True, "authentication_required", first)
+    assert "finish_reason" not in normalized["metadata"]
+    assert "first_answer_delta_at" not in normalized["metadata"]
 
 
 async def test_hook_receives_the_settlement_without_the_caller_waiting() -> None:

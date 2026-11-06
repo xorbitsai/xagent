@@ -91,20 +91,20 @@ class TurnFacts:
         self.usage = usage
 
     def absorb_result(self, result: Mapping[str, Any]) -> None:
-        """Copy the allowlisted classification fields of a run result."""
-        metadata = result.get("metadata")
-        if isinstance(metadata, dict):
-            finish_reason = metadata.get("finish_reason")
-            self.llm_finish_reason = (
-                finish_reason if isinstance(finish_reason, str) else None
-            )
-            self.empty_final_answer = metadata.get("empty_final_answer") is True
-            self.tool_failure_code = normalize_tool_failure_code(
-                metadata.get("failure_code")
-            )
-            self.first_answer_delta_at = _parse_timestamp(
-                metadata.get("first_answer_delta_at")
-            )
+        """Copy the allowlisted classification fields of a normalized run result.
+
+        ``result`` is ``AgentExecutionAdapter`` output; only its top-level
+        keys are read.
+        """
+        finish_reason = result.get("finish_reason")
+        self.llm_finish_reason = (
+            finish_reason if isinstance(finish_reason, str) else None
+        )
+        self.empty_final_answer = result.get("empty_final_answer") is True
+        self.tool_failure_code = normalize_tool_failure_code(result.get("failure_code"))
+        self.first_answer_delta_at = _parse_timestamp(
+            result.get("first_answer_delta_at")
+        )
         model_error = result.get("model_error")
         if isinstance(model_error, dict):
             kind = model_error.get("kind")

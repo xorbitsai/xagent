@@ -675,3 +675,88 @@ def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tm
     with pytest.raises(external_media.ExternalMediaUnavailable, match="read") as raised:
         issue()
     assert not isinstance(raised.value, external_media.ExternalMediaUnsupportedImage)
+
+
+def _png(path, color="blue"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 64), color).save(path)
+
+
+def test_trust_refuses_a_symlink_below_the_user_root(monkeypatch, tmp_path):
+    # Why: a registered file replaced by a link to another task's image must
+    # not be delivered from the local copy (#3588 scope review, P1).
+    uploads = tmp_path / "uploads"
+    other = uploads / "user_7" / "web_task_99" / "private.png"
+    _png(other, "red")
+    registered = uploads / "user_7" / "web_task_11" / "post.png"
+    registered.parent.mkdir(parents=True)
+    registered.symlink_to(other)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads)
+    record = _record(str(uuid4()), storage_path=str(registered))
+
+    assert external_media.local_record_path_is_trusted(record, registered) is False
+    _png(registered.with_name("plain.png"))
+    plain = registered.with_name("plain.png")
+    assert external_media.local_record_path_is_trusted(record, plain) is True
+
+
+def test_trust_accepts_an_upload_root_that_is_itself_a_link(monkeypatch, tmp_path):
+    # Why: a mounted volume may make the upload root a link; only links below
+    # the user root are refused, so ordinary deployments keep local delivery.
+    real = tmp_path / "volume"
+    _png(real / "user_7" / "web_task_11" / "post.png")
+    uploads = tmp_path / "uploads"
+    uploads.symlink_to(real)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads)
+    path = uploads / "user_7" / "web_task_11" / "post.png"
+
+    assert (
+        external_media.local_record_path_is_trusted(_record(str(uuid4())), path) is True
+    )
+
+
+def test_issue_facebook_does_not_deliver_a_symlinked_local_copy(monkeypatch, tmp_path):
+    # Why: with the local copy refused and no durable object, issuing must
+    # fail as out of scope (staging then applies its own rules), never sign
+    # a URL for the link's target.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    uploads = tmp_path / "uploads"
+    other = uploads / "user_7" / "web_task_99" / "private.png"
+    _png(other, "red")
+
+    def link(path):
+        path.symlink_to(other)
+
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, write=link)
+
+    with pytest.raises(external_media.ExternalMediaOutOfScope):
+        issue()
+
+
+def test_issue_local_only_copy_outside_uploads_is_out_of_scope(monkeypatch, tmp_path):
+    # Why: a workspace may keep a local-only file outside the upload root that
+    # its own staging can read; issuing cannot, and must say so as its own
+    # error so native grants fall back instead of failing (scope review, P2).
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: tmp_path / "uploads")
+    elsewhere = tmp_path / "custom-workspace" / "post.png"
+    _png(elsewhere)
+    file_id = str(uuid4())
+    db = _DB(
+        _record(
+            file_id,
+            filename="post.png",
+            storage_path=str(elsewhere),
+            storage_status="legacy",
+            storage_key=None,
+        )
+    )
+
+    with pytest.raises(external_media.ExternalMediaOutOfScope):
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        )

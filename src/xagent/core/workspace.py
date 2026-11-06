@@ -81,9 +81,10 @@ _SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS = (_INTERNAL_TEMP_DIR_NAME, "mcp-upload")
 class ExternalMediaNotIssuableError(ValueError):
     """No external media URL can be issued for this file on this deployment.
 
-    Either the deployment has no public HTTPS base URL, or the image's type,
-    size or encoding is outside what the purpose delivers. A connector that
-    can upload the file itself may still take it.
+    The deployment has no public HTTPS base URL, the image's type, size or
+    encoding is outside what the purpose delivers, or external media cannot
+    reach its bytes in its own scope. A connector that can upload the file
+    itself, staged under the workspace's own rules, may still take it.
     """
 
 
@@ -440,6 +441,7 @@ class TaskWorkspace:
         from ..web.services.external_media import (
             ExternalMediaNotConfigured,
             ExternalMediaNotFound,
+            ExternalMediaOutOfScope,
             ExternalMediaPurpose,
             ExternalMediaUnavailable,
             ExternalMediaUnsupportedImage,
@@ -464,7 +466,11 @@ class TaskWorkspace:
                 )
             except ExternalMediaNotFound:
                 raise FileNotFoundError("Registered image was not found") from None
-            except (ExternalMediaNotConfigured, ExternalMediaUnsupportedImage) as exc:
+            except (
+                ExternalMediaNotConfigured,
+                ExternalMediaOutOfScope,
+                ExternalMediaUnsupportedImage,
+            ) as exc:
                 raise ExternalMediaNotIssuableError(str(exc)) from None
             except ExternalMediaUnavailable as exc:
                 raise ValueError(str(exc)) from None

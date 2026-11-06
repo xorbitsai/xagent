@@ -349,7 +349,9 @@ def test_workspace_maps_external_media_errors(
     assert db.closed is True
 
 
-@pytest.mark.parametrize("service_error", ["not_configured", "unsupported_image"])
+@pytest.mark.parametrize(
+    "service_error", ["not_configured", "unsupported_image", "out_of_scope"]
+)
 def test_workspace_marks_external_media_that_cannot_be_issued(
     monkeypatch, tmp_path: Path, service_error: str
 ) -> None:
@@ -365,6 +367,7 @@ def test_workspace_marks_external_media_that_cannot_be_issued(
     error = {
         "not_configured": external_media.ExternalMediaNotConfigured,
         "unsupported_image": external_media.ExternalMediaUnsupportedImage,
+        "out_of_scope": external_media.ExternalMediaOutOfScope,
     }[service_error]
 
     def issue(*args, **kwargs):

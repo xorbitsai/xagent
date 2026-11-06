@@ -80,6 +80,7 @@ from ..services.external_media import (
     ExternalMediaUnavailable,
     instagram_image_requires_normalization,
     instagram_jpeg_bytes,
+    local_record_path_is_trusted,
     redeem_external_media_ticket,
 )
 from ..services.kb_file_service import (
@@ -1798,9 +1799,8 @@ def external_media_file(
     file_ref = ManagedFileRef(record)
     try:
         path = file_ref.materialize(
-            allow_existing_local=_is_under_uploads(
-                file_ref.local_path,
-                int(record.user_id),
+            allow_existing_local=local_record_path_is_trusted(
+                record, file_ref.local_path
             )
         )
     except DurableObjectIntegrityError as exc:

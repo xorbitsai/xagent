@@ -436,3 +436,48 @@ def test_route_serves_the_stored_png_for_facebook(
     assert response.status_code == 200
     assert response.content == expected
     assert response.headers["content-type"] == "image/png"
+
+
+def test_route_does_not_serve_a_file_swapped_for_a_link_after_issue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    # Why: the ticket is checked again at delivery; replacing the registered
+    # file with a link after issuing must not deliver the link's target.
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / "post.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), "blue").save(image_path)
+    other = uploads_dir / "user_7" / "web_task_99" / "private.png"
+    other.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), "red").save(other)
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="post.png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        ).url
+    )
+    image_path.unlink()
+    image_path.symlink_to(other)
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code != 200
+    assert response.content != other.read_bytes()

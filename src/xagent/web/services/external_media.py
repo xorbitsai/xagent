@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -69,6 +70,15 @@ class ExternalMediaNotConfigured(ExternalMediaUnavailable):
 
 class ExternalMediaUnsupportedImage(ExternalMediaUnavailable):
     """The image's type, size or encoding cannot be delivered for this purpose."""
+
+
+class ExternalMediaOutOfScope(ExternalMediaUnavailable):
+    """External media cannot reach the image's bytes within its own scope.
+
+    It trusts a local copy only inside the user's upload root with no symbolic
+    link below it, and otherwise needs the durable object. A workspace may
+    still read a local copy elsewhere under its own rules.
+    """
 
 
 class ExternalMediaTicketRejected(ExternalMediaError):
@@ -293,11 +303,31 @@ def _validate_instagram_source(image: Image.Image) -> None:
         )
 
 
-def _local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
+def local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
+    """Whether a local copy may be delivered externally instead of the durable one.
+
+    The path must lie inside the record owner's upload root, and nothing below
+    that root may be a symbolic link: a registered file replaced by a link
+    would otherwise deliver another task's image. The root itself may be a
+    link, as a mounted volume can be.
+    """
     uploads_root = get_uploads_dir().resolve()
-    user_root = scoped_user_root(get_uploads_dir(), int(record.user_id)).resolve()
-    resolved = path.resolve()
-    return resolved.is_relative_to(uploads_root) and resolved.is_relative_to(user_root)
+    user_root = scoped_user_root(get_uploads_dir(), int(record.user_id))
+    candidate = Path(os.path.abspath(path))
+    for base in (Path(os.path.abspath(user_root)), user_root.resolve()):
+        try:
+            below = candidate.relative_to(base)
+        except ValueError:
+            continue
+        if not base.resolve().is_relative_to(uploads_root):
+            return False
+        current = base
+        for part in below.parts:
+            current = current / part
+            if current.is_symlink():
+                return False
+        return True
+    return False
 
 
 def _validate_instagram_header(path: Path) -> None:
@@ -316,7 +346,7 @@ def _materialize_record(record: UploadedFile) -> Path:
     file_ref = ManagedFileRef(record)
     try:
         path = file_ref.materialize(
-            allow_existing_local=_local_record_path_is_trusted(
+            allow_existing_local=local_record_path_is_trusted(
                 record,
                 file_ref.local_path,
             )
@@ -326,9 +356,7 @@ def _materialize_record(record: UploadedFile) -> Path:
             "Registered image failed integrity verification"
         ) from exc
     except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
-        raise ExternalMediaUnavailable(
-            "Registered image bytes are unavailable"
-        ) from exc
+        raise ExternalMediaOutOfScope("Registered image bytes are unavailable") from exc
     except DurableStorageOperationError as exc:
         raise ExternalMediaUnavailable(
             "Registered image could not be prepared for external delivery"

@@ -2907,9 +2907,9 @@ async def execute_task_background(
                 agent_context.pop("run_id", None)
             # The model text may carry server-added context (uploaded files, the
             # output requirement block, the prompt-context block). Whenever it
-            # differs from the transcript text,
-            # record the transcript text as the display message for the
-            # user_message trace event; a display message the caller set wins.
+            # differs from the transcript text, record the transcript text as the
+            # display message for the user_message trace event; a display message
+            # the caller set wins.
             if task_for_agent != user_message and not _has_display_message_override(
                 agent_context
             ):

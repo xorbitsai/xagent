@@ -555,3 +555,92 @@ def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="normalized"):
         external_media.instagram_jpeg_bytes(source)
+
+
+def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / name
+    source.parent.mkdir(parents=True)
+    if write is None:
+        Image.new("RGB", (3000, 400), "blue").save(source)
+    else:
+        write(source)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    record = _record(
+        file_id,
+        filename=name,
+        storage_path=str(source),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    db = _DB(record)
+    issued = lambda: external_media.issue_external_media_url(  # noqa: E731
+        db,
+        file_id=file_id,
+        user_id=7,
+        task_id=11,
+        purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+    )
+    return db, file_id, issued
+
+
+def test_issue_facebook_ticket_names_its_purpose(monkeypatch, tmp_path):
+    # Why: the delivery route decides whether to normalize by the ticket's
+    # purpose, so a Facebook ticket must carry the Facebook purpose.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db, file_id, issue = _facebook_issue(monkeypatch, tmp_path)
+
+    ticket = parse_qs(urlsplit(issue().url).query)["ticket"][0]
+    redeemed = external_media.redeem_external_media_ticket(
+        db, file_id=file_id, ticket=ticket
+    )
+
+    assert redeemed.purpose is external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH
+    assert redeemed.media_type == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("name", "write", "message"),
+    [
+        ("post.png", lambda path: path.write_bytes(b"not-an-image"), "PNG or JPEG"),
+        (
+            "post.gif",
+            lambda path: Image.new("RGB", (8, 8)).save(path, "GIF"),
+            "PNG or JPEG",
+        ),
+        ("post.png", lambda path: path.write_bytes(b"x" * 64), "10 MB"),
+    ],
+)
+def test_issue_facebook_rejects_what_the_page_cannot_take(
+    monkeypatch, tmp_path, name, write, message
+):
+    # Why: an image the URL path cannot deliver must fail at issue, before a
+    # ticket exists, as its own error so native grants can fall back to the
+    # connector's upload; the size cap matches the connector's.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    if message == "10 MB":
+        monkeypatch.setattr(external_media, "FACEBOOK_MAX_IMAGE_BYTES", 32)
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, name=name, write=write)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match=message):
+        issue()
+
+
+@pytest.mark.parametrize("base", [None, "http://api.example.test"])
+def test_issue_without_a_public_https_base_is_not_configured(monkeypatch, base):
+    # Why: the adapter falls back to a native upload only for this case, so it
+    # must be its own error, distinct from an image that cannot be delivered.
+    monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+    if base:
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", base)
+    file_id = str(uuid4())
+
+    with pytest.raises(external_media.ExternalMediaNotConfigured):
+        external_media.issue_external_media_url(
+            _DB(_record(file_id)),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        )

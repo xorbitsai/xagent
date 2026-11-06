@@ -394,3 +394,45 @@ def test_route_does_not_trust_local_path_outside_uploads(
     )
 
     assert response.status_code == 404
+
+
+def test_route_serves_the_stored_png_for_facebook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    # Why: only Instagram needs JPEG normalization; Facebook must receive the
+    # stored bytes with their own type, directly and without a redirect.
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / "wide.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGBA", (3000, 400), (0, 0, 255, 128)).save(image_path)
+    expected = image_path.read_bytes()
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="wide.png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        ).url
+    )
+
+    response = client.get(f"{target.path}?{target.query}", follow_redirects=False)
+
+    assert response.status_code == 200
+    assert response.content == expected
+    assert response.headers["content-type"] == "image/png"

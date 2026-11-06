@@ -48,6 +48,7 @@ class ExternalMediaPurpose(str, Enum):
     """Providers allowed to receive a purpose-scoped media URL."""
 
     INSTAGRAM_PUBLISH = "instagram-publish"
+    FACEBOOK_PUBLISH = "facebook-publish"
 
 
 class ExternalMediaError(RuntimeError):
@@ -60,6 +61,14 @@ class ExternalMediaNotFound(ExternalMediaError):
 
 class ExternalMediaUnavailable(ExternalMediaError):
     """The image exists but cannot currently be delivered externally."""
+
+
+class ExternalMediaNotConfigured(ExternalMediaUnavailable):
+    """This deployment has no public HTTPS base URL to deliver media from."""
+
+
+class ExternalMediaUnsupportedImage(ExternalMediaUnavailable):
+    """The image's type, size or encoding cannot be delivered for this purpose."""
 
 
 class ExternalMediaTicketRejected(ExternalMediaError):
@@ -80,6 +89,8 @@ class RedeemedExternalMedia:
     media_type: str
 
 
+# Matches the Facebook connector's own limit for an uploaded image.
+FACEBOOK_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 INSTAGRAM_MAX_JPEG_BYTES = 8 * 1024 * 1024
 INSTAGRAM_MIN_ASPECT_RATIO = 4 / 5
 INSTAGRAM_MAX_ASPECT_RATIO = 1.91
@@ -112,7 +123,7 @@ def _image_media_type(record: Any) -> str:
     filename = str(getattr(record, "filename", "") or "").strip().lower()
     media_type = _IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
     if media_type is None:
-        raise ExternalMediaUnavailable("Instagram accepts PNG or JPEG images")
+        raise ExternalMediaUnsupportedImage("Only PNG or JPEG images can be delivered")
     return media_type
 
 
@@ -186,16 +197,19 @@ def issue_external_media_url(
     ttl = get_external_media_url_ttl_seconds()
     base_url = get_s2s_api_base_url()
     if not base_url:
-        raise ExternalMediaUnavailable(
+        raise ExternalMediaNotConfigured(
             "A public HTTPS XAGENT_S2S_API_BASE_URL or XAGENT_PUBLIC_API_BASE_URL "
             "is required for external media delivery"
         )
     if urlsplit(base_url).scheme != "https":
-        raise ExternalMediaUnavailable(
+        raise ExternalMediaNotConfigured(
             "XAGENT_S2S_API_BASE_URL (or XAGENT_PUBLIC_API_BASE_URL when S2S is "
             "unset) must be HTTPS for external media delivery"
         )
-    _validate_instagram_record(record)
+    if purpose is ExternalMediaPurpose.FACEBOOK_PUBLISH:
+        _validate_facebook_record(record)
+    else:
+        _validate_instagram_record(record)
     ticket = _encode_ticket(
         file_id=normalized_file_id,
         user_id=int(user_id),
@@ -298,7 +312,7 @@ def _validate_instagram_header(path: Path) -> None:
         ) from exc
 
 
-def _validate_instagram_record(record: UploadedFile) -> None:
+def _materialize_record(record: UploadedFile) -> Path:
     file_ref = ManagedFileRef(record)
     try:
         path = file_ref.materialize(
@@ -319,7 +333,31 @@ def _validate_instagram_record(record: UploadedFile) -> None:
         raise ExternalMediaUnavailable(
             "Registered image could not be prepared for external delivery"
         ) from exc
-    _validate_instagram_header(path)
+    return path
+
+
+def _validate_instagram_record(record: UploadedFile) -> None:
+    _validate_instagram_header(_materialize_record(record))
+
+
+def _validate_facebook_record(record: UploadedFile) -> None:
+    """Facebook fetches the image as stored: PNG or JPEG within its size limit."""
+
+    _image_media_type(record)
+    path = _materialize_record(record)
+    try:
+        if path.stat().st_size > FACEBOOK_MAX_IMAGE_BYTES:
+            raise ExternalMediaUnsupportedImage(
+                "Registered image exceeds the 10 MB limit"
+            )
+        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS):
+            pass
+    except ExternalMediaUnavailable:
+        raise
+    except _INSTAGRAM_PROCESSING_ERRORS as exc:
+        raise ExternalMediaUnsupportedImage(
+            "Registered image could not be decoded as PNG or JPEG"
+        ) from exc
 
 
 def instagram_image_requires_normalization(path: Path) -> bool:

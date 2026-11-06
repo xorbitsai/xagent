@@ -836,6 +836,195 @@ async def test_instagram_registered_workspace_path_is_substituted():
     assert replacements[temporary_url] == f"file:{file_id}"
 
 
+def test_facebook_page_image_binding_falls_back_to_the_connector_upload():
+    # Why: the catalog name is "Facebook Pages"; a "facebook" key would never
+    # match, and native grants must keep their multipart upload as a fallback.
+    binding = _external_media_binding("Facebook Pages", "facebook_publish_image_post")
+
+    assert binding is not None
+    assert binding.purpose == "facebook-publish"
+    assert (binding.file_argument, binding.url_argument) == ("file_path", "image_url")
+    assert binding.upload_fallback is True
+    instagram = _external_media_binding("Instagram", "instagram_publish_image")
+    assert instagram.upload_fallback is False
+
+
+_FACEBOOK_FILE_ID = "5b0e2d4c-3a7f-4c11-9a54-0d2f6c1e8b21"
+_FACEBOOK_STAGED_PATH = "/task/temp/.xagent-internal/mcp-upload/staged/photo.png"
+
+
+class _FacebookWorkspace:
+    """Records which way a workspace image was handed to the connector."""
+
+    def __init__(self, *, issue, registered_paths=None):
+        self._issue = issue
+        self.registered_paths = registered_paths or {}
+        self.issued = []
+        self.staged = []
+        self.discarded = []
+
+    def issue_external_media_url_detached(self, file_id, purpose):
+        self.issued.append((file_id, purpose))
+        return self._issue(file_id)
+
+    def resolve_path(self, path):
+        return Path(path)
+
+    def get_file_id_from_path(self, path):
+        return self.registered_paths.get(path)
+
+    def stage_file_for_external_upload(self, file_id):
+        self.staged.append(file_id)
+        return _FACEBOOK_STAGED_PATH
+
+    def discard_staged_external_upload(self, path):
+        self.discarded.append(path)
+
+
+async def _run_facebook_publish(monkeypatch, workspace, file_path, reply="ok"):
+    adapter = _build_mcp_tool_adapter(
+        "Facebook Pages",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="facebook_publish_image_post",
+            description="Publish an image post",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "image_url": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+                "required": ["page_id"],
+            },
+        ),
+        workspace=workspace,
+    )
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["arguments"] = arguments
+            return CallToolResult(
+                content=[TextContent(type="text", text=reply)], isError=False
+            )
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    result = await adapter.run_json_async({"page_id": "p-1", "file_path": file_path})
+    return adapter, captured.get("arguments"), result
+
+
+@pytest.mark.asyncio
+async def test_facebook_workspace_image_is_sent_as_a_url_not_staged(monkeypatch):
+    # Why: a Composio-proxied grant cannot upload bytes (#3586); Meta must get
+    # a URL, nothing may be staged, and the URL must not reach the model.
+    temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+    workspace = _FacebookWorkspace(issue=lambda _file_id: temporary_url)
+
+    adapter, arguments, result = await _run_facebook_publish(
+        monkeypatch,
+        workspace,
+        f"file:{_FACEBOOK_FILE_ID}",
+        reply=f"posted from {temporary_url}",
+    )
+
+    assert arguments == {"page_id": "p-1", "image_url": temporary_url}
+    assert workspace.issued == [(_FACEBOOK_FILE_ID, "facebook-publish")]
+    assert workspace.staged == []
+    assert temporary_url not in result["content"][0]["text"]
+    assert f"file:{_FACEBOOK_FILE_ID}" in result["content"][0]["text"]
+    assert "TTL-bound access" in adapter.description
+    assert "staged in the current task workspace" not in adapter.description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["no public base URL", "Only PNG or JPEG images can be delivered"],
+)
+async def test_facebook_image_falls_back_to_staging_when_no_url_can_be_issued(
+    monkeypatch, reason
+):
+    # Why: native grants upload today. Without a public base URL, or for a
+    # GIF/BMP/TIFF or oversized image the URL path refuses, they must keep the
+    # staged multipart upload rather than regress (#3586 review).
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+
+    def not_issuable(_file_id):
+        raise ExternalMediaNotIssuableError(reason)
+
+    workspace = _FacebookWorkspace(issue=not_issuable)
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, f"file:{_FACEBOOK_FILE_ID}"
+    )
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "file_path": _FACEBOOK_STAGED_PATH}
+    assert workspace.staged == [_FACEBOOK_FILE_ID]
+    assert workspace.discarded == [_FACEBOOK_STAGED_PATH]
+
+
+@pytest.mark.asyncio
+async def test_facebook_unregistered_workspace_path_is_left_to_the_connector(
+    monkeypatch,
+):
+    # Why: native grants read a plain workspace path themselves today; a path
+    # with no registered file must not turn into a host error.
+    workspace = _FacebookWorkspace(issue=lambda _file_id: "unused")
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, "/task/output/chart.png"
+    )
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "file_path": "/task/output/chart.png"}
+    assert workspace.issued == []
+
+
+@pytest.mark.asyncio
+async def test_instagram_still_fails_without_a_public_base_url(monkeypatch):
+    # Why: only Facebook has an upload to fall back to; Instagram must keep
+    # reporting the missing base URL instead of passing file_path through.
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+
+    class Workspace:
+        def issue_external_media_url_detached(self, file_id, purpose):
+            raise ExternalMediaNotIssuableError("no public base URL")
+
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["called"] = True
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    adapter = _instagram_adapter_for_workspace(Workspace())
+
+    result = await adapter.run_json_async(
+        {"instagram_account_id": "ig-1", "file_path": f"file:{_FACEBOOK_FILE_ID}"}
+    )
+
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == "no public base URL"
+    assert "called" not in captured
+
+
 @pytest.mark.asyncio
 async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
     monkeypatch,

@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
-from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as execution
 from xagent.web.services import task_command_transport as transport
@@ -20,10 +20,10 @@ from xagent.web.services.task_command_transport import (
     SettledTaskCommand,
     TaskCommandRejected,
 )
+from xagent.web.services.task_existing_command import stage_existing_execution
 from xagent.web.services.task_runtime import (
     MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY,
 )
-from xagent.web.services.task_existing_command import stage_existing_execution
 
 RUNNER = "local-1"
 

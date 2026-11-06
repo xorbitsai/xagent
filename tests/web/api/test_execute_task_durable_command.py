@@ -23,9 +23,9 @@ from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import (
     task_command_transport,
-    task_orchestrator,
     task_event_bridge,
     task_execution,
+    task_orchestrator,
 )
 from xagent.web.services.release_hold import ReleaseHold
 from xagent.web.services.task_orchestrator import TaskTurnError

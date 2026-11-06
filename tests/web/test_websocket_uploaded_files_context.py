@@ -52,7 +52,6 @@ from xagent.web.services.task_execution import (
     execute_task_background,
 )
 from xagent.web.services.task_existing_command import stage_existing_execution
-from xagent.web.services.task_start_consumer import execute_task_start
 from xagent.web.services.task_lease_service import TaskLease, get_runner_id
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
@@ -61,6 +60,7 @@ from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
     _TaskFields,
 )
+from xagent.web.services.task_start_consumer import execute_task_start
 
 
 @pytest.fixture()

@@ -15,11 +15,11 @@ from tests.web.test_auth_api import test_db as test_db
 from xagent.web.api import auth, files, oidc_google, progress_ws
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
-from xagent.web.auth_sessions import hash_refresh_token
 from xagent.web.auth_dependencies import (
     get_user_from_token,
     get_user_from_websocket_token,
 )
+from xagent.web.auth_sessions import hash_refresh_token
 from xagent.web.models.user import User
 
 pytestmark = pytest.mark.usefixtures("test_db")

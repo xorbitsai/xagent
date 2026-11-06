@@ -40,9 +40,18 @@ class AdmissionGate:
     subtracted from concurrent batch wall time.
     """
 
-    def __init__(self, limit: int, telemetry: Path | None = None):
+    def __init__(
+        self,
+        limit: int,
+        telemetry: Path | None = None,
+        *,
+        trigger: float = 70,
+        resume: float = 60,
+    ):
         self.limit = limit
         self.telemetry = telemetry
+        self.trigger = trigger
+        self.resume = resume
         self.active = 0
         self.condition = asyncio.Condition()
         self.waiters: deque[object] = deque()
@@ -67,7 +76,7 @@ class AdmissionGate:
         thermal = any(
             row["sw_thermal_throttle"] or row["hw_thermal_throttle"] for row in rows
         )
-        if thermal or any(row["temperature_C"] > 70 for row in rows):
+        if thermal or any(row["temperature_C"] > self.trigger for row in rows):
             self.cooling = True
         if self.cooling:
             if not self.active and self.idle_started is None:
@@ -75,7 +84,7 @@ class AdmissionGate:
             if (
                 not self.active
                 and not thermal
-                and all(row["temperature_C"] <= 60 for row in rows)
+                and all(row["temperature_C"] <= self.resume for row in rows)
             ):
                 self.cooling = False
                 self.finish_idle()
@@ -417,7 +426,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if rows < 2:
         raise ValueError("Corpus needs at least two invoices")
     scope = uuid4().hex
-    gate = AdmissionGate(args.max_inflight, args.gpu_telemetry_json)
+    gate = AdmissionGate(
+        args.max_inflight,
+        args.gpu_telemetry_json,
+        trigger=args.cooldown_trigger,
+        resume=args.cooldown_resume,
+    )
     source = audit.source_manifest()
     source["source_sha256"]["scripts/agent_cache_concurrency_benchmark.py"] = (
         hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -472,6 +486,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 "probe_tokens",
                 "probe_interval",
                 "probe_start",
+                "cooldown_trigger",
+                "cooldown_resume",
             ]
         },
         **summarize(agents, probes, elapsed, cooling),
@@ -503,6 +519,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--probe-interval", type=float, default=10)
     value.add_argument("--probe-start", type=float, default=5)
     value.add_argument("--gpu-telemetry-json", type=Path)
+    value.add_argument("--cooldown-trigger", type=float, default=70)
+    value.add_argument("--cooldown-resume", type=float, default=60)
     value.add_argument("--timeout", type=float, default=1200)
     return value
 
@@ -520,6 +538,7 @@ def main() -> None:
         or args.probe_interval <= 0
         or args.probe_start < 0
         or args.timeout <= 0
+        or not 0 < args.cooldown_resume < args.cooldown_trigger
         or any(delay < 0 for delay in args.tool_delays)
         or not all(
             math.isfinite(value)
@@ -527,6 +546,8 @@ def main() -> None:
                 args.probe_interval,
                 args.probe_start,
                 args.timeout,
+                args.cooldown_trigger,
+                args.cooldown_resume,
                 *args.tool_delays,
             ]
         )

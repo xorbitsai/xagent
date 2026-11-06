@@ -60,7 +60,10 @@ async def test_admission_cancellation_does_not_leak_capacity():
 
 
 @pytest.mark.asyncio
-async def test_thermal_gate_drains_work_before_counting_idle(tmp_path):
+@pytest.mark.parametrize("trigger,resume,hot", [(70, 60, 75), (60, 45, 65)])
+async def test_thermal_gate_drains_work_before_counting_idle(
+    tmp_path, trigger, resume, hot
+):
     file = tmp_path / "telemetry.json"
 
     def temperature(value):
@@ -78,13 +81,13 @@ async def test_thermal_gate_drains_work_before_counting_idle(tmp_path):
         )
 
     temperature(50)
-    gate = bench.AdmissionGate(2, file)
+    gate = bench.AdmissionGate(2, file, trigger=trigger, resume=resume)
     async with gate.slot():
-        temperature(75)
+        temperature(hot)
         assert not gate.can_enter()
         assert gate.cooling and gate.idle_started is None
     assert gate.idle_started is not None
-    temperature(60)
+    temperature(resume)
     async with gate.slot():
         assert not gate.cooling
     assert len(gate.cooling_intervals) == 1

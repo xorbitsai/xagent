@@ -177,8 +177,10 @@ published as an all-success performance sample.
 The optional `--gpu-telemetry-json` accepts a continuously refreshed mapping of
 GPU index to rows containing `utc` (timezone-aware ISO 8601), `temperature_C`,
 `sw_thermal_throttle` and `hw_thermal_throttle`. Missing/stale telemetry fails
-closed. Above 70 C or with a thermal flag, new calls wait, in-flight calls drain,
-and admission resumes at 60 C. The harness changes no GPU settings. Any run with
+closed. Above `--cooldown-trigger` (default 70 C) or with a thermal flag, new calls
+wait and in-flight calls drain; admission resumes at `--cooldown-resume` (default
+60 C). Use the same thresholds for all comparison arms and record them; colder
+targets may be necessary for sustained concurrent workloads. The harness changes no GPU settings. Any run with
 thermal throttling must be retained and excluded from clean timing comparisons.
 Use a separate start-temperature gate and external monitor for repeatable runs.
 

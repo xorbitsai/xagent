@@ -4808,3 +4808,12 @@ def test_get_sandbox_enabled(monkeypatch, value, expected):
     else:
         monkeypatch.setenv("SANDBOX_ENABLED", value)
     assert get_sandbox_enabled() is expected
+
+
+def test_legacy_source_uploads_boundary_ignores_operator_overrides(monkeypatch):
+    from xagent.config import get_legacy_source_uploads_dir
+
+    expected = get_legacy_source_uploads_dir()
+    monkeypatch.setenv("XAGENT_WEB_DIR", "/unrelated")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", "/")
+    assert get_legacy_source_uploads_dir() == expected

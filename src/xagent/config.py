@@ -2764,6 +2764,15 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     return absolute
 
 
+def get_legacy_source_uploads_dir() -> Path:
+    """Fixed historical data subtree, used only by source-isolation checks.
+
+    This is not an operator-configurable root. Upload configuration must not
+    turn arbitrary application directories into exempt data mounts.
+    """
+    return Path(__file__).resolve().parent / "web" / "uploads"
+
+
 def get_uploads_dir() -> Path:
     """Get the uploads directory path.
 

@@ -417,3 +417,40 @@ async def test_shared_mcp_adapter_keeps_each_wrappers_sandbox_transport():
         await second.run_json_async({})
         b.assert_awaited_once()
     assert adapter._sandbox_transport is None
+
+
+@pytest.mark.parametrize("directory", ["web", "core"])
+def test_uploads_configuration_cannot_exempt_application_modules(
+    monkeypatch, directory
+):
+    from xagent.sandbox.base import SandboxRuntimeConflictError
+    from xagent.web.sandbox_manager import _reject_platform_source_mounts
+
+    source = _SOURCE_ROOT / "xagent" / directory
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_uploads_dir", lambda: source)
+    with pytest.raises(SandboxRuntimeConflictError):
+        _reject_platform_source_mounts([(str(source), "/data", "rw")])
+
+
+def test_fixed_legacy_uploads_subtree_remains_mountable(monkeypatch):
+    from xagent.config import get_legacy_source_uploads_dir
+    from xagent.web.sandbox_manager import _reject_platform_source_mounts
+
+    data = get_legacy_source_uploads_dir()
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_uploads_dir", lambda: data)
+    _reject_platform_source_mounts([(str(data / "user_1"), "/workspace", "rw")])
+
+
+def test_legacy_uploads_symlink_cannot_exempt_source(tmp_path, monkeypatch):
+    from xagent.sandbox.base import SandboxRuntimeConflictError
+    from xagent.web.sandbox_manager import _reject_platform_source_mounts
+
+    source = _SOURCE_ROOT / "xagent" / "web"
+    alias = tmp_path / "uploads"
+    alias.symlink_to(source, target_is_directory=True)
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_uploads_dir", lambda: alias)
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_legacy_source_uploads_dir", lambda: alias
+    )
+    with pytest.raises(SandboxRuntimeConflictError):
+        _reject_platform_source_mounts([(str(alias), "/data", "rw")])

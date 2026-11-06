@@ -18,6 +18,7 @@ from ..config import (
     SANDBOX_VOLUMES,
     get_boxlite_home_dir,
     get_external_upload_dirs,
+    get_legacy_source_uploads_dir,
     get_sandbox_cpus,
     get_sandbox_enabled,
     get_sandbox_env,
@@ -2861,7 +2862,15 @@ def _reject_platform_source_mounts(volumes: list[tuple[str, str, str]]) -> None:
     """
     package_root = Path(__file__).resolve().parents[1]
     roots = [package_root, package_root.parent.parent / "tests"]
-    allowed_data = [Path(get_uploads_dir()).resolve()]
+    data = Path(get_uploads_dir()).resolve()
+    legacy_data = get_legacy_source_uploads_dir()
+    # A configured uploads root must never exempt web/, core/, or a symlink
+    # pointing back to source. Only the fixed legacy data subtree is exempt.
+    allowed_data = (
+        [data]
+        if legacy_data.resolve() == legacy_data and data.is_relative_to(legacy_data)
+        else []
+    )
     host_project = get_sandbox_host_project_root()
     if host_project is not None:
         roots += [host_project / "src" / "xagent", host_project / "tests"]

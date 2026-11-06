@@ -6,6 +6,7 @@ Execute tool's run_json_sync/async methods in sandbox environment.
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import logging
@@ -407,10 +408,12 @@ class SandboxedToolWrapper(AbstractBaseTool):
         from ..mcp_adapter import MCPToolAdapter
 
         self._mcp_target = (
-            reconstruction_target
+            copy.copy(reconstruction_target)
             if isinstance(reconstruction_target, MCPToolAdapter)
             else None
         )
+        # An adapter can be supplied to multiple task factories. Never bind a
+        # task-specific sandbox transport on the shared original instance.
         if self._mcp_target is not None:
             self._mcp_target._sandbox_transport = self._execute_mcp_in_sandbox
 

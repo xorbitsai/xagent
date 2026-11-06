@@ -222,7 +222,9 @@ async def test_mcp_authorization_runs_before_sandbox_transport():
     set_instance_sandbox_config(adapter, SandboxConfig())
     wrapper = SandboxedToolWrapper(adapter, object())
     with (
-        patch.object(adapter, "_get_current_user_id", return_value="denied"),
+        patch.object(
+            wrapper._mcp_target, "_get_current_user_id", return_value="denied"
+        ),
         patch.object(wrapper, "_execute_runtime_request", new=AsyncMock()) as execute,
     ):
         result = await wrapper.run_json_async({})
@@ -252,7 +254,9 @@ async def test_authorized_mcp_normalizes_arguments_and_uses_guest_transport():
     wrapper = SandboxedToolWrapper(adapter, object())
     payload = {"content": [{"type": "text", "text": "ok"}], "isError": False}
     with (
-        patch.object(adapter, "_get_current_user_id", return_value="allowed"),
+        patch.object(
+            wrapper._mcp_target, "_get_current_user_id", return_value="allowed"
+        ),
         patch.object(
             wrapper, "_execute_runtime_request", new=AsyncMock(return_value=payload)
         ) as execute,
@@ -387,3 +391,29 @@ async def test_shell_outputs_keep_host_registration_and_bulk_limits(tmp_path):
         result = await wrapper.run_json_async({"command": "create report"})
     assert result["generated_files"] == ["report.csv"]
     assert result["file_refs"][0]["file_id"]
+
+
+@pytest.mark.asyncio
+async def test_shared_mcp_adapter_keeps_each_wrappers_sandbox_transport():
+    adapter = MCPToolAdapter(
+        MCPTool(name="echo", inputSchema={"type": "object", "properties": {}}),
+        {"transport": "stdio", "command": "npx", "args": []},
+    )
+    set_instance_sandbox_config(adapter, SandboxConfig())
+    first = SandboxedToolWrapper(adapter, object())
+    second = SandboxedToolWrapper(adapter, object())
+    response = {"content": [], "isError": False}
+    with (
+        patch.object(
+            first, "_execute_runtime_request", new=AsyncMock(return_value=response)
+        ) as a,
+        patch.object(
+            second, "_execute_runtime_request", new=AsyncMock(return_value=response)
+        ) as b,
+    ):
+        await first.run_json_async({})
+        a.assert_awaited_once()
+        b.assert_not_awaited()
+        await second.run_json_async({})
+        b.assert_awaited_once()
+    assert adapter._sandbox_transport is None

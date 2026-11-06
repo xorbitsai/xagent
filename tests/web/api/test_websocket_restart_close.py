@@ -520,11 +520,17 @@ async def test_execute_task_holds_ingress_while_it_runs(global_manager, monkeypa
     ws = FakeSocket()
     release = asyncio.Event()
 
-    async def blocked(*_args):
-        await release.wait()
+    async def acknowledge(_message, _websocket):
+        return None
 
-    monkeypatch.setattr(ws_module, "_handle_admitted_execute_task", blocked)
-    work = asyncio.create_task(ws_module.handle_execute_task(ws, 1, {}))
+    async def blocked_load(*_args, **_kwargs):
+        await release.wait()
+        return None  # task not found: the handler answers with an error
+
+    monkeypatch.setattr(global_manager, "send_personal_message", acknowledge)
+    monkeypatch.setattr(ws_module, "run_db_io_cancellation_safe", blocked_load)
+    user = type("User", (), {"id": 1, "is_admin": False})()
+    work = asyncio.create_task(ws_module.handle_execute_task(ws, 1, {"user": user}))
     await asyncio.sleep(0.05)
     assert global_manager._has_pending_command(ws)
 

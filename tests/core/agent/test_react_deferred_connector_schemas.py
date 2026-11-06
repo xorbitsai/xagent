@@ -373,3 +373,294 @@ async def test_approval_pause_and_resume_keep_the_loaded_tool_callable() -> None
     assert resumed["success"] is True
     assert tool.writes == [{"body": "hi"}]
     assert "hubspot_create_note" in _names(resumed_llm.calls[0])
+
+
+def _batch(*calls: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": f"b{i}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }
+            for i, (name, args) in enumerate(calls)
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_call_in_the_same_response_as_its_load_is_refused() -> None:
+    tools = _tools()
+    llm = ScriptedLLM(
+        [
+            _batch(
+                (LOAD_TOOLS_NAME, {"names": ["notion_search"]}),
+                ("notion_search", {"query": "guessed blind"}),
+            ),
+            _call("notion_search", {"query": "with the schema in view"}, "c2"),
+            {"content": "done"},
+        ]
+    )
+    await _pattern().run(context=_ctx(), tools=tools, llm=llm)
+
+    notion = next(t for t in tools if t.name == "notion_search")
+    assert notion.calls == [{"query": "with the schema in view"}]
+    # The load took effect for the next model call, which therefore saw it.
+    assert "notion_search" not in _names(llm.calls[0])
+    assert "notion_search" in _names(llm.calls[1])
+
+
+class ValidatingLLM:
+    """Like DeepSeek/OpenRouter: a call outside the sent schemas is refused."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        from xagent.core.model.chat.exceptions import LLMToolProtocolError
+
+        self.calls.append(kwargs)
+        response = self.responses.pop(0)
+        sent = set(_names(kwargs))
+        for call in response.get("tool_calls") or []:
+            name = call["function"]["name"]
+            if name not in sent:
+                raise LLMToolProtocolError(
+                    provider="validating",
+                    code="unavailable_tool_call",
+                    message=f"unavailable tool call {name!r}",
+                    details={"tool_name": name},
+                )
+        return response
+
+
+@pytest.mark.asyncio
+async def test_a_provider_refusing_an_unloaded_call_gets_the_tool_loaded() -> None:
+    tools = _tools()
+    llm = ValidatingLLM(
+        [
+            _call("notion_search", {"query": "direct"}, "c1"),
+            _call("notion_search", {"query": "retried"}, "c2"),
+            {"content": "done"},
+        ]
+    )
+    result = await _pattern().run(context=_ctx(), tools=tools, llm=llm)
+
+    assert result["success"] is True
+    notion = next(t for t in tools if t.name == "notion_search")
+    assert notion.calls == [{"query": "retried"}]
+    assert "notion_search" not in _names(llm.calls[0])
+    assert "notion_search" in _names(llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_message_preloads_the_connector_it_names() -> None:
+    tools = _tools()
+    context = _ctx("Hello")
+    first = ScriptedLLM([{"content": "hi"}])
+    await _pattern().run(context=context, tools=tools, llm=first)
+    assert "hubspot_search_contacts" not in _names(first.calls[0])
+
+    context.add_user_message("Now look it up in HubSpot")
+    second = ScriptedLLM([{"content": "ok"}])
+    await _pattern().run(context=context, tools=tools, llm=second)
+    assert "hubspot_search_contacts" in _names(second.calls[0])
+
+    # Resuming without a new user message does not scan again.
+    third = ScriptedLLM([{"content": "ok"}])
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    await _pattern().run(context=resumed, tools=tools, llm=third)
+    assert _names(third.calls[0]).count("hubspot_search_contacts") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_quoted_exact_tool_name_is_preloaded() -> None:
+    llm = ScriptedLLM([{"content": "hi"}])
+    await _pattern().run(
+        context=_ctx("please call notion_search for the roadmap"),
+        tools=_tools(),
+        llm=llm,
+    )
+
+    names = _names(llm.calls[0])
+    assert "notion_search" in names
+    assert "hubspot_search_contacts" not in names
+
+
+@pytest.mark.asyncio
+async def test_preload_matches_what_the_user_typed_not_injected_context() -> None:
+    context = ExecutionContext()
+    context.add_user_message(
+        "[system context mentions HubSpot and Notion] hello",
+        metadata={"display_message": "hello"},
+    )
+    llm = ScriptedLLM([{"content": "hi"}])
+    await _pattern().run(context=context, tools=_tools(), llm=llm)
+
+    assert "hubspot_search_contacts" not in _names(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_preload_keeps_tool_order_when_the_budget_fits_only_one() -> None:
+    servers = ["zeta", "yankee", "xray", "whiskey", "victor", "uniform", "tango"]
+    tools = [ConnectorTool(f"{name}_search", name, fat=True) for name in servers]
+    cost = ReActPattern()._tool_schema_cost(tools[0])
+    llm = ScriptedLLM([{"content": "hi"}])
+    await _pattern(deferred_preload_token_budget=cost + 10).run(
+        context=_ctx(" and ".join(servers)), tools=tools, llm=llm
+    )
+
+    # The first connector in tool order wins whatever the hash seed is.
+    assert [n for n in _names(llm.calls[0]) if n.endswith("_search")] == ["zeta_search"]
+
+
+@pytest.mark.asyncio
+async def test_a_forced_answer_turn_sends_no_loaded_connector_schema() -> None:
+    tools = _tools()
+    llm = ScriptedLLM(
+        [
+            _call(LOAD_TOOLS_NAME, {"names": ["notion_search"]}, "c1"),
+            _call("notion_search", {"query": "plan"}, "c2"),
+            _call(
+                "final_answer",
+                {
+                    "response_language": "English",
+                    "answer": "done",
+                    "outcome": "completed",
+                },
+                "c3",
+            ),
+        ]
+    )
+    await ReActPattern(max_iterations=2, defer_connector_schemas=True).run(
+        context=_ctx(), tools=tools, llm=llm
+    )
+
+    assert "notion_search" in _names(llm.calls[1])
+    forced = _names(llm.calls[-1])
+    assert "notion_search" not in forced and "final_answer" in forced
+
+
+@pytest.mark.asyncio
+async def test_already_loaded_names_do_not_use_the_per_call_cap() -> None:
+    many = [ConnectorTool(f"hubspot_tool_{i}", "hubspot") for i in range(14)]
+    names = [t.name for t in many]
+    llm = ScriptedLLM(
+        [
+            _call(LOAD_TOOLS_NAME, {"names": names[:12]}, "c1"),
+            _call(LOAD_TOOLS_NAME, {"names": names}, "c2"),
+            {"content": "ok"},
+        ]
+    )
+    context = _ctx()
+    await _pattern().run(context=context, tools=many, llm=llm)
+
+    second = context.get_messages_by_role("tool")[1].content
+    assert "Loaded: hubspot_tool_12, hubspot_tool_13." in second
+    assert "Not loaded" not in second
+    assert second.count("hubspot_tool_0,") == 1  # listed once, as already loaded
+
+
+@pytest.mark.asyncio
+async def test_a_host_supplied_load_tools_disables_deferral() -> None:
+    class HostLoadTools(PlainTool):
+        pass
+
+    tools = [HostLoadTools(LOAD_TOOLS_NAME), *_tools()]
+    llm = ScriptedLLM([{"content": "hi"}])
+    await _pattern().run(context=_ctx(), tools=tools, llm=llm)
+
+    names = _names(llm.calls[0])
+    assert names.count(LOAD_TOOLS_NAME) == 1
+    assert "notion_search" in names
+
+
+@pytest.mark.asyncio
+async def test_a_misspelled_connector_tool_gets_a_load_hint() -> None:
+    llm = ScriptedLLM([_call("notion_serch", {"query": "x"}), {"content": "ok"}])
+    context = _ctx()
+    await _pattern().run(context=context, tools=_tools(), llm=llm)
+
+    error = context.get_messages_by_role("tool")[0].metadata["raw_result"]["error"]
+    assert "notion_search" in error and LOAD_TOOLS_NAME in error
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_committed_load_is_put_back() -> None:
+    from xagent.core.agent.runtime import PatternRuntime
+
+    tools = _tools()
+    pattern = _pattern()
+    context = _ctx()
+    prepared = pattern._tools_with_deferral(tools, context)
+    runtime = PatternRuntime(execution_id="replay")
+
+    async def committed(_call: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "result": {"success": True, "output": "Loaded: notion_search."},
+            "error": None,
+        }
+
+    runtime.load_committed_tool_outcome = committed  # type: ignore[method-assign]
+    call = {
+        "id": "r1",
+        "name": LOAD_TOOLS_NAME,
+        "args": {"names": ["notion_search"]},
+    }
+    await pattern._execute_tool_safely(call, prepared, runtime, context=context)
+
+    schemas = pattern._normal_tool_schemas([], None, prepared, context)
+    assert [s["function"]["name"] for s in schemas] == ["notion_search"]
+
+
+def test_service_flags_reach_the_react_and_auto_patterns() -> None:
+    from xagent.core.agent.execution_adapter import (
+        AgentExecutionAdapter,
+        AgentExecutionConfig,
+    )
+
+    for mode in ("react", "auto"):
+        adapter = AgentExecutionAdapter(
+            AgentExecutionConfig(
+                name="t",
+                llm=object(),
+                pattern=mode,
+                defer_connector_schemas=True,
+                deferred_preload_token_budget=123,
+            )
+        )
+        pattern, _ = adapter._build_pattern()
+        react = pattern.react_pattern if mode == "auto" else pattern
+        assert react.defer_connector_schemas is True
+        assert react.deferred_preload_token_budget == 123
+    off = AgentExecutionAdapter(
+        AgentExecutionConfig(name="t", llm=object(), pattern="react")
+    )
+    assert off._build_pattern()[0].defer_connector_schemas is False
+
+
+@pytest.mark.asyncio
+async def test_loaded_schemas_go_after_the_stored_result_reader() -> None:
+    from xagent.core.agent.context.components import SpillRegistryComponent
+    from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
+
+    tools = [*_tools(), PlainTool(SPILL_READ_TOOL_NAME)]
+    context = _ctx()
+    context.set_component(
+        "spilled_results",
+        SpillRegistryComponent(records=[{"relative_path": "stored/result.json"}]),
+    )
+    llm = ScriptedLLM(
+        [
+            _call(LOAD_TOOLS_NAME, {"names": ["notion_search"]}, "c1"),
+            {"content": "done"},
+        ]
+    )
+    await _pattern().run(context=context, tools=tools, llm=llm)
+
+    first, second = _names(llm.calls[0]), _names(llm.calls[1])
+    assert SPILL_READ_TOOL_NAME in first
+    assert second[: len(first)] == first
+    assert second[-1] == "notion_search"

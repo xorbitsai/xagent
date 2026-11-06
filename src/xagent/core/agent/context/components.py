@@ -97,25 +97,46 @@ class SpillRegistryComponent:
 class LoadedToolsComponent:
     """Deferred connector tools whose schemas this execution has loaded.
 
-    Order is load order; schemas are appended in this order so the tool list
-    stays a stable prefix between model calls.
+    ``names`` is the set whose schemas are sent, in load order, so the tool
+    list only ever grows at its end. ``pending`` holds names a load_tools call
+    asked for in the current model response: they become part of ``names`` at
+    the start of the next iteration, so a call in the same response as its
+    load is refused instead of running with arguments written blind.
+    ``scanned_user_turns`` counts the user messages already scanned for
+    connector names to pre-load.
     """
 
     names: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    scanned_user_turns: int = 0
 
     def clone(self) -> "LoadedToolsComponent":
-        return LoadedToolsComponent(names=list(self.names))
+        return LoadedToolsComponent(
+            names=list(self.names),
+            pending=list(self.pending),
+            scanned_user_turns=self.scanned_user_turns,
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"names": list(self.names)}
+        return {
+            "names": list(self.names),
+            "pending": list(self.pending),
+            "scanned_user_turns": self.scanned_user_turns,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LoadedToolsComponent":
-        raw = data.get("names")
+        def _names(key: str) -> list[str]:
+            raw = data.get(key)
+            if not isinstance(raw, list):
+                return []
+            return list(dict.fromkeys(n for n in raw if isinstance(n, str)))
+
+        scanned = data.get("scanned_user_turns")
         return cls(
-            names=list(dict.fromkeys(n for n in raw if isinstance(n, str)))
-            if isinstance(raw, list)
-            else []
+            names=_names("names"),
+            pending=_names("pending"),
+            scanned_user_turns=scanned if isinstance(scanned, int) else 0,
         )
 
 

@@ -20,6 +20,7 @@ from xagent.web.services.agent_service_manager import (
     AgentServiceManager,
     AgentServiceMemoryPolicy,
     _task_model_override_excluded_categories,
+    _task_model_override_excluded_model_ids,
 )
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
@@ -323,6 +324,51 @@ class TestExcludedCategories:
             ),
         )
         assert _task_model_override_excluded_categories(applied) == frozenset({"mcp"})
+
+
+class TestExcludedModelIds:
+    def test_any_collection_becomes_a_frozenset(self):
+        override = TaskModelOverride(
+            llm=NamedLLM("selected"),
+            excluded_model_ids=["img-1", "vid-1"],  # type: ignore[arg-type]
+        )
+        assert override.excluded_model_ids == frozenset({"img-1", "vid-1"})
+
+    def test_the_default_is_empty(self):
+        assert (
+            TaskModelOverride(llm=NamedLLM("selected")).excluded_model_ids
+            == frozenset()
+        )
+
+    @pytest.mark.parametrize("value", ["img-1", b"img-1"])
+    def test_a_single_string_is_refused(self, value):
+        with pytest.raises(TypeError):
+            TaskModelOverride(llm=NamedLLM("selected"), excluded_model_ids=value)  # type: ignore[arg-type]
+
+    def test_ids_must_be_strings(self):
+        with pytest.raises(TypeError):
+            TaskModelOverride(llm=NamedLLM("selected"), excluded_model_ids={1})  # type: ignore[arg-type]
+
+    def test_apply_carries_the_set_on_the_snapshot_override(self):
+        override = TaskModelOverride(
+            llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+        )
+        applied = apply_task_model_override(_snapshot(["image"]), override)
+        assert applied.model_override is override
+        assert applied.model_override.excluded_model_ids == frozenset({"img-1"})
+
+    def test_the_reader_takes_the_set_from_the_snapshot_override(self):
+        assert _task_model_override_excluded_model_ids(None) == frozenset()
+        assert (
+            _task_model_override_excluded_model_ids(_snapshot(["image"])) == frozenset()
+        )
+        applied = apply_task_model_override(
+            _snapshot(["image"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+            ),
+        )
+        assert _task_model_override_excluded_model_ids(applied) == frozenset({"img-1"})
 
 
 def test_the_stand_in_is_not_reported_as_a_configured_vision_model() -> None:
@@ -762,3 +808,57 @@ async def test_the_built_service_and_its_tools_use_only_the_override() -> None:
         tool_kwargs["llm"],
         tool_kwargs["vision_model"],
     }
+
+
+@pytest.mark.asyncio
+async def test_get_agent_for_task_passes_excluded_model_ids() -> None:
+    builds = _Builds()
+    override = TaskModelOverride(
+        llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+    )
+    await builds.get(apply_task_model_override(_snapshot(["image"]), override))
+
+    assert builds.tool_calls[-1]["excluded_model_ids"] == frozenset({"img-1"})
+
+
+@pytest.mark.asyncio
+async def test_get_agent_for_task_without_override_passes_no_excluded_model_ids() -> (
+    None
+):
+    builds = _Builds()
+    await builds.get(_snapshot(["image"]))
+
+    assert builds.tool_calls[-1]["excluded_model_ids"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_build_tools_for_task_passes_excluded_model_ids() -> None:
+    manager = AgentServiceManager()
+    override = TaskModelOverride(
+        llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+    )
+    snapshot = apply_task_model_override(_snapshot(["image", "basic"]), override)
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+    task = SimpleNamespace(id=42, user_id=1, source="external", agent_config={})
+
+    with (
+        patch.object(
+            manager, "_get_or_create_task_sandbox", new=AsyncMock(return_value=None)
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+    ):
+        await manager._build_tools_for_task(
+            task_id=42,
+            task=task,
+            db=None,
+            user=RuntimeUserFields(id=1, is_admin=False),
+            agent_config=snapshot.agent_config,
+            task_llm=snapshot.task_llm,
+            task_vision_llm=snapshot.task_vision_llm,
+            task_setup_snapshot=snapshot,
+        )
+
+    assert create_tools.await_args.kwargs["excluded_model_ids"] == frozenset({"img-1"})

@@ -274,22 +274,25 @@ class ElevenLabsTTS(BaseTTS):
         if aliases is None:
             return text
         if not isinstance(aliases, dict):
-            raise ValueError(
+            raise MediaParameterError(
                 "ElevenLabs pronunciation_aliases must be an object mapping "
-                "source phrases to spoken aliases"
+                "source phrases to spoken aliases",
+                field="pronunciation_aliases",
             )
 
         normalized_aliases: dict[str, str] = {}
         for source, alias in aliases.items():
             if not isinstance(source, str) or not source.strip():
-                raise ValueError(
+                raise MediaParameterError(
                     "ElevenLabs pronunciation_aliases source phrases must be "
-                    "non-empty strings"
+                    "non-empty strings",
+                    field="pronunciation_aliases",
                 )
             if not isinstance(alias, str) or not alias.strip():
-                raise ValueError(
+                raise MediaParameterError(
                     "ElevenLabs pronunciation_aliases spoken aliases must be "
-                    "non-empty strings"
+                    "non-empty strings",
+                    field="pronunciation_aliases",
                 )
             normalized_aliases[source] = alias
 

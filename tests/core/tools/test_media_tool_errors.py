@@ -870,6 +870,35 @@ class TestParameterErrorsFromTheAdapters:
         assert result["error_category"] == INVALID_REQUEST
         assert "allowed_values" not in result
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "aliases",
+        ["not an object", {"": "spoken"}, {"written": ""}],
+        ids=["not-object", "empty-source", "empty-target"],
+    )
+    async def test_invalid_pronunciation_aliases_are_a_parameter_error(
+        self, aliases: object
+    ) -> None:
+        """The adapter rejects these before opening a client, so they are the
+        caller's parameter error -- not a failure whose reason is unknown."""
+        tts_model = ElevenLabsTTS(api_key="test-key")
+        tts_model._ensure_async_client = Mock(
+            side_effect=AssertionError("a rejected request must not reach the SDK")
+        )
+        tool = AudioToolCore(
+            tts_models={"elevenlabs": tts_model},
+            default_tts_model=tts_model,
+        )
+
+        result = await tool.synthesize_speech(
+            "Hello", provider_options={"pronunciation_aliases": aliases}
+        )
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+        assert tts_model._ensure_async_client.call_count == 0
+
     def test_a_typed_parameter_error_wins_over_an_ambiguous_status(self) -> None:
         """The adapter knows more than the status does, in both directions."""
         error = MediaParameterError("bad format", field="audio_format")

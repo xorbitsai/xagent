@@ -101,8 +101,7 @@ class StructuredOutputFormat:
     the result and its JSON ``schema``.
 
     The schema is a shared reference and is only read. ``INVALID`` stands for a
-    stored format that failed its checks and ``READ_FAILED`` for a stored
-    format that could not be read; both are compared with ``is``.
+    stored format that failed its checks; it is compared with ``is``.
     """
 
     name: str
@@ -110,11 +109,9 @@ class StructuredOutputFormat:
     schema: dict[str, Any]
 
     INVALID: ClassVar[StructuredOutputFormat]
-    READ_FAILED: ClassVar[StructuredOutputFormat]
 
 
 StructuredOutputFormat.INVALID = StructuredOutputFormat("<invalid>", None, {})
-StructuredOutputFormat.READ_FAILED = StructuredOutputFormat("<read_failed>", None, {})
 
 
 class _Decision(enum.Enum):
@@ -194,7 +191,7 @@ def structured_output_eligibility(
     outcome that is already settled without a model.
 
     The rows are taken from the top and the first that matches decides: no
-    format, a run that did not finish normally, an invalid or unreadable
+    format, a run that did not finish normally, an invalid stored
     format, a partial or blocked run, and an empty answer.
     """
     if fmt is None:
@@ -207,8 +204,6 @@ def structured_output_eligibility(
         return SKIP
     if fmt is StructuredOutputFormat.INVALID:
         return _settled("failed", "invalid_stored_format")
-    if fmt is StructuredOutputFormat.READ_FAILED:
-        return _settled("failed", "internal_error")
     outcome = result.get("completion_outcome")
     if outcome == "partial":
         return _settled("incomplete", "agent_partial")

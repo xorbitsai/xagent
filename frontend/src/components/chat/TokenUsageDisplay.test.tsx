@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -25,6 +25,7 @@ const interpolate = (
   )
 
 const messages: Record<string, string> = {
+  "chatPage.tokenUsage.details": "Usage details",
   "chatPage.tokenUsage.input": "Input tokens",
   "chatPage.tokenUsage.output": "Output tokens",
   "chatPage.tokenUsage.cached": "Cached input tokens",
@@ -105,6 +106,32 @@ describe("TokenUsageDisplay", () => {
     expect(formatTokenCount(2_755_525)).toBe("2.76m")
     expect(formatExactTokenCount(2_755_525)).toBe("2,755,525")
     expect(formatTokenCount(2_755_525, "zh")).toBe("275.55万")
+  })
+
+  it("opens the mobile summary without losing cached, model or media usage", async () => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      input_tokens: 150_930,
+      output_tokens: 6_340,
+      total_tokens: 157_270,
+      cached_input_tokens: 105_651,
+      model_usage: [{ model_id: "main", model_name: "Main model", input_tokens: 150_930, output_tokens: 6_340 }],
+      media_usage: [{ model_id: "tts", model_name: "Speech model", call_type: "tts", unit: "seconds", quantity: 12, calls: 2 }],
+    }), { status: 200 }))
+
+    render(<TokenUsageDisplay taskId={42} isRunning={false} />)
+    const summary = await screen.findByRole("button", {
+      name: "Usage details",
+    })
+    expect(summary).toHaveTextContent("157.27k tokens")
+    expect(summary).toHaveAttribute("title", "Input tokens: 150,930, Output tokens: 6,340, 2 media calls")
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+
+    fireEvent.click(summary)
+    const details = within(screen.getByRole("dialog"))
+    expect(details.getByText("70% cached")).toBeInTheDocument()
+    expect(details.getByRole("button", { name: "1 model" })).toBeInTheDocument()
+    fireEvent.click(details.getByRole("button", { name: "2 media calls" }))
+    expect(await screen.findByText("Speech model")).toBeInTheDocument()
   })
 
   it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -298,7 +325,7 @@ describe("TokenUsageDisplay", () => {
       render(<TokenUsageDisplay taskId={9} isRunning={false} />)
 
       await screen.findByText("12")
-      expect(screen.queryByRole("button")).not.toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: /model|unattributed/ })).not.toBeInTheDocument()
     },
   )
 })

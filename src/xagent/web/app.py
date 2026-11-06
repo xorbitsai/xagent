@@ -2598,9 +2598,6 @@ async def shutdown_event() -> None:
         await wait_for_heartbeat_manager_idle()
         from .api.websocket import manager
 
-        # Tell connected clients to reconnect (1012) before their disconnect
-        # checks are stopped; those checks read the database.
-        await manager.close_for_restart()
         # Disconnect delivery checks read the database; stop them before the
         # database runtime closes.
         await manager.stop_delivery_checks()

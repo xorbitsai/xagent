@@ -1289,6 +1289,10 @@ class ConnectionManager:
         ) = None
         # Set at shutdown so later disconnects schedule no database read.
         self._delivery_checks_stopped = False
+        # Set by ``close_for_restart``: a socket registered while draining is
+        # closed with 1012 at once. ``end_restart_drain`` reverses it.
+        self._restart_draining = False
+        self._restart_closes: set[asyncio.Task[None]] = set()
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -1323,6 +1327,10 @@ class ConnectionManager:
             self._writers[websocket] = TaskSocketWriter(
                 websocket, lambda: self.disconnect(websocket)
             )
+        if self._restart_draining and not getattr(
+            websocket, "is_broadcast_only", False
+        ):
+            self._schedule_restart_close(websocket)
 
     def _remove_from_task(self, websocket: WebSocket, task_id: int) -> None:
         if task_id in self.active_connections:
@@ -1518,31 +1526,69 @@ class ConnectionManager:
             return
         _report_delivery(ledger, expected)
 
+    def _has_pending_command(self, websocket: Any) -> bool:
+        """Whether a command from this socket still awaits its reply.
+
+        Non-shared execution records the origin in ``_command_origins``;
+        shared execution records it in the task event bridge instead.
+        """
+        if _command_origins.has_pending_for_socket(websocket):
+            return True
+        if get_shared_task_execution_enabled():
+            from ..services.task_event_bridge import get_task_event_bridge
+
+            try:
+                return get_task_event_bridge().has_pending_for_recipient(websocket)
+            except ConnectionError:
+                return False
+        return False
+
+    def _schedule_restart_close(self, websocket: WebSocket) -> None:
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._close_for_restart(websocket, 2.0)
+            )
+        except RuntimeError:
+            return
+        self._restart_closes.add(task)
+        task.add_done_callback(self._restart_closes.discard)
+
+    def end_restart_drain(self) -> None:
+        """Stop closing new registrations; the release was aborted."""
+        self._restart_draining = False
+
     async def close_for_restart(
         self,
         *,
         reply_deadline_seconds: float = 5.0,
         close_timeout_seconds: float = 2.0,
     ) -> int:
-        """Close every registered WebSocket with ``1012 Service Restart``.
+        """Close registered WebSockets with ``1012 Service Restart``.
 
-        Meant for a planned restart or release hand-over, callable by a
-        release controller as well as by process shutdown. Clients treat 1012
-        as "reconnect and resync from the snapshot", so queued frames are
-        dropped rather than flushed. A socket with no command awaiting its
-        reply is closed at once; one that has such a command is closed after
-        the reply settled, or when ``reply_deadline_seconds`` passes. SSE
-        sinks (``is_broadcast_only``) are not WebSockets and stay open.
+        Meant for a planned release hand-over, callable by a release
+        controller. Clients treat 1012 as "reconnect and resync from the
+        snapshot", so queued frames are dropped rather than flushed. A socket
+        with no command awaiting its reply is closed at once; one with such a
+        command is closed after the reply settled, or when
+        ``reply_deadline_seconds`` passes. SSE sinks (``is_broadcast_only``)
+        are not WebSockets and stay open.
+
+        The manager then keeps draining: a socket registered afterwards is
+        closed with 1012 at once, until ``end_restart_drain``. Only sockets
+        registered with this manager are covered; ``/ws/build/chat``,
+        ``/ws/progress/{task_id}``, ``/asr/stream`` and a ``/ws/build/preview``
+        socket that has not started a preview task are not.
 
         Idempotent and best-effort: a socket that cannot be closed is only
         dropped from the registry. Returns the number of sockets handled.
         """
+        self._restart_draining = True
         sockets = [
             ws
             for ws in list(self._connection_task_ids)
             if not getattr(ws, "is_broadcast_only", False)
         ]
-        waiting = [ws for ws in sockets if _command_origins.has_pending_for_socket(ws)]
+        waiting = [ws for ws in sockets if self._has_pending_command(ws)]
         waiting_ids = {id(ws) for ws in waiting}
         immediate = [ws for ws in sockets if id(ws) not in waiting_ids]
         await asyncio.gather(
@@ -1554,8 +1600,7 @@ class ConnectionManager:
             ready = [
                 ws
                 for ws in waiting
-                if not _command_origins.has_pending_for_socket(ws)
-                or loop.time() >= deadline
+                if not self._has_pending_command(ws) or loop.time() >= deadline
             ]
             if ready:
                 await asyncio.gather(

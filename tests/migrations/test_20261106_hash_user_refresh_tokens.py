@@ -13,7 +13,7 @@ from alembic.config import Config
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 
-PARENT_REVISION = "20261105_update_atlassian_name_and_description"
+PARENT_REVISION = "20261106_api_idempotency_keys"
 TARGET_REVISION = "20261106_hash_user_refresh_tokens"
 
 JWT_A = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxfQ.c2lnbmF0dXJlLWE"

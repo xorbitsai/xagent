@@ -6,7 +6,7 @@ its digest in place; the application hashes the token a client presents before
 comparing, so signed-in users keep their sessions.
 
 Revision ID: 20261106_hash_user_refresh_tokens
-Revises: 20261105_update_atlassian_name_and_description
+Revises: 20261106_api_idempotency_keys
 """
 
 import hashlib
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261106_hash_user_refresh_tokens"
-down_revision: Union[str, None] = "20261105_update_atlassian_name_and_description"
+down_revision: Union[str, None] = "20261106_api_idempotency_keys"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

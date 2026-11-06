@@ -13,6 +13,7 @@ from ..task_runtime import (
 from .agent import Agent
 from .attachments import build_image_context_references
 from .budget import BudgetPolicyProvider
+from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
 from .interruption import (
     INTERRUPTION_REASON_KEY,
     classify_run_result,
@@ -67,6 +68,10 @@ class AgentExecutionConfig:
     # Capability gate: False overrides an explicitly supplied manager/list.
     skills_enabled: bool = True
     user_interaction_enabled: bool = True
+    # Host opt-in for ReAct: withhold connector tool schemas until the model
+    # loads them with ``load_tools`` (see ``deferred_tools``).
+    defer_connector_schemas: bool = False
+    deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET
     preferred_input_modalities: tuple[str, ...] = ()
     execution_metadata: dict[str, Any] = field(default_factory=dict)
     budget_policy_provider: BudgetPolicyProvider | None = None
@@ -346,6 +351,10 @@ class AgentExecutionAdapter:
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
                         user_interaction_enabled=self.config.user_interaction_enabled,
+                        defer_connector_schemas=self.config.defer_connector_schemas,
+                        deferred_preload_token_budget=(
+                            self.config.deferred_preload_token_budget
+                        ),
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
@@ -378,6 +387,10 @@ class AgentExecutionAdapter:
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
                 user_interaction_enabled=self.config.user_interaction_enabled,
+                defer_connector_schemas=self.config.defer_connector_schemas,
+                deferred_preload_token_budget=(
+                    self.config.deferred_preload_token_budget
+                ),
             ),
             "agent_react",
         )

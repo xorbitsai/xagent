@@ -28,6 +28,7 @@ from ..tools.adapters.vibe.config import (
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .budget import BudgetPolicyProvider
+from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
 from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
@@ -91,6 +92,8 @@ class AgentService:
         enable_default_tools: bool = True,
         skills_enabled: bool = True,
         user_interaction_enabled: bool = True,
+        defer_connector_schemas: bool = False,
+        deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET,
         execution_metadata: dict[str, Any] | None = None,
         budget_policy_provider: BudgetPolicyProvider | None = None,
         **agent_kwargs: Any,
@@ -124,6 +127,8 @@ class AgentService:
         self.enable_default_tools = enable_default_tools
         self.skills_enabled = skills_enabled
         self.user_interaction_enabled = user_interaction_enabled
+        self.defer_connector_schemas = defer_connector_schemas
+        self.deferred_preload_token_budget = deferred_preload_token_budget
         self.execution_metadata = dict(execution_metadata or {})
         self.budget_policy_provider = budget_policy_provider
         if tools is not None and tool_config is not None:
@@ -651,6 +656,12 @@ class AgentService:
             self._execution_adapter.config.user_interaction_enabled = (
                 self.user_interaction_enabled
             )
+            self._execution_adapter.config.defer_connector_schemas = (
+                self.defer_connector_schemas
+            )
+            self._execution_adapter.config.deferred_preload_token_budget = (
+                self.deferred_preload_token_budget
+            )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
@@ -718,6 +729,8 @@ class AgentService:
                 allowed_skills=self.allowed_skills,
                 skills_enabled=self.skills_enabled,
                 user_interaction_enabled=self.user_interaction_enabled,
+                defer_connector_schemas=self.defer_connector_schemas,
+                deferred_preload_token_budget=self.deferred_preload_token_budget,
                 preferred_input_modalities=self.preferred_input_modalities,
                 execution_metadata=dict(self.execution_metadata),
             )

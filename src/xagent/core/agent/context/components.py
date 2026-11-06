@@ -94,6 +94,32 @@ class SpillRegistryComponent:
 
 
 @dataclass
+class LoadedToolsComponent:
+    """Deferred connector tools whose schemas this execution has loaded.
+
+    Order is load order; schemas are appended in this order so the tool list
+    stays a stable prefix between model calls.
+    """
+
+    names: list[str] = field(default_factory=list)
+
+    def clone(self) -> "LoadedToolsComponent":
+        return LoadedToolsComponent(names=list(self.names))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"names": list(self.names)}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LoadedToolsComponent":
+        raw = data.get("names")
+        return cls(
+            names=list(dict.fromkeys(n for n in raw if isinstance(n, str)))
+            if isinstance(raw, list)
+            else []
+        )
+
+
+@dataclass
 class GenericComponent:
     """Fallback component for unknown serialized component payloads."""
 
@@ -110,6 +136,7 @@ COMPONENT_LOADERS: dict[str, Callable[[dict[str, Any]], ExecutionComponent]] = {
     "workspace": WorkspaceComponent.from_dict,
     "memory": MemoryComponent.from_dict,
     "spilled_results": SpillRegistryComponent.from_dict,
+    "loaded_tools": LoadedToolsComponent.from_dict,
 }
 
 

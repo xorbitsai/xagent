@@ -156,13 +156,15 @@ class ConcurrentLLM(audit.BenchmarkLLM):
         self.protocol["cache_session_sent"] = "cache_session" in config
 
     async def _update_cache_session(self, session: dict[str, Any]) -> None:
-        row = {"phase": session["phase"], "revision": session["revision"], "utc": utc()}
+        row = {
+            "phase": session["phase"],
+            "revision": session["revision"],
+            "utc": utc(),
+            "success": False,
+        }
         try:
             await super()._update_cache_session(session)
             row["success"] = True
-        except Exception:
-            row["success"] = False
-            raise
         finally:
             self.control.append(row)
 

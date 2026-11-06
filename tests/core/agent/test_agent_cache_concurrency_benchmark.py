@@ -11,7 +11,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 
 from scripts.benchmarks import agent_cache_concurrency_benchmark as bench
-from xagent.core.model.chat.cache_lifecycle import agent_cache_session
+from xagent.core.model.chat.cache_lifecycle import (
+    AgentCacheSession,
+    agent_cache_session,
+)
 from xagent.core.model.chat.routing_context import xinference_routing_key
 
 
@@ -57,6 +60,48 @@ async def test_admission_cancellation_does_not_leak_capacity():
     async with asyncio.timeout(1):
         async with gate.slot():
             assert gate.active == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_terminal_update_keeps_retry_acknowledgement_reportable(
+    tmp_path, monkeypatch
+):
+    attempts = []
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    async def update(self, payload):
+        attempts.append(dict(payload))
+        if len(attempts) == 1:
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    monkeypatch.setattr(bench.audit.BenchmarkLLM, "_update_cache_session", update)
+    args = argparse.Namespace(
+        model="fixture",
+        context_window=16384,
+        endpoint="http://unused",
+        api_key_file=None,
+        timeout=30,
+    )
+    llm = bench.model(args, tmp_path, bench.AdmissionGate(1), hints=True)
+    session = AgentCacheSession()
+    session.register(("fixture", "fixture"), llm._update_cache_session)
+    try:
+        await session.transition("finished")
+        assert session._publisher is not None
+        await asyncio.wait_for(session._publisher, timeout=2)
+        assert cancelled.is_set()
+        assert len(attempts) == 2
+        assert attempts[0] == attempts[1]
+        # Use the same acknowledgement scan that builds each agent report.
+        assert any(row["phase"] == "finished" and row["success"] for row in llm.control)
+        assert [row["success"] for row in llm.control] == [False, True]
+    finally:
+        await llm.close()
 
 
 @pytest.mark.asyncio

@@ -211,7 +211,6 @@ async def test_legacy_existing_execution_returns_after_durable_acceptance(
         task_start.execute_existing_task(
             task_id=task_id,
             task_owner_user_id=owner,
-            task_source="internal",
             task_description="saved",
             context={},
             actor_user_id=owner,

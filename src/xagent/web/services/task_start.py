@@ -1207,7 +1207,6 @@ async def execute_existing_task(
     *,
     task_id: int,
     task_owner_user_id: int,
-    task_source: str | None,
     task_description: str,
     context: dict[str, Any],
     actor_user_id: int,
@@ -1217,14 +1216,13 @@ async def execute_existing_task(
     Both execution modes stage the same START (kind ``existing``). The command
     dispatcher executes it, so a closed release hold leaves it pending for the
     successor, and the WebSocket returns once the command is accepted instead
-    of waiting for the execution. ``task_source`` is read again by the
-    consumer from the task row.
+    of waiting for the execution.
     """
     from .task_command_execution import execute_durable_task_command
     from .task_command_transport import dispatch_task_command_promptly
     from .task_existing_command import stage_existing_execution
 
-    _run_id, command_db_id = await run_db_io_cancellation_safe(
+    command_db_id = await run_db_io_cancellation_safe(
         lambda: stage_existing_execution(
             task_id=task_id,
             task_owner_user_id=task_owner_user_id,

@@ -23,11 +23,12 @@ from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import (
     task_command_transport,
+    task_orchestrator,
     task_event_bridge,
     task_execution,
 )
 from xagent.web.services.release_hold import ReleaseHold
-from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
+from xagent.web.services.task_orchestrator import TaskTurnError
 
 from .conftest import _direct_db_session
 
@@ -53,12 +54,18 @@ def frames(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 @pytest.fixture
-def schedule(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+def schedule(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """The scheduler the consumer hands the committed run to.
+
+    Only the run itself is replaced: staging, the handoff's fence and lease
+    acquisition and the command's completion are the real ones.
+    """
+
     async def completed() -> None:
         return None
 
-    mock = AsyncMock(side_effect=lambda **_k: asyncio.create_task(completed()))
-    monkeypatch.setattr(TaskTurnOrchestrator, "schedule_existing_task_execution", mock)
+    mock = Mock(side_effect=lambda **_k: asyncio.create_task(completed()))
+    monkeypatch.setattr(task_orchestrator, "_schedule_bg", mock)
     return mock
 
 
@@ -122,9 +129,9 @@ async def test_combined_execute_task_is_staged_and_run_by_the_dispatcher(
     await _wait_for_status(task_id, "completed")
 
     assert _commands(task_id) == [("start", "completed", "existing")]
-    schedule.assert_awaited_once()
-    assert schedule.await_args.kwargs["task_id"] == task_id
-    assert schedule.await_args.kwargs["payload"].transcript_message == (
+    schedule.assert_called_once()
+    assert schedule.call_args.kwargs["task_id"] == task_id
+    assert schedule.call_args.kwargs["payload"].transcript_message == (
         "Run the existing task"
     )
     # The reply contract is unchanged and goes to the originating socket.
@@ -148,7 +155,7 @@ async def test_execute_task_stays_pending_under_a_closed_hold(
 
     # Accepted and acknowledged, but nothing was started in this process.
     assert _commands(task_id) == [("start", "pending", "existing")]
-    schedule.assert_not_awaited()
+    schedule.assert_not_called()
     assert frames.send_personal_message.await_args.args[0]["type"] == (
         "execution_started"
     )
@@ -158,7 +165,7 @@ async def test_execute_task_stays_pending_under_a_closed_hold(
     hold.reopen()
     assert await _dispatch()
     assert _commands(task_id) == [("start", "completed", "existing")]
-    schedule.assert_awaited_once()
+    schedule.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -177,7 +184,7 @@ async def test_duplicate_execute_task_frame_executes_once(
     hold.reopen()
     assert await _dispatch()
     assert not await _dispatch()
-    schedule.assert_awaited_once()
+    schedule.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -200,7 +207,7 @@ async def test_start_refused_at_consumption_is_reported_to_the_task(
     await _dispatch()
 
     assert _commands(task_id) == [("start", "failed", "existing")]
-    schedule.assert_not_awaited()
+    schedule.assert_not_called()
     errors = [
         call.args[0]
         for call in frames.broadcast_to_task.await_args_list
@@ -222,5 +229,31 @@ async def test_shared_mode_stages_the_same_start_pending_under_a_hold(
     await websocket_api.handle_execute_task(websocket, task_id, {"user": user})
 
     assert _commands(task_id) == [("start", "pending", "existing")]
-    schedule.assert_not_awaited()
+    schedule.assert_not_called()
     assert frames.send_personal_message.await_args.args[1] is websocket
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "error_code"),
+    [("task_not_found", "task_unavailable"), ("other", "task_execution_failed")],
+)
+async def test_unstageable_execute_task_answers_the_client(
+    task_and_user, hold, frames, monkeypatch, reason, error_code
+) -> None:
+    task_id, user = task_and_user
+    monkeypatch.setattr(
+        websocket_api.task_start_service,
+        "execute_existing_task",
+        AsyncMock(side_effect=TaskTurnError(reason)),
+    )
+    websocket = MagicMock(name="origin")
+
+    await websocket_api.handle_execute_task(websocket, task_id, {"user": user})
+
+    errors = [
+        call.args[0]
+        for call in frames.send_personal_message.await_args_list
+        if call.args[0].get("type") == "error"
+    ]
+    assert [e["error_code"] for e in errors] == [error_code]

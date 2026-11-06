@@ -22,12 +22,13 @@ from xagent.web.api.websocket import (
     handle_file_upload_for_task,
 )
 from xagent.web.models import Base
+from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_execution as task_execution_service
-from xagent.web.services import task_execution_host, task_orchestrator, task_start
+from xagent.web.services import task_execution_host, task_orchestrator
 from xagent.web.services.file_turn import (
     append_prompt_context_block,
     append_uploaded_files_context,
@@ -44,27 +45,21 @@ from xagent.web.services.task_command_execution import (
     _prepare_task_message_sync,
     _selected_file_refs_from_task,
 )
-from xagent.web.services.task_command_transport import (
-    ClaimedTaskCommand,
-    TaskCommandKind,
-)
+from xagent.web.services.task_command_transport import claim_task_command
 from xagent.web.services.task_execution import (
     _register_uploaded_files_for_agent,
     _rewrite_file_links_to_file_id,
     execute_task_background,
 )
-from xagent.web.services.task_existing_command import execute_existing_start_local
-from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.task_existing_command import stage_existing_execution
+from xagent.web.services.task_start_consumer import execute_task_start
+from xagent.web.services.task_lease_service import TaskLease, get_runner_id
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
-)
-from xagent.web.services.task_start_protocol import (
-    ExistingExecutionContext,
-    TaskStartPayload,
 )
 
 
@@ -302,6 +297,8 @@ class _NoopAgentService:
 
 
 class _NoopBackgroundTaskManager:
+    running_tasks: dict = {}
+
     async def wait_for_previous(self, task_id):
         pass
 
@@ -1690,19 +1687,16 @@ async def test_execute_existing_task_gets_prompt_context_at_run_start(
     block = build_prompt_context_block(prompt_context)
     assert block is not None
     user = _create_user(db_session, 1, "owner")
-    lease = _task_lease(10)
-    row = _create_task(
+    _create_task(
         db_session,
         task_id=10,
         user_id=1,
         status=TaskStatus.COMPLETED,
         agent_config={PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context},
-        runner_id=lease.runner_id,
-        run_id=lease.run_id,
-    )
-    row.input = "saved task"
+    ).input = "saved task"
     db_session.commit()
     captured: dict = {}
+    runs: list[asyncio.Task] = []
 
     class BroadcastManager:
         async def broadcast_to_task(self, event, task_id):
@@ -1717,64 +1711,59 @@ async def test_execute_existing_task_gets_prompt_context_at_run_start(
             captured["agent_context"] = kwargs.get("context")
             return {"success": True, "output": "ok", "file_outputs": []}
 
-    async def fake_schedule(**kwargs):
+    def fake_schedule(**kwargs):
+        # The consumer hands over the run it committed; run it as the
+        # orchestrator's worker would, under that exact lease.
         payload = kwargs["payload"]
+        lease = kwargs["task_lease"]
         captured["payload"] = payload
-        await execute_task_background(
-            task_id=kwargs["task_id"],
-            user_message=payload.transcript_message,
-            context=kwargs["context"],
-            agent_manager=AgentManager(),
-            task_owner_user_id=kwargs["task_owner_user_id"],
-            llm_user_message=payload.execution_message,
-            task_setup_snapshot=_task_setup_snapshot(
-                task_id=kwargs["task_id"],
-                user_id=int(user.id),
-                status=TaskStatus.COMPLETED,
-                run_id=lease.run_id,
-                agent_config={PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context},
-            ),
-            expected_run_id=lease.run_id,
-            task_lease=lease,
-            resolved_execution_scope=None,
+        captured["lease"] = lease
+        runs.append(
+            asyncio.ensure_future(
+                execute_task_background(
+                    task_id=kwargs["task_id"],
+                    user_message=payload.transcript_message,
+                    context=kwargs["context"],
+                    agent_manager=AgentManager(),
+                    task_owner_user_id=kwargs["task_owner_user_id"],
+                    llm_user_message=payload.execution_message,
+                    task_setup_snapshot=_task_setup_snapshot(
+                        task_id=kwargs["task_id"],
+                        user_id=int(user.id),
+                        status=TaskStatus.RUNNING,
+                        run_id=lease.run_id,
+                        agent_config={PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context},
+                    ),
+                    expected_run_id=lease.run_id,
+                    task_lease=lease,
+                    resolved_execution_scope=None,
+                )
+            )
         )
-        done = asyncio.get_running_loop().create_future()
-        done.set_result(None)
-        return done
+        return runs[-1]
 
-    monkeypatch.setattr(
-        task_start.TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        fake_schedule,
-    )
+    monkeypatch.setattr(task_orchestrator, "_schedule_bg", fake_schedule)
     monkeypatch.setattr(task_execution_host, "enqueues_task_turns", lambda: False)
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
 
-    start = TaskStartPayload(
-        version=1,
-        run_id="run-existing",
-        state_version=0,
-        turn_id="turn-existing",
-        kind="existing",
-        message="saved task",
-        execution_message="saved task",
-        existing_context=ExistingExecutionContext(),
+    command_db_id = stage_existing_execution(
+        task_id=10,
+        task_owner_user_id=int(user.id),
+        task_description="saved task",
+        context={},
+        actor_user_id=int(user.id),
     )
-    await execute_existing_start_local(
-        ClaimedTaskCommand(
-            id=1,
-            task_id=10,
-            actor_user_id=int(user.id),
-            command_id="turn-existing",
-            kind=TaskCommandKind.START,
-            payload=start.model_dump(mode="json"),
-            target_run_id="run-existing",
-            attempt_count=1,
+    with get_session_local()() as db:
+        command = claim_task_command(
+            db, runner_id=get_runner_id(), command_db_id=command_db_id
         )
-    )
+    assert command is not None
+    await execute_task_start(command)
+    await asyncio.gather(*runs)
 
     assert captured["payload"].transcript_message == "saved task"
     assert captured["payload"].execution_message == "saved task"
+    assert captured["lease"].run_id == command.target_run_id
     assert captured["agent_task"] == f"saved task\n\n{block}"
 
 

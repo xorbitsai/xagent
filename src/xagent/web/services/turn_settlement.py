@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 HOOK_TIMEOUT_SECONDS = 10.0
 _HOOK_METRIC = "xagent.turn_settlement.hook"
+_MISSING_TURN_ID_METRIC = "xagent.turn_settlement.missing_turn_id"
 # The only error codes a settlement carries: the client error codes, the
 # quota gate's code, and the public-safe connector-runtime codes. Anything
 # else a run reports is folded into ``task_execution_failed`` so free text
@@ -229,7 +230,8 @@ def build_error_code(raw: Any) -> str | None:
     """
     if raw is None:
         return None
-    if isinstance(raw, str) and str(raw) in _ERROR_CODES:
+    if isinstance(raw, str) and raw in _ERROR_CODES:
+        # ``ClientErrorCode`` members are str subclasses; hand the hook a plain str.
         return str(raw)
     return ClientErrorCode.TASK_EXECUTION_FAILED.value
 
@@ -282,14 +284,14 @@ def report_turn_settled(
 ) -> bool:
     """Report this run's settlement unless it was already reported.
 
-    Returns whether this call reported it. A missing ``turn_id`` is counted
-    and the settlement is still reported.
+    Returns whether this call reported it. A missing ``turn_id`` is counted on
+    its own metric and the settlement is still reported.
     """
     if facts.notified:
         return False
     facts.notified = True
     if turn_id is None:
-        increment_counter(_HOOK_METRIC, attributes={"outcome": "missing_turn_id"})
+        increment_counter(_MISSING_TURN_ID_METRIC)
     notify_turn_settled(
         build_turn_settlement(
             facts,
@@ -329,9 +331,7 @@ async def _call(hook: TurnSettledHook, settlement: TurnSettlement) -> None:
 async def _run_hook(hook: TurnSettledHook, settlement: TurnSettlement) -> None:
     try:
         await asyncio.wait_for(_call(hook, settlement), timeout=HOOK_TIMEOUT_SECONDS)
-    except asyncio.CancelledError:
-        raise
-    except (asyncio.TimeoutError, TimeoutError):
+    except TimeoutError:
         logger.warning(
             "turn settled hook timed out for task %s run %s",
             settlement.task_id,

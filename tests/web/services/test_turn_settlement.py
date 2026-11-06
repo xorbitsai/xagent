@@ -1401,7 +1401,13 @@ async def test_resume_without_any_turn_id_is_counted_and_still_reported(
         await _settle_inflight()
 
     assert [(s.status, s.turn_id) for s in received] == [("completed", None)]
-    assert _outcomes(counter).count("missing_turn_id") == 1
+    missing = [
+        call
+        for call in counter.call_args_list
+        if call.args and call.args[0] == "xagent.turn_settlement.missing_turn_id"
+    ]
+    assert len(missing) == 1
+    assert _outcomes(counter) == ["ok"]
 
 
 @pytest.mark.usefixtures("_clear_bg_manager")

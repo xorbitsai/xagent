@@ -11,6 +11,7 @@ import {
 } from "react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import type { ToolCategoryDefinition } from "@/lib/tool-category-labels"
 
 // The agent builder's pickers are fed by independent endpoints. Each one loads
 // and fails on its own (#3007): a slow or failing /api/tools/available must not
@@ -110,6 +111,7 @@ export function useBuilderCatalog({
   const [skills, setSkills] = useState<Skill[]>([])
   const [skillsStatus, setSkillsStatus] = useState<CatalogStatus>("loading")
   const [tools, setTools] = useState<Tool[]>([])
+  const [toolCategoryDefinitions, setToolCategoryDefinitions] = useState<ToolCategoryDefinition[]>([])
   const [intrinsicToolNames, setIntrinsicToolNames] = useState<string[]>([])
   const [skillLoaderTool, setSkillLoaderTool] = useState<string | null>(null)
   const [toolsStatus, setToolsStatus] = useState<CatalogStatus>("loading")
@@ -156,6 +158,7 @@ export function useBuilderCatalog({
     await loadList("/api/tools/available?include_usage=false", setToolsStatus, (data) => {
       const all = requireList<Tool>(data?.tools)
       setTools(all.filter((t) => t.enabled))
+      setToolCategoryDefinitions(Array.isArray(data.categories) ? data.categories : [])
       // Unfiltered: the runtime injects these without reading ToolConfig.enabled.
       setIntrinsicToolNames(all.filter((t) => t.always_available).map((t) => t.name))
       const loader = data?.skill_loader_tool
@@ -257,6 +260,7 @@ export function useBuilderCatalog({
     skillsStatus,
     retrySkills: loadSkills,
     tools,
+    toolCategoryDefinitions,
     intrinsicToolNames,
     skillLoaderTool,
     toolsStatus,

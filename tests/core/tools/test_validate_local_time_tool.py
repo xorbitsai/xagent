@@ -301,7 +301,7 @@ def test_description_hands_off_from_the_current_time_tool() -> None:
     ("spec", "expected"),
     [
         (ToolSelectionSpec.from_raw(tool_categories=None), 1),  # ALL
-        (ToolSelectionSpec.from_raw(tool_categories=["web_search"]), 1),  # non-basic
+        (ToolSelectionSpec.from_raw(tool_categories=["web_tools"]), 1),  # non-basic
         (ToolSelectionSpec.from_raw(tool_categories=[]), 0),  # explicit NONE
     ],
 )

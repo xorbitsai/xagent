@@ -73,7 +73,7 @@ class FakeToolMetadata:
         *,
         concurrency_safe: bool = False,
         read_only: bool = False,
-        category: str = "basic",
+        category: str = "basic_tools",
         decision_group: str | None = None,
         description: str | None = None,
     ) -> None:

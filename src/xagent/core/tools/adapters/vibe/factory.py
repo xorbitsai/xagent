@@ -142,7 +142,7 @@ class ToolRegistry:
 
         Usage (with categories — registry can skip this creator when a
         ToolSelectionSpec excludes all declared categories):
-            @register_tool(categories={"basic"})
+            @register_tool(categories={"basic_tools"})
             def create_basic_tools(config: BaseToolConfig) -> List[Tool]:
                 return [BasicTool(...)]
 
@@ -306,43 +306,35 @@ class ToolRegistry:
     def _sort_tools_by_category(cls, tools: list[Tool]) -> list[Tool]:
         """Sort tools by category priority.
 
-        Priority order (most important first):
-        1. BASIC - Basic tools (code execution, calculator)
-        2. WEB_SEARCH - Web search and webpage fetching
-        3. KNOWLEDGE - Knowledge base search
-        4. FILE - File operations
-        5. VISION - Vision understanding
-        6. IMAGE - Image generation
-        7. VIDEO - Video generation
-        8. AUDIO - Speech and sound effect tools
-        9. BROWSER - Browser automation
-        10. PPT - PPT tools
-        11. DATABASE - Database tools (SQL query)
-        12. MCP - MCP tools
-        13. SKILL - Skill documentation access tools
-        14. AGENT - Agent tools (delegation)
-        15. OTHER - Other tools
+        General helpers precede code execution, network tools, domain tools
+        and the internal fallback category.
         """
         from .base import ToolCategory
 
         # Define category priority order
         category_order = {
-            ToolCategory.BASIC: 0,
-            ToolCategory.WEB_SEARCH: 1,
-            ToolCategory.KNOWLEDGE: 2,
-            ToolCategory.FILE: 3,
-            ToolCategory.VISION: 4,
-            ToolCategory.IMAGE: 5,
-            ToolCategory.VIDEO: 6,
-            ToolCategory.AUDIO: 7,
-            ToolCategory.BROWSER: 8,
-            ToolCategory.PPT: 9,
-            ToolCategory.DATABASE: 10,
-            ToolCategory.MCP: 11,
-            ToolCategory.SKILL: 12,
-            ToolCategory.AGENT: 13,
-            ToolCategory.SSH: 14,
-            ToolCategory.OTHER: 15,
+            category: priority
+            for priority, category in enumerate(
+                (
+                    ToolCategory.BASIC,
+                    ToolCategory.CODE_EXECUTION,
+                    ToolCategory.WEB_TOOLS,
+                    ToolCategory.KNOWLEDGE,
+                    ToolCategory.FILE,
+                    ToolCategory.VISION,
+                    ToolCategory.IMAGE,
+                    ToolCategory.VIDEO,
+                    ToolCategory.AUDIO,
+                    ToolCategory.BROWSER,
+                    ToolCategory.PPT,
+                    ToolCategory.DATABASE,
+                    ToolCategory.MCP,
+                    ToolCategory.SKILL,
+                    ToolCategory.AGENT,
+                    ToolCategory.SSH,
+                    ToolCategory.OTHER,
+                )
+            )
         }
 
         def get_tool_priority(tool: Tool) -> int:

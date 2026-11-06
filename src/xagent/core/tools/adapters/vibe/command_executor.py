@@ -39,9 +39,9 @@ _SKIPPED_SNAPSHOT_DIRS = frozenset(
 
 
 class CommandExecutorFunctionTool(FunctionTool):
-    """Command executor tool with BASIC category."""
+    """Command executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
 
 class CommandExecutorArgs(BaseModel):
@@ -283,9 +283,9 @@ def _snapshot_artifacts(
 
 @sandbox_config()
 class CommandExecutorToolForBasic(CommandExecutorTool):
-    """Command executor tool with BASIC category."""
+    """Command executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
     @property
     def name(self) -> str:

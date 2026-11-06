@@ -79,7 +79,10 @@ from ...core.agent.runner import (
     classify_injection,
     track_user_message_injection,
 )
-from ...core.agent.structured_output import StructuredOutputFormat
+from ...core.agent.structured_output import (
+    STRUCTURED_OUTPUT_RESULT_KEY,
+    StructuredOutputFormat,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -2540,7 +2543,7 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     interruption_pause_result()
                     if interruption_pause_reason is not None
-                    else result,
+                    else _settlement_result(result),
                     turn_id=turn_id,
                 )
                 finalize_db.flush()
@@ -2632,6 +2635,20 @@ def _has_display_message_override(context: Dict[str, Any]) -> bool:
         "display_message" in request_context
         or "display_user_message" in request_context
     )
+
+
+def _settlement_result(result: dict[str, Any]) -> dict[str, Any]:
+    """The run result as stored in the ``execution_settled`` fact.
+
+    The structured output is persisted once, in
+    ``tasks.structured_output_record``; no reader of the settlement needs it,
+    and every next turn reads the settlement history back. A result without it
+    is returned as it is; otherwise a copy without it is returned and ``result``
+    is not modified.
+    """
+    if STRUCTURED_OUTPUT_RESULT_KEY not in result:
+        return result
+    return {k: v for k, v in result.items() if k != STRUCTURED_OUTPUT_RESULT_KEY}
 
 
 def _format_kwargs(fmt: StructuredOutputFormat | None) -> dict[str, Any]:
@@ -3566,7 +3583,9 @@ def _finalize_resumed_task(
         stage_result_fact_no_commit(
             db,
             task,
-            interruption_pause_result() if pause_reason is not None else result,
+            interruption_pause_result()
+            if pause_reason is not None
+            else _settlement_result(result),
             turn_id=result_turn_id,
         )
         if task.channel_id is not None and final_task_status in {

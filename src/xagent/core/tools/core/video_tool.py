@@ -884,7 +884,6 @@ The generated video URL is temporary on the provider side, so completed videos a
                         logger=logger,
                         action=f"Video generation failed (model={actual_model_id})",
                         model=video_model,
-                        allowed_values=self._duration_allowed_values(video_model),
                     ),
                     "video_path": None,
                 }

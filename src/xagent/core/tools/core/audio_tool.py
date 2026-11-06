@@ -34,11 +34,6 @@ from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
 
-# The output formats the synthesize_speech description documents. Reported
-# back when a provider rejects the request, so the model can pick one of these
-# instead of guessing at what the provider wanted.
-_TTS_AUDIO_FORMATS = ("mp3", "wav", "pcm")
-
 
 class AudioToolCore:
     """
@@ -966,7 +961,6 @@ class AudioToolCore:
                         logger=logger,
                         action="Speech synthesis failed",
                         model=tts_model,
-                        allowed_values={"audio_format": list(_TTS_AUDIO_FORMATS)},
                     ),
                     "audio_path": None,
                     "model_used": (
@@ -1883,7 +1877,6 @@ class AudioToolCore:
                     logger=logger,
                     action=f"Segment {index} synthesis failed",
                     model=tts_model,
-                    allowed_values={"audio_format": list(_TTS_AUDIO_FORMATS)},
                 )
                 # The batch aggregates these into its own ``errors`` list,
                 # where the segment number is the only thing that says which

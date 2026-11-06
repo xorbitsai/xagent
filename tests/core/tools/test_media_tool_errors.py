@@ -72,6 +72,7 @@ class ProviderStatusError(Exception):
         code: str,
         message: str,
         request_id: str = SDK_REQUEST_ID,
+        param: str = "",
     ) -> None:
         self.status_code = status_code
         self.request_id = request_id
@@ -79,7 +80,7 @@ class ProviderStatusError(Exception):
             "error": {
                 "code": code,
                 "message": message,
-                "param": "",
+                "param": param,
                 "type": "Not Found",
             }
         }
@@ -256,36 +257,81 @@ class FailingTTS(BaseTTS):
         return ["tts", "text_to_speech"]
 
 
-@pytest.mark.asyncio
-async def test_a_rejected_parameter_reports_the_values_the_caller_can_change(
-    workspace: Mock,
-) -> None:
-    tool, _ = _ark_video_tool(workspace, invalid_parameter_error())
+class TestProviderRejectionsCarryNoGuessedRange:
+    """A provider rejection arrives without a typed field.
 
-    result = await tool.generate_video("A short clip", seconds=6)
+    Its body may name a parameter, a different one, or none at all, so a range
+    this tool happens to know would point the caller at the wrong field. Such
+    a failure reports the category and one sentence, and no range.
+    """
 
-    assert result["success"] is False
-    assert result["error_category"] == INVALID_REQUEST
-    assert result["allowed_values"] == {"duration_seconds": "4-15"}
-    assert "InvalidParameter" not in json.dumps(result, default=str)
-
-
-@pytest.mark.asyncio
-async def test_a_rejected_speech_request_lists_the_supported_formats(
-    workspace: Mock,
-) -> None:
-    tts_model = FailingTTS(invalid_parameter_error())
-    tool = AudioToolCore(
-        tts_models={"tts": tts_model},
-        default_tts_model=tts_model,
-        workspace=workspace,
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ProviderStatusError(
+                status_code=404,
+                code="voice_not_found",
+                message="The voice could not be found.",
+                param="voice_id",
+            ),
+            ProviderStatusError(
+                status_code=400,
+                code="InvalidParameter",
+                message="The parameter `text` specified in the request is not valid.",
+                param="text",
+            ),
+            invalid_parameter_error(),
+        ],
+        ids=["voice", "text", "no-field"],
     )
+    async def test_a_rejected_speech_request_carries_no_audio_format(
+        self, error: ProviderStatusError
+    ) -> None:
+        tts_model = FailingTTS(error)
+        tool = AudioToolCore(
+            tts_models={"tts": tts_model},
+            default_tts_model=tts_model,
+        )
 
-    result = await tool.synthesize_speech("Hello there", audio_format="opus")
+        result = await tool.synthesize_speech("Hello there", audio_format="opus")
 
-    assert result["success"] is False
-    assert result["error_category"] == INVALID_REQUEST
-    assert result["allowed_values"] == {"audio_format": ["mp3", "wav", "pcm"]}
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+        readable = json.dumps(result, default=str)
+        for unrelated in ("audio_format", "mp3", "wav", "pcm"):
+            assert unrelated not in readable
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ProviderStatusError(
+                status_code=400,
+                code="InvalidParameter",
+                message=(
+                    "The parameter `resolution` specified in the request is not valid."
+                ),
+                param="resolution",
+            ),
+            invalid_parameter_error(),
+        ],
+        ids=["resolution", "no-field"],
+    )
+    async def test_a_rejected_video_request_carries_no_duration_range(
+        self, workspace: Mock, error: ProviderStatusError
+    ) -> None:
+        tool, _ = _ark_video_tool(workspace, error)
+
+        result = await tool.generate_video("A short clip", seconds=4)
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+        readable = json.dumps(result, default=str)
+        for unrelated in ("duration_seconds", "4-15"):
+            assert unrelated not in readable
 
 
 class FailingASR(BaseASR):

@@ -564,9 +564,8 @@ def _parameter_error(exc: BaseException) -> Optional[MediaParameterError]:
     """The typed parameter error in ``exc``'s chain, if an adapter raised one.
 
     Its presence is what separates "the adapter rejected this field and knows
-    what it accepts" from "a provider rejected the request on the far side
-    and named no field": only the first may decide the range, including
-    deciding that there is no reliable one.
+    what it accepts" from "a provider rejected the request on the far side":
+    only the first can state a range, including stating that there is none.
     """
     for link in _exception_chain(exc):
         if isinstance(link, MediaParameterError):
@@ -599,7 +598,6 @@ def media_failure_fields(
     logger: logging.Logger,
     action: str,
     model: Any = None,
-    allowed_values: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Log ``exc`` and return the failure fields that replace ``str(exc)``.
 
@@ -608,10 +606,11 @@ def media_failure_fields(
     and redacted message follow it, and ``model_not_enabled`` adds the marker
     line operators alert on.
 
-    ``allowed_values`` is the caller's fallback list, used only when the
-    exception says nothing about which parameter was rejected. An adapter
-    that raised :class:`MediaParameterError` answers for itself, including
-    when its answer is that it knows no reliable range.
+    A range comes only from a :class:`MediaParameterError`, because only that
+    adapter has named the rejected field. A provider rejection arrives without
+    one: the body may name a field, a different field, or none at all, and a
+    list for a field it never blamed sends the caller to change the wrong
+    thing. Such a failure carries no ``allowed_values``.
     """
     category = classify_media_failure(exc)
     logger.error(
@@ -627,11 +626,5 @@ def media_failure_fields(
     rejected = _parameter_error(exc)
     return media_error_fields(
         category,
-        # The typed error names the field the adapter rejected, so it also
-        # owns the answer: the range when it knows one, and none at all when
-        # it does not. Falling back to the caller's list there would attach a
-        # range for a field the provider never blamed.
-        allowed_values=(
-            rejected.allowed_values if rejected is not None else allowed_values
-        ),
+        allowed_values=rejected.allowed_values if rejected is not None else None,
     )

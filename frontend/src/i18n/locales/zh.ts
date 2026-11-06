@@ -102,6 +102,7 @@ const zh = {
     notice: "提示",
     copy: "复制",
     copied: "已复制",
+    copyFailed: "复制到剪贴板失败",
     send: "发送",
     pause: "暂停",
     resume: "继续",

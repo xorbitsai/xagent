@@ -6,7 +6,11 @@ import OnboardingPage from "./page"
 
 const routerPush = vi.hoisted(() => vi.fn())
 const routerReplace = vi.hoisted(() => vi.fn())
-const authUser = vi.hoisted(() => ({ id: "user-a", username: "Shulei" as string | undefined }))
+const authUser = vi.hoisted(() => ({
+  id: "user-a", username: "Shulei" as string | undefined,
+  first_name: undefined as string | undefined,
+  email: undefined as string | undefined,
+}))
 // Lets exactly one test diverge readAuthSessionSnapshot()'s userId from
 // authUser.id (which every other test keeps them equal to by default, so
 // none of them can tell whether wizardUserIdRef's initial capture actually
@@ -139,6 +143,8 @@ describe("OnboardingPage", () => {
     i18nState.locale = "en"
     authUser.id = "user-a"
     authUser.username = "Shulei"
+    authUser.first_name = undefined
+    authUser.email = undefined
     sessionUserIdOverride.current = undefined
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue({ ok: true, json: async () => TEMPLATES })
@@ -247,6 +253,55 @@ describe("OnboardingPage", () => {
 
     const badge = document.querySelector(".ob-acct span")
     expect(badge).toHaveTextContent("\u{1F600}")
+  })
+
+  it("uses the Google given name in both the greeting and account badge", async () => {
+    authUser.username = "cheffrey.imutan@gmail.com"
+    authUser.first_name = "Cheffrey"
+    await startOnboarding()
+    expect(screen.getByRole("heading")).toHaveTextContent("Hi Cheffrey — what should")
+    expect(document.querySelector(".ob-acct b")).toHaveTextContent(/^Cheffrey$/)
+    expect(screen.queryByText(/cheffrey.imutan@gmail.com/)).not.toBeInTheDocument()
+  })
+
+  it("loads an existing Google account's stored name when its cached session has no first_name", async () => {
+    authUser.username = "email.alias@gmail.com"
+    apiRequestMock.mockImplementation(async (url: string) => ({
+      ok: true,
+      json: async () => url.endsWith("/api/auth/me")
+        ? { user: { id: authUser.id, first_name: "Mary Jane" } }
+        : TEMPLATES,
+    }))
+    await startOnboarding()
+    await waitFor(() => expect(screen.getByRole("heading")).toHaveTextContent("Hi Mary Jane —"))
+    expect(document.querySelector(".ob-acct b")).toHaveTextContent(/^Mary Jane$/)
+  })
+
+  it("keeps the email out of the greeting when the optional profile request fails", async () => {
+    authUser.username = "cheffrey.imutan@gmail.com"
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/auth/me")) throw new Error("offline")
+      return { ok: true, json: async () => TEMPLATES }
+    })
+    await startOnboarding()
+    expect(screen.getByRole("heading")).toHaveTextContent("Hi cheffrey —")
+    expect(document.querySelector(".ob-acct b")).toHaveTextContent(/^cheffrey$/)
+  })
+
+  it("ignores a profile response that arrives after switching accounts", async () => {
+    authUser.username = "alice@example.com"
+    let resolveProfile!: (value: unknown) => void
+    apiRequestMock.mockImplementation((url: string) => url.endsWith("/api/auth/me")
+      ? new Promise((resolve) => { resolveProfile = resolve })
+      : Promise.resolve({ ok: true, json: async () => TEMPLATES }))
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(resolveProfile).toBeTypeOf("function"))
+    authUser.id = "user-b"
+    authUser.username = "Bob"
+    rerender(<OnboardingPage />)
+    await act(async () => resolveProfile({ ok: true, json: async () => ({ user: { id: "user-a", first_name: "Alice" } }) }))
+    expect(screen.getByRole("heading")).toHaveTextContent("Hi Bob —")
+    expect(screen.queryByText(/Hi Alice/)).not.toBeInTheDocument()
   })
 
   it("falls back to a generic name when the user has no username", async () => {

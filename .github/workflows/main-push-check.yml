@@ -1,0 +1,57 @@
+name: Main Push Check
+
+# ci.yml does not run on push. The merge queue runs it on the exact commit it
+# then fast-forwards main to, so a second run on that push only repeats a
+# passing result and holds runners other pull requests are queued for.
+#
+# What the push run used to add was a net for commits that skipped the queue:
+# administrators can still push to main directly (see
+# docs/branch-protection.md). This workflow keeps that net. A pushed commit
+# with no successful merge_group run of ci.yml gets the whole of ci.yml, called
+# from here so the run still belongs to the push and its pusher.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    name: Check the merge queue tested this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      tested: ${{ steps.lookup.outputs.tested }}
+
+    steps:
+      - name: Look for a successful merge_group run of this commit
+        id: lookup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # An API failure counts as "not tested": the fallback is running the
+          # suite, never skipping it.
+          count=$(gh api \
+            "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=merge_group&status=success" \
+            --jq '.total_count') || count=0
+
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "The merge queue already ran ci.yml on $SHA."
+            echo "tested=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No successful merge_group run of ci.yml for $SHA; running it."
+            echo "tested=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  ci:
+    name: CI
+    needs: check
+    # `!cancelled()` so a failed lookup job still runs the suite, and
+    # `!= 'true'` so an empty output runs it rather than skipping it.
+    if: ${{ !cancelled() && needs.check.outputs.tested != 'true' }}
+    uses: ./.github/workflows/ci.yml

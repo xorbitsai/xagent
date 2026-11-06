@@ -76,6 +76,12 @@ describe("widget bootstrap", () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it("delegates clipboard writes to the cross-origin chat iframe", () => {
+    runWidget({ "data-token": "legacy-token" })
+    expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.getAttribute("allow"))
+      .toBe("clipboard-write")
+  })
+
   it("generates and persists a guest id for a first-time visitor", async () => {
     localStorage.removeItem("xagent_guest_id")
     vi.spyOn(Math, "random")

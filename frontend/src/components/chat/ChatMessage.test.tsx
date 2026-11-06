@@ -1,10 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const clipboardWriteTextMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
 const appContextMock = vi.hoisted(() => ({
   filesDisabled: false,
   openFilePreview: vi.fn(),
@@ -18,6 +19,10 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => appContextMock,
+}))
+
+vi.mock("@/components/ui/sonner", () => ({
+  toast: { error: toastErrorMock },
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -94,6 +99,7 @@ describe("ChatMessage Session file capability", () => {
     clarificationFormMock.mockReset()
     apiRequestMock.mockReset()
     clipboardWriteTextMock.mockReset()
+    toastErrorMock.mockReset()
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: clipboardWriteTextMock },
@@ -253,6 +259,63 @@ describe("ChatMessage Session file capability", () => {
     expect(clipboardWriteTextMock).toHaveBeenLastCalledWith(
       "Saved secret.txt from src, xagent, tmp, app, and passwd; keep /v1/openapi.json and /care/export.csv.",
     )
+  })
+
+  describe("copy button outcome", () => {
+    // jsdom has no execCommand; install one per test so the legacy fallback
+    // path copyToClipboard takes after a refused Clipboard API is observable.
+    const withExecCommand = async (execCommand: () => boolean, run: () => Promise<void>) => {
+      const previous = Object.getOwnPropertyDescriptor(document, "execCommand")
+      Object.defineProperty(document, "execCommand", { configurable: true, value: execCommand })
+      try {
+        await run()
+      } finally {
+        if (previous) Object.defineProperty(document, "execCommand", previous)
+        else delete (document as { execCommand?: unknown }).execCommand
+      }
+    }
+
+    it("shows the check mark once the Clipboard API write has succeeded", async () => {
+      clipboardWriteTextMock.mockResolvedValue(undefined)
+      render(<ChatMessage role="assistant" content="copy me" />)
+      const button = screen.getByTitle("common.copy")
+
+      await act(async () => { fireEvent.click(button) })
+
+      expect(clipboardWriteTextMock).toHaveBeenCalledWith("copy me")
+      expect(button.querySelector("svg.text-green-500")).not.toBeNull()
+      expect(toastErrorMock).not.toHaveBeenCalled()
+    })
+
+    it("falls back to execCommand when the Clipboard API is refused, as in a cross-origin embed", async () => {
+      clipboardWriteTextMock.mockRejectedValue(
+        new DOMException("The Clipboard API has been blocked because of a permissions policy", "NotAllowedError"),
+      )
+      const execCommand = vi.fn(() => true)
+      await withExecCommand(execCommand, async () => {
+        render(<ChatMessage role="assistant" content="copy me" />)
+        const button = screen.getByTitle("common.copy")
+
+        await act(async () => { fireEvent.click(button) })
+
+        expect(execCommand).toHaveBeenCalledWith("copy")
+        expect(button.querySelector("svg.text-green-500")).not.toBeNull()
+        expect(toastErrorMock).not.toHaveBeenCalled()
+      })
+    })
+
+    it("reports a copy that never reached the clipboard instead of claiming it", async () => {
+      clipboardWriteTextMock.mockRejectedValue(new DOMException("blocked", "NotAllowedError"))
+      await withExecCommand(() => false, async () => {
+        render(<ChatMessage role="assistant" content="copy me" />)
+        const button = screen.getByTitle("common.copy")
+
+        await act(async () => { fireEvent.click(button) })
+
+        expect(button.querySelector("svg.text-green-500")).toBeNull()
+        expect(toastErrorMock).toHaveBeenCalledWith("common.copyFailed")
+      })
+    })
   })
 
   it("uses the parser-complete file projection for assistant DOM and clipboard", () => {

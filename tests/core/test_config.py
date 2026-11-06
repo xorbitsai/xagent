@@ -2638,6 +2638,27 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestComposioReconcileConfig:
+    """How often unbound Composio accounts are cleaned up (#3548)."""
+
+    def test_off_unless_set(self, monkeypatch):
+        from xagent.config import get_composio_reconcile_interval_seconds
+
+        monkeypatch.delenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", raising=False)
+        assert get_composio_reconcile_interval_seconds() is None
+        monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", " ")
+        assert get_composio_reconcile_interval_seconds() is None
+
+    def test_a_set_interval_has_a_floor(self, monkeypatch):
+        from xagent.config import get_composio_reconcile_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", "900")
+        assert get_composio_reconcile_interval_seconds() == 900
+        for invalid in ("5", "hourly"):
+            monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", invalid)
+            assert get_composio_reconcile_interval_seconds() is None
+
+
 class TestTaskCleanupRetryConfig:
     """Config for retrying the external cleanup a task deletion owes (#2587)."""
 

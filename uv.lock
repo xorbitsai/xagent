@@ -1430,9 +1430,9 @@ wheels = [
 
 [[package]]
 name = "datrie"
-version = "0.8.2"
+version = "0.8.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/9d/fe/db74bd405d515f06657f11ad529878fd389576dca4812bea6f98d9b31574/datrie-0.8.2.tar.gz", hash = "sha256:525b08f638d5cf6115df6ccd818e5a01298cd230b2dac91c8ff2e6499d18765d", size = 63278, upload-time = "2020-03-26T03:31:53.681Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/51/0b/c0f53a14317b304e2e93b29a831b0c83306caae9af7f0e2e037d17c4f63f/datrie-0.8.3.tar.gz", hash = "sha256:ea021ad4c8a8bf14e08a71c7872a622aa399a510f981296825091c7ca0436e80", size = 499040, upload-time = "2025-08-28T12:37:23.227Z" }
 
 [[package]]
 name = "deepdoc-lib"

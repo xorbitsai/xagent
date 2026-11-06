@@ -249,6 +249,7 @@ KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
 KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+COMPOSIO_RECONCILE_INTERVAL_SECONDS = "XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS"
 TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
 TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
@@ -1809,6 +1810,32 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
         60 * 60,
         minimum=60,
     )
+
+
+def get_composio_reconcile_interval_seconds() -> int | None:
+    """How often unbound Composio accounts are cleaned up (#3548).
+
+    Off (None) unless XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS is set: the
+    cleanup deletes every xagent account in the auth config that this database
+    does not reference, so only an operator who knows no other database shares
+    that auth config can turn it on. A value that is not an integer of at
+    least 300 keeps it off.
+    """
+    value = (os.getenv(COMPOSIO_RECONCILE_INTERVAL_SECONDS) or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = 0
+    if parsed < 300:
+        logger.warning(
+            "Invalid %s=%r; Composio reconcile stays off",
+            COMPOSIO_RECONCILE_INTERVAL_SECONDS,
+            value,
+        )
+        return None
+    return parsed
 
 
 def get_task_cleanup_retry_interval_seconds() -> int:

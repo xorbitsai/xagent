@@ -32,6 +32,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+MAIN_PUSH_CHECK = REPO_ROOT / ".github" / "workflows" / "main-push-check.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 # This suite validates the `changes` outputs, so a job gated on them cannot be
@@ -497,7 +498,7 @@ def test_non_pull_request_events_never_filter(jobs: dict) -> None:
         expression = jobs["changes"]["outputs"][output]
         assert "github.event_name != 'pull_request' ||" in expression, (
             f"output '{output}' must short-circuit to true on non-pull_request "
-            "events so merge_group, push and workflow_dispatch run everything"
+            "events so merge_group and workflow_dispatch run everything"
         )
         assert f"steps.filter.outputs.{output} != 'false'" in expression, (
             f"output '{output}' must use != 'false' so a missing filter output "
@@ -784,3 +785,55 @@ def test_a_pre_pull_leg_swapped_for_another_declared_leg_is_rejected(
 
     with pytest.raises(AssertionError):
         test_every_step_of_a_gated_job_is_guarded(mutated, "pytest-fast")
+
+
+def _triggers(workflow: dict) -> dict:
+    # YAML 1.1 reads a bare `on` key as the boolean True.
+    return workflow.get("on", workflow.get(True))
+
+
+def test_ci_does_not_rerun_on_push(workflow: dict) -> None:
+    """The merge queue already ran ci.yml on the commit a merge puts on main.
+
+    A push trigger repeats that run on every merge and holds runners queued
+    pull requests are waiting for.
+    """
+    assert "push" not in _triggers(workflow), (
+        "ci.yml must not run on push; main-push-check.yml calls it for a push "
+        "the merge queue did not test"
+    )
+    assert "workflow_call" in _triggers(workflow), (
+        "main-push-check.yml calls ci.yml, which needs a workflow_call trigger"
+    )
+
+
+def test_a_push_the_queue_did_not_test_still_runs_ci() -> None:
+    """Administrators can push to main directly, bypassing the queue.
+
+    main-push-check.yml is the only thing that runs ci.yml on such a commit, so
+    it has to fire on every push, look for a successful merge_group run of this
+    exact commit, treat a failed lookup as "not tested", and otherwise call
+    ci.yml.
+    """
+    check = yaml.load(
+        MAIN_PUSH_CHECK.read_text(encoding="utf-8"), Loader=_NoDuplicateKeyLoader
+    )
+    assert _triggers(check) == {"push": {"branches": ["main"]}}
+
+    lookup = check["jobs"]["check"]
+    assert "if" not in lookup
+    # Key presence, not truthiness: `if: false` loads as a falsy False.
+    assert not [step for step in lookup["steps"] if "if" in step]
+    script = "\n".join(step.get("run", "") for step in lookup["steps"])
+    assert (
+        "actions/workflows/ci.yml/runs?head_sha=$SHA&event=merge_group&status=success"
+        in script
+    )
+    assert "|| count=0" in script, "a failed lookup must run the suite"
+
+    ci = check["jobs"]["ci"]
+    assert ci["uses"] == "./.github/workflows/ci.yml"
+    assert ci["needs"] == "check"
+    assert _normalise(ci["if"]) == (
+        "${{ !cancelled() && needs.check.outputs.tested != 'true' }}"
+    ), "only a confirmed merge_group success may skip the suite"

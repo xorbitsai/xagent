@@ -102,6 +102,7 @@ const en = {
     notice: "Notice",
     copy: "Copy",
     copied: "Copied!",
+    copyFailed: "Failed to copy to clipboard",
     send: "Send",
     pause: "Pause",
     resume: "Resume",

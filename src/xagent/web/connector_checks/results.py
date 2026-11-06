@@ -147,7 +147,7 @@ class SessionRow:
         _validate_duration(self.duration_ms)
 
     def to_json(self) -> dict[str, Any]:
-        return _row_json("session", self.connector, None, None, None, self)
+        return _row_json("session", self)
 
 
 @dataclass(frozen=True)
@@ -178,9 +178,7 @@ class CheckRow:
         _validate_duration(self.duration_ms)
 
     def to_json(self) -> dict[str, Any]:
-        return _row_json(
-            "check", self.connector, self.check, self.kind, self.tool, self
-        )
+        return _row_json("check", self)
 
 
 @dataclass(frozen=True)
@@ -260,9 +258,8 @@ class RunResult:
 
 def load_result_schema() -> dict[str, Any]:
     """The JSON Schema every result document validates against."""
-    package = __name__.rpartition(".")[0]
     text = (
-        resources.files(package)
+        resources.files(__package__)
         .joinpath("result.schema.json")
         .read_text(encoding="utf-8")
     )
@@ -305,20 +302,14 @@ def _validate_duration(duration_ms: int) -> None:
         raise ValueError("duration_ms must be a non-negative integer")
 
 
-def _row_json(
-    row_type: str,
-    connector: str,
-    check: str | None,
-    kind: str | None,
-    tool: str | None,
-    row: SessionRow | CheckRow,
-) -> dict[str, Any]:
+def _row_json(row_type: str, row: SessionRow | CheckRow) -> dict[str, Any]:
+    check = row if isinstance(row, CheckRow) else None
     return {
         "row": row_type,
-        "connector": connector,
-        "check": check,
-        "kind": kind,
-        "tool": tool,
+        "connector": row.connector,
+        "check": check.check if check else None,
+        "kind": check.kind if check else None,
+        "tool": check.tool if check else None,
         "outcome": row.outcome.value,
         "failure_class": (
             row.failure_class.value if row.failure_class is not None else None

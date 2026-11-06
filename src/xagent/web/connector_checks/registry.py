@@ -19,15 +19,13 @@ from .declarations import ConnectorChecks, L3Envelope, ReadCheck, UnprobeableChe
 # Connectors that have adopted V2, by catalog app id.
 CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {}
 
-L3_CHECK_NAME = "l3_probe"
-
 
 def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:
     """``app_id``'s L3 probe as a V2 read check, or None without one.
 
     An unprobeable reason wins over a probe, as in the probe route.
     """
-    check_id = f"{app_id}.{L3_CHECK_NAME}"
+    check_id = f"{app_id}.l3_probe"
     reason = get_unprobeable_reason(app_id)
     if reason is not None:
         return UnprobeableCheck(check_id, reason)

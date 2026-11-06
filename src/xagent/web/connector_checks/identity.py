@@ -19,7 +19,18 @@ connector the enumeration already knows is broken (a grant that needs
 reconnecting) is returned as a non-OK listing without starting anything.
 
 The adapter is responsible for the identity being one that may be probed;
-the engine trusts it as given.
+the engine trusts it as given. When the identity or its connectors cannot be
+resolved, ``enumerate_targets`` raises ``IdentitySetupError``.
+
+An adapter offers a target only for a connection that is the catalog's own.
+For a server row that is the probe route's catalog-identity rule
+(``_owns_catalog_identity`` in ``services/connector_probe.py``); an actor
+stdio connection is synthesized from the catalog. A lookalike or custom row
+never gets a builtin app's checks.
+
+App ids are unique per enumeration. Where an identity has several rows of
+one app, the adapter offers the one its catalog resolution selects, the one
+a task of that identity would load.
 """
 
 from __future__ import annotations
@@ -34,6 +45,27 @@ from .fixtures import FixtureValue
 
 if TYPE_CHECKING:
     from ..services.mcp_connector_session import ConnectorToolsResult
+
+
+class IdentitySetupError(Exception):
+    """The identity or its connectors cannot be resolved.
+
+    ``enumerate_targets`` raises it, for example for a user outside
+    ``XAGENT_CONNECTOR_PROBE_USERS``. The run then records
+    ``RunResult.failure = error.code`` and has no rows. The message is the
+    code alone: it never carries a user id, an email or an exception text.
+    """
+
+    def __init__(self, stage: str, reason: str) -> None:
+        if (
+            not is_code(stage)
+            or not is_code(reason)
+            or ":" in stage
+            or not is_code(f"{stage}:{reason}")
+        ):
+            raise ValueError("an identity setup error needs a stage and a reason code")
+        self.code = f"{stage}:{reason}"
+        super().__init__(self.code)
 
 
 class SessionPurpose(str, Enum):
@@ -87,10 +119,17 @@ class IdentityAdapter(Protocol):
     @property
     def label(self) -> str:
         """The identity's public label in the result (``toby``, ``user``):
-        never a user id, a workspace id or an email."""
+        never a user id, a workspace id or an email. It must match
+        ``results.IDENTITY_PATTERN``."""
 
     def enumerate_targets(self) -> Sequence[ConnectorTarget]:
-        """The identity's connectors, in the order they should run."""
+        """The identity's connectors, in the order they should run.
+
+        Raises ``IdentitySetupError`` when the identity or its connectors
+        cannot be resolved (for example a user outside
+        ``XAGENT_CONNECTOR_PROBE_USERS``); the run then records
+        ``RunResult.failure = error.code`` with no rows.
+        """
 
     async def open_session(
         self,

@@ -51,7 +51,7 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 | Assertion | Passes when |
 |---|---|
 | `StatusSuccess()` | the payload's `status` is `"success"` (the in-repo envelope) |
-| `HasKeys(keys, path=())` | the object at `path` has every key |
+| `HasKeys(path, keys)` | the object at `path` has every key |
 | `EachHasKeys(path, keys)` | every item of the array at `path` has every key |
 | `IsType(path, type)` | the value at `path` has JSON type `object`, `array`, `string`, `number`, `boolean` or `null` |
 | `Length(path, min=0, max=None)` | the array at `path` has between `min` and `max` items |
@@ -76,10 +76,12 @@ A connector adopts V2 by adding an entry to `CONNECTOR_CHECKS`. To keep its L3 c
 
 The engine runs as an identity through an `IdentityAdapter` (`identity.py`):
 
-- `label`: the identity's public label in the result (`toby`, `user`), never a user id, workspace id or email;
-- `enumerate_targets()`: the identity's connectors as `ConnectorTarget`s, one per app id. A connector the adapter cannot start carries a `skip_reason` code, decided from the enumeration and never from a result. A failure to resolve the identity or its connectors is the run's `failure`, not a row;
+- `label`: the identity's public label in the result (`toby`, `user`), never a user id, workspace id or email. It matches `results.IDENTITY_PATTERN`;
+- `enumerate_targets()`: the identity's connectors as `ConnectorTarget`s, one per app id. A connector the adapter cannot start carries a `skip_reason` code, decided from the enumeration and never from a result. When the identity or its connectors cannot be resolved (for example a user outside `XAGENT_CONNECTOR_PROBE_USERS`), it raises `IdentitySetupError(stage, reason)`, and the run records `RunResult.failure = error.code` (`<stage>:<reason>`) with no rows;
 - `open_session(target, purpose=...)`: starts the connector as a task of that identity would and returns its `ConnectorToolsResult`. A failure is reported through the listing's outcome, not raised. The engine finds a check's tool by its MCP wire name, so the listing's name prefix is the adapter's choice;
 - `resolve_fixture(key)`: the fixture value, or None.
+
+An adapter offers a target only for a connection that is the catalog's own: for a server row, the probe route's catalog-identity rule (`_owns_catalog_identity` in `services/connector_probe.py`); an actor stdio connection is synthesized from the catalog. A lookalike or custom row never gets a builtin app's checks. App ids are unique per enumeration: where an identity has several rows of one app, the adapter offers the one its catalog resolution selects, the one a task of that identity would load.
 
 `SessionPurpose.CALL_TOOLS` refuses a sandboxed (`npx`/`uvx`) connection, because the listing's lease is released before any call. `SessionPurpose.LIST_ONLY`, for a connector where no check will call a tool (each is unprobeable, or the app has no declaration), lets such a connection list through a lease, as V1's Toby probe does. This is the one departure from "sandboxed connections stay refused": no tool is called after the lease is released.
 
@@ -121,7 +123,7 @@ The engine runs as an identity through an `IdentityAdapter` (`identity.py`):
 - **`failure`** is a code for a run that could not be set up (`<stage>:<reason>`, such as `enumeration:no_connectors`), and null otherwise. Such a run has no rows; the diff reads it as no data, never as every connector recovering.
 - **Outcomes.** `pass` and `unprobeable` carry no class; an `unprobeable` row's `reason` is its L3 reason. `fail` and `skip` carry a class from the tables below, and `reason` optionally refines it with a code.
 - **What a document never holds.** Tokens, secrets, response bodies, fixture values or end-user ids. Every reason is a code (`^[a-z0-9][a-z0-9_.:-]{0,79}$`): a listing's reason that is not a code is dropped, and a row refuses one. A code-shaped value can still be anything, so the callers that build rows put only codes in them.
-- **The schema enforces the pairing** of outcome and class: `pass` carries none, `fail` only a failure class, `skip` only a skip class, and `unprobeable` (a check row) an L3 reason. A consumer that validates against it accepts exactly what the rows can produce.
+- **The schema enforces the pairing** of outcome and class: `pass` carries none, `fail` only a failure class, `skip` only a skip class, and `unprobeable` (a check row) an L3 reason. The schema checks each row on its own. The cross-row rules (a check id starts with its connector, one session row per connector, a session row precedes its checks, no check runs under a failed session) are enforced only by `RunResult`.
 
 | Failure class (`fail`) | Meaning |
 |---|---|

@@ -94,8 +94,8 @@ class StatusSuccess:
 class HasKeys:
     """The object at ``path`` carries every key in ``keys``."""
 
+    path: PayloadPath
     keys: tuple[str, ...]
-    path: PayloadPath = ()
 
 
 @dataclass(frozen=True)
@@ -250,17 +250,26 @@ def validate_connector_checks(checks: ConnectorChecks) -> None:
         raise DeclarationError(f"app id {app_id!r} would not be its own result label")
 
     seen: set[str] = set()
-    for check in (*checks.reads, *checks.writes):
-        _validate_check_id(app_id, check.id, seen)
-        if isinstance(check, ReadCheck):
-            _validate_read(check)
-        elif isinstance(check, UnprobeableCheck):
-            if check.reason not in UNPROBEABLE_REASONS:
-                raise DeclarationError(
-                    f"{check.id}: unknown unprobeable reason {check.reason!r}"
-                )
-        else:
-            _validate_write(check)
+    for read in checks.reads:
+        if not isinstance(read, (ReadCheck, UnprobeableCheck)):
+            raise DeclarationError(
+                f"{app_id}: reads take a ReadCheck or UnprobeableCheck, "
+                f"not {type(read).__name__}"
+            )
+        _validate_check_id(app_id, read.id, seen)
+        if isinstance(read, ReadCheck):
+            _validate_read(read)
+        elif read.reason not in UNPROBEABLE_REASONS:
+            raise DeclarationError(
+                f"{read.id}: unknown unprobeable reason {read.reason!r}"
+            )
+    for write in checks.writes:
+        if not isinstance(write, WriteCheck):
+            raise DeclarationError(
+                f"{app_id}: writes take a WriteCheck, not {type(write).__name__}"
+            )
+        _validate_check_id(app_id, write.id, seen)
+        _validate_write(write)
 
     checked = checks.checked_tools()
     exempted: set[str] = set()
@@ -296,18 +305,34 @@ def _validate_read(check: ReadCheck) -> None:
         check.id, check.tool, check.arguments, check.payload, check.assertions
     )
     _refuse_run_scoped_name(check.id, check.arguments, check.assertions)
+    _require_assertion(check.id, "check", check.assertions)
 
 
 def _validate_write(check: WriteCheck) -> None:
     where = check.id
     pin = check.tenant_pin
+    for name in ("create", "verify", "cleanup"):
+        if not isinstance(getattr(check, name), ToolStep):
+            raise DeclarationError(f"{where}: {name} must be a ToolStep")
+    if not isinstance(pin, TenantPin):
+        raise DeclarationError(f"{where}: tenant pin must be a TenantPin")
+    if not isinstance(pin.step, ToolStep):
+        raise DeclarationError(f"{where}: tenant pin step must be a ToolStep")
+    if not isinstance(pin.expected, FixtureRef):
+        raise DeclarationError(f"{where}: tenant pin expected must be a FixtureRef")
     for step in (check.create, check.verify, check.cleanup, pin.step):
         _validate_call(where, step.tool, step.arguments, step.payload, step.assertions)
     _validate_path(where, pin.path)
+    for name in ("create", "verify", "cleanup"):
+        _require_assertion(where, name, getattr(check, name).assertions)
     _refuse_run_scoped_name(where, pin.step.arguments, pin.step.assertions)
     if not _contains_run_scoped_name(check.create.arguments):
         raise DeclarationError(
             f"{where}: create must name its object with a run-scoped name"
+        )
+    if not _contains_run_scoped_name(check.cleanup.arguments):
+        raise DeclarationError(
+            f"{where}: cleanup must name its object with a run-scoped name"
         )
     write_tools = {check.create.tool, check.cleanup.tool}
     verdicts = check.expected_verdicts
@@ -318,6 +343,13 @@ def _validate_write(check: WriteCheck) -> None:
     allowed = set(get_args(ExpectedVerdict))
     if any(verdict not in allowed for verdict in verdicts.values()):
         raise DeclarationError(f"{where}: unknown expected verdict")
+
+
+def _require_assertion(
+    where: str, name: str, assertions: tuple[Assertion, ...]
+) -> None:
+    if not assertions:
+        raise DeclarationError(f"{where}: {name} needs at least one assertion")
 
 
 def _validate_call(

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from xagent.web.connector_checks.identity import ConnectorTarget
+from xagent.web.connector_checks.identity import ConnectorTarget, IdentitySetupError
 from xagent.web.connector_checks.results import (
     CheckRow,
     FailureClass,
@@ -88,3 +88,21 @@ def test_a_target_needs_an_app_id_and_a_code_shaped_skip_reason(
 ) -> None:
     with pytest.raises(ValueError):
         ConnectorTarget(app_id, skip_reason=skip_reason)
+
+
+def test_an_identity_setup_error_carries_a_stage_reason_code() -> None:
+    error = IdentitySetupError("identity", "not_allowed")
+
+    assert error.code == "identity:not_allowed"
+    assert str(error) == "identity:not_allowed"
+
+
+@pytest.mark.parametrize(
+    ("stage", "reason"),
+    [("Identity", "x"), ("a:b", "c"), ("identity", "not allowed")],
+)
+def test_an_identity_setup_error_refuses_a_stage_or_reason_that_is_no_code(
+    stage: str, reason: str
+) -> None:
+    with pytest.raises(ValueError):
+        IdentitySetupError(stage, reason)

@@ -323,6 +323,7 @@ def test_a_fixture_key_fits_a_fixture_missing_row() -> None:
         (("rows", 3, "failure_class"), "client_rejected"),
         (("rows", 5, "reason"), None),
         (("failure",), "enumeration:no_connectors"),
+        (("rows", 0, "outcome"), "unprobeable"),
     ],
 )
 def test_the_schema_refuses_free_text_and_unknown_fields(

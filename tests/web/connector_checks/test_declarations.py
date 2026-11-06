@@ -47,7 +47,13 @@ def _write(**changes: Any) -> WriteCheck:
             {"jql": RunScopedName("issue")},
             assertions=(Length(("issues",), min=1, max=1),),
         ),
-        cleanup=ToolStep("jira_delete_issue", {"summary": RunScopedName("issue")}),
+        # Cleanup by a created object's id needs a create-result reference,
+        # which comes with #3564; until then it names the run-scoped object.
+        cleanup=ToolStep(
+            "jira_delete_smoke_issues",
+            {"summary": RunScopedName("issue")},
+            assertions=(StatusSuccess(),),
+        ),
         tenant_pin=TenantPin(
             ToolStep("jira_list_accessible_sites"),
             path=("sites", 0, "id"),
@@ -55,7 +61,7 @@ def _write(**changes: Any) -> WriteCheck:
         ),
         expected_verdicts={
             "jira_create_issue": "require_approval",
-            "jira_delete_issue": "require_approval",
+            "jira_delete_smoke_issues": "require_approval",
         },
     )
     return replace(check, **changes)
@@ -80,7 +86,7 @@ def _checks(**changes: Any) -> ConnectorChecks:
                 tool="jira_search_issues",
                 arguments={"jql": "project = SMOKE", "max_results": 1},
                 payload="structured_content",
-                assertions=(HasKeys(("issues",)),),
+                assertions=(HasKeys((), ("issues",)),),
                 require_read_only_hint=True,
             ),
             UnprobeableCheck(id="jira.l3_probe", reason="needs_fixture"),
@@ -123,7 +129,8 @@ def test_the_l3_envelope_alone_is_a_valid_read_check() -> None:
 
 
 def _read(**changes: Any) -> ReadCheck:
-    return replace(ReadCheck("jira.extra", "jira_get_issue"), **changes)
+    check = ReadCheck("jira.extra", "jira_get_issue", assertions=(StatusSuccess(),))
+    return replace(check, **changes)
 
 
 @pytest.mark.parametrize(
@@ -148,11 +155,11 @@ def _read(**changes: Any) -> ReadCheck:
         (_checks(reads=(_read(arguments={"q": RunScopedName("x")}),)), "run-scoped"),
         (_checks(reads=(_read(assertions=(Length((), min=2, max=1),)),)), "length"),
         (_checks(reads=(_read(assertions=(Length((), min=-1),)),)), "length"),
-        (_checks(reads=(_read(assertions=(HasKeys(()),)),)), "keys"),
+        (_checks(reads=(_read(assertions=(HasKeys((), ()),)),)), "keys"),
         (_checks(reads=(_read(assertions=(EachHasKeys(("a",), ()),)),)), "keys"),
         (_checks(reads=(_read(assertions=(IsType((), "list"),)),)), "type"),  # type: ignore[arg-type]
-        (_checks(reads=(_read(assertions=(HasKeys(("a",), (-1,)),)),)), "path"),
-        (_checks(reads=(_read(assertions=(HasKeys(("a",), (1.5,)),)),)), "path"),  # type: ignore[arg-type]
+        (_checks(reads=(_read(assertions=(HasKeys((-1,), ("a",)),)),)), "path"),
+        (_checks(reads=(_read(assertions=(HasKeys((1.5,), ("a",)),)),)), "path"),  # type: ignore[arg-type]
         (
             _checks(reads=(_read(assertions=(L3Envelope(), StatusSuccess())),)),
             "L3Envelope",
@@ -167,7 +174,9 @@ def _read(**changes: Any) -> ReadCheck:
             "both checked and exempted",
         ),
         (
-            _checks(exemptions=(ToolExemption("jira_delete_issue", "only cleanup"),)),
+            _checks(
+                exemptions=(ToolExemption("jira_delete_smoke_issues", "only cleanup"),)
+            ),
             "both checked and exempted",
         ),
         (
@@ -180,7 +189,13 @@ def _read(**changes: Any) -> ReadCheck:
         (
             _checks(
                 writes=(
-                    _write(create=ToolStep("jira_create_issue", {"summary": "fixed"})),
+                    _write(
+                        create=ToolStep(
+                            "jira_create_issue",
+                            {"summary": "fixed"},
+                            assertions=(StatusSuccess(),),
+                        )
+                    ),
                 )
             ),
             "run-scoped name",
@@ -195,7 +210,7 @@ def _read(**changes: Any) -> ReadCheck:
                     _write(
                         expected_verdicts={
                             "jira_create_issue": "allow",
-                            "jira_delete_issue": "allow",
+                            "jira_delete_smoke_issues": "allow",
                             "jira_other": "allow",
                         }
                     ),
@@ -209,7 +224,7 @@ def _read(**changes: Any) -> ReadCheck:
                     _write(
                         expected_verdicts={
                             "jira_create_issue": "maybe",
-                            "jira_delete_issue": "allow",
+                            "jira_delete_smoke_issues": "allow",
                         }
                     ),
                 )
@@ -229,6 +244,81 @@ def _read(**changes: Any) -> ReadCheck:
         (
             _checks(reads=(_read(assertions=(Equals(("a",), float("nan")),)),)),
             "finite",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        cleanup=ToolStep(
+                            "jira_delete_smoke_issues",
+                            {"issue_key": FixtureRef("jira.seed.issue")},
+                            assertions=(StatusSuccess(),),
+                        )
+                    ),
+                )
+            ),
+            "cleanup",
+        ),
+        (_checks(reads=(_read(assertions=()),)), "assertion"),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        cleanup=ToolStep(
+                            "jira_delete_smoke_issues",
+                            {"summary": RunScopedName("issue")},
+                        )
+                    ),
+                )
+            ),
+            "assertion",
+        ),
+        (_checks(reads=(_write(),), writes=()), "reads"),
+        (_checks(writes=(_read(),)), "writes"),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        tenant_pin=TenantPin(
+                            ToolStep("jira_list_accessible_sites"),
+                            path=("sites", 0, "id"),
+                            expected="site-1",  # type: ignore[arg-type]
+                        )
+                    ),
+                )
+            ),
+            "tenant pin",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        tenant_pin=TenantPin(
+                            ToolStep(
+                                "jira_list_accessible_sites",
+                                {"q": RunScopedName("x")},
+                            ),
+                            path=("sites", 0, "id"),
+                            expected=FixtureRef("jira.site_id"),
+                        )
+                    ),
+                )
+            ),
+            "run-scoped",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        tenant_pin=TenantPin(
+                            ToolStep("jira_list_accessible_sites"),
+                            path=("sites", -1),
+                            expected=FixtureRef("jira.site_id"),
+                        )
+                    ),
+                )
+            ),
+            "path",
         ),
         (ConnectorChecks("custom-foo"), "result label"),
         (ConnectorChecks("a" * 65), "result label"),

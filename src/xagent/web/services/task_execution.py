@@ -79,6 +79,7 @@ from ...core.agent.runner import (
     classify_injection,
     track_user_message_injection,
 )
+from ...core.agent.structured_output import StructuredOutputFormat
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -96,11 +97,12 @@ from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .release_hold import release_hold
+from .response_format import RESPONSE_FORMAT_CONFIG_KEY, parse_stored_response_format
 from .routine_history_provenance import (
     load_routine_history_turn_id,
     routine_history_turn_id,
 )
-from .structured_output_projection import build_record
+from .structured_output_projection import build_record, response_format_configured
 from .task_auto_recovery import (
     InterruptionDecision,
     InterruptionOutcome,
@@ -2632,6 +2634,32 @@ def _has_display_message_override(context: Dict[str, Any]) -> bool:
     )
 
 
+def _format_kwargs(fmt: StructuredOutputFormat | None) -> dict[str, Any]:
+    """The keyword that hands ``fmt`` to the agent, empty when there is no
+    format so a task without one calls the agent exactly as before."""
+    return {} if fmt is None else {"structured_output_format": fmt}
+
+
+def _read_resumed_task_response_format_sync(
+    task_id: int, run_id: str
+) -> tuple[bool, Any]:
+    """Read ``agent_config`` of the task row that still belongs to ``run_id``.
+
+    Returns ``(found, agent_config)``; ``found`` is false when no row matches,
+    for example because the task has moved on to another run. Uses its own
+    short session and returns only detached data.
+    """
+    with get_session_local()() as db:
+        row = (
+            db.query(Task.agent_config)
+            .filter(Task.id == task_id, Task.run_id == run_id)
+            .first()
+        )
+    if row is None:
+        return False, None
+    return True, row[0]
+
+
 async def execute_task_background(
     task_id: int,
     user_message: str,
@@ -2802,6 +2830,14 @@ async def execute_task_background(
 
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
+            stored_agent_config: Any = getattr(snapshot.task, "agent_config", None)
+            output_format: StructuredOutputFormat | None = None
+            if response_format_configured(stored_agent_config):
+                output_format = await asyncio.to_thread(
+                    parse_stored_response_format,
+                    stored_agent_config[RESPONSE_FORMAT_CONFIG_KEY],
+                    task_id=task_id,
+                )
             prompt_context = prompt_context_from_agent_config(
                 getattr(snapshot.task, "agent_config", None)
             )
@@ -2860,6 +2896,7 @@ async def execute_task_background(
                 turn_usage_sink=(
                     turn_facts.record_usage if turn_facts is not None else None
                 ),
+                **_format_kwargs(output_format),
             )
 
         finalize_run_id = (
@@ -4452,6 +4489,45 @@ async def execute_resume_background(
             )
             resume_tracker = None
 
+        # This function holds no task row, so it reads the stored format itself
+        # and none of its callers, including callers in a downstream embedder,
+        # need to change. ``lease.run_id`` is checked here because a ``None``
+        # would query ``run_id IS NULL``.
+        format_run_id = lease.run_id
+        assert format_run_id is not None
+        resumed_format: StructuredOutputFormat | None = None
+        try:
+            format_found, resumed_agent_config = await run_db_io_cancellation_safe(
+                lambda: _read_resumed_task_response_format_sync(task_id, format_run_id)
+            )
+        except Exception as read_error:
+            if is_database_pool_timeout(read_error):
+                raise
+            # A format that cannot be read is treated as no format: the run
+            # carries on and gets no structured result.
+            logger.warning(
+                "task_id=%s run_id=%s could not read the stored response_format "
+                "(%s); continuing without one",
+                task_id,
+                format_run_id,
+                type(read_error).__name__,
+                exc_info=True,
+            )
+        else:
+            if not format_found:
+                logger.warning(
+                    "task_id=%s run_id=%s no task row matches this run; "
+                    "continuing without a stored response_format",
+                    task_id,
+                    format_run_id,
+                )
+            elif response_format_configured(resumed_agent_config):
+                resumed_format = await asyncio.to_thread(
+                    parse_stored_response_format,
+                    resumed_agent_config[RESPONSE_FORMAT_CONFIG_KEY],
+                    task_id=task_id,
+                )
+
         assert lease_heartbeat_task is not None
         with (
             UserContext(task_owner_user_id),
@@ -4465,6 +4541,7 @@ async def execute_resume_background(
                         "task_source": trusted_task_source,
                         "run_id": lease.run_id,
                     },
+                    **_format_kwargs(resumed_format),
                 ),
                 lease_heartbeat_task,
             )

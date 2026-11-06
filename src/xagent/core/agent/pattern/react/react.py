@@ -130,6 +130,7 @@ from ...deferred_tools import (
     DEFERRED_RULE,
     LOAD_TOOLS_NAME,
     LOADED_TOOLS_COMPONENT,
+    MAX_AUTO_LOAD_RETRIES,
     MAX_TOOLS_PER_LOAD,
     LoadToolsTool,
     servers_mentioned,
@@ -1321,12 +1322,9 @@ class ReActPattern(AgentPattern):
                     # Past max_iterations only a forced answer turn may run;
                     # stop rather than restore the full tool set there.
                     break
-                if (
-                    unavailable_tool_call
-                    and not settlement_fence
-                    and self._auto_load_refused(
-                        context, _unavailable_tool_call_names({"details": exc.details})
-                    )
+                auto_load_allowed = unavailable_tool_call and not settlement_fence
+                if auto_load_allowed and self._auto_load_refused(
+                    context, _unavailable_tool_call_names({"details": exc.details})
                 ):
                     normal_tool_schemas = self._normal_tool_schemas(
                         base_tool_schemas, spill_read_schema, tools, context
@@ -1342,7 +1340,11 @@ class ReActPattern(AgentPattern):
                     (
                         response,
                         answer_streamer,
-                    ) = await self._retry_tool_protocol_response(
+                    ) = await self._retry_auto_loading(
+                        auto_load=auto_load_allowed,
+                        rebuild=lambda: self._normal_tool_schemas(
+                            base_tool_schemas, spill_read_schema, tools, context
+                        ),
                         context=context,
                         llm=call_llm,
                         runtime=runtime,
@@ -1507,7 +1509,11 @@ class ReActPattern(AgentPattern):
                     (
                         response,
                         answer_streamer,
-                    ) = await self._retry_tool_protocol_response(
+                    ) = await self._retry_auto_loading(
+                        auto_load=recover_full_tool_set,
+                        rebuild=lambda: self._normal_tool_schemas(
+                            base_tool_schemas, spill_read_schema, tools, context
+                        ),
                         context=context,
                         llm=call_llm,
                         runtime=runtime,
@@ -2205,6 +2211,56 @@ class ReActPattern(AgentPattern):
                 *messages[1:],
             ]
         return [{"role": "system", "content": instruction}, *messages]
+
+    async def _retry_auto_loading(
+        self,
+        *,
+        auto_load: bool,
+        rebuild: Callable[[], list[dict[str, Any]]],
+        context: Any,
+        tool_schemas: list[dict[str, Any]],
+        **retry: Any,
+    ) -> tuple[Any, Any]:
+        """The protocol retry, repeated while the provider refuses deferred tools.
+
+        A provider that checks calls against the schemas it sent reports one
+        refused call at a time (DeepSeek returns the first violation only), so a
+        response that calls several unloaded connector tools is refused once per
+        tool. Each refusal loads that tool and retries with the schemas
+        rebuilt, up to MAX_AUTO_LOAD_RETRIES times. The refusal is raised by
+        some providers and carried in the response by others; both are handled.
+        """
+        attempts = 0
+        while True:
+            refused: frozenset[str] | None = None
+            try:
+                response, streamer = await self._retry_tool_protocol_response(
+                    context=context, tool_schemas=tool_schemas, **retry
+                )
+            except LLMToolProtocolError as exc:
+                if not auto_load or exc.code != "unavailable_tool_call":
+                    raise
+                refused = _unavailable_tool_call_names({"details": exc.details})
+                error: LLMToolProtocolError | None = exc
+            else:
+                error = None
+                protocol_error = get_tool_protocol_error(response)
+                if (
+                    auto_load
+                    and isinstance(protocol_error, dict)
+                    and protocol_error.get("code") == "unavailable_tool_call"
+                ):
+                    refused = _unavailable_tool_call_names(protocol_error)
+            if (
+                refused is None
+                or attempts >= MAX_AUTO_LOAD_RETRIES
+                or not self._auto_load_refused(context, refused)
+            ):
+                if error is not None:
+                    raise error
+                return response, streamer
+            attempts += 1
+            tool_schemas = rebuild()
 
     async def _retry_tool_protocol_response(
         self,
@@ -4515,19 +4571,14 @@ class ReActPattern(AgentPattern):
         return True
 
     def _deferred_retry_sentence(self) -> str:
-        """Retry wording for a deferred tool: loaded just now, or still unloaded."""
-        if self._just_auto_loaded:
-            names = self._just_auto_loaded
-            self._just_auto_loaded = []
-            verb = "is" if len(names) == 1 else "are"
-            call = "it" if len(names) == 1 else "them"
-            return f" {', '.join(names)} {verb} now loaded; call {call} directly."
-        if self._deferred_tool_names:
-            return (
-                f" A deferred connector tool must be loaded with {LOAD_TOOLS_NAME} "
-                "before it can be called."
-            )
-        return ""
+        """Retry wording naming the deferred tools a refusal just loaded."""
+        if not self._just_auto_loaded:
+            return ""
+        names = self._just_auto_loaded
+        self._just_auto_loaded = []
+        verb = "is" if len(names) == 1 else "are"
+        call = "it" if len(names) == 1 else "them"
+        return f" {', '.join(names)} {verb} now loaded; call {call} directly."
 
     def _tool_schema_cost(self, tool: Any) -> int:
         """Estimated tokens of one tool's schema (characters / 4)."""
@@ -7353,7 +7404,7 @@ class ReActPattern(AgentPattern):
             load_hint = (
                 f" Load deferred connector tools with {LOAD_TOOLS_NAME} before "
                 "calling them."
-                if any(match in self._deferred_tool_names for match in close)
+                if any(self._deferred_tool_unloaded(match, context) for match in close)
                 else ""
             )
             return f"{message} Did you mean: {', '.join(close)}?{load_hint}"

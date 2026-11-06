@@ -31,6 +31,11 @@ LOADED_TOOLS_COMPONENT = "loaded_tools"
 # truncated and the model is told which names were not loaded.
 MAX_TOOLS_PER_LOAD = 12
 
+# How many extra protocol retries a run may spend auto-loading deferred tools a
+# provider keeps refusing. A provider that reports only the first refused call
+# of a response needs one per tool the model called in parallel.
+MAX_AUTO_LOAD_RETRIES = 3
+
 # Default ceiling, in estimated tokens, for the schemas pre-loaded because the
 # user named their connector. A connector that would exceed what is left of the
 # budget is not pre-loaded; the model loads the few tools it needs by name.

@@ -106,7 +106,8 @@ literal format strings.
   - `finalize_ack_unresolved`: a finalize COMMIT (a new or a resumed run's
     result) lost its acknowledgement (dropped connection) and the read-back
     could not decide, or there was no inserted row to read back (a legacy
-    wait or pause, an ownerless legacy task, a replayed result fact).
+    wait or pause with no answer, an ownerless legacy task, a replayed
+    result fact).
   - `settlement_ack_unresolved`: the same for a V2 settlement (a run that
     raised, an interruption pause, or a managed inline-transport result).
     The lease is retained for TTL recovery.

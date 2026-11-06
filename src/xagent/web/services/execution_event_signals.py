@@ -345,8 +345,8 @@ def report_unknown_outcome(
     ``kind`` names the case and is the counter's ``operation`` attribute, so
     it must stay a small fixed set: ``tool_effect``, ``turn_commit``,
     ``command_commit``, ``finalize_ack_unresolved``,
-    ``settlement_ack_unresolved``, ``settlement_deferred`` -- and ``finalize_ack_reconciled`` and
-    ``settlement_ack_reconciled``, which are not unknown but confirmed
+    ``settlement_ack_unresolved``, ``settlement_deferred`` -- and
+    ``finalize_ack_reconciled`` and ``settlement_ack_reconciled``, which are not unknown but confirmed
     successes (the read-back proved a lost acknowledgement's COMMIT applied),
     reported at INFO and counted for visibility only: alerts on this counter
     must exclude them. ``storage`` is ``v1``, ``v2`` or ``unknown``; ``turn_commit``,

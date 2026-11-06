@@ -75,6 +75,7 @@ from xagent.core.agent.checkpoint import (
 from xagent.core.agent.interruption import InterruptionReason
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_execution
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.task_execution import (
     _finalize_resumed_task,
     _settle_resumed_task_lease,
@@ -159,6 +160,8 @@ COMPLETED = ("completed", True, {"success": True, "status": "completed"})
 WAITING = ("waiting_for_user", False, {"success": False, "status": "waiting_for_user"})
 PAUSED = ("failed", False, PERSISTENCE_RESULT)
 OUTCOMES = {"completed": COMPLETED, "waiting_for_user": WAITING, "paused": PAUSED}
+# A plain failure: no interruption reason, so it settles FAILED.
+FAILED = ("failed", False, {"success": False, "status": "failed", "error": "boom"})
 
 
 def _resume_finalize(factory, tid: int, lease, outcome) -> dict[str, Any]:
@@ -252,6 +255,11 @@ def test_a_lost_resumed_finalize_ack_whose_commit_applied_is_confirmed(
     )
 
 
+@pytest.mark.parametrize(
+    ("outcome", "line"),
+    [(COMPLETED, "done"), (FAILED, CLIENT_SAFE_TASK_FAILURE)],
+    ids=["completed", "failed"],
+)
 def test_a_legacy_resumed_finalize_is_confirmed_by_its_transcript_row(
     canonical,
     finalizes,
@@ -260,18 +268,22 @@ def test_a_legacy_resumed_finalize_is_confirmed_by_its_transcript_row(
     monkeypatch,
     caplog,
     metric_reader,
+    outcome,
+    line,
 ):
+    """An answer or a failure inserts a legacy transcript row; the failure's
+    row has fixed content, so its id is what tells it apart."""
     factory, tid = canonical
     lease = _start_run(factory, tid, conversation_storage_version=1)
     fail_commits(monkeypatch, finalizes, committed=True)
 
-    finalized = _resume_finalize(factory, tid, lease, COMPLETED)
+    finalized = _resume_finalize(factory, tid, lease, outcome)
 
     assert read_backs == [True]
     assert finalized["lease_released"] is True
-    assert finalized["final_status"] == "completed"
+    assert finalized["final_status"] == outcome[0]
     assert file_settlements == [True]
-    assert _assistant_lines(factory, tid) == ["done"]
+    assert _assistant_lines(factory, tid) == [line]
     assert_one(
         caplog,
         metric_reader,
@@ -373,6 +385,33 @@ def test_a_resumed_finalize_commit_that_did_not_apply_is_raised(
     assert file_settlements == [False]
     _assert_still_running(factory, tid, lease)
     # The read-back decided "absent" (or the server refused): a plain failure.
+    assert_none(caplog, metric_reader)
+
+
+@pytest.mark.parametrize("outcome", [COMPLETED, FAILED], ids=["completed", "failed"])
+def test_a_legacy_resumed_finalize_that_did_not_apply_is_raised(
+    canonical,
+    finalizes,
+    file_settlements,
+    read_backs,
+    monkeypatch,
+    caplog,
+    metric_reader,
+    outcome,
+):
+    """The legacy transcript row is read back and found absent: a plain
+    failure, even after a dropped connection."""
+    factory, tid = canonical
+    lease = _start_run(factory, tid, conversation_storage_version=1)
+    raised = fail_commits(monkeypatch, finalizes, committed=False, error=invalidated)
+
+    with pytest.raises(OperationalError) as caught:
+        _resume_finalize(factory, tid, lease, outcome)
+
+    assert caught.value is raised[0]
+    assert read_backs == [False]
+    assert file_settlements == [False]
+    _assert_still_running(factory, tid, lease)
     assert_none(caplog, metric_reader)
 
 
@@ -491,7 +530,7 @@ async def test_a_raised_run_is_classified_for_an_unknown_tool_effect(
 )
 async def test_a_raised_resume_asks_settlement_to_classify(explicit_cancel):
     """The resume exception branch asks for the classification a new run's
-    does; an explicit cancel is not an unknown tool effect."""
+    does, cancelled or not: a cancel does not undo a tool that ran."""
     settle_mock = MagicMock(return_value=True)
 
     await _resume_raising(
@@ -501,9 +540,7 @@ async def test_a_raised_resume_asks_settlement_to_classify(explicit_cancel):
     )
 
     settle_mock.assert_called_once()
-    assert settle_mock.call_args.kwargs["classify_unknown_tool_effect"] is (
-        not explicit_cancel
-    )
+    assert settle_mock.call_args.kwargs["classify_unknown_tool_effect"] is True
 
 
 @pytest.mark.asyncio

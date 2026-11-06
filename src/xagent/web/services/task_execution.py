@@ -3273,6 +3273,7 @@ def _finalize_resumed_task(
 ) -> dict[str, Any]:
     """Persist one fenced resumed result in a single worker transaction."""
     from ..models.agent import Agent
+    from ..models.chat_message import TaskChatMessage
     from .chat_history_service import persist_assistant_message_no_commit
     from .task_orchestrator import sync_trigger_run_status
 
@@ -3413,8 +3414,8 @@ def _finalize_resumed_task(
         finalized["completion_outcome"] = task.completion_outcome
 
         # A legacy row inserted by this transaction; V2 uses its result fact
-        # instead. Wait and pause transitions insert no legacy row.
-        assistant_message: Any = None
+        # instead. Only a successful answer or a failure inserts one.
+        assistant_message: TaskChatMessage | None = None
         if success and output.strip() and task_owner_user_id is not None:
             assistant_message = persist_assistant_message_no_commit(
                 db,
@@ -3537,8 +3538,9 @@ def _finalize_resumed_task(
         # The lease is released in this transaction, so a lost acknowledgement
         # can only be proven applied by a row it inserted: the result fact
         # (V2) or the legacy transcript row. Without one (a legacy wait or
-        # pause, an ownerless legacy task, a replayed fact) the commit error
-        # is re-raised, reported as unresolved when the connection dropped.
+        # pause with no answer, an ownerless legacy task, a replayed fact)
+        # the commit error is re-raised, reported as unresolved when the
+        # connection dropped.
         # Read before COMMIT: the row's attributes expire on a failed one.
         resume_storage = "v2" if task.conversation_storage_version == 2 else "v1"
         _commit_finalization_or_reconcile(
@@ -4982,9 +4984,10 @@ async def execute_resume_background(
                                         if explicit_cancel
                                         else settlement_interruption
                                     ),
+                                    # A cancel does not undo a tool that
+                                    # ran: classified as for a new run.
                                     classify_unknown_tool_effect=(
                                         settlement_classifies_unknown_tool_effect
-                                        and not explicit_cancel
                                     ),
                                     report=settlement_report,
                                 )

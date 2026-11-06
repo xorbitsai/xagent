@@ -343,10 +343,12 @@ async def run_probe(
     error = None
     passed = False
     try:
-        answer = await llm.chat(
+        content = []
+        async for chunk in llm.stream_chat(
             messages=[{"role": "user", "content": text}], max_tokens=8
-        )
-        passed = "OK" in str(answer.get("content", "")).upper()
+        ):
+            content.append(chunk.content or "")
+        passed = "OK" in "".join(content).upper()
     except Exception as exc:
         error = type(exc).__name__
     finally:

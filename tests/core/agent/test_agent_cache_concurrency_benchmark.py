@@ -289,3 +289,50 @@ async def test_batch_retains_failed_agent_and_still_finishes_foreground(
     assert (args.output / "report.json").exists()
     with pytest.raises(FileExistsError):
         await bench.run(args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_tokens,expected", [(0, True), (32, False)])
+async def test_foreground_stream_preserves_usage_and_rejects_warm_probe(
+    tmp_path, monkeypatch, cached_tokens, expected
+):
+    from xagent.core.model.chat.basic.xinference import XinferenceLLM
+    from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+    async def stream(self, **kwargs):
+        config = {}
+        self._apply_session_affinity(config)
+        self._apply_cache_lifecycle(config)
+        yield StreamChunk(type=ChunkType.TOKEN, content="OK")
+        yield StreamChunk(
+            type=ChunkType.USAGE,
+            usage={
+                "prompt_tokens": 500,
+                "prompt_tokens_details": {"cached_tokens": cached_tokens},
+            },
+        )
+
+    monkeypatch.setattr(XinferenceLLM, "stream_chat", stream)
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = WhitespaceSplit()
+    args = argparse.Namespace(
+        output=tmp_path,
+        model="fixture",
+        context_window=16384,
+        endpoint="http://unused",
+        api_key_file=None,
+        timeout=30,
+        probe_start=0,
+        probe_interval=1,
+        probe_tokens=256,
+    )
+    result = await bench.run_probe(
+        args, 0, bench.time.perf_counter(), tokenizer, bench.AdmissionGate(1), "scope"
+    )
+    assert result["passed"] is expected
+    assert (
+        result["calls"][0]["usage"]["prompt_tokens_details"]["cached_tokens"]
+        == cached_tokens
+    )
+    assert not result["calls"][0]["routing_key_sent"]
+    assert not result["calls"][0]["cache_session_sent"]

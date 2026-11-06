@@ -20,6 +20,9 @@ down_revision: Union[str, None] = "20261105_update_atlassian_name_and_descriptio
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+# Rows are converted in keyset batches to bound memory. env.py runs the whole
+# upgrade in one transaction, so the locks on converted rows are held until it
+# commits; the conditional UPDATE below keeps a re-run or a concurrent writer safe.
 BATCH_SIZE = 500
 
 users = sa.table(

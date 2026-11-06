@@ -119,6 +119,62 @@ def test_logout_clears_the_digest_for_the_matching_token_only():
     assert _stored() is None
 
 
+def test_the_refresh_filter_itself_rejects_the_stored_digest():
+    """Bypass the JWT check that normally runs first, so the SQL filter and
+    refresh_token_matches are the only things standing between a leaked digest
+    and a new session."""
+    _login()
+    with auth_tests.TestingSessionLocal() as session:
+        user_id = session.query(User).one().id
+
+    with pytest.raises(auth.HTTPException) as rejected:
+        auth._refresh_in_worker(
+            auth.RefreshTokenRequest(refresh_token=_stored()),
+            user_id,
+            auth_tests.TestingSessionLocal,
+        )
+
+    assert rejected.value.status_code == 401
+
+
+def _plaintext_row(tokens: dict) -> None:
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        user.refresh_token = tokens["refresh_token"]
+        session.commit()
+
+
+def _logout(tokens: dict, presented: str):
+    return auth_tests.client.post(
+        "/api/auth/logout",
+        json={"refresh_token": presented},
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+    )
+
+
+def test_logout_revokes_a_row_that_is_still_plaintext():
+    tokens = _login()
+    _plaintext_row(tokens)
+
+    assert _logout(tokens, tokens["refresh_token"]).status_code == 200
+
+    assert _stored() is None
+
+
+@pytest.mark.parametrize("stored_as", ["digest", "plaintext"])
+@pytest.mark.parametrize("presented", ["\u00e9", "ok\u4e2d"])
+def test_logout_with_a_non_ascii_token_is_a_noop_not_an_error(stored_as, presented):
+    tokens = _login()
+    if stored_as == "plaintext":
+        _plaintext_row(tokens)
+    before = _stored()
+
+    response = _logout(tokens, presented)
+
+    assert response.status_code == 200
+    assert _stored() == before
+
+
 def test_matching_helpers():
     token = "header.payload.signature"
     digest = hash_refresh_token(token)
@@ -128,5 +184,10 @@ def test_matching_helpers():
     assert not refresh_token_matches(digest, "other.token.value")
     assert refresh_token_matches(token, token)  # legacy plaintext row
     assert not refresh_token_matches(None, token)
+    assert not refresh_token_matches(digest, "caf\u00e9")
+    assert not refresh_token_matches(token, "caf\u00e9")
+    # A lone surrogate (a JSON "\\ud800" escape) is non-ASCII and must not crash either.
+    assert not refresh_token_matches(digest, "\ud800")
+    assert not refresh_token_matches(token, "\ud800")
     assert not refresh_token_matches("", token)
     assert refresh_token_lookup_values(token) == [digest, token]

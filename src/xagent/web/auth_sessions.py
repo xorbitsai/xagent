@@ -37,13 +37,22 @@ def refresh_token_lookup_values(token: str) -> list[str]:
     migration ran (a deploy that overlaps the old release can still write one).
     The caller must have verified the JWT signature first: a bare digest taken
     from a leaked row is not a valid JWT and must not reach this filter.
+
+    TODO: remove the plaintext fallback here and in ``refresh_token_matches``
+    once no release that stores the raw token is running. Until then a row an
+    old instance wrote after the migration scan stays redeemable at rest until
+    its owner next signs in or refreshes, or the token expires; re-run the
+    conversion (migration ``20261106_hash_user_refresh_tokens``) in the release
+    that removes the fallback.
     """
     return [hash_refresh_token(token), token]
 
 
 def refresh_token_matches(stored: str | None, presented: str) -> bool:
     """Compare a presented refresh token with the value stored for the user."""
-    if not stored:
+    # Logout passes the client's token unverified. A JWT and a digest are ASCII,
+    # so anything else cannot match, and compare_digest rejects non-ASCII str.
+    if not stored or not presented.isascii():
         return False
     if _REFRESH_TOKEN_HASH_RE.fullmatch(stored):
         return hmac.compare_digest(stored, hash_refresh_token(presented))

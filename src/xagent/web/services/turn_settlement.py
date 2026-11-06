@@ -26,15 +26,21 @@ from typing import Any
 from ...core.agent.result import normalize_tool_failure_code
 from ...core.model.chat.exceptions import MODEL_PROVIDER_FAILURE_KINDS
 from ...core.runtime_performance import increment_counter
-from .client_error_messages import ClientErrorCode
+from .client_error_messages import CONNECTOR_RUNTIME_CLIENT_ERROR_CODES, ClientErrorCode
 
 logger = logging.getLogger(__name__)
 
 HOOK_TIMEOUT_SECONDS = 10.0
 _HOOK_METRIC = "xagent.turn_settlement.hook"
-# The only error codes a settlement carries. Anything else a run reports is
-# folded into ``task_execution_failed`` so free text never reaches the hook.
-_ERROR_CODES = frozenset({code.value for code in ClientErrorCode} | {"quota_exceeded"})
+# The only error codes a settlement carries: the client error codes, the
+# quota gate's code, and the public-safe connector-runtime codes. Anything
+# else a run reports is folded into ``task_execution_failed`` so free text
+# never reaches the hook.
+_ERROR_CODES = frozenset(
+    {code.value for code in ClientErrorCode}
+    | {"quota_exceeded"}
+    | CONNECTOR_RUNTIME_CLIENT_ERROR_CODES
+)
 
 
 @dataclass(frozen=True)

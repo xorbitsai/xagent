@@ -40,7 +40,10 @@ from xagent.web.services import task_orchestrator as orchestrator
 from xagent.web.services import (
     turn_settlement,
 )
-from xagent.web.services.client_error_messages import ClientErrorCode
+from xagent.web.services.client_error_messages import (
+    CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
+    ClientErrorCode,
+)
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
@@ -117,6 +120,7 @@ async def _settle_inflight() -> None:
     ("raw", "expected"),
     [
         *[(code.value, code.value) for code in ClientErrorCode],
+        *[(code, code) for code in sorted(CONNECTOR_RUNTIME_CLIENT_ERROR_CODES)],
         (ClientErrorCode.MODEL_ERROR, "model_error"),
         ("quota_exceeded", "quota_exceeded"),
         ("garbage", "task_execution_failed"),

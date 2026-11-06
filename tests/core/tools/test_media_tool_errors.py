@@ -243,6 +243,20 @@ class FailingTTS(BaseTTS):
 
 
 @pytest.mark.asyncio
+async def test_a_rejected_parameter_reports_the_values_the_caller_can_change(
+    workspace: Mock,
+) -> None:
+    tool, _ = _ark_video_tool(workspace, invalid_parameter_error())
+
+    result = await tool.generate_video("A short clip", seconds=6)
+
+    assert result["success"] is False
+    assert result["error_category"] == INVALID_REQUEST
+    assert result["allowed_values"] == {"duration_seconds": "4-15"}
+    assert "InvalidParameter" not in json.dumps(result, default=str)
+
+
+@pytest.mark.asyncio
 async def test_a_rejected_speech_request_lists_the_supported_formats(
     workspace: Mock,
 ) -> None:

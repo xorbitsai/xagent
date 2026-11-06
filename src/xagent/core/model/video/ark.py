@@ -21,7 +21,38 @@ _STANDARD_RATIOS = (
     ("3:4", 3 / 4),
 )
 _RATIO_TOLERANCE = 0.02
+
+# Whole seconds each Seedance family accepts. The lower bound is 4 for the
+# whole family; the upper bound differs by family and comes from the two
+# places that state it: the ``generate_video`` provider notes (xagent
+# ``tools/core/video_tool.py``, "Seedance 1.5 Pro supports 4-12 seconds or -1
+# for intelligent duration; Seedance 2.0 supports 4-15 seconds or -1") and the
+# Ark video-generation docs those notes follow. Matched as a substring of the
+# provider model name, so ``doubao-seedance-2-0-fast-260128`` and its future
+# dated siblings keep the 2.0 bound without a new row per release.
+SEEDANCE_DURATION_LIMITS = (
+    ("seedance-1-5-pro", 4, 12),
+    ("seedance-2", 4, 15),
+)
+# Anything else named Seedance: the family range, which is what a caller who
+# asks for "a Seedance clip" is told to stay inside.
+DEFAULT_SEEDANCE_DURATION_LIMITS = (4, 15)
+
 logger = logging.getLogger(__name__)
+
+
+def seedance_duration_limits(model_name: str) -> tuple[int, int]:
+    """``(shortest, longest)`` whole seconds ``model_name`` accepts.
+
+    Ark answers anything outside the range with a bare ``InvalidParameter``,
+    so the caller clamps up to the shortest length and reports the range
+    instead of letting the provider reject the request.
+    """
+    lowered = str(model_name or "").lower().replace("_", "-").replace(".", "-")
+    for family, shortest, longest in SEEDANCE_DURATION_LIMITS:
+        if family in lowered:
+            return shortest, longest
+    return DEFAULT_SEEDANCE_DURATION_LIMITS
 
 
 def _to_plain_data(value: Any) -> Any:

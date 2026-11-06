@@ -1490,6 +1490,30 @@ class TestTaskTracker:
         assert (received[0].input_tokens, received[0].output_tokens) == (4, 2)
 
     @pytest.mark.asyncio
+    async def test_turn_usage_sink_runs_when_the_final_write_raises(
+        self, db_session, monkeypatch
+    ):
+        """A final write that raises something other than pool exhaustion is
+        only logged: the usage was still observed, so the sink receives it."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        def failing_write(*_args, **_kwargs):
+            raise RuntimeError("db unavailable")
+
+        monkeypatch.setattr(tracker_module, "_complete_task_usage_sync", failing_write)
+        received = []
+        tracker = TaskTracker(
+            task_id=123, db_session=db_session, turn_usage_sink=received.append
+        )
+        await tracker.start_tracking()
+        add_token_usage(input_tokens=4, output_tokens=2, model="m", call_type="chat")
+
+        usage = await tracker.complete_tracking()
+
+        assert len(received) == 1
+        assert received[0] == tracker.turn_usage(usage)
+
+    @pytest.mark.asyncio
     async def test_failing_turn_usage_sink_is_only_logged(self, db_session):
         def sink(_usage):
             raise RuntimeError("sink broke")

@@ -674,7 +674,11 @@ async def test_channel_turn_paused_by_its_settlement_reports_paused(
     await _drive_channel(
         monkeypatch,
         status=TaskStatus.FAILED,
-        result={"success": False, "error": "x", "error_code": "quota_exceeded"},
+        result={
+            "success": False,
+            "error": "x",
+            "interruption_reason": "llm_unavailable",
+        },
         pause=True,
     )
     await _settle_inflight()
@@ -720,7 +724,7 @@ async def test_channel_run_without_output_reports_an_empty_answer(monkeypatch) -
 
     await _drive_channel(
         monkeypatch,
-        content="Task completed, but no output was generated.",
+        content="No output provided",
         result={
             "success": True,
             "output": "No output provided",
@@ -888,6 +892,53 @@ async def test_scheduled_turn_reports_its_settlement_once(canonical, path) -> No
     assert settlement.error_code == error_code
     assert settlement.started_at <= settlement.ended_at
     assert len(settlement.settlement_id) == 32
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_whose_result_was_discarded_reports_the_kept_status(
+    canonical,
+) -> None:
+    """The task row turned FAILED while the run was in flight, so its
+    finalizer discards the completed result and keeps the terminal status."""
+    factory, tid = canonical
+    received = _capture()
+
+    async def execute_task(**_kwargs: Any) -> dict[str, Any]:
+        with factory() as db:
+            db.get(Task, tid).status = TaskStatus.FAILED
+            db.commit()
+        return {"success": True, "output": "No output provided", "output_missing": True}
+
+    manager = MagicMock()
+    manager.get_agent_for_task = AsyncMock(return_value=MagicMock())
+    manager.execute_task = execute_task
+
+    await _schedule_turn(canonical, manager)
+
+    assert [(s.status, s.error_code, s.empty_visible_answer) for s in received] == [
+        ("failed", "task_execution_failed", False)
+    ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_without_output_reports_the_adapter_classification(
+    canonical,
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="a", pattern="react", llm=None)
+    )
+    normalized = adapter._normalize_result(
+        result={"success": True, "output": "", "finish_reason": "length"},
+        execution_type="agent_react",
+        execution_id="1",
+    )
+    received = _capture()
+
+    await _schedule_turn(canonical, _result_manager(normalized))
+
+    assert [
+        (s.status, s.empty_visible_answer, s.llm_finish_reason) for s in received
+    ] == [("completed", True, "length")]
 
 
 @pytest.mark.usefixtures("_clear_bg_manager")
@@ -1644,6 +1695,25 @@ async def test_resume_cancelled_while_its_result_commits_is_reported(
 
     assert await drive is asyncio.CancelledError
     assert [(s.status, s.error_code) for s in received] == [("completed", None)]
+
+
+async def test_resume_without_output_reports_the_adapter_classification(
+    monkeypatch,
+) -> None:
+    received = _capture()
+
+    await _drive_resume(
+        monkeypatch,
+        {
+            **RESUME_OK,
+            "output_missing": True,
+            "finish_reason": "length",
+        },
+    )
+
+    assert [
+        (s.status, s.empty_visible_answer, s.llm_finish_reason) for s in received
+    ] == [("completed", True, "length")]
 
 
 async def test_resume_finding_the_task_terminal_reports_the_kept_status(

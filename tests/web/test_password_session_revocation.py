@@ -15,6 +15,7 @@ from tests.web.test_auth_api import test_db as test_db
 from xagent.web.api import auth, files, oidc_google, progress_ws
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
+from xagent.web.auth_sessions import hash_refresh_token
 from xagent.web.auth_dependencies import (
     get_user_from_token,
     get_user_from_websocket_token,
@@ -286,7 +287,7 @@ def test_refresh_checks_epoch_even_if_refresh_token_is_unchanged(monkeypatch):
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).one()
         assert user.session_epoch == "new-generation"
-        assert user.refresh_token == tokens["refresh_token"]
+        assert user.refresh_token == hash_refresh_token(tokens["refresh_token"])
 
 
 def test_session_epoch_generator_fits_the_database_column():
@@ -512,7 +513,7 @@ def test_login_preserves_atomic_legacy_password_upgrade():
         user = session.query(User).one()
         assert user.password_hash.startswith("$2")
         assert auth.verify_password("old-password-123", user.password_hash)
-        assert user.refresh_token == response["refresh_token"]
+        assert user.refresh_token == hash_refresh_token(response["refresh_token"])
 
 
 def test_login_checks_session_version_even_when_password_hash_is_unchanged(monkeypatch):

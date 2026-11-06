@@ -276,7 +276,11 @@ async def stream_asr(
             raise HTTPException(
                 status_code=400, detail="Selected ASR model does not support live audio"
             )
-        async with usage_scope(user.id, usage_source="speech_transcribe"):
+        async with usage_scope(
+            user.id,
+            usage_source="speech_transcribe",
+            model_ids=(config.model_id,),
+        ):
             try:
                 deadline = asyncio.timeout(_SESSION_SECONDS)
                 try:
@@ -390,7 +394,12 @@ class _TTSAudioResponse(StreamingResponse):
         # Meter on the request owner, outside the cancellable stream/disconnect
         # race. An EOF-triggered disconnect must not detach the quota hook.
         try:
-            async with usage_scope(self.user_id, usage_source="speech_synthesize"):
+            async with usage_scope(
+                self.user_id,
+                usage_source="speech_synthesize",
+                # Stamped by get_tts_model_instance from the model row.
+                model_ids=(getattr(self.model, "model_id", ""),),
+            ):
                 await self._respond(scope, receive, send)
         except StandaloneUsageRefused as exc:
             # Only entering the scope raises this: _respond turns every failure
@@ -435,12 +444,14 @@ async def stream_tts(
 ) -> StreamingResponse:
     user_id = int(user.id)
     release_db_connection_if_clean(db)
-    # The metering scope opens once the response is being sent, too late for a
-    # status code; refuse here. The scope checks again, for a gate that turns
-    # in between.
-    await check_standalone_gate_async(user_id, "speech_synthesize")
     config = await run_db_io_cancellation_safe(
         lambda: _load_speech_config(user_id, request.model_id, "tts")
+    )
+    # The metering scope opens once the response is being sent, too late for a
+    # status code; refuse here, before the provider is reached. The scope
+    # checks again, for a gate that turns in between.
+    await check_standalone_gate_async(
+        user_id, "speech_synthesize", model_ids=(config.model_id,)
     )
     try:
         model = get_tts_model_instance(config)

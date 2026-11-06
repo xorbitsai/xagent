@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import asyncio
 import json
 import logging
 from enum import IntEnum
@@ -31,13 +30,13 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_existing_command
 from xagent.web.services.client_error_messages import (
     ClientErrorCode,
 )
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
 
 from .conftest import _direct_db_session
 
@@ -124,13 +123,10 @@ async def test_execute_task_redacts_an_incidental_validation_error(
     connection_manager.broadcast_to_task = AsyncMock()
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
-    async def raise_at_schedule(**_kwargs: object) -> asyncio.Task:
-        raise raised
-
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=raise_at_schedule),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=raised),
     )
 
     await websocket_api.handle_execute_task(
@@ -2297,9 +2293,9 @@ async def test_unexpected_execute_error_keeps_its_traceback(
     finally:
         db.close()
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=_Unexpected("boom")),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=_Unexpected("boom")),
     )
 
     with caplog.at_level(logging.ERROR):
@@ -2622,9 +2618,9 @@ async def test_execute_runtime_error_broadcast_is_redacted(
         ),
     )
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
     )
 
     await websocket_api.handle_execute_task(
@@ -2984,9 +2980,9 @@ async def test_execute_safe_error_reaches_the_ingress_socket(
         ),
     )
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
     )
 
     ingress = MagicMock(name="ingress")

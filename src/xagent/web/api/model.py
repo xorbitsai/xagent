@@ -1003,6 +1003,7 @@ async def test_model_connection(
                     run_in_usage_scope,
                     int(user.id),
                     "model_probe",
+                    (),
                     embedding_model.encode,
                     "hello",
                 ),
@@ -1185,7 +1186,7 @@ async def test_model_connection(
 
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    run_in_usage_scope, int(user.id), "model_probe", _probe_rerank
+                    run_in_usage_scope, int(user.id), "model_probe", (), _probe_rerank
                 ),
                 timeout=timeout_seconds,
             )
@@ -1313,7 +1314,11 @@ async def transcribe_speech_input(
     try:
         # The provider records the transcription; this delivers it for the
         # requesting user, since no agent run is tracking it.
-        async with usage_scope(int(user.id), usage_source="speech_transcribe"):
+        async with usage_scope(
+            int(user.id),
+            usage_source="speech_transcribe",
+            model_ids=(str(db_model.model_id),),
+        ):
             result = await asyncio.wait_for(
                 asr_model.transcribe(
                     audio_bytes,

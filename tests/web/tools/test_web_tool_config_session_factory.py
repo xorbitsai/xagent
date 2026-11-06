@@ -1858,6 +1858,234 @@ def test_empty_unhanded_off_mapping_loader_is_cached_and_returns_fresh_dicts(
     assert first is not second
 
 
+@dataclass(frozen=True)
+class _MediaModel:
+    model_id: str
+    abilities: tuple[str, ...] = ("generate",)
+
+
+def _media_config(*, excluded_model_ids=(), **snapshot_values):
+    from xagent.web.tools.config import (
+        _ToolFactoryRuntimeLoadPlan,
+        _ToolFactoryRuntimeSnapshot,
+    )
+
+    plan = _ToolFactoryRuntimeLoadPlan(
+        user_id=1,
+        task_id=None,
+        connector_runtime_turn_id=None,
+        load_policy=False,
+        load_basic=False,
+        load_sql=False,
+        load_custom_api=False,
+        load_vision=False,
+        load_image=True,
+        load_video=True,
+        load_audio=True,
+        published_agent_policy=None,
+    )
+    cfg = WebToolConfig(
+        db=object(),
+        request=None,
+        user_id=1,
+        excluded_model_ids=frozenset(excluded_model_ids),
+    )
+    cfg._factory_runtime_snapshot = _ToolFactoryRuntimeSnapshot(
+        plan=plan, **snapshot_values
+    )
+    return cfg
+
+
+def test_empty_excluded_model_ids_leaves_every_media_kind_unchanged():
+    snapshot, expected = _factory_model_snapshot("no-exclusions")
+    cfg = WebToolConfig(db=object(), request=None, user_id=1)
+    cfg._factory_runtime_snapshot = snapshot
+    _assert_factory_model_values(cfg, expected)
+
+
+def test_empty_excluded_model_ids_never_loads_a_kind_mapping(monkeypatch):
+    snapshot, _ = _factory_model_snapshot("no-exclusions")
+    cfg = WebToolConfig(db=object(), request=None, user_id=1)
+    cfg._factory_runtime_snapshot = snapshot
+
+    loads: list[str] = []
+
+    def make_spy(name):
+        def spy():
+            loads.append(name)
+            return {}
+
+        return spy
+
+    for name in (
+        "get_image_models",
+        "get_video_models",
+        "get_asr_models",
+        "get_tts_models",
+        "get_music_models",
+        "get_sound_effect_models",
+    ):
+        monkeypatch.setattr(cfg, name, make_spy(name))
+
+    for getter in (
+        cfg.get_image_generate_model,
+        cfg.get_image_edit_model,
+        cfg.get_video_model,
+        cfg.get_asr_model,
+        cfg.get_tts_model,
+        cfg.get_music_model,
+        cfg.get_sound_effect_model,
+    ):
+        getter()
+
+    assert loads == []
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "snapshot_field", "keys_are_model_ids"),
+    [
+        ("get_image_models", "image_models", True),
+        ("get_video_models", "video_models", True),
+        ("get_asr_models", "asr_models", False),
+        ("get_tts_models", "tts_models", False),
+        ("get_music_models", "music_models", True),
+        ("get_sound_effect_models", "sound_effect_models", True),
+    ],
+)
+def test_excluded_model_is_removed_from_each_media_dict(
+    getter_name, snapshot_field, keys_are_model_ids
+):
+    excluded = _MediaModel("excluded-id")
+    kept = _MediaModel("kept-id")
+
+    def key(model):
+        # ASR/TTS dicts are legacy-keyed by model name, not by model id.
+        return model.model_id if keys_are_model_ids else f"name-{model.model_id}"
+
+    cfg = _media_config(
+        excluded_model_ids={"excluded-id"},
+        **{snapshot_field: {key(excluded): excluded, key(kept): kept}},
+    )
+
+    models = getattr(cfg, getter_name)()
+    assert models == {key(kept): kept}
+    assert excluded not in models.values()
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "models_field", "default_field", "ability"),
+    [
+        ("get_video_model", "video_models", "video_model", "generate"),
+        ("get_asr_model", "asr_models", "asr_model", "asr"),
+        ("get_tts_model", "tts_models", "tts_model", "tts"),
+        ("get_music_model", "music_models", "music_model", "generate"),
+        (
+            "get_sound_effect_model",
+            "sound_effect_models",
+            "sound_effect_model",
+            "generate",
+        ),
+    ],
+)
+def test_excluded_default_is_repicked_for_each_media_kind(
+    getter_name, models_field, default_field, ability
+):
+    excluded_default = _MediaModel("default-id", (ability,))
+    replacement = _MediaModel("replacement-id", (ability,))
+    cfg = _media_config(
+        excluded_model_ids={"default-id"},
+        **{
+            models_field: {
+                excluded_default.model_id: excluded_default,
+                replacement.model_id: replacement,
+            },
+            default_field: excluded_default,
+        },
+    )
+    assert getattr(cfg, getter_name)() is replacement
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "ability", "wrong_ability"),
+    [
+        ("get_image_generate_model", "generate", "edit"),
+        ("get_image_edit_model", "edit", "generate"),
+    ],
+)
+def test_excluded_image_default_is_repicked_with_the_needed_ability(
+    getter_name, ability, wrong_ability
+):
+    excluded_default = _MediaModel("default-id", (ability,))
+    wrong = _MediaModel("wrong-ability", (wrong_ability,))
+    right = _MediaModel("right-ability", (ability,))
+    cfg = _media_config(
+        excluded_model_ids={"default-id"},
+        # The wrong-ability model comes first: a dropped ability check would
+        # pick it instead of the only model that can serve this default.
+        image_models={"wrong": wrong, "right": right},
+        image_generate_model=excluded_default,
+        image_edit_model=excluded_default,
+    )
+    assert getattr(cfg, getter_name)() is right
+
+
+def test_excluded_default_without_a_capable_model_is_none():
+    excluded_default = _MediaModel("default-id", ("generate",))
+    edit_only = _MediaModel("edit-only", ("edit",))
+    cfg = _media_config(
+        excluded_model_ids={"default-id"},
+        image_models={"edit-only": edit_only},
+        image_generate_model=excluded_default,
+    )
+    assert cfg.get_image_generate_model() is None
+    assert cfg.get_image_models() == {"edit-only": edit_only}
+
+
+def test_all_models_excluded_leaves_an_empty_dict_and_no_default():
+    only_model = _MediaModel("only-id", ("generate",))
+    cfg = _media_config(
+        excluded_model_ids={"only-id"},
+        music_models={"only-id": only_model},
+        music_model=only_model,
+    )
+    assert cfg.get_music_models() == {}
+    assert cfg.get_music_model() is None
+
+
+def test_the_code_ability_strings_exist_on_the_real_model_classes():
+    from xagent.core.model.asr.elevenlabs import ElevenLabsASR
+    from xagent.core.model.asr.xinference import XinferenceASR
+    from xagent.core.model.image.base import default_image_abilities
+    from xagent.core.model.music.base import BaseMusicModel
+    from xagent.core.model.sound_effect.base import BaseSoundEffectModel
+    from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
+    from xagent.core.model.tts.xinference import XinferenceTTS
+    from xagent.core.model.video.ark import ArkVideoModel
+    from xagent.core.model.video.xinference import XinferenceVideoModel
+
+    # This helper is the ability source for an image row that declares none.
+    assert "generate" in default_image_abilities("generic", "any-model")
+    assert "edit" in default_image_abilities("openai", "any-model")
+
+    instances = (
+        (XinferenceASR("whisper-base"), "asr"),
+        (ElevenLabsASR(api_key="test-key"), "asr"),
+        (XinferenceTTS("chat-tts"), "tts"),
+        (ElevenLabsTTS(api_key="test-key"), "tts"),
+        (XinferenceVideoModel("test-model"), "generate"),
+        (ArkVideoModel(api_key="test-key"), "generate"),
+    )
+    for instance, ability in instances:
+        assert ability in instance.abilities
+
+    # The base classes are abstract; read their property getter directly.
+    for base, ability in (
+        (BaseMusicModel, "generate"),
+        (BaseSoundEffectModel, "generate"),
+    ):
+        assert ability in base.abilities.fget(None)
+
+
 def test_close_neutralizes_prefilled_model_mapping_caches_without_loading(monkeypatch):
     cfg = WebToolConfig(db=object(), request=None, user_id=None)
     mapping_getters = (

@@ -1859,6 +1859,38 @@ def _load_tool_runtime_policy_snapshot(
 _APP_LOCALE_TO_BROWSER_LOCALE = {"en": "en-US", "zh": "zh-CN"}
 
 
+def _filter_excluded_media_models(
+    models: Mapping[str, Any],
+    default: Any | None,
+    excluded_model_ids: frozenset[str],
+    *,
+    ability: str | None = None,
+) -> tuple[Dict[str, Any], Any | None]:
+    """Drop excluded media models and re-pick an excluded default.
+
+    The re-pick uses the media dict's own order (DB row order) and checks ``ability``.
+    """
+    if not excluded_model_ids:
+        return dict(models), default
+    kept = {
+        key: model
+        for key, model in models.items()
+        if key not in excluded_model_ids
+        and getattr(model, "model_id", None) not in excluded_model_ids
+    }
+    if default is None or getattr(default, "model_id", None) not in excluded_model_ids:
+        return kept, default
+    replacement = next(
+        (
+            model
+            for model in kept.values()
+            if ability is None or ability in (getattr(model, "abilities", None) or ())
+        ),
+        None,
+    )
+    return kept, replacement
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -1911,7 +1943,11 @@ class WebToolConfig(BaseToolConfig):
         mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
         knowledge_base_team_id: Optional[int] = None,
+        excluded_model_ids: frozenset[str] = frozenset(),
     ):
+        # Media model ids this task excludes; the getters drop them from the
+        # kind's dict and re-pick an excluded default (see the filter helper).
+        self._excluded_model_ids = frozenset(excluded_model_ids)
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
         # import cycle (web.tools → core.tools.adapters). The factory
@@ -2220,7 +2256,28 @@ class WebToolConfig(BaseToolConfig):
             loader=loader,
             terminal_neutral={},
         )
-        return dict(resolved)
+        return _filter_excluded_media_models(
+            dict(resolved), None, self._excluded_model_ids
+        )[0]
+
+    def _repick_excluded_media_default(
+        self,
+        default: Any | None,
+        models: Callable[[], Mapping[str, Any]],
+        *,
+        ability: str | None = None,
+    ) -> Any | None:
+        """Keep a default unless excluded, then re-pick it from the remaining models.
+
+        Not excluded (or no exclusions) returns it without loading the kind's dict.
+        """
+        if default is None or (
+            getattr(default, "model_id", None) not in self._excluded_model_ids
+        ):
+            return default
+        return _filter_excluded_media_models(
+            models(), default, self._excluded_model_ids, ability=ability
+        )[1]
 
     def get_vision_model(self) -> Optional[Any]:
         """Get vision model, prioritizing explicitly provided model over database."""
@@ -2254,29 +2311,41 @@ class WebToolConfig(BaseToolConfig):
 
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_image",
-            field_name="image_generate_model",
-            cache_name="_cached_image_generate_model",
-            loader=self._load_image_generate_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_image",
+                field_name="image_generate_model",
+                cache_name="_cached_image_generate_model",
+                loader=self._load_image_generate_model,
+            ),
+            self.get_image_models,
+            ability="generate",
         )
 
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_image",
-            field_name="image_edit_model",
-            cache_name="_cached_image_edit_model",
-            loader=self._load_image_edit_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_image",
+                field_name="image_edit_model",
+                cache_name="_cached_image_edit_model",
+                loader=self._load_image_edit_model,
+            ),
+            self.get_image_models,
+            ability="edit",
         )
 
     def get_video_model(self) -> Optional[Any]:
         """Get default video generation model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_video",
-            field_name="video_model",
-            cache_name="_cached_video_model",
-            loader=self._load_video_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_video",
+                field_name="video_model",
+                cache_name="_cached_video_model",
+                loader=self._load_video_model,
+            ),
+            self.get_video_models,
+            ability="generate",
         )
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
@@ -3251,6 +3320,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()
 
+    def get_excluded_model_ids(self) -> frozenset[str]:
+        """Get media model ids this task excludes (inherited by sub-agents)."""
+        return self._excluded_model_ids
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""
         return getattr(self, "_excluded_agent_id", None)
@@ -3483,11 +3556,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_model(self) -> Optional[Any]:
         """Get default ASR model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="asr_model",
-            cache_name="_cached_asr_model",
-            loader=self._load_asr_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="asr_model",
+                cache_name="_cached_asr_model",
+                loader=self._load_asr_model,
+            ),
+            self.get_asr_models,
+            ability="asr",
         )
 
     def _load_asr_model(self) -> Optional[Any]:
@@ -3525,11 +3602,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_model(self) -> Optional[Any]:
         """Get default TTS model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="tts_model",
-            cache_name="_cached_tts_model",
-            loader=self._load_tts_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="tts_model",
+                cache_name="_cached_tts_model",
+                loader=self._load_tts_model,
+            ),
+            self.get_tts_models,
+            ability="tts",
         )
 
     def get_sound_effect_models(self) -> Dict[str, Any]:
@@ -3553,11 +3634,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         """Get the user's default sound effect model."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="sound_effect_model",
-            cache_name="_cached_sound_effect_model",
-            loader=self._load_sound_effect_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="sound_effect_model",
+                cache_name="_cached_sound_effect_model",
+                loader=self._load_sound_effect_model,
+            ),
+            self.get_sound_effect_models,
+            ability="generate",
         )
 
     def _load_sound_effect_model(self) -> Optional[Any]:
@@ -3591,11 +3676,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_model(self) -> Optional[Any]:
         """Get the user's default music model."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="music_model",
-            cache_name="_cached_music_model",
-            loader=self._load_music_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="music_model",
+                cache_name="_cached_music_model",
+                loader=self._load_music_model,
+            ),
+            self.get_music_models,
+            ability="generate",
         )
 
     def _load_music_model(self) -> Optional[Any]:

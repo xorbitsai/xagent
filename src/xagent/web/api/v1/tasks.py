@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, Optional, cast
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import TypeAdapter
 from sqlalchemy import func
@@ -60,6 +60,7 @@ from ...schemas.v1 import (
     UploadFilesResponse,
 )
 from ...services import task_start as task_start_service
+from ...services.api_idempotency import IdempotencyClaim
 from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
@@ -106,6 +107,11 @@ from .deps import (
     record_principal_usage,
 )
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
+from .idempotency import (
+    IDEMPOTENCY_KEY_HEADER,
+    fingerprint_payload,
+    run_with_idempotency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +375,7 @@ def _ensure_agent_reachable(
 async def create_chat_task(
     request: CreateTaskRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+    idempotency_key: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> CreateTaskResponse:
     """Create a new SDK-driven task and kick off its first turn.
 
@@ -406,6 +413,14 @@ async def create_chat_task(
         principal: Key owner from the auth dependency: an agent key's
             bound agent, or a personal key's holder. A workforce key
             cannot create tasks here.
+        idempotency_key: Optional ``Idempotency-Key`` header (1-255 printable
+            ASCII characters, scoped to the key's agent, workforce or holder,
+            kept for 24 hours). The same key with the same body replays the
+            original 202 response (``Idempotent-Replayed: true``) without
+            starting another task; with a different body it is 422
+            ``idempotency_key_reused``; while the first request is still
+            running it is 409 ``idempotency_key_in_progress``. Without the
+            header the call behaves exactly as before.
     Returns:
         :class:`CreateTaskResponse` with the new ``task_id``,
         ``agent_id``, ``status='running'`` (the atomic claim inside
@@ -428,6 +443,23 @@ async def create_chat_task(
             ``{"error": {"code": "internal_error", ...}}`` and the raw
             exception message stays out of the response.
     """
+    return cast(
+        CreateTaskResponse,
+        await run_with_idempotency(
+            principal=principal,
+            operation="create_task",
+            header_value=idempotency_key,
+            request_payload=fingerprint_payload(request),
+            run=lambda claim: _create_chat_task(request, principal, claim),
+        ),
+    )
+
+
+async def _create_chat_task(
+    request: CreateTaskRequest,
+    principal: ApiKeyPrincipal,
+    idempotency_claim: IdempotencyClaim | None,
+) -> CreateTaskResponse:
     agent_identity = principal.agent
     _validate_prompt_context(request.prompt_context)
     credential_kind: task_start_service.SdkCredentialKind
@@ -458,6 +490,7 @@ async def create_chat_task(
             requested_priority=request.priority,
             prompt_context=request.prompt_context,
             credential_kind=credential_kind,
+            idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -1055,6 +1088,7 @@ async def append_message_to_task(
     task_id: int,
     request: AppendMessageRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+    idempotency_key: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> AppendMessageResponse:
     """Append the next user message to an existing task and kick off its next turn.
 
@@ -1096,6 +1130,10 @@ async def append_message_to_task(
         request: Validated :class:`AppendMessageRequest`. ``message.content``
             is guaranteed non-empty by Pydantic.
         principal: Key-bound owner from the auth dependency.
+        idempotency_key: Optional ``Idempotency-Key`` header, with the same
+            semantics as on ``POST /v1/chat/tasks`` and scoped to this task:
+            a retry with the same key and body replays the original 202
+            response instead of starting another turn.
     Returns:
         :class:`AppendMessageResponse` with the task identity and an
         ``accepted_at`` timestamp.
@@ -1116,6 +1154,26 @@ async def append_message_to_task(
             (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
+    return cast(
+        AppendMessageResponse,
+        await run_with_idempotency(
+            principal=principal,
+            operation=f"append_message:{task_id}",
+            header_value=idempotency_key,
+            request_payload=fingerprint_payload(request),
+            run=lambda claim: _append_message_to_task(
+                task_id, request, principal, claim
+            ),
+        ),
+    )
+
+
+async def _append_message_to_task(
+    task_id: int,
+    request: AppendMessageRequest,
+    principal: ApiKeyPrincipal,
+    idempotency_claim: IdempotencyClaim | None,
+) -> AppendMessageResponse:
     _validate_prompt_context(request.prompt_context)
     if request.prompt_context is not None and principal.workforce is not None:
         raise V1ApiError(
@@ -1136,6 +1194,7 @@ async def append_message_to_task(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
             prompt_context=request.prompt_context,
+            idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)

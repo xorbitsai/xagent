@@ -3320,6 +3320,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()
 
+    def get_excluded_model_ids(self) -> frozenset[str]:
+        """Get media model ids this task excludes (inherited by sub-agents)."""
+        return self._excluded_model_ids
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""
         return getattr(self, "_excluded_agent_id", None)

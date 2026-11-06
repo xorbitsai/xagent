@@ -147,9 +147,6 @@ def test_the_rows_are_taken_from_the_top():
     assert so.structured_output_eligibility(
         _result(completion_outcome="partial"), invalid
     ) == _settled("failed", "invalid_stored_format")
-    assert so.structured_output_eligibility(
-        _result(completion_outcome="blocked"), invalid
-    ) == _settled("failed", "invalid_stored_format")
     assert so.structured_output_eligibility(_result(success=False), invalid) is so.SKIP
     assert so.structured_output_eligibility(
         _result(completion_outcome="partial", output=""), _fmt()

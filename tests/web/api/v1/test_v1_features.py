@@ -134,9 +134,13 @@ async def test_a_workforce_task_keeps_its_format_across_a_workforce_key_turn(
     model = wiring.ScriptedModel([wiring._submit('{"a": "y", "b": 2}')])
     seen = await _run_turn(monkeypatch, task_id, model)
 
-    assert seen[wiring.KWARG].schema == stored["schema"]
+    fmt = seen[wiring.KWARG]
+    assert (fmt.name, fmt.description) == (stored["name"], stored["description"])
+    assert fmt.schema == stored["schema"]
     assert "[Output requirement]" in seen["task"]
     assert model.calls == 1
+    ready = client.get(f"/v1/chat/tasks/{task_id}", headers=bearer(workforce_key))
+    assert ready.json()["structured_output_status"] == "ready"
 
     _set_status(task_id, TaskStatus.COMPLETED)
     refused = _workforce_append(

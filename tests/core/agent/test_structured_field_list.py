@@ -358,10 +358,10 @@ def test_element_lines_count_as_fields_in_the_remainder() -> None:
     assert result.split("\n")[-1] == f"- …({400 - kept} more fields)"
 
 
-def test_a_list_that_fits_exactly_is_not_cut() -> None:
-    schema = obj({f"f{i}": STR for i in range(5)})
+def test_a_list_of_exactly_four_kilobytes_is_not_cut() -> None:
+    result = field_list(obj({f"f{i:03d}": STR for i in range(241)}))
 
-    assert "more fields" not in field_list(schema)
+    assert len(result.encode()) == 4096 and "more fields" not in result
 
 
 # --- the constraint suffix ---------------------------------------------------

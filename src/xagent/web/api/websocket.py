@@ -2465,15 +2465,8 @@ async def handle_execute_task(
 
     Like ``chat``, the execution is a durable command, so a planned restart's
     hold leaves it pending for the successor instead of refusing it, and no
-    execution starts inside this socket's handler.
+    execution starts inside this socket's handler. No DB Session is retained.
     """
-    await _handle_admitted_execute_task(websocket, task_id, message_data)
-
-
-async def _handle_admitted_execute_task(
-    websocket: WebSocket, task_id: int, message_data: dict
-) -> None:
-    """Accept the execution command without retaining a DB Session."""
     try:
         user = message_data.get("user")
         authorized_task_id: int | None = None
@@ -2522,25 +2515,47 @@ async def _handle_admitted_execute_task(
         await task_start_service.execute_existing_task(
             task_id=request.task_id,
             task_owner_user_id=request.task_owner_user_id,
-            task_source=request.task_source,
             task_description=request.task_description,
             context=request.task_context,
             actor_user_id=actor_user_id,
         )
 
     except TaskTurnError as e:
-        if e.reason != "busy":
-            raise
-        # The task is already running or already has an execution command
-        # waiting (a duplicate frame, or one racing a restart hold). Nothing
-        # new is staged, so the execution cannot run twice; the first command
-        # keeps the client's attention and the socket stays open.
-        logger.info(
-            "execute_task for task %s not staged (%s): execution already "
-            "accepted or running",
-            task_id,
-            e.reason,
-        )
+        if e.reason == "busy":
+            # The task is already running or already has an execution command
+            # waiting (a duplicate frame, or one racing a restart hold).
+            # Nothing new is staged, so the execution cannot run twice; the
+            # first command keeps the client's attention and the socket stays
+            # open.
+            logger.info(
+                "execute_task for task %s not staged (%s): execution already "
+                "accepted or running",
+                task_id,
+                e.reason,
+            )
+        else:
+            # Not staged for another reason (for example the task vanished or
+            # is not the actor's): the client was acknowledged, so tell it.
+            logger.warning(
+                "execute_task for task %s not staged (%s)",
+                task_id,
+                e.reason,
+                exc_info=True,
+            )
+            error_code = (
+                ClientErrorCode.TASK_UNAVAILABLE
+                if e.reason == "task_not_found"
+                else ClientErrorCode.TASK_EXECUTION_FAILED
+            )
+            await manager.send_personal_message(
+                {
+                    "type": "error",
+                    "error_code": error_code.value,
+                    "message": client_error_message(error_code),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                websocket,
+            )
     except (
         MCPBuiltinOAuthActorPolicyRequiredError,
         ValueError,

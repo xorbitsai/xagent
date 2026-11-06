@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from sqlalchemy import event
@@ -95,17 +95,12 @@ async def test_legacy_execute_uses_worker_snapshot_and_primitive_scheduler_bound
 
     scheduled_background = asyncio.create_task(completed_execution())
 
-    async def schedule_at_closed_session_boundary(**_kwargs: object) -> asyncio.Task:
+    def schedule_at_closed_session_boundary(**_kwargs: object) -> asyncio.Task:
         assert checked_out_connections == 0
         return scheduled_background
 
-    schedule = AsyncMock(side_effect=schedule_at_closed_session_boundary)
-    monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        schedule,
-        raising=False,
-    )
+    schedule = Mock(side_effect=schedule_at_closed_session_boundary)
+    monkeypatch.setattr(orchestrator_module, "_schedule_bg", schedule)
 
     engine = get_engine()
     event.listen(engine, "before_cursor_execute", record_database_thread)
@@ -117,24 +112,25 @@ async def test_legacy_execute_uses_worker_snapshot_and_primitive_scheduler_bound
             task_id,
             {"user": SimpleNamespace(id=user_id, is_admin=False)},
         )
+        # The handler only accepts the command; the dispatcher schedules it.
+        # Wait here, with the listeners still attached, so the dispatcher's own
+        # database I/O is checked too.
+        for _ in range(100):
+            if schedule.call_count:
+                break
+            await asyncio.sleep(0.05)
     finally:
         event.remove(engine, "before_cursor_execute", record_database_thread)
         event.remove(engine, "checkout", record_checkout)
         event.remove(engine, "checkin", record_checkin)  # codespell:ignore checkin
 
-    # The handler only accepts the command; the dispatcher schedules it.
-    for _ in range(100):
-        if schedule.await_count:
-            break
-        await asyncio.sleep(0.05)
     assert database_thread_ids
     assert all(thread_id != main_thread_id for thread_id in database_thread_ids)
-    schedule.assert_awaited_once()
-    schedule_call = schedule.await_args
+    schedule.assert_called_once()
+    schedule_call = schedule.call_args
     assert schedule_call.kwargs["task_id"] == task_id
     assert schedule_call.kwargs["task_owner_user_id"] == user_id
     assert schedule_call.kwargs["task_source"] == "internal"
-    assert schedule_call.kwargs["actor_user_id"] == user_id
     assert schedule_call.kwargs["context"] == {
         "execution_mode": "balanced",
         "process_description": "Follow the saved process",

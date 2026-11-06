@@ -9,8 +9,18 @@ lease recovery; a run deferred to lease recovery before its result was
 written is not reported. Delivery is detached: the entry point never waits
 for the hook, so a slow hook cannot delay the next turn of the same task.
 
-A synchronous hook is called on the event loop and must not block; a hook
-that does I/O should return an awaitable or move the work to a thread.
+Runs are reported from three entry points: the scheduler's runner
+(``task_orchestrator``), the resume entry (``execute_resume_background``) and
+the shared channel entry (``execute_channel_background``). When shared task
+execution is off -- ``get_shared_task_execution_enabled()`` is False, the
+default for a combined host with no worker count configured -- the Slack,
+Telegram and Feishu bots call ``execute_task`` directly and their runs are
+not reported.
+
+A synchronous hook is called on the event loop, outside the delivery
+timeout: nothing bounds it, so it must not block. A hook that does I/O
+should return an awaitable, which the timeout bounds, or move the work to a
+thread.
 """
 
 from __future__ import annotations
@@ -56,7 +66,14 @@ class TurnModelUsage:
 
 @dataclass(frozen=True)
 class TurnUsage:
-    """What one run consumed, over the baseline its tracker was seeded with."""
+    """What one run consumed, over the baseline its tracker was seeded with.
+
+    Observed usage for reporting, not a billing record: it is delivered
+    whenever tracking completes, including when the tracker's final usage
+    write was not persisted. Quota metering goes through the usage record
+    hook (``quota_hooks.set_usage_record_hook``), which runs only after that
+    write persisted.
+    """
 
     input_tokens: int
     output_tokens: int
@@ -124,8 +141,8 @@ class TurnFacts:
     """Facts one run accumulates before its settlement is reported.
 
     Created by the execution entry point when the run starts; the run's
-    usage, its committed outcome and its result metadata are recorded as
-    they become known. Every field but ``started_at`` stays at its default
+    usage, its settled outcome and the classification fields of its result
+    are recorded as they become known. Every field but ``started_at`` stays at its default
     when the run never got that far.
     """
 
@@ -217,7 +234,12 @@ _inflight: set[asyncio.Task[None]] = set()
 
 
 def set_turn_settled_hook(hook: TurnSettledHook | None) -> None:
-    """Register the callback that receives every settled run; None removes it."""
+    """Register the callback that receives each reported run; None removes it.
+
+    See the module docstring for which runs are reported. A synchronous
+    ``hook`` must return promptly: it runs on the event loop and the
+    delivery timeout does not bound it.
+    """
     global _turn_settled_hook
     _turn_settled_hook = hook
 
@@ -309,9 +331,10 @@ def report_turn_settled(
 def notify_turn_settled(settlement: TurnSettlement) -> None:
     """Hand ``settlement`` to the registered hook without waiting for it.
 
-    Must be called on the event loop. The hook runs as its own task, bounded
-    by ``HOOK_TIMEOUT_SECONDS``; its failures are logged and counted, never
-    raised to the caller.
+    Must be called on the event loop. The hook runs as its own task; an
+    awaitable it returns is bounded by ``HOOK_TIMEOUT_SECONDS``, a synchronous
+    hook is not; its failures are logged and counted, never raised to the
+    caller.
     """
     hook = _turn_settled_hook
     if hook is None:

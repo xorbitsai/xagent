@@ -413,6 +413,7 @@ const en = {
       generating: "GeneratingModel Reasoning response",
     },
     tokenUsage: {
+      details: "Usage details",
       input: "Input tokens",
       output: "Output tokens",
       cached: "Cached input tokens",

@@ -1032,7 +1032,7 @@ export function TaskConversationPanel({
             )}
           </div>
         )}
-        <div className="flex-1 overflow-y-auto">
+        <div className="min-h-0 flex-1 overflow-y-auto">
           <main className={cn("mx-auto px-4 relative z-0 transition-all", mode === "page" ? "container max-w-4xl py-8" : "max-w-3xl py-4")}>
             <div className={cn(mode === "page" ? "space-y-6 pb-4" : "space-y-4 pb-4")}>
               {shouldShowHistoryLoading ? (
@@ -1140,25 +1140,25 @@ export function TaskConversationPanel({
           </main>
         </div>
 
-        <div className={cn("flex-shrink-0 z-10 glass", mode === "page" ? "pb-6" : "border-t bg-card/30 p-4")}>
+        <div className={cn("flex-shrink-0 z-10 glass", mode === "page" ? "pb-2 sm:pb-6" : "border-t bg-card/30 p-4")}>
           <div className={cn("mx-auto px-4", mode === "page" ? "container max-w-4xl" : "max-w-3xl px-0")}>
             {showTaskActions && (
-              <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
-                <div className="flex flex-wrap items-center gap-2">
+              <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 sm:mb-4 sm:gap-3">
+                <div className="flex min-w-0 items-center gap-2">
                   {showTaskFiles && !filesDisabled && (
                     <TaskFileManager taskId={state.taskId} onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}>
-                      <Button type="button" variant="outline" className="h-auto rounded-xl bg-card/80 px-3 py-2 text-sm" title={t("files.header.title")}>
-                        <FolderOpen className="w-3.5 h-3.5 mr-1" />
-                        {t("files.header.title")}
+                      <Button type="button" variant="outline" className="h-9 w-9 shrink-0 rounded-xl bg-card/80 p-0 sm:h-auto sm:w-auto sm:px-3 sm:py-2 text-sm" title={t("files.header.title")} aria-label={t("files.header.title")}>
+                        <FolderOpen className="h-4 w-4 sm:mr-1 sm:h-3.5 sm:w-3.5" />
+                        <span className="hidden sm:inline">{t("files.header.title")}</span>
                       </Button>
                     </TaskFileManager>
                   )}
                 </div>
 
                 {showTokenUsage && (
-                  <div className="sm:ml-auto flex items-center gap-3">
+                  <div className="ml-auto flex min-w-0 items-center gap-2 sm:gap-3">
                     {state.contextUsage && (
-                      <div className="inline-flex items-center rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm">
+                      <div className="inline-flex shrink-0 items-center rounded-xl border bg-card/80 px-2 py-2 text-xs sm:px-3 sm:text-sm">
                         <ContextUsageRing
                           tokens={state.contextUsage.tokens}
                           threshold={state.contextUsage.threshold}
@@ -1235,7 +1235,7 @@ export function TaskConversationPanel({
               voiceConversationDisabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
               hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}
-              minHeightClass={compactInput ? "min-h-[44px]" : undefined}
+              minHeightClass={compactInput ? "min-h-[44px]" : mode === "page" ? "min-h-[104px] sm:min-h-[130px]" : undefined}
               autoFocus={autoFocusInput}
               uploadFile={uploadFile}
               deferFileUpload={deferFileUpload}

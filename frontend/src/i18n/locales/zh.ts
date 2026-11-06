@@ -413,6 +413,7 @@ const zh = {
       generating: "正在生成响应",
     },
     tokenUsage: {
+      details: "用量明细",
       input: "输入tokens",
       output: "输出tokens",
       cached: "缓存命中tokens",

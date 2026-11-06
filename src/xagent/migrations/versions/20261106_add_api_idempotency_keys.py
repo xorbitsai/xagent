@@ -27,7 +27,10 @@ def _has_table() -> bool:
 
 
 def upgrade() -> None:
-    if _has_table():
+    inspector = sa.inspect(op.get_bind())
+    # ``tasks`` is metadata-owned in Alembic-only installations; this table is
+    # then created from the models together with it.
+    if not inspector.has_table("tasks") or inspector.has_table(TABLE):
         return
     op.create_table(
         TABLE,

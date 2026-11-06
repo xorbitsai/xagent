@@ -214,7 +214,7 @@ def _judge_existing(
         .values(lease_expires_at=moment + IDEMPOTENCY_LEASE, claim_token=token)
     )
     db.commit()
-    if taken.rowcount != 1:
+    if getattr(taken, "rowcount", None) != 1:
         raise IdempotencyRejected("in_progress")
     return IdempotencyClaim(claim_id=int(row.id), token=token)
 
@@ -237,7 +237,7 @@ def bind_task_no_commit(db: Session, claim: IdempotencyClaim, task_id: int) -> N
         )
         .values(task_id=task_id, state=IDEMPOTENCY_STATE_BOUND)
     )
-    if bound.rowcount != 1:
+    if getattr(bound, "rowcount", None) != 1:
         raise IdempotencyRejected("in_progress")
 
 

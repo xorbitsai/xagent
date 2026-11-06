@@ -52,3 +52,14 @@ def test_upgrade_matches_the_model_and_is_idempotent(engine):
         migration.downgrade()
         migration.downgrade()
         assert not sa.inspect(connection).has_table(migration.TABLE)
+
+
+def test_upgrade_is_a_noop_before_tasks_exists(engine):
+    migration = importlib.import_module(MIGRATION)
+    with (
+        engine.begin() as connection,
+        Operations.context(MigrationContext.configure(connection)),
+    ):
+        assert not sa.inspect(connection).has_table("tasks")
+        migration.upgrade()
+        assert not sa.inspect(connection).has_table(migration.TABLE)

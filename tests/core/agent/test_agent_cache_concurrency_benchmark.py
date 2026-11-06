@@ -10,7 +10,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 
-from scripts import agent_cache_concurrency_benchmark as bench
+from scripts.benchmarks import agent_cache_concurrency_benchmark as bench
 from xagent.core.model.chat.cache_lifecycle import agent_cache_session
 from xagent.core.model.chat.routing_context import xinference_routing_key
 

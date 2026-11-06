@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from scripts import agent_cache_benchmark as audit
+from scripts.benchmarks import agent_cache_benchmark as audit
 from xagent.core.agent import PatternRuntime, ReActPattern
 from xagent.core.agent.runner import _session_routing_key
 from xagent.core.model.chat.routing_context import xinference_routing_key
@@ -433,9 +433,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         resume=args.cooldown_resume,
     )
     source = audit.source_manifest()
-    source["source_sha256"]["scripts/agent_cache_concurrency_benchmark.py"] = (
-        hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    )
+    source["source_sha256"][
+        "scripts/benchmarks/agent_cache_concurrency_benchmark.py"
+    ] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     audit.write_json(args.output / "source.json", source)
     start_utc = utc()
     start = time.perf_counter()

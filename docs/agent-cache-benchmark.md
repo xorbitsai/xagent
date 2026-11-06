@@ -26,7 +26,7 @@ downloads a tokenizer or model. An API key or access token can be read from a
 private file so its value does not appear in the command line or reports.
 
 ```bash
-PYTHONPATH=src:. uv run --frozen python -m scripts.agent_cache_benchmark \
+PYTHONPATH=src:. uv run --frozen python -m scripts.benchmarks.agent_cache_benchmark \
   --endpoint https://xinference.example.com \
   --model your-model-uid \
   --api-key-file /secure/xinference-key \
@@ -134,7 +134,7 @@ files remain separate. A fixed number of unrelated foreground requests arrive
 at a fixed cadence, independently of how quickly the agents finish.
 
 ```bash
-PYTHONPATH=src:. uv run --frozen python -m scripts.agent_cache_concurrency_benchmark \
+PYTHONPATH=src:. uv run --frozen python -m scripts.benchmarks.agent_cache_concurrency_benchmark \
   --endpoint https://xinference.example.com --model your-model-uid \
   --api-key-file /secure/xinference-key \
   --tokenizer-json /models/checkpoint/tokenizer.json \

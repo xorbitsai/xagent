@@ -42,7 +42,7 @@ CORPUS_PATH = (
 CORPUS = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
 
 # Changing the corpus means changing this digest in the same commit.
-CORPUS_SHA256 = "38a1c2e9c256b0408201f0974143de762219aa2ef6505b28650980026c10fbc7"
+CORPUS_SHA256 = "5f8ef162f956483be8d2d5e32a40c9ae0765b61bdee3ea5dff1748201cbdbe9d"
 
 SCHEMA: dict[str, Any] = {
     "type": "object",

@@ -82,6 +82,7 @@ from ...core.agent.runner import (
 from ...core.agent.structured_output import (
     STRUCTURED_OUTPUT_RESULT_KEY,
     StructuredOutputFormat,
+    output_requirement_block,
 )
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -191,6 +192,7 @@ from .file_reference_output_service import (
 from .file_turn import (
     append_prompt_context_block,
     build_prompt_context_block,
+    insert_before_prompt_context_block,
     normalize_filename,
     prompt_context_from_agent_config,
     resolve_turn_file_infos,
@@ -2859,9 +2861,16 @@ async def execute_task_background(
                 getattr(snapshot.task, "agent_config", None)
             )
             prompt_context_block = build_prompt_context_block(prompt_context)
-            task_for_agent = append_prompt_context_block(
-                llm_user_message or user_message, prompt_context
-            )
+            if output_format is None or output_format is StructuredOutputFormat.INVALID:
+                task_for_agent = append_prompt_context_block(
+                    llm_user_message or user_message, prompt_context
+                )
+            else:
+                task_for_agent = insert_before_prompt_context_block(
+                    llm_user_message or user_message,
+                    output_requirement_block(output_format),
+                    prompt_context,
+                )
             if prompt_context_block is not None:
                 # Field names and trust level only; values stay out of logs.
                 logger.info(

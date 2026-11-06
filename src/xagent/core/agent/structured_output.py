@@ -8,6 +8,8 @@ nullable copy written by :func:`model_facing_schema` is only shown to the
 model. :func:`_attach_structured_output` is the one place that turns an
 exception the extraction did not classify into an outcome. This module belongs
 to the core layer and imports nothing from the web layer.
+:func:`output_requirement_block` writes the block that tells the agent which
+fields its final answer must state.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from .structured_schema import (
     judge_empty_answer,
     judge_instance,
     model_facing_schema,
+    schema_field_list,
 )
 from .trace import SYSTEM_INFO, Tracer
 
@@ -721,3 +724,34 @@ async def _attach_structured_output(
             duration_ms=int((time.monotonic() - started) * 1000),
         )
     return result
+
+
+_OUTPUT_REQUIREMENT_HEAD = (
+    "[Output requirement]\n"
+    "After you finish, your final answer will be converted into a JSON object "
+    "with the fields listed below.\n"
+    "Write your final answer in plain language as usual, but state every "
+    "listed value explicitly.\n"
+    "Copy identifiers, numbers, dates, amounts and names exactly as they "
+    "appear in tool results; never round, abbreviate or paraphrase them.\n"
+    "If you could not obtain a value, say so explicitly instead of guessing.\n"
+    "If a field description names a different unit or format, also state the "
+    "value in that unit and format. For a field with listed allowed values, "
+    "use wording that clearly matches one of them.\n"
+    "Do not output the JSON yourself.\n"
+)
+
+
+def output_requirement_block(fmt: StructuredOutputFormat) -> str:
+    """The text that tells the agent which fields its final answer must state:
+    the fixed instructions, the schema name and one line per field.
+
+    The schema name is placed into the block as it is; descriptions and
+    allowed values come from ``schema_field_list``, which puts each on one
+    line and shortens long ones. None of the caller's text is run through
+    string formatting.
+    """
+    return (
+        f"{_OUTPUT_REQUIREMENT_HEAD}Schema name: {fmt.name}\n"
+        f"Fields:\n{schema_field_list(fmt.schema)}"
+    )

@@ -1073,12 +1073,23 @@ def _claimable_query(
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
-            # Keep START dormant until the entire shared host is enabled.
+            # Keep START dormant until the entire shared host is enabled,
+            # except the legacy ``execute_task`` START ("existing"), which
+            # combined mode consumes locally (``execute_existing_start_local``).
             (
                 true()
                 if get_shared_task_execution_enabled()
-                else TaskExecutionCommand.kind.notin_(
-                    (TaskCommandKind.START.value, TaskCommandKind.RESUME_INPUT.value)
+                else or_(
+                    TaskExecutionCommand.kind.notin_(
+                        (
+                            TaskCommandKind.START.value,
+                            TaskCommandKind.RESUME_INPUT.value,
+                        )
+                    ),
+                    and_(
+                        TaskExecutionCommand.kind == TaskCommandKind.START.value,
+                        TaskExecutionCommand.payload["kind"].as_string() == "existing",
+                    ),
                 )
             ),
             _claim_availability_predicate(now),

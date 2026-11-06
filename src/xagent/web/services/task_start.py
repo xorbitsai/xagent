@@ -1200,35 +1200,27 @@ async def execute_existing_task(
     context: dict[str, Any],
     actor_user_id: int,
 ) -> None:
-    """Submit shared execution, or await the legacy local execution handle."""
-    from .task_execution_host import enqueues_task_turns
+    """Durably accept the legacy ``execute_task``, then dispatch it promptly.
 
-    if enqueues_task_turns():
-        from .task_existing_command import enqueue_existing_execution
+    Both execution modes stage the same START (kind ``existing``). The command
+    dispatcher executes it, so a closed release hold leaves it pending for the
+    successor, and the WebSocket returns once the command is accepted instead
+    of waiting for the execution. ``task_source`` is read again by the
+    consumer from the task row.
+    """
+    from .task_command_execution import execute_durable_task_command
+    from .task_command_transport import dispatch_task_command_promptly
+    from .task_existing_command import stage_existing_execution
 
-        await run_db_io_cancellation_safe(
-            lambda: enqueue_existing_execution(
-                task_id=task_id,
-                task_owner_user_id=task_owner_user_id,
-                task_description=task_description,
-                context=context,
-                actor_user_id=actor_user_id,
-            )
+    _run_id, command_db_id = await run_db_io_cancellation_safe(
+        lambda: stage_existing_execution(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            task_description=task_description,
+            context=context,
+            actor_user_id=actor_user_id,
         )
-        # The WebSocket must keep receiving pause/resume commands while the
-        # worker executes. Completion arrives through the shared event bridge.
-        return
-    background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
-        task_id=task_id,
-        task_owner_user_id=task_owner_user_id,
-        task_source=task_source,
-        payload=TaskTurnPayload(
-            transcript_message=task_description,
-            execution_message=task_description,
-        ),
-        context=context,
-        actor_user_id=actor_user_id,
     )
-    # Legacy WebSocket execute_task must not return until execution finishes.
-    # Keep that ordering even though scheduling owns the background handle.
-    await background_task
+    await dispatch_task_command_promptly(
+        execute_durable_task_command, command_db_id=command_db_id
+    )

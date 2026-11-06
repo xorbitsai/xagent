@@ -345,10 +345,10 @@ def local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
 
 
 def open_delivery_file(record: UploadedFile, path: Path) -> BinaryIO:
-    """Open the file an external-media response will send, without following links.
+    """Open a registered image for issuing or delivery, without following links.
 
     Checking a path and opening it are separate steps, and a file replaced by a
-    link in between would send the link's target. Below the owner's upload root
+    link in between would read the link's target. Below the owner's upload root
     each component is opened relative to its parent's descriptor with
     ``O_NOFOLLOW``, so the bytes come from the file the check allowed, or the
     open fails. The root itself may be a link. Any other path is a host-private
@@ -382,10 +382,13 @@ def open_delivery_file(record: UploadedFile, path: Path) -> BinaryIO:
         )
     finally:
         os.close(current_fd)
-    if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise FileNotFoundError(str(path))
+        return os.fdopen(file_fd, "rb")
+    except BaseException:
         os.close(file_fd)
-        raise FileNotFoundError(str(path))
-    return os.fdopen(file_fd, "rb")
+        raise
 
 
 def _source_size(source: Path | BinaryIO) -> int:
@@ -394,9 +397,9 @@ def _source_size(source: Path | BinaryIO) -> int:
     return os.fstat(source.fileno()).st_size
 
 
-def _validate_instagram_header(path: Path) -> None:
+def _validate_instagram_header(source: BinaryIO) -> None:
     try:
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+        with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
     except ExternalMediaUnavailable:
         raise
@@ -429,7 +432,16 @@ def _materialize_record(record: UploadedFile) -> Path:
 
 
 def _validate_instagram_record(record: UploadedFile) -> None:
-    _validate_instagram_header(_materialize_record(record))
+    path = _materialize_record(record)
+    try:
+        # The same safe open as delivery: a FIFO or link swapped in after
+        # materialization fails here instead of blocking or being followed.
+        with open_delivery_file(record, path) as source:
+            _validate_instagram_header(source)
+    except OSError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be read for external delivery"
+        ) from exc
 
 
 def _validate_facebook_record(record: UploadedFile) -> None:
@@ -444,11 +456,9 @@ def _validate_facebook_record(record: UploadedFile) -> None:
     _image_media_type(record)
     path = _materialize_record(record)
     try:
-        if path.stat().st_size > FACEBOOK_MAX_IMAGE_BYTES:
-            raise ExternalMediaUnsupportedImage(
-                "Registered image exceeds the 10 MB limit"
-            )
-        content = path.read_bytes()
+        # Pin the opened file and bound the read even if a sandbox writer grows it.
+        with open_delivery_file(record, path) as source:
+            content = source.read(FACEBOOK_MAX_IMAGE_BYTES + 1)
     except OSError as exc:
         raise ExternalMediaUnavailable(
             "Registered image could not be read for external delivery"

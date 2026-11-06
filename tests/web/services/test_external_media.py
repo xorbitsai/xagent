@@ -1,4 +1,6 @@
-from unittest.mock import Mock
+import os
+from pathlib import Path
+from unittest.mock import MagicMock, Mock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -667,14 +669,195 @@ def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tm
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
     _, _, issue = _facebook_issue(monkeypatch, tmp_path)
 
-    def unreadable(self):
-        raise OSError("Input/output error")
-
-    monkeypatch.setattr(external_media.Path, "read_bytes", unreadable)
+    reader = MagicMock()
+    reader.__enter__.return_value.read.side_effect = OSError("Input/output error")
+    monkeypatch.setattr(external_media, "open_delivery_file", Mock(return_value=reader))
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="read") as raised:
         issue()
     assert not isinstance(raised.value, external_media.ExternalMediaUnsupportedImage)
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("swapped", ["file", "directory", "fifo"])
+def test_issue_facebook_refuses_a_path_swapped_after_materialization(
+    monkeypatch, tmp_path, swapped
+):
+    # The sandbox can replace an output after materialization. Signing must
+    # neither follow the new link nor block on a FIFO, before any ticket exists.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    source = Path(db.record.storage_path)
+    other = tmp_path / "other" / source.name
+    other.parent.mkdir()
+    Image.new("RGB", (64, 64), "red").save(other)
+    materialize = external_media._materialize_record
+    tickets = _count_encode_calls(monkeypatch)
+
+    def materialize_then_swap(record):
+        path = materialize(record)
+        assert path == source
+        if swapped == "directory":
+            source.parent.rename(tmp_path / "original-output")
+            source.parent.symlink_to(other.parent)
+        else:
+            source.unlink()
+            if swapped == "fifo":
+                os.mkfifo(source)
+            else:
+                source.symlink_to(other)
+        return path
+
+    monkeypatch.setattr(external_media, "_materialize_record", materialize_then_swap)
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="read") as raised:
+        issue()
+
+    assert type(raised.value) is external_media.ExternalMediaUnavailable
+    assert tickets == []
+
+
+def test_open_delivery_file_closes_the_descriptor_when_wrapping_fails(
+    monkeypatch, tmp_path
+):
+    # Each issuance or GET opens a descriptor; a failure after the open must
+    # not leak it.
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / "launch.png"
+    _png(source)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    record = _record(str(uuid4()), storage_path=str(source))
+    opened = []
+    real_open = os.open
+
+    def tracking_open(name, flags, *args, **kwargs):
+        fd = real_open(name, flags, *args, **kwargs)
+        if name == source.name:
+            opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(external_media.os, "open", tracking_open)
+    monkeypatch.setattr(
+        external_media.os, "fdopen", Mock(side_effect=OSError("fdopen failed"))
+    )
+
+    with pytest.raises(OSError, match="fdopen failed"):
+        external_media.open_delivery_file(record, source)
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("swapped", ["file", "directory", "fifo"])
+def test_issue_instagram_refuses_a_path_swapped_after_materialization(
+    monkeypatch, tmp_path, swapped
+):
+    # Instagram issuance reads the header the same way, and must not block on a
+    # FIFO or follow a link swapped in after materialization either.
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / "launch.png"
+    source.parent.mkdir(parents=True)
+    Image.new("RGB", (640, 640), "blue").save(source)
+    other = tmp_path / "other" / source.name
+    other.parent.mkdir()
+    Image.new("RGB", (640, 640), "red").save(other)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    materialize = external_media._materialize_record
+    tickets = _count_encode_calls(monkeypatch)
+
+    def materialize_then_swap(record):
+        path = materialize(record)
+        assert path == source
+        if swapped == "directory":
+            source.parent.rename(tmp_path / "original-output")
+            source.parent.symlink_to(other.parent)
+        else:
+            source.unlink()
+            if swapped == "fifo":
+                os.mkfifo(source)
+            else:
+                source.symlink_to(other)
+        return path
+
+    monkeypatch.setattr(external_media, "_materialize_record", materialize_then_swap)
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="read"):
+        external_media.issue_external_media_url(
+            _DB(
+                _record(
+                    file_id,
+                    storage_path=str(source),
+                    storage_status="legacy",
+                    storage_key=None,
+                )
+            ),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        )
+    assert tickets == []
+
+
+def test_issue_facebook_bounds_read_when_file_grows(monkeypatch, tmp_path):
+    # Grow a real, initially valid image immediately before reading. Count the
+    # bytes actually returned: checking len() after an unbounded read is too late.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    source = Path(db.record.storage_path)
+    source_inode = source.stat().st_ino
+    limit = source.stat().st_size
+    monkeypatch.setattr(external_media, "FACEBOOK_MAX_IMAGE_BYTES", limit)
+    tickets = _count_encode_calls(monkeypatch)
+    reads = []
+    opened = []
+    path_open = Path.open
+    fdopen = os.fdopen
+
+    def track_read(stream):
+        opened.append(stream)
+        reader = MagicMock(wraps=stream)
+        reader.__enter__.return_value = reader
+        reader.__exit__.side_effect = stream.__exit__
+
+        def read(*args, **kwargs):
+            with path_open(source, "ab") as writer:
+                writer.write(b"x" * (limit * 2))
+            content = stream.read(*args, **kwargs)
+            reads.append(len(content))
+            return content
+
+        reader.read.side_effect = read
+        return reader
+
+    def open_path(path, *args, **kwargs):
+        stream = path_open(path, *args, **kwargs)
+        mode = kwargs.get("mode", args[0] if args else "r")
+        if path == source and mode == "rb":
+            return track_read(stream)
+        return stream
+
+    def open_fd(fd, *args, **kwargs):
+        stream = fdopen(fd, *args, **kwargs)
+        if os.fstat(stream.fileno()).st_ino == source_inode:
+            return track_read(stream)
+        return stream
+
+    # Observe both the old pathname reader and the descriptor reader, so this
+    # regression fails on the old implementation without allocating a large file.
+    monkeypatch.setattr(Path, "open", open_path)
+    monkeypatch.setattr(os, "fdopen", open_fd)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="10 MB"):
+        issue()
+
+    assert reads == [limit + 1]
+    assert opened and all(stream.closed for stream in opened)
+    assert tickets == []
 
 
 def _png(path, color="blue"):

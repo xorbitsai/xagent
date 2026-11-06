@@ -1,5 +1,8 @@
 """Shared session-generation checks for HTTP, OAuth and file credentials."""
 
+import hashlib
+import hmac
+import re
 import secrets
 from datetime import datetime
 from typing import Any, cast
@@ -13,6 +16,48 @@ from .models.user import User
 def new_session_epoch() -> str:
     """Generate exactly 32 URL-safe characters for User.session_epoch."""
     return secrets.token_urlsafe(24)
+
+
+_REFRESH_TOKEN_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def hash_refresh_token(token: str) -> str:
+    """SHA-256 hex digest stored in User.refresh_token in place of the JWT.
+
+    The token is a signed, high-entropy JWT, so a plain unsalted digest is enough
+    to keep a copy of the database from yielding usable credentials.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def refresh_token_lookup_values(token: str) -> list[str]:
+    """Stored values that identify ``token``, for use in a SQL ``IN`` filter.
+
+    The digest, plus the raw token for a row written before the hashing
+    migration ran (a deploy that overlaps the old release can still write one).
+    The caller must have verified the JWT signature first: a bare digest taken
+    from a leaked row is not a valid JWT and must not reach this filter.
+
+    TODO: remove the plaintext fallback here and in ``refresh_token_matches``
+    once no release that stores the raw token is running. Until then a row an
+    old instance wrote after the migration scan stays redeemable at rest until
+    its owner next signs in or refreshes, or the token expires; re-run the
+    conversion (migration ``20261106_hash_user_refresh_tokens``) in the release
+    that removes the fallback.
+    """
+    return [hash_refresh_token(token), token]
+
+
+def refresh_token_matches(stored: str | None, presented: str) -> bool:
+    """Compare a presented refresh token with the value stored for the user."""
+    # Logout passes the client's token unverified. A JWT and a digest are ASCII,
+    # so anything else cannot match, and compare_digest rejects non-ASCII str.
+    if not stored or not presented.isascii():
+        return False
+    if _REFRESH_TOKEN_HASH_RE.fullmatch(stored):
+        return hmac.compare_digest(stored, hash_refresh_token(presented))
+    # Legacy plaintext row; see refresh_token_lookup_values.
+    return hmac.compare_digest(stored, presented)
 
 
 def user_session_claims(user: User) -> dict[str, Any]:
@@ -74,13 +119,15 @@ def commit_refresh_credentials(
 ) -> None:
     """Publish credentials only if their authenticated snapshot is still current.
 
+    ``refresh_token`` is the issued JWT; only its digest is stored.
+
     Discard pending ORM writes and the read transaction before the conditional
     write (also avoiding SQLite read-to-write snapshot upgrades). A password
     change/reset must never be followed by a stale login restoring refresh.
     """
     db.rollback()
     values: dict[Any, Any] = {
-        User.refresh_token: refresh_token,
+        User.refresh_token: hash_refresh_token(refresh_token),
         User.refresh_token_expires_at: expires_at,
     }
     if upgraded_password_hash is not None:

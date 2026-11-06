@@ -60,7 +60,7 @@ class ExaWebSearchResult(BaseModel):
 class ExaWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the Exa AI-powered web search tool."""
 
-    category = ToolCategory.WEB_SEARCH
+    category = ToolCategory.WEB_TOOLS
     read_only = True  # read-only HTTP search ⇒ concurrency-safe
 
     def __init__(self, api_key: str | None = None) -> None:

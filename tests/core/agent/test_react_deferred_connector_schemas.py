@@ -468,11 +468,14 @@ async def test_a_follow_up_message_preloads_the_connector_it_names() -> None:
     await _pattern().run(context=context, tools=tools, llm=second)
     assert "hubspot_search_contacts" in _names(second.calls[0])
 
-    # Resuming without a new user message does not scan again.
-    third = ScriptedLLM([{"content": "ok"}])
+    # Resuming without a new user message does not scan again: with the loaded
+    # list emptied, a rescan would put HubSpot back and this call would show it.
     resumed = ExecutionContext.from_dict(context.to_dict())
+    _component(resumed).names.clear()
+    _component(resumed).sent_names.clear()
+    third = ScriptedLLM([{"content": "ok"}])
     await _pattern().run(context=resumed, tools=tools, llm=third)
-    assert _names(third.calls[0]).count("hubspot_search_contacts") == 1
+    assert "hubspot_search_contacts" not in _names(third.calls[0])
 
 
 @pytest.mark.asyncio
@@ -970,3 +973,83 @@ def test_a_tool_sent_before_an_interruption_stays_callable_after_resume() -> Non
     resumed_pattern._tools_with_deferral(tools, resumed)
 
     assert not resumed_pattern._deferred_tool_unloaded("notion_search", resumed)
+
+
+@pytest.mark.asyncio
+async def test_two_parallel_unloaded_calls_are_both_loaded_when_the_provider_reports_one() -> (
+    None
+):
+    """DeepSeek's validator reports only the first violation of a response."""
+    tools = _tools()
+    both = _batch(
+        ("notion_search", {"query": "plan"}),
+        ("hubspot_search_contacts", {"query": "acme"}),
+    )
+    llm = ValidatingLLM([both, both, both, {"content": "done"}])
+    result = await _pattern().run(context=_ctx(), tools=tools, llm=llm)
+
+    assert result["success"] is True
+    by_name = {t.name: t for t in tools}
+    assert by_name["notion_search"].calls == [{"query": "plan"}]
+    assert by_name["hubspot_search_contacts"].calls == [{"query": "acme"}]
+
+
+@pytest.mark.asyncio
+async def test_two_parallel_unloaded_calls_in_response_refusals_are_both_loaded() -> (
+    None
+):
+    tools = _tools()
+    both = _batch(
+        ("notion_search", {"query": "plan"}),
+        ("hubspot_search_contacts", {"query": "acme"}),
+    )
+    llm = ScriptedLLM(
+        [
+            _protocol_error_response("notion_search"),
+            _protocol_error_response("hubspot_search_contacts"),
+            both,
+            {"content": "done"},
+        ]
+    )
+    result = await _pattern().run(context=_ctx(), tools=tools, llm=llm)
+
+    assert result["success"] is True
+    by_name = {t.name: t for t in tools}
+    assert by_name["notion_search"].calls and by_name["hubspot_search_contacts"].calls
+
+
+@pytest.mark.asyncio
+async def test_the_retry_does_not_ask_for_load_tools_on_an_unrelated_refusal() -> None:
+    """A refused name that is not a deferred connector tool gets no load hint."""
+    from xagent.core.model.chat.exceptions import LLMToolProtocolError
+
+    class Refusing(ScriptedLLM):
+        async def chat(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise LLMToolProtocolError(
+                    provider="validating",
+                    code="unavailable_tool_call",
+                    message="unavailable",
+                    details={"tool_name": "made_up_tool"},
+                )
+            return self.responses.pop(0)
+
+    llm = Refusing([{"content": "done"}])
+    await _pattern().run(context=_ctx(), tools=_tools(), llm=llm)
+
+    retry_text = "\n".join(str(m.get("content")) for m in llm.calls[1]["messages"])
+    assert "Call only a tool present in that set" in retry_text
+    assert "must be loaded with" not in retry_text
+
+
+@pytest.mark.asyncio
+async def test_a_misspelling_of_an_already_sent_tool_gets_no_load_hint() -> None:
+    tools = _tools()
+    llm = ScriptedLLM([_call("notion_serch", {"query": "x"}), {"content": "ok"}])
+    context = _ctx("search Notion")  # Notion is preloaded, so its schema is sent
+    await _pattern().run(context=context, tools=tools, llm=llm)
+
+    error = context.get_messages_by_role("tool")[0].metadata["raw_result"]["error"]
+    assert "notion_search" in error
+    assert LOAD_TOOLS_NAME not in error

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -335,13 +336,52 @@ def test_workspace_maps_external_media_errors(
     monkeypatch.setattr(manager, "create_db_session", lambda: db)
     monkeypatch.setattr(external_media, "issue_external_media_url", issue)
 
-    with pytest.raises(expected_error, match=message):
+    with pytest.raises(expected_error, match=message) as raised:
         workspace.issue_external_media_url_detached(
             "31218a9f-1497-4216-9f75-1fc8d51368c4",
             "instagram-publish",
         )
 
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+
+    # Only a missing base URL or an unsupported image may trigger a fallback.
+    assert not isinstance(raised.value, ExternalMediaNotIssuableError)
     assert db.closed is True
+
+
+@pytest.mark.parametrize(
+    "service_error", ["not_configured", "unsupported_image", "out_of_scope"]
+)
+def test_workspace_marks_external_media_that_cannot_be_issued(
+    monkeypatch, tmp_path: Path, service_error: str
+) -> None:
+    # Why: the adapter falls back to a connector upload only on this error, so
+    # a missing base URL and an unsupported image must both map to it, and
+    # nothing else may (see test_workspace_maps_external_media_errors).
+    from xagent.core.storage import manager
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+    from xagent.web.services import external_media
+
+    workspace = TaskWorkspace("web_task_11", str(tmp_path), db_task_id=11)
+    workspace.owner_user_id = 7
+    error = {
+        "not_configured": external_media.ExternalMediaNotConfigured,
+        "unsupported_image": external_media.ExternalMediaUnsupportedImage,
+        "out_of_scope": external_media.ExternalMediaOutOfScope,
+    }[service_error]
+
+    def issue(*args, **kwargs):
+        raise error("cannot be issued")
+
+    monkeypatch.setattr(
+        manager, "create_db_session", lambda: SimpleNamespace(close=lambda: None)
+    )
+    monkeypatch.setattr(external_media, "issue_external_media_url", issue)
+
+    with pytest.raises(ExternalMediaNotIssuableError, match="cannot be issued"):
+        workspace.issue_external_media_url_detached(
+            "31218a9f-1497-4216-9f75-1fc8d51368c4", "facebook-publish"
+        )
 
 
 def test_workspace_external_media_requires_database_scope(tmp_path: Path) -> None:

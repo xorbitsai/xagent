@@ -85,11 +85,8 @@ def current_time(timezone_name: Optional[str] = None) -> CurrentTimeResult:
 class CurrentTimeTool(AbstractBaseTool):
     """Answers 'what time is it now', which the system prompt cannot."""
 
-    # OTHER (not BASIC) keeps it out of the builder's category picker: it is
-    # intrinsic (selection_gate="intrinsic"), always on for any non-NONE agent,
-    # so presenting a togglable "basic" category that cannot actually disable it
-    # would mislead. OTHER is in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES.
-    category = ToolCategory.OTHER
+    # Display with Basic Tools; intrinsic selection keeps existing availability.
+    category = ToolCategory.BASIC
     read_only = True  # reads a clock ⇒ concurrency-safe
 
     def __init__(self) -> None:
@@ -274,7 +271,7 @@ class ValidateLocalTimeTool(AbstractBaseTool):
     must not infer: daylight-saving gaps, overlaps, offsets and abbreviations
     are all read from the zone database."""
 
-    category = ToolCategory.OTHER
+    category = ToolCategory.BASIC
     read_only = True  # pure tzdata lookup ⇒ concurrency-safe
 
     def __init__(self) -> None:

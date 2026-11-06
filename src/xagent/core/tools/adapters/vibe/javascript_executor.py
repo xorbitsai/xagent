@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 class JavaScriptExecutorFunctionTool(FunctionTool):
-    """JavaScript executor tool with BASIC category."""
+    """JavaScript executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
 
 class JavaScriptExecutorArgs(BaseModel):
@@ -135,9 +135,9 @@ class JavaScriptExecutorTool(AbstractBaseTool):
 
 @sandbox_config()
 class JavaScriptExecutorToolForBasic(JavaScriptExecutorTool):
-    """JavaScript executor tool with BASIC category."""
+    """JavaScript executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
     @property
     def name(self) -> str:

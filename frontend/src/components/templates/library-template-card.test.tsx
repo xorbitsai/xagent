@@ -306,7 +306,7 @@ describe("LibraryTemplateCard", () => {
         "Creates matching visuals at correct dimensions",
         "Applies brand tone, voice, and visual guidelines",
       ],
-      tool_categories: ["basic", "web_search", "browser", "file", "image", "knowledge", "mcp:LinkedIn"],
+      tool_categories: ["basic_tools", "code_execution", "web_tools", "browser", "file", "image", "knowledge", "mcp:LinkedIn"],
       skills: ["static-visual-design"],
       persona: {
         name: "Maya",
@@ -338,25 +338,26 @@ describe("LibraryTemplateCard", () => {
       expect(
         screen.getByText("Transforms topics or briefs into platform-native copy")
       ).toBeInTheDocument();
-      // basic/browser/knowledge/mcp: are excluded from the tag row; skills
+      // basic_tools/browser/knowledge/mcp: are excluded from the tag row; skills
       // are appended verbatim - see tool-category-labels.test.ts for the
       // filtering behavior itself.
-      expect(screen.getByText("[web_search]")).toBeInTheDocument();
+      expect(screen.getByText("[code_execution]")).toBeInTheDocument();
+      expect(screen.getByText("[web_tools]")).toBeInTheDocument();
       expect(screen.getByText("[file]")).toBeInTheDocument();
       expect(screen.getByText("[image]")).toBeInTheDocument();
       expect(screen.getByText("static-visual-design")).toBeInTheDocument();
-      expect(screen.queryByText("[basic]")).not.toBeInTheDocument();
+      expect(screen.queryByText("[basic_tools]")).not.toBeInTheDocument();
       expect(screen.queryByText("[browser]")).not.toBeInTheDocument();
     });
 
     it("keys duplicate capability tags uniquely when a formatted category collides with a skill string", () => {
       // formatToolLabel here deliberately produces "static-visual-design"
-      // for the "web_search" category, colliding with the literal skill of
+      // for the "web_tools" category, colliding with the literal skill of
       // the same name - capabilityTags then has that string twice.
       const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const collidingTemplate = makeTemplate({
         ...MAYA_TEMPLATE,
-        tool_categories: ["web_search"],
+        tool_categories: ["web_tools"],
         skills: ["static-visual-design"],
       });
 

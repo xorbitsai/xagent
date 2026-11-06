@@ -36,6 +36,7 @@ import {
   Search,
 } from "lucide-react"
 import { getApiUrl, cn } from "@/lib/utils"
+import { formatToolCategory } from "@/lib/tool-category-labels"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
@@ -115,6 +116,7 @@ interface ConfigurableToolField {
 }
 
 interface ConfigurableTool {
+  category?: string
   tool_name: string
   display_name?: string
   configured: boolean
@@ -797,30 +799,7 @@ function ToolsPageContent() {
   }
 
 
-  const getCategoryLabel = (category: string) => {
-    if (!category) return ""
-
-    // Special cases for correct capitalization
-    const categoryDisplayMap: Record<string, string> = {
-      ppt: "PPT",
-      pptx: "PPTX",
-      ai: "AI",
-      api: "API",
-      llm: "LLM",
-      ai2: "AI2",
-    }
-
-    // Check special cases first
-    if (categoryDisplayMap[category]) {
-      const key = `tools.categories.${category}`
-      return tDynamic(key, categoryDisplayMap[category])
-    }
-
-    // Try translation
-    const key = `tools.categories.${category}`
-    const fallback = category.charAt(0).toUpperCase() + category.slice(1).replace(/_/g, ' ')
-    return tDynamic(key, fallback)
-  }
+  const getCategoryLabel = (category: string) => formatToolCategory(category, tDynamic)
 
   const getToolIcon = (name: string, type: string, category?: string) => {
     const lowerName = name.toLowerCase()
@@ -842,25 +821,20 @@ function ToolsPageContent() {
     if (lowerCategory === 'knowledge') return <Book className="h-6 w-6 text-indigo-500" />
     if (lowerCategory === 'audio') return <Mic className="h-6 w-6 text-green-500" />
     if (lowerCategory === 'video') return <Video className="h-6 w-6 text-rose-500" />
-    if (type === 'builtin' || lowerCategory === 'basic') return <Wrench className="h-6 w-6 text-slate-500" />
+    if (type === 'builtin' || (lowerCategory === 'basic_tools' || lowerCategory === 'basic')) return <Wrench className="h-6 w-6 text-slate-500" />
 
     return <Code className="h-6 w-6 text-slate-500" />
   }
 
-  const getBadgeLabel = (tool: Tool) => {
-    // Use display_category if available, otherwise fallback to category
-    if (tool.display_category) return tool.display_category  // Already formatted correctly (PPT not Ppt)
-    if (tool.category) return getCategoryLabel(tool.category)  // Fallback to translation
-    return t('tools.badges.types.tool')
-  }
+  const getBadgeLabel = (tool: Tool) => tool.category
+    ? formatToolCategory(tool.category, tDynamic, tool.display_category)
+    : t('tools.badges.types.tool')
 
-  // Get unique categories
-  const categories = Array.from(new Set(
-    tools
-      .map(t => t.category)
-      .filter(Boolean)
-      .filter(c => c !== 'mcp')
-  )).sort()
+  const getConfigCategory = (tool: ConfigurableTool) => tool.category || 'other'
+  const categories = Array.from(new Set([
+    ...tools.map(tool => tool.category),
+    ...(isAdmin ? configurableTools.map(getConfigCategory) : []),
+  ].filter(category => category && category !== 'mcp'))).sort()
 
   const filteredTools = tools.filter(t => {
     const matchesSearch = t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -906,7 +880,7 @@ function ToolsPageContent() {
       .filter((toolName): toolName is string => Boolean(toolName))
   )
 
-  const filteredSearchProviderTools = configurableTools.filter((tool) => {
+  const filteredConfigurationTools = configurableTools.filter((tool) => {
     const searchLower = searchQuery.toLowerCase()
     const matchesSearch =
       !searchLower ||
@@ -914,7 +888,7 @@ function ToolsPageContent() {
       (tool.display_name || tool.tool_name).toLowerCase().includes(searchLower) ||
       Object.values(tool.fields).some((field) => field.label.toLowerCase().includes(searchLower))
 
-    return !runtimeConfigToolNames.has(tool.tool_name) && matchesSearch
+    return !runtimeConfigToolNames.has(tool.tool_name) && matchesSearch && (activeTab === 'all' || getConfigCategory(tool) === activeTab)
   })
 
   const getConfigurableToolDescription = (tool: ConfigurableTool) => {
@@ -1092,7 +1066,7 @@ function ToolsPageContent() {
     { id: 'mcp', label: t('tools.tabs.connectors') },
   ]
 
-  const totalCount = filteredTools.length + (activeTab === 'all' || activeTab === 'mcp' ? filteredMcpServers.length : 0) + (isAdmin && (activeTab === 'all' || activeTab === 'basic') ? filteredSearchProviderTools.length : 0)
+  const totalCount = filteredTools.length + (activeTab === 'all' || activeTab === 'mcp' ? filteredMcpServers.length : 0) + (isAdmin ? filteredConfigurationTools.length : 0)
 
   return (
     <div className="flex h-full flex-col overflow-y-auto p-[48px_52px_72px]">
@@ -1241,7 +1215,7 @@ function ToolsPageContent() {
 
       {/* Tools grid */}
       <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 xl:grid-cols-4">
-        {isAdmin && (activeTab === 'all' || activeTab === 'basic') && filteredSearchProviderTools.map((tool) => (
+        {isAdmin && filteredConfigurationTools.map((tool) => (
           <ConfigurableToolCard key={`config-${tool.tool_name}`} tool={tool} />
         ))}
 
@@ -1254,7 +1228,7 @@ function ToolsPageContent() {
         ))}
 
         {(activeTab !== 'mcp' && filteredTools.length === 0 &&
-          filteredSearchProviderTools.length === 0 &&
+          filteredConfigurationTools.length === 0 &&
           ((activeTab !== 'all' && activeTab !== 'mcp') || (activeTab === 'all' && filteredMcpServers.length === 0)) &&
           (activeTab !== 'mcp' || filteredMcpServers.length === 0)) && (
             <div className="col-span-full flex justify-center">

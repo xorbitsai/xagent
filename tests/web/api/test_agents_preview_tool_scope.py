@@ -24,7 +24,7 @@ def _make_user() -> User:
     return user
 
 
-async def _run_preview(tool_categories):
+async def _run_preview(tool_categories, *, execute_error=None):
     """Run preview_agent with a stubbed LLM/AgentService and return the
     WebToolConfig it was constructed with."""
     current_user = _make_user()
@@ -55,7 +55,8 @@ async def _run_preview(tool_categories):
 
         mock_agent_service = mock_agent_service_class.return_value
         mock_agent_service.execute_task = AsyncMock(
-            return_value={"output": "preview response", "status": "completed"}
+            return_value={"output": "preview response", "status": "completed"},
+            side_effect=execute_error,
         )
 
         await preview_agent(request=request, current_user=current_user, db=db)
@@ -67,11 +68,11 @@ async def _run_preview(tool_categories):
 async def test_preview_scoped_categories_exclude_custom_api_and_mcp():
     """A preview for an agent that selected only ``basic`` must not load
     the user's Custom API registry nor initialize MCP servers."""
-    tool_config = await _run_preview(["basic"])
+    tool_config = await _run_preview(["basic_tools"])
 
     spec = tool_config.get_tool_selection_spec()
     assert spec.is_by_categories()
-    assert spec.includes_category("basic") is True
+    assert spec.includes_category("basic_tools") is True
     assert spec.includes_custom_api() is False
     assert spec.includes_mcp() is False
     assert tool_config._include_mcp_tools is False
@@ -113,3 +114,41 @@ async def test_preview_omitted_categories_keep_builtins_but_not_custom_apis():
     assert spec.includes_custom_api() is False
     # Legacy ALL mode does not pay MCP server init on the preview path.
     assert tool_config._include_mcp_tools is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["basic", "code_execution"])
+@pytest.mark.parametrize("execute_error", [None, RuntimeError("execution failed")])
+async def test_preview_binds_task_sandbox_and_cleans_it_on_all_outcomes(
+    monkeypatch, tmp_path, execute_error, category
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("SANDBOX_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path))
+    manager = MagicMock()
+    provider = object()
+    manager.get_or_create_lease_provider = AsyncMock(return_value=provider)
+    manager.delete_sandbox = AsyncMock()
+    with patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=manager):
+        if execute_error:
+            with pytest.raises(HTTPException, match="execution failed"):
+                await _run_preview([category], execute_error=execute_error)
+        else:
+            config = await _run_preview([category])
+            assert config.get_sandbox() is provider
+    call = manager.get_or_create_lease_provider.await_args
+    assert call.args[0] == "task"
+    task_id = call.args[1]
+    assert call.kwargs["mount_intent"].mount_root == str(tmp_path / "preview" / task_id)
+    manager.delete_sandbox.assert_awaited_once_with("task", task_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("categories", [[], ["basic_tools"], ["web_tools"]])
+async def test_non_code_preview_does_not_allocate_sandbox(monkeypatch, categories):
+    monkeypatch.setenv("SANDBOX_ENABLED", "true")
+    with patch("xagent.web.sandbox_manager.get_sandbox_manager") as get_manager:
+        config = await _run_preview(categories)
+    assert config.get_sandbox() is None
+    get_manager.assert_not_called()

@@ -346,13 +346,25 @@ async def test_uvx_runs_offline_when_the_sandbox_is_off(tmp_path):
     assert "UV_OFFLINE=1" in result.stderr_tail
 
 
-def test_sandbox_switch_reads_sandbox_enabled(monkeypatch):
+@pytest.mark.parametrize(
+    "value,enabled",
+    [
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("0", False),
+    ],
+)
+def test_sandbox_switch_reads_sandbox_enabled(monkeypatch, value, enabled):
+    from xagent.config import get_sandbox_enabled
+
     monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
     assert connector_readiness.sandbox_enabled_from_env() is False
-    monkeypatch.setenv("SANDBOX_ENABLED", "TRUE")
-    assert connector_readiness.sandbox_enabled_from_env() is True
-    monkeypatch.setenv("SANDBOX_ENABLED", "1")
-    assert connector_readiness.sandbox_enabled_from_env() is False
+    monkeypatch.setenv("SANDBOX_ENABLED", value)
+    assert connector_readiness.sandbox_enabled_from_env() is enabled
+    assert get_sandbox_enabled() is enabled
 
 
 # --- remote shape -----------------------------------------------------------

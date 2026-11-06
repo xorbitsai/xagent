@@ -1,6 +1,6 @@
 
 import React, { useEffect, useState } from 'react';
-import { getApiUrl } from '@/lib/utils';
+import { cn, getApiUrl } from '@/lib/utils';
 import { apiRequest } from '@/lib/api-wrapper';
 import { ChevronDown, Sparkles } from 'lucide-react';
 import { useI18n, type Locale } from '@/contexts/i18n-context';
@@ -233,8 +233,12 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
         )
       : '';
 
-  const details = (
-    <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
+  const renderDetails = (inPopover: boolean) => (
+    <div className={cn(
+      'flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-xs sm:text-sm',
+      inPopover ? 'flex w-full' : 'inline-flex rounded-xl border bg-card/80',
+      !inPopover && className,
+    )}>
       <span className="flex items-center gap-1.5 whitespace-nowrap">
         <Sparkles className="w-4 h-4 text-indigo-500" />
         <span className="font-medium text-foreground" title={formatExactTokenCount(usage.input_tokens, locale)}>
@@ -437,7 +441,6 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
           <button
             type="button"
             className={`inline-flex h-9 min-w-0 items-center gap-1.5 rounded-xl border bg-card/80 px-2 text-xs hover:bg-muted sm:hidden ${className || ""}`}
-            aria-label={t('chatPage.tokenUsage.details')}
             title={summaryLabel}
           >
             <Sparkles className="h-4 w-4 shrink-0 text-indigo-500" />
@@ -446,14 +449,15 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                 ? `${formatTokenCount(usage.total_tokens, locale)} ${t('chatPage.tokenUsage.tokensShort')}`
                 : mediaUsageLabel}
             </span>
+            <span className="sr-only"> {t('chatPage.tokenUsage.details')}</span>
             <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           </button>
         </PopoverTrigger>
         <PopoverContent side="top" align="end" className="w-80 max-w-[calc(100vw-2rem)] max-h-[60dvh] overflow-y-auto p-0 sm:hidden">
-          {details}
+          {renderDetails(true)}
         </PopoverContent>
       </Popover>
-      <div className="hidden min-w-0 sm:contents">{details}</div>
+      <div className="hidden sm:contents">{renderDetails(false)}</div>
     </>
   );
 }

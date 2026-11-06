@@ -1423,7 +1423,7 @@ export function ChatInput({
               aria-multiline="true"
             />
             {!message && (
-              <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
+              <div className="pointer-events-none absolute left-4 top-3 text-base sm:text-[14px] text-muted-foreground/60">
                 {placeholder ?? t("chatPage.input.placeholder")}
               </div>
             )}

@@ -1140,7 +1140,7 @@ export function TaskConversationPanel({
           </main>
         </div>
 
-        <div className={cn("flex-shrink-0 z-10 glass", mode === "page" ? "pb-[max(0.5rem,env(safe-area-inset-bottom))] sm:pb-6" : "border-t bg-card/30 p-4")}>
+        <div className={cn("flex-shrink-0 z-10 glass", mode === "page" ? "pb-2 sm:pb-6" : "border-t bg-card/30 p-4")}>
           <div className={cn("mx-auto px-4", mode === "page" ? "container max-w-4xl" : "max-w-3xl px-0")}>
             {showTaskActions && (
               <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 sm:mb-4 sm:gap-3">

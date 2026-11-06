@@ -120,7 +120,7 @@ describe("TokenUsageDisplay", () => {
 
     render(<TokenUsageDisplay taskId={42} isRunning={false} />)
     const summary = await screen.findByRole("button", {
-      name: "Usage details",
+      name: "157.27k tokens Usage details",
     })
     expect(summary).toHaveTextContent("157.27k tokens")
     expect(summary).toHaveAttribute("title", "Input tokens: 150,930, Output tokens: 6,340, 2 media calls")
@@ -131,6 +131,25 @@ describe("TokenUsageDisplay", () => {
     expect(details.getByText("70% cached")).toBeInTheDocument()
     expect(details.getByRole("button", { name: "1 model" })).toBeInTheDocument()
     fireEvent.click(details.getByRole("button", { name: "2 media calls" }))
+    expect(await screen.findByText("Speech model")).toBeInTheDocument()
+  })
+
+  it.each([1, 2])("announces the media-only summary for %s calls and opens its details", async (calls) => {
+    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      media_usage: [{ model_id: "tts", model_name: "Speech model", call_type: "tts", unit: "seconds", quantity: 12, calls }],
+    }), { status: 200 }))
+
+    render(<TokenUsageDisplay taskId={42} isRunning={false} />)
+    const mediaLabel = `${calls} media ${calls === 1 ? "call" : "calls"}`
+    const summary = await screen.findByRole("button", { name: `${mediaLabel} Usage details` })
+    expect(summary).toHaveTextContent(mediaLabel)
+    expect(summary).not.toHaveTextContent("0 tokens")
+
+    fireEvent.click(summary)
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: mediaLabel }))
     expect(await screen.findByText("Speech model")).toBeInTheDocument()
   })
 
@@ -390,7 +409,7 @@ describe("TokenUsageDisplay media usage", () => {
     render(<TokenUsageDisplay taskId={20} isRunning={false} />)
 
     // 4 media calls total (2 image + 1 tts + 1 asr).
-    fireEvent.click(await screen.findByRole("button", { name: /4 media calls/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "4 media calls" }))
 
     expect(await screen.findByText("Media usage")).toBeInTheDocument()
     expect(screen.getByText("stable-diffusion-xl")).toBeInTheDocument()
@@ -435,7 +454,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={31} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "1 media call" }))
 
     expect(await screen.findByText("32 texts")).toBeInTheDocument()
   })
@@ -471,7 +490,7 @@ describe("TokenUsageDisplay media usage", () => {
     render(<TokenUsageDisplay taskId={33} isRunning={false} />)
 
     // calls > 0 with quantity 0: the row must still be counted and shown.
-    fireEvent.click(await screen.findByRole("button", { name: /2 media calls/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "2 media calls" }))
 
     expect(await screen.findByText("not yet measured")).toBeInTheDocument()
     expect(screen.getByText("veo-3")).toBeInTheDocument()
@@ -506,7 +525,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={34} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "1 media call" }))
 
     expect(await screen.findByText("<0.1 sec")).toBeInTheDocument()
     expect(screen.queryByText("0 sec")).not.toBeInTheDocument()
@@ -555,7 +574,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={35} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /3 media calls/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "3 media calls" }))
 
     expect(await screen.findByText("1 image")).toBeInTheDocument()
     expect(screen.getByText("1 request")).toBeInTheDocument()
@@ -602,7 +621,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={36} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /3 media calls/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "3 media calls" }))
 
     expect(await screen.findByText("sd-primary")).toBeInTheDocument()
     expect(screen.getByText("sd-fallback")).toBeInTheDocument()
@@ -637,7 +656,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={37} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "1 media call" }))
 
     await screen.findByText("2 images")
     expect(screen.getAllByText("stable-diffusion-xl")).toHaveLength(1)
@@ -678,7 +697,7 @@ describe("TokenUsageDisplay media usage", () => {
     render(<TokenUsageDisplay taskId={32} isRunning={false} />)
 
     // The junk rows are dropped; the real one still renders and is counted.
-    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "1 media call" }))
     expect(await screen.findByText("2 images")).toBeInTheDocument()
     // Assert absence too: the count and quantity above both still pass if a
     // dropped row leaks back in as an extra unknown/unmeasured row, so those
@@ -717,7 +736,7 @@ describe("TokenUsageDisplay media usage", () => {
     render(<TokenUsageDisplay taskId={33} isRunning={false} />)
 
     // The string calls count is coerced too, so the label reads 2.
-    fireEvent.click(await screen.findByRole("button", { name: /2 media calls/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "2 media calls" }))
     expect(await screen.findByText("4 images")).toBeInTheDocument()
   })
 
@@ -749,7 +768,7 @@ describe("TokenUsageDisplay media usage", () => {
     render(<TokenUsageDisplay taskId={21} isRunning={false} />)
 
     expect(
-      await screen.findByRole("button", { name: /^1 media call$/ }),
+      await screen.findByRole("button", { name: "1 media call" }),
     ).toBeInTheDocument()
   })
 
@@ -803,7 +822,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={23} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "1 media call" }))
     expect(await screen.findByText("custom_op")).toBeInTheDocument()
     expect(screen.getByText("4 widgets")).toBeInTheDocument()
   })
@@ -834,7 +853,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={24} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "1 media call" }))
     // Exact match: "4 " with a trailing space would not satisfy this.
     expect(await screen.findByText("4")).toBeInTheDocument()
   })
@@ -877,7 +896,7 @@ describe("TokenUsageDisplay media usage", () => {
 
     render(<TokenUsageDisplay taskId={25} isRunning={false} />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /2 media calls/ }))
+    fireEvent.click(await screen.findByRole("button", { name: "2 media calls" }))
     // Assert the whole string, label included: matching only the number passes
     // even if `tokensShort` is missing or resolved from the wrong key, which is
     // what makes the count meaningful rather than a bare number in the popover.

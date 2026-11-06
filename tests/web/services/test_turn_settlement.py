@@ -596,6 +596,19 @@ async def test_channel_run_reports_its_committed_settlement_once(monkeypatch) ->
     assert settlement.usage == USAGE
 
 
+async def test_each_channel_run_reports_its_own_settlement_id(monkeypatch) -> None:
+    received = _capture()
+
+    await _drive_channel(monkeypatch)
+    await _drive_channel(monkeypatch)
+    await _settle_inflight()
+
+    ids = [s.settlement_id for s in received]
+    assert len(ids) == 2
+    assert all(len(i) == 32 for i in ids)
+    assert ids[0] != ids[1]
+
+
 async def test_channel_failed_result_reports_a_closed_error_code(monkeypatch) -> None:
     received = _capture()
 
@@ -874,6 +887,7 @@ async def test_scheduled_turn_reports_its_settlement_once(canonical, path) -> No
     assert settlement.status == status
     assert settlement.error_code == error_code
     assert settlement.started_at <= settlement.ended_at
+    assert len(settlement.settlement_id) == 32
 
 
 @pytest.mark.usefixtures("_clear_bg_manager")
@@ -1219,6 +1233,7 @@ async def test_resumed_run_reports_its_settlement_once(monkeypatch, path) -> Non
         "turn-r",
     )
     assert settlement.task_source == "sdk"
+    assert len(settlement.settlement_id) == 32
     assert settlement.status == status
     assert settlement.error_code == error_code
     assert settlement.completion_outcome == (

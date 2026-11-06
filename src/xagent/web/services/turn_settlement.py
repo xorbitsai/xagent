@@ -28,8 +28,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -142,11 +143,13 @@ class TurnFacts:
 
     Created by the execution entry point when the run starts; the run's
     usage, its settled outcome and the classification fields of its result
-    are recorded as they become known. Every field but ``started_at`` stays at its default
-    when the run never got that far.
+    are recorded as they become known. Every field but ``started_at`` and
+    ``settlement_id`` stays at its default when the run never got that far.
     """
 
     started_at: datetime
+    # Identifies this run's report; minted once per facts bag.
+    settlement_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     usage: TurnUsage | None = None
     first_answer_delta_at: datetime | None = None
     # The outcome this run's own result finalizer settled: the status it
@@ -205,9 +208,16 @@ def _parse_timestamp(raw: Any) -> datetime | None:
 
 @dataclass(frozen=True)
 class TurnSettlement:
-    """How one run of a task ended, reported once its outcome was settled."""
+    """How one run of a task ended, reported once its outcome was settled.
+
+    ``settlement_id`` is unique to this report; a host deduplicating
+    deliveries keys on it. ``(task_id, run_id, turn_id)`` is not unique: a
+    resumed run keeps its ``run_id`` and, for a routine or an automatically
+    resumed turn, its ``turn_id``.
+    """
 
     task_id: int
+    settlement_id: str
     run_id: str | None
     turn_id: str | None
     task_source: str | None
@@ -274,6 +284,7 @@ def build_turn_settlement(
     """
     return TurnSettlement(
         task_id=task_id,
+        settlement_id=facts.settlement_id,
         run_id=run_id,
         turn_id=turn_id,
         task_source=task_source,

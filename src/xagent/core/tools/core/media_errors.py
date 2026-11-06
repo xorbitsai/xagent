@@ -196,7 +196,30 @@ _STRUCTURED_FIELD_PATTERN = re.compile(
     (?P<name>[A-Za-z][A-Za-z0-9 _-]{0,40})
     (?P=name_quote)
     \s*[:=]\s*
-    (?P<value>"[^"\n]*"|'[^'\n]*'|[^\s,;:()[\]{}"']+)
+    (?P<value>
+        "(?:[^"\\\n]|\\.)*"      # one quoted value, a backslash escape and all
+      | '(?:[^'\\\n]|\\.)*'
+      | \[[^\[\]{}]*\]           # a flat array of them, masked as one value
+      | [^\s,;:()[\]{}"']+
+    )
+    """
+)
+
+# A label, whitespace and a value with no punctuation between them at all:
+# ``Request id req_short_id``, ``Your account acct_abc has not activated``.
+# Only labels that name an identifier are matched, and the value has to look
+# like one -- a digit or an underscore in it -- so ordinary prose such as
+# ``your account is not activated`` keeps its words.
+_PROSE_IDENTIFIER_PATTERN = re.compile(
+    r"""(?ix)
+    \b
+    (?P<label>
+        request[ _-]?id
+      | (?:account|organisation|organization|org)[ _-]?(?:id|number)
+      | account
+    )
+    \s+
+    (?P<value>(?=[A-Za-z0-9_.:-]*[0-9_])[A-Za-z0-9][A-Za-z0-9_.:-]*)
     """
 )
 
@@ -243,24 +266,42 @@ def _is_identifier_field(name: str) -> bool:
     return normalized == "id" or normalized.endswith(("_id", "_ids", "_uuid", "_guid"))
 
 
+# Header names whose whole value is a credential, whatever the value's shape.
+_AUTH_HEADER_FIELDS = frozenset({"authorization", "proxy_authorization"})
+
+
 def _is_secret_field(name: str) -> bool:
     """Whether the value of the structured field ``name`` must be masked.
 
     Credential names reuse :func:`is_credential_key`, the rule the repository
     already applies to ``identifier=value`` assignments, so a field named
     ``api_key`` or ``access_token`` is masked here in the quoted shapes that
-    rule does not parse.
+    rule does not parse. A header that carries nothing but a credential is
+    masked under its own name: ``Authorization`` does not end in a credential
+    word, and a short ``Bearer`` value is below every shape rule.
     """
     normalized = _normalize_field_name(name)
     if not normalized:
         return False
-    return _is_identifier_field(normalized) or is_credential_key(normalized)
+    return (
+        _is_identifier_field(normalized)
+        or is_credential_key(normalized)
+        or normalized in _AUTH_HEADER_FIELDS
+    )
 
 
 # A quoted run of text: a JSON value, a repr string. ``"""`` does not occur in
 # provider messages, and a value with a newline is split by the caller before
-# this runs, so one line at a time is enough.
-_QUOTED_SECTION_PATTERN = re.compile(r""""[^"\n]*"|'[^'\n]*'""")
+# this runs, so one line at a time is enough. A backslash escape is part of
+# the run it sits in, so ``"req_\_after"`` is read as one value rather than
+# closing the quote early.
+_QUOTED_SECTION_PATTERN = re.compile(
+    r"""(?x)
+    "(?:[^"\\\n]|\\.)*"
+    |
+    '(?:[^'\\\n]|\\.)*'
+    """
+)
 
 
 def _mask_field_assignments(text: str) -> str:
@@ -284,7 +325,8 @@ def _mask_structured_fields(text: str) -> str:
     inside ``"message": "..."`` (every OpenAI-compatible SDK does) would
     otherwise be skipped whole by the outer scan, which matches the outer
     field and moves past its value -- and that value is where the account id
-    and the request id live.
+    and the request id live. The last pass reads the labels a provider writes
+    as prose, with no ``:`` or ``=`` between the label and the value.
     """
 
     def _mask_section(match: re.Match[str]) -> str:
@@ -292,7 +334,10 @@ def _mask_structured_fields(text: str) -> str:
         return f"{quote}{_mask_field_assignments(match.group(0)[1:-1])}{quote}"
 
     masked_inside = _QUOTED_SECTION_PATTERN.sub(_mask_section, text)
-    return _mask_field_assignments(masked_inside)
+    masked = _mask_field_assignments(masked_inside)
+    return _PROSE_IDENTIFIER_PATTERN.sub(
+        lambda match: f"{match.group('label')} {_REDACTED}", masked
+    )
 
 
 def redact_provider_detail(text: Any) -> str:

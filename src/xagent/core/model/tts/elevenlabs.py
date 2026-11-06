@@ -16,7 +16,7 @@ from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from ...tools.core.media_errors import MediaParameterError
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -351,7 +351,7 @@ class ElevenLabsTTS(BaseTTS):
                 except Exception as exc:
                     logger.warning(
                         "Failed to create ElevenLabs client for temporary voice cleanup: %s",
-                        redact_sensitive_text(str(exc)),
+                        redact_provider_detail(exc),
                     )
             self._client = None
             self._async_client = None
@@ -366,7 +366,7 @@ class ElevenLabsTTS(BaseTTS):
                         logger.warning(
                             "Failed to delete temporary ElevenLabs voice clone %s: %s",
                             voice_id,
-                            redact_sensitive_text(str(exc)),
+                            redact_provider_detail(exc),
                         )
                 if deleted_voice_ids:
                     self._cloned_voice_ids = {
@@ -588,7 +588,9 @@ class ElevenLabsTTS(BaseTTS):
             response = await client.voices.ivc.create(**request_kwargs)
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
-            logger.error("ElevenLabs voice cloning failed: %s", redacted_error)
+            logger.error(
+                "ElevenLabs voice cloning failed: %s", redact_provider_detail(exc)
+            )
             raise RuntimeError(
                 f"ElevenLabs voice cloning failed: {redacted_error}"
             ) from exc
@@ -619,7 +621,9 @@ class ElevenLabsTTS(BaseTTS):
             await client.voices.delete(normalized_voice_id)
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
-            logger.error("ElevenLabs voice deletion failed: %s", redacted_error)
+            logger.error(
+                "ElevenLabs voice deletion failed: %s", redact_provider_detail(exc)
+            )
             raise RuntimeError(
                 f"ElevenLabs voice deletion failed: {redacted_error}"
             ) from exc
@@ -711,7 +715,7 @@ class ElevenLabsTTS(BaseTTS):
                 "ElevenLabs TTS stream failed" if streaming else "ElevenLabs TTS failed"
             )
             message = f"{prefix}: {redact_sensitive_text(error_text)}"
-        logger.error("%s", message)
+        logger.error("%s", redact_provider_detail(message))
         return RuntimeError(message)
 
     async def synthesize(

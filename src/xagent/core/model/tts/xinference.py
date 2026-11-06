@@ -381,7 +381,10 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
             return result
 
         except Exception as e:
-            logger.error(f"Failed to fetch TTS models from Xinference: {e}")
+            logger.error(
+                "Failed to fetch TTS models from Xinference: %s",
+                redact_provider_detail(e),
+            )
             return []
 
         finally:

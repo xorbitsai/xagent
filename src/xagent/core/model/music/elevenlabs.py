@@ -8,7 +8,7 @@ import re
 from inspect import isawaitable
 from typing import Any, Literal, Optional, get_args, get_origin
 
-from ...tools.core.media_errors import MediaParameterError
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -251,7 +251,9 @@ class ElevenLabsMusicModel(BaseMusicModel):
             completed = True
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
-            logger.error("ElevenLabs music generation failed: %s", redacted_error)
+            logger.error(
+                "ElevenLabs music generation failed: %s", redact_provider_detail(exc)
+            )
             raise RuntimeError(
                 f"ElevenLabs music generation failed: {redacted_error}"
             ) from exc
@@ -328,7 +330,7 @@ class ElevenLabsMusicModel(BaseMusicModel):
                 logger.warning(
                     "Could not list ElevenLabs music models because the API key "
                     "lacks user_read; using the SDK catalog: %s",
-                    safe_error,
+                    redact_provider_detail(exc),
                 )
         finally:
             await model.aclose()

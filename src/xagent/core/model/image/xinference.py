@@ -474,7 +474,10 @@ class XinferenceImageModel(BaseImageModel):
             return result
 
         except Exception as e:
-            logger.error(f"Failed to fetch image models from Xinference: {e}")
+            logger.error(
+                "Failed to fetch image models from Xinference: %s",
+                redact_provider_detail(e),
+            )
             return []
 
         finally:

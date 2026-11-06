@@ -416,5 +416,8 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
             return result
 
         except Exception as e:
-            logger.error(f"Failed to fetch ASR models from Xinference: {e}")
+            logger.error(
+                "Failed to fetch ASR models from Xinference: %s",
+                redact_provider_detail(e),
+            )
             return []

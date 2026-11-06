@@ -22,18 +22,23 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional, Union
+from types import SimpleNamespace
+from typing import Any, Callable, Optional, Union
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from xagent.core.model.asr.base import ASRResult, BaseASR
+from xagent.core.model.asr.elevenlabs import ElevenLabsASR
+from xagent.core.model.asr.xinference import XinferenceASR
 from xagent.core.model.image import dashscope as dashscope_image
 from xagent.core.model.image.dashscope import DashScopeImageModel
+from xagent.core.model.image.xinference import XinferenceImageModel
 from xagent.core.model.music.elevenlabs import ElevenLabsMusicModel
 from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.base import BaseTTS, TTSResult
 from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
+from xagent.core.model.tts.xinference import XinferenceTTS
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BilledVideoTaskTimeout
 from xagent.core.tools.core.audio_tool import AudioToolCore
@@ -433,6 +438,152 @@ class TestAdapterLogs:
         assert PROVIDER_REQUEST_ID not in caplog.text
         assert SDK_REQUEST_ID not in caplog.text
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("adapter_line", "call"),
+        [
+            (
+                "ElevenLabs voice cloning failed",
+                lambda tool: tool.clone_tts_voice("My voice", ["reference.wav"]),
+            ),
+            (
+                "ElevenLabs voice deletion failed",
+                lambda tool: tool.delete_tts_voice("voice-1"),
+            ),
+        ],
+        ids=["clone", "delete"],
+    )
+    async def test_a_failed_voice_request_writes_no_account_or_request_id(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        adapter_line: str,
+        call: Callable[[AudioToolCore], Any],
+    ) -> None:
+        """Cloning and deleting go through the SDK and log before the tool
+        sees the exception, so these two lines are the whole hierarchy."""
+        model = ElevenLabsTTS(api_key="test-key")
+        sdk = Mock()
+        sdk.voices.ivc.create = AsyncMock(side_effect=model_not_open_error())
+        sdk.voices.delete = AsyncMock(side_effect=model_not_open_error())
+        model._async_client = sdk
+        model._reference_audio_file = Mock(
+            return_value=("reference.wav", b"audio", "audio/wav")
+        )
+        tool = AudioToolCore(tts_models={"elevenlabs": model}, default_tts_model=model)
+
+        with caplog.at_level(logging.DEBUG):
+            result = await call(tool)
+
+        assert result["success"] is False
+        assert adapter_line in caplog.text
+        assert ACCOUNT_ID not in caplog.text
+        assert PROVIDER_REQUEST_ID not in caplog.text
+        assert SDK_REQUEST_ID not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model_class", "section", "method", "call", "adapter_line"),
+        [
+            (
+                ElevenLabsTTS,
+                "text_to_speech",
+                "convert",
+                lambda model: model.synthesize("Hello there"),
+                "ElevenLabs TTS failed",
+            ),
+            (
+                ElevenLabsMusicModel,
+                "music",
+                "compose",
+                lambda model: model.generate_music("A slow piano theme"),
+                "ElevenLabs music generation failed",
+            ),
+            (
+                ElevenLabsSoundEffectModel,
+                "text_to_sound_effects",
+                "convert",
+                lambda model: model.generate_sound_effect("A door slams"),
+                "ElevenLabs sound effect generation failed",
+            ),
+            (
+                ElevenLabsASR,
+                "speech_to_text",
+                "convert",
+                lambda model: model.transcribe(b"audio"),
+                "ElevenLabs ASR failed",
+            ),
+        ],
+        ids=["speech", "music", "sound-effect", "transcription"],
+    )
+    async def test_a_failed_generation_writes_no_account_or_request_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        model_class: Any,
+        section: str,
+        method: str,
+        call: Callable[[Any], Any],
+        adapter_line: str,
+    ) -> None:
+        client = SimpleNamespace(
+            **{
+                section: SimpleNamespace(
+                    **{method: AsyncMock(side_effect=model_not_open_error())}
+                )
+            }
+        )
+        monkeypatch.setattr(
+            model_class,
+            "_create_async_client",
+            staticmethod(lambda *args, **kwargs: client),
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(RuntimeError):
+                await call(model_class(api_key="test-key"))
+
+        assert adapter_line in caplog.text
+        assert ACCOUNT_ID not in caplog.text
+        assert PROVIDER_REQUEST_ID not in caplog.text
+        assert SDK_REQUEST_ID not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("client_path", "list_models"),
+        [
+            (
+                "xagent.core.model.image.xinference.XinferenceClient",
+                XinferenceImageModel.list_available_models,
+            ),
+            (
+                "xagent.core.model.public_xinference.PublicXinferenceClient",
+                XinferenceASR.list_available_models,
+            ),
+            (
+                "xagent.core.model.public_xinference.PublicXinferenceClient",
+                XinferenceTTS.list_available_models,
+            ),
+        ],
+        ids=["image", "asr", "tts"],
+    )
+    def test_a_failed_model_list_writes_no_account_or_request_id(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        client_path: str,
+        list_models: Callable[[str], Any],
+    ) -> None:
+        client = Mock()
+        client.list_models.side_effect = model_not_open_error()
+        monkeypatch.setattr(client_path, lambda *args, **kwargs: client)
+
+        with caplog.at_level(logging.DEBUG):
+            assert list_models("http://localhost:9997") == []
+
+        assert "Failed to fetch" in caplog.text
+        assert ACCOUNT_ID not in caplog.text
+        assert PROVIDER_REQUEST_ID not in caplog.text
+        assert SDK_REQUEST_ID not in caplog.text
+
 
 class TestStructuredRedaction:
     """Ids in the shapes providers actually print: JSON, repr and plain text."""
@@ -464,6 +615,37 @@ class TestStructuredRedaction:
         )
 
         assert detail == "{'request_id': <redacted>, 'account_id': <redacted>}"
+
+    @pytest.mark.parametrize(
+        ("detail", "hidden"),
+        [
+            ("Request id req_short_id", "req_short_id"),
+            ("Your account acct_abc has not activated it", "acct_abc"),
+            ('{"Authorization": "Bearer abc"}', "Bearer abc"),
+            ('{"request_ids": ["req_a", "req_b"]}', "req_a"),
+            ('{"request_id": "req_\\"_after", "account_id": "acct_b"}', "_after"),
+        ],
+        ids=[
+            "no-separator",
+            "account-prose",
+            "short-auth",
+            "id-array",
+            "escaped-quote",
+        ],
+    )
+    def test_a_provider_shape_without_a_plain_field_is_masked(
+        self, detail: str, hidden: str
+    ) -> None:
+        """A label written as prose, a value that is a list, and a quote
+        escaped inside one: none of them are a ``name=value`` pair."""
+        assert hidden not in redact_provider_detail(detail)
+
+    def test_prose_about_an_account_keeps_its_words(self) -> None:
+        """Only a value that looks like an id is masked: the sentence itself
+        stays readable in the log."""
+        detail = "your account is not activated yet"
+
+        assert redact_provider_detail(detail) == detail
 
     def test_an_identifier_inside_a_json_message_is_masked(self) -> None:
         """SDKs nest the real error in `"message": "..."`; scanning only the

@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from inspect import isawaitable
 from typing import Any, Optional
 
-from ...tools.core.media_errors import MediaParameterError
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -170,7 +170,7 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             logger.warning(
                 "ElevenLabs key lacks user_read; generation access cannot be "
                 "validated without a billed request: %s",
-                safe_error,
+                redact_provider_detail(exc),
             )
 
     async def _record_usage(
@@ -264,7 +264,8 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
             logger.error(
-                "ElevenLabs sound effect generation failed: %s", redacted_error
+                "ElevenLabs sound effect generation failed: %s",
+                redact_provider_detail(exc),
             )
             raise RuntimeError(
                 f"ElevenLabs sound effect generation failed: {redacted_error}"
@@ -316,7 +317,7 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
                 logger.warning(
                     "Could not list ElevenLabs sound effect models because the API "
                     "key lacks user_read; using the documented catalog: %s",
-                    safe_error,
+                    redact_provider_detail(exc),
                 )
         finally:
             await model.aclose()

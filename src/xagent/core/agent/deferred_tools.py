@@ -18,9 +18,8 @@ token budget, so the common "do X in HubSpot" turn needs no extra model call.
 
 from __future__ import annotations
 
-import difflib
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -37,8 +36,6 @@ MAX_TOOLS_PER_LOAD = 12
 # budget is not pre-loaded; the model loads the few tools it needs by name.
 DEFAULT_PRELOAD_TOKEN_BUDGET = 20_000
 
-_CLOSE_NAME_LIMIT = 3
-
 
 class LoadToolsArgs(BaseModel):
     names: list[str] = Field(
@@ -47,14 +44,12 @@ class LoadToolsArgs(BaseModel):
 
 
 class LoadToolsTool:
-    """Duck-typed tool whose execution the ReAct loop handles itself.
+    """The ``load_tools`` tool, bound to one run's context.
 
-    It lives in the run's tool list so it is looked up, scheduled and traced
-    like any other tool; the loop recognises it by ``is_load_tools`` and
-    executes it against the run context, which a plain tool cannot reach.
+    Built per run, like the ``load_skill`` tool, with a handler that closes
+    over the run's context, so it executes through the ordinary tool path.
     """
 
-    is_load_tools = True
     name = LOAD_TOOLS_NAME
     description = (
         "Load the full schemas of connector tools listed in the connector-tool "
@@ -66,8 +61,14 @@ class LoadToolsTool:
     )
     metadata = None
 
+    def __init__(self, handler: Callable[[Any], str]) -> None:
+        self._handler = handler
+
     def args_type(self) -> Any:
         return LoadToolsArgs
+
+    async def execute(self, names: Any) -> str:
+        return self._handler(names)
 
 
 def _normalize(text: str) -> str:
@@ -108,7 +109,3 @@ def tool_names_mentioned(text: str, names: Iterable[str]) -> list[str]:
         for name in names
         if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text)
     ]
-
-
-def close_names(name: str, candidates: Sequence[str]) -> list[str]:
-    return difflib.get_close_matches(name, candidates, n=_CLOSE_NAME_LIMIT, cutoff=0.6)

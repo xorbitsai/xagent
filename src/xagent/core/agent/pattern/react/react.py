@@ -132,7 +132,6 @@ from ...deferred_tools import (
     LOADED_TOOLS_COMPONENT,
     MAX_TOOLS_PER_LOAD,
     LoadToolsTool,
-    close_names,
     servers_mentioned,
     tool_names_mentioned,
 )
@@ -805,6 +804,9 @@ class ReActPattern(AgentPattern):
         self.deferred_preload_token_budget = max(0, int(deferred_preload_token_budget))
         self._deferred_tool_names: frozenset[str] = frozenset()
         self._deferred_order: tuple[str, ...] = ()
+        # Deferred tools the last provider refusal auto-loaded; the retry
+        # instruction names them once and clears this.
+        self._just_auto_loaded: list[str] = []
         self.max_iterations = max_iterations
         self.tool_choice = tool_choice
         self.reasoning_mode = ReActReasoningMode(reasoning_mode)
@@ -1319,8 +1321,12 @@ class ReActPattern(AgentPattern):
                     # Past max_iterations only a forced answer turn may run;
                     # stop rather than restore the full tool set there.
                     break
-                if unavailable_tool_call and self._auto_load_refused(
-                    context, _unavailable_tool_call_names({"details": exc.details})
+                if (
+                    unavailable_tool_call
+                    and not settlement_fence
+                    and self._auto_load_refused(
+                        context, _unavailable_tool_call_names({"details": exc.details})
+                    )
                 ):
                     normal_tool_schemas = self._normal_tool_schemas(
                         base_tool_schemas, spill_read_schema, tools, context
@@ -2250,12 +2256,7 @@ class ReActPattern(AgentPattern):
                 "set. If the requested work or artifact has not been successfully "
                 "produced, call the appropriate work tool; call final_answer only "
                 "when the task is actually complete and its required results exist."
-                + (
-                    f" A deferred connector tool must be loaded with "
-                    f"{LOAD_TOOLS_NAME} before it can be called."
-                    if self._deferred_tool_names
-                    else ""
-                )
+                + self._deferred_retry_sentence()
             )
             retry_phase = "unavailable_tool_call_recovery"
         elif recovery_reason == "settlement_final_answer_required":
@@ -4451,7 +4452,12 @@ class ReActPattern(AgentPattern):
         self._deferred_order = tuple(deferred)
         self._deferred_tool_names = frozenset(deferred)
         self._preload_mentioned(tools, sources, context)
-        return [*tools, LoadToolsTool()]
+        return [
+            *tools,
+            LoadToolsTool(
+                lambda names: self._execute_load_tools({"names": names}, context)
+            ),
+        ]
 
     def _loaded_component(self, context: Any) -> LoadedToolsComponent:
         component = context.get_component(LOADED_TOOLS_COMPONENT)
@@ -4460,38 +4466,36 @@ class ReActPattern(AgentPattern):
             context.set_component(LOADED_TOOLS_COMPONENT, component)
         return component
 
-    def _loaded_deferred_names(self, context: Any) -> list[str]:
-        component = context.get_component(LOADED_TOOLS_COMPONENT)
-        names = getattr(component, "names", None) or []
-        return [n for n in names if n in self._deferred_tool_names]
-
     def _deferred_tool_unloaded(self, name: str, context: Any) -> bool:
-        return name in self._deferred_tool_names and name not in set(
-            self._loaded_deferred_names(context)
-        )
+        """Whether ``name`` is deferred and its schema was not in the tool list
+        last built for a model call: the only state in which a call to it may
+        run, because only then can the model have written valid arguments."""
+        if name not in self._deferred_tool_names:
+            return False
+        component = context.get_component(LOADED_TOOLS_COMPONENT)
+        return name not in (getattr(component, "sent_names", None) or [])
 
-    def _deferred_tool_unloaded_message(self, name: Any) -> str:
+    def _deferred_tool_unloaded_message(self, name: Any, context: Any) -> str:
+        component = context.get_component(LOADED_TOOLS_COMPONENT)
+        if name in (getattr(component, "names", None) or []):
+            return (
+                f"Tool {name!r} was loaded, but its schema was not part of the "
+                "request that produced this call, so it was not run. Call it "
+                "again in your next step."
+            )
         return (
             f"Tool {name!r} is a connector tool whose schema is not loaded, so "
             f"it was not run. Call {LOAD_TOOLS_NAME} with names=[{name!r}] first, "
             "then call it in the next step."
         )
 
-    def _request_loads(self, context: Any, names: list[str]) -> None:
-        """Ask for ``names`` to be loaded from the next iteration on."""
+    def _load_names(self, context: Any, names: list[str]) -> None:
+        """Record ``names`` as loaded. They become callable only once a model
+        call has been built with their schemas (see ``sent_names``)."""
         component = self._loaded_component(context)
         for name in names:
-            if name not in component.names and name not in component.pending:
-                component.pending.append(name)
-
-    def _promote_pending_loads(self, context: Any) -> None:
-        component = context.get_component(LOADED_TOOLS_COMPONENT)
-        if not isinstance(component, LoadedToolsComponent) or not component.pending:
-            return
-        for name in component.pending:
             if name not in component.names:
                 component.names.append(name)
-        component.pending = []
 
     def _auto_load_refused(self, context: Any, refused: frozenset[str] | None) -> bool:
         """Load deferred tools a provider refused as unavailable.
@@ -4506,9 +4510,24 @@ class ReActPattern(AgentPattern):
         ]
         if not wanted:
             return False
-        self._request_loads(context, wanted)
-        self._promote_pending_loads(context)
+        self._load_names(context, wanted)
+        self._just_auto_loaded = wanted
         return True
+
+    def _deferred_retry_sentence(self) -> str:
+        """Retry wording for a deferred tool: loaded just now, or still unloaded."""
+        if self._just_auto_loaded:
+            names = self._just_auto_loaded
+            self._just_auto_loaded = []
+            verb = "is" if len(names) == 1 else "are"
+            call = "it" if len(names) == 1 else "them"
+            return f" {', '.join(names)} {verb} now loaded; call {call} directly."
+        if self._deferred_tool_names:
+            return (
+                f" A deferred connector tool must be loaded with {LOAD_TOOLS_NAME} "
+                "before it can be called."
+            )
+        return ""
 
     def _tool_schema_cost(self, tool: Any) -> int:
         """Estimated tokens of one tool's schema (characters / 4)."""
@@ -4579,7 +4598,7 @@ class ReActPattern(AgentPattern):
             if group and cost <= remaining:
                 to_load.extend(group)
                 remaining -= cost
-        component.names.extend(n for n in to_load if n not in component.names)
+        self._load_names(context, to_load)
 
     def _normal_tool_schemas(
         self,
@@ -4603,15 +4622,16 @@ class ReActPattern(AgentPattern):
         """Append the schemas of deferred tools this run has loaded.
 
         Always appended at the very end, after the stored-result reader, in
-        load order, so a load only ever grows the tool list. Loads requested
-        in the previous response take effect here. Byte-identical to
-        ``schemas`` when nothing is deferred or loaded, and under
-        ``tool_choice="none"``.
+        load order, so a load only ever grows the tool list. Records which
+        deferred tools the list carries as ``sent_names``: the gate that lets a
+        call to one run. Byte-identical to ``schemas`` when nothing is
+        deferred.
         """
-        if not self._deferred_tool_names or self.tool_choice == "none":
+        if not self._deferred_tool_names:
             return schemas
-        self._promote_pending_loads(context)
-        loaded = self._loaded_deferred_names(context)
+        component = self._loaded_component(context)
+        loaded = [n for n in component.names if n in self._deferred_tool_names]
+        component.sent_names = list(loaded)
         if not loaded:
             return schemas
         by_name = {self._tool_name(t): t for t in tools}
@@ -4630,7 +4650,7 @@ class ReActPattern(AgentPattern):
         and replay of a committed outcome, which must agree on what loaded.
         """
         component = self._loaded_component(context)
-        taken = set(component.names) | set(component.pending)
+        taken = set(component.names)
         requested = list(dict.fromkeys(requested))
         known = [n for n in requested if n in self._deferred_tool_names]
         unknown = [n for n in requested if n not in self._deferred_tool_names]
@@ -4645,7 +4665,7 @@ class ReActPattern(AgentPattern):
         ):
             raise ValueError("load_tools requires names: a list of tool names.")
         accepted, already, skipped, unknown = self._plan_load(requested, context)
-        self._request_loads(context, accepted)
+        self._load_names(context, accepted)
         parts = []
         if accepted:
             parts.append(
@@ -4662,7 +4682,7 @@ class ReActPattern(AgentPattern):
                 + ". Call load_tools again for these."
             )
         for name in unknown:
-            close = close_names(name, list(self._deferred_order))
+            close = difflib.get_close_matches(name, list(self._deferred_order), n=3)
             hint = f" Did you mean: {', '.join(close)}?" if close else ""
             parts.append(
                 f"Unknown tool {name!r}: not in the connector inventory.{hint}"
@@ -4691,7 +4711,7 @@ class ReActPattern(AgentPattern):
         if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
             return
         accepted, _, _, _ = self._plan_load(names, context)
-        self._request_loads(context, accepted)
+        self._load_names(context, accepted)
 
     def _tool_schemas_with_spill_read(
         self,
@@ -7224,12 +7244,10 @@ class ReActPattern(AgentPattern):
             raise ValueError(
                 self._tool_not_found_message(tool_call["name"], tools, context)
             )
-        if getattr(tool, "is_load_tools", False):
-            return self._execute_load_tools(
-                self._tool_call_args_dict(tool_call, require_mapping=True), context
-            )
         if self._deferred_tool_unloaded(self._tool_name(tool), context):
-            raise ValueError(self._deferred_tool_unloaded_message(tool_call["name"]))
+            raise ValueError(
+                self._deferred_tool_unloaded_message(tool_call["name"], context)
+            )
         args = self._tool_args_for_execution(tool_call, tool)
 
         execute = getattr(tool, "execute", None)

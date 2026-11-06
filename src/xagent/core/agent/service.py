@@ -126,6 +126,8 @@ class AgentService:
         self.skills_enabled = skills_enabled
         self.user_interaction_enabled = user_interaction_enabled
         self.defer_connector_schemas = defer_connector_schemas
+        # Per newly scanned user message, not a session cap; see
+        # ``AgentExecutionConfig.deferred_preload_token_budget``.
         self.deferred_preload_token_budget = deferred_preload_token_budget
         self.execution_metadata = dict(execution_metadata or {})
         self.budget_policy_provider = budget_policy_provider

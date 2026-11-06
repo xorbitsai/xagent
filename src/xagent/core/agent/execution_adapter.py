@@ -71,6 +71,10 @@ class AgentExecutionConfig:
     # Host opt-in for ReAct: withhold connector tool schemas until the model
     # loads them with ``load_tools`` (see ``deferred_tools``).
     defer_connector_schemas: bool = False
+    # Estimated tokens of connector schemas pre-loaded because a user message
+    # names the connector. The allowance applies to each newly scanned user
+    # message, not to the whole session: loaded tools are never evicted, so a
+    # long conversation can accumulate more than this in total.
     deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET
     preferred_input_modalities: tuple[str, ...] = ()
     execution_metadata: dict[str, Any] = field(default_factory=dict)

@@ -95,33 +95,34 @@ class SpillRegistryComponent:
 
 @dataclass
 class LoadedToolsComponent:
-    """Deferred connector tools whose schemas this execution has loaded.
+    """Deferred connector tools this execution has loaded, and which were sent.
 
-    ``names`` is the set whose schemas are sent, in load order, so the tool
-    list only ever grows at its end. ``pending`` holds names a load_tools call
-    asked for in the current model response: they become part of ``names`` at
-    the start of the next iteration, so a call in the same response as its
-    load is refused instead of running with arguments written blind.
-    ``last_scanned_at`` is the timestamp of the newest user message already
-    scanned for connector names to pre-load. A timestamp, not a count, so a
-    compaction that shrinks the transcript cannot hide a later message.
+    ``names`` is every tool loaded so far, in load order, so the tool list only
+    ever grows at its end. ``sent_names`` is the subset whose schemas were in the
+    last tool list actually built for a model call. Only ``sent_names`` makes a
+    deferred tool callable: a model can only have written valid arguments for a
+    schema it was sent. Everything that loads (load_tools, preload by mention,
+    replay of a committed load, recovery from a provider refusal) writes
+    ``names`` alone, so none of them can make a tool callable before a model
+    call has been sent its schema. ``last_scanned_at`` is the timestamp of the
+    newest user message already scanned for connector names to pre-load.
     """
 
     names: list[str] = field(default_factory=list)
-    pending: list[str] = field(default_factory=list)
+    sent_names: list[str] = field(default_factory=list)
     last_scanned_at: str | None = None
 
     def clone(self) -> "LoadedToolsComponent":
         return LoadedToolsComponent(
             names=list(self.names),
-            pending=list(self.pending),
+            sent_names=list(self.sent_names),
             last_scanned_at=self.last_scanned_at,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "names": list(self.names),
-            "pending": list(self.pending),
+            "sent_names": list(self.sent_names),
             "last_scanned_at": self.last_scanned_at,
         }
 
@@ -136,7 +137,7 @@ class LoadedToolsComponent:
         scanned = data.get("last_scanned_at")
         return cls(
             names=_names("names"),
-            pending=_names("pending"),
+            sent_names=_names("sent_names"),
             last_scanned_at=scanned if isinstance(scanned, str) else None,
         )
 

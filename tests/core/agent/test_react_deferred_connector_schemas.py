@@ -679,25 +679,30 @@ def _component(context: ExecutionContext) -> LoadedToolsComponent:
     return component
 
 
-def test_a_mention_preload_does_not_promote_a_pending_load() -> None:
-    """Interrupted after load_tools(X), resumed by a message that never names X.
+@pytest.mark.parametrize(
+    "resume_message", ["yes, use Notion", "yes, call notion_search", "ok, continue"]
+)
+def test_a_resume_message_cannot_make_a_saved_sibling_call_runnable(
+    resume_message: str,
+) -> None:
+    """Interrupted after load_tools(X) ran, with X's own call still saved.
 
-    X's sibling call is still saved; it must be refused until a model call has
-    actually been sent X's schema.
+    However the resuming message reads, the saved call must stay refused until
+    a model call has actually been sent X's schema.
     """
     tools = _tools()
     context = _ctx("add a note")
     pattern = _pattern()
     pattern._tools_with_deferral(tools, context)
-    pattern._request_loads(context, ["notion_search"])  # the loader ran
+    pattern._execute_load_tools({"names": ["notion_search"]}, context)  # the loader ran
 
     resumed = ExecutionContext.from_dict(context.to_dict())
-    resumed.add_user_message("ok, continue")
+    resumed.add_user_message(resume_message)
     resumed_pattern = _pattern()
     resumed_pattern._tools_with_deferral(tools, resumed)
 
     assert resumed_pattern._deferred_tool_unloaded("notion_search", resumed)
-    # The next schema-bearing model call is where it becomes available.
+    # The next schema-bearing model call is where it becomes usable.
     schemas = resumed_pattern._normal_tool_schemas([], None, tools, resumed)
     assert [s["function"]["name"] for s in schemas] == ["notion_search"]
     assert not resumed_pattern._deferred_tool_unloaded("notion_search", resumed)
@@ -744,7 +749,7 @@ async def test_replaying_a_committed_failed_load_returns_the_saved_failure() -> 
 
     assert result == saved
     # A failed outcome loads nothing.
-    assert not _component(context).pending and not _component(context).names
+    assert not _component(context).names
 
 
 @pytest.mark.asyncio
@@ -764,7 +769,7 @@ async def test_replaying_a_committed_load_applies_the_cap_to_new_names_only() ->
         prepared,
     )
 
-    assert _component(context).pending == ["hubspot_tool_12", "hubspot_tool_13"]
+    assert _component(context).names[12:] == ["hubspot_tool_12", "hubspot_tool_13"]
 
 
 @pytest.mark.asyncio
@@ -828,7 +833,7 @@ async def test_replaying_a_committed_failed_load_with_valid_names_loads_nothing(
         prepared,
     )
 
-    assert not _component(context).pending and not _component(context).names
+    assert not _component(context).names
 
 
 @pytest.mark.asyncio
@@ -846,4 +851,122 @@ async def test_replaying_a_committed_load_with_malformed_names_returns_the_saved
     )
 
     assert result == saved
-    assert not _component(context).pending and not _component(context).names
+    assert not _component(context).names
+
+
+@pytest.mark.asyncio
+async def test_a_load_in_the_same_response_gets_its_own_refusal_message() -> None:
+    tools = _tools()
+    llm = ScriptedLLM(
+        [
+            _batch(
+                (LOAD_TOOLS_NAME, {"names": ["notion_search"]}),
+                ("notion_search", {"query": "blind"}),
+            ),
+            {"content": "done"},
+        ]
+    )
+    context = _ctx()
+    await _pattern().run(context=context, tools=tools, llm=llm)
+
+    refusal = next(
+        raw["error"]
+        for m in context.get_messages_by_role("tool")
+        if isinstance(raw := m.metadata.get("raw_result"), dict) and raw.get("error")
+    )
+    assert "not run" in refusal and "next step" in refusal
+    assert f"{LOAD_TOOLS_NAME} with names" not in refusal
+
+
+def _protocol_error_response(tool_name: str) -> dict[str, Any]:
+    from xagent.core.model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
+
+    return {
+        "type": "tool_protocol_error",
+        "content": "",
+        "tool_calls": [],
+        TOOL_PROTOCOL_ERROR_KEY: {
+            "provider": "validating",
+            "code": "unavailable_tool_call",
+            "message": f"unavailable tool call {tool_name!r}",
+            "details": {"tool_name": tool_name},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_in_response_provider_refusal_gets_the_tool_loaded() -> None:
+    tools = _tools()
+    llm = ScriptedLLM(
+        [
+            _protocol_error_response("notion_search"),
+            _call("notion_search", {"query": "retried"}, "c2"),
+            {"content": "done"},
+        ]
+    )
+    await _pattern().run(context=_ctx(), tools=tools, llm=llm)
+
+    notion = next(t for t in tools if t.name == "notion_search")
+    assert notion.calls == [{"query": "retried"}]
+    assert "notion_search" not in _names(llm.calls[0])
+    assert "notion_search" in _names(llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_the_retry_after_an_auto_load_names_the_loaded_tool() -> None:
+    llm = ValidatingLLM(
+        [
+            _call("notion_search", {"query": "direct"}, "c1"),
+            _call("notion_search", {"query": "retried"}, "c2"),
+            {"content": "done"},
+        ]
+    )
+    await _pattern().run(context=_ctx(), tools=_tools(), llm=llm)
+
+    retry_text = "\n".join(str(m.get("content")) for m in llm.calls[1]["messages"])
+    assert "notion_search is now loaded" in retry_text
+    assert "must be loaded with" not in retry_text
+
+
+@pytest.mark.asyncio
+async def test_a_settlement_fence_turn_does_not_auto_load_a_refused_tool() -> None:
+    tools = _tools()
+    context = _ctx()
+    pattern = _pattern()
+    pattern.force_final_answer_next = True
+    pattern.settlement_final_answer_fence = True
+    llm = ValidatingLLM(
+        [
+            _call("notion_search", {"query": "denied write retried"}, "c1"),
+            _call(
+                "final_answer",
+                {
+                    "response_language": "English",
+                    "answer": "done",
+                    "outcome": "blocked",
+                },
+                "c2",
+            ),
+        ]
+    )
+    await pattern.run(context=context, tools=tools, llm=llm)
+
+    notion = next(t for t in tools if t.name == "notion_search")
+    assert notion.calls == []
+    assert not _component(context).names
+
+
+def test_a_tool_sent_before_an_interruption_stays_callable_after_resume() -> None:
+    """A saved call whose schema really was sent must not be refused on resume."""
+    tools = _tools()
+    context = _ctx("add a note")
+    pattern = _pattern()
+    pattern._tools_with_deferral(tools, context)
+    pattern._execute_load_tools({"names": ["notion_search"]}, context)
+    pattern._normal_tool_schemas([], None, tools, context)  # the next call was built
+
+    resumed = ExecutionContext.from_dict(context.to_dict())
+    resumed_pattern = _pattern()
+    resumed_pattern._tools_with_deferral(tools, resumed)
+
+    assert not resumed_pattern._deferred_tool_unloaded("notion_search", resumed)

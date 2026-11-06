@@ -560,17 +560,17 @@ def media_error_fields(
     return fields
 
 
-def _parameter_allowed_values(exc: BaseException) -> Optional[dict[str, Any]]:
-    """The values a rejected parameter accepts, when the exception knows them.
+def _parameter_error(exc: BaseException) -> Optional[MediaParameterError]:
+    """The typed parameter error in ``exc``'s chain, if an adapter raised one.
 
-    An adapter that validated the parameter itself knows the field and its
-    real range; the tool's own list is a fallback for the providers that do
-    their checking on the far side.
+    Its presence is what separates "the adapter rejected this field and knows
+    what it accepts" from "a provider rejected the request on the far side
+    and named no field": only the first may decide the range, including
+    deciding that there is no reliable one.
     """
     for link in _exception_chain(exc):
-        values = getattr(link, "allowed_values", None)
-        if isinstance(values, Mapping) and values:
-            return dict(values)
+        if isinstance(link, MediaParameterError):
+            return link
     return None
 
 
@@ -607,6 +607,11 @@ def media_failure_fields(
     the existing per-tool log lines stay recognizable. The exception's class
     and redacted message follow it, and ``model_not_enabled`` adds the marker
     line operators alert on.
+
+    ``allowed_values`` is the caller's fallback list, used only when the
+    exception says nothing about which parameter was rejected. An adapter
+    that raised :class:`MediaParameterError` answers for itself, including
+    when its answer is that it knows no reliable range.
     """
     category = classify_media_failure(exc)
     logger.error(
@@ -619,7 +624,14 @@ def media_failure_fields(
     if category == MODEL_NOT_ENABLED:
         provider, name = _model_identity(model)
         logger.error("media model not enabled: provider=%s model=%s", provider, name)
+    rejected = _parameter_error(exc)
     return media_error_fields(
         category,
-        allowed_values=_parameter_allowed_values(exc) or allowed_values,
+        # The typed error names the field the adapter rejected, so it also
+        # owns the answer: the range when it knows one, and none at all when
+        # it does not. Falling back to the caller's list there would attach a
+        # range for a field the provider never blamed.
+        allowed_values=(
+            rejected.allowed_values if rejected is not None else allowed_values
+        ),
     )

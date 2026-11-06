@@ -209,7 +209,12 @@ class ElevenLabsTTS(BaseTTS):
     @staticmethod
     def _validate_voice_id(voice_id: str) -> None:
         if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", voice_id) is None:
-            raise ValueError("ElevenLabs voice must be a valid voice ID")
+            # The accepted values are the account's own voice ids, which the
+            # caller gets from list_tts_voices; there is no range to state.
+            raise MediaParameterError(
+                "ElevenLabs voice must be a valid voice ID",
+                field="voice",
+            )
 
     @staticmethod
     def _validate_sample_rate_request(
@@ -225,11 +230,15 @@ class ElevenLabsTTS(BaseTTS):
         if resolved_codec == "pcm" or resolved_sample_rate == sample_rate:
             return
 
-        raise ValueError(
+        # Which rates a format renders at is the provider's table, not a
+        # range this adapter can state: name the rejected field without
+        # inventing one.
+        raise MediaParameterError(
             "ElevenLabs sample_rate must match the resolved output format. "
             "Use format='pcm' for custom sample rates, or pass an ElevenLabs "
             f"output_format that includes {sample_rate}. Requested format "
-            f"'{requested_format}' resolves to '{output_format}'."
+            f"'{requested_format}' resolves to '{output_format}'.",
+            field="sample_rate",
         )
 
     def _resolve_output_format(

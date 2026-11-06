@@ -790,6 +790,40 @@ class TestParameterErrorsFromTheAdapters:
         assert result["error_category"] == INVALID_REQUEST
         assert "allowed_values" not in result
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "request_kwargs",
+        [
+            # The adapter rejects both of these itself, and neither has a
+            # range it could offer: one is a rate it cannot resolve, the other
+            # a rate the format does not render at.
+            {"audio_format": "pcm", "sample_rate": 12345},
+            {"audio_format": "mp3", "sample_rate": 22050},
+            {"voice": "not a voice id"},
+        ],
+        ids=["pcm-rate", "mp3-rate", "voice"],
+    )
+    async def test_a_rejected_parameter_with_no_known_range_names_no_range(
+        self, request_kwargs: dict[str, Any]
+    ) -> None:
+        """The adapter knows the field was rejected but not which values the
+        provider accepts -- so the result says "rejected" and stops, instead
+        of offering the audio formats as if they were the problem."""
+        tts_model = ElevenLabsTTS(api_key="test-key")
+        tts_model._ensure_async_client = Mock(
+            side_effect=AssertionError("a rejected request must not reach the SDK")
+        )
+        tool = AudioToolCore(
+            tts_models={"elevenlabs": tts_model},
+            default_tts_model=tts_model,
+        )
+
+        result = await tool.synthesize_speech("Hello", **request_kwargs)
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+
     def test_a_typed_parameter_error_wins_over_an_ambiguous_status(self) -> None:
         """The adapter knows more than the status does, in both directions."""
         error = MediaParameterError("bad format", field="audio_format")

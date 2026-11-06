@@ -3728,7 +3728,8 @@ async def execute_resume_background(
         else TurnFacts(started_at=datetime.now(timezone.utc))
     )
     # Set by the cleanup when its own settlement committed (a failure or a
-    # pause); the result finalizer's commit is recorded on ``facts``.
+    # pause); the result finalizer's outcome (its commit, or the terminal
+    # status it kept) is recorded on ``facts``.
     resume_settled_by_cleanup = False
     resume_settled_paused = False
 

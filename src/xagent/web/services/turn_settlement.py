@@ -1,8 +1,9 @@
 """Per-run settlement notification for the hosting application.
 
 The execution entry points build a ``TurnFacts`` for each run, the run fills
-it in, and once the run's outcome is settled -- its own result committed, or
-its lease settled by the entry point -- the entry point hands a frozen
+it in, and once the run's outcome is settled -- its own result committed, its
+result discarded because the task was already terminal, or its lease settled
+by the entry point -- the entry point hands a frozen
 ``TurnSettlement`` to the hook registered with ``set_turn_settled_hook``. A
 run whose result committed is reported even when its lease is then left to
 lease recovery; a run deferred to lease recovery before its result was
@@ -154,8 +155,9 @@ class TurnFacts:
     first_answer_delta_at: datetime | None = None
     # The outcome this run's own result finalizer settled: the status it
     # committed, or a terminal status it found and kept while discarding
-    # this run's result. None when no finalizer ran to completion (the run
-    # raised, or a cancellation landed before its finalizer was invoked).
+    # this run's result. None when no finalizer settled it: the run raised, a
+    # cancellation landed before its finalizer was invoked, or the finalizer
+    # found the run no longer owned the task.
     outcome: SettledOutcome | None = None
     completion_outcome: str | None = None
     llm_finish_reason: str | None = None

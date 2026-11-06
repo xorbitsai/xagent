@@ -1160,6 +1160,7 @@ class AudioToolCore:
             - supported_providers (list): Providers that currently support this API
         """
         supported_providers = self._get_voice_listing_supported_providers()
+        tts_model: Optional[BaseTTS] = None
         try:
             tts_model, actual_model_id = self._get_provider_tts_model(
                 provider=provider,
@@ -1223,14 +1224,21 @@ class AudioToolCore:
             }
 
         except Exception as e:
-            logger.error(f"Failed to list TTS voices: {e}")
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
             )
             return {
                 "success": False,
                 "supported": False,
-                "error": str(e),
+                # The provider's own words stay in the log; what the model
+                # reads is the category and one plain sentence, exactly as on
+                # the synthesis path.
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list TTS voices",
+                    model=tts_model,
+                ),
                 "voices": [],
                 "count": 0,
                 "model_used": actual_model_id,
@@ -1248,6 +1256,7 @@ class AudioToolCore:
         model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a persistent voice clone with a configured provider account."""
+        tts_model: Optional[BaseTTS] = None
         try:
             tts_model, actual_model_id = self._get_provider_tts_model(
                 provider=provider,
@@ -1304,14 +1313,18 @@ class AudioToolCore:
                 "model_used": actual_model_id,
             }
         except Exception as e:
-            logger.error(f"Failed to clone TTS voice: {e}")
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
             )
             return {
                 "success": False,
                 "supported": True,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to clone TTS voice",
+                    model=tts_model,
+                ),
                 "provider": provider,
                 "model_used": actual_model_id,
             }
@@ -1323,6 +1336,7 @@ class AudioToolCore:
         model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Permanently delete a voice from a configured provider account."""
+        tts_model: Optional[BaseTTS] = None
         try:
             tts_model, actual_model_id = self._get_provider_tts_model(
                 provider=provider,
@@ -1370,7 +1384,6 @@ class AudioToolCore:
                 "model_used": actual_model_id,
             }
         except Exception as e:
-            logger.error(f"Failed to delete TTS voice: {e}")
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
             )
@@ -1378,7 +1391,12 @@ class AudioToolCore:
                 "success": False,
                 "supported": True,
                 "deleted": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to delete TTS voice",
+                    model=tts_model,
+                ),
                 "provider": provider,
                 "model_used": actual_model_id,
             }

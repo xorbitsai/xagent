@@ -12,6 +12,7 @@ from urllib.request import url2pathname
 import aiohttp
 
 from ....config import get_media_download_max_bytes
+from ...tools.core.media_errors import redact_provider_detail
 from ...utils.public_download import download_public_input
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
@@ -488,7 +489,10 @@ class XinferenceVideoModel(BaseVideoModel):
             record_provider_usage(self, MediaCallType.VIDEO, 0)
             raise
         except Exception as exc:
-            logger.error("Xinference video generation failed: %s", exc)
+            logger.error(
+                "Xinference video generation failed: %s",
+                redact_provider_detail(exc),
+            )
             raise RuntimeError(f"Xinference video generation failed: {exc}") from exc
 
         data, video_item = self._record_response_usage(

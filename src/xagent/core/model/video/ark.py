@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any, List, Optional
 
+from ...tools.core.media_errors import redact_provider_detail
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from .base import BaseVideoModel, BilledVideoTaskError, BilledVideoTaskTimeout
@@ -458,8 +459,14 @@ class ArkVideoModel(BaseVideoModel):
             try:
                 task_result = await self.get_video_task(str(task_id))
             except Exception as exc:
+                # The tool layer redacts what it reports, but this line is
+                # written before the tool ever sees the exception: the SDK
+                # error carries the account id and both request ids, so it
+                # goes through the same redactor.
                 logger.warning(
-                    "Transient error polling video task %s: %s", task_id, exc
+                    "Transient error polling video task %s: %s",
+                    task_id,
+                    redact_provider_detail(exc),
                 )
                 if time.monotonic() >= deadline:
                     self._record_task_usage(None)

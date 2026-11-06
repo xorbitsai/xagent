@@ -8,6 +8,7 @@ import re
 from inspect import isawaitable
 from typing import Any, Literal, Optional, get_args, get_origin
 
+from ...tools.core.media_errors import MediaParameterError
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -204,12 +205,26 @@ class ElevenLabsMusicModel(BaseMusicModel):
         output_format: str = "auto",
     ) -> MusicResult:
         text = prompt.strip()
+        # These three are the caller's parameters, not provider failures: say
+        # which one was wrong and, where the limit is a number, what it is, so
+        # the tool reports something the caller can act on.
         if not text:
-            raise ValueError("Music prompt must not be empty")
+            raise MediaParameterError(
+                "Music prompt must not be empty",
+                field="prompt",
+            )
         if len(text) > 4100:
-            raise ValueError("Music prompt must not exceed 4100 characters")
+            raise MediaParameterError(
+                "Music prompt must not exceed 4100 characters",
+                field="prompt",
+                allowed_values={"prompt_max_characters": 4100},
+            )
         if music_length_seconds is not None and not 3 <= music_length_seconds <= 600:
-            raise ValueError("music_length_seconds must be between 3 and 600")
+            raise MediaParameterError(
+                "music_length_seconds must be between 3 and 600",
+                field="music_length_seconds",
+                allowed_values={"music_length_seconds": "3-600"},
+            )
 
         request_kwargs: dict[str, Any] = {
             "prompt": text,

@@ -3,6 +3,7 @@
 import logging
 from typing import Any, List, Optional
 
+from ...tools.core.media_errors import redact_provider_detail
 from ..chat.token_context import MediaCallType
 from ..public_xinference import PublicXinferenceClient as XinferenceClient
 from .base import (
@@ -273,7 +274,10 @@ class XinferenceImageModel(BaseImageModel):
             # re-billing an already-billed and already-metered response.
             raise
         except Exception as e:
-            logger.error(f"Xinference image generation failed: {e}")
+            logger.error(
+                "Xinference image generation failed: %s",
+                redact_provider_detail(e),
+            )
             raise RuntimeError(f"Xinference image generation failed: {str(e)}") from e
 
     async def edit_image(
@@ -392,7 +396,10 @@ class XinferenceImageModel(BaseImageModel):
             # re-billing an already-billed and already-metered response.
             raise
         except Exception as e:
-            logger.error(f"Xinference image editing failed: {e}")
+            logger.error(
+                "Xinference image editing failed: %s",
+                redact_provider_detail(e),
+            )
             raise RuntimeError(f"Xinference image editing failed: {str(e)}") from e
 
     async def close(self) -> None:

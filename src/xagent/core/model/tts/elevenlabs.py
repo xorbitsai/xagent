@@ -16,6 +16,7 @@ from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from ...tools.core.media_errors import MediaParameterError
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -638,13 +639,30 @@ class ElevenLabsTTS(BaseTTS):
             format or self.output_format, sample_rate or self.sample_rate
         )
         # Keep saved models discoverable; validate the effective request before
-        # any provider client is opened, including agent-tool callers.
+        # any provider client is opened, including agent-tool callers. Both
+        # checks name the parameter they reject and the values it accepts, so
+        # a caller that passed a format this client cannot produce is told
+        # what it can pass instead of "the request failed".
         requested_format = (format or self.output_format).strip().lower()
         if (
             requested_format not in _GENERIC_OUTPUT_FORMATS
             and requested_format not in _SUPPORTED_OUTPUT_FORMATS
-        ) or final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
-            raise ValueError("Unsupported ElevenLabs output format or sample rate")
+        ):
+            raise MediaParameterError(
+                "Unsupported ElevenLabs output format",
+                field="audio_format",
+                allowed_values={
+                    "audio_format": sorted(_GENERIC_OUTPUT_FORMATS),
+                },
+            )
+        if final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
+            # The format is one this client knows but the sample rate is not
+            # one ElevenLabs renders it at; the accepted rates are a property
+            # of the provider, not a range this adapter can state.
+            raise MediaParameterError(
+                "Unsupported ElevenLabs output sample rate for this format",
+                field="sample_rate",
+            )
         self._validate_sample_rate_request(
             format or self.output_format,
             sample_rate,

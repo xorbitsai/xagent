@@ -26,10 +26,11 @@ So a failed media call now reports three things and nothing else:
 
 The exception itself still goes to the log, at the level it went before, with
 its ids rubbed out (:func:`redact_provider_detail`) -- an operator needs the
-provider's own words, an end user does not. ``model_not_enabled`` also writes a
-fixed second line, ``media model not enabled: provider=<p> model=<m>``, so a
-deployment that never activated a model is one query away instead of one
-support thread away.
+provider's own words, an end user does not. The adapters log through the same
+function, so an id is masked in their warning lines too, not only in the one
+line a tool writes. ``model_not_enabled`` also writes a fixed second line,
+``media model not enabled: provider=<p> model=<m>``, so a deployment that never
+activated a model is one query away instead of one support thread away.
 
 Classification is duck-typed over the exception's ``__cause__``/``__context__``
 chain rather than by provider class: the adapters wrap provider errors in
@@ -38,7 +39,9 @@ media tool must not have to import six SDKs to name a failure. Anything the
 chain does not explain is ``unknown`` -- the honest answer, and the safe one:
 ``unknown`` promises the caller nothing, while a wrongly-guessed
 ``invalid_request`` would send them to change a parameter that was never the
-problem.
+problem. The one thing an adapter can state instead of leaving to inference is
+:class:`MediaParameterError`, which carries the field the provider rejected and
+the values it accepts.
 """
 
 from __future__ import annotations
@@ -47,6 +50,8 @@ import logging
 import re
 from collections.abc import Iterator, Mapping
 from typing import Any, Optional
+
+from ...utils.security import is_credential_key, redact_sensitive_text
 
 MODEL_NOT_ENABLED = "model_not_enabled"
 INVALID_REQUEST = "invalid_request"
@@ -119,6 +124,11 @@ _INVALID_REQUEST_MARKERS = (
     "missing parameter",
     "unprocessable",
     "must be between",
+    # A voice the caller named that the account cannot use. ElevenLabs answers
+    # 404 ``voice_not_found``; the fix is to list the voices and pick one, so
+    # it belongs with the parameter errors rather than with a missing route.
+    "voice_not_found",
+    "voice not found",
 )
 
 # Provider-side wording for "try again later". Transport failures (timeouts,
@@ -172,20 +182,29 @@ _MAX_CAUSE_DEPTH = 8
 
 _REDACTED = "<redacted>"
 
-# Applied in order. The labelled forms come first so that an id the provider
-# named survives as a recognizable field name with its value removed, rather
-# than disappearing into the generic patterns below.
-_REDACTION_RULES = (
-    # "Request id: 0217...", "request_id=...", "request-id ..."
-    (re.compile(r"(?i)\brequest[ _-]?id\b\s*[:=]?\s*\S+"), "request_id=<redacted>"),
-    # "Account id", "org id", "user id" and friends, explicitly labelled.
-    (
-        re.compile(
-            r"(?i)\b(?:account|org|organization|organisation|tenant|user|"
-            r"project|workspace)[ _-]?id\b\s*[:=]?\s*\S+"
-        ),
-        "id=<redacted>",
-    ),
+# A field the provider names, then ``:`` or ``=``, then its value, quoted or
+# not. The value ends at its own quote, a comma, a semicolon, a bracket or
+# whitespace, so masking it leaves the surrounding JSON or repr intact: the
+# earlier version consumed ``\S+`` and ate the quote and the colon instead of
+# the value, turning ``{'request_id': 'req_short_id'}`` into
+# ``{'request_id=<redacted> 'req_short_id'}`` -- balanced only by accident and
+# with the id still there.
+_STRUCTURED_FIELD_PATTERN = re.compile(
+    r"""(?ix)
+    (?<![A-Za-z0-9_-])
+    (?P<name_quote>["']?)
+    (?P<name>[A-Za-z][A-Za-z0-9 _-]{0,40})
+    (?P=name_quote)
+    \s*[:=]\s*
+    (?P<value>"[^"\n]*"|'[^'\n]*'|[^\s,;:()[\]{}"']+)
+    """
+)
+
+# Shapes masked wherever they appear, whatever the field around them. These
+# are the fallback for text that names no field at all (``Your account
+# 2100...4339 has not activated ...``) and for the short ids the field rules
+# cannot see because the provider only wrote the value.
+_SHAPE_RULES = (
     # API keys and bearer tokens, which several SDKs echo in their message.
     (re.compile(r"(?i)\b(?:sk|pk|rk)[-_][A-Za-z0-9._-]{8,}"), _REDACTED),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{8,}"), "bearer <redacted>"),
@@ -210,6 +229,72 @@ _REDACTION_RULES = (
 _MAX_LOGGED_DETAIL = 300
 
 
+def _normalize_field_name(name: str) -> str:
+    """``request id`` / ``requestId`` / ``request-id`` -> ``request_id``."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name.strip())
+    return re.sub(r"[\s-]+", "_", spaced).strip("_").lower()
+
+
+def _is_identifier_field(name: str) -> bool:
+    """Whether ``name`` labels an identifier rather than prose about one."""
+    normalized = _normalize_field_name(name)
+    if not normalized:
+        return False
+    return normalized == "id" or normalized.endswith(("_id", "_ids", "_uuid", "_guid"))
+
+
+def _is_secret_field(name: str) -> bool:
+    """Whether the value of the structured field ``name`` must be masked.
+
+    Credential names reuse :func:`is_credential_key`, the rule the repository
+    already applies to ``identifier=value`` assignments, so a field named
+    ``api_key`` or ``access_token`` is masked here in the quoted shapes that
+    rule does not parse.
+    """
+    normalized = _normalize_field_name(name)
+    if not normalized:
+        return False
+    return _is_identifier_field(normalized) or is_credential_key(normalized)
+
+
+# A quoted run of text: a JSON value, a repr string. ``"""`` does not occur in
+# provider messages, and a value with a newline is split by the caller before
+# this runs, so one line at a time is enough.
+_QUOTED_SECTION_PATTERN = re.compile(r""""[^"\n]*"|'[^'\n]*'""")
+
+
+def _mask_field_assignments(text: str) -> str:
+    """Mask the value of every structured field the rules call secret."""
+    parts: list[str] = []
+    copied = 0
+    for match in _STRUCTURED_FIELD_PATTERN.finditer(text):
+        if match.start() < copied or not _is_secret_field(match.group("name")):
+            continue
+        parts.append(text[copied : match.start("value")])
+        parts.append(_REDACTED)
+        copied = match.end("value")
+    parts.append(text[copied:])
+    return "".join(parts)
+
+
+def _mask_structured_fields(text: str) -> str:
+    """Mask labelled ids and credentials, including those inside a message.
+
+    The quoted contents are masked first: a provider that nests its real error
+    inside ``"message": "..."`` (every OpenAI-compatible SDK does) would
+    otherwise be skipped whole by the outer scan, which matches the outer
+    field and moves past its value -- and that value is where the account id
+    and the request id live.
+    """
+
+    def _mask_section(match: re.Match[str]) -> str:
+        quote = match.group(0)[0]
+        return f"{quote}{_mask_field_assignments(match.group(0)[1:-1])}{quote}"
+
+    masked_inside = _QUOTED_SECTION_PATTERN.sub(_mask_section, text)
+    return _mask_field_assignments(masked_inside)
+
+
 def redact_provider_detail(text: Any) -> str:
     """``text`` on one line, with ids, keys and opaque tokens rubbed out.
 
@@ -217,13 +302,50 @@ def redact_provider_detail(text: Any) -> str:
     provider's own message -- but an operator reading it should not be looking
     at a customer's account id, and an operator's log search should not be able
     to turn one up.
+
+    The repository's credential rules (:func:`redact_sensitive_text`) run
+    first, then the labelled id/credential fields, then the shapes that need
+    no label. Both media adapters and media tools go through this one
+    function, so an id that is hidden in a tool result is hidden in the
+    adapter's own log line too.
     """
     cleaned = " ".join(str(text or "").split())
-    for pattern, replacement in _REDACTION_RULES:
+    cleaned = redact_sensitive_text(cleaned)
+    cleaned = _mask_structured_fields(cleaned)
+    for pattern, replacement in _SHAPE_RULES:
         cleaned = pattern.sub(replacement, cleaned)
     if len(cleaned) > _MAX_LOGGED_DETAIL:
         cleaned = cleaned[:_MAX_LOGGED_DETAIL].rstrip() + "…"
     return cleaned
+
+
+class MediaParameterError(ValueError):
+    """A request parameter the caller can change, and the values it accepts.
+
+    The adapters check a few parameters before the provider sees them -- an
+    output format the client cannot encode, a clip length outside the model's
+    range, a prompt over the limit. A bare ``ValueError`` says only that
+    something was wrong, which leaves the failure ``unknown`` and the caller
+    with nothing to change. This carries the field name and, where the adapter
+    knows them, the accepted values.
+
+    Raise it only for a parameter the caller supplied and can change; a bug in
+    our own code is not the caller's request error.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field: str,
+        allowed_values: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.field = field
+        # ``None`` rather than an empty dict: no reliable range means the
+        # failure says "the request was rejected" and stops there, instead of
+        # inventing values the caller would then try and fail with.
+        self.allowed_values = dict(allowed_values) if allowed_values else None
 
 
 def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
@@ -286,12 +408,45 @@ def _code_strings(exc: BaseException) -> list[str]:
     return codes
 
 
+def _code_and_target_strings(exc: BaseException) -> list[str]:
+    """The provider's code and the request target it blames, as strings.
+
+    Only the fields that say *what* was refused, never the message: a message
+    mentioning a model does not prove the model was the thing refused.
+    """
+    values: list[str] = []
+
+    def _add(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+
+    for link in _exception_chain(exc):
+        containers: list[Any] = [link]
+        body = getattr(link, "body", None)
+        if isinstance(body, Mapping):
+            containers.append(body)
+            error = body.get("error")
+            if isinstance(error, Mapping):
+                containers.append(error)
+        for container in containers:
+            if isinstance(container, Mapping):
+                for key in ("code", "param", "target", "field"):
+                    _add(container.get(key))
+            else:
+                for attribute in ("code", "param", "target", "field"):
+                    _add(getattr(container, attribute, None))
+    return values
+
+
 def classify_media_failure(exc: BaseException) -> str:
     """The category for ``exc``, from its chain and the HTTP status it carries."""
     statuses: list[int] = []
     haystack: list[str] = []
     class_names: list[str] = []
+    parameter_rejected = False
     for link in _exception_chain(exc):
+        if isinstance(link, MediaParameterError):
+            parameter_rejected = True
         status = _status_code(link)
         if status is not None:
             statuses.append(status)
@@ -299,14 +454,23 @@ def classify_media_failure(exc: BaseException) -> str:
         haystack.append(str(link))
         class_names.append(type(link).__name__.lower())
 
+    # An adapter that already knows the caller passed something it cannot use
+    # says so, in its own type; that beats any guess from a status.
+    if parameter_rejected:
+        return INVALID_REQUEST
+
     lowered = " ".join(haystack).lower()
 
     if any(marker in lowered for marker in _MODEL_NOT_ENABLED_MARKERS):
         return MODEL_NOT_ENABLED
-    # A media API answers 404 for a model the caller may not use far more often
-    # than for a missing route, and the two are the same thing to the person
-    # waiting: this deployment cannot generate with it.
-    if 404 in statuses:
+    # A 404 is "this deployment cannot use the model" only when the provider
+    # says so: a code or request target that names a model. The same status
+    # answers a missing route, a voice that does not exist and a deleted
+    # file, and calling those "not enabled, and changing the request will not
+    # help" both misleads the caller and fires the not-enabled alert.
+    if 404 in statuses and any(
+        "model" in value.lower() for value in _code_and_target_strings(exc)
+    ):
         return MODEL_NOT_ENABLED
     if any(status in _INVALID_REQUEST_STATUSES for status in statuses):
         return INVALID_REQUEST
@@ -349,6 +513,20 @@ def media_error_fields(
     if allowed_values and category == INVALID_REQUEST:
         fields["allowed_values"] = dict(allowed_values)
     return fields
+
+
+def _parameter_allowed_values(exc: BaseException) -> Optional[dict[str, Any]]:
+    """The values a rejected parameter accepts, when the exception knows them.
+
+    An adapter that validated the parameter itself knows the field and its
+    real range; the tool's own list is a fallback for the providers that do
+    their checking on the far side.
+    """
+    for link in _exception_chain(exc):
+        values = getattr(link, "allowed_values", None)
+        if isinstance(values, Mapping) and values:
+            return dict(values)
+    return None
 
 
 def _model_identity(model: Any) -> tuple[str, str]:
@@ -396,4 +574,7 @@ def media_failure_fields(
     if category == MODEL_NOT_ENABLED:
         provider, name = _model_identity(model)
         logger.error("media model not enabled: provider=%s model=%s", provider, name)
-    return media_error_fields(category, allowed_values=allowed_values)
+    return media_error_fields(
+        category,
+        allowed_values=_parameter_allowed_values(exc) or allowed_values,
+    )

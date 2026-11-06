@@ -28,8 +28,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from xagent.core.model.asr.base import ASRResult, BaseASR
+from xagent.core.model.image import dashscope as dashscope_image
+from xagent.core.model.image.dashscope import DashScopeImageModel
+from xagent.core.model.music.elevenlabs import ElevenLabsMusicModel
+from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.base import BaseTTS, TTSResult
+from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.core.model.video.ark import ArkVideoModel
+from xagent.core.model.video.base import BilledVideoTaskTimeout
 from xagent.core.tools.core.audio_tool import AudioToolCore
 from xagent.core.tools.core.image_tool import ImageGenerationToolCore
 from xagent.core.tools.core.media_errors import (
@@ -37,9 +43,12 @@ from xagent.core.tools.core.media_errors import (
     MODEL_NOT_ENABLED,
     PROVIDER_UNAVAILABLE,
     UNKNOWN,
+    MediaParameterError,
     classify_media_failure,
     redact_provider_detail,
 )
+from xagent.core.tools.core.music_tool import MusicToolCore
+from xagent.core.tools.core.sound_effect_tool import SoundEffectToolCore
 from xagent.core.tools.core.video_tool import VideoGenerationToolCore
 
 ACCOUNT_ID = "2100123456784339"
@@ -354,3 +363,361 @@ class TestClassification:
         assert ACCOUNT_ID not in detail
         assert PROVIDER_REQUEST_ID not in detail
         assert "sk-live" not in detail
+
+
+
+
+
+class FailingVoiceTTS(BaseTTS):
+    """A voice-capable TTS client whose provider calls all fail."""
+
+    provider_name = "elevenlabs"
+    supports_voice_listing = True
+    supports_persistent_voice_cloning = True
+
+    def __init__(self, error: Exception) -> None:
+        self.model_name = "eleven_v3"
+        self._error = error
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Union[bytes, TTSResult]:
+        raise self._error
+
+    async def list_available_voices(self) -> list[dict[str, Any]]:
+        raise self._error
+
+    async def clone_voice(self, **kwargs: Any) -> dict[str, Any]:
+        raise self._error
+
+    async def delete_voice(self, voice_id: str) -> None:
+        raise self._error
+
+    @property
+    def abilities(self) -> list[str]:
+        return ["tts", "voice_listing", "voice_cloning"]
+
+
+def _voice_tool(error: Exception) -> tuple[AudioToolCore, FailingVoiceTTS]:
+    model = FailingVoiceTTS(error)
+    tool = AudioToolCore(
+        tts_models={"elevenlabs-tts": model},
+        default_tts_model=model,
+    )
+    return tool, model
+
+
+class TestAdapterLogs:
+    """The adapters log before a tool can redact anything, so they share the
+    redactor. These tests read the whole logger hierarchy, not one logger."""
+
+    @pytest.mark.asyncio
+    async def test_a_polling_failure_writes_no_account_or_request_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        model = ArkVideoModel(api_key="test-key")
+        model.create_video_task = AsyncMock(return_value={"task_id": "cgt-1"})
+        model.get_video_task = AsyncMock(side_effect=model_not_open_error())
+
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(BilledVideoTaskTimeout):
+                # A deadline that has already passed ends the loop after the
+                # first failed poll: the warning is written either way.
+                await model.generate_video(prompt="A clip", timeout=-1)
+
+        assert "Transient error polling video task" in caplog.text
+        assert ACCOUNT_ID not in caplog.text
+        assert PROVIDER_REQUEST_ID not in caplog.text
+        assert SDK_REQUEST_ID not in caplog.text
+
+
+class TestStructuredRedaction:
+    """Ids in the shapes providers actually print: JSON, repr and plain text."""
+
+    @pytest.mark.parametrize(
+        ("detail", "hidden"),
+        [
+            ("request_id=abc", "abc"),
+            ("account_id=xyz", "xyz"),
+            ("request_id=req_short_id", "req_short_id"),
+            ("request_id: req_short_id", "req_short_id"),
+            ("{'request_id': 'req_short_id'}", "req_short_id"),
+            ('{"request_id": "req_short_id"}', "req_short_id"),
+            ('{"error": {"api_key": "review_key_alpha"}}', "review_key_alpha"),
+            ("api_key=review_key_alpha", "review_key_alpha"),
+            ('{"voice_id": "21m00Tcm4TlvDq8ikWAM"}', "21m00Tcm4TlvDq8ikWAM"),
+        ],
+    )
+    def test_a_labelled_identifier_is_masked_in_its_own_shape(
+        self, detail: str, hidden: str
+    ) -> None:
+        assert hidden not in redact_provider_detail(detail)
+
+    def test_masking_a_repr_keeps_its_delimiters(self) -> None:
+        """The value goes, the punctuation around it stays: consuming the
+        quote and the colon instead left the id itself in the log."""
+        detail = redact_provider_detail(
+            "{'request_id': 'req_short_id', 'account_id': 'acct_abc'}"
+        )
+
+        assert detail == "{'request_id': <redacted>, 'account_id': <redacted>}"
+
+    def test_an_identifier_inside_a_json_message_is_masked(self) -> None:
+        """SDKs nest the real error in `"message": "..."`; scanning only the
+        outer field skipped everything inside it."""
+        detail = redact_provider_detail(
+            '{"error": {"code": "ModelNotOpen", "message": "Your account '
+            f"{ACCOUNT_ID} has not activated it. Request id: "
+            f'{PROVIDER_REQUEST_ID}"}}}}'
+        )
+
+        assert "has not activated" in detail
+        assert ACCOUNT_ID not in detail
+        assert PROVIDER_REQUEST_ID not in detail
+
+
+class TestNotFoundClassification:
+    """A 404 is only a missing model when the provider says it is."""
+
+    def test_a_voice_that_does_not_exist_is_the_callers_to_fix(self) -> None:
+        error = ProviderStatusError(
+            status_code=404, code="voice_not_found", message="voice not found"
+        )
+
+        assert classify_media_failure(error) == INVALID_REQUEST
+
+    def test_a_missing_resource_is_not_a_missing_model(self) -> None:
+        error = ProviderStatusError(
+            status_code=404,
+            code="resource_not_found",
+            message="the requested resource was not found",
+        )
+
+        assert classify_media_failure(error) == UNKNOWN
+
+    def test_a_404_that_names_the_model_as_its_target_is_not_enabled(self) -> None:
+        error = ProviderStatusError(
+            status_code=404,
+            code="invalid_request_error",
+            message="no endpoint serves this request",
+        )
+        error.body["error"]["param"] = "model"
+
+        assert classify_media_failure(error) == MODEL_NOT_ENABLED
+
+    @pytest.mark.asyncio
+    async def test_listing_voices_through_a_404_writes_no_not_enabled_marker(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tool, _ = _voice_tool(
+            ProviderStatusError(
+                status_code=404, code="voice_not_found", message="voice not found"
+            )
+        )
+
+        with caplog.at_level(logging.ERROR):
+            result = await tool.list_tts_voices()
+
+        assert result["error_category"] == INVALID_REQUEST
+        assert "media model not enabled" not in caplog.text
+        assert ACCOUNT_ID not in json.dumps(result, default=str)
+
+
+class TestParameterErrorsFromTheAdapters:
+    """An adapter that validated a parameter says which one and its range."""
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_speech_format_lists_the_provider_formats(
+        self,
+    ) -> None:
+        tts_model = ElevenLabsTTS(api_key="test-key")
+        tool = AudioToolCore(
+            tts_models={"elevenlabs": tts_model},
+            default_tts_model=tts_model,
+        )
+
+        result = await tool.synthesize_speech("Hello", audio_format="not-a-format")
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        formats = result["allowed_values"]["audio_format"]
+        # The adapter knows ElevenLabs also renders opus/ulaw, which the
+        # tool's own documented list does not mention.
+        assert "opus" in formats
+        assert "mp3" in formats
+        assert "not-a-format" not in json.dumps(result, default=str)
+
+    @pytest.mark.asyncio
+    async def test_a_music_length_outside_the_range_reports_the_range(self) -> None:
+        model = ElevenLabsMusicModel(api_key="test-key")
+        tool = MusicToolCore(models={"elevenlabs-music": model}, default_model=model)
+
+        result = await tool.generate_music("A slow piano theme", music_length_seconds=2)
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["allowed_values"] == {"music_length_seconds": "3-600"}
+        # The plain sentence is all the model reads: the provider's own text,
+        # which names the field and the range in its words, stays in the log.
+        assert result["error"] == (
+            "The request was rejected because a parameter is outside what this "
+            "model supports."
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_overlong_music_prompt_reports_the_limit(self) -> None:
+        model = ElevenLabsMusicModel(api_key="test-key")
+        tool = MusicToolCore(models={"elevenlabs-music": model}, default_model=model)
+
+        result = await tool.generate_music("x" * 4101)
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["allowed_values"] == {"prompt_max_characters": 4100}
+
+    @pytest.mark.asyncio
+    async def test_a_sound_effect_length_outside_the_range_reports_the_range(
+        self,
+    ) -> None:
+        model = ElevenLabsSoundEffectModel(api_key="test-key")
+        tool = SoundEffectToolCore(
+            models={"elevenlabs-sound": model}, default_model=model
+        )
+
+        result = await tool.generate_sound_effect("A door slams", duration_seconds=0.4)
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["allowed_values"] == {"duration_seconds": "0.5-30"}
+
+    @pytest.mark.asyncio
+    async def test_a_parameter_with_no_known_range_carries_no_allowed_values(
+        self,
+    ) -> None:
+        """No reliable range means no range: the failure says the request was
+        rejected and stops there instead of inventing values."""
+        model = ElevenLabsMusicModel(api_key="test-key")
+        tool = MusicToolCore(models={"elevenlabs-music": model}, default_model=model)
+
+        result = await tool.generate_music("   ")
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+
+    def test_a_typed_parameter_error_wins_over_an_ambiguous_status(self) -> None:
+        """The adapter knows more than the status does, in both directions."""
+        error = MediaParameterError("bad format", field="audio_format")
+
+        assert classify_media_failure(error) == INVALID_REQUEST
+
+
+class _FakeHTTPResponse:
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        self._body = body
+
+    async def text(self) -> str:
+        return self._body
+
+    async def json(self) -> Any:
+        raise AssertionError("a non-200 body is never decoded")
+
+
+class _FakePost:
+    def __init__(self, response: _FakeHTTPResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeHTTPResponse:
+        return self._response
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return False
+
+
+class _FakeSession:
+    def __init__(self, response: _FakeHTTPResponse) -> None:
+        self._response = response
+
+    def post(self, *args: Any, **kwargs: Any) -> _FakePost:
+        return _FakePost(self._response)
+
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return False
+
+
+class TestDashScopeStatusCodes:
+    """The DashScope adapter keeps the HTTP status instead of spelling it
+    into the text, so a 429 or 503 stays a retryable outage."""
+
+    @pytest.mark.parametrize("status", [429, 503])
+    @pytest.mark.asyncio
+    async def test_a_retryable_status_reaches_the_result(
+        self, monkeypatch: pytest.MonkeyPatch, status: int
+    ) -> None:
+        monkeypatch.setattr(
+            dashscope_image,
+            "create_public_model_aiohttp_session",
+            lambda **kwargs: _FakeSession(
+                _FakeHTTPResponse(status, "upstream temporarily busy")
+            ),
+        )
+        model = DashScopeImageModel(model_name="qwen-image", api_key="test-key")
+        tool = ImageGenerationToolCore(
+            {"dashscope": model},
+            default_generate_model=model,
+        )
+
+        result = await tool.generate_image("A product shot")
+
+        assert result["success"] is False
+        assert result["error_category"] == PROVIDER_UNAVAILABLE
+        assert "upstream temporarily busy" not in json.dumps(result, default=str)
+
+
+class TestVoiceTools:
+    """The voice helpers leaked the provider's text like the other media
+    tools did; they now report the same category and plain sentence."""
+
+    @pytest.mark.asyncio
+    async def test_listing_voices_reports_no_provider_detail(self) -> None:
+        tool, _ = _voice_tool(model_not_open_error())
+
+        result = await tool.list_tts_voices()
+
+        assert result["success"] is False
+        assert result["error_category"] == MODEL_NOT_ENABLED
+        readable = json.dumps(result, default=str)
+        for leaked in (ACCOUNT_ID, PROVIDER_REQUEST_ID, SDK_REQUEST_ID, "ModelNotOpen"):
+            assert leaked not in readable
+
+    @pytest.mark.asyncio
+    async def test_cloning_a_voice_reports_no_provider_detail(self) -> None:
+        tool, _ = _voice_tool(model_not_open_error())
+
+        result = await tool.clone_tts_voice("My voice", ["reference.mp3"])
+
+        assert result["success"] is False
+        assert result["error_category"] == MODEL_NOT_ENABLED
+        assert ACCOUNT_ID not in json.dumps(result, default=str)
+        assert "ModelNotOpen" not in json.dumps(result, default=str)
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_voice_reports_no_provider_detail(self) -> None:
+        tool, _ = _voice_tool(model_not_open_error())
+
+        result = await tool.delete_tts_voice("voice-1")
+
+        assert result["success"] is False
+        assert result["error_category"] == MODEL_NOT_ENABLED
+        assert ACCOUNT_ID not in json.dumps(result, default=str)
+        assert "ModelNotOpen" not in json.dumps(result, default=str)

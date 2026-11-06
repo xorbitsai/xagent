@@ -7,6 +7,7 @@ import logging
 from collections.abc import AsyncGenerator
 from typing import Any, Optional, Protocol, Union
 
+from ...tools.core.media_errors import redact_provider_detail
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
@@ -292,7 +293,7 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
                 return audio_data
 
         except Exception as e:
-            logger.error(f"Xinference TTS failed: {e}")
+            logger.error("Xinference TTS failed: %s", redact_provider_detail(e))
             raise RuntimeError(f"Xinference TTS failed: {str(e)}") from e
 
     @property

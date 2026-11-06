@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Callable, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -449,13 +450,15 @@ async def _drive_channel(
     usage: TurnUsage | None = None,
     committed: bool = True,
     pause: bool = False,
+    finalize_gate: tuple[threading.Event, threading.Event] | None = None,
 ) -> dict[str, Any]:
     """Run ``execute_channel_background`` with its collaborators faked.
 
     The result write is the entry's own ``finalize`` closure around a fake
     ``finalize_managed_task_lease_result_sync``, which fills the report as a
-    committed interruption pause does when ``pause`` is set. Returns the
-    keyword arguments ``execute_task`` received.
+    committed interruption pause does when ``pause`` is set, and, given
+    ``finalize_gate``, signals the first event and then blocks on the second.
+    Returns the keyword arguments ``execute_task`` received.
     """
     seen: dict[str, Any] = {}
 
@@ -513,19 +516,26 @@ async def _drive_channel(
     )
 
     def fake_finalize(_lease: Any, **kwargs: Any) -> bool:
+        if finalize_gate is not None:
+            started, release = finalize_gate
+            started.set()
+            release.wait()
         if pause:
             kwargs["report"].paused_for = InterruptionReason.LLM_UNAVAILABLE
         return committed
-
-    async def run_db_io(work: Any) -> Any:
-        # Only the result write runs; every other database step is skipped.
-        return work() if getattr(work, "__name__", "") == "finalize" else None
 
     monkeypatch.setattr(
         "xagent.web.services.managed_task_lease."
         "finalize_managed_task_lease_result_sync",
         fake_finalize,
     )
+    real_run_db_io = shared_channel_execution.run_db_io_cancellation_safe
+
+    async def run_db_io(work: Any) -> Any:
+        # Every other database step is skipped; a result write that went
+        # through here would still run for real, in a worker thread.
+        return await real_run_db_io(work) if work.__name__ == "finalize" else None
+
     monkeypatch.setattr(
         shared_channel_execution, "run_db_io_cancellation_safe", run_db_io
     )
@@ -705,6 +715,27 @@ async def test_channel_run_without_output_reports_an_empty_answer(monkeypatch) -
     assert [(s.status, s.empty_visible_answer) for s in received] == [
         ("completed", True)
     ]
+
+
+async def test_channel_turn_cancelled_while_its_result_commits_is_reported(
+    monkeypatch,
+) -> None:
+    received = _capture()
+    started, release = threading.Event(), threading.Event()
+    drive = asyncio.create_task(
+        _drive_channel(monkeypatch, finalize_gate=(started, release))
+    )
+
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        drive.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drive
+    await _settle_inflight()
+
+    assert [(s.status, s.turn_id) for s in received] == [("completed", "cmd-1")]
 
 
 # ---------------------------------------------------------------------------
@@ -1038,6 +1069,7 @@ async def _drive_resume(
     trusted_task_source: str | None = "sdk",
     extra_patches: tuple[Any, ...] = (),
     preacquired_prior_status: TaskStatus | None = None,
+    finalize_side_effect: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> type[BaseException] | None:
     from xagent.web.services.task_execution import execute_resume_background
 
@@ -1085,6 +1117,11 @@ async def _drive_resume(
             ),
             patch(
                 "xagent.web.services.task_execution._finalize_resumed_task",
+                side_effect=(
+                    None
+                    if finalize_side_effect is None
+                    else lambda *_a, **_k: finalize_side_effect(finalized)
+                ),
                 return_value=finalized,
             ),
             patch(
@@ -1552,6 +1589,36 @@ async def test_resume_late_result_reports_nothing(monkeypatch) -> None:
     )
 
     assert received == []
+
+
+async def test_resume_cancelled_while_its_result_commits_is_reported(
+    monkeypatch,
+) -> None:
+    received = _capture()
+    loop = asyncio.get_running_loop()
+    holder: list[asyncio.Task[Any]] = []
+
+    def cancel_while_writing(finalized: dict[str, Any]) -> dict[str, Any]:
+        # Runs in the worker thread: the cancellation reaches the awaiting
+        # coroutine while its result write is still in flight.
+        loop.call_soon_threadsafe(holder[0].cancel)
+        processed = threading.Event()
+        loop.call_soon_threadsafe(processed.set)
+        processed.wait()
+        return finalized
+
+    drive = asyncio.create_task(
+        _drive_resume(
+            monkeypatch,
+            RESUME_OK,
+            settled=False,
+            finalize_side_effect=cancel_while_writing,
+        )
+    )
+    holder.append(drive)
+
+    assert await drive is asyncio.CancelledError
+    assert [(s.status, s.error_code) for s in received] == [("completed", None)]
 
 
 async def test_resume_finding_the_task_terminal_reports_the_kept_status(

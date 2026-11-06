@@ -4517,24 +4517,40 @@ async def execute_resume_background(
 
         outputs_for_finalizer = prepared_outputs
         try:
-            finalized = await run_db_io_cancellation_safe(
-                lambda: _finalize_resumed_task(
-                    task_id,
-                    status=status,
-                    success=success,
-                    output=output,
-                    task_owner_user_id=task_owner_user_id,
-                    result=result,
-                    task_lease=lease,
-                    prepared_outputs=outputs_for_finalizer,
+            finalization_worker = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(
+                    lambda: _finalize_resumed_task(
+                        task_id,
+                        status=status,
+                        success=success,
+                        output=output,
+                        task_owner_user_id=task_owner_user_id,
+                        result=result,
+                        task_lease=lease,
+                        prepared_outputs=outputs_for_finalizer,
+                    )
                 )
+            )
+            finalized, finalization_cancellation = await await_task_settlement(
+                finalization_worker
             )
         finally:
             # Once invoked, the fenced finalizer owns success cleanup or
             # compensation, including cancellation-safe late completion.
             prepared_outputs = None
-        if finalized["late_result"]:
-            if finalized.get("kept_terminal_status") is not None:
+        # A cancellation that arrived while the result was written is raised
+        # only after the settled outcome is recorded for the cleanup's report.
+        with propagate_deferred_cancellation(finalization_cancellation):
+            if not finalized["late_result"]:
+                facts.absorb_result(result)
+                facts.outcome = settled_outcome(
+                    finalized["final_status"],
+                    failure_code=finalized.get("error_code"),
+                    visible_text=str(finalized["output"] or ""),
+                    output_missing=facts.output_missing,
+                )
+                facts.completion_outcome = finalized.get("completion_outcome")
+            elif finalized.get("kept_terminal_status") is not None:
                 # The task was already terminal: report the status it kept.
                 facts.absorb_result(result)
                 facts.outcome = settled_outcome(
@@ -4542,6 +4558,7 @@ async def execute_resume_background(
                     output_missing=facts.output_missing,
                     ignored_result=True,
                 )
+        if finalized["late_result"]:
             logger.info(
                 "Ignoring late resume result for task %s run %s; ownership changed",
                 task_id,
@@ -4554,14 +4571,6 @@ async def execute_resume_background(
             return
         normalized_outputs = finalized["normalized_outputs"]
         output = finalized["output"]
-        facts.absorb_result(result)
-        facts.outcome = settled_outcome(
-            finalized["final_status"],
-            failure_code=finalized.get("error_code"),
-            visible_text=str(output or ""),
-            output_missing=facts.output_missing,
-        )
-        facts.completion_outcome = finalized.get("completion_outcome")
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
         task_title = finalized["task_title"]

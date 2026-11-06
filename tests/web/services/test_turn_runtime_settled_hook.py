@@ -100,7 +100,7 @@ async def drive_channel_background(
     monkeypatch: pytest.MonkeyPatch,
     *,
     fail_before_execute: str | None = None,
-    run_db_io: AsyncMock | None = None,
+    finalize: Callable[..., bool] | None = None,
 ) -> None:
     outcome = agent_outcome(path)
     tracer = SimpleNamespace(add_handler=Mock(), remove_handler=Mock())
@@ -167,9 +167,14 @@ async def drive_channel_background(
         shared_channel_execution, "channel_durable_result", lambda *_a: {}
     )
     monkeypatch.setattr(
+        "xagent.web.services.managed_task_lease."
+        "finalize_managed_task_lease_result_sync",
+        finalize or Mock(return_value=True),
+    )
+    monkeypatch.setattr(
         shared_channel_execution,
         "run_db_io_cancellation_safe",
-        run_db_io or AsyncMock(return_value=True),
+        AsyncMock(return_value=True),
     )
 
     snapshot = SimpleNamespace(

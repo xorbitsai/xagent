@@ -1,4 +1,5 @@
 import base64
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -601,3 +602,112 @@ async def test_other_video_models_keep_the_length_they_are_given(mock_workspace)
     assert result["success"] is True
     assert xinference_model.generate_video.await_args.kwargs["seconds"] == 3
     assert "duration_adjusted" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_failed_generation_does_not_carry_the_internal_model_id(
+    mock_workspace, caplog
+):
+    """The model id is a diagnostic: it goes to the log, not to the model."""
+    tool, ark_model = _ark_video_tool(mock_workspace)
+    ark_model.generate_video = AsyncMock(side_effect=RuntimeError("provider exploded"))
+
+    with caplog.at_level(logging.INFO):
+        result = await tool.generate_video("A short clip", seconds=4)
+
+    assert result["success"] is False
+    assert "model_used" not in result
+    assert "ark-video" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_provider_reported_length_wins_over_the_adjusted_request(
+    mock_workspace,
+):
+    """A clip asked for at 4 seconds can come back at 5; the note says 5."""
+    tool, ark_model = _ark_video_tool(
+        mock_workspace,
+        result={
+            "task_id": "task-ark",
+            "status": "succeeded",
+            "video_url": "",
+            "duration": 5,
+        },
+    )
+
+    result = await tool.generate_video("A three-second idea", seconds=3)
+
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == 4
+    assert result["duration"] == 5
+    assert result["duration_adjusted"] == {"requested": 3, "used": 5}
+    assert "shortest supported clip is 4 seconds" in result["duration_note"]
+    assert result["duration_note"].endswith("this clip is 5 seconds long.")
+
+
+@pytest.mark.asyncio
+async def test_a_seedance_version_without_a_recorded_range_keeps_the_length(
+    mock_workspace,
+):
+    """Seedance 2.5 accepts 4-30 seconds, so the 2.0 bounds must not clamp it."""
+    tool, ark_model = _ark_video_tool(
+        mock_workspace, model_name="doubao-seedance-2-5-pro-260101"
+    )
+
+    result = await tool.generate_video("A short clip", seconds=2)
+
+    assert result["success"] is True
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == 2
+    assert "duration_adjusted" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_seedance_version_without_a_recorded_range_is_not_refused(
+    mock_workspace,
+):
+    """No known range means no local refusal: the provider decides."""
+    tool, ark_model = _ark_video_tool(
+        mock_workspace, model_name="doubao-seedance-2-5-pro-260101"
+    )
+
+    result = await tool.generate_video("A long clip", seconds=20)
+
+    assert result["success"] is True
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == 20
+    assert "allowed_values" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [0, -2, 4.5])
+async def test_a_length_that_cannot_be_a_clip_is_refused_locally(
+    mock_workspace, length
+):
+    tool, ark_model = _ark_video_tool(mock_workspace)
+
+    result = await tool.generate_video("A clip", seconds=length)
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert result["allowed_values"] == {"duration_seconds": "4-15"}
+    ark_model.generate_video.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_length_is_refused_for_a_model_with_no_known_range(
+    mock_workspace,
+):
+    xinference_model = XinferenceVideoModel(model_name="Wan2.1-t2v-14B-480p")
+    xinference_model.generate_video = AsyncMock(
+        return_value={"task_id": "task-x", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"xinference-video": xinference_model},
+        workspace=mock_workspace,
+        default_video_model=xinference_model,
+    )
+
+    result = await tool.generate_video("A clip", seconds=0)
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert "allowed_values" not in result
+    xinference_model.generate_video.assert_not_called()

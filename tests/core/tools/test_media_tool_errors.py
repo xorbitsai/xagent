@@ -365,9 +365,6 @@ class TestClassification:
         assert "sk-live" not in detail
 
 
-
-
-
 class FailingVoiceTTS(BaseTTS):
     """A voice-capable TTS client whose provider calls all fail."""
 

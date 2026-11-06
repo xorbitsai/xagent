@@ -3,6 +3,7 @@ import importlib
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, List, Optional
 
@@ -23,37 +24,45 @@ _STANDARD_RATIOS = (
 )
 _RATIO_TOLERANCE = 0.02
 
-# Whole seconds each Seedance family accepts. The lower bound is 4 for the
-# whole family; the upper bound differs by family and comes from the two
-# places that state it: the ``generate_video`` provider notes (xagent
+# Whole seconds each Seedance family accepts, keyed by the version its provider
+# model name carries: ``doubao-seedance-2-0-fast-260128`` is (2, 0),
+# ``doubao-seedance-1-5-pro-250528`` is (1, 5). The bounds come from the two
+# places that state them: the ``generate_video`` provider notes (xagent
 # ``tools/core/video_tool.py``, "Seedance 1.5 Pro supports 4-12 seconds or -1
 # for intelligent duration; Seedance 2.0 supports 4-15 seconds or -1") and the
-# Ark video-generation docs those notes follow. Matched as a substring of the
-# provider model name, so ``doubao-seedance-2-0-fast-260128`` and its future
-# dated siblings keep the 2.0 bound without a new row per release.
-SEEDANCE_DURATION_LIMITS = (
-    ("seedance-1-5-pro", 4, 12),
-    ("seedance-2", 4, 15),
-)
-# Anything else named Seedance: the family range, which is what a caller who
-# asks for "a Seedance clip" is told to stay inside.
-DEFAULT_SEEDANCE_DURATION_LIMITS = (4, 15)
+# Ark video-generation documentation those notes follow, whose ``duration``
+# field lists the same two ranges:
+#   https://api.volcengine.com/api-docs/view?action=CreateContentsGenerationsTasks&serviceCode=ark&version=2024-01-01
+#   https://docs.volcengine.com/docs/ark/video-generation-tutorial
+# Matched on the version numbers instead of on a substring of the name: a bare
+# ``seedance-2`` is also a prefix of ``doubao-seedance-2-5-...``, and 2.5 takes
+# 4-30 seconds (1.0 takes 2-12), so the 2.0 bound would refuse clips the model
+# accepts. A family that is not in this table has no known range here, which is
+# what ``seedance_duration_limits`` reports.
+SEEDANCE_DURATION_LIMITS: dict[tuple[int, int], tuple[int, int]] = {
+    (1, 5): (4, 12),
+    (2, 0): (4, 15),
+}
+
+_SEEDANCE_VERSION_PATTERN = re.compile(r"seedance-(\d+)-(\d+)(?!\d)")
 
 logger = logging.getLogger(__name__)
 
 
-def seedance_duration_limits(model_name: str) -> tuple[int, int]:
-    """``(shortest, longest)`` whole seconds ``model_name`` accepts.
+def seedance_duration_limits(model_name: str) -> Optional[tuple[int, int]]:
+    """``(shortest, longest)`` whole seconds ``model_name`` accepts, or ``None``.
 
     Ark answers anything outside the range with a bare ``InvalidParameter``,
     so the caller clamps up to the shortest length and reports the range
-    instead of letting the provider reject the request.
+    instead of letting the provider reject the request. A model whose family
+    is not known here returns ``None``: the caller then leaves the length to
+    the provider and reports no range, rather than a range that was guessed.
     """
     lowered = str(model_name or "").lower().replace("_", "-").replace(".", "-")
-    for family, shortest, longest in SEEDANCE_DURATION_LIMITS:
-        if family in lowered:
-            return shortest, longest
-    return DEFAULT_SEEDANCE_DURATION_LIMITS
+    match = _SEEDANCE_VERSION_PATTERN.search(lowered)
+    if match is None:
+        return None
+    return SEEDANCE_DURATION_LIMITS.get((int(match.group(1)), int(match.group(2))))
 
 
 def _to_plain_data(value: Any) -> Any:

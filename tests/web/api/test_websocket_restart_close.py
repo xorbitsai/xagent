@@ -1,8 +1,11 @@
 """A planned restart closes registered WebSockets with 1012 Service Restart."""
 
 import asyncio
+import json
+import time
 
 import pytest
+from starlette.websockets import WebSocketState
 
 from xagent.web.api import websocket as ws_module
 from xagent.web.api.websocket import ConnectionManager, _command_origins
@@ -15,13 +18,17 @@ class FakeSocket:
         fail_close: bool = False,
         hang_close: bool = False,
         log: list[str] | None = None,
+        send_yields: bool = False,
     ) -> None:
+        self.send_yields = send_yields
         self.closed: list[tuple[int, str | None]] = []
         self.fail_close = fail_close
         self.hang_close = hang_close
         self.log = log if log is not None else []
 
     async def send_text(self, text: str) -> None:
+        if self.send_yields:
+            await asyncio.sleep(0)
         self.log.append(f"sent:{text}")
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
@@ -176,22 +183,6 @@ async def test_end_restart_drain_admits_new_sockets_again(manager):
 
 
 @pytest.mark.asyncio
-async def test_reply_is_sent_before_1012_on_a_registered_origin(manager):
-    log: list[str] = []
-    ws = FakeSocket(log=log)
-    manager.register_connection(ws, 1)
-    _command_origins.register("cmd-1", ws, 1)
-
-    closing = asyncio.create_task(manager.close_for_restart(reply_deadline_seconds=5))
-    await asyncio.sleep(0.1)
-    await ws.send_text("reply")
-    _command_origins.discard_command("cmd-1", 1)
-    await asyncio.wait_for(closing, timeout=2)
-
-    assert log == ["sent:reply", "close:1012"]
-
-
-@pytest.mark.asyncio
 async def test_stalled_close_is_bounded_and_unregisters(manager):
     stuck = FakeSocket(hang_close=True)
     manager.register_connection(stuck, 1)
@@ -278,3 +269,300 @@ async def test_command_handlers_hold_ingress_while_enqueueing(monkeypatch, name)
 
 async def _reply_delivery(websocket, **_kwargs):
     await websocket.send_text("reply")
+
+
+@pytest.fixture
+def global_manager(monkeypatch):
+    """The module-level manager, which the real reply path is bound to."""
+
+    async def passthrough(message):
+        return message
+
+    monkeypatch.setattr(ws_module, "_with_current_task_control_state", passthrough)
+    gm = ws_module.manager
+    yield gm
+    gm.end_restart_drain()
+    for ws in list(gm._connection_task_ids):
+        gm.disconnect(ws)
+    _command_origins._origins.clear()
+
+
+@pytest.mark.asyncio
+async def test_task_id_updated_reply_precedes_1012_through_the_real_reply_path(
+    global_manager,
+):
+    # A legacy first chat: the reply re-registers the socket on the new task
+    # while the manager drains, then sends ``task_id_updated``.
+    log: list[str] = []
+    ws = FakeSocket(log=log, send_yields=True)
+    global_manager.register_connection(ws, 1)
+    _command_origins.register("cmd-1", ws, 1)
+
+    closing = asyncio.create_task(
+        global_manager.close_for_restart(reply_deadline_seconds=5)
+    )
+    await asyncio.sleep(0.1)
+    reply = _command_origins.reply_for("cmd-1", 1)
+    await reply({"type": "task_id_updated", "new_task_id": 2})
+    await asyncio.sleep(0.1)
+    assert [e.split(":", 1)[0] for e in log] == ["sent"]
+    assert json.loads(log[0].removeprefix("sent:"))["new_task_id"] == 2
+
+    _command_origins.discard_command("cmd-1", 1)
+    await asyncio.wait_for(closing, timeout=2)
+    assert log[1:] == ["close:1012"]
+
+
+@pytest.mark.asyncio
+async def test_move_connection_while_holding_ingress_is_not_closed_at_once(manager):
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+    release = asyncio.Event()
+
+    async def handler() -> None:
+        async with manager.ingress(ws):
+            await release.wait()
+
+    work = asyncio.create_task(handler())
+    await asyncio.sleep(0.05)
+    closing = asyncio.create_task(manager.close_for_restart(reply_deadline_seconds=5))
+    await asyncio.sleep(0.1)
+
+    manager.move_connection(ws, 2)
+    await asyncio.sleep(0.2)
+    assert ws.closed == []
+    assert manager.connection_count() == 1
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(work, closing), timeout=2)
+    assert ws.closed == [(1012, "Service Restart")]
+
+
+@pytest.mark.asyncio
+async def test_ingress_hands_over_to_the_origin_without_a_close_gap(manager):
+    # The accepted path: the handler registers the origin, then leaves ingress.
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+    release = asyncio.Event()
+
+    async def handler() -> None:
+        async with manager.ingress(ws):
+            _command_origins.register("cmd-1", ws, 1)
+            await release.wait()
+
+    work = asyncio.create_task(handler())
+    await asyncio.sleep(0.05)
+    closing = asyncio.create_task(manager.close_for_restart(reply_deadline_seconds=5))
+    release.set()
+    await asyncio.wait_for(work, timeout=1)
+    await asyncio.sleep(0.2)
+    assert ws.closed == []
+
+    _command_origins.discard_command("cmd-1", 1)
+    await asyncio.wait_for(closing, timeout=2)
+    assert ws.closed == [(1012, "Service Restart")]
+
+
+@pytest.fixture
+def real_bridge(monkeypatch):
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://127.0.0.1:1/0")
+    from xagent.web.services import task_event_bridge
+    from xagent.web.services.task_event_bridge import TaskEventBridge
+
+    bridge = TaskEventBridge()
+    bridge.ready.set()
+    monkeypatch.setattr(ws_module, "get_shared_task_execution_enabled", lambda: True)
+    monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_real_bridge_origin_holds_the_close_until_discarded(manager, real_bridge):
+    async def reply(_message) -> None:
+        return None
+
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+    token = real_bridge.register_origin(1, "cmd-1", reply, recipient=ws)
+
+    closing = asyncio.create_task(manager.close_for_restart(reply_deadline_seconds=5))
+    await asyncio.sleep(0.2)
+    assert ws.closed == []
+
+    real_bridge.discard_origin(token)
+    await asyncio.wait_for(closing, timeout=2)
+    assert ws.closed == [(1012, "Service Restart")]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_bridge_counts_as_no_pending_command(manager, monkeypatch):
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setattr(ws_module, "get_shared_task_execution_enabled", lambda: True)
+    monkeypatch.setattr(task_event_bridge, "_bridge", None)  # raises ConnectionError
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+
+    assert not manager._has_pending_command(ws)
+    await asyncio.wait_for(manager.close_for_restart(reply_deadline_seconds=5), 1)
+    assert ws.closed == [(1012, "Service Restart")]
+
+
+@pytest.mark.asyncio
+async def test_end_restart_drain_during_the_wait_sends_no_further_1012(manager):
+    waiting = FakeSocket()
+    manager.register_connection(waiting, 1)
+    _command_origins.register("cmd-1", waiting, 1)
+
+    closing = asyncio.create_task(manager.close_for_restart(reply_deadline_seconds=5))
+    await asyncio.sleep(0.2)
+    manager.end_restart_drain()
+    _command_origins.discard_command("cmd-1", 1)
+
+    assert await asyncio.wait_for(closing, timeout=2) == 0
+    assert waiting.closed == []
+    assert manager.connection_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_end_restart_drain_cancels_scheduled_closes(manager, monkeypatch):
+    monkeypatch.setattr(ws_module, "RESTART_CLOSE_TIMEOUT_SECONDS", 0.1)
+    await manager.close_for_restart()
+    late = FakeSocket(hang_close=True)
+    manager.register_connection(late, 1)
+    await asyncio.sleep(0.02)  # the scheduled close is now inside close()
+    manager.end_restart_drain()
+    await asyncio.sleep(0.3)  # past its timeout: an uncancelled close drops it
+
+    assert manager._restart_closes == set()
+    assert manager.connection_count() == 1
+
+    fresh = FakeSocket()
+    manager.register_connection(fresh, 1)
+    await asyncio.sleep(0.05)
+    assert fresh.closed == []
+
+
+@pytest.mark.asyncio
+async def test_a_close_from_an_ended_drain_is_a_no_op(manager):
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+    stale = manager._restart_drain_generation
+    manager.end_restart_drain()
+
+    await manager._close_for_restart(ws, 1.0, stale)
+
+    assert ws.closed == []
+    assert manager.connection_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_for_restart_ends_the_drain(manager):
+    waiting = FakeSocket()
+    manager.register_connection(waiting, 1)
+    _command_origins.register("cmd-1", waiting, 1)
+
+    closing = asyncio.create_task(manager.close_for_restart(reply_deadline_seconds=5))
+    await asyncio.sleep(0.1)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    late = FakeSocket()
+    manager.register_connection(late, 2)
+    await asyncio.sleep(0.05)
+    assert late.closed == []
+    assert waiting.closed == []
+
+
+@pytest.mark.asyncio
+async def test_failed_close_for_restart_ends_the_drain(manager, monkeypatch):
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+
+    async def boom(*_args):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(manager, "_close_for_restart", boom)
+    with pytest.raises(ValueError):
+        await manager.close_for_restart()
+    monkeypatch.undo()
+
+    late = FakeSocket()
+    manager.register_connection(late, 2)
+    await asyncio.sleep(0.05)
+    assert late.closed == []
+
+
+@pytest.mark.asyncio
+async def test_deadline_counts_from_the_call_not_after_the_first_close(manager):
+    stuck = FakeSocket(hang_close=True)
+    waiting = FakeSocket()
+    manager.register_connection(stuck, 1)
+    manager.register_connection(waiting, 1)
+    _command_origins.register("cmd-1", waiting, 1)
+
+    started = time.monotonic()
+    await asyncio.wait_for(
+        manager.close_for_restart(
+            reply_deadline_seconds=0.4, close_timeout_seconds=0.4
+        ),
+        timeout=3,
+    )
+
+    # close_timeout + one more close, not close_timeout + deadline + close.
+    assert time.monotonic() - started < 0.4 + 0.4 - 0.1
+    assert waiting.closed == [(1012, "Service Restart")]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_holds_ingress_while_it_runs(global_manager, monkeypatch):
+    ws = FakeSocket()
+    release = asyncio.Event()
+
+    async def blocked(*_args):
+        await release.wait()
+
+    monkeypatch.setattr(ws_module, "_handle_admitted_execute_task", blocked)
+    work = asyncio.create_task(ws_module.handle_execute_task(ws, 1, {}))
+    await asyncio.sleep(0.05)
+    assert global_manager._has_pending_command(ws)
+
+    release.set()
+    await work
+    assert not global_manager._has_pending_command(ws)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_close_uses_the_shared_timeout_constant(manager, monkeypatch):
+    monkeypatch.setattr(ws_module, "RESTART_CLOSE_TIMEOUT_SECONDS", 0.05)
+    await manager.close_for_restart()
+    stuck = FakeSocket(hang_close=True)
+
+    manager.register_connection(stuck, 1)
+    await asyncio.sleep(0.3)
+
+    assert manager.connection_count() == 0
+
+
+def test_close_timeout_default_is_the_shared_constant():
+    import inspect
+
+    default = inspect.signature(ConnectionManager.close_for_restart).parameters[
+        "close_timeout_seconds"
+    ]
+    assert default.default == ws_module.RESTART_CLOSE_TIMEOUT_SECONDS
+
+
+class _StateSocket:
+    def __init__(self, state) -> None:
+        self.application_state = state
+
+
+def test_receive_after_our_own_close_is_not_an_error(manager):
+    gone = _StateSocket(WebSocketState.DISCONNECTED)
+    live = _StateSocket(WebSocketState.CONNECTED)
+
+    assert manager.was_closed_by_server(gone, RuntimeError("receive after close"))
+    assert not manager.was_closed_by_server(live, RuntimeError("real fault"))
+    assert not manager.was_closed_by_server(gone, ConnectionError("reset"))

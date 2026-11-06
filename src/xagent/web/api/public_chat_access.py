@@ -1844,7 +1844,7 @@ async def public_chat_websocket_endpoint(
 
         if isinstance(exc, WebSocketDisconnect):
             logger.info("Public chat WebSocket disconnected: %s", exc)
-        else:
+        elif not manager.was_closed_by_server(websocket, exc):
             logger.error("Public chat WebSocket error: %s", exc)
     finally:
         manager.disconnect(websocket)
@@ -1948,7 +1948,7 @@ async def share_chat_websocket_endpoint(
 
         if isinstance(exc, WebSocketDisconnect):
             logger.info("Share chat WebSocket disconnected: %s", exc)
-        else:
+        elif not manager.was_closed_by_server(websocket, exc):
             logger.error("Share chat WebSocket error: %s", exc)
     finally:
         manager.disconnect(websocket)

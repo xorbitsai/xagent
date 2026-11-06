@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -34,6 +35,7 @@ from xagent.web.services.task_execution_context_service import (
 )
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_settlement_report import SettlementReport
+from xagent.web.services.turn_settlement import TurnFacts
 
 HOOK_WARNING = "Settling the cached runtime for task"
 OK_RESULT = {"success": True, "output": "ok", "status": "completed"}
@@ -186,6 +188,7 @@ async def drive_channel_background(
         payload=SimpleNamespace(
             for_agent="hello", transcript_message="hello", attachments=[], file_ids=()
         ),
+        turn_facts=TurnFacts(started_at=datetime.now(timezone.utc)),
     )
 
 

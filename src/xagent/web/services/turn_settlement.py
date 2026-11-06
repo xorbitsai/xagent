@@ -59,6 +59,59 @@ class TurnUsage:
     by_model: tuple[TurnModelUsage, ...]
 
 
+_UNSETTLED_ANSWER_STATUSES = frozenset({"paused", "waiting_for_user"})
+
+
+@dataclass(frozen=True)
+class SettledOutcome:
+    """What one run's settlement left on the task row, as the hook reports it."""
+
+    status: str
+    error_code: str | None
+    empty_visible_answer: bool
+
+
+def settled_outcome(
+    status: str,
+    *,
+    failure_code: Any = None,
+    visible_text: str | None = None,
+    output_missing: bool = False,
+    ignored_result: bool = False,
+) -> SettledOutcome:
+    """Decide the reported outcome from what a settlement committed.
+
+    ``status`` is the task status the settlement committed, or the terminal
+    status a finalizer found and kept. ``failure_code`` is the code the
+    committing write recorded for a failure. ``visible_text`` is the answer
+    text this run wrote; ``None`` when it wrote none. ``output_missing`` is
+    True when the run produced no output and a placeholder stands in for it
+    in ``visible_text``. ``ignored_result`` is True when a finalizer found the
+    task already terminal and discarded this run's result, so neither its
+    code nor its answer describes the row.
+
+    A paused run carries no error code: it is not an outcome yet, and its
+    resumed run reports again. A failure always carries a code. Never raises.
+    """
+    if status == "paused":
+        error_code: str | None = None
+    elif ignored_result:
+        error_code = (
+            ClientErrorCode.TASK_EXECUTION_FAILED.value if status == "failed" else None
+        )
+    else:
+        error_code = build_error_code(failure_code)
+        if error_code is None and status == "failed":
+            error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
+    empty_visible_answer = (
+        not ignored_result
+        and visible_text is not None
+        and status not in _UNSETTLED_ANSWER_STATUSES
+        and (output_missing or not visible_text.strip())
+    )
+    return SettledOutcome(status, error_code, empty_visible_answer)
+
+
 @dataclass
 class TurnFacts:
     """Facts one run accumulates before its settlement is reported.
@@ -72,15 +125,16 @@ class TurnFacts:
     started_at: datetime
     usage: TurnUsage | None = None
     first_answer_delta_at: datetime | None = None
-    # The task status this run's result finalizer committed; None when no
-    # result was committed (the run raised, or was cancelled before its
-    # result was committed).
-    finalized_status: str | None = None
+    # The outcome this run's own result finalizer settled: the status it
+    # committed, or a terminal status it found and kept while discarding
+    # this run's result. None when no finalizer ran to completion (the run
+    # raised, or a cancellation landed before its finalizer was invoked).
+    outcome: SettledOutcome | None = None
     completion_outcome: str | None = None
-    error_code: str | None = None
     llm_finish_reason: str | None = None
     empty_final_answer: bool = False
-    empty_visible_answer: bool = False
+    # The run produced no output; the adapter substituted a placeholder.
+    output_missing: bool = False
     model_error_kind: str | None = None
     tool_failure_code: str | None = None
     # Set once this run's settlement was reported; a run is reported at most
@@ -101,6 +155,7 @@ class TurnFacts:
             finish_reason if isinstance(finish_reason, str) else None
         )
         self.empty_final_answer = result.get("empty_final_answer") is True
+        self.output_missing = result.get("output_missing") is True
         self.tool_failure_code = normalize_tool_failure_code(result.get("failure_code"))
         self.first_answer_delta_at = _parse_timestamp(
             result.get("first_answer_delta_at")
@@ -180,8 +235,7 @@ def build_turn_settlement(
     run_id: str | None,
     turn_id: str | None,
     task_source: str | None,
-    status: str,
-    error_code: Any,
+    outcome: SettledOutcome,
     ended_at: datetime,
 ) -> TurnSettlement:
     """Freeze ``facts`` into the settlement the hook receives.
@@ -193,14 +247,14 @@ def build_turn_settlement(
         run_id=run_id,
         turn_id=turn_id,
         task_source=task_source,
-        status=status,
+        status=outcome.status,
         completion_outcome=(
-            facts.completion_outcome if status == "completed" else None
+            facts.completion_outcome if outcome.status == "completed" else None
         ),
-        error_code=build_error_code(error_code),
+        error_code=outcome.error_code,
         llm_finish_reason=facts.llm_finish_reason,
         empty_final_answer=facts.empty_final_answer,
-        empty_visible_answer=facts.empty_visible_answer,
+        empty_visible_answer=outcome.empty_visible_answer,
         model_error_kind=facts.model_error_kind,
         tool_failure_code=facts.tool_failure_code,
         usage=facts.usage,
@@ -217,8 +271,7 @@ def report_turn_settled(
     run_id: str | None,
     turn_id: str | None,
     task_source: str | None,
-    status: str,
-    error_code: Any,
+    outcome: SettledOutcome,
     ended_at: datetime,
 ) -> bool:
     """Report this run's settlement unless it was already reported.
@@ -238,8 +291,7 @@ def report_turn_settled(
             run_id=run_id,
             turn_id=turn_id,
             task_source=task_source,
-            status=status,
-            error_code=error_code,
+            outcome=outcome,
             ended_at=ended_at,
         )
     )

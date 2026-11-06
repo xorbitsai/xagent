@@ -129,7 +129,7 @@ from .task_lease_service import (
     task_lease_attempt_predicate,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
-from .turn_settlement import TurnFacts, report_turn_settled
+from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -2642,8 +2642,9 @@ async def execute_task_background(
     Setup and finalization use worker-owned short Sessions. The long-running
     agent await receives only detached runtime state and primitive identifiers.
 
-    ``turn_facts``, when given, receives this run's usage and, once the result
-    is committed, its committed outcome; the caller reports the settlement.
+    ``turn_facts``, when given, receives this run's usage and, once its result
+    finalizer ran, the outcome it settled (committed, or a terminal status it
+    found and kept); the caller reports the settlement.
     """
     from .task_execution_context_service import (
         materialize_task_execution_recovery_state,
@@ -2877,16 +2878,17 @@ async def execute_task_background(
             if finalized.late_result:
                 return
             if turn_facts is not None:
-                turn_facts.finalized_status = finalized.final_task_status
+                turn_facts.absorb_result(result)
+                turn_facts.outcome = settled_outcome(
+                    finalized.final_task_status,
+                    failure_code=finalized.error_code,
+                    visible_text=safe_str(finalized.ai_response),
+                    output_missing=turn_facts.output_missing,
+                    ignored_result=not finalized.terminal_state_committed,
+                )
                 turn_facts.completion_outcome = finalized.broadcast_meta.get(
                     "completion_outcome"
                 )
-                turn_facts.error_code = finalized.error_code
-                turn_facts.empty_visible_answer = (
-                    not finalized.waiting_for_control
-                    and not safe_str(finalized.ai_response).strip()
-                )
-                turn_facts.absorb_result(result)
 
             normalized_outputs = finalized.normalized_outputs
             if normalized_outputs:
@@ -3312,6 +3314,9 @@ def _finalize_resumed_task(
         "error_code": result.get("error_code"),
         "error_details": result.get("error_details"),
         "late_result": False,
+        # Set when the task was already terminal: the status kept, this run's
+        # result discarded.
+        "kept_terminal_status": None,
     }
     if task_lease.run_id is None:
         _settle_prepared_task_file_outputs(
@@ -3361,6 +3366,7 @@ def _finalize_resumed_task(
                 finalized["late_result"] = True
                 return finalized
             db.commit()
+            finalized["kept_terminal_status"] = task.status.value
             finalized["late_result"] = True
             return finalized
 
@@ -3705,9 +3711,10 @@ async def execute_resume_background(
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
 
-    Once the resume's lease is settled -- by the result finalizer, or by the
-    failure/pause settlement in its cleanup -- this function reports the
-    settlement once through ``report_turn_settled``.
+    Once the resume's outcome is settled -- by the result finalizer (including
+    one that found the task already terminal), or by the failure/pause
+    settlement in its cleanup -- this function reports the settlement once
+    through ``report_turn_settled``.
     """
     from .agent_service_manager import caller_facing_execution_metadata
 
@@ -4527,6 +4534,14 @@ async def execute_resume_background(
             # compensation, including cancellation-safe late completion.
             prepared_outputs = None
         if finalized["late_result"]:
+            if finalized.get("kept_terminal_status") is not None:
+                # The task was already terminal: report the status it kept.
+                facts.absorb_result(result)
+                facts.outcome = settled_outcome(
+                    finalized["kept_terminal_status"],
+                    output_missing=facts.output_missing,
+                    ignored_result=True,
+                )
             logger.info(
                 "Ignoring late resume result for task %s run %s; ownership changed",
                 task_id,
@@ -4539,18 +4554,14 @@ async def execute_resume_background(
             return
         normalized_outputs = finalized["normalized_outputs"]
         output = finalized["output"]
-        facts.finalized_status = finalized["final_status"]
-        facts.completion_outcome = finalized.get("completion_outcome")
-        facts.error_code = finalized.get("error_code")
-        facts.empty_visible_answer = (
-            finalized["final_status"]
-            not in {
-                TaskStatus.PAUSED.value,
-                TaskStatus.WAITING_FOR_USER.value,
-            }
-            and not str(output or "").strip()
-        )
         facts.absorb_result(result)
+        facts.outcome = settled_outcome(
+            finalized["final_status"],
+            failure_code=finalized.get("error_code"),
+            visible_text=str(output or ""),
+            output_missing=facts.output_missing,
+        )
+        facts.completion_outcome = finalized.get("completion_outcome")
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
         task_title = finalized["task_title"]
@@ -5112,18 +5123,15 @@ async def execute_resume_background(
                 # release.
                 try:
                     if not facts.notified and (
-                        facts.finalized_status is not None or resume_settled_by_cleanup
+                        facts.outcome is not None or resume_settled_by_cleanup
                     ):
-                        status = facts.finalized_status
-                        if status is None:
-                            status = (
+                        outcome = facts.outcome
+                        if outcome is None:
+                            outcome = settled_outcome(
                                 TaskStatus.PAUSED.value
                                 if resume_settled_paused
                                 else TaskStatus.FAILED.value
                             )
-                        error_code = facts.error_code
-                        if error_code is None and status == TaskStatus.FAILED.value:
-                            error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
                         report_turn_settled(
                             facts,
                             task_id=task_id,
@@ -5140,8 +5148,7 @@ async def execute_resume_background(
                                 or None
                             ),
                             task_source=trusted_task_source,
-                            status=status,
-                            error_code=error_code,
+                            outcome=outcome,
                             ended_at=datetime.now(timezone.utc),
                         )
                 except Exception:  # noqa: BLE001

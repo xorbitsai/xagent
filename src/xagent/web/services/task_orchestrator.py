@@ -158,7 +158,7 @@ from .task_runtime import (
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
-from .turn_settlement import TurnFacts, report_turn_settled
+from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -3255,7 +3255,7 @@ def _schedule_bg(
                 lease is not None
                 and not facts.notified
                 and (
-                    facts.finalized_status is not None
+                    facts.outcome is not None
                     or (
                         lease_settled
                         and (channel_command is None or settlement_error is not None)
@@ -3264,29 +3264,30 @@ def _schedule_bg(
                 and (execution_started or settlement_error is not None)
             ):
                 try:
-                    status = facts.finalized_status
-                    if status is None:
-                        status = (
+                    outcome = facts.outcome
+                    if outcome is None:
+                        # This coroutine's own settlement committed the outcome.
+                        if broadcast_error_code is not None:
+                            failure_code: str | None = broadcast_error_code
+                        elif settlement_error == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
+                            failure_code = (
+                                ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
+                            )
+                        else:
+                            failure_code = None
+                        outcome = settled_outcome(
                             TaskStatus.PAUSED.value
                             if report.paused
-                            else TaskStatus.FAILED.value
+                            else TaskStatus.FAILED.value,
+                            failure_code=failure_code,
                         )
-                    error_code = facts.error_code
-                    if error_code is None and status == TaskStatus.FAILED.value:
-                        if broadcast_error_code is not None:
-                            error_code = broadcast_error_code
-                        elif settlement_error == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
-                            error_code = ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
-                        else:
-                            error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
                     report_turn_settled(
                         facts,
                         task_id=task_id,
                         run_id=lease.run_id,
                         turn_id=turn_id,
                         task_source=task_source,
-                        status=status,
-                        error_code=error_code,
+                        outcome=outcome,
                         ended_at=datetime.now(timezone.utc),
                     )
                 except Exception:  # noqa: BLE001

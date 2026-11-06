@@ -12,7 +12,7 @@ import logging
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -29,6 +29,7 @@ from xagent.core.agent import (
     AgentExecutionConfig,
     PatternResult,
 )
+from xagent.core.agent.interruption import InterruptionReason
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import (
     agent_service_manager,
@@ -60,6 +61,7 @@ from xagent.web.services.turn_settlement import (
     notify_turn_settled,
     report_turn_settled,
     set_turn_settled_hook,
+    settled_outcome,
 )
 
 HOOK_METRIC = "xagent.turn_settlement.hook"
@@ -91,8 +93,7 @@ def _settlement(**overrides: Any) -> TurnSettlement:
         "run_id": "run-7",
         "turn_id": "turn-7",
         "task_source": None,
-        "status": "completed",
-        "error_code": None,
+        "outcome": settled_outcome("completed"),
         "ended_at": now,
     }
     values.update(overrides)
@@ -129,6 +130,78 @@ def test_build_error_code_is_a_closed_vocabulary(raw: Any, expected: Any) -> Non
     assert code is None or type(code) is str
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        (
+            {
+                "status": "paused",
+                "failure_code": "quota_exceeded",
+                "visible_text": "x",
+            },
+            ("paused", None, False),
+        ),
+        (
+            {"status": "failed", "visible_text": ""},
+            ("failed", "task_execution_failed", True),
+        ),
+        (
+            {"status": "failed", "failure_code": "model_error", "visible_text": "msg"},
+            ("failed", "model_error", False),
+        ),
+        (
+            {"status": "failed", "failure_code": "free text", "visible_text": ""},
+            ("failed", "task_execution_failed", True),
+        ),
+        (
+            {
+                "status": "failed",
+                "failure_code": "model_error",
+                "visible_text": "",
+                "ignored_result": True,
+            },
+            ("failed", "task_execution_failed", False),
+        ),
+        (
+            {"status": "completed", "visible_text": "  "},
+            ("completed", None, True),
+        ),
+        ({"status": "completed"}, ("completed", None, False)),
+        (
+            {
+                "status": "completed",
+                "failure_code": "quota_exceeded",
+                "visible_text": "",
+                "ignored_result": True,
+            },
+            ("completed", None, False),
+        ),
+        (
+            {"status": "waiting_for_user", "visible_text": ""},
+            ("waiting_for_user", None, False),
+        ),
+        (
+            {
+                "status": "completed",
+                "visible_text": "No output provided",
+                "output_missing": True,
+            },
+            ("completed", None, True),
+        ),
+    ],
+)
+def test_settled_outcome_decides_code_and_emptiness(
+    kwargs: dict[str, Any], expected: tuple[str, str | None, bool]
+) -> None:
+    outcome = settled_outcome(**kwargs)
+
+    assert (
+        outcome.status,
+        outcome.error_code,
+        outcome.empty_visible_answer,
+    ) == expected
+
+
 def test_completion_outcome_is_only_reported_for_completed_runs() -> None:
     facts = TurnFacts(
         started_at=datetime.now(timezone.utc), completion_outcome="answered"
@@ -138,12 +211,13 @@ def test_completion_outcome_is_only_reported_for_completed_runs() -> None:
         "run_id": None,
         "turn_id": None,
         "task_source": None,
-        "error_code": None,
         "ended_at": datetime.now(timezone.utc),
     }
 
-    completed = build_turn_settlement(facts, status="completed", **kwargs)
-    failed = build_turn_settlement(facts, status="failed", **kwargs)
+    completed = build_turn_settlement(
+        facts, outcome=settled_outcome("completed"), **kwargs
+    )
+    failed = build_turn_settlement(facts, outcome=settled_outcome("failed"), **kwargs)
 
     assert completed.completion_outcome == "answered"
     assert failed.completion_outcome is None
@@ -208,6 +282,31 @@ def test_absorb_result_reads_real_adapter_output() -> None:
     ) == ("length", True, "authentication_required", first)
     assert "finish_reason" not in normalized["metadata"]
     assert "first_answer_delta_at" not in normalized["metadata"]
+
+
+def test_absorb_result_records_a_missing_output() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="a", pattern="react", llm=None)
+    )
+    facts = TurnFacts(started_at=datetime.now(timezone.utc))
+
+    facts.absorb_result(
+        adapter._normalize_result(
+            result={"success": True, "output": ""},
+            execution_type="agent_react",
+            execution_id="1",
+        )
+    )
+    assert facts.output_missing is True
+
+    facts.absorb_result(
+        adapter._normalize_result(
+            result={"success": True, "output": "ok"},
+            execution_type="agent_react",
+            execution_id="1",
+        )
+    )
+    assert facts.output_missing is False
 
 
 async def test_hook_receives_the_settlement_without_the_caller_waiting() -> None:
@@ -349,10 +448,14 @@ async def _drive_channel(
     result: dict[str, Any] | None = None,
     usage: TurnUsage | None = None,
     committed: bool = True,
+    pause: bool = False,
 ) -> dict[str, Any]:
     """Run ``execute_channel_background`` with its collaborators faked.
 
-    Returns the keyword arguments ``execute_task`` received.
+    The result write is the entry's own ``finalize`` closure around a fake
+    ``finalize_managed_task_lease_result_sync``, which fills the report as a
+    committed interruption pause does when ``pause`` is set. Returns the
+    keyword arguments ``execute_task`` received.
     """
     seen: dict[str, Any] = {}
 
@@ -408,10 +511,27 @@ async def _drive_channel(
     monkeypatch.setattr(
         shared_channel_execution, "channel_durable_result", lambda *_a: {}
     )
+
+    def fake_finalize(_lease: Any, **kwargs: Any) -> bool:
+        if pause:
+            kwargs["report"].paused_for = InterruptionReason.LLM_UNAVAILABLE
+        return committed
+
+    async def run_db_io(work: Any) -> Any:
+        # Only the result write runs; every other database step is skipped.
+        return work() if getattr(work, "__name__", "") == "finalize" else None
+
     monkeypatch.setattr(
-        shared_channel_execution,
-        "run_db_io_cancellation_safe",
-        AsyncMock(return_value=committed),
+        "xagent.web.services.managed_task_lease."
+        "finalize_managed_task_lease_result_sync",
+        fake_finalize,
+    )
+    monkeypatch.setattr(
+        shared_channel_execution, "run_db_io_cancellation_safe", run_db_io
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.publish_settlement_pause",
+        AsyncMock(),
     )
     snapshot = SimpleNamespace(
         runtime_user=None,
@@ -431,6 +551,7 @@ async def _drive_channel(
         payload=SimpleNamespace(
             for_agent="hello", transcript_message="hello", attachments=[], file_ids=()
         ),  # type: ignore[arg-type]
+        turn_facts=TurnFacts(started_at=datetime.now(timezone.utc)),
     )
     return seen
 
@@ -516,6 +637,74 @@ async def test_failing_hook_leaves_the_channel_run_unchanged(monkeypatch) -> Non
         await _settle_inflight()
 
     assert _outcomes(counter) == ["failed"]
+
+
+async def test_channel_turn_paused_by_its_settlement_reports_paused(
+    monkeypatch,
+) -> None:
+    received = _capture()
+
+    await _drive_channel(
+        monkeypatch,
+        status=TaskStatus.FAILED,
+        result={"success": False, "error": "x", "error_code": "quota_exceeded"},
+        pause=True,
+    )
+    await _settle_inflight()
+
+    assert [(s.status, s.error_code) for s in received] == [("paused", None)]
+    publish = cast(AsyncMock, orchestrator.publish_settlement_pause)
+    publish.assert_awaited_once()
+
+
+async def test_channel_model_failure_reports_the_presented_code(monkeypatch) -> None:
+    received = _capture()
+
+    await _drive_channel(
+        monkeypatch,
+        status=TaskStatus.FAILED,
+        result={
+            "success": False,
+            "error": "x",
+            "model_error": {
+                "kind": "rate_limited",
+                "status_code": 429,
+                "provider_code": None,
+                "message": "p",
+            },
+        },
+    )
+    await _settle_inflight()
+
+    assert [s.error_code for s in received] == ["model_error"]
+
+
+async def test_channel_interrupted_run_is_not_an_empty_answer(monkeypatch) -> None:
+    received = _capture()
+
+    await _drive_channel(monkeypatch, status=TaskStatus.PAUSED, content="")
+    await _settle_inflight()
+
+    assert [(s.status, s.empty_visible_answer) for s in received] == [("paused", False)]
+
+
+async def test_channel_run_without_output_reports_an_empty_answer(monkeypatch) -> None:
+    received = _capture()
+
+    await _drive_channel(
+        monkeypatch,
+        content="Task completed, but no output was generated.",
+        result={
+            "success": True,
+            "output": "No output provided",
+            "output_missing": True,
+        },
+    )
+    await _settle_inflight()
+
+    assert [(s.status, s.empty_visible_answer) for s in received] == [
+        ("completed", True)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -731,15 +920,14 @@ def _report_like_the_channel_entry(kwargs: dict[str, Any]) -> None:
     """What the channel entry reports once its result committed."""
     facts = kwargs["turn_facts"]
     assert isinstance(facts, TurnFacts)
-    facts.finalized_status = "completed"
+    facts.outcome = settled_outcome("completed")
     report_turn_settled(
         facts,
         task_id=kwargs["command"].task_id,
         run_id=kwargs["lease"].run_id,
         turn_id="cmd",
         task_source=None,
-        status="completed",
-        error_code=None,
+        outcome=facts.outcome,
         ended_at=datetime.now(timezone.utc),
     )
 
@@ -1087,8 +1275,7 @@ def test_report_turn_settled_reports_a_run_once() -> None:
         "run_id": "r",
         "turn_id": "t",
         "task_source": None,
-        "status": "completed",
-        "error_code": None,
+        "outcome": settled_outcome("completed"),
         "ended_at": datetime.now(timezone.utc),
     }
 
@@ -1244,7 +1431,7 @@ async def test_channel_result_committed_but_unreported_is_reported_by_scheduler(
         )
         # The entry recorded the committed status, then its report raised
         # before ``report_turn_settled`` and was only logged.
-        kwargs["turn_facts"].finalized_status = "completed"
+        kwargs["turn_facts"].outcome = settled_outcome("completed")
 
     _lease, payload, _raised = await _schedule_turn(
         canonical,
@@ -1365,6 +1552,66 @@ async def test_resume_late_result_reports_nothing(monkeypatch) -> None:
     )
 
     assert received == []
+
+
+async def test_resume_finding_the_task_terminal_reports_the_kept_status(
+    monkeypatch,
+) -> None:
+    received = _capture()
+    kept = {
+        "late_result": True,
+        "lease_released": False,
+        "kept_terminal_status": "failed",
+    }
+
+    await _drive_resume(
+        monkeypatch,
+        RESUME_OK,
+        extra_patches=(
+            patch(
+                "xagent.web.services.task_execution._finalize_resumed_task",
+                return_value=kept,
+            ),
+        ),
+    )
+
+    assert [(s.status, s.error_code, s.empty_visible_answer) for s in received] == [
+        ("failed", "task_execution_failed", False)
+    ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_resume_finalizer_keeps_a_terminal_row_and_says_so(canonical) -> None:
+    from xagent.web.services.task_execution import (
+        _finalize_resumed_task,
+        _PreparedTaskFileOutputs,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        lease = acquire_task_lease(db, tid, new_run=True)
+        task = db.get(Task, tid)
+        task.status = TaskStatus.FAILED
+        db.commit()
+
+    finalized = await asyncio.to_thread(
+        _finalize_resumed_task,
+        tid,
+        status="completed",
+        success=True,
+        output="ok",
+        task_owner_user_id=None,
+        result={"success": True, "output": "ok", "status": "completed"},
+        task_lease=lease,
+        prepared_outputs=_PreparedTaskFileOutputs((), (), ()),
+    )
+
+    assert finalized["late_result"] is True
+    assert finalized["kept_terminal_status"] == "failed"
+    with factory() as db:
+        row = db.get(Task, tid)
+        assert row.status == TaskStatus.FAILED
+        assert row.runner_id is None
 
 
 async def test_resume_restored_to_its_prior_status_reports_nothing(

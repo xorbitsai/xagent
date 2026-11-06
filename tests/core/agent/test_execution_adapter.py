@@ -2540,3 +2540,27 @@ def test_normalize_result_lifts_only_well_typed_classification(
 
     for key in ("finish_reason", "empty_final_answer", "first_answer_delta_at"):
         assert key not in normalized
+
+
+@pytest.mark.parametrize(
+    ("agent_result", "expected"),
+    [
+        ({"success": True, "output": ""}, True),
+        ({"success": True}, True),
+        ({"success": True, "output": "ok"}, False),
+    ],
+)
+def test_normalize_result_flags_a_missing_output(
+    agent_result: dict[str, Any], expected: bool
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+
+    normalized = adapter._normalize_result(
+        result=agent_result, execution_type="agent_react", execution_id="1"
+    )
+
+    assert normalized.get("output_missing", False) is expected
+    if expected:
+        assert normalized["output"] == NO_OUTPUT_PLACEHOLDER

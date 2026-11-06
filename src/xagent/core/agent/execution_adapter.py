@@ -473,6 +473,11 @@ class AgentExecutionAdapter:
             "agent_result": result,
             "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
+        if not output:
+            # ``output`` above now holds the placeholder, which a reader cannot
+            # tell from a real answer; this key is the supported way to know
+            # the run produced none.
+            normalized["output_missing"] = True
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome

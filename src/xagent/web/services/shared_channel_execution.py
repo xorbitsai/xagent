@@ -45,7 +45,6 @@ from .channel_runtime import (
     _prepare_channel_task_sync,
 )
 from .chat_history_service import persist_user_message_no_commit
-from .client_error_messages import ClientErrorCode
 from .db_runtime import (
     await_task_settlement,
     cancel_and_drain_async_task,
@@ -75,7 +74,7 @@ from .task_start_protocol import (
     TaskStartPayload,
     stage_task_start_command,
 )
-from .turn_settlement import TurnFacts, build_error_code, report_turn_settled
+from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
 from .workspace_binding import canonical_workspace_base
 
 logger = logging.getLogger(__name__)
@@ -747,26 +746,25 @@ async def execute_channel_background(
     heartbeat_task: asyncio.Task,
     snapshot: Any,
     payload: TaskTurnPayload,
-    turn_facts: TurnFacts | None = None,
+    turn_facts: TurnFacts,
 ) -> None:
     """Run one channel turn and report its settlement once its result commits.
 
     ``turn_facts`` is the scheduler's facts bag for this run, so a run the
-    scheduler also settles is still reported once; None creates one here.
+    scheduler also settles is still reported once.
     """
     from ..user_isolated_memory import UserContext
     from .agent_service_manager import get_agent_manager
-    from .execution_result_projection import project_execution_result_for_channel
+    from .execution_result_projection import (
+        present_failed_result,
+        project_execution_result_for_channel,
+    )
     from .managed_task_lease import finalize_managed_task_lease_result_sync
     from .task_execution_context_service import (
         materialize_task_execution_recovery_state,
     )
 
-    facts = (
-        turn_facts
-        if turn_facts is not None
-        else TurnFacts(started_at=datetime.now(timezone.utc))
-    )
+    facts = turn_facts
     manager = get_agent_manager()
     service = await manager.get_agent_for_task(
         command.task_id,
@@ -887,30 +885,30 @@ async def execute_channel_background(
             # that raises instead is settled and reported by the scheduler;
             # the shared facts bag keeps either path from reporting twice.
             try:
-                facts.finalized_status = (
-                    projection.task_status.value
-                    if isinstance(projection.task_status, TaskStatus)
-                    else str(projection.task_status)
+                # The settlement rests a recoverable interruption PAUSED and
+                # fills ``report``; report what it committed.
+                committed_status = (
+                    TaskStatus.PAUSED if report.paused else projection.task_status
                 )
                 facts.completion_outcome = projection.completion_outcome
-                facts.empty_visible_answer = not (
-                    projection.transcript_content or ""
-                ).strip()
                 facts.absorb_result(result)
-                error_code = build_error_code(result.get("error_code"))
-                if (
-                    error_code is None
-                    and facts.finalized_status == TaskStatus.FAILED.value
-                ):
-                    error_code = ClientErrorCode.TASK_EXECUTION_FAILED.value
+                facts.outcome = settled_outcome(
+                    committed_status.value,
+                    failure_code=(
+                        present_failed_result(result).error_code
+                        if committed_status == TaskStatus.FAILED
+                        else None
+                    ),
+                    visible_text=projection.transcript_content,
+                    output_missing=facts.output_missing,
+                )
                 report_turn_settled(
                     facts,
                     task_id=command.task_id,
                     run_id=lease.run_id,
                     turn_id=command.command_id,
                     task_source=getattr(snapshot.task, "source", None),
-                    status=facts.finalized_status,
-                    error_code=error_code,
+                    outcome=facts.outcome,
                     ended_at=datetime.now(timezone.utc),
                 )
             except Exception:  # noqa: BLE001

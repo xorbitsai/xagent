@@ -210,6 +210,7 @@ describe("openMcpOAuthPopup", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
   });
 
@@ -251,7 +252,7 @@ describe("openMcpOAuthPopup", () => {
         // Without this, connect_mcp_oauth's Accept-based content negotiation
         // (src/xagent/web/api/mcp.py) returns a redirect instead of
         // {authorization_url} JSON, and every mcp_oauth connect fails.
-        headers: expect.objectContaining({ Accept: "application/json" }),
+        headers: expect.objectContaining({ Accept: "application/json", "X-XAgent-OAuth-Launch-Version": "2" }),
         body: JSON.stringify({ redirect_after: "/tools?tab=mcp" }),
       })
     );
@@ -261,6 +262,56 @@ describe("openMcpOAuthPopup", () => {
 
     await expect(pending).resolves.toEqual({ connected: true });
     expect(apiRequestMock).toHaveBeenNthCalledWith(2, "http://api.local/api/mcp/apps?location=remote");
+  });
+
+  it("negotiates regional bootstrap and navigates only after same-origin configuration validation", async () => {
+    const popup = fakeMcpPopup({ opener: {} as Window });
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    const authorizationUrl = "https://cloud.xagent.co/api/oauth/launch/au?ticket=proof";
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({
+      authorization_url: authorizationUrl,
+      launch_mode: "regional_bootstrap",
+    }));
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([{ id: "granola", is_connected: true }]));
+    let releaseConfig!: (response: Response) => void;
+    const fetchConfig = vi.fn().mockReturnValue(new Promise<Response>((resolve) => { releaseConfig = resolve; }));
+    vi.stubGlobal("fetch", fetchConfig);
+
+    const pending = openMcpOAuthPopup({ appId: "granola" });
+    await vi.waitFor(() => expect(fetchConfig).toHaveBeenCalledWith("/api/deployment-config", {
+      credentials: "same-origin", cache: "no-store", redirect: "error",
+    }));
+    expect(apiRequestMock).toHaveBeenNthCalledWith(1,
+      "http://api.local/api/mcp/apps/granola/oauth/connect",
+      expect.objectContaining({ headers: expect.objectContaining({ "X-XAgent-OAuth-Launch-Version": "2" }) }));
+    expect(popup.opener).toBeNull();
+    expect(popup.location.href).toBe("");
+    releaseConfig(jsonResponse({ oauth_authorization_origins: ["https://cloud.xagent.co"] }));
+    await vi.waitFor(() => expect(popup.location.href).toBe(authorizationUrl));
+    (popup as unknown as { closed: boolean }).closed = true;
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(pending).resolves.toEqual({ connected: true });
+    expect(apiRequestMock).toHaveBeenNthCalledWith(2, "http://api.local/api/mcp/apps?location=remote");
+  });
+
+  it.each([
+    "https://evil.example/api/oauth/launch/au?ticket=proof",
+    "https://cloud.xagent.co/api/oauth/launch/au?ticket=proof&ticket=duplicate",
+    "https://cloud.xagent.co/api/auth/google/login?ticket=proof",
+  ])("rejects an invalid negotiated bootstrap destination without navigating: %s", async (authorizationUrl) => {
+    const popup = fakeMcpPopup();
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({
+      authorization_url: authorizationUrl, launch_mode: "regional_bootstrap",
+    }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      oauth_authorization_origins: ["https://cloud.xagent.co"],
+    })));
+
+    await expect(openMcpOAuthPopup({ appId: "granola" })).resolves.toEqual({ connected: false });
+    expect(popup.location.href).toBe("");
+    expect(popup.close).toHaveBeenCalledOnce();
+    expect(apiRequestMock).toHaveBeenCalledOnce();
   });
 
   it("resolves connected:false with the backend's own error detail, without ever opening the popup's location, when the connect POST fails", async () => {

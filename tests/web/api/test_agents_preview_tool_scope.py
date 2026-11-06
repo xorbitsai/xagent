@@ -117,9 +117,10 @@ async def test_preview_omitted_categories_keep_builtins_but_not_custom_apis():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["basic", "code_execution"])
 @pytest.mark.parametrize("execute_error", [None, RuntimeError("execution failed")])
 async def test_preview_binds_task_sandbox_and_cleans_it_on_all_outcomes(
-    monkeypatch, tmp_path, execute_error
+    monkeypatch, tmp_path, execute_error, category
 ):
     from fastapi import HTTPException
 
@@ -132,9 +133,9 @@ async def test_preview_binds_task_sandbox_and_cleans_it_on_all_outcomes(
     with patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=manager):
         if execute_error:
             with pytest.raises(HTTPException, match="execution failed"):
-                await _run_preview(["basic"], execute_error=execute_error)
+                await _run_preview([category], execute_error=execute_error)
         else:
-            config = await _run_preview(["basic"])
+            config = await _run_preview([category])
             assert config.get_sandbox() is provider
     call = manager.get_or_create_lease_provider.await_args
     assert call.args[0] == "task"
@@ -144,9 +145,10 @@ async def test_preview_binds_task_sandbox_and_cleans_it_on_all_outcomes(
 
 
 @pytest.mark.asyncio
-async def test_tool_free_preview_does_not_allocate_sandbox(monkeypatch):
+@pytest.mark.parametrize("categories", [[], ["basic_tools"], ["web_tools"]])
+async def test_non_code_preview_does_not_allocate_sandbox(monkeypatch, categories):
     monkeypatch.setenv("SANDBOX_ENABLED", "true")
     with patch("xagent.web.sandbox_manager.get_sandbox_manager") as get_manager:
-        config = await _run_preview([])
+        config = await _run_preview(categories)
     assert config.get_sandbox() is None
     get_manager.assert_not_called()

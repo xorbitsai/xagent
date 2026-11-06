@@ -2011,6 +2011,7 @@ async def preview_agent(
 
         if get_sandbox_enabled() and (
             tool_selection_spec.includes_category("basic")
+            or tool_selection_spec.includes_category("code_execution")
             or tool_selection_spec.includes_category("browser")
             or tool_selection_spec.includes_published_agent()
             or tool_selection_spec.includes_mcp()

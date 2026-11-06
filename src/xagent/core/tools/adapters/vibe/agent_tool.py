@@ -2068,7 +2068,7 @@ class AgentTool(AbstractBaseTool):
         self._file_operation_access_version = file_operation_access_version
         self._voice = voice
         self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
-        self._excluded_model_ids = frozenset(excluded_model_ids)
+        self._excluded_model_ids = excluded_model_ids
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -3110,11 +3110,6 @@ if TYPE_CHECKING:
     from xagent.web.tools.config import WebToolConfig
 
 
-def _config_excluded_model_ids(config: Any) -> frozenset[str]:
-    getter = getattr(config, "get_excluded_model_ids", None)
-    return frozenset(getter()) if callable(getter) else frozenset()
-
-
 @register_tool(categories={"agent"}, selection_gate="published_agent")
 async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create tools from published agents.
@@ -3166,7 +3161,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             ),
             voice=config.get_voice(),
             inherited_mcp_unavailable_reason=config.get_mcp_unavailable_reason(),
-            excluded_model_ids=_config_excluded_model_ids(config),
+            excluded_model_ids=config.get_excluded_model_ids(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

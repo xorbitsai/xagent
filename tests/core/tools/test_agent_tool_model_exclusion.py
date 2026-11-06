@@ -1,7 +1,6 @@
 """Delegated sub-agents inherit the parent task's excluded media model ids."""
 
-import os
-import tempfile
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -18,17 +17,17 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
-from xagent.web.models.user import User
+from xagent.web.models.user import User, UserModel
 from xagent.web.tools.config import WebToolConfig
 
 pytestmark = pytest.mark.usefixtures("no_resolvable_default_llm")
 
+IMAGE_MODEL_ID = "image-a"
+
 
 @pytest.fixture
-def published_agent_db() -> Any:
-    temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    temp_db.close()
-    engine = create_engine(f"sqlite:///{temp_db.name}")
+def published_agent_db(tmp_path: Path) -> Any:
+    engine = create_engine(f"sqlite:///{tmp_path / 'exclusion.db'}")
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     with session_factory() as db:
@@ -53,20 +52,38 @@ def published_agent_db() -> Any:
             user_id=user.id,
             name="Delegate",
             status=AgentStatus.PUBLISHED,
+            tool_categories=None,
             models={"general": model.id},
         )
         db.add(agent)
+        db.add(
+            Agent(
+                user_id=user.id,
+                name="Sibling",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+        )
+        image = Model(
+            model_id=IMAGE_MODEL_ID,
+            category="image",
+            model_provider="openai",
+            model_name="gpt-image-1",
+            api_key="test-api-key",
+            base_url="https://api.openai.com/v1",
+            abilities=["generate"],
+        )
+        db.add(image)
         db.commit()
         db.refresh(agent)
+        db.refresh(image)
+        db.add(UserModel(user_id=user.id, model_id=image.id, is_owner=True))
+        db.commit()
         ids = (user.id, agent.id)
     try:
         yield session_factory, ids[0], ids[1]
     finally:
         engine.dispose()
-        try:
-            os.remove(temp_db.name)
-        except OSError:
-            pass
 
 
 def _agent_tools(tools: list[Any]) -> list[AgentTool]:
@@ -98,10 +115,10 @@ def test_get_published_agents_tools_passes_excluded_ids_to_each_tool(
     tools = get_published_agents_tools(
         session_factory=session_factory,
         user_id=user_id,
-        excluded_model_ids=frozenset({"image-a"}),
+        excluded_model_ids=frozenset({IMAGE_MODEL_ID}),
     )
 
-    assert all(t._excluded_model_ids == {"image-a"} for t in _agent_tools(tools))
+    assert all(t._excluded_model_ids == {IMAGE_MODEL_ID} for t in _agent_tools(tools))
 
 
 def test_get_published_agents_tools_defaults_to_no_exclusion(
@@ -115,7 +132,9 @@ def test_get_published_agents_tools_defaults_to_no_exclusion(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("excluded", [frozenset({"image-a", "tts-b"}), frozenset()])
+@pytest.mark.parametrize(
+    "excluded", [frozenset({IMAGE_MODEL_ID, "tts-b"}), frozenset()]
+)
 async def test_create_agent_tools_reads_the_parent_task_exclusion(
     published_agent_db: Any, excluded: frozenset[str]
 ) -> None:
@@ -130,8 +149,8 @@ async def test_create_agent_tools_reads_the_parent_task_exclusion(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("excluded", [frozenset({"image-a"}), frozenset()])
-async def test_delegated_child_tool_config_carries_the_exclusion(
+@pytest.mark.parametrize("excluded", [frozenset({IMAGE_MODEL_ID}), frozenset()])
+async def test_delegated_child_drops_the_excluded_media_model(
     published_agent_db: Any, excluded: frozenset[str]
 ) -> None:
     session_factory, user_id, agent_id = published_agent_db
@@ -143,18 +162,29 @@ async def test_delegated_child_tool_config_carries_the_exclusion(
     )
     tool = next(t for t in _agent_tools(tools) if t._agent_id == agent_id)
 
+    seen: dict[str, Any] = {}
+
+    async def run_child(**_: Any) -> dict[str, Any]:
+        # The child config is closed after the run, so read it while it runs.
+        child_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+        seen["image_models"] = set(child_config.get_image_models())
+        seen["grandchildren"] = await create_agent_tools(child_config)
+        return {"output": "done", "file_outputs": []}
+
     with (
         patch(
             "xagent.web.services.llm_utils.UserAwareModelStorage"
         ) as mock_storage_class,
         patch("xagent.core.agent.service.AgentService") as mock_agent_service_class,
-        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
     ):
         mock_storage_class.return_value = Mock()
         mock_agent_service_class.return_value.execute_task = AsyncMock(
-            return_value={"output": "done", "file_outputs": []}
+            side_effect=run_child
         )
         await tool.run_json_async({"task": "draw something"})
 
-    child_config = mock_agent_service_class.call_args.kwargs["tool_config"]
-    assert child_config.get_excluded_model_ids() == excluded
+    # The empty-set parametrization shows the seeded model is otherwise visible.
+    assert seen["image_models"] == {IMAGE_MODEL_ID} - excluded
+    assert all(
+        t._excluded_model_ids == excluded for t in _agent_tools(seen["grandchildren"])
+    )

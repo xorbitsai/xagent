@@ -108,6 +108,7 @@ from ....tools.user_interaction import (
 )
 from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
+from ...context.components import LoadedToolsComponent
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
@@ -115,7 +116,6 @@ from ...context.enrichment import (
     pending_user_response_lifecycle,
     pending_user_response_marker,
 )
-from ...context.components import LoadedToolsComponent
 from ...context.execution import (
     note_compaction_evidence_loss,
     provider_safe_tool_name,
@@ -124,6 +124,19 @@ from ...context.execution import (
 )
 from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
+from ...deferred_tools import (
+    DEFAULT_PRELOAD_TOKEN_BUDGET,
+    LOAD_TOOLS_NAME,
+    LOADED_TOOLS_COMPONENT,
+    MAX_TOOLS_PER_LOAD,
+    LoadToolsTool,
+    close_names,
+    deferred_rule,
+    is_deferrable_tool,
+    servers_mentioned,
+    tool_names_mentioned,
+    tool_source,
+)
 from ...grounding import evidence_facts, grounding_rule
 from ...language import effective_output_language, final_answer_language_rule
 from ...prompt_composition import (
@@ -155,19 +168,6 @@ from ...runtime import (
     ToolCallInterrupted,
     prepare_llm_for_context,
     resolved_llm_metadata,
-)
-from ...deferred_tools import (
-    DEFAULT_PRELOAD_TOKEN_BUDGET,
-    LOAD_TOOLS_NAME,
-    LOADED_TOOLS_COMPONENT,
-    MAX_TOOLS_PER_LOAD,
-    LoadToolsTool,
-    close_names,
-    deferred_rule,
-    is_deferrable_tool,
-    servers_mentioned,
-    tool_names_mentioned,
-    tool_source,
 )
 from ...tool_access import connector_tool_sources, tool_access_context
 from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope

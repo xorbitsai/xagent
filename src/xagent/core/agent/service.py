@@ -28,14 +28,12 @@ from ..tools.adapters.vibe.config import (
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .budget import BudgetPolicyProvider
-from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
 from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
-from .context.memory_retrieval import (
-    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
-)
+from .context.memory_retrieval import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 

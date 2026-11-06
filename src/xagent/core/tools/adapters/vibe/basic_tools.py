@@ -101,8 +101,3 @@ async def create_code_tools(config: "BaseToolConfig") -> List[Any]:
         tools.append(CommandExecutorToolForBasic(workspace=workspace))
 
     return tools
-
-
-async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
-    """Compatibility entry point; the registry dispatches the groups separately."""
-    return [*await create_web_tools(config), *await create_code_tools(config)]

@@ -17,22 +17,26 @@ File operations, knowledge bases, browser automation, connectors and the other
 specialized categories remain independent. The internal `other` fallback is
 not assignable to an agent and is not treated as a Basic Tools grant.
 
-## Existing selections
+## Upgrade existing configurations
 
-Old selectors remain accepted without rewriting stored agents, templates,
-execution snapshots or SDK requests:
+The `20261107_split_tool_categories` database migration rewrites persisted
+`agents.tool_categories` and `tasks.agent_config.tool_categories`:
 
-- `basic` preserves its previous built-in tools: structured questions, JSON
-  translation, Python, JavaScript, shell commands and `api_call`.
-- `web_search` preserves search, webpage fetching and asset downloading. It
-  does not grant `api_call`.
+- `basic` becomes `basic_tools`, `code_execution`, and `web_tools`.
+- `web_search` becomes `web_tools`.
+- Duplicate categories are merged, preserving order. Other categories, connector
+  scopes, explicit empty selections and unconfigured (`null`) values are kept.
 
-The backend filters these legacy groups by their original tool membership.
-The builder shows retained selections as existing permissions and lists their
-tools. Saving unrelated changes preserves the selectors; users can explicitly
-replace them with the new groups. Only new groups are advertised for new agent
-configuration. This prevents search-only agents from gaining HTTP API access
-and keeps existing code-enabled agents working.
+Existing agents retain code execution and HTTP API capabilities through the
+new groups. Network capabilities now follow the complete Web Tools group:
+old Basic selections also gain search, and old Web Search selections also
+gain HTTP API calls. Builders can adjust the migrated selections normally.
+
+Run the database upgrade and restart application processes and workers together.
+The runtime and UI use only the new selectors. Update external templates and
+API clients to send these selectors; bundled templates are already updated.
+The data migration is not reversed on downgrade, because the merged network
+group cannot be split back unambiguously.
 
 Category selection does not replace sandbox isolation or file/network policy.
 Code tools continue to follow the deployment's configured sandbox policy.

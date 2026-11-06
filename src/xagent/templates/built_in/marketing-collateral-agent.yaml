@@ -133,7 +133,9 @@ agent_config:
   execution_mode: think
   skills: []
   tool_categories:
-  - basic
+  - basic_tools
+  - code_execution
+  - web_tools
   - file
   - image
   - knowledge

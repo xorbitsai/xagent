@@ -3235,7 +3235,6 @@ Build when you need.`,
           skill: "Skill Tools",
           ssh: "SSH",
         },
-        existingPermissions: "Existing permissions",
         categoryDescriptions: {
           codeExecution: "Run Python, JavaScript and shell commands in the execution environment.",
           basic: "Structured questions and JSON field translation. Time and timezone helpers remain built in whenever tools are enabled.",

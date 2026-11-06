@@ -36,7 +36,6 @@ from .base import (
     ToolCategory,
     ToolVisibility,
 )
-from .categories import LEGACY_CATEGORY_TOOL_NAMES
 from .config import (
     NESTED_DELEGATION_NOT_APPROVABLE_REASON,
     run_with_tool_runtime_cleanup,
@@ -86,7 +85,7 @@ def resolve_llm_tool_categories(raw: Any, connector_error: str) -> list[str]:
         name = category.strip()
         if _is_connector_category(name):
             connectors.append(category)
-        elif name not in choices and name not in LEGACY_CATEGORY_TOOL_NAMES:
+        elif name not in choices:
             invalid.append(category)
         elif name not in selected:
             selected.append(name)

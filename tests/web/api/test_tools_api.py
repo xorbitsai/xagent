@@ -1766,12 +1766,11 @@ class TestAvailableToolsSandboxLifecycle:
 
 
 @pytest.mark.asyncio
-async def test_available_tools_exposes_canonical_and_legacy_category_catalogs(
+async def test_available_tools_exposes_canonical_category_catalog(
     monkeypatch,
 ):
     from xagent.core.tools.adapters.vibe.categories import (
         category_catalog,
-        legacy_category_catalog,
     )
     from xagent.web.api.tools import get_available_tools
 
@@ -1781,7 +1780,7 @@ async def test_available_tools_exposes_canonical_and_legacy_category_catalogs(
         current_user=SimpleNamespace(id=7, is_admin=False), db=db
     )
     assert response["categories"] == category_catalog()
-    assert response["legacy_categories"] == legacy_category_catalog()
+    assert "legacy_categories" not in response
 
 
 @pytest.mark.asyncio

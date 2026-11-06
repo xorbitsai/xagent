@@ -31,7 +31,7 @@ class TestAPIToolIntegration:
         assert api_tool.name == "api_call"
         assert "HTTP requests to arbitrary APIs" in api_tool.description
         assert "api" in api_tool.tags
-        assert api_tool.category.value == "basic"
+        assert api_tool.category.value == "basic_tools"
 
     @pytest.mark.asyncio
     async def test_api_tool_execution(self, monkeypatch):
@@ -172,7 +172,7 @@ class TestAPIToolIntegration:
         # Check metadata
         metadata = api_tool.metadata
         assert metadata.name == "api_call"
-        assert metadata.category.value == "basic"
+        assert metadata.category.value == "basic_tools"
         assert "api" in metadata.tags
         assert "http" in metadata.tags
 

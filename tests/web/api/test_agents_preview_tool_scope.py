@@ -67,11 +67,11 @@ async def _run_preview(tool_categories):
 async def test_preview_scoped_categories_exclude_custom_api_and_mcp():
     """A preview for an agent that selected only ``basic`` must not load
     the user's Custom API registry nor initialize MCP servers."""
-    tool_config = await _run_preview(["basic"])
+    tool_config = await _run_preview(["basic_tools"])
 
     spec = tool_config.get_tool_selection_spec()
     assert spec.is_by_categories()
-    assert spec.includes_category("basic") is True
+    assert spec.includes_category("basic_tools") is True
     assert spec.includes_custom_api() is False
     assert spec.includes_mcp() is False
     assert tool_config._include_mcp_tools is False

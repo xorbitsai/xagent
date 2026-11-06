@@ -240,16 +240,7 @@ class ToolRegistry:
         if declared_cats & BINDING_AUTHORIZED_CATEGORIES:
             return spec.includes_binding_authorized()
 
-        from .categories import LEGACY_CATEGORY_DISPATCH
-
-        # Existing extensions can retain their registration tags. Filtering
-        # below still uses each tool's actual capability category.
-        dispatch_categories = {
-            current
-            for category in declared_cats
-            for current in LEGACY_CATEGORY_DISPATCH.get(category, (category,))
-        }
-        return any(spec.includes_category(category) for category in dispatch_categories)
+        return bool(declared_cats & spec.categories)
 
     @classmethod
     async def create_registered_tools(cls, config: BaseToolConfig) -> list[Tool]:

@@ -1,10 +1,9 @@
-"""Capability selections must preserve old grants without widening new ones."""
+"""The runtime exposes only the migrated capability categories."""
 
 import pytest
 
 from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES, ToolCategory
 from xagent.core.tools.adapters.vibe.categories import (
-    LEGACY_CATEGORY_TOOL_NAMES,
     category_catalog,
     configurable_tool_category,
 )
@@ -26,8 +25,6 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
             ["web_tools"],
             {"web_search", "fetch_web_content", "download_web_asset", "api_call"},
         ),
-        (["basic"], set(LEGACY_CATEGORY_TOOL_NAMES["basic"])),
-        (["web_search"], {"web_search", "fetch_web_content", "download_web_asset"}),
         ([], set()),
     ],
 )
@@ -56,7 +53,7 @@ def test_canonical_categories_are_explicit_and_legacy_selectors_are_not_advertis
     catalog = {row["id"]: row["label"] for row in category_catalog()}
     assert catalog[ToolCategory.BASIC.value] == "Basic Tools"
     assert catalog[ToolCategory.CODE_EXECUTION.value] == "Code Execution"
-    assert catalog[ToolCategory.WEB_SEARCH.value] == "Web Tools"
+    assert catalog[ToolCategory.WEB_TOOLS.value] == "Web Tools"
     assert "basic" not in catalog
     assert "web_search" not in catalog
 
@@ -66,17 +63,15 @@ def test_canonical_categories_are_explicit_and_legacy_selectors_are_not_advertis
     ["web_search", "tavily_web_search", "zhipu_web_search", "exa_web_search"],
 )
 def test_search_configuration_and_runtime_share_the_web_category(provider):
-    assert configurable_tool_category(provider) == ToolCategory.WEB_SEARCH.value
+    assert configurable_tool_category(provider) == ToolCategory.WEB_TOOLS.value
 
 
-@pytest.mark.parametrize(
-    "raw,canonical",
-    [("basic", ToolCategory.BASIC), ("web_search", ToolCategory.WEB_TOOLS)],
-)
-def test_saved_tool_metadata_decodes_legacy_category_values(raw, canonical):
+@pytest.mark.parametrize("raw", ["basic", "web_search"])
+def test_old_categories_are_not_runtime_metadata_aliases(raw):
     from xagent.core.tools.adapters.vibe.base import ToolMetadata
 
-    assert ToolMetadata(name="saved", category=raw).category is canonical
+    with pytest.raises(ValueError):
+        ToolMetadata(name="saved", category=raw)
 
 
 @pytest.mark.parametrize(
@@ -85,8 +80,6 @@ def test_saved_tool_metadata_decodes_legacy_category_values(raw, canonical):
         (["basic_tools"], False),
         (["code_execution"], False),
         (["web_tools"], True),
-        (["basic"], True),
-        (["web_search"], True),
         ([], False),
     ],
 )
@@ -106,17 +99,16 @@ def test_detached_factory_prefetch_follows_network_selection(
 
 
 @pytest.mark.parametrize(
-    "old_tag,selection",
+    "old_tag",
     [
-        ("basic", "basic_tools"),
-        ("basic", "code_execution"),
-        ("web_search", "web_tools"),
+        "basic",
+        "web_search",
     ],
 )
-def test_extension_registration_tags_keep_working_with_new_selections(
-    old_tag, selection
-):
+def test_old_registration_tags_do_not_grant_new_categories(old_tag):
     from xagent.core.tools.adapters.vibe.factory import ToolRegistry
 
-    spec = ToolSelectionSpec.from_raw(tool_categories=[selection])
-    assert ToolRegistry._should_run_creator(frozenset({old_tag}), spec, None)
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools", "code_execution", "web_tools"]
+    )
+    assert not ToolRegistry._should_run_creator(frozenset({old_tag}), spec, None)

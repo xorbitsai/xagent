@@ -3,11 +3,9 @@
  * Marketplace detail page's "Tools" panel and its card's capability tags,
  * so the two surfaces can't drift out of sync with each other. */
 export const TOOL_CATEGORY_I18N_KEYS: Record<string, string> = {
-  basic: "builds.configForm.tools.categories.basic",
   basic_tools: "builds.configForm.tools.categories.basic",
   code_execution: "builds.configForm.tools.categories.codeExecution",
   web_tools: "builds.configForm.tools.categories.webSearch",
-  web_search: "builds.configForm.tools.categories.webSearch",
   file: "builds.configForm.tools.categories.file",
   vision: "builds.configForm.tools.categories.vision",
   image: "builds.configForm.tools.categories.image",
@@ -32,11 +30,11 @@ export function capitalize(value: string): string {
  * A curated, on-brand subset of `tool_categories` + `skills` for a
  * marketplace card's highlight-tags row: drops the categories that are
  * either redundant with the connector icons (`mcp:*`), assumed present on
- * every agent (`basic`), or not interesting to show as a capability
+ * every agent (`basic_tools`), or not interesting to show as a capability
  * headline (`browser`, `knowledge`) - then appends skill names verbatim
  * (they're author-chosen slugs, not translated categories).
  */
-const CARD_TAG_EXCLUDED_CATEGORIES = new Set(["basic", "basic_tools", "browser", "knowledge"]);
+const CARD_TAG_EXCLUDED_CATEGORIES = new Set(["basic_tools", "browser", "knowledge"]);
 
 export function getCardCapabilityTags(
   toolCategories: string[] | undefined,
@@ -57,11 +55,6 @@ export interface ToolCategoryDefinition {
   label: string;
 }
 
-export interface LegacyToolCategoryDefinition {
-  id: string;
-  tool_names: string[];
-}
-
 export function formatToolCategory(
   category: string,
   translate: (key: string, fallback: string) => string,
@@ -77,13 +70,4 @@ export function describeToolCategory(
 ): string {
   const key = category === "ssh" ? undefined : TOOL_CATEGORY_I18N_KEYS[category];
   return key ? translate(key.replace(".categories.", ".categoryDescriptions."), "") : "";
-}
-
-export function toolMatchesCategory(
-  tool: { name: string; category: string },
-  category: string,
-  legacyCategories: LegacyToolCategoryDefinition[],
-): boolean {
-  const legacy = legacyCategories.find(item => item.id === category);
-  return legacy ? legacy.tool_names.includes(tool.name) : tool.category === category;
 }

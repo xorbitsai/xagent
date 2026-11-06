@@ -1029,7 +1029,7 @@ def test_list_insights_requests_basic_shape(monkeypatch):
     result = json.loads(posthog.posthog_list_insights())
 
     assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["params"]["basic"] == "true"
+    assert mock_request.call_args.kwargs["params"]["basic_tools"] == "true"
 
 
 def test_get_insight_returns_insight(monkeypatch):

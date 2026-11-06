@@ -135,12 +135,14 @@ async def test_basic_category_selection_excludes_web_fetch_tool(monkeypatch):
             "tool_credentials": {},
         }
     )
-    config._tool_selection_spec = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools"]
+    )
 
     tools = await ToolFactory.create_all_tools(config)
 
     names = _tool_names(tools)
-    assert "api_call" in names
+    assert "api_call" not in names
     assert "fetch_web_content" not in names
 
 
@@ -154,15 +156,16 @@ async def test_web_search_category_selection_keeps_web_fetch_tool(monkeypatch):
         }
     )
     config._tool_selection_spec = ToolSelectionSpec.from_raw(
-        tool_categories=["web_search"]
+        tool_categories=["web_tools"]
     )
 
     tools = await ToolFactory.create_all_tools(config)
 
     # The time tools are intrinsic: they ride along every non-NONE selection
-    # regardless of category, so a web_search-only agent sees them too
+    # regardless of category, so a web-tools-only agent sees them too
     # (#1729). Their display category does not change that availability.
     assert set(_tool_names(tools)) == {
+        "api_call",
         "fetch_web_content",
         "get_current_time",
         "validate_local_time",

@@ -1,6 +1,6 @@
 "use client"
 
-import { formatToolCategory, describeToolCategory, toolMatchesCategory } from "@/lib/tool-category-labels"
+import { formatToolCategory, describeToolCategory } from "@/lib/tool-category-labels"
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
@@ -356,7 +356,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     models, modelsStatus, retryModels, userDefaultGeneral, modelDefaultsSettled,
     kbs, kbsStatus, reloadKbs,
     skills, skillsStatus, retrySkills,
-    tools, toolCategoryDefinitions, legacyToolCategories, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
+    tools, toolCategoryDefinitions, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
     mcpServers, setMcpServers, mcpSettled,
   } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
@@ -1060,17 +1060,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     new Set((Array.isArray(tools) ? tools : []).map(t => t.category).filter(c => c !== 'mcp' && isAssignableToolCategory(c)))
   ).sort()
 
-  // Keep existing selectors explicit until the user changes those grants.
-  // Replacing legacy basic with Web Tools would also grant search access.
-  const retainedLegacyCategories = legacyToolCategories.filter(category => selectedToolCategories.includes(category.id))
-  const categoryIds = Array.from(new Set([...toolCategories, ...retainedLegacyCategories.map(category => category.id)]))
-  const toolCategoryOptions = categoryIds.map(category => {
-    const legacy = retainedLegacyCategories.find(item => item.id === category)
-    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(tool => toolMatchesCategory(tool, category, legacyToolCategories))
-    const categoryDesc = legacy ? t('builds.configForm.tools.existingPermissions') : getCategoryDescription(category)
+  const toolCategoryOptions = toolCategories.map(category => {
+    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(tool => tool.category === category)
+    const categoryDesc = getCategoryDescription(category)
     return {
       value: category,
-      label: getCategoryLabel(category) + (legacy ? ` (${t('builds.configForm.tools.existingPermissions')})` : ''),
+      label: getCategoryLabel(category),
       count: toolsInCategory.length,
       description: (categoryDesc ? `**${categoryDesc}**\n\n` : '') + toolsInCategory.map(tool => tool.name).join(', '),
     }
@@ -2630,7 +2625,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             <div className="text-xs text-muted-foreground">
               {t("builds.configForm.tools.selectedCount", {
                 count: selectedToolCategories.length,
-                tools: tools.filter(tool => selectedToolCategories.some(category => toolMatchesCategory(tool, category, legacyToolCategories))).length
+                tools: tools.filter(tool => selectedToolCategories.includes(tool.category)).length
               })}
             </div>
           )}

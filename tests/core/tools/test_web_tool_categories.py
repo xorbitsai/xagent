@@ -23,4 +23,4 @@ def test_web_research_tools_share_web_search_category(tmp_path: Path) -> None:
         DownloadWebAssetTool(workspace),
     ]
 
-    assert {tool.metadata.category for tool in tools} == {ToolCategory.WEB_SEARCH}
+    assert {tool.metadata.category for tool in tools} == {ToolCategory.WEB_TOOLS}

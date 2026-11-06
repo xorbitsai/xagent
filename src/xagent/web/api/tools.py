@@ -18,7 +18,6 @@ from ...core.tools.adapters.vibe.categories import (
     CATEGORY_DISPLAY_NAMES,
     category_catalog,
     configurable_tool_category,
-    legacy_category_catalog,
 )
 from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
@@ -496,7 +495,6 @@ async def get_available_tools(
             "count": len(tools),
             "skill_loader_tool": LOAD_SKILL_TOOL_NAME,
             "categories": category_catalog(),
-            "legacy_categories": legacy_category_catalog(),
         }
 
     return await run_with_tool_runtime_cleanup(

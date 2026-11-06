@@ -3230,7 +3230,6 @@ const zh = {
           skill: "技能工具",
           ssh: "SSH",
         },
-        existingPermissions: "原有权限",
         categoryDescriptions: {
           codeExecution: "在执行环境中运行 Python、JavaScript 和命令行命令。",
           basic: "结构化提问和 JSON 字段翻译。启用任意工具时，时间查询和时区校验始终内置可用。",

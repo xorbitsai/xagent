@@ -255,9 +255,9 @@ class TestCreateAgentTool:
         assert "web_search" not in categories
 
     def test_resolve_llm_tool_categories_trims_and_deduplicates(self) -> None:
-        assert resolve_llm_tool_categories([" file", "file", "basic "], "x") == [
+        assert resolve_llm_tool_categories([" file", "file", "basic_tools "], "x") == [
             "file",
-            "basic",
+            "basic_tools",
         ]
         assert resolve_llm_tool_categories([], "x") == []
 
@@ -2055,7 +2055,7 @@ class TestUpdateAgentTool:
     async def test_update_agent_refuses_invalid_tool_categories(
         self, session_local: Any, requested: Any
     ) -> None:
-        user_id, agent_id = _seed_agent(session_local, ["basic", "mcp:github"])
+        user_id, agent_id = _seed_agent(session_local, ["basic_tools", "mcp:github"])
         result = await UpdateAgentTool(
             session_factory=session_local, user_id=user_id
         ).run_json_async(
@@ -2065,17 +2065,17 @@ class TestUpdateAgentTool:
         assert result["status"] == "error"
         assert _stored(session_local, agent_id) == (
             "tc_agent",
-            ["basic", "mcp:github"],
+            ["basic_tools", "mcp:github"],
         )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("stored", "requested", "column"),
         [
-            (["basic", "mcp:github"], ["file"], ["file", "mcp:github"]),
-            (["basic", "mcp:github"], [], ["mcp:github"]),
+            (["basic_tools", "mcp:github"], ["file"], ["file", "mcp:github"]),
+            (["basic_tools", "mcp:github"], [], ["mcp:github"]),
             (None, ["file"], ["file"]),
-            ('["basic", "mcp:github"]', ["file"], ["file", "mcp:github"]),
+            ('["basic_tools", "mcp:github"]', ["file"], ["file", "mcp:github"]),
             # Runtime rule, untrimmed: " mcp" is inert (dropped), "mcp: x" is live.
             (
                 ["mcpfoo", " mcp", " mcp:x", "mcp: x", "mcp", "mcp"],
@@ -2125,7 +2125,7 @@ class TestUpdateAgentTool:
     async def test_update_agent_takes_connectors_from_the_row_after_awaits(
         self, session_local: Any
     ) -> None:
-        user_id, agent_id = _seed_agent(session_local, ["basic", "mcp:github"])
+        user_id, agent_id = _seed_agent(session_local, ["basic_tools", "mcp:github"])
         refresh = Session.refresh
         locked_refreshes: list[Any] = []
 
@@ -2138,7 +2138,7 @@ class TestUpdateAgentTool:
         async def builder_saves_meanwhile(*_args: Any, **_kwargs: Any) -> list[str]:
             with session_local() as db:
                 AgentStore(db).update_agent_fields(
-                    user_id, agent_id, {"tool_categories": ["basic", "mcp:slack"]}
+                    user_id, agent_id, {"tool_categories": ["basic_tools", "mcp:slack"]}
                 )
             return []
 
@@ -2168,13 +2168,13 @@ class TestUpdateAgentTool:
         ("stored", "unshared", "expected"),
         [
             (
-                ["basic", "mcp"],
+                ["basic_tools", "mcp"],
                 [{"type": "mcp", "id": 3, "name": "gmail"}],
                 "are not shared with the team: gmail. Nothing was saved: it "
                 "grants every MCP server ('mcp')",
             ),
             (
-                ["basic", "mcp:ghost", "mcp:drive"],
+                ["basic_tools", "mcp:ghost", "mcp:drive"],
                 [
                     {"type": "mcp", "name": "ghost", "reason": "unresolved"},
                     {"type": "mcp", "id": 4, "name": "drive"},
@@ -2266,7 +2266,7 @@ class TestUpdateAgentTool:
                 name="strip_update_agent",
                 description="Original description",
                 instructions="Original instructions",
-                tool_categories=["basic"],
+                tool_categories=["basic_tools"],
                 status=AgentStatus.DRAFT,
             )
             db.add(existing_agent)
@@ -2285,7 +2285,7 @@ class TestUpdateAgentTool:
             assert result["status"] == "error"
 
             db.refresh(existing_agent)
-            assert existing_agent.tool_categories == ["basic"]
+            assert existing_agent.tool_categories == ["basic_tools"]
 
         finally:
             db.close()
@@ -3500,7 +3500,7 @@ class TestCreateAndCallAgent:
 
     @pytest.mark.parametrize(
         "tool_categories",
-        [["basic"], [], None],
+        [["basic_tools"], [], None],
         ids=["basic-only", "empty-list", "null"],
     )
     async def test_delegated_non_mcp_agent_disables_mcp_init(

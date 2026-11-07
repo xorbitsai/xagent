@@ -14,10 +14,103 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from ..connector_probes import get_connector_probe, get_unprobeable_reason
-from .declarations import ConnectorChecks, L3Envelope, ReadCheck, UnprobeableCheck
+from .declarations import (
+    ConnectorChecks,
+    HasKeys,
+    L3Envelope,
+    ReadCheck,
+    StatusSuccess,
+    UnprobeableCheck,
+)
+from .fixtures import FixtureRef
 
 # Connectors that have adopted V2, by catalog app id.
-CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {}
+CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
+    "excel": ConnectorChecks(
+        "excel",
+        reads=(
+            ReadCheck(
+                "excel.read_fixture",
+                "excel_list_worksheets",
+                {"file_path": FixtureRef("excel.file_path")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("worksheets", "truncated")),
+                ),
+            ),
+        ),
+    ),
+    "google-docs": ConnectorChecks(
+        "google-docs",
+        reads=(
+            ReadCheck(
+                "google-docs.read_fixture",
+                "google_docs_get_document",
+                {"document_id": FixtureRef("google-docs.document_id")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("document_id", "title")),
+                ),
+            ),
+        ),
+    ),
+    "google-sheets": ConnectorChecks(
+        "google-sheets",
+        reads=(
+            ReadCheck(
+                "google-sheets.read_fixture",
+                "google_sheets_get_spreadsheet",
+                {"spreadsheet_id": FixtureRef("google-sheets.spreadsheet_id")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("spreadsheet_id", "title", "sheets")),
+                ),
+            ),
+        ),
+    ),
+    "google-slides": ConnectorChecks(
+        "google-slides",
+        reads=(
+            ReadCheck(
+                "google-slides.read_fixture",
+                "google_slides_get_presentation",
+                {"presentation_id": FixtureRef("google-slides.presentation_id")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("presentation_id", "title", "slides")),
+                ),
+            ),
+        ),
+    ),
+    "powerpoint": ConnectorChecks(
+        "powerpoint",
+        reads=(
+            ReadCheck(
+                "powerpoint.read_fixture",
+                "powerpoint_list_slides",
+                {"file_path": FixtureRef("powerpoint.file_path")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("slides", "etag")),
+                ),
+            ),
+        ),
+    ),
+    "word": ConnectorChecks(
+        "word",
+        reads=(
+            ReadCheck(
+                "word.read_fixture",
+                "word_get_document_text",
+                {"file_path": FixtureRef("word.file_path")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("text", "generation")),
+                ),
+            ),
+        ),
+    ),
+}
 
 
 def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:

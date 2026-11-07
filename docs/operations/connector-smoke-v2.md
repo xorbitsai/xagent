@@ -36,6 +36,8 @@ ConnectorChecks(
 
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`; a write step's value can also be a `RunScopedName`. Neither ever comes from the caller of the engine.
 
+The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `powerpoint`, `word` and `excel`) declare a `read_fixture` read check that reads the object named by its fixture key: `google-docs.document_id`, `google-sheets.spreadsheet_id`, `google-slides.presentation_id`, `powerpoint.file_path`, `word.file_path` and `excel.file_path`. Each object must be a document or file the identity's account can read, and a `file_path` is relative to that account's drive root, not a local task-workspace path. Without a value the check reports `skip` with `fixture_missing`, and the probe route, which takes no fixtures, still records these connectors as `needs_fixture`.
+
 ### Assertions
 
 Assertions read a **payload** taken from the tool's normalized result (`{"content": [...], "structured_content": ..., "is_error": ...}`). A result flagged `is_error` fails before any assertion runs.
@@ -60,7 +62,7 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 
 ### Fixture keys
 
-A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The probe route's document fixtures (#3284) use the same keys.
+A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The document connectors' `read_fixture` checks use these keys; the probe route takes none.
 
 ### Today's L3 probes
 

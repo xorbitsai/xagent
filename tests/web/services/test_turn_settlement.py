@@ -1320,6 +1320,42 @@ async def test_resumed_run_reports_its_settlement_once(monkeypatch, path) -> Non
     )
 
 
+async def test_cancelled_external_resume_reports_external_interruption(
+    monkeypatch,
+) -> None:
+    from xagent.web.services.external_task_cancel import (
+        EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+    )
+    from xagent.web.services.task_orchestrator import EXTERNAL_TASK_SOURCE
+
+    received = _capture()
+    settle_calls: list[dict[str, Any]] = []
+
+    def record_settlement(*_args: Any, **kwargs: Any) -> bool:
+        settle_calls.append(kwargs)
+        return True
+
+    raised = await _drive_resume(
+        monkeypatch,
+        asyncio.CancelledError(),
+        trusted_task_source=EXTERNAL_TASK_SOURCE,
+        extra_patches=(
+            patch(
+                "xagent.web.services.task_execution._settle_resumed_task_lease",
+                new=record_settlement,
+            ),
+        ),
+    )
+
+    assert raised is asyncio.CancelledError
+    assert [c["error_message"] for c in settle_calls] == [
+        EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    ]
+    assert [(s.status, s.error_code) for s in received] == [
+        ("failed", "external_turn_interrupted")
+    ]
+
+
 async def test_resume_without_delivery_turn_takes_the_result_turn(
     monkeypatch,
 ) -> None:

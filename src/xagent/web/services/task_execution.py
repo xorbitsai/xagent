@@ -5142,10 +5142,23 @@ async def execute_resume_background(
                     ):
                         outcome = facts.outcome
                         if outcome is None:
+                            from .external_task_cancel import (
+                                EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+                            )
+
+                            # This cleanup's own settlement committed the
+                            # outcome; an interrupted external run carries the
+                            # code the scheduler reports for it.
                             outcome = settled_outcome(
                                 TaskStatus.PAUSED.value
                                 if resume_settled_paused
-                                else TaskStatus.FAILED.value
+                                else TaskStatus.FAILED.value,
+                                failure_code=(
+                                    ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
+                                    if settlement_error
+                                    == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+                                    else None
+                                ),
                             )
                         report_turn_settled(
                             facts,

@@ -116,7 +116,7 @@ def test_every_remote_mcp_read_check_requires_the_read_only_hint() -> None:
         for row in get_builtin_public_mcp_app_rows()
         if "url" in row["launch_config"]
     }
-    assert {"notion", "miro", "atlassian"} <= remote_app_ids
+    assert {"notion", "miro", "atlassian"} <= remote_app_ids & set(CONNECTOR_CHECKS)
     for app_id in remote_app_ids & set(CONNECTOR_CHECKS):
         for check in CONNECTOR_CHECKS[app_id].reads:
             if isinstance(check, ReadCheck):

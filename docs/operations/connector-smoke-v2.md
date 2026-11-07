@@ -34,8 +34,6 @@ ConnectorChecks(
 - **Write check.** `create`, `verify` and `cleanup` steps, a `tenant_pin` and `expected_verdicts`. `create` must name its object with a `RunScopedName`, which the engine fills in as `xagent-smoke-<run_id>-<suffix>`. The tenant pin reads the connection's tenant id and compares it with the registry's (a fixture key). `expected_verdicts` gives, for exactly the `create` and `cleanup` tools, the approval gate's verdict (`allow`, `require_approval`, `deny`), because the probe path bypasses the gate. The write switch is per connector, keyed by its app id. **No write check runs until #3564 lands**: each one reports `skip` with `writes_disabled`.
 - **Exemption.** A tool that has no check carries an exemption and a reason, keyed by its wire name. A tool cannot be both checked and exempted.
 
-`notion`, `miro` and `atlassian` have adopted V2 with a `current_user` read check that sets `require_read_only_hint`, because their tools are vendor-owned: the check is skipped unless the server advertises the tool with `readOnlyHint: true`. The check takes the place of their unprobeable `l3_probe` row. `connector_probes.py` has no such guard, so the probe route still records them as `covered_by_l2`. The other remote MCP connectors keep the derived `covered_by_l2` row until their result shapes are verified against a test account; `fireflies` returns plain text, which no payload source reads.
-
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`; a write step's value can also be a `RunScopedName`. Neither ever comes from the caller of the engine.
 
 ### Assertions
@@ -73,6 +71,8 @@ A connector that has not adopted V2 keeps `web/connector_probes.py` as its singl
 - an app with neither (a custom catalog app) has no declaration, and its `<connector>.l3_probe` row is `skip` with `not_declared`.
 
 A connector adopts V2 by adding an entry to `CONNECTOR_CHECKS`. To keep its L3 call, it lists `l3_read_check(app_id)` among its reads.
+
+`notion`, `miro` and `atlassian` have adopted V2 with a `current_user` read check that sets `require_read_only_hint`, because their tools are vendor-owned: the check is skipped unless the server advertises the tool with `readOnlyHint: true`. The check takes the place of their unprobeable `l3_probe` row. `connector_probes.py` has no such guard, so the probe route still records them as `covered_by_l2`. The other remote MCP connectors keep the derived `covered_by_l2` row until their result shapes are verified against a test account; `fireflies` returns plain text, which no payload source reads. A remote (`url`) connector's tool list is vendor-owned and changes without a release, so per-tool coverage (#3565) does not apply to it: it declares the checks it has and no exemptions.
 
 ## Identity adapters
 

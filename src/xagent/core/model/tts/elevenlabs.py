@@ -573,7 +573,10 @@ class ElevenLabsTTS(BaseTTS):
         """Create a persistent ElevenLabs Instant Voice Clone."""
         normalized_name = name.strip()
         if not normalized_name:
-            raise ValueError("ElevenLabs voice clone name must not be empty")
+            raise MediaParameterError(
+                "ElevenLabs voice clone name must not be empty",
+                field="name",
+            )
         if not reference_audio_files:
             raise ValueError("At least one reference audio file is required")
 
@@ -626,7 +629,10 @@ class ElevenLabsTTS(BaseTTS):
         """Delete a persistent voice from the configured ElevenLabs account."""
         normalized_voice_id = voice_id.strip()
         if not normalized_voice_id:
-            raise ValueError("ElevenLabs voice ID must not be empty")
+            raise MediaParameterError(
+                "ElevenLabs voice ID must not be empty",
+                field="voice_id",
+            )
 
         client = self._ensure_async_client()
         try:

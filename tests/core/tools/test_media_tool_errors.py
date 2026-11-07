@@ -41,6 +41,7 @@ from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.core.model.tts.xinference import XinferenceTTS
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BilledVideoTaskTimeout
+from xagent.core.model.video.xinference import XinferenceVideoModel
 from xagent.core.tools.core.audio_tool import AudioToolCore
 from xagent.core.tools.core.image_tool import ImageGenerationToolCore
 from xagent.core.tools.core.media_errors import (
@@ -332,6 +333,73 @@ class TestProviderRejectionsCarryNoGuessedRange:
         readable = json.dumps(result, default=str)
         for unrelated in ("duration_seconds", "4-15"):
             assert unrelated not in readable
+
+
+class TestAdapterOwnedParameterChecks:
+    """A check the adapter runs before calling the provider is the caller's
+    parameter error, not an unexplained failure."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "video_model",
+        [
+            ArkVideoModel(api_key="test-key"),
+            XinferenceVideoModel("test-video-model", base_url="http://test"),
+        ],
+        ids=["ark", "xinference"],
+    )
+    async def test_a_second_video_is_a_parameter_error(
+        self, workspace: Mock, video_model: Any
+    ) -> None:
+        tool = VideoGenerationToolCore(
+            {"video": video_model},
+            workspace=workspace,
+            default_video_model=video_model,
+        )
+
+        result = await tool.generate_video("A short clip", seconds=4, n=2)
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["allowed_values"] == {"n": [1]}
+        assert "one video per request" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_empty_clone_name_is_a_parameter_error(self) -> None:
+        tts_model = ElevenLabsTTS(api_key="test-key")
+        tts_model._ensure_async_client = Mock(
+            side_effect=AssertionError("a rejected request must not reach the SDK")
+        )
+        tool = AudioToolCore(
+            tts_models={"elevenlabs": tts_model},
+            default_tts_model=tts_model,
+        )
+
+        result = await tool.clone_tts_voice("   ", ["reference.mp3"])
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+        assert tts_model._ensure_async_client.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_an_empty_voice_id_is_a_parameter_error(self) -> None:
+        tts_model = ElevenLabsTTS(api_key="test-key")
+        tts_model._ensure_async_client = Mock(
+            side_effect=AssertionError("a rejected request must not reach the SDK")
+        )
+        tool = AudioToolCore(
+            tts_models={"elevenlabs": tts_model},
+            default_tts_model=tts_model,
+        )
+
+        result = await tool.delete_tts_voice("   ")
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["deleted"] is False
+        assert "allowed_values" not in result
+        assert tts_model._ensure_async_client.call_count == 0
 
 
 class FailingASR(BaseASR):

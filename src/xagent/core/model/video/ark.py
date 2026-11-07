@@ -7,7 +7,7 @@ import re
 import time
 from typing import Any, List, Optional
 
-from ...tools.core.media_errors import redact_provider_detail
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from .base import BaseVideoModel, BilledVideoTaskError, BilledVideoTaskTimeout
@@ -391,7 +391,11 @@ class ArkVideoModel(BaseVideoModel):
             logger.debug("Ark video generation does not support negative_prompt")
         n = kwargs.pop("n", 1)
         if n not in (None, 1, "1"):
-            raise ValueError("Seedance video generation supports one video per request")
+            raise MediaParameterError(
+                "Seedance video generation supports one video per request",
+                field="n",
+                allowed_values={"n": [1]},
+            )
         if duration is not None:
             kwargs["duration"] = duration
         elif seconds is not None:

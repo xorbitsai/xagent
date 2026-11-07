@@ -7,6 +7,7 @@ from xagent.core.model.video.ark import (
     ARK_DOMESTIC_BASE_URL,
     ArkVideoModel,
     _size_to_seedance_params,
+    seedance_duration_limits,
 )
 
 
@@ -277,3 +278,19 @@ async def test_audio_reference_requires_visual_reference():
             prompt="",
             reference_audio_urls=["https://example.com/audio.mp3"],
         )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        ("doubao-seedance-2-0-fast-260128", (4, 15)),
+        ("doubao-seedance-1-5-pro-250528", (4, 12)),
+        # 2.5 is not 2.0: taking the 2.0 bounds would refuse its valid clips.
+        ("doubao-seedance-2-5-pro-260101", None),
+        # 1.0 accepts 2 second clips, so clamping it to 4 would be wrong too.
+        ("doubao-seedance-1-0-pro-250528", None),
+        ("Wan2.1-t2v-14B-480p", None),
+    ],
+)
+def test_seedance_limits_match_the_version_and_guess_nothing_else(model_name, expected):
+    assert seedance_duration_limits(model_name) == expected

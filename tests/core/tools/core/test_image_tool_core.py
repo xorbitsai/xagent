@@ -628,7 +628,10 @@ class TestImageGenerationToolCore:
         )
 
         assert result["success"] is False
-        assert result["error"] == "Edit model error"
+        # The exception's own words stay in the log. The result carries a
+        # category and a sentence that names nothing internal.
+        assert result["error_category"] == "unknown"
+        assert "Edit model error" not in result["error"]
         assert result["model_used"] == "model1"
 
     @pytest.mark.asyncio

@@ -22,7 +22,7 @@ from pydantic import Field
 
 from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
-from ...model.video.ark import ArkVideoModel
+from ...model.video.ark import ArkVideoModel, seedance_duration_limits
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
 from ...utils.media_download import (
@@ -31,6 +31,7 @@ from ...utils.media_download import (
     resolve_workspace_media_path,
 )
 from ...workspace import TaskWorkspace
+from .media_errors import INVALID_REQUEST, media_error_fields, media_failure_fields
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,46 @@ _VIDEO_MIME_EXTENSIONS = {
 
 def _has_value(value: Any) -> bool:
     return value is not None and not (isinstance(value, str) and not value.strip())
+
+
+def _requested_length_seconds(value: Any) -> Optional[float]:
+    """A positive clip length the caller asked for, or ``None``.
+
+    ``None`` covers everything the length check must not touch: an absent
+    value, a range like ``"4-5"`` the model was told to resolve itself, and
+    Ark's ``-1``, which means "let the provider pick" rather than "minus one
+    second".
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    return None
+
+
+def _plain_number(value: float) -> int | float:
+    return int(value) if float(value).is_integer() else value
+
+
+def _clip_length_problem(value: Any, *, whole_seconds: bool) -> Optional[str]:
+    """Why ``value`` cannot be a clip length, or ``None`` when it can be one.
+
+    ``-1`` is Ark's "choose a length for me", not a length, so it keeps its
+    meaning. Every other non-positive value means nothing to any provider, and
+    when the model's range is known (``whole_seconds``) a fraction of a second
+    cannot be met either. A value the tool could not read as a number -- the
+    ``"4-5"`` range the model was told to resolve itself -- is left alone: it
+    is not this check's to judge.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value == -1:
+        return None
+    if value <= 0:
+        return "a clip length has to be a positive number of seconds, or -1"
+    if whole_seconds and not float(value).is_integer():
+        return "a clip length has to be a whole number of seconds"
+    return None
 
 
 def _canonical_video_tool_arg_key(key: str) -> str:
@@ -275,6 +316,27 @@ The generated video URL is temporary on the provider side, so completed videos a
             f"Video model '{model_id}' is not configured; "
             f"available video generation models: {available_text}"
         )
+
+    def _duration_allowed_values(
+        self, video_model: Optional[BaseVideoModel]
+    ) -> Optional[dict[str, Any]]:
+        """The clip lengths ``video_model`` accepts, for a rejected request.
+
+        Only the Seedance families with a recorded range state one here;
+        every other video model -- including a Seedance version whose bounds
+        this deployment does not know -- is left to say its own piece, which
+        is why the failure carries no range rather than a guessed one.
+        """
+        inner_video_model = (
+            getattr(video_model, "_inner", video_model) if video_model else None
+        )
+        if not isinstance(inner_video_model, ArkVideoModel):
+            return None
+        limits = seedance_duration_limits(inner_video_model.model_name)
+        if limits is None:
+            return None
+        shortest, longest = limits
+        return {"duration_seconds": f"{shortest}-{longest}"}
 
     @staticmethod
     def _normalize_url_list(value: Optional[str | list[str]]) -> Optional[list[str]]:
@@ -610,6 +672,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         **kwargs: Any,
     ) -> Dict[str, Any]:
         actual_model_id = model_id or "default"
+        video_model: Optional[BaseVideoModel] = None
         try:
             kwargs = self._normalize_extra_kwargs(kwargs)
             kwargs.pop("allowed_local_media_roots", None)
@@ -656,6 +719,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                     "model_used": actual_model_id,
                 }
             actual_model_id = self._model_id_for_model(video_model)
+            inner_video_model = getattr(video_model, "_inner", video_model)
             effective_ratio = ratio or "16:9"
 
             generate_params: dict[str, Any] = {
@@ -670,6 +734,72 @@ The generated video URL is temporary on the provider side, so completed videos a
             effective_seconds = self._normalize_seconds(
                 seconds if seconds is not None else duration
             )
+            # Seedance bills and rejects by length, and its providers answer a
+            # 3-second request with a parameter error that used to be relayed
+            # to the user verbatim. Rising to the shortest length is what the
+            # caller wanted anyway (a clip); overshooting the longest is not
+            # truncatable without silently changing the request, so it is
+            # refused with the range they can ask for.
+            duration_adjustment: Optional[dict[str, Any]] = None
+            seedance_model_name = (
+                inner_video_model.model_name
+                if isinstance(inner_video_model, ArkVideoModel)
+                else None
+            )
+            seedance_limits = (
+                seedance_duration_limits(seedance_model_name)
+                if seedance_model_name is not None
+                else None
+            )
+            # A length that cannot be a clip at all is refused here, before a
+            # task is created: 0, -2 and 4.5 all mean nothing to the provider,
+            # and Ark answers them with a parameter error whose text the user
+            # would end up reading. -1 (let the provider choose) and the "4-5"
+            # range are not lengths and pass through untouched.
+            length_problem = _clip_length_problem(
+                effective_seconds, whole_seconds=seedance_limits is not None
+            )
+            if length_problem is not None:
+                logger.info(
+                    "Rejected a clip length of %r: %s",
+                    effective_seconds,
+                    length_problem,
+                )
+                return {
+                    "success": False,
+                    **media_error_fields(
+                        INVALID_REQUEST,
+                        allowed_values=self._duration_allowed_values(video_model),
+                    ),
+                    "video_path": None,
+                }
+            if seedance_limits is not None:
+                shortest, longest = seedance_limits
+                requested_seconds = _requested_length_seconds(effective_seconds)
+                if requested_seconds is not None and requested_seconds > longest:
+                    logger.info(
+                        "Rejected a %s-second clip: %s accepts %s-%s seconds",
+                        _plain_number(requested_seconds),
+                        seedance_model_name,
+                        shortest,
+                        longest,
+                    )
+                    return {
+                        "success": False,
+                        **media_error_fields(
+                            INVALID_REQUEST,
+                            allowed_values={
+                                "duration_seconds": f"{shortest}-{longest}"
+                            },
+                        ),
+                        "video_path": None,
+                    }
+                if requested_seconds is not None and requested_seconds < shortest:
+                    effective_seconds = shortest
+                    duration_adjustment = {
+                        "requested": _plain_number(requested_seconds),
+                        "used": shortest,
+                    }
             if effective_seconds is not None:
                 generate_params["seconds"] = effective_seconds
                 generate_params["duration"] = effective_seconds
@@ -729,7 +859,6 @@ The generated video URL is temporary on the provider side, so completed videos a
             # the video. A model that still sends the flag has it dropped.
             kwargs.pop("wait_for_result", None)
             generate_params.update(kwargs)
-            inner_video_model = getattr(video_model, "_inner", video_model)
             if isinstance(inner_video_model, ArkVideoModel):
                 await self._prepare_ark_image_references(generate_params)
             if self._workspace and isinstance(inner_video_model, XinferenceVideoModel):
@@ -737,7 +866,27 @@ The generated video URL is temporary on the provider side, so completed videos a
                     self._workspace.workspace_dir
                 ]
 
-            result = await video_model.generate_video(**generate_params)
+            # The provider is the only thing in this method that speaks for
+            # somebody else, so it is also the only failure whose text cannot
+            # be handed on. Everything that fails before or after it is our
+            # own argument check or file handling, and keeps its message.
+            try:
+                result = await video_model.generate_video(**generate_params)
+            except Exception as e:
+                # The model that failed is a diagnostic, not something the
+                # caller can act on: it stays in the log line rather than in
+                # what the model reads, where it was one paraphrase away from
+                # the user.
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action=f"Video generation failed (model={actual_model_id})",
+                        model=video_model,
+                    ),
+                    "video_path": None,
+                }
 
             video_url = result.get("video_url")
             video_path = None
@@ -789,19 +938,40 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "frames": result.get("frames"),
                 "model_used": actual_model_id,
                 "saved_to_workspace": video_path is not None,
-                "raw_response": result.get("raw_response"),
             }
+            if duration_adjustment is not None:
+                # What we asked for and what came back are two different
+                # facts. The provider's own duration wins when it reports one
+                # -- a clip asked for at the shortest length can still come
+                # back a second longer -- and the note is written from that
+                # value, so the model never claims a length the file does not
+                # have.
+                requested_length = duration_adjustment["requested"]
+                adjusted_length = duration_adjustment["used"]
+                reported = _requested_length_seconds(result.get("duration"))
+                used = (
+                    _plain_number(reported) if reported is not None else adjusted_length
+                )
+                response["duration"] = used
+                response["duration_adjusted"] = {
+                    "requested": requested_length,
+                    "used": used,
+                }
+                response["duration_note"] = (
+                    f"Requested {requested_length} seconds; the shortest "
+                    f"supported clip is {adjusted_length} seconds, so this clip "
+                    f"is {used} seconds long."
+                )
             if download_error is not None:
                 response["download_error"] = download_error
             return response
 
         except Exception as e:
-            logger.error("Video generation failed: %s", e)
+            logger.error("Video generation failed (model=%s): %s", actual_model_id, e)
             return {
                 "success": False,
                 "error": str(e),
                 "video_path": None,
-                "model_used": actual_model_id,
             }
 
     def list_available_models(self) -> Dict[str, Any]:
@@ -824,10 +994,13 @@ The generated video URL is temporary on the provider side, so completed videos a
             }
 
         except Exception as e:
-            logger.error("Failed to list available video models: %s", e)
             return {
                 "success": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list available video models",
+                ),
                 "models": [],
                 "count": 0,
             }

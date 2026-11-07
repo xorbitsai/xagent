@@ -1,4 +1,5 @@
 import base64
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -502,3 +503,211 @@ def test_normalize_seconds_preserves_fractional_numeric_values():
     assert VideoGenerationToolCore._normalize_seconds("4.5") == 4.5
     assert VideoGenerationToolCore._normalize_seconds(4.5) == 4.5
     assert VideoGenerationToolCore._normalize_seconds("5") == 5
+
+
+def _ark_video_tool(mock_workspace, model_name=None, result=None):
+    ark_model = ArkVideoModel(
+        model_name=model_name or "doubao-seedance-2-0-fast-260128",
+        api_key="test-key",
+    )
+    if result is None:
+        ark_model.generate_video = AsyncMock(
+            return_value={"task_id": "task-ark", "status": "succeeded", "video_url": ""}
+        )
+    else:
+        ark_model.generate_video = AsyncMock(return_value=result)
+    tool = VideoGenerationToolCore(
+        {"ark-video": ark_model},
+        workspace=mock_workspace,
+        default_video_model=ark_model,
+    )
+    return tool, ark_model
+
+
+@pytest.mark.asyncio
+async def test_seconds_below_the_shortest_length_are_raised_to_it(mock_workspace):
+    tool, ark_model = _ark_video_tool(
+        mock_workspace,
+        result={"task_id": "task-ark", "status": "succeeded", "video_url": ""},
+    )
+
+    result = await tool.generate_video("A three-second idea", seconds=3)
+
+    assert result["success"] is True
+    generate_kwargs = ark_model.generate_video.await_args.kwargs
+    assert generate_kwargs["seconds"] == 4
+    assert generate_kwargs["duration"] == 4
+    # The result says which length was actually made, and why, so the model can
+    # tell the user instead of implying the 3 seconds they asked for.
+    assert result["duration"] == 4
+    assert result["duration_adjusted"] == {"requested": 3, "used": 4}
+    assert "shortest supported clip is 4 seconds" in result["duration_note"]
+
+
+@pytest.mark.asyncio
+async def test_seconds_above_the_longest_length_are_refused_not_truncated(
+    mock_workspace,
+):
+    tool, ark_model = _ark_video_tool(mock_workspace)
+
+    result = await tool.generate_video("A twenty-second idea", seconds=20)
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert result["allowed_values"] == {"duration_seconds": "4-15"}
+    ark_model.generate_video.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_1_5_pro_family_reports_its_own_longest_length(mock_workspace):
+    tool, ark_model = _ark_video_tool(
+        mock_workspace, model_name="doubao-seedance-1-5-pro-250528"
+    )
+
+    result = await tool.generate_video("A fourteen-second idea", seconds=14)
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert result["allowed_values"] == {"duration_seconds": "4-12"}
+    ark_model.generate_video.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_intelligent_duration_is_forwarded_untouched(mock_workspace):
+    """``-1`` means "let the provider choose", not "one second short"."""
+    tool, ark_model = _ark_video_tool(mock_workspace)
+
+    result = await tool.generate_video("Let the model choose", seconds=-1)
+
+    assert result["success"] is True
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == -1
+    assert "duration_adjusted" not in result
+
+
+@pytest.mark.asyncio
+async def test_other_video_models_keep_the_length_they_are_given(mock_workspace):
+    """Only Seedance states a supported range, and a guess is worse than none."""
+    xinference_model = XinferenceVideoModel(model_name="Wan2.1-t2v-14B-480p")
+    xinference_model.generate_video = AsyncMock(
+        return_value={"task_id": "task-x", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"xinference-video": xinference_model},
+        workspace=mock_workspace,
+        default_video_model=xinference_model,
+    )
+
+    result = await tool.generate_video("A three-second idea", seconds=3)
+
+    assert result["success"] is True
+    assert xinference_model.generate_video.await_args.kwargs["seconds"] == 3
+    assert "duration_adjusted" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_failed_generation_does_not_carry_the_internal_model_id(
+    mock_workspace, caplog
+):
+    """The model id is a diagnostic: it goes to the log, not to the model."""
+    tool, ark_model = _ark_video_tool(mock_workspace)
+    ark_model.generate_video = AsyncMock(side_effect=RuntimeError("provider exploded"))
+
+    with caplog.at_level(logging.INFO):
+        result = await tool.generate_video("A short clip", seconds=4)
+
+    assert result["success"] is False
+    assert "model_used" not in result
+    assert "ark-video" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_provider_reported_length_wins_over_the_adjusted_request(
+    mock_workspace,
+):
+    """A clip asked for at 4 seconds can come back at 5; the note says 5."""
+    tool, ark_model = _ark_video_tool(
+        mock_workspace,
+        result={
+            "task_id": "task-ark",
+            "status": "succeeded",
+            "video_url": "",
+            "duration": 5,
+        },
+    )
+
+    result = await tool.generate_video("A three-second idea", seconds=3)
+
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == 4
+    assert result["duration"] == 5
+    assert result["duration_adjusted"] == {"requested": 3, "used": 5}
+    assert "shortest supported clip is 4 seconds" in result["duration_note"]
+    assert result["duration_note"].endswith("this clip is 5 seconds long.")
+
+
+@pytest.mark.asyncio
+async def test_a_seedance_version_without_a_recorded_range_keeps_the_length(
+    mock_workspace,
+):
+    """Seedance 2.5 accepts 4-30 seconds, so the 2.0 bounds must not clamp it."""
+    tool, ark_model = _ark_video_tool(
+        mock_workspace, model_name="doubao-seedance-2-5-pro-260101"
+    )
+
+    result = await tool.generate_video("A short clip", seconds=2)
+
+    assert result["success"] is True
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == 2
+    assert "duration_adjusted" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_seedance_version_without_a_recorded_range_is_not_refused(
+    mock_workspace,
+):
+    """No known range means no local refusal: the provider decides."""
+    tool, ark_model = _ark_video_tool(
+        mock_workspace, model_name="doubao-seedance-2-5-pro-260101"
+    )
+
+    result = await tool.generate_video("A long clip", seconds=20)
+
+    assert result["success"] is True
+    assert ark_model.generate_video.await_args.kwargs["seconds"] == 20
+    assert "allowed_values" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [0, -2, 4.5])
+async def test_a_length_that_cannot_be_a_clip_is_refused_locally(
+    mock_workspace, length
+):
+    tool, ark_model = _ark_video_tool(mock_workspace)
+
+    result = await tool.generate_video("A clip", seconds=length)
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert result["allowed_values"] == {"duration_seconds": "4-15"}
+    ark_model.generate_video.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_length_is_refused_for_a_model_with_no_known_range(
+    mock_workspace,
+):
+    xinference_model = XinferenceVideoModel(model_name="Wan2.1-t2v-14B-480p")
+    xinference_model.generate_video = AsyncMock(
+        return_value={"task_id": "task-x", "status": "succeeded", "video_url": ""}
+    )
+    tool = VideoGenerationToolCore(
+        {"xinference-video": xinference_model},
+        workspace=mock_workspace,
+        default_video_model=xinference_model,
+    )
+
+    result = await tool.generate_video("A clip", seconds=0)
+
+    assert result["success"] is False
+    assert result["error_category"] == "invalid_request"
+    assert "allowed_values" not in result
+    xinference_model.generate_video.assert_not_called()

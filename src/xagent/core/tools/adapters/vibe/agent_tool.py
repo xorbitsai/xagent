@@ -858,7 +858,7 @@ class CreateAgentTool(AbstractBaseTool):
             "- name: A short, descriptive name for the agent (e.g., 'researcher', 'data_analyzer')\n"
             "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose. Write this in the same natural language as the current output language policy unless the user explicitly asks for another language.\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
-            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"  Example: ['file', 'knowledge', 'basic_tools']\n"
             "  Any other value, including a connector ('mcp' or 'mcp:<server>'), rejects "
             "the whole call; the user manages connectors in the agent builder.\n"
             f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
@@ -1233,7 +1233,7 @@ class UpdateAgentTool(AbstractBaseTool):
             "- name (optional): New name for the agent\n"
             "- description (optional): New description of when to use this agent\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
-            f"  Example: ['file', 'knowledge', 'basic']\n"
+            f"  Example: ['file', 'knowledge', 'basic_tools']\n"
             "  Replaces the agent's non-connector categories; any other value, including a "
             "connector ('mcp' or 'mcp:<server>'), rejects the whole call. The user manages "
             "connectors in the agent builder and they are kept automatically; do not pass them.\n"
@@ -1986,6 +1986,7 @@ class AgentTool(AbstractBaseTool):
         file_operation_access_version: Any = None,
         voice: Optional[str] = None,
         inherited_mcp_unavailable_reason: Optional[str] = None,
+        excluded_model_ids: frozenset[str] = frozenset(),
     ):
         """
         Initialize an agent tool.
@@ -2031,6 +2032,8 @@ class AgentTool(AbstractBaseTool):
                 populated -- keeps holding for every further hop, where that
                 context is empty and the call would otherwise read as
                 unregistered and dispatch ungated.
+            excluded_model_ids: Media model ids the parent task excludes;
+                forwarded to the child's tool config.
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -2065,6 +2068,8 @@ class AgentTool(AbstractBaseTool):
         self._file_operation_access_version = file_operation_access_version
         self._voice = voice
         self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
+        self._excluded_model_ids = excluded_model_ids
+        self._sandbox: Any = None
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2082,6 +2087,16 @@ class AgentTool(AbstractBaseTool):
             execution_scope if execution_scope is not None else get_execution_scope()
         )
         self._visibility = ToolVisibility.PUBLIC
+
+    def with_sandbox(self, sandbox: Any, workspace: Any) -> "AgentTool":
+        """Bind a task-local copy; delegated files stay under the parent's mount."""
+        import copy
+
+        bound = copy.copy(self)
+        bound._sandbox = sandbox
+        if workspace is not None:
+            bound._workspace_base_dir = str(workspace.temp_dir)
+        return bound
 
     @property
     def name(self) -> str:
@@ -2588,6 +2603,7 @@ class AgentTool(AbstractBaseTool):
                 else ()
             )
             tool_config = WebToolConfig(
+                sandbox=self._sandbox,
                 db=None,
                 db_factory=self._session_factory,
                 request=MinimalRequest(self._user_id),
@@ -2656,6 +2672,7 @@ class AgentTool(AbstractBaseTool):
                 knowledge_base_team_id=knowledge_base_team_id,
                 agent_creator_user_id=agent_creator_user_id,
                 declared_knowledge_bases=agent_knowledge_bases,
+                excluded_model_ids=self._excluded_model_ids,
             )
 
             async def execute_delegated_runtime() -> tuple[dict[str, Any], Any]:
@@ -2908,6 +2925,7 @@ def build_published_agent_tools_from_records(
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
     inherited_mcp_unavailable_reason: Optional[str] = None,
+    excluded_model_ids: frozenset[str] = frozenset(),
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2997,6 +3015,7 @@ def build_published_agent_tools_from_records(
             file_operation_access_version=file_operation_access_version,
             voice=voice,
             inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
+            excluded_model_ids=excluded_model_ids,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -3023,6 +3042,7 @@ def get_published_agents_tools(
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
     inherited_mcp_unavailable_reason: Optional[str] = None,
+    excluded_model_ids: frozenset[str] = frozenset(),
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -3086,6 +3106,7 @@ def get_published_agents_tools(
             file_operation_access_version=file_operation_access_version,
             voice=voice,
             inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
+            excluded_model_ids=excluded_model_ids,
         )
 
     except Exception as e:
@@ -3152,6 +3173,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             ),
             voice=config.get_voice(),
             inherited_mcp_unavailable_reason=config.get_mcp_unavailable_reason(),
+            excluded_model_ids=config.get_excluded_model_ids(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

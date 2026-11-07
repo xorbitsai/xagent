@@ -14,6 +14,7 @@ from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.deployment import Deployment, DeploymentOwnerType
+from ..models.task import Task
 from ..models.trigger import AgentTrigger
 from ..models.user import User
 from ..models.workforce import (
@@ -1347,8 +1348,16 @@ async def list_workforce_runs(
         query = query.filter(WorkforceRun.is_preview.is_(False))
 
     total = query.count()
+    # Loaded without structured_output_record: reading the column from these objects, or
+    # from the same rows reached again through Session.get or a relationship in this
+    # session, raises; do not keep using these Task objects after a commit, because the
+    # reload after a commit reads the column back.
     runs = (
-        query.options(selectinload(WorkforceRun.task))
+        query.options(
+            selectinload(WorkforceRun.task).defer(
+                cast(Any, Task.structured_output_record), raiseload=True
+            )
+        )
         .order_by(WorkforceRun.created_at.desc(), WorkforceRun.id.desc())
         .offset((page - 1) * size)
         .limit(size)

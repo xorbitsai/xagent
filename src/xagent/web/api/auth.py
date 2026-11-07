@@ -76,9 +76,12 @@ from ..auth_config import (
 from ..auth_dependencies import get_current_user, get_user_from_token
 from ..auth_sessions import (
     commit_refresh_credentials,
+    hash_refresh_token,
     lock_current_session_epoch,
     matches_user_session,
     new_session_epoch,
+    refresh_token_lookup_values,
+    refresh_token_matches,
     user_session_claims,
 )
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
@@ -2114,7 +2117,8 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
         )
         token = create_refresh_token(data=identity)
-    setattr(user, "refresh_token", token)
+    # Only the digest is ever stored; commit_refresh_credentials writes the same.
+    setattr(user, "refresh_token", hash_refresh_token(token))
     setattr(
         user,
         "refresh_token_expires_at",
@@ -2921,7 +2925,7 @@ def _prepare_refresh_response(
         raise HTTPException(status_code=401, detail="Invalid refresh token")
     token = getattr(user, "refresh_token", None)
     expires = getattr(user, "refresh_token_expires_at", None)
-    if token != request.refresh_token or expires is None:
+    if not refresh_token_matches(token, request.refresh_token) or expires is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
     now = datetime.now(timezone.utc)
     if getattr(expires, "tzinfo", None) is None:
@@ -2962,13 +2966,15 @@ def _refresh_in_worker(
             session.query(User)
             .filter(
                 User.id == user_id,
-                User.refresh_token == request.refresh_token,
+                User.refresh_token.in_(
+                    refresh_token_lookup_values(request.refresh_token)
+                ),
                 User.refresh_token_expires_at >= now,
                 User.session_epoch == previous_epoch,
             )
             .update(
                 {
-                    User.refresh_token: response.refresh_token,
+                    User.refresh_token: hash_refresh_token(response.refresh_token),
                     User.refresh_token_expires_at: now
                     + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
                 },
@@ -3019,7 +3025,9 @@ async def logout(
     if (
         request is not None
         and request.refresh_token is not None
-        and request.refresh_token != getattr(user, "refresh_token", None)
+        and not refresh_token_matches(
+            getattr(user, "refresh_token", None), request.refresh_token
+        )
     ):
         return {"success": True, "message": "Logged out successfully"}
     setattr(user, "refresh_token", None)

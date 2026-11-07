@@ -125,6 +125,10 @@ class TaskEventBridge:
     def discard_origin(self, token: str) -> None:
         self._origins.pop(token, None)
 
+    def has_pending_for_recipient(self, recipient: object) -> bool:
+        """Whether a command submitted on this socket still awaits its outcome."""
+        return any(origin.recipient is recipient for origin in self._origins.values())
+
     def discard_recipient(self, recipient: object) -> None:
         for token in [
             token

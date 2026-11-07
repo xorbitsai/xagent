@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session, contains_eager, selectinload
@@ -360,9 +360,17 @@ def cancel_active_workforce_runs(
     internally, so calling it on this session mid-loop would leak a partial
     archive state.)
     """
+    # Loaded without structured_output_record: reading the column from these objects, or
+    # from the same rows reached again through Session.get or a relationship in this
+    # session, raises; do not keep using these Task objects after a commit, because the
+    # reload after a commit reads the column back.
     runs = (
         db.query(WorkforceRun)
-        .options(selectinload(WorkforceRun.task))
+        .options(
+            selectinload(WorkforceRun.task).defer(
+                cast(Any, Task.structured_output_record), raiseload=True
+            )
+        )
         .filter(
             WorkforceRun.workforce_id == int(workforce_id),
             WorkforceRun.status.in_(ACTIVE_WORKFORCE_RUN_STATUSES),

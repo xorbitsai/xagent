@@ -22,19 +22,16 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, cast
 
 from ......sandbox.base import Sandbox
+from ......sandbox.tool_runtime.bundle import build_runtime_command
 from ....core.mcp.sessions import Connection
 from .chrome_daemon_runner import CHROME_DEVTOOLS_PACKAGE
-from .sandboxed_tool_wrapper import SANDBOX_SRC_ROOT
+from .sandboxed_tool_wrapper import _write_sandbox_file_cancellation_safe
 
 logger = logging.getLogger(__name__)
 
 CHROME_DEVTOOLS_APP_ID = "chrome-devtools"
 CHROME_SANDBOX_LIFECYCLE_TYPE = "chrome-execution"
 
-_CHROME_RUNNER_PATH = (
-    f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/"
-    "chrome_daemon_runner.py"
-)
 _SCOPE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_FILE_PREFIX = "/tmp/xagent_chrome_daemon_"
 _RUNNER_TIMEOUT_SECONDS = 75.0
@@ -196,22 +193,37 @@ class ChromeDaemonClient:
 
     async def _run(self, operation: str, *args: str) -> dict[str, Any]:
         result_file = f"{_RESULT_FILE_PREFIX}{uuid.uuid4().hex}.json"
+        request_file = result_file + ".request.json"
         primary_failure: BaseException | None = None
         command_args = [
-            _CHROME_RUNNER_PATH,
             operation,
             "--session-id",
             self._session_id,
-            "--result-file",
-            result_file,
             *args,
         ]
         try:
             try:
+                await _write_sandbox_file_cancellation_safe(
+                    self._sandbox,
+                    json.dumps(
+                        {"kind": "chrome", "arguments": command_args},
+                        ensure_ascii=False,
+                    ),
+                    request_file,
+                    overwrite=False,
+                )
+            except Exception as exc:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} request upload failed"
+                ) from exc
+            command = build_runtime_command(
+                request_file=request_file, result_file=result_file
+            )
+            try:
                 execution = await asyncio.wait_for(
                     self._sandbox.exec(
-                        "python",
-                        *command_args,
+                        command[0],
+                        *command[1:],
                         env=dict(_CHROME_SANDBOX_ENV),
                         max_output_bytes=_RUNNER_MAX_OUTPUT_BYTES,
                     ),
@@ -285,7 +297,13 @@ class ChromeDaemonClient:
         finally:
             try:
                 cleanup = await asyncio.wait_for(
-                    self._sandbox.exec("rm", "-f", result_file),
+                    self._sandbox.exec(
+                        "rm",
+                        "-f",
+                        result_file,
+                        request_file,
+                        result_file + ".runtime.pyz",
+                    ),
                     timeout=_RESULT_CLEANUP_TIMEOUT_SECONDS,
                 )
                 if cleanup.exit_code != 0:

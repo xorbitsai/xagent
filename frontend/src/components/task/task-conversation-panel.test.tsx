@@ -349,6 +349,12 @@ describe("TaskConversationPanel", () => {
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
   })
 
+  it("labels the file manager icon button", () => {
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByRole("button", { name: "files.header.title" }))
+      .toHaveAttribute("aria-label", "files.header.title")
+  })
+
   it.each(["completed", "partial", "blocked"])("shows the current settled outcome %s, including on history load", (completionOutcome) => {
     appState.currentTask = { id: "42", status: "completed", completionOutcome }
     const { rerender } = render(<TaskConversationPanel mode="page" />)

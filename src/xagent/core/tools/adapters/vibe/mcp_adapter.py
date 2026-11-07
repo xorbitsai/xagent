@@ -549,6 +549,10 @@ class _ExternalMediaBinding:
     file_argument: str
     url_argument: str
     purpose: str
+    # When no URL can be issued for the file (no public base URL, or a type or
+    # size the purpose does not deliver), leave the file argument for the
+    # connector's own upload instead of failing.
+    upload_fallback: bool = False
 
 
 # These built-in tools do not upload bytes themselves. The host converts one
@@ -559,6 +563,16 @@ _EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
         file_argument="file_path",
         url_argument="image_url",
         purpose="instagram-publish",
+    ),
+    # A Composio-proxied grant cannot send multipart bytes, so Meta fetches the
+    # image from a URL for every grant (#3586). When no URL can be issued (no
+    # public base URL, or GIF/BMP/TIFF or over 10 MB), native grants keep the
+    # connector's own multipart upload, staged as before.
+    ("facebook-pages", "facebook_publish_image_post"): _ExternalMediaBinding(
+        file_argument="file_path",
+        url_argument="image_url",
+        purpose="facebook-publish",
+        upload_fallback=True,
     ),
 }
 _EXTERNAL_MEDIA_FILE_NOT_FOUND = "file_id not found or not accessible."
@@ -1952,14 +1966,9 @@ def _strict_http_401_responses(
 
 def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
     try:
-        # Lazy import keeps the core adapter independent from the web layer
-        # at import time -- and, since this runs inside MCPToolAdapter.
-        # run_json_async, which tool_runner.py reconstructs and calls for
-        # every sandboxed npx/uvx MCP tool call, from crashing with
-        # ModuleNotFoundError on a 401 (mcp_oauth.py needs sqlalchemy,
-        # which the sandbox never installs) instead of just skipping the
-        # refresh attempt the same way an unparsable challenge already
-        # does below.
+        # Keep the web OAuth parser optional for standalone core consumers.
+        # Authorization and refresh execute on the host, including for MCP
+        # calls whose stdio transport is delegated into a sandbox.
         from .....web.services.mcp_oauth import parse_www_authenticate_bearer
     except ImportError:
         parse_www_authenticate_bearer = None  # type: ignore[assignment]
@@ -2335,6 +2344,9 @@ class MCPToolAdapter(AbstractBaseTool):
         self.mcp_tool = mcp_tool
         self._raw_annotations = raw_annotations
         self.connection = connection
+        # Bound by SandboxedToolWrapper. Authorization and runtime bindings
+        # remain in this adapter; only transport work crosses into the guest.
+        self._sandbox_transport: Any = None
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
@@ -2431,7 +2443,11 @@ class MCPToolAdapter(AbstractBaseTool):
         description += _provider_tool_description_guidance(
             self.source_server, self.mcp_tool.name
         )
-        if self._workspace is not None and self._durable_upload_fields:
+        if (
+            self._workspace is not None
+            and self._durable_upload_fields
+            and self._external_media_binding is None
+        ):
             description += _durable_upload_note(
                 self._durable_upload_fields,
                 own_file_id=self._durable_upload_own_file_id,
@@ -3331,14 +3347,30 @@ class MCPToolAdapter(AbstractBaseTool):
             except (FileNotFoundError, OSError, ValueError):
                 file_id = None
         if file_id is None:
+            if binding.upload_fallback:
+                # Not a registered file: the connector reads the path itself,
+                # as it did before this binding existed.
+                return prepared, {}
             raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_FILE_REF_REQUIRED)
+        from ....workspace import ExternalMediaNotIssuableError
+
         try:
             external_url = await self._run_upload_staging_operation(
                 workspace.issue_external_media_url_detached,
                 file_id,
                 binding.purpose,
             )
+        except ExternalMediaNotIssuableError as exc:
+            if binding.upload_fallback:
+                return prepared, {}
+            raise _ExternalMediaPreparationError(str(exc)) from None
         except FileNotFoundError:
+            if binding.upload_fallback:
+                # Issuance only sees files of this exact task; staging also
+                # accepts task-less uploads, internal-* ids and workspace
+                # records. Staging resolves the id again in its own scope and
+                # still reports a file that is really missing.
+                return prepared, {}
             raise _ExternalMediaPreparationError(
                 _EXTERNAL_MEDIA_FILE_NOT_FOUND
             ) from None
@@ -3558,6 +3590,15 @@ class MCPToolAdapter(AbstractBaseTool):
                 redact_sensitive=True, log_skipped=False
             )
             tool_meta = self._runtime_mcp_meta()
+            # External media first: when it takes the file argument, there is
+            # nothing left to stage; when it falls back, staging runs as usual.
+            try:
+                (
+                    tool_args,
+                    external_media_replacements,
+                ) = await self._substitute_external_media_args(tool_args)
+            except _ExternalMediaPreparationError as exc:
+                return {"content": [{"text": str(exc)}], "is_error": True}
             try:
                 (
                     tool_args,
@@ -3570,14 +3611,6 @@ class MCPToolAdapter(AbstractBaseTool):
                     own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
-            try:
-                (
-                    tool_args,
-                    external_media_replacements,
-                ) = await self._substitute_external_media_args(tool_args)
-            except _ExternalMediaPreparationError as exc:
-                await self._discard_external_upload_args(staged_uploads)
-                return {"content": [{"text": str(exc)}], "is_error": True}
 
             # Pydantic inserts declared defaults before this point. Validate
             # only values supplied by the model. Runtime-bound fields are
@@ -3771,25 +3804,32 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any]:
-        async with create_session(connection) as session:
-            await session.initialize()
-            result = await session.call_tool(
-                self.mcp_tool.name,
-                dict(tool_args),
-                meta=dict(tool_meta) or None,
-            )
+        if self._sandbox_transport is not None:
+            from mcp.types import CallToolResult
 
-            normalized = _normalized_mcp_call_result(
-                result,
-                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
+            payload = await self._sandbox_transport(
+                connection, self.mcp_tool.name, tool_args, tool_meta
             )
-            if self._is_excel_tool:
-                failure_code = _excel_failure_code(normalized)
-                if failure_code is not None:
-                    normalized["failure_code"] = failure_code
-                    normalized["success"] = False
-                    normalized["is_error"] = True
-            return normalized
+            result = CallToolResult.model_validate(payload)
+        else:
+            async with create_session(connection) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    self.mcp_tool.name,
+                    dict(tool_args),
+                    meta=dict(tool_meta) or None,
+                )
+        normalized = _normalized_mcp_call_result(
+            result,
+            detect_legacy_plain_text_error=self._detect_legacy_plain_text_error,
+        )
+        if self._is_excel_tool:
+            failure_code = _excel_failure_code(normalized)
+            if failure_code is not None:
+                normalized["failure_code"] = failure_code
+                normalized["success"] = False
+                normalized["is_error"] = True
+        return normalized
 
     async def _retry_after_authorization_failure(
         self,
@@ -5583,7 +5623,10 @@ async def load_mcp_tools_as_agent_tools(
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
             sandbox_required = should_sandbox_mcp_connection(connection)
-            if requires_sandbox_mcp_connection(connection) and sandbox is None:
+            if sandbox is None and (
+                requires_sandbox_mcp_connection(connection)
+                or (_root_config.get_sandbox_enabled() and sandbox_required)
+            ):
                 raise RuntimeError(
                     "This stdio MCP connection requires a sandbox, but no sandbox "
                     "is available"

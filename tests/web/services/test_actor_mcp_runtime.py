@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import inspect
 import json
 import logging
@@ -1409,18 +1408,10 @@ async def test_tool_factory_keeps_actor_stdio_session_identity_out_of_connection
         connection_config = kwargs["connection"]
         serialized = json.dumps(connection_config).encode()
         assert owner_bytes not in serialized
-        from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
-            _serialize_connection,
-        )
+        from xagent.sandbox.tool_runtime.bundle import sandbox_connection
 
-        file_payload = _serialize_connection(connection_config).encode()
+        file_payload = json.dumps(sandbox_connection(connection_config)).encode()
         assert owner_bytes not in file_payload
-        import cloudpickle
-
-        pickled = base64.b64decode(
-            base64.b64encode(cloudpickle.dumps(connection_config))
-        )
-        assert owner_bytes not in pickled
         return []
 
     monkeypatch.setattr(

@@ -795,7 +795,7 @@ def _saturated_tool_config(
         workspace_config={"task_id": "_mock_"},
         task_id="_mock_",
         include_mcp_tools=False,
-        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["web_tools"]),
     )
     return engine, held_connection, cfg
 
@@ -878,7 +878,7 @@ async def test_tool_factory_releases_live_read_session_before_worker_checkout(
         workspace_config={"task_id": "_mock_"},
         task_id="_mock_",
         include_mcp_tools=False,
-        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["web_tools"]),
     )
 
     monkeypatch.setattr(
@@ -1362,7 +1362,7 @@ async def test_factory_runtime_snapshot_is_rebuilt_for_each_build(monkeypatch):
         workspace_config={"task_id": "_mock_"},
         task_id="_mock_",
         include_mcp_tools=False,
-        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["web_tools"]),
     )
 
     await ToolFactory.create_all_tools(cfg)
@@ -2149,7 +2149,7 @@ async def test_policy_refresh_defers_full_factory_inputs_until_build(monkeypatch
         workspace_config={"task_id": "_mock_"},
         task_id="_mock_",
         include_mcp_tools=False,
-        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["web_tools"]),
     )
 
     await cfg.refresh_runtime_policy()
@@ -2195,7 +2195,7 @@ async def test_factory_runtime_snapshot_is_released_when_build_raises(monkeypatc
         workspace_config={"task_id": "_mock_"},
         task_id="_mock_",
         include_mcp_tools=False,
-        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["web_tools"]),
     )
 
     with pytest.raises(RuntimeError, match="registered tool build failed"):
@@ -2260,7 +2260,7 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
         include_mcp_tools=False,
         tool_selection_spec=ToolSelectionSpec.from_raw(
             tool_categories=[
-                "basic",
+                "web_tools",
                 "database",
                 "image",
                 "video",
@@ -2553,7 +2553,7 @@ async def test_factory_prefetch_recovers_before_later_read_after_required_failur
         workspace_config={"task_id": "_mock_"},
         include_mcp_tools=False,
         tool_selection_spec=ToolSelectionSpec.from_raw(
-            tool_categories=["basic", "database"]
+            tool_categories=["web_tools", "database"]
         ),
     )
 
@@ -2588,7 +2588,7 @@ async def test_unreadable_credential_does_not_poison_unrelated_tools(monkeypatch
         task_id="_mock_",
         workspace_config={"task_id": "_mock_"},
         include_mcp_tools=False,
-        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["web_tools"]),
     )
     try:
         await cfg.prepare_factory_runtime()

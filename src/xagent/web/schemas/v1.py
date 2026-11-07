@@ -943,6 +943,36 @@ class TaskInfoResponse(BaseModel):
             "see #1079 for the full typed interaction surface."
         ),
     )
+    structured_output: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The structured result of the run shown in this response, when "
+            "structured_output_status is 'ready'; null otherwise."
+        ),
+    )
+    structured_output_status: Optional[str] = Field(
+        None,
+        description=(
+            "One of: ready / incomplete / failed. Null unless the task is "
+            "completed and either produced a structured result or has a "
+            "response format configured."
+        ),
+    )
+    structured_output_reason: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Why there is no structured result when structured_output_status "
+            "is 'incomplete' or 'failed': an object with code and message, "
+            "and missing_fields or unexpressible_fields (at most 20 paths "
+            "each) when the result lacks or cannot express values. A key with "
+            "no value is absent. code is one of: agent_partial / "
+            "agent_blocked / information_missing / value_not_expressible / "
+            "not_produced (status incomplete); schema_mismatch / "
+            "result_too_large / model_error / invalid_stored_format / "
+            "extraction_timeout / internal_error (status failed). Null "
+            "otherwise."
+        ),
+    )
 
 
 # ``PublicStep.type`` is the public surface for what was internally one

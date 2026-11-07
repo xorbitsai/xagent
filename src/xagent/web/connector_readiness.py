@@ -73,6 +73,7 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED
 
+from ..config import get_sandbox_enabled
 from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
     should_sandbox_mcp_connection,
 )
@@ -129,7 +130,7 @@ NO_LAUNCH = ConnectorReadiness(
 def sandbox_enabled_from_env() -> bool:
     """Whether a task attaches a sandbox, read the way
     ``sandbox_manager._create_sandbox_service`` reads it."""
-    return os.getenv("SANDBOX_ENABLED", "false").lower() == "true"
+    return get_sandbox_enabled()
 
 
 def is_sandbox_command(command: str) -> bool:

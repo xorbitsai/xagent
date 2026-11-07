@@ -78,6 +78,16 @@ _sandbox_permission_migrations_lock = Lock()
 _SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS = (_INTERNAL_TEMP_DIR_NAME, "mcp-upload")
 
 
+class ExternalMediaNotIssuableError(ValueError):
+    """No external media URL can be issued for this file on this deployment.
+
+    The deployment has no public HTTPS base URL, the image's type, size or
+    encoding is outside what the purpose delivers, or external media cannot
+    reach its bytes in its own scope. A connector that can upload the file
+    itself, staged under the workspace's own rules, may still take it.
+    """
+
+
 class ExternalUploadStagingError(ValueError):
     """A validated source could not be copied into upload staging."""
 
@@ -429,9 +439,12 @@ class TaskWorkspace:
             raise FileNotFoundError("Registered image was not found")
 
         from ..web.services.external_media import (
+            ExternalMediaNotConfigured,
             ExternalMediaNotFound,
+            ExternalMediaOutOfScope,
             ExternalMediaPurpose,
             ExternalMediaUnavailable,
+            ExternalMediaUnsupportedImage,
             issue_external_media_url,
         )
         from .storage.manager import create_db_session
@@ -453,6 +466,12 @@ class TaskWorkspace:
                 )
             except ExternalMediaNotFound:
                 raise FileNotFoundError("Registered image was not found") from None
+            except (
+                ExternalMediaNotConfigured,
+                ExternalMediaOutOfScope,
+                ExternalMediaUnsupportedImage,
+            ) as exc:
+                raise ExternalMediaNotIssuableError(str(exc)) from None
             except ExternalMediaUnavailable as exc:
                 raise ValueError(str(exc)) from None
             return issued.url

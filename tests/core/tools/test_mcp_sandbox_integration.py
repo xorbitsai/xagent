@@ -95,7 +95,7 @@ class TestListToolsInSandbox:
         json_payload = '[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{}}}]'
 
         # ensure_requirements: write_file + pip install
-        # list_tools_in_sandbox: mcp_runner exec, rm cleanup
+        # list_tools_in_sandbox: isolated MCP runtime exec, rm cleanup
         pip_result = MagicMock(exit_code=0, stderr="")
         runner_result = MagicMock(exit_code=0, stderr="", error_message=None)
         rm_result = MagicMock(exit_code=0)
@@ -254,7 +254,7 @@ class TestLoadMcpToolsAsAgentTools:
         # reproducing a failure with XAGENT_LOG_LEVEL=DEBUG (or --debug)
         # actually captures it rather than silently getting nothing more
         # than the always-on ERROR log already gives.
-        caplog.set_level("DEBUG")
+        caplog.set_level("DEBUG", logger="xagent.core.tools.adapters.vibe.mcp_adapter")
         connection: Connection = {
             "transport": "stdio",
             "command": "npx",
@@ -522,3 +522,23 @@ class TestLoadMcpToolsConnectorRefs:
             )
 
         assert result.tools[0]._connector_ref is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["npx", "uvx"])
+async def test_configured_sandbox_missing_never_starts_stdio_discovery_on_host(
+    monkeypatch, command
+):
+    monkeypatch.setenv("SANDBOX_ENABLED", "yes")
+    with patch(
+        "xagent.core.tools.adapters.vibe.mcp_adapter._load_direct_mcp_tools",
+        new=AsyncMock(),
+    ) as direct:
+        result = await load_mcp_tools_as_agent_tools(
+            {"unavailable": {"transport": "stdio", "command": command, "args": []}},
+            sandbox=None,
+        )
+    direct.assert_not_awaited()
+    assert result.tools == ()
+    assert len(result.failures) == 1
+    assert result.failures[0].phase is MCPFailurePhase.SESSION_START

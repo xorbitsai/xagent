@@ -1,10 +1,11 @@
-"""Basic tools registration using @register_tool decorator."""
+"""Network and code capability registration; basic helpers register separately."""
 
 import logging
 from typing import TYPE_CHECKING, Any, List
 
 from .....config import get_web_search_provider
 from ....utils.encryption import ToolCredentialUnreadableError
+from .base import ToolCategory
 from .factory import ToolFactory, register_tool
 
 if TYPE_CHECKING:
@@ -13,9 +14,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool(categories={"basic", "web_search"})
-async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
-    """Create basic tools (web search, code executors)."""
+@register_tool(categories={ToolCategory.WEB_TOOLS.value})
+async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
+    """Create search, public webpage fetching and HTTP API tools."""
     if not config.get_basic_tools_enabled():
         return []
 
@@ -66,6 +67,21 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
 
         tools.append(DownloadWebAssetTool(workspace=workspace))
 
+    # API tool
+    from .api_tool import APITool
+
+    tools.append(APITool())
+
+    return tools
+
+
+@register_tool(categories={ToolCategory.CODE_EXECUTION.value})
+async def create_code_tools(config: "BaseToolConfig") -> List[Any]:
+    """Create Python, JavaScript and shell tools under the configured sandbox policy."""
+    if not config.get_basic_tools_enabled():
+        return []
+    workspace = await ToolFactory.create_workspace_async(config)
+    tools: List[Any] = []
     # Python executor tool (if workspace available)
     if workspace:
         from .python_executor import PythonExecutorToolForBasic
@@ -77,11 +93,6 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
         from .javascript_executor import JavaScriptExecutorToolForBasic
 
         tools.append(JavaScriptExecutorToolForBasic(workspace=workspace))
-
-    # API tool
-    from .api_tool import APITool
-
-    tools.append(APITool())
 
     # Command executor tool (if workspace available)
     if workspace:

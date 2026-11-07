@@ -24,12 +24,12 @@ describe("getCardCapabilityTags", () => {
     // Reproduces Maya's real tool_categories/skills from the marketing
     // template - this exact case is what the reference design shows.
     const tags = getCardCapabilityTags(
-      ["basic", "web_search", "browser", "file", "image", "knowledge", "mcp:LinkedIn", "mcp:Facebook"],
+      ["basic_tools", "web_tools", "browser", "file", "image", "knowledge", "mcp:LinkedIn", "mcp:Facebook"],
       ["static-visual-design"],
       format
     );
 
-    expect(tags).toEqual(["[web_search]", "[file]", "[image]", "static-visual-design"]);
+    expect(tags).toEqual(["[web_tools]", "[file]", "[image]", "static-visual-design"]);
   });
 
   it("returns an empty list for a workforce template with no capabilities", () => {

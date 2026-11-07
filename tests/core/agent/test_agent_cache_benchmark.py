@@ -10,8 +10,8 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 
-from scripts import agent_cache_benchmark
-from scripts.agent_cache_benchmark import (
+from scripts.benchmarks import agent_cache_benchmark
+from scripts.benchmarks.agent_cache_benchmark import (
     AuditTool,
     AuditWorkload,
     BenchmarkLLM,

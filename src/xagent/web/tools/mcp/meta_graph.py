@@ -23,8 +23,9 @@ COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
 COMPOSIO_CONNECTED_ACCOUNT_ID_ENV = "COMPOSIO_CONNECTED_ACCOUNT_ID"
 COMPOSIO_USER_ID_ENV = "COMPOSIO_USER_ID"
 PROXY_FILE_UPLOAD_UNSUPPORTED = (
-    "Uploading a local file is not supported for this connection; "
-    "use a public image_url instead"
+    "Uploading a local file is not supported for this connection. A workspace "
+    "image works when it is a PNG or JPEG of at most 10 MB and this deployment "
+    "has a public HTTPS base URL; otherwise use a public image_url"
 )
 # Proxy responses carry Page tokens in plaintext (/me/accounts). They are
 # redacted from everything this process reports afterwards.

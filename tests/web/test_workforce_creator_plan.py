@@ -186,9 +186,9 @@ def test_builder_state_rejects_unused_or_failed_staged_agents() -> None:
 def test_builder_state_validates_tool_categories_like_create_agent() -> None:
     state = WorkforcePromptBuilderState.from_agents([])
     for categories, expected in (
-        (["web_search", "email"], "['email'] are not assignable"),
+        (["web_tools", "email"], "['email'] are not assignable"),
         (
-            ["web_search", "mcp:github"],
+            ["web_tools", "mcp:github"],
             "cannot grant; once it is created, the user can add connectors to its worker agents",
         ),
         (["mcp"], "built from a prompt cannot grant"),
@@ -212,11 +212,11 @@ def test_builder_state_validates_tool_categories_like_create_agent() -> None:
             "name": "研究员",
             "description": "检索资料时使用。",
             "instructions": "检索并核验资料。",
-            "tool_categories": [" web_search", "web_search"],
+            "tool_categories": [" web_tools", "web_tools"],
         }
     )
     assert staged["status"] == "success"
-    assert state.created_agents[staged["agent_ref"]].tool_categories == ["web_search"]
+    assert state.created_agents[staged["agent_ref"]].tool_categories == ["web_tools"]
 
 
 def test_builder_state_enforces_staged_agent_limit() -> None:
@@ -309,7 +309,7 @@ async def test_react_builder_creates_multiple_agents_before_workforce() -> None:
                     "name": "市场研究员",
                     "description": "用于收集并核验市场资料。",
                     "instructions": "检索可靠资料，交叉核验并记录来源。",
-                    "tool_categories": ["web_search"],
+                    "tool_categories": ["web_tools"],
                 },
             ),
             _tool_call(

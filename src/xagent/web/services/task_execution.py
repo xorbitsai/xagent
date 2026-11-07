@@ -100,6 +100,7 @@ from .routine_history_provenance import (
     load_routine_history_turn_id,
     routine_history_turn_id,
 )
+from .structured_output_projection import build_record
 from .task_auto_recovery import (
     InterruptionDecision,
     InterruptionOutcome,
@@ -2425,6 +2426,17 @@ def _finalize_task_execution_result_isolated(
                         "completion_outcome",
                         completion_outcome_for_status(result, final_status),
                     )
+                    if final_status == TaskStatus.COMPLETED:
+                        # Replaced on every completed run: a run that
+                        # produced no structured result clears the column.
+                        setattr(
+                            task_updated,
+                            "structured_output_record",
+                            build_record(
+                                cast(str | None, task_updated.run_id),
+                                result.get("structured_output"),
+                            ),
+                        )
                     if final_status == TaskStatus.FAILED:
                         presentation = present_failed_result(result)
                         setattr(
@@ -3411,6 +3423,16 @@ def _finalize_resumed_task(
             completion_outcome_for_status(result, final_task_status),
         )
         finalized["completion_outcome"] = task.completion_outcome
+        if final_task_status == TaskStatus.COMPLETED:
+            # Replaced on every completed run: a run that produced no
+            # structured result clears the column.
+            setattr(
+                task,
+                "structured_output_record",
+                build_record(
+                    cast(str | None, task.run_id), result.get("structured_output")
+                ),
+            )
 
         if success and output.strip() and task_owner_user_id is not None:
             persist_assistant_message_no_commit(

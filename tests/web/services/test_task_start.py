@@ -139,7 +139,7 @@ def test_task_starts_execute_without_api_routes() -> None:
                             key_prefix="key-one", text="a2a first", message_id="message-1", context_id=None, task_id=None,
                         )
                         await task_start.execute_existing_task(
-                            task_id=legacy_id, task_owner_user_id=owner, task_source="internal",
+                            task_id=legacy_id, task_owner_user_id=owner,
                             task_description="saved task", context={}, actor_user_id=owner,
                         )
                         # The legacy command is accepted durably as a START; a
@@ -254,7 +254,7 @@ async def test_legacy_execute_returns_after_durable_acceptance(monkeypatch):
 
     def stage(**kwargs):
         staged.append(kwargs)
-        return "run-1", 41
+        return 41
 
     async def dispatch(executor, *, command_db_id):
         dispatched.append(command_db_id)
@@ -266,7 +266,6 @@ async def test_legacy_execute_returns_after_durable_acceptance(monkeypatch):
     await task_start.execute_existing_task(
         task_id=91,
         task_owner_user_id=3,
-        task_source="internal",
         task_description="saved task",
         context={},
         actor_user_id=3,

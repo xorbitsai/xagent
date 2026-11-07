@@ -169,6 +169,16 @@ def _is_credential_key(key: str) -> bool:
     return False
 
 
+def is_credential_key(key: str) -> bool:
+    """Whether ``key`` names a credential, by the same rule the redactor uses.
+
+    Exposed for callers that find credentials in a shape
+    :func:`redact_sensitive_text` does not parse -- a quoted field name, for
+    instance -- so they can reuse this rule instead of writing a second one.
+    """
+    return _is_credential_key(key)
+
+
 def _redact_assignments(text: str) -> str:
     # Values are read only for credentials and never overlap, and finditer
     # tries each position once, so every character is examined a constant

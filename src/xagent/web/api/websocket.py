@@ -6,11 +6,13 @@ import logging
 import uuid
 import weakref
 from collections import OrderedDict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import (
@@ -219,6 +221,9 @@ from .websocket_auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+# RFC 6455 1012: the server is restarting; clients reconnect and resync.
+WS_CLOSE_SERVICE_RESTART = 1012
 
 
 def _make_command_reply(websocket: WebSocket) -> CommandReply:
@@ -1137,6 +1142,10 @@ class _CommandOriginRegistry:
         for key in [k for k, ws in self._origins.items() if ws is websocket]:
             del self._origins[key]
 
+    def has_pending_for_socket(self, websocket: Any) -> bool:
+        """Whether a command submitted on this socket still awaits its outcome."""
+        return any(ws is websocket for ws in self._origins.values())
+
 
 _command_origins = _CommandOriginRegistry()
 
@@ -1282,6 +1291,14 @@ class ConnectionManager:
         ) = None
         # Set at shutdown so later disconnects schedule no database read.
         self._delivery_checks_stopped = False
+        # Set by ``close_for_restart``: a socket registered while draining is
+        # closed with 1012 at once. ``end_restart_drain`` reverses it.
+        self._restart_draining = False
+        self._restart_closes: set[asyncio.Task[None]] = set()
+        # socket -> command handlers still between accepting a frame and
+        # sending its first reply; no origin exists yet, but a close now would
+        # lose that reply.
+        self._ingress: dict[int, int] = {}
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -1316,6 +1333,10 @@ class ConnectionManager:
             self._writers[websocket] = TaskSocketWriter(
                 websocket, lambda: self.disconnect(websocket)
             )
+        if self._restart_draining and not getattr(
+            websocket, "is_broadcast_only", False
+        ):
+            self._schedule_restart_close(websocket)
 
     def _remove_from_task(self, websocket: WebSocket, task_id: int) -> None:
         if task_id in self.active_connections:
@@ -1511,6 +1532,131 @@ class ConnectionManager:
             return
         _report_delivery(ledger, expected)
 
+    @asynccontextmanager
+    async def ingress(self, websocket: WebSocket) -> AsyncIterator[None]:
+        """Mark a command handler as in flight on this socket.
+
+        A restart close waits for it (up to its reply deadline), so the
+        acceptance or rejection reply is sent before 1012.
+        """
+        # Keyed by identity: some callers hand in unhashable socket stand-ins.
+        key = id(websocket)
+        self._ingress[key] = self._ingress.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._ingress.get(key, 1) - 1
+            if remaining > 0:
+                self._ingress[key] = remaining
+            else:
+                self._ingress.pop(key, None)
+
+    def _has_pending_command(self, websocket: Any) -> bool:
+        """Whether a command from this socket still awaits its reply.
+
+        True while a command handler is in flight (``ingress``), and while an
+        origin awaits its outcome: non-shared execution records it in
+        ``_command_origins``, shared execution in the task event bridge.
+        """
+        if self._ingress.get(id(websocket)):
+            return True
+        if _command_origins.has_pending_for_socket(websocket):
+            return True
+        if get_shared_task_execution_enabled():
+            from ..services.task_event_bridge import get_task_event_bridge
+
+            try:
+                return get_task_event_bridge().has_pending_for_recipient(websocket)
+            except ConnectionError:
+                return False
+        return False
+
+    def _schedule_restart_close(self, websocket: WebSocket) -> None:
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._close_for_restart(websocket, 2.0)
+            )
+        except RuntimeError:
+            return
+        self._restart_closes.add(task)
+        task.add_done_callback(self._restart_closes.discard)
+
+    def end_restart_drain(self) -> None:
+        """Stop closing new registrations; the release was aborted."""
+        self._restart_draining = False
+
+    async def close_for_restart(
+        self,
+        *,
+        reply_deadline_seconds: float = 5.0,
+        close_timeout_seconds: float = 2.0,
+    ) -> int:
+        """Close registered WebSockets with ``1012 Service Restart``.
+
+        Meant for a planned release hand-over, callable by a release
+        controller. Clients treat 1012 as "reconnect and resync from the
+        snapshot", so queued frames are dropped rather than flushed. A socket
+        with no command awaiting its reply is closed at once; one with such a
+        command is closed after the reply settled, or when
+        ``reply_deadline_seconds`` passes. SSE sinks (``is_broadcast_only``)
+        are not WebSockets and stay open.
+
+        The manager then keeps draining: a socket registered afterwards is
+        closed with 1012 at once, until ``end_restart_drain``. Only sockets
+        registered with this manager are covered; ``/ws/build/chat``,
+        ``/ws/progress/{task_id}``, ``/asr/stream`` and a ``/ws/build/preview``
+        socket that has not started a preview task are not.
+
+        Idempotent and best-effort: a socket that cannot be closed is only
+        dropped from the registry. Returns the number of sockets handled.
+        """
+        self._restart_draining = True
+        sockets = [
+            ws
+            for ws in list(self._connection_task_ids)
+            if not getattr(ws, "is_broadcast_only", False)
+        ]
+        waiting = [ws for ws in sockets if self._has_pending_command(ws)]
+        waiting_ids = {id(ws) for ws in waiting}
+        immediate = [ws for ws in sockets if id(ws) not in waiting_ids]
+        await asyncio.gather(
+            *(self._close_for_restart(ws, close_timeout_seconds) for ws in immediate)
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, reply_deadline_seconds)
+        while waiting:
+            ready = [
+                ws
+                for ws in waiting
+                if not self._has_pending_command(ws) or loop.time() >= deadline
+            ]
+            if ready:
+                await asyncio.gather(
+                    *(
+                        self._close_for_restart(ws, close_timeout_seconds)
+                        for ws in ready
+                    )
+                )
+                ready_ids = {id(ws) for ws in ready}
+                waiting = [ws for ws in waiting if id(ws) not in ready_ids]
+            if waiting:
+                await asyncio.sleep(0.05)
+        return len(sockets)
+
+    async def _close_for_restart(self, websocket: WebSocket, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(
+                websocket.close(
+                    code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
+                ),
+                timeout=timeout,
+            )
+        except Exception:
+            # Already closed, or the peer is gone; either way it is leaving.
+            pass
+        finally:
+            self.disconnect(websocket)
+
     async def stop_delivery_checks(self) -> None:
         """Cancel pending disconnect checks, wait for them, schedule no more."""
         self._delivery_checks_stopped = True
@@ -1688,6 +1834,22 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _holds_ingress(handler: Any) -> Any:
+    """Keep ``manager.ingress`` held for a command handler's whole run.
+
+    Bound to the connection manager that exists at import time, so replacing
+    the module-level ``manager`` (tests do) cannot disturb the tracking.
+    """
+    connections = manager
+
+    @wraps(handler)
+    async def wrapper(websocket: WebSocket, *args: Any, **kwargs: Any) -> Any:
+        async with connections.ingress(websocket):
+            return await handler(websocket, *args, **kwargs)
+
+    return wrapper
+
+
 # The execution service publishes events; this process owns socket delivery.
 async def _deliver_task_event(message: dict[str, Any], task_id: int) -> None:
     await manager.broadcast_to_task(message, task_id)
@@ -1760,6 +1922,7 @@ async def handle_file_upload_for_task(
         raise
 
 
+@_holds_ingress
 async def handle_chat_message(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -2302,15 +2465,8 @@ async def handle_execute_task(
 
     Like ``chat``, the execution is a durable command, so a planned restart's
     hold leaves it pending for the successor instead of refusing it, and no
-    execution starts inside this socket's handler.
+    execution starts inside this socket's handler. No DB Session is retained.
     """
-    await _handle_admitted_execute_task(websocket, task_id, message_data)
-
-
-async def _handle_admitted_execute_task(
-    websocket: WebSocket, task_id: int, message_data: dict
-) -> None:
-    """Accept the execution command without retaining a DB Session."""
     try:
         user = message_data.get("user")
         authorized_task_id: int | None = None
@@ -2359,25 +2515,47 @@ async def _handle_admitted_execute_task(
         await task_start_service.execute_existing_task(
             task_id=request.task_id,
             task_owner_user_id=request.task_owner_user_id,
-            task_source=request.task_source,
             task_description=request.task_description,
             context=request.task_context,
             actor_user_id=actor_user_id,
         )
 
     except TaskTurnError as e:
-        if e.reason != "busy":
-            raise
-        # The task is already running or already has an execution command
-        # waiting (a duplicate frame, or one racing a restart hold). Nothing
-        # new is staged, so the execution cannot run twice; the first command
-        # keeps the client's attention and the socket stays open.
-        logger.info(
-            "execute_task for task %s not staged (%s): execution already "
-            "accepted or running",
-            task_id,
-            e.reason,
-        )
+        if e.reason == "busy":
+            # The task is already running or already has an execution command
+            # waiting (a duplicate frame, or one racing a restart hold).
+            # Nothing new is staged, so the execution cannot run twice; the
+            # first command keeps the client's attention and the socket stays
+            # open.
+            logger.info(
+                "execute_task for task %s not staged (%s): execution already "
+                "accepted or running",
+                task_id,
+                e.reason,
+            )
+        else:
+            # Not staged for another reason (for example the task vanished or
+            # is not the actor's): the client was acknowledged, so tell it.
+            logger.warning(
+                "execute_task for task %s not staged (%s)",
+                task_id,
+                e.reason,
+                exc_info=True,
+            )
+            error_code = (
+                ClientErrorCode.TASK_UNAVAILABLE
+                if e.reason == "task_not_found"
+                else ClientErrorCode.TASK_EXECUTION_FAILED
+            )
+            await manager.send_personal_message(
+                {
+                    "type": "error",
+                    "error_code": error_code.value,
+                    "message": client_error_message(error_code),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                websocket,
+            )
     except (
         MCPBuiltinOAuthActorPolicyRequiredError,
         ValueError,
@@ -3656,6 +3834,7 @@ async def handle_intervention(
         raise
 
 
+@_holds_ingress
 async def handle_pause_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -3723,6 +3902,7 @@ async def handle_pause_task(
     )
 
 
+@_holds_ingress
 async def handle_resume_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:

@@ -674,7 +674,7 @@ class TestAPITool:
         assert "dedicated MCP connector" in tool.description
         assert "api" in tool.tags
         assert "http" in tool.tags
-        assert tool.category.value == "basic"
+        assert tool.category.value == "web_tools"
 
     def test_args_schema(self):
         """Test argument schema"""

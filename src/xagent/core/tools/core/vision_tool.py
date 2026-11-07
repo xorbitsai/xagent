@@ -254,6 +254,17 @@ class VisionCore:
             Path(root).resolve() for root in allowed_local_media_roots
         )
 
+    def _vision_model_reads_images(self) -> bool:
+        """Whether the model can take an image.
+
+        A configured Auto never advertises ``vision`` (the model that answers
+        is chosen per call), but one whose candidates all read images can take
+        an image whichever it picks.
+        """
+        if self.vision_model.has_ability("vision"):
+            return True
+        return getattr(self.vision_model, "accepts_image_input", False) is True
+
     def add_allowed_local_media_root(self, root: str | Path) -> None:
         """Authorize a private staging root created after initialization."""
         resolved = Path(root).resolve()
@@ -799,7 +810,7 @@ class VisionCore:
                 raise ValueError("end_time must be greater than start_time")
 
             # Validate vision model capability
-            if not self.vision_model.has_ability("vision"):
+            if not self._vision_model_reads_images():
                 model_info = f"Model: {self.vision_model.__class__.__name__}"
 
                 model_id = self._get_attr_safely(self.vision_model, "model_id")
@@ -1088,7 +1099,7 @@ class VisionCore:
             max_tokens = self._coerce_optional_int(max_tokens, "max_tokens")
 
             # Validate vision model capability
-            if not self.vision_model.has_ability("vision"):
+            if not self._vision_model_reads_images():
                 model_info = f"Model: {self.vision_model.__class__.__name__}"
 
                 model_id = self._get_attr_safely(self.vision_model, "model_id")

@@ -3054,7 +3054,7 @@ class WebToolConfig(BaseToolConfig):
             connector_runtime_turn_id=self._connector_runtime_turn_id,
             connector_team_id=self._connector_team_id,
             load_policy=(self._user_id is not None and has_user_tool_policy_hooks()),
-            load_basic=(wants_category("basic") or wants_category("web_search")),
+            load_basic=wants_category("web_tools"),
             load_sql=wants_category("database"),
             load_custom_api=(
                 True
@@ -3319,6 +3319,10 @@ class WebToolConfig(BaseToolConfig):
         self._tool_allowlist_cached = False
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()
+
+    def get_excluded_model_ids(self) -> frozenset[str]:
+        """Get media model ids this task excludes (inherited by sub-agents)."""
+        return self._excluded_model_ids
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""

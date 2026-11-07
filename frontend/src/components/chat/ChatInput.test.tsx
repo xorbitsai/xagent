@@ -166,6 +166,16 @@ describe("ChatInput", () => {
     expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
   })
 
+  it("labels the non-compact send icon and submits through it", async () => {
+    const onSend = vi.fn()
+    render(<ChatInput onSend={onSend} inputValue="Send my draft" onInputChange={vi.fn()}
+      compact={false} hideConfig hideFileUpload voiceInputEnabled={false} taskConfig={{ model: "selected-model" }} />)
+    const send = screen.getByRole("button", { name: "common.send" })
+    expect(send).toHaveAttribute("aria-label", "common.send")
+    fireEvent.click(send)
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Send my draft", expect.objectContaining({ model: "selected-model" })))
+  })
+
   it("requires a model when submitting generic chat", async () => {
     const onSend = vi.fn()
     const { container } = render(

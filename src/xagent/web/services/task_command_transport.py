@@ -2627,7 +2627,8 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     (``_dispatcher_candidate_query``), seen from ``runner_id``: claim
     availability, team admission, the earlier-unfinished-command gate and
     runner routing, plus the START/RESUME_INPUT exclusion without shared
-    execution and the owner lease-recovery filter with it. Whether shared
+    execution (except a START of kind ``existing``, which combined mode
+    consumes itself) and the owner lease-recovery filter with it. Whether shared
     execution is on, and so which variant of each predicate applies, comes
     from the calling process's ``get_shared_task_execution_enabled()``, not
     from the worker that would claim. Without shared execution the

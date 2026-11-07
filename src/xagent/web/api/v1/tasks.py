@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, NoReturn, Optional, cast
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import TypeAdapter
 from sqlalchemy import func
@@ -60,6 +60,7 @@ from ...schemas.v1 import (
     UploadFilesResponse,
 )
 from ...services import task_start as task_start_service
+from ...services.api_idempotency import IdempotencyClaim
 from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
@@ -75,6 +76,10 @@ from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
 from ...services.prompt_context import validate_signed_prompt_context
+from ...services.structured_output_projection import (
+    project_structured_output,
+    response_format_configured,
+)
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
 from ...services.task_delete import (
     TaskDeleteBusy,
@@ -106,6 +111,10 @@ from .deps import (
     record_principal_usage,
 )
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
+from .idempotency import (
+    IDEMPOTENCY_KEY_HEADER,
+    run_with_idempotency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +378,7 @@ def _ensure_agent_reachable(
 async def create_chat_task(
     request: CreateTaskRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+    idempotency_key: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> CreateTaskResponse:
     """Create a new SDK-driven task and kick off its first turn.
 
@@ -406,6 +416,16 @@ async def create_chat_task(
         principal: Key owner from the auth dependency: an agent key's
             bound agent, or a personal key's holder. A workforce key
             cannot create tasks here.
+        idempotency_key: Optional ``Idempotency-Key`` header (1-255 printable
+            ASCII characters, scoped to the key's agent, workforce or holder,
+            kept for 24 hours). The same key with the same body replays the
+            original 202 response (``Idempotent-Replayed: true``) without
+            starting another task; with a different body it is 422
+            ``idempotency_key_reused``; while the first request is still
+            running it is 409 ``idempotency_key_in_progress``. A body that
+            cannot be encoded as JSON is 422 ``invalid_input`` with the
+            header, before anything is reserved. Without the header the call
+            behaves exactly as before.
     Returns:
         :class:`CreateTaskResponse` with the new ``task_id``,
         ``agent_id``, ``status='running'`` (the atomic claim inside
@@ -428,6 +448,23 @@ async def create_chat_task(
             ``{"error": {"code": "internal_error", ...}}`` and the raw
             exception message stays out of the response.
     """
+    return cast(
+        CreateTaskResponse,
+        await run_with_idempotency(
+            principal=principal,
+            operation="create_task",
+            header_value=idempotency_key,
+            request=request,
+            run=lambda claim: _create_chat_task(request, principal, claim),
+        ),
+    )
+
+
+async def _create_chat_task(
+    request: CreateTaskRequest,
+    principal: ApiKeyPrincipal,
+    idempotency_claim: IdempotencyClaim | None,
+) -> CreateTaskResponse:
     agent_identity = principal.agent
     _validate_prompt_context(request.prompt_context)
     credential_kind: task_start_service.SdkCredentialKind
@@ -458,6 +495,7 @@ async def create_chat_task(
             requested_priority=request.priority,
             prompt_context=request.prompt_context,
             credential_kind=credential_kind,
+            idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -521,6 +559,12 @@ class _TaskInfoSnapshot:
     # Set when an appended turn's START is queued and the row still holds the
     # previous turn (see ``_QUEUED_START_STATUSES``). Applied like ``view``.
     start_queued: bool = False
+    # Read from the same row as ``status`` and ``run_id``: the stored
+    # structured result of the run the row shows, and whether the task has a
+    # response format configured. Raw values; the response fields come from
+    # ``project_structured_output`` applied to the effective status.
+    structured_output_record: Any = None
+    format_configured: bool = False
 
 
 # Terminal statuses an append is accepted from. With shared execution the row
@@ -793,6 +837,8 @@ def _load_task_info_snapshot(
             pending_interactions=pending_interactions,
             view=view,
             start_queued=start_queued,
+            structured_output_record=task.structured_output_record,
+            format_configured=response_format_configured(task.agent_config),
         )
 
 
@@ -938,7 +984,8 @@ def _get_chat_task_sync(
     row's ``updated_at``, so a cached body cannot prove the view is still
     current. The cached body holds the stored values; the view is applied
     to the response after every cache read or write. A queued START is
-    applied the same way, for the same reason.
+    applied the same way, for the same reason. So are the structured output
+    fields: the cached body holds them as null.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -969,6 +1016,17 @@ def _get_chat_task_sync(
             error=effective.error,
             completed_at=task.view.stopped_at,
         )
+    # Applied on every read, never cached: the record can change without the
+    # row's ``updated_at`` telling a cached body so, and the effective status
+    # decides whether it is shown at all.
+    overlay.update(
+        project_structured_output(
+            status=effective_task_snapshot(task).status,
+            run_id=task.run_id,
+            record=task.structured_output_record,
+            format_configured=task.format_configured,
+        ).as_dict()
+    )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)
@@ -1055,6 +1113,7 @@ async def append_message_to_task(
     task_id: int,
     request: AppendMessageRequest,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+    idempotency_key: Optional[str] = Header(default=None, alias=IDEMPOTENCY_KEY_HEADER),
 ) -> AppendMessageResponse:
     """Append the next user message to an existing task and kick off its next turn.
 
@@ -1096,6 +1155,10 @@ async def append_message_to_task(
         request: Validated :class:`AppendMessageRequest`. ``message.content``
             is guaranteed non-empty by Pydantic.
         principal: Key-bound owner from the auth dependency.
+        idempotency_key: Optional ``Idempotency-Key`` header, with the same
+            semantics as on ``POST /v1/chat/tasks`` and scoped to this task:
+            a retry with the same key and body replays the original 202
+            response instead of starting another turn.
     Returns:
         :class:`AppendMessageResponse` with the task identity and an
         ``accepted_at`` timestamp.
@@ -1116,6 +1179,26 @@ async def append_message_to_task(
             (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
+    return cast(
+        AppendMessageResponse,
+        await run_with_idempotency(
+            principal=principal,
+            operation=f"append_message:{task_id}",
+            header_value=idempotency_key,
+            request=request,
+            run=lambda claim: _append_message_to_task(
+                task_id, request, principal, claim
+            ),
+        ),
+    )
+
+
+async def _append_message_to_task(
+    task_id: int,
+    request: AppendMessageRequest,
+    principal: ApiKeyPrincipal,
+    idempotency_claim: IdempotencyClaim | None,
+) -> AppendMessageResponse:
     _validate_prompt_context(request.prompt_context)
     if request.prompt_context is not None and principal.workforce is not None:
         raise V1ApiError(
@@ -1136,6 +1219,7 @@ async def append_message_to_task(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
             prompt_context=request.prompt_context,
+            idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -1504,7 +1588,10 @@ async def stream_chat_task_events(
     types (each a ``event: <name>`` / ``data: <json>`` frame pair). Four
     are lifecycle-only:
       - ``task.status``: ``{status}``.
-      - ``task.completed``: ``{status, output, error}``. A failed task
+      - ``task.completed``: ``{status, output, error, structured_output,
+        structured_output_status, structured_output_reason}``. The three
+        structured fields carry the same values as the fields of the
+        same name on ``GET /v1/chat/tasks/{task_id}``. A failed task
         also ends the stream with this event rather than a separate
         one -- ``status`` is ``"failed"`` and ``error`` is set.
       - ``task.input_required``: ``{task_id, prompt}``. ``prompt`` is the

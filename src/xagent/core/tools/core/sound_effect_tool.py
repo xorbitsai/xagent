@@ -10,6 +10,7 @@ from typing import Any, Optional
 from ...file_ref import build_workspace_file_ref
 from ...model.sound_effect import BaseSoundEffectModel, SoundEffectResult
 from ...workspace import TaskWorkspace
+from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,7 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
         model_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Generate a sound effect and save it to the task workspace."""
+        model: Optional[BaseSoundEffectModel] = None
         try:
             prompt = text.strip()
             if not prompt:
@@ -144,13 +146,29 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
                     "saved_to_workspace": False,
                 }
 
-            result = await model.generate_sound_effect(
-                text=prompt,
-                duration_seconds=duration_seconds,
-                prompt_influence=prompt_influence,
-                loop=loop,
-                output_format=output_format,
-            )
+            try:
+                result = await model.generate_sound_effect(
+                    text=prompt,
+                    duration_seconds=duration_seconds,
+                    prompt_influence=prompt_influence,
+                    loop=loop,
+                    output_format=output_format,
+                )
+            except Exception as exc:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        exc,
+                        logger=logger,
+                        action="Sound effect generation failed",
+                        model=model,
+                    ),
+                    "audio_path": None,
+                    "file_id": None,
+                    "model_used": configured_model_id,
+                    "saved_to_workspace": False,
+                }
+
             if not isinstance(result, SoundEffectResult):
                 raise RuntimeError(f"Unexpected sound effect response: {type(result)}")
             if not result.audio:

@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 class PythonExecutorFunctionTool(FunctionTool):
-    """Python executor tool with BASIC category."""
+    """Python executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
 
 class PythonExecutorArgs(BaseModel):
@@ -168,9 +168,9 @@ class PythonExecutorTool(AbstractBaseTool):
     exec_timeout=get_python_executor_timeout_seconds,
 )
 class PythonExecutorToolForBasic(PythonExecutorTool):
-    """Python executor tool with BASIC category."""
+    """Python executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
     @property
     def name(self) -> str:

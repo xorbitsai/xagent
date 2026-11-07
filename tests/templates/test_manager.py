@@ -606,7 +606,7 @@ workforce_config:
         assert len(templates) == 0
         assert not manager.has_templates()
 
-    def test_builtin_templates_that_use_web_search_select_web_search_category(self):
+    def test_builtin_templates_that_use_web_search_select_web_tools_category(self):
         built_in_dir = (
             Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
         )
@@ -626,7 +626,7 @@ workforce_config:
             instructions = str(agent_config.get("instructions") or "").lower()
             tool_categories = agent_config.get("tool_categories") or []
             if any(marker in instructions for marker in markers):
-                if "web_search" not in tool_categories:
+                if "web_tools" not in tool_categories:
                     offenders.append(template_file.name)
 
         assert not offenders

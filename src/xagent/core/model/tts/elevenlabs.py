@@ -16,6 +16,7 @@ from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -208,7 +209,12 @@ class ElevenLabsTTS(BaseTTS):
     @staticmethod
     def _validate_voice_id(voice_id: str) -> None:
         if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", voice_id) is None:
-            raise ValueError("ElevenLabs voice must be a valid voice ID")
+            # The accepted values are the account's own voice ids, which the
+            # caller gets from list_tts_voices; there is no range to state.
+            raise MediaParameterError(
+                "ElevenLabs voice must be a valid voice ID",
+                field="voice",
+            )
 
     @staticmethod
     def _validate_sample_rate_request(
@@ -224,11 +230,15 @@ class ElevenLabsTTS(BaseTTS):
         if resolved_codec == "pcm" or resolved_sample_rate == sample_rate:
             return
 
-        raise ValueError(
+        # Which rates a format renders at is the provider's table, not a
+        # range this adapter can state: name the rejected field without
+        # inventing one.
+        raise MediaParameterError(
             "ElevenLabs sample_rate must match the resolved output format. "
             "Use format='pcm' for custom sample rates, or pass an ElevenLabs "
             f"output_format that includes {sample_rate}. Requested format "
-            f"'{requested_format}' resolves to '{output_format}'."
+            f"'{requested_format}' resolves to '{output_format}'.",
+            field="sample_rate",
         )
 
     def _resolve_output_format(
@@ -264,22 +274,25 @@ class ElevenLabsTTS(BaseTTS):
         if aliases is None:
             return text
         if not isinstance(aliases, dict):
-            raise ValueError(
+            raise MediaParameterError(
                 "ElevenLabs pronunciation_aliases must be an object mapping "
-                "source phrases to spoken aliases"
+                "source phrases to spoken aliases",
+                field="pronunciation_aliases",
             )
 
         normalized_aliases: dict[str, str] = {}
         for source, alias in aliases.items():
             if not isinstance(source, str) or not source.strip():
-                raise ValueError(
+                raise MediaParameterError(
                     "ElevenLabs pronunciation_aliases source phrases must be "
-                    "non-empty strings"
+                    "non-empty strings",
+                    field="pronunciation_aliases",
                 )
             if not isinstance(alias, str) or not alias.strip():
-                raise ValueError(
+                raise MediaParameterError(
                     "ElevenLabs pronunciation_aliases spoken aliases must be "
-                    "non-empty strings"
+                    "non-empty strings",
+                    field="pronunciation_aliases",
                 )
             normalized_aliases[source] = alias
 
@@ -350,7 +363,7 @@ class ElevenLabsTTS(BaseTTS):
                 except Exception as exc:
                     logger.warning(
                         "Failed to create ElevenLabs client for temporary voice cleanup: %s",
-                        redact_sensitive_text(str(exc)),
+                        redact_provider_detail(exc),
                     )
             self._client = None
             self._async_client = None
@@ -365,7 +378,7 @@ class ElevenLabsTTS(BaseTTS):
                         logger.warning(
                             "Failed to delete temporary ElevenLabs voice clone %s: %s",
                             voice_id,
-                            redact_sensitive_text(str(exc)),
+                            redact_provider_detail(exc),
                         )
                 if deleted_voice_ids:
                     self._cloned_voice_ids = {
@@ -560,7 +573,10 @@ class ElevenLabsTTS(BaseTTS):
         """Create a persistent ElevenLabs Instant Voice Clone."""
         normalized_name = name.strip()
         if not normalized_name:
-            raise ValueError("ElevenLabs voice clone name must not be empty")
+            raise MediaParameterError(
+                "ElevenLabs voice clone name must not be empty",
+                field="name",
+            )
         if not reference_audio_files:
             raise ValueError("At least one reference audio file is required")
 
@@ -587,7 +603,9 @@ class ElevenLabsTTS(BaseTTS):
             response = await client.voices.ivc.create(**request_kwargs)
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
-            logger.error("ElevenLabs voice cloning failed: %s", redacted_error)
+            logger.error(
+                "ElevenLabs voice cloning failed: %s", redact_provider_detail(exc)
+            )
             raise RuntimeError(
                 f"ElevenLabs voice cloning failed: {redacted_error}"
             ) from exc
@@ -611,14 +629,19 @@ class ElevenLabsTTS(BaseTTS):
         """Delete a persistent voice from the configured ElevenLabs account."""
         normalized_voice_id = voice_id.strip()
         if not normalized_voice_id:
-            raise ValueError("ElevenLabs voice ID must not be empty")
+            raise MediaParameterError(
+                "ElevenLabs voice ID must not be empty",
+                field="voice_id",
+            )
 
         client = self._ensure_async_client()
         try:
             await client.voices.delete(normalized_voice_id)
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
-            logger.error("ElevenLabs voice deletion failed: %s", redacted_error)
+            logger.error(
+                "ElevenLabs voice deletion failed: %s", redact_provider_detail(exc)
+            )
             raise RuntimeError(
                 f"ElevenLabs voice deletion failed: {redacted_error}"
             ) from exc
@@ -638,13 +661,30 @@ class ElevenLabsTTS(BaseTTS):
             format or self.output_format, sample_rate or self.sample_rate
         )
         # Keep saved models discoverable; validate the effective request before
-        # any provider client is opened, including agent-tool callers.
+        # any provider client is opened, including agent-tool callers. Both
+        # checks name the parameter they reject and the values it accepts, so
+        # a caller that passed a format this client cannot produce is told
+        # what it can pass instead of "the request failed".
         requested_format = (format or self.output_format).strip().lower()
         if (
             requested_format not in _GENERIC_OUTPUT_FORMATS
             and requested_format not in _SUPPORTED_OUTPUT_FORMATS
-        ) or final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
-            raise ValueError("Unsupported ElevenLabs output format or sample rate")
+        ):
+            raise MediaParameterError(
+                "Unsupported ElevenLabs output format",
+                field="audio_format",
+                allowed_values={
+                    "audio_format": sorted(_GENERIC_OUTPUT_FORMATS),
+                },
+            )
+        if final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
+            # The format is one this client knows but the sample rate is not
+            # one ElevenLabs renders it at; the accepted rates are a property
+            # of the provider, not a range this adapter can state.
+            raise MediaParameterError(
+                "Unsupported ElevenLabs output sample rate for this format",
+                field="sample_rate",
+            )
         self._validate_sample_rate_request(
             format or self.output_format,
             sample_rate,
@@ -693,7 +733,7 @@ class ElevenLabsTTS(BaseTTS):
                 "ElevenLabs TTS stream failed" if streaming else "ElevenLabs TTS failed"
             )
             message = f"{prefix}: {redact_sensitive_text(error_text)}"
-        logger.error("%s", message)
+        logger.error("%s", redact_provider_detail(message))
         return RuntimeError(message)
 
     async def synthesize(

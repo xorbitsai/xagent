@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.basic_tools import create_basic_tools
+from xagent.core.tools.adapters.vibe.basic_tools import create_web_tools
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
@@ -29,7 +29,7 @@ async def test_unreadable_provider_preserves_other_basic_tools(
         return None
 
     monkeypatch.setattr(config, "get_tool_credential", resolve)
-    tools = await create_basic_tools(config)
+    tools = await create_web_tools(config)
     assert "zhipu_web_search" not in _tool_names(tools)
     assert "fetch_web_content" in _tool_names(tools)
     assert "api_call" in _tool_names(tools)
@@ -41,7 +41,7 @@ async def test_unreadable_provider_preserves_other_basic_tools(
 async def test_auto_web_search_provider_preserves_existing_priority(monkeypatch):
     monkeypatch.delenv("XAGENT_WEB_SEARCH_PROVIDER", raising=False)
 
-    tools = await create_basic_tools(
+    tools = await create_web_tools(
         ToolConfig(
             {
                 "workspace": None,
@@ -67,7 +67,7 @@ async def test_auto_web_search_provider_preserves_existing_priority(monkeypatch)
 async def test_explicit_google_web_search_provider_uses_google(monkeypatch):
     monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
 
-    tools = await create_basic_tools(
+    tools = await create_web_tools(
         ToolConfig(
             {
                 "workspace": None,
@@ -90,7 +90,7 @@ async def test_explicit_google_web_search_provider_uses_google(monkeypatch):
 async def test_explicit_exa_web_search_provider_uses_exa(monkeypatch):
     monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "exa")
 
-    tools = await create_basic_tools(
+    tools = await create_web_tools(
         ToolConfig(
             {
                 "workspace": None,
@@ -112,7 +112,7 @@ async def test_explicit_exa_web_search_provider_uses_exa(monkeypatch):
 async def test_explicit_provider_without_credentials_adds_no_search_tool(monkeypatch):
     monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
 
-    tools = await create_basic_tools(
+    tools = await create_web_tools(
         ToolConfig(
             {
                 "workspace": None,
@@ -135,12 +135,14 @@ async def test_basic_category_selection_excludes_web_fetch_tool(monkeypatch):
             "tool_credentials": {},
         }
     )
-    config._tool_selection_spec = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    config._tool_selection_spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools"]
+    )
 
     tools = await ToolFactory.create_all_tools(config)
 
     names = _tool_names(tools)
-    assert "api_call" in names
+    assert "api_call" not in names
     assert "fetch_web_content" not in names
 
 
@@ -154,19 +156,20 @@ async def test_web_search_category_selection_keeps_web_fetch_tool(monkeypatch):
         }
     )
     config._tool_selection_spec = ToolSelectionSpec.from_raw(
-        tool_categories=["web_search"]
+        tool_categories=["web_tools"]
     )
 
     tools = await ToolFactory.create_all_tools(config)
 
     # The time tools are intrinsic: they ride along every non-NONE selection
-    # regardless of category, so a web_search-only agent sees them too
-    # (#1729). They sort last, being category OTHER rather than BASIC.
-    assert _tool_names(tools) == [
+    # regardless of category, so a web-tools-only agent sees them too
+    # (#1729). Their display category does not change that availability.
+    assert set(_tool_names(tools)) == {
+        "api_call",
         "fetch_web_content",
         "get_current_time",
         "validate_local_time",
-    ]
+    }
 
 
 @pytest.mark.asyncio
@@ -175,7 +178,7 @@ async def test_basic_tools_include_web_asset_download_with_workspace(
 ):
     monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
 
-    tools = await create_basic_tools(
+    tools = await create_web_tools(
         ToolConfig(
             {
                 "workspace": {

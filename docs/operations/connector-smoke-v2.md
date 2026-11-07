@@ -72,6 +72,8 @@ A connector that has not adopted V2 keeps `web/connector_probes.py` as its singl
 
 A connector adopts V2 by adding an entry to `CONNECTOR_CHECKS`. To keep its L3 call, it lists `l3_read_check(app_id)` among its reads.
 
+`notion`, `miro` and `atlassian` have adopted V2 with a `current_user` read check that sets `require_read_only_hint`, because their tools are vendor-owned: the check is skipped unless the server advertises the tool with `readOnlyHint: true`. The check takes the place of their unprobeable `l3_probe` row. `connector_probes.py` has no such guard, so the probe route still records them as `covered_by_l2`. The other remote MCP connectors keep the derived `covered_by_l2` row until their result shapes are verified against a test account; `fireflies` returns plain text, which no payload source reads. A remote (`url`) connector's tool list is vendor-owned and changes without a release, so per-tool coverage (#3565) does not apply to it: it declares the checks it has and no exemptions.
+
 ## Identity adapters
 
 The engine runs as an identity through an `IdentityAdapter` (`identity.py`):

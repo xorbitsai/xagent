@@ -14,10 +14,56 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from ..connector_probes import get_connector_probe, get_unprobeable_reason
-from .declarations import ConnectorChecks, L3Envelope, ReadCheck, UnprobeableCheck
+from .declarations import (
+    ConnectorChecks,
+    HasKeys,
+    L3Envelope,
+    ReadCheck,
+    UnprobeableCheck,
+)
 
 # Connectors that have adopted V2, by catalog app id.
-CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {}
+CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
+    "atlassian": ConnectorChecks(
+        "atlassian",
+        reads=(
+            ReadCheck(
+                "atlassian.current_user",
+                "atlassianUserInfo",
+                payload="json_text",
+                assertions=(HasKeys(("data",), ("accountId",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+    ),
+    "miro": ConnectorChecks(
+        "miro",
+        reads=(
+            ReadCheck(
+                "miro.current_user",
+                "user_who_am_i",
+                payload="structured_content",
+                assertions=(HasKeys((), ("user_id",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+    ),
+    "notion": ConnectorChecks(
+        "notion",
+        reads=(
+            ReadCheck(
+                "notion.current_user",
+                "notion-get-self",
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("workspace", "user")),
+                    HasKeys(("user",), ("id",)),
+                ),
+                require_read_only_hint=True,
+            ),
+        ),
+    ),
+}
 
 
 def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:

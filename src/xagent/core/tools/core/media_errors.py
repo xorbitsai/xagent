@@ -51,6 +51,8 @@ import re
 from collections.abc import Iterator, Mapping
 from typing import Any, Optional
 
+from aiohttp import ClientConnectorError, ServerDisconnectedError
+
 from ...utils.security import is_credential_key, redact_sensitive_text
 
 MODEL_NOT_ENABLED = "model_not_enabled"
@@ -496,6 +498,21 @@ def _provider_codes(exc: BaseException) -> Iterator[str]:
                         yield value
 
 
+def _is_transport_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` is a dropped or refused connection, by its type.
+
+    Only the two concrete aiohttp failures the media adapters' HTTP paths
+    surface count: the peer closing the connection, and a refused connection.
+    TLS, DNS, proxy and invalid-URL failures are different problems and stay
+    out of the retry-later guidance.
+    """
+    if isinstance(exc, ServerDisconnectedError):
+        return True
+    return type(exc) is ClientConnectorError and isinstance(
+        getattr(exc, "os_error", None), ConnectionRefusedError
+    )
+
+
 def _code_and_target_strings(exc: BaseException) -> list[str]:
     """The provider's code and the request target it blames, as strings.
 
@@ -532,9 +549,12 @@ def classify_media_failure(exc: BaseException) -> str:
     haystack: list[str] = []
     class_names: list[str] = []
     parameter_rejected = False
+    transport_failure = False
     for link in _exception_chain(exc):
         if isinstance(link, MediaParameterError):
             parameter_rejected = True
+        if _is_transport_failure(link):
+            transport_failure = True
         status = _status_code(link)
         if status is not None:
             statuses.append(status)
@@ -546,6 +566,10 @@ def classify_media_failure(exc: BaseException) -> str:
     # says so, in its own type; that beats any guess from a status.
     if parameter_rejected:
         return INVALID_REQUEST
+    # A dropped or refused connection is the provider not answering, whatever
+    # text the transport library put in its message.
+    if transport_failure:
+        return PROVIDER_UNAVAILABLE
 
     lowered = " ".join(haystack).lower()
 

@@ -26,7 +26,9 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional, Union
 from unittest.mock import AsyncMock, Mock
 
+import aiohttp
 import pytest
+from aiohttp.client_reqrep import ConnectionKey
 
 from xagent.core.model.asr.base import ASRResult, BaseASR
 from xagent.core.model.asr.elevenlabs import ElevenLabsASR
@@ -39,6 +41,7 @@ from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.base import BaseTTS, TTSResult
 from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.core.model.tts.xinference import XinferenceTTS
+from xagent.core.model.video import xinference as xinference_video
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BilledVideoTaskTimeout
 from xagent.core.model.video.xinference import XinferenceVideoModel
@@ -1039,6 +1042,103 @@ class TestDashScopeStatusCodes:
         assert result["success"] is False
         assert result["error_category"] == PROVIDER_UNAVAILABLE
         assert "upstream temporarily busy" not in json.dumps(result, default=str)
+
+
+def _connection_key() -> ConnectionKey:
+    return ConnectionKey(
+        host="media.example",
+        port=443,
+        is_ssl=True,
+        ssl=True,
+        proxy=None,
+        proxy_auth=None,
+        proxy_headers_hash=None,
+    )
+
+
+def _connection_refused_error() -> aiohttp.ClientConnectorError:
+    return aiohttp.ClientConnectorError(
+        _connection_key(), ConnectionRefusedError(61, "Connection refused")
+    )
+
+
+class _RaisingSession:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._error
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._error
+
+    async def __aenter__(self) -> _RaisingSession:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> bool:
+        return False
+
+
+class TestAiohttpTransportFailures:
+    """A dropped or refused connection is the provider not answering, even
+    when the transport's own class name is not on the SDK allowlist."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [aiohttp.ServerDisconnectedError(), _connection_refused_error()],
+        ids=["server-disconnect", "connection-refused"],
+    )
+    async def test_a_dashscope_transport_failure_is_an_outage(
+        self, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        monkeypatch.setattr(
+            dashscope_image,
+            "create_public_model_aiohttp_session",
+            lambda **kwargs: _RaisingSession(error),
+        )
+        model = DashScopeImageModel(model_name="qwen-image", api_key="test-key")
+        tool = ImageGenerationToolCore(
+            {"dashscope": model},
+            default_generate_model=model,
+        )
+
+        result = await tool.generate_image("A product shot")
+
+        assert result["success"] is False
+        assert result["error_category"] == PROVIDER_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_a_refused_connection_in_xinference_video_is_an_outage(
+        self, workspace: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            xinference_video,
+            "create_public_model_aiohttp_session",
+            lambda **kwargs: _RaisingSession(_connection_refused_error()),
+        )
+        model = XinferenceVideoModel("test-video-model", base_url="http://test")
+        tool = VideoGenerationToolCore(
+            {"video": model},
+            workspace=workspace,
+            default_video_model=model,
+        )
+
+        result = await tool.generate_video("A short clip", seconds=4)
+
+        assert result["success"] is False
+        assert result["error_category"] == PROVIDER_UNAVAILABLE
+
+    def test_a_connector_failure_that_is_not_a_refusal_is_not_an_outage(
+        self,
+    ) -> None:
+        """Only the connection-refused case is transient: a TLS, DNS or
+        configuration failure is not something a retry is promised for."""
+        error = aiohttp.ClientConnectorError(
+            _connection_key(), OSError("network is unreachable")
+        )
+
+        assert classify_media_failure(error) == UNKNOWN
 
 
 class TestStructuredQuotaStatus:

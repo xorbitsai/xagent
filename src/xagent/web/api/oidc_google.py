@@ -29,6 +29,7 @@ from ...config import (
     get_oidc_exchange_ttl_seconds,
     get_oidc_login_ttl_seconds,
     get_session_secret,
+    public_entries_configured,
 )
 from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from ..auth_sessions import (
@@ -143,9 +144,12 @@ async def complete_google_oidc_authorization(
     request: Request, *, redirect_uri: str
 ) -> dict[str, Any]:
     google = _google_oauth_client()
-    entry = await google_state_entry(request, google)
-    if redirect_uri != entry.google_oidc_redirect_uri:
-        raise ValueError("invalid_entry")
+    # With explicit entries, the callback URI saved in Authlib state must match
+    # the entry completing the flow. Legacy deployments have a single callback.
+    if public_entries_configured():
+        entry = await google_state_entry(request, google)
+        if redirect_uri != entry.google_oidc_redirect_uri:
+            raise ValueError("invalid_entry")
     token = await google.authorize_access_token(request)
     userinfo = token.get("userinfo")
     if userinfo is None:
@@ -382,9 +386,16 @@ async def google_oidc_callback(
     request: Request,
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
+    # Explicit entries resolve the completing entry from the saved Authlib state
+    # before anything else. Legacy deployments keep their single entry and the
+    # original error mapping (no state lookup, no client construction here).
     try:
-        entry = await google_state_entry(request, _google_oauth_client())
-    except (ValueError, HTTPException):
+        entry = (
+            await google_state_entry(request, _google_oauth_client())
+            if public_entries_configured()
+            else request_public_entry(request)
+        )
+    except (ValueError, RuntimeError, HTTPException):
         return _login_error_redirect("invalid_callback")
 
     def failure(code: str) -> RedirectResponse:
@@ -392,7 +403,7 @@ async def google_oidc_callback(
 
     if request.query_params.get("error"):
         return failure("provider_error")
-    if not request.query_params.get("code"):
+    if not request.query_params.get("code") or not request.query_params.get("state"):
         return failure("invalid_callback")
     redirect_uri = entry.google_oidc_redirect_uri
     if not redirect_uri:

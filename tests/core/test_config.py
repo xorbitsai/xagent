@@ -4810,7 +4810,8 @@ def test_public_site_configuration_is_opt_in(monkeypatch):
     monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://legacy.example")
     monkeypatch.setenv("XAGENT_REGION_COOKIE_DOMAIN", ".legacy.example")
     assert get_primary_public_site_url() == "https://legacy.example"
-    assert get_public_entries()[0].region_cookie_domain == ".legacy.example"
+    # The unconfigured legacy entry never carries a hosting cookie domain.
+    assert get_public_entries()[0].region_cookie_domain is None
     assert not get_dual_entry_oauth_enabled()
 
 

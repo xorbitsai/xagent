@@ -1,4 +1,3 @@
-
 import { mcpAuthorizationURL } from "@/lib/oauth-bootstrap"
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import { Input } from "@/components/ui/input"
@@ -334,10 +333,11 @@ export function CustomMcpForm({
         toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
         return
       }
+      const href = await mcpAuthorizationURL(data)
       if (popup) {
-        popup.location.href = await mcpAuthorizationURL(data)
+        popup.location.href = href
       } else {
-        popup = window.open(await mcpAuthorizationURL(data), "_blank", "noopener,noreferrer")
+        popup = window.open(href, "_blank", "noopener,noreferrer")
       }
       const startedAt = Date.now()
       const maxWaitMs = 5 * 60 * 1000

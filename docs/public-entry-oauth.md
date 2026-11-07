@@ -111,3 +111,27 @@ Deployment prerequisites (not performed here): trusted dual ingress, matching
 fixed-region edge bootstrap routes, adapter and callback middleware integration,
 Google callback registrations, and browser verification of actual historical 301
 callback hosts. Promote the primary site separately from enabling entries/routes.
+
+Additional prerequisites:
+
+- The browser calls `/api` on the entry's own host (empty/same-origin
+  `NEXT_PUBLIC_API_URL`). Entry resolution and the Google exchange binding use
+  the request Host, so an absolute API base on another host is rejected.
+- The authorization entry must equal the provider callback host or one of its
+  configured `XAGENT_OAUTH_CALLBACK_ORIGIN_MAP` aliases; nonce/state cookies are
+  host-only, so a mismatch surfaces only as `invalid_state` after consent.
+- Ingress overwrites Host/X-Forwarded-Host with the validated public entry.
+- Unconfigured deployments (`XAGENT_PUBLIC_ENTRIES_JSON` unset) keep the exact
+  legacy frontend origin and Google error mapping; the strict origin validation
+  applies only to explicit entries.
+
+## Known limitation: enablement blocker
+
+Regional bootstrap tickets are bearer credentials that are not bound to the
+initiating browser. The authorization entry has no session for a user signed in
+only on another entry, so whichever browser opens a valid ticket URL receives the
+OAuth state cookie. A user who opens a ticket URL minted by someone else would
+connect their provider account to the minting account (account-linking CSRF).
+Legacy MCP flows set the state cookie on the authenticated POST and are not
+affected. Keep `XAGENT_DUAL_ENTRY_OAUTH_ENABLED=false` until a browser binding
+(for example a confirmation interstitial or an opener handshake) is added.

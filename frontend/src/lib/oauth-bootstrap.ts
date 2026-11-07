@@ -1,11 +1,11 @@
 /** The allowlist comes only from same-origin deployment configuration. */
 export function validateRegionalBootstrap(raw: string, origins: readonly string[]): string {
   const url = new URL(raw)
+  const keys = [...url.searchParams.keys()]
   if (!origins.includes(url.origin) || !["https:", "http:"].includes(url.protocol)
     || url.username || url.password || url.hash || raw.includes("#")
     || !/^\/api\/oauth\/launch\/[a-z0-9-]+$/.test(url.pathname)
-    || [...url.searchParams.keys()].length !== 1
-    || !url.searchParams.get("ticket") || [...url.searchParams.keys()][0] !== "ticket") {
+    || keys.join() !== "ticket" || !url.searchParams.get("ticket")) {
     throw new Error("Invalid regional authorization destination")
   }
   return url.href

@@ -1,4 +1,3 @@
-
 import { mcpAuthorizationURL } from "@/lib/oauth-bootstrap"
 import React, { useState } from "react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"

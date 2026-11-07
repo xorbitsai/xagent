@@ -581,3 +581,45 @@ def test_new_exchange_entry_rejection_does_not_consume_code(oidc_client, monkeyp
         ).status_code
         == 200
     )
+
+
+def test_unconfigured_entries_keep_legacy_google_behavior(oidc_client, monkeypatch):
+    """Without explicit entries, origins outside the strict entry grammar work
+    and callback errors keep the legacy mapping instead of raising."""
+    client, SessionLocal = oidc_client
+    _create_admin(SessionLocal)
+    monkeypatch.delenv("XAGENT_PUBLIC_ENTRIES_JSON", raising=False)
+    monkeypatch.delenv("XAGENT_APP_BASE_URL", raising=False)
+    monkeypatch.setenv("XAGENT_FRONTEND_URL", "http://xagent_web:3000")
+    _install_authlib_login_fake(monkeypatch)
+
+    _start_google_login(client)
+
+    def callback_error(query: str) -> tuple[str, list[str]]:
+        response = client.get(
+            f"/api/auth/oidc/google/callback?{query}", follow_redirects=False
+        )
+        assert response.status_code == 307
+        location = urlparse(response.headers["location"])
+        return location.netloc, parse_qs(location.query)["oidc_error"]
+
+    assert callback_error("error=access_denied&state=s") == (
+        "xagent_web:3000",
+        ["provider_error"],
+    )
+    assert callback_error("code=google-code") == (
+        "xagent_web:3000",
+        ["invalid_callback"],
+    )
+
+    # An unconfigured client fails inside the guarded completion, as before.
+    def unconfigured_client():
+        raise RuntimeError("Google OIDC is not configured")
+
+    monkeypatch.setattr(
+        "xagent.web.api.oidc_google._google_oauth_client", unconfigured_client
+    )
+    assert callback_error("code=google-code&state=s") == (
+        "xagent_web:3000",
+        ["callback_failed"],
+    )

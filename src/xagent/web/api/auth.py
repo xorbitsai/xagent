@@ -6467,7 +6467,7 @@ def start_oauth_authorization(
     )
 
     if regional_launch_requested(request):
-        from ...config import get_oauth_callback_origin_map
+        from ...config import get_oauth_callback_origin_map, normalize_public_origin
         from ..public_entries import request_public_entry
 
         validate_builtin_resource(db, provider, payload.app_id)
@@ -6481,8 +6481,9 @@ def start_oauth_authorization(
                 "options": payload.model_dump(),
             },
         )
+        # Map keys are normalized origins; normalize before the alias lookup.
         result["callback_origin"] = get_oauth_callback_origin_map().get(
-            callback_origin, callback_origin
+            normalize_public_origin(callback_origin), callback_origin
         )
         return JSONResponse(result, headers=private_headers)
 

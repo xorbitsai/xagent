@@ -4955,7 +4955,11 @@ def public_entries_configured() -> bool:
 
 
 def get_legacy_public_origin() -> str:
-    """Extract the legacy origin without changing configured frontend path prefixes."""
+    """Extract the normalized legacy origin for explicit-entry validation.
+
+    Only meaningful when ``XAGENT_PUBLIC_ENTRIES_JSON`` is configured; it raises
+    for origins that explicit entries could not represent.
+    """
     parts = urlsplit(get_app_base_url() or get_frontend_url())
     return normalize_public_origin(f"{parts.scheme}://{parts.netloc}")
 
@@ -4964,10 +4968,16 @@ def get_public_entries() -> tuple[PublicEntry, ...]:
     """Return trusted entries; explicit null cookie domains remain host-only."""
     raw = os.getenv(PUBLIC_ENTRIES_JSON)
     if not raw:
+        # Unconfigured deployments keep their exact legacy frontend origin.
+        # The strict origin validation below applies only to explicit entries,
+        # so hosts such as ``http://xagent_web:3000`` keep working unchanged.
+        # The legacy entry carries no cookie domain: hosting layers keep their
+        # own region-cookie configuration when entries are not configured.
+        parts = urlsplit(get_app_base_url() or get_frontend_url())
         return (
             PublicEntry(
-                get_legacy_public_origin(),
-                os.getenv("XAGENT_REGION_COOKIE_DOMAIN", ".cloud.xagent.co"),
+                f"{parts.scheme}://{parts.netloc}",
+                None,
                 get_google_oidc_redirect_uri(),
             ),
         )

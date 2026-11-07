@@ -1,5 +1,6 @@
 """Opt-in regional OAuth navigation, with a hosting-owned routing adapter."""
 
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import timedelta
@@ -51,8 +52,6 @@ class OAuthHandoffAdapter(Protocol):
 def handoff_context(
     request: Request,
 ) -> tuple[OAuthHandoffAdapter, OAuthHandoffContext]:
-    import re
-
     adapter = getattr(request.app.state, "oauth_handoff_adapter", None)
     if not get_dual_entry_oauth_enabled() or adapter is None:
         raise HTTPException(503, "Regional OAuth unavailable", headers=HEADERS)
@@ -159,7 +158,6 @@ def redeem_handoff(
         actual_origin = None
     if (
         actual_origin != context.authorization_entry_origin
-        or request.method != "GET"
         or region != context.region
         or list(request.query_params.keys()) != ["ticket"]
         or len(request.query_params.getlist("ticket")) != 1

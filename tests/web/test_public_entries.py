@@ -155,3 +155,14 @@ def test_explicit_callback_preserves_actual_redirect_uri_normalization(
         get_public_entries()[1].google_oidc_redirect_uri
         == entries[1]["google_oidc_redirect_uri"]
     )
+
+
+def test_unconfigured_entry_keeps_raw_legacy_origin(monkeypatch):
+    monkeypatch.delenv("XAGENT_PUBLIC_ENTRIES_JSON", raising=False)
+    monkeypatch.delenv("XAGENT_APP_BASE_URL", raising=False)
+    monkeypatch.setenv("XAGENT_FRONTEND_URL", "http://xagent_web:3000")
+    entry = get_public_entries()[0]
+    assert entry.origin == "http://xagent_web:3000"
+    assert entry.region_cookie_domain is None
+    assert request_public_entry(request("anything.example")) == entry
+    assert validate_exchange_entry(request("anything.example"), None)

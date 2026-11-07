@@ -67,11 +67,15 @@ async def google_state_entry(request: Request, google: Any) -> PublicEntry:
 
 
 def validate_exchange_entry(request: Request, origin: str | None) -> bool:
+    """Bind an exchange code to the entry that completed the Google callback.
+
+    Codes without an origin predate explicit entries; they are accepted only at
+    the legacy entry (always, when entries are not configured).
+    """
     entry = request_public_entry(request)
     if origin is None:
         return (
-            entry == get_public_entries()[0]
-            if not public_entries_configured()
-            else entry.origin == get_legacy_public_origin()
+            not public_entries_configured()
+            or entry.origin == get_legacy_public_origin()
         )
     return origin == entry.origin

@@ -645,6 +645,7 @@ export function buildMcpServerPayload(
 
 export interface McpOAuthConnectResponse {
   authorization_url: string
+  launch_mode?: string
 }
 
 /** Extract a human-readable message from an MCP OAuth endpoint error body.

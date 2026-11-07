@@ -15,7 +15,11 @@ cannot enforce a downstream route that standalone XAgent does not provide.
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ...config import get_app_base_url
+from ...config import (
+    get_dual_entry_oauth_enabled,
+    get_oauth_authorization_entry_origin,
+    get_primary_public_site_url,
+)
 
 router = APIRouter(prefix="/api", tags=["deployment"])
 
@@ -36,6 +40,7 @@ class DeploymentConfigResponse(BaseModel):
     deployment_origin: str | None
     app_origin: str | None
     region: str | None
+    oauth_authorization_origins: list[str] | None = None
 
 
 @router.get("/deployment-config", response_model=DeploymentConfigResponse)
@@ -44,6 +49,9 @@ def get_deployment_config() -> DeploymentConfigResponse:
 
     return DeploymentConfigResponse(
         deployment_origin=None,
-        app_origin=get_app_base_url(),
+        app_origin=get_primary_public_site_url(),
+        oauth_authorization_origins=[get_oauth_authorization_entry_origin()]
+        if get_dual_entry_oauth_enabled()
+        else None,
         region=None,
     )

@@ -26,6 +26,7 @@ def test_deployment_config_preserves_standalone_client_origins(monkeypatch):
         "deployment_origin": None,
         "app_origin": "https://app.example.test",
         "region": None,
+        "oauth_authorization_origins": None,
     }
 
 
@@ -38,4 +39,5 @@ def test_deployment_config_allows_an_unconfigured_standalone_app_origin(
         "deployment_origin": None,
         "app_origin": None,
         "region": None,
+        "oauth_authorization_origins": None,
     }

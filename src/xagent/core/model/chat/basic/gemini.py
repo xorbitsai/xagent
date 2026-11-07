@@ -31,6 +31,13 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+def _thoughts_token_count(usage_metadata: Any) -> int:
+    """Return Gemini thinking tokens, which are billed as output but are not
+    included in ``candidates_token_count``."""
+    raw = getattr(usage_metadata, "thoughts_token_count", 0)
+    return raw if isinstance(raw, int) else 0
+
+
 def _contains_refs_or_defs(obj: Any) -> bool:
     """Recursively check if object contains $defs or $ref keys."""
     if isinstance(obj, dict):
@@ -667,7 +674,9 @@ class GeminiLLM(BaseLLM):
             if hasattr(response, "usage_metadata") and response.usage_metadata:
                 usage_metadata = response.usage_metadata
                 input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
-                output_tokens = getattr(usage_metadata, "candidates_token_count", 0)
+                output_tokens = (
+                    getattr(usage_metadata, "candidates_token_count", 0) or 0
+                ) + _thoughts_token_count(usage_metadata)
                 cached_tokens = (
                     getattr(usage_metadata, "cached_content_token_count", 0) or 0
                 )
@@ -936,7 +945,7 @@ class GeminiLLM(BaseLLM):
                     input_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
                     output_tokens = (
                         getattr(usage_metadata, "candidates_token_count", 0) or 0
-                    )
+                    ) + _thoughts_token_count(usage_metadata)
                     raw_cached = getattr(
                         usage_metadata, "cached_content_token_count", 0
                     )

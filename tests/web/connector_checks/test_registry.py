@@ -7,6 +7,7 @@ import pytest
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_checks.declarations import (
     ConnectorChecks,
+    HasKeys,
     L3Envelope,
     ReadCheck,
     UnprobeableCheck,
@@ -65,6 +66,63 @@ def test_an_unknown_app_has_no_declaration() -> None:
     assert connector_checks_for("not-a-catalog-app") is None
 
 
+@pytest.mark.parametrize(
+    ("app_id", "check"),
+    [
+        (
+            "notion",
+            ReadCheck(
+                "notion.current_user",
+                "notion-get-self",
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("workspace", "user")),
+                    HasKeys(("user",), ("id",)),
+                ),
+                require_read_only_hint=True,
+            ),
+        ),
+        (
+            "miro",
+            ReadCheck(
+                "miro.current_user",
+                "user_who_am_i",
+                payload="structured_content",
+                assertions=(HasKeys((), ("user_id",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+        (
+            "atlassian",
+            ReadCheck(
+                "atlassian.current_user",
+                "atlassianUserInfo",
+                payload="json_text",
+                assertions=(HasKeys(("data",), ("accountId",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+    ],
+)
+def test_a_vendor_hosted_read_check_is_declared_exactly(
+    app_id: str, check: ReadCheck
+) -> None:
+    assert connector_checks_for(app_id) == ConnectorChecks(app_id, reads=(check,))
+
+
+def test_every_remote_mcp_read_check_requires_the_read_only_hint() -> None:
+    remote_app_ids = {
+        row["app_id"]
+        for row in get_builtin_public_mcp_app_rows()
+        if "url" in row["launch_config"]
+    }
+    assert {"notion", "miro", "atlassian"} <= remote_app_ids
+    for app_id in remote_app_ids & set(CONNECTOR_CHECKS):
+        for check in CONNECTOR_CHECKS[app_id].reads:
+            if isinstance(check, ReadCheck):
+                assert check.require_read_only_hint, (app_id, check.id)
+
+
 def test_every_builtin_catalog_app_has_a_valid_declaration() -> None:
     app_ids = sorted(row["app_id"] for row in get_builtin_public_mcp_app_rows())
 
@@ -77,6 +135,9 @@ def test_every_builtin_catalog_app_has_a_valid_declaration() -> None:
 
 
 def test_declared_v2_checks_are_valid_and_keyed_by_their_app() -> None:
+    app_ids = {row["app_id"] for row in get_builtin_public_mcp_app_rows()}
+
+    assert set(CONNECTOR_CHECKS) <= app_ids
     for app_id, checks in CONNECTOR_CHECKS.items():
         assert checks.app_id == app_id
         validate_connector_checks(checks)

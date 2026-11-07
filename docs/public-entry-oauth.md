@@ -76,8 +76,19 @@ It exports GET `/api/oauth/launch/{region}`; no adapter or disabled feature fail
 closed. `context` is called both when signing and redeeming. The handler checks
 signed product/environment/target origin/region, path and actual host, purpose,
 expiry, user/session epoch, and resource bindings before releasing browser proof.
-Tickets expire after 30 seconds and use distinct `oauth-launch:builtin:` and
-`oauth-launch:mcp:` consumption namespaces in the existing store. The legacy
+Tickets expire after 120 seconds and use distinct `oauth-launch:builtin:` and
+`oauth-launch:mcp:` consumption namespaces in the existing store.
+
+Redemption takes two GETs. The authorization entry has no session for a user
+signed in only on another entry, so a ticket is a bearer credential that is not
+bound to the initiating browser. The first GET validates everything, consumes
+nothing and renders a script-free, unframeable confirmation page naming the
+target account and provider/server, while setting a per-ticket
+`SameSite=Strict`, `HttpOnly` nonce cookie scoped to the launch path. Only the
+second GET (`?ticket=...&confirm=<nonce>`) with the matching cookie consumes the
+ticket and releases browser proof. A ticket URL received from someone else stops
+at a page naming *their* account (account-linking CSRF), and a cross-site
+navigation straight to the second step lacks the cookie. The legacy
 `oauth-launch:` namespace and old launch route are unchanged.
 
 For builtin consent retries, the hosting callback middleware must issue a new
@@ -124,14 +135,3 @@ Additional prerequisites:
 - Unconfigured deployments (`XAGENT_PUBLIC_ENTRIES_JSON` unset) keep the exact
   legacy frontend origin and Google error mapping; the strict origin validation
   applies only to explicit entries.
-
-## Known limitation: enablement blocker
-
-Regional bootstrap tickets are bearer credentials that are not bound to the
-initiating browser. The authorization entry has no session for a user signed in
-only on another entry, so whichever browser opens a valid ticket URL receives the
-OAuth state cookie. A user who opens a ticket URL minted by someone else would
-connect their provider account to the minting account (account-linking CSRF).
-Legacy MCP flows set the state cookie on the authenticated POST and are not
-affected. Keep `XAGENT_DUAL_ENTRY_OAUTH_ENABLED=false` until a browser binding
-(for example a confirmation interstitial or an opener handshake) is added.

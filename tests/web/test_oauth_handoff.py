@@ -1,4 +1,6 @@
+import html
 import json
+import re
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -95,19 +97,87 @@ def setup(tmp_path, monkeypatch):
     engine.dispose()
 
 
+def _confirm_href(page) -> str:
+    """The Continue link of the step-one confirmation page."""
+    return html.unescape(re.search(r'href="([^"]+)"', page.text)[1])
+
+
+def _confirmed_url(launch, page) -> str:
+    return launch["authorization_url"].split("?", 1)[0] + _confirm_href(page)
+
+
+def test_confirmation_page_names_account_and_consumes_nothing(setup):
+    client, _, launch, _ = setup
+    page = client.get(launch["authorization_url"], follow_redirects=False)
+    assert page.status_code == 200
+    assert "Connect Sample?" in page.text
+    assert "<strong>handoff</strong>" in page.text
+    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    assert page.headers["x-frame-options"] == "DENY"
+    assert page.headers["cache-control"] == "no-store"
+    assert page.headers["referrer-policy"] == "no-referrer"
+    cookie = page.headers["set-cookie"]
+    assert cookie.startswith("oauth_launch_confirm_")
+    assert "samesite=strict" in cookie.lower() and "httponly" in cookie.lower()
+    assert "Path=/api/oauth/launch/au" in cookie
+    assert "Secure" in cookie
+    assert "scoped-builtin" not in cookie
+    # Rendering again is harmless: the ticket was not consumed.
+    assert client.get(launch["authorization_url"]).status_code == 200
+
+
 def test_bootstrap_single_use_and_scoped_only(setup):
     client, _, launch, _ = setup
     client.cookies.set("selected_region", "sg")
-    response = client.get(launch["authorization_url"], follow_redirects=False)
+    page = client.get(launch["authorization_url"], follow_redirects=False)
+    response = client.get(_confirmed_url(launch, page), follow_redirects=False)
     assert response.status_code == 303
     assert "scoped-builtin" in response.headers["set-cookie"]
     assert "selected_region" not in response.headers["set-cookie"]
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["referrer-policy"] == "no-referrer"
     assert (
-        client.get(launch["authorization_url"], follow_redirects=False).status_code
+        client.get(_confirmed_url(launch, page), follow_redirects=False).status_code
         == 401
     )
+
+
+@pytest.mark.parametrize("variant", ["no-cookie", "wrong-nonce", "foreign-cookie"])
+def test_confirmation_requires_this_browsers_nonce(setup, variant):
+    """A link straight to step two (e.g. from someone else's ticket) is refused."""
+    client, _, launch, _ = setup
+    page = client.get(launch["authorization_url"], follow_redirects=False)
+    url = _confirmed_url(launch, page)
+    if variant == "no-cookie":
+        client.cookies.clear()
+    if variant == "wrong-nonce":
+        url = url.rsplit("confirm=", 1)[0] + "confirm=forged"
+    if variant == "foreign-cookie":
+        name = page.headers["set-cookie"].split("=", 1)[0]
+        client.cookies.clear()
+        client.cookies.set(name, "attacker-nonce", path="/api/oauth/launch/au")
+    response = client.get(url, follow_redirects=False)
+    assert response.status_code == 401
+    assert "set-cookie" not in response.headers
+    # The refusal did not consume the ticket: the real browser can still finish.
+    page = client.get(launch["authorization_url"], follow_redirects=False)
+    finished = client.get(_confirmed_url(launch, page), follow_redirects=False)
+    assert finished.status_code == 303
+
+
+def test_consume_storage_failure_is_unavailable(setup, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    from xagent.web.services import oauth_launch
+
+    def unavailable(*args, **kwargs):
+        raise OperationalError("consume", {}, Exception("down"))
+
+    client, _, launch, _ = setup
+    page = client.get(launch["authorization_url"], follow_redirects=False)
+    monkeypatch.setattr(oauth_launch, "consume_oauth_launch_ticket", unavailable)
+    response = client.get(_confirmed_url(launch, page), follow_redirects=False)
+    assert response.status_code == 503
 
 
 @pytest.mark.parametrize(
@@ -121,6 +191,8 @@ def test_bootstrap_single_use_and_scoped_only(setup):
         ("type", "oauth_launch"),
         ("session_epoch", "old"),
         ("exp", 1),
+        ("user_id", 2**31),
+        ("jti", None),
         ("return_origin", "https://evil.test"),
     ],
 )

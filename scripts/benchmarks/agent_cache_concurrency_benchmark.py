@@ -26,6 +26,8 @@ from xagent.core.agent import PatternRuntime, ReActPattern
 from xagent.core.agent.runner import _session_routing_key
 from xagent.core.model.chat.routing_context import xinference_routing_key
 
+ADMISSION_POLICIES = ("foreground-first", "fifo")
+
 
 def utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -34,11 +36,11 @@ def utc() -> str:
 class AdmissionGate:
     """Shared request limit; drain in-flight work before a thermal cooldown.
 
-    All agents and foreground calls share this client-side gate. Waiting
-    foreground requests take the next free slot without interrupting work.
-    Only intervals with zero in-flight requests count
-    as cooling idle time; per-request admission waits must never be summed and
-    subtracted from concurrent batch wall time.
+    All agents and foreground calls share this client-side gate. With the
+    default foreground-first policy, waiting foreground requests take the next
+    free slot without interrupting work. Only intervals with zero in-flight
+    requests count as cooling idle time. Per-request admission waits must
+    never be summed and subtracted from concurrent batch wall time.
     """
 
     def __init__(
@@ -50,6 +52,8 @@ class AdmissionGate:
         resume: float = 60,
         admission_policy: str = "foreground-first",
     ):
+        if admission_policy not in ADMISSION_POLICIES:
+            raise ValueError(f"Unknown admission policy: {admission_policy!r}")
         self.limit = limit
         self.telemetry = telemetry
         self.trigger = trigger
@@ -539,7 +543,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--max-inflight", type=int, default=2)
     value.add_argument(
         "--admission-policy",
-        choices=["foreground-first", "fifo"],
+        choices=ADMISSION_POLICIES,
         default="foreground-first",
         help="Client queue order. Use fifo as the comparison baseline.",
     )

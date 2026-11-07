@@ -207,7 +207,11 @@ class TraceEventCallback:
             execution_id,
             error_type="agent_error",
             error_message=str(result.get("error") or "agent execution failed"),
-            data={**data, "context": self._context_payload(context)},
+            data=(
+                data
+                if result.get("_output_guardrail_applied")
+                else {**data, "context": self._context_payload(context)}
+            ),
         )
 
     def _final_answer_stream_message_id(

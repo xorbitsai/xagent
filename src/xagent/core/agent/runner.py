@@ -24,6 +24,12 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
+from ..guardrails.output import (
+    BLOCKED_OUTPUT,
+    ProtectedInteractionError,
+    bind_output_guardrail,
+    resolve_output_guardrail,
+)
 from ..inline_file_delivery import InlineFileDelivery
 from ..model.chat.exceptions import ModelProviderError
 from ..model.chat.routing_context import xinference_routing_key
@@ -72,6 +78,7 @@ from .interruption import (
 )
 from .language import reset_output_language_to_request_context
 from .result import (
+    FINAL_ANSWER_KEYS,
     extract_assistant_message,
     normalize_tool_failure_code,
     set_assistant_message,
@@ -505,6 +512,9 @@ class AgentRunner:
                     else self.outbound_message_handler
                 ),
             )
+            reviewer = await resolve_output_guardrail(execution_id)
+            if reviewer is not None:
+                runtime.output_guardrail = reviewer
             if self.workspace_enabled and runtime.context_ref_resolver is None:
                 if workspace is None:
                     workspace_base = base_dir or self.workspace_base_dir
@@ -631,16 +641,21 @@ class AgentRunner:
                     )
                     teardown_status = "failed"
                     try:
-                        result = await pattern.run(
-                            **self._build_pattern_kwargs(
-                                pattern=pattern,
-                                task=task or "",
-                                context=context,
-                                tools=tools,
-                                runtime=runtime,
-                                streaming_handler=streaming_handler,
+                        with bind_output_guardrail(runtime.output_guardrail):
+                            result = await pattern.run(
+                                **self._build_pattern_kwargs(
+                                    pattern=pattern,
+                                    task=task or "",
+                                    context=context,
+                                    tools=tools,
+                                    runtime=runtime,
+                                    streaming_handler=(
+                                        streaming_handler
+                                        if runtime.output_guardrail is None
+                                        else None
+                                    ),
+                                )
                             )
-                        )
                     except ExecutionInterrupted as exc:
                         if runtime.budget_stopped:
                             teardown_status = "completed"
@@ -688,6 +703,16 @@ class AgentRunner:
                                     "a checkpoint durability abort"
                                 )
                         raise
+                    except ProtectedInteractionError as exc:
+                        teardown_status = "failed"
+                        result = {
+                            "success": False,
+                            "error": str(exc),
+                            "execution_id": execution_id,
+                            "context": context,
+                        }
+                        await self._finish_run(context, result, runtime=runtime)
+                        return result
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"
                         logger.exception(
@@ -723,14 +748,41 @@ class AgentRunner:
                         if isinstance(result, dict)
                         else result
                     )
+                    if (
+                        runtime.output_guardrail is not None
+                        and isinstance(result, dict)
+                        and result.get("status") == "waiting_for_user"
+                    ):
+                        # Questions have their own check, which also covers options.
+                        raw_answer = None
+                    elif runtime.output_guardrail is not None:
+                        if isinstance(result, dict):
+                            result = dict(result)
+                            if raw_answer is None and result.get("output") is not None:
+                                raw_answer = json.dumps(
+                                    result["output"], ensure_ascii=False, default=str
+                                )
+                        elif raw_answer is not None and not isinstance(raw_answer, str):
+                            raw_answer = json.dumps(
+                                raw_answer, ensure_ascii=False, default=str
+                            )
                     if isinstance(raw_answer, str):
                         delivered_answer = await runtime.prepare_final_answer(
                             raw_answer
                         )
+                        if runtime.output_guardrail is not None and isinstance(
+                            result, dict
+                        ):
+                            # A different alias is not a second approved answer.
+                            for key in FINAL_ANSWER_KEYS:
+                                if key in result:
+                                    result[key] = delivered_answer
+                            result["output"] = delivered_answer
                         if delivered_answer != raw_answer:
                             if isinstance(result, dict):
-                                result = dict(result)
-                                set_assistant_message(result, delivered_answer)
+                                if runtime.output_guardrail is None:
+                                    result = dict(result)
+                                    set_assistant_message(result, delivered_answer)
                             else:
                                 result = {"success": True, "output": delivered_answer}
                             for index in range(len(context.messages) - 1, -1, -1):
@@ -859,7 +911,7 @@ class AgentRunner:
             # With no run left the checkpoint is authoritative again; another
             # process may extend it before this one sees the next input.
             self._release_idle_context(execution_id, context)
-            runtime.discard_inline_file_streams()
+            runtime.discard_final_answer_streams()
             self._active_controls.pop(execution_id, None)
             exit_goal(goal_token)
             if usage_token is not None:
@@ -918,6 +970,7 @@ class AgentRunner:
                 if chinese
                 else "\n\nExisting files (not a claim of validation):\n"
             ) + "\n".join(links)
+        answer = await runtime.prepare_final_answer(answer)
         context.add_assistant_message(answer)
         result = {
             "success": True,
@@ -2214,6 +2267,27 @@ class AgentRunner:
         *,
         runtime: PatternRuntime,
     ) -> None:
+        if runtime.output_guardrail is not None:
+            if result.get(
+                "status"
+            ) == "waiting_for_user" and not await runtime.approve_waiting_result(
+                result
+            ):
+                result.clear()
+                result.update(
+                    success=False,
+                    status="failed",
+                    error=BLOCKED_OUTPUT,
+                    execution_id=context.execution_id,
+                    context=context,
+                )
+            result["_output_guardrail_applied"] = True
+            if not result.get("success") and result.get("status") != "waiting_for_user":
+                error = result.get("error")
+                if error != BLOCKED_OUTPUT:
+                    result["error"] = "The agent could not complete this request."
+                result.pop("diagnostic_error", None)
+                result.pop("model_error", None)
         # Drain an in-flight injection before publishing a terminal result.
         # Once closed, late live input takes the existing deferred-post path;
         # callbacks and tool teardown must not reopen this acceptance window.

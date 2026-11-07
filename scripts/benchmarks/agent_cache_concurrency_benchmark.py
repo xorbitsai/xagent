@@ -34,8 +34,9 @@ def utc() -> str:
 class AdmissionGate:
     """Shared request limit; drain in-flight work before a thermal cooldown.
 
-    All agents and foreground calls share this gate. Its queue is client-side,
-    not an engine scheduler. Only intervals with zero in-flight requests count
+    All agents and foreground calls share this client-side gate. Waiting
+    foreground requests take the next free slot without interrupting work.
+    Only intervals with zero in-flight requests count
     as cooling idle time; per-request admission waits must never be summed and
     subtracted from concurrent batch wall time.
     """
@@ -47,6 +48,7 @@ class AdmissionGate:
         *,
         trigger: float = 70,
         resume: float = 60,
+        admission_policy: str = "foreground-first",
     ):
         self.limit = limit
         self.telemetry = telemetry
@@ -55,6 +57,8 @@ class AdmissionGate:
         self.active = 0
         self.condition = asyncio.Condition()
         self.waiters: deque[object] = deque()
+        self.foreground_waiters: deque[object] = deque()
+        self.admission_policy = admission_policy
         self.cooling = False
         self.idle_started: float | None = None
         self.cooling_intervals: list[dict[str, Any]] = []
@@ -108,22 +112,29 @@ class AdmissionGate:
             self.idle_started = None
 
     @asynccontextmanager
-    async def slot(self):
+    async def slot(self, *, foreground: bool = False):
         requested = time.perf_counter()
         ticket = object()
+        queue = (
+            self.foreground_waiters
+            if foreground and self.admission_policy == "foreground-first"
+            else self.waiters
+        )
         async with self.condition:
-            self.waiters.append(ticket)
+            queue.append(ticket)
             try:
-                while self.waiters[0] is not ticket or not self.can_enter():
+                while (self.foreground_waiters or self.waiters)[
+                    0
+                ] is not ticket or not self.can_enter():
                     try:
                         await asyncio.wait_for(self.condition.wait(), timeout=0.5)
                     except asyncio.TimeoutError:
                         pass
-                self.waiters.popleft()
+                queue.popleft()
                 self.active += 1
                 self.condition.notify_all()
             except BaseException:
-                self.waiters.remove(ticket)
+                queue.remove(ticket)
                 self.condition.notify_all()
                 raise
         try:
@@ -137,10 +148,13 @@ class AdmissionGate:
 
 
 class ConcurrentLLM(audit.BenchmarkLLM):
-    def __init__(self, *, gate: AdmissionGate, hints: bool, **kwargs: Any):
+    def __init__(
+        self, *, gate: AdmissionGate, hints: bool, foreground: bool, **kwargs: Any
+    ):
         super().__init__(**kwargs)
         self.gate = gate
         self.hints = hints
+        self.foreground = foreground
         self.protocol: dict[str, bool] = {}
         self.admission: dict[str, float] = {}
         self.control: list[dict[str, Any]] = []
@@ -173,13 +187,13 @@ class ConcurrentLLM(audit.BenchmarkLLM):
         super().record(row)
 
     async def stream_chat(self, **kwargs: Any):
-        async with self.gate.slot() as admission:
+        async with self.gate.slot(foreground=self.foreground) as admission:
             self.admission = admission
             async for chunk in super().stream_chat(**kwargs):
                 yield chunk
 
     async def chat(self, **kwargs: Any):
-        async with self.gate.slot() as admission:
+        async with self.gate.slot(foreground=self.foreground) as admission:
             self.admission = admission
             return await super().chat(**kwargs)
 
@@ -204,12 +218,18 @@ class WaitingAuditTool(audit.AuditTool):
 
 
 def model(
-    args: argparse.Namespace, output: Path, gate: AdmissionGate, *, hints: bool
+    args: argparse.Namespace,
+    output: Path,
+    gate: AdmissionGate,
+    *,
+    hints: bool,
+    foreground: bool = False,
 ) -> ConcurrentLLM:
     return ConcurrentLLM(
         output=output,
         gate=gate,
         hints=hints,
+        foreground=foreground,
         context_window=args.context_window,
         model_name=args.model,
         model_uid=args.model,
@@ -344,7 +364,7 @@ async def run_probe(
     await asyncio.sleep(max(0, scheduled - time.perf_counter()))
     output = args.output / f"foreground-{index:02d}"
     output.mkdir()
-    llm = model(args, output, gate, hints=False)
+    llm = model(args, output, gate, hints=False, foreground=True)
     text = (
         f"Independent request {scope}-{index}.\n"
         + "Inventory and delivery records are complete. " * args.probe_tokens
@@ -433,6 +453,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         args.gpu_telemetry_json,
         trigger=args.cooldown_trigger,
         resume=args.cooldown_resume,
+        admission_policy=args.admission_policy,
     )
     source = audit.source_manifest()
     source["source_sha256"][
@@ -483,6 +504,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 "context_tokens",
                 "context_window",
                 "max_inflight",
+                "admission_policy",
                 "tool_delays",
                 "probes",
                 "probe_tokens",
@@ -515,6 +537,12 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--context-tokens", type=int, default=65536)
     value.add_argument("--context-window", type=int, default=131072)
     value.add_argument("--max-inflight", type=int, default=2)
+    value.add_argument(
+        "--admission-policy",
+        choices=["foreground-first", "fifo"],
+        default="foreground-first",
+        help="Client queue order. Use fifo as the comparison baseline.",
+    )
     value.add_argument("--tool-delays", type=float, nargs="+", default=[2, 20])
     value.add_argument("--probes", type=int, default=8)
     value.add_argument("--probe-tokens", type=int, default=8192)

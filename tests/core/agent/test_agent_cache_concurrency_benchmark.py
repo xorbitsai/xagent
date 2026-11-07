@@ -63,6 +63,37 @@ async def test_admission_cancellation_does_not_leak_capacity():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,order",
+    [
+        ("foreground-first", ["probe-1", "probe-2", "agent"]),
+        ("fifo", ["agent", "probe-1", "probe-2"]),
+    ],
+)
+async def test_admission_orders_waiters_without_interrupting_active_work(policy, order):
+    gate = bench.AdmissionGate(1, admission_policy=policy)
+    admitted = []
+
+    async def enter(name, foreground):
+        async with gate.slot(foreground=foreground):
+            admitted.append(name)
+
+    async with gate.slot():
+        tasks = [
+            asyncio.create_task(enter(name, foreground))
+            for name, foreground in (
+                ("agent", False),
+                ("probe-1", True),
+                ("probe-2", True),
+            )
+        ]
+        await asyncio.sleep(0)
+        assert admitted == []
+    await asyncio.wait_for(asyncio.gather(*tasks), 1)
+    assert admitted == order
+
+
+@pytest.mark.asyncio
 async def test_cancelled_terminal_update_keeps_retry_acknowledgement_reportable(
     tmp_path, monkeypatch
 ):

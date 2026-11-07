@@ -161,7 +161,10 @@ protocol check if the deployed adapter does not send the expected metadata or
 acknowledge waiting/finished transitions. First agent and foreground calls must
 report zero cached tokens. Foreground responses must contain `OK`.
 
-All calls share a FIFO client admission queue with `--max-inflight` slots. Set
+All calls share `--max-inflight` client slots. By default, a waiting foreground
+request takes the next free slot. Running requests keep their slots and calls
+within each class run in arrival order. Use `--admission-policy fifo` to repeat
+the workload with a single FIFO queue. Set the slot count
 this deliberately, for example two slots for two replicas each configured with
 one active engine sequence. This measures multiple agent sessions with bounded
 inference concurrency, not unrestricted engine admission. Every call records

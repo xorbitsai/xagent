@@ -93,6 +93,10 @@ from ..services.connector_name_policy import (
     folds_to_catalog_app_name,
     has_folded_connector_name_conflict,
 )
+from ..services.connector_team_scope import (
+    TeamMemberOAuthScope,
+    team_member_oauth_scope,
+)
 from ..services.google_picker import get_google_picker_config
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -102,6 +106,7 @@ from ..services.mcp_oauth import (
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
     SafeOAuthAsyncHTTPTransport,
+    _canonical_resource,
     _same_url,
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
@@ -967,6 +972,76 @@ def _get_user_mcp_server_or_404(
     return cast(tuple[UserMCPServer, MCPServer], result)
 
 
+@dataclass(frozen=True)
+class _MCPOAuthRouteAccess:
+    server: MCPServer
+    # None means the caller reaches the server only through the team overlay.
+    association: UserMCPServer | None
+    # Set only when association is None.
+    scope: TeamMemberOAuthScope | None = None
+
+
+def _mcp_oauth_route_access_or_404(
+    db: Session,
+    *,
+    user_id: int,
+    server_id: int,
+    require_active: bool,
+    require_member_oauth: bool,
+) -> _MCPOAuthRouteAccess:
+    """Decide how ``user_id`` reaches ``server_id`` on the OAuth routes.
+
+    A caller with an association row always takes the association path, active
+    or not. Otherwise the caller needs the team overlay to show them the server
+    and, when ``require_member_oauth`` is set, the embedder to have opened it to
+    member authorization. Unknown and invisible servers are indistinguishable.
+    """
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .first()
+    )
+    server = db.get(MCPServer, server_id)
+    if association is not None:
+        if (require_active and not association.is_active) or server is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+            )
+        return _MCPOAuthRouteAccess(server=server, association=association)
+    if server is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+        )
+    try:
+        scope = team_member_oauth_scope(db, user_id)
+    except Exception:
+        logger.warning(
+            "Connector team scope is unavailable: user_id=%s server_id=%s",
+            user_id,
+            server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Connector team scope is unavailable.",
+        )
+    if server_id not in scope.visible_mcp_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+        )
+    if require_member_oauth and server_id not in scope.member_oauth_mcp_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "member_authorization_not_enabled",
+                "message": "This connector is not open to member authorization",
+            },
+        )
+    return _MCPOAuthRouteAccess(server=server, association=None, scope=scope)
+
+
 def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
     config = server.to_config_dict()
     auth_config = config.get("auth")
@@ -1207,6 +1282,29 @@ def _mcp_oauth_flow_identity(flow_state: MCPOAuthFlowState) -> _MCPOAuthFlowIden
     )
 
 
+@dataclass(frozen=True)
+class _MCPOAuthTeamFlowIdentity:
+    id: int
+    state: str
+    server_id: int
+    user_id: int
+    client_id: int
+
+
+def _mcp_oauth_team_flow_identity(
+    flow_state: MCPOAuthFlowState,
+) -> _MCPOAuthTeamFlowIdentity:
+    if flow_state.association_lifecycle_generation is not None:
+        raise RuntimeError("MCP OAuth team-member flow carries a lifecycle generation")
+    return _MCPOAuthTeamFlowIdentity(
+        id=int(flow_state.id),
+        state=str(flow_state.state),
+        server_id=int(flow_state.mcp_server_id),
+        user_id=int(flow_state.user_id),
+        client_id=int(flow_state.mcp_oauth_client_id),
+    )
+
+
 def _lock_active_mcp_oauth_lifecycle(
     db: Session,
     *,
@@ -1264,6 +1362,110 @@ def _lock_active_mcp_oauth_lifecycle(
         if flow_state is None:
             return None
     return server, association, flow_state
+
+
+def _lock_team_member_mcp_oauth_lifecycle(
+    db: Session,
+    *,
+    flow_identity: _MCPOAuthTeamFlowIdentity,
+    resource: str,
+) -> tuple[MCPServer, MCPOAuthFlowState] | None:
+    """Lock server, user, then the exact team-member flow after provider I/O.
+
+    ``resource`` is the protected resource the flow was started for. Returns
+    None when the caller no longer reaches the server this way. A failing team
+    scope hook is not caught here.
+    """
+    if db.get_bind().dialect.name == "sqlite":
+        _begin_sqlite_oauth_persistence(db)
+    db.expire_all()
+
+    server = (
+        db.query(MCPServer)
+        .filter(MCPServer.id == flow_identity.server_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if server is None:
+        return None
+    if _canonical_resource(str(server.url)) != _canonical_resource(resource):
+        return None
+    user = (
+        db.query(User)
+        .filter(User.id == flow_identity.user_id)
+        .with_for_update(read=True)
+        .one_or_none()
+    )
+    if user is None:
+        return None
+    if (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.user_id == flow_identity.user_id,
+            UserMCPServer.mcpserver_id == flow_identity.server_id,
+        )
+        .first()
+        is not None
+    ):
+        return None
+    flow_state = (
+        db.query(MCPOAuthFlowState)
+        .filter(
+            MCPOAuthFlowState.id == flow_identity.id,
+            MCPOAuthFlowState.state == flow_identity.state,
+            MCPOAuthFlowState.mcp_server_id == flow_identity.server_id,
+            MCPOAuthFlowState.user_id == flow_identity.user_id,
+            MCPOAuthFlowState.mcp_oauth_client_id == flow_identity.client_id,
+            MCPOAuthFlowState.access_path == "team_member",
+            MCPOAuthFlowState.association_lifecycle_generation.is_(None),
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if flow_state is None:
+        return None
+    scope = team_member_oauth_scope(db, flow_identity.user_id, caller_holds_lock=True)
+    if flow_identity.server_id not in scope.member_oauth_mcp_ids:
+        return None
+    return server, flow_state
+
+
+def _store_team_member_mcp_oauth_grant(
+    db: Session,
+    *,
+    flow_identity: _MCPOAuthTeamFlowIdentity,
+    resource: str,
+    token_data: dict[str, Any],
+) -> bool:
+    """Lock, write the grant and commit; False when access no longer holds.
+
+    Locking and committing happen in this one synchronous call, so a worker
+    thread never hands an open transaction back to the event loop. Row locks
+    held across that hand-back would stall every request that waits for the
+    same row on the event loop thread, and with it the whole process. Any
+    failure rolls back before it propagates; a False result has rolled back
+    too.
+    """
+    try:
+        locked = _lock_team_member_mcp_oauth_lifecycle(
+            db, flow_identity=flow_identity, resource=resource
+        )
+        if locked is None:
+            db.rollback()
+            return False
+        server, flow_state = locked
+        _upsert_mcp_oauth_grant(
+            db,
+            flow_state=flow_state,
+            token_data=token_data,
+            required_scope=_explicit_mcp_oauth_required_scope(server),
+            selected_scope=_mcp_oauth_selected_scope(server),
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _lock_caller_oauth_lifecycle(
@@ -1411,6 +1613,121 @@ def _persist_mcp_oauth_connect_flow(
         raise
 
 
+def _persist_team_member_mcp_oauth_connect_flow(
+    db: Session,
+    *,
+    server_id: int,
+    user_id: int,
+    prepared: "_PreparedMCPOAuthConnect",
+    binding_at_discovery: tuple[Any, ...],
+    redirect_after: str | None,
+) -> tuple[str, str, str] | None:
+    """Persist a client and a team-member flow, or return None when access moved.
+
+    The lock order is the server row, then the user row. The definition
+    binding is compared once the server row is locked; the caller's own
+    association and the team scope are checked once both locks are held.
+    """
+    # Commit independent maintenance before taking lifecycle row locks.
+    _sweep_expired_mcp_oauth_flow_states(db)
+    if db.get_bind().dialect.name == "sqlite":
+        _begin_sqlite_oauth_persistence(db)
+    db.expire_all()
+
+    try:
+        server = (
+            db.query(MCPServer)
+            .filter(MCPServer.id == server_id)
+            .with_for_update()
+            .first()
+        )
+        if server is None:
+            db.rollback()
+            return None
+        binding_changed = _member_grant_binding(server) != binding_at_discovery
+        # The binding comparison already includes the URL, so this comparison
+        # cannot differ on its own; it is kept as an explicit guard that the
+        # design requires.
+        resource_changed = _canonical_resource(str(server.url)) != _canonical_resource(
+            prepared.selected_resource
+        )
+        if binding_changed or resource_changed:
+            db.rollback()
+            return None
+        user = (
+            db.query(User)
+            .filter(User.id == user_id)
+            .with_for_update(read=True)
+            .one_or_none()
+        )
+        if user is None:
+            db.rollback()
+            return None
+        if (
+            db.query(UserMCPServer.id)
+            .filter(
+                UserMCPServer.user_id == user_id,
+                UserMCPServer.mcpserver_id == server_id,
+            )
+            .first()
+            is not None
+        ):
+            db.rollback()
+            return None
+        try:
+            scope = team_member_oauth_scope(db, user_id, caller_holds_lock=True)
+        except Exception:
+            # The hook gate has already restored the session.
+            logger.warning(
+                "Connector team scope is unavailable: user_id=%s server_id=%s",
+                user_id,
+                server_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Connector team scope is unavailable.",
+            )
+        if server_id not in scope.member_oauth_mcp_ids:
+            db.rollback()
+            return None
+
+        oauth_client = _upsert_mcp_oauth_client(
+            db,
+            server_id=server_id,
+            discovery=prepared.discovered.discovery,
+            client_id=prepared.client_id,
+            client_secret=prepared.client_secret,
+            token_endpoint_auth_method=prepared.token_endpoint_auth_method,
+            redirect_uri=prepared.discovered.redirect_uri,
+            registration_lookup_hash=prepared.registration_lookup_hash,
+        )
+        state_value = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(64)
+        db.add(
+            MCPOAuthFlowState(
+                state=state_value,
+                mcp_server_id=server_id,
+                user_id=user_id,
+                access_path="team_member",
+                association_lifecycle_generation=None,
+                mcp_oauth_client_id=oauth_client.id,
+                resource_owner_key=_default_resource_owner_key(user_id),
+                issuer=prepared.discovered.selected_issuer,
+                resource=prepared.selected_resource,
+                scope=prepared.selected_scope,
+                code_verifier=encrypt_value(code_verifier),
+                redirect_after=_safe_mcp_oauth_redirect_after(redirect_after),
+                expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
+            )
+        )
+        persisted_client_id = str(oauth_client.client_id)
+        db.commit()
+        return persisted_client_id, state_value, code_verifier
+    except Exception:
+        db.rollback()
+        raise
+
+
 def _mcp_oauth_grant_response(grant: MCPOAuthGrant) -> MCPOAuthGrantResponse:
     return MCPOAuthGrantResponse(
         id=cast(int, grant.id),
@@ -1491,6 +1808,43 @@ def _mcp_oauth_flow_state_error(
             "invalid_state",
             "OAuth state is no longer associated with MCP server access",
         )
+    return None
+
+
+def _mcp_oauth_team_flow_state_error(
+    db: Session, flow_state: MCPOAuthFlowState
+) -> tuple[str, str] | None:
+    if flow_state.consumed_at is not None:
+        return "state_already_consumed", "OAuth state consumed"
+    if _as_aware_utc(flow_state.expires_at) <= _utc_now():
+        return "expired_state", "OAuth state expired"
+    user_id = int(flow_state.user_id)
+    server_id = int(flow_state.mcp_server_id)
+    access_lost = (
+        "invalid_state",
+        "OAuth state is no longer associated with MCP server access",
+    )
+    if (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .first()
+        is not None
+    ):
+        return access_lost
+    try:
+        scope = team_member_oauth_scope(db, user_id)
+    except Exception:
+        logger.warning(
+            "Connector team scope is unavailable: user_id=%s server_id=%s",
+            user_id,
+            server_id,
+        )
+        return "invalid_state", "Team connector access could not be checked"
+    if server_id not in scope.member_oauth_mcp_ids:
+        return access_lost
     return None
 
 
@@ -3253,9 +3607,10 @@ def _local_mcp_consent_association_ok(
 
     The endpoint calls ``_get_user_mcp_server_or_404(..., require_active=True)``
     on the mcp_oauth shape, so all three terms are the endpoint's own
-    preconditions. Deliberately *not* the visibility rule above: a team-owned
-    row (``user_mcp is None``) is visible and attachable, yet has no personal
-    association for that route to resolve, so consent there would 404.
+    preconditions for a caller holding an association. Deliberately *not* the
+    visibility rule above: the route also admits a member of a team that can
+    see and has opened the connector (``user_mcp is None``), but this field
+    stays True only for a caller holding an active association row.
 
     Shared by ``can_authorize`` and the ``auth_type`` hint below, which is the
     same condition plus, respectively, the resolver term and nothing -- they
@@ -3657,10 +4012,10 @@ def list_mcp_apps(
             # Configure button away from the custom edit form. Inactive
             # associations are excluded because the per-server OAuth endpoints
             # require an active one — a deactivated server needs re-enabling,
-            # not re-authorization. A team-owned server (user_mcp is None) is
-            # excluded for the same reason, more strongly: the member holds no
-            # association at all, so /{server_id}/oauth/connect would 404 and
-            # the advertised flow would dead-end in a failed popup.
+            # not re-authorization. The connect route also admits a member of a
+            # team that can see and has opened the connector, but this field
+            # is still returned only to a caller holding an active association
+            # row (user_mcp is not None).
             #
             # can_authorize above repeats those last two exclusions on purpose:
             # this field still answers "which Connect flow does the settings
@@ -6537,7 +6892,12 @@ async def mcp_oauth_callback(
                 or "OAuth callback state did not match this browser session"
             ),
         )
-    state_error = _mcp_oauth_flow_state_error(db, flow_state)
+    team_member_flow = flow_state.access_path == "team_member"
+    state_error = (
+        await asyncio.to_thread(_mcp_oauth_team_flow_state_error, db, flow_state)
+        if team_member_flow
+        else _mcp_oauth_flow_state_error(db, flow_state)
+    )
     if state_error is not None:
         error_code, message = state_error
         return _mcp_oauth_callback_error_redirect_for_path(
@@ -6558,19 +6918,18 @@ async def mcp_oauth_callback(
             message="OAuth client metadata not found",
         )
 
+    flow_identity: _MCPOAuthFlowIdentity | _MCPOAuthTeamFlowIdentity
     try:
-        flow_identity = _mcp_oauth_flow_identity(flow_state)
+        if team_member_flow:
+            flow_identity = _mcp_oauth_team_flow_identity(flow_state)
+        else:
+            flow_identity = _mcp_oauth_flow_identity(flow_state)
     except RuntimeError:
         return _mcp_oauth_callback_error_redirect_for_path(
             callback_redirect_after,
             error_code="invalid_state",
             message="OAuth state is not bound to an MCP server connection lifecycle",
         )
-    association_identity = _MCPOAuthAssociationIdentity(
-        server_id=flow_identity.server_id,
-        user_id=flow_identity.user_id,
-        lifecycle_generation=flow_identity.association_lifecycle_generation,
-    )
 
     try:
         _validate_mcp_oauth_callback_issuer(
@@ -6646,31 +7005,53 @@ async def mcp_oauth_callback(
             token_data=token_data,
         )
         failure_stage = "lock_lifecycle"
-        lifecycle = _lock_active_mcp_oauth_lifecycle(
-            db,
-            association_identity=association_identity,
-            flow_identity=flow_identity,
-        )
-        if lifecycle is None:
-            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
-            return _mcp_oauth_callback_error_redirect_for_path(
-                callback_redirect_after,
-                error_code="invalid_state",
-                message="MCP server connection changed during OAuth authorization",
+        if isinstance(flow_identity, _MCPOAuthTeamFlowIdentity):
+            # Lock, write and commit all happen inside the one worker call.
+            failure_stage = "store_team_member_grant"
+            stored = await asyncio.to_thread(
+                _store_team_member_mcp_oauth_grant,
+                db,
+                flow_identity=flow_identity,
+                resource=resource,
+                token_data=token_data,
             )
-        locked_flow_state = lifecycle[2]
-        if locked_flow_state is None:
-            raise RuntimeError("MCP OAuth lifecycle lock did not return the flow")
-        failure_stage = "persist_grant"
-        _upsert_mcp_oauth_grant(
-            db,
-            flow_state=locked_flow_state,
-            token_data=token_data,
-            required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
-            selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
-        )
-        failure_stage = "commit_grant"
-        db.commit()
+            if not stored:
+                await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+                return _mcp_oauth_callback_error_redirect_for_path(
+                    callback_redirect_after,
+                    error_code="invalid_state",
+                    message="MCP server connection changed during OAuth authorization",
+                )
+        else:
+            lifecycle = _lock_active_mcp_oauth_lifecycle(
+                db,
+                association_identity=_MCPOAuthAssociationIdentity(
+                    server_id=flow_identity.server_id,
+                    user_id=flow_identity.user_id,
+                    lifecycle_generation=flow_identity.association_lifecycle_generation,
+                ),
+                flow_identity=flow_identity,
+            )
+            if lifecycle is None:
+                await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+                return _mcp_oauth_callback_error_redirect_for_path(
+                    callback_redirect_after,
+                    error_code="invalid_state",
+                    message="MCP server connection changed during OAuth authorization",
+                )
+            locked_flow_state = lifecycle[2]
+            if locked_flow_state is None:
+                raise RuntimeError("MCP OAuth lifecycle lock did not return the flow")
+            failure_stage = "persist_grant"
+            _upsert_mcp_oauth_grant(
+                db,
+                flow_state=locked_flow_state,
+                token_data=token_data,
+                required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
+                selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
+            )
+            failure_stage = "commit_grant"
+            db.commit()
     except HTTPException as exc:
         if issued_token is not None:
             await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
@@ -6756,15 +7137,32 @@ async def connect_mcp_oauth(
             update={"redirect_after": "/auth/mcp-complete"}
         )
 
-    return await _connect_mcp_oauth_for_owner(
-        server_id,
-        request_data,
-        current_user,
+    user_id = cast(int, current_user.id)
+    # The team scope hook is synchronous application code: keep it off the
+    # event loop thread.
+    access = await asyncio.to_thread(
+        _mcp_oauth_route_access_or_404,
         db,
-        resource_owner_key=_default_resource_owner_key(cast(int, current_user.id)),
-        accept=accept,
-        persistence=_OAuthPersistence.COMMIT,
-        regional_request=regional_request,
+        user_id=user_id,
+        server_id=server_id,
+        require_active=True,
+        require_member_oauth=True,
+    )
+    if access.association is not None:
+        return await _connect_mcp_oauth_for_owner(
+            server_id,
+            request_data,
+            current_user,
+            db,
+            resource_owner_key=_default_resource_owner_key(user_id),
+            accept=accept,
+            persistence=_OAuthPersistence.COMMIT,
+            regional_request=regional_request,
+        )
+    # The member path does not take part in the regional OAuth hand-off; it
+    # returns the plain authorization URL.
+    return await _connect_team_member_mcp_oauth(
+        access.server, request_data, current_user, db, accept=accept
     )
 
 
@@ -6948,6 +7346,89 @@ def _mcp_oauth_connect_response(
     )
     _set_mcp_oauth_state_cookie(redirect_response, state_value)
     return redirect_response
+
+
+async def _connect_team_member_mcp_oauth(
+    server: MCPServer,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User,
+    db: Session,
+    *,
+    accept: str | None,
+) -> RedirectResponse | JSONResponse:
+    """Start OAuth for a team member who holds no association row.
+
+    The authorization code goes to the redirect URI, and the token later goes to
+    the connector URL, both of which the connector's owner controls. So the
+    redirect URI must be this deployment's own callback, and the protected
+    resource must equal the connector URL, both checked before the first
+    registration request.
+    """
+    user_id = cast(int, current_user.id)
+    server_id = cast(int, server.id)
+    auth_config = _get_mcp_oauth_config(server)
+    configured_redirect_uri = (
+        _configured_mcp_oauth_value(None, auth_config, "redirect_uri")
+        or _default_mcp_oauth_redirect_uri()
+    )
+    if configured_redirect_uri != _default_mcp_oauth_redirect_uri():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "redirect_uri_not_allowed",
+                "message": (
+                    "Member authorization requires the connector to use this "
+                    "deployment's OAuth callback"
+                ),
+            },
+        )
+    discovered = await _discover_mcp_oauth_connect(server)
+    # Taken before the client step: that step may roll the session back, after
+    # which ``server`` would reload whatever the row holds by then.
+    binding_at_discovery = _member_grant_binding(server)
+    if _canonical_resource(str(discovered.discovery.resource)) != _canonical_resource(
+        str(server.url)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "resource_mismatch",
+                "message": (
+                    "MCP OAuth protected resource does not match the connector URL"
+                ),
+            },
+        )
+    # Unlike the owner path, no owner key is passed in to bound here: the
+    # persist step always writes this user's default key, ``xagent:user:{id}``,
+    # which stays far below the owner key length limit.
+    prepared = await _resolve_mcp_oauth_connect_client(
+        db, server, discovered, persistence=_OAuthPersistence.COMMIT
+    )
+    persisted = await asyncio.to_thread(
+        _persist_team_member_mcp_oauth_connect_flow,
+        db,
+        server_id=server_id,
+        user_id=user_id,
+        prepared=prepared,
+        binding_at_discovery=binding_at_discovery,
+        redirect_after=request_data.redirect_after,
+    )
+    if persisted is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "oauth_lifecycle_changed",
+                "message": "MCP server connection changed during OAuth setup",
+            },
+        )
+    persisted_client_id, state_value, code_verifier = persisted
+    return _mcp_oauth_connect_response(
+        prepared,
+        persisted_client_id=persisted_client_id,
+        state_value=state_value,
+        code_verifier=code_verifier,
+        accept=accept,
+    )
 
 
 async def _connect_mcp_oauth_for_owner(

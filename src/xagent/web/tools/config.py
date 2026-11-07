@@ -129,6 +129,7 @@ MCP_UNAVAILABLE_REASONS = frozenset(
         ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
+        "grant_not_allowed_for_task_source",
         "insufficient_scope",
         "invalid_configuration",
         "invalid_launch_config",

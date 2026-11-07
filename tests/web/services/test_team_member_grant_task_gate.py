@@ -290,6 +290,7 @@ _REGISTERED_CALLS = frozenset(
         ("web/tools/config.py", "WebToolConfig._build_mcp_server_config"),
         ("web/services/mcp_runtime.py", "build_mcp_runtime_connection"),
         ("web/services/mcp_oauth.py", "resolve_mcp_oauth_runtime_auth"),
+        ("web/services/mcp_oauth.py", "_team_member_grants_withheld"),
     }
 )
 
@@ -684,7 +685,9 @@ async def test_channel_task_through_snapshot_path_excludes_member_grant(
                 gate_db, task=task, member_id=member_id
             )
             assert kwargs["mcp_team_member_grants_allowed"] is False
-            assert [d.get("code") for d in diagnostics] == ["authorization_required"]
+            assert [d.get("code") for d in diagnostics] == [
+                "grant_not_allowed_for_task_source"
+            ]
             assert _MEMBER_TOKEN not in json.dumps(configs, default=str)
 
         configs, diagnostics, kwargs = await _build_tools_and_load_mcp(

@@ -634,6 +634,12 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
 
     ``endpoint_url`` is the URL of the connection the returned token is added
     to; it is forwarded to ``select_mcp_oauth_grants``.
+
+    When ``allow_team_member_grants`` is false and no grant is selected, but a
+    grant would be selected with it true, this fails with
+    ``grant_not_allowed_for_task_source`` rather than
+    ``authorization_required``: authorizing again cannot help, because the
+    task's source is what withholds the grant.
     """
     from ...core.utils.encryption import decrypt_value
 
@@ -665,6 +671,24 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             allow_team_member_grants=allow_team_member_grants,
             endpoint_url=endpoint_url,
         )
+        if (
+            not candidate_grants
+            and not allow_team_member_grants
+            and _team_member_grants_withheld(
+                db,
+                server_id=server_id,
+                user_id=user_id,
+                auth_config=auth_config,
+                resource_owner_key=resource_owner_key,
+                resource=resource,
+                issuer=issuer,
+                endpoint_url=endpoint_url,
+            )
+        ):
+            raise MCPOAuthRuntimeError(
+                "grant_not_allowed_for_task_source",
+                "MCP OAuth grant cannot be used by tasks from this source",
+            )
         grant = _select_runtime_grant(candidate_grants, required_scopes)
         if not _grant_needs_refresh(grant.expires_at):
             access_token = decrypt_value(str(grant.access_token))
@@ -702,6 +726,41 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     raise MCPOAuthRuntimeError(
         "authorization_required",
         "MCP OAuth grant changed while preparing runtime authorization",
+    )
+
+
+def _team_member_grants_withheld(  # noqa: PLR0913
+    db: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    auth_config: dict[str, Any],
+    resource_owner_key: str,
+    resource: str | None,
+    issuer: str | None,
+    endpoint_url: str | None,
+) -> bool:
+    """Whether grants exist that only ``allow_team_member_grants`` withholds.
+
+    Selects again with the same arguments and team-member grants allowed. Only
+    the failure path of ``resolve_mcp_oauth_runtime_auth`` calls this, after a
+    selection with them withheld found nothing. A grant whose resource does not
+    match ``endpoint_url`` is still not selected, so that case keeps
+    ``authorization_required``.
+    """
+    return bool(
+        select_mcp_oauth_grants(
+            db,
+            server_id=server_id,
+            user_id=user_id,
+            auth_config=auth_config,
+            resource_owner_key=resource_owner_key,
+            resource=resource,
+            issuer=issuer,
+            scope="",
+            allow_team_member_grants=True,
+            endpoint_url=endpoint_url,
+        )
     )
 
 
@@ -949,13 +1008,13 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     the same value, and the stored URL is not read. When it is omitted, the
     stored URL is read.
 
-    The comparison is strict on purpose. No code path in this repository
-    creates a grant for a caller without an association today. A flow that
-    does so must require the protected resource to equal the connector URL
-    when it starts, when it stores its flow and at the callback; this
-    comparison then never drops such a grant, and on a server whose protected
-    resource differs from its URL that flow refuses the member before any
-    grant is stored.
+    The comparison is strict on purpose. The team member OAuth connect route
+    and its callback create grants for callers without an association. That
+    flow requires the protected resource to equal the connector URL when it
+    starts, when it stores its flow and at the callback; this comparison then
+    never drops such a grant, and on a server whose protected resource
+    differs from its URL that flow refuses the member before any grant is
+    stored.
     """
     from ..models.mcp import MCPServer, UserMCPServer
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant

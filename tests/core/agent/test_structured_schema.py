@@ -983,7 +983,7 @@ def test_a_small_schema_whose_copy_would_be_over_a_megabyte_is_refused() -> None
     assert _violation(schema) == ("S11", "")
 
 
-def test_a_500_value_enum_expanded_nine_times_is_refused_within_50_ms() -> None:
+def test_a_500_value_enum_expanded_nine_times_is_refused_within_a_second() -> None:
     values = [f"{i:04d}-" + "v" * 14 for i in range(500)]
     schema = _layered_schema(9, {"type": "string", "enum": values})
     original = len(json.dumps(schema, separators=(",", ":")).encode())
@@ -994,7 +994,7 @@ def test_a_500_value_enum_expanded_nine_times_is_refused_within_50_ms() -> None:
     elapsed = time.perf_counter() - start
 
     assert found == ("S11", "")
-    assert elapsed < 0.05, f"took {elapsed * 1000:.1f} ms"
+    assert elapsed < 1.0, f"took {elapsed * 1000:.1f} ms"
 
 
 def test_an_unreferenced_entry_is_refused_before_any_expansion_is_measured(

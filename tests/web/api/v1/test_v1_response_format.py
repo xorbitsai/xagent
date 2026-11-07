@@ -650,6 +650,58 @@ def test_the_echo_follows_a_format_changed_after_the_task_was_loaded(
     assert _echo(response) == ("json_schema", "F2")
 
 
+# --- Idempotency-Key ----------------------------------------------------------------
+
+
+def _create_with_key(
+    key: str, agent_id: int, idempotency_key: str, **extra: Any
+) -> Any:
+    body: dict[str, Any] = {
+        "agent_id": agent_id,
+        "message": {"role": "user", "content": "first turn"},
+    }
+    body.update(extra)
+    return client.post(
+        "/v1/chat/tasks",
+        headers={**bearer(key), "Idempotency-Key": idempotency_key},
+        json=body,
+    )
+
+
+def test_a_retry_that_changes_the_format_is_refused_as_a_reused_key() -> None:
+    agent_id, key = create_agent_with_key()
+    before = _task_count()
+
+    first = _create_with_key(
+        key, agent_id, "format-retry-1", response_format=_format(name="one")
+    )
+    retry = _create_with_key(
+        key, agent_id, "format-retry-1", response_format=_format(name="two")
+    )
+
+    assert first.status_code == 202, first.text
+    assert retry.status_code == 422, retry.text
+    assert retry.json()["error"]["code"] == "idempotency_key_reused"
+    assert _task_count() == before + 1
+
+
+def test_a_replayed_create_echoes_the_format_it_stored() -> None:
+    agent_id, key = create_agent_with_key()
+
+    first = _create_with_key(
+        key, agent_id, "format-replay-1", response_format=_format(name="one")
+    )
+    replay = _create_with_key(
+        key, agent_id, "format-replay-1", response_format=_format(name="one")
+    )
+
+    assert first.status_code == 202, first.text
+    assert replay.status_code == 202, replay.text
+    assert replay.headers["Idempotent-Replayed"] == "true"
+    assert _echo(replay) == ("json_schema", "one")
+    assert replay.json()["task_id"] == first.json()["task_id"]
+
+
 # --- workforce keys ---------------------------------------------------------------
 
 

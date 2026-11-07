@@ -99,6 +99,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
+    team_member_mcp_grants_allowed_for_task,
 )
 from .memory_availability import (
     GENERIC_MEMORY_AVAILABILITY_REASON as GENERIC_MEMORY_AVAILABILITY_REASON,
@@ -852,6 +853,7 @@ async def create_default_tools(
     agent_creator_user_id: Optional[int] = None,
     declared_knowledge_bases: Optional[List[str]] = None,
     excluded_model_ids: frozenset[str] = frozenset(),
+    mcp_team_member_grants_allowed: bool = False,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -885,6 +887,10 @@ async def create_default_tools(
     place ``allowed_collections`` already is (the agent's own configuration)
     and is never the model-supplied value on a search request -- the two stay
     distinct all the way to the resolution point.
+
+    ``mcp_team_member_grants_allowed`` is the task-source gate's verdict (see
+    :func:`team_member_mcp_grants_allowed_for_task`). It defaults to ``False``;
+    only the two task builders pass it, so every other caller is closed.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -968,6 +974,7 @@ async def create_default_tools(
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
         excluded_model_ids=excluded_model_ids,
+        mcp_team_member_grants_allowed=mcp_team_member_grants_allowed,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -2372,6 +2379,9 @@ class AgentServiceManager:
             if agent_config
             else None,
             excluded_model_ids=excluded_model_ids,
+            mcp_team_member_grants_allowed=team_member_mcp_grants_allowed_for_task(
+                task
+            ),
         )
 
     @agent_setup.measure()
@@ -3228,6 +3238,9 @@ class AgentServiceManager:
                     if agent_config
                     else None,
                     excluded_model_ids=excluded_model_ids,
+                    mcp_team_member_grants_allowed=(
+                        team_member_mcp_grants_allowed_for_task(task)
+                    ),
                 )
 
                 with UserContext(runtime_user_id):

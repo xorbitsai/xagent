@@ -434,6 +434,69 @@ async def test_runtime_stream_end_and_buffered_result_share_registered_file(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("checked_stream", [False, True])
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_runtime_reviews_encoded_file_before_delivering(
+    delivery, checked_stream, allowed
+):
+    from xagent.core.agent import PatternRuntime
+    from xagent.core.agent.pattern.final_answer_stream import FinalAnswerStreamSession
+    from xagent.core.guardrails.output import BLOCKED_OUTPUT, OutputDecision
+
+    encoded = "YSwK"
+    source = f"Download:\n```base64 filename=report.csv\n{encoded}\n```"
+    checks = []
+
+    class CheckedStream:
+        prefix = ""
+
+        async def feed(self, delta):
+            self.prefix += delta
+            return delta
+
+        def approved_suffix(self, content):
+            return (
+                content[len(self.prefix) :] if content.startswith(self.prefix) else ""
+            )
+
+    class Reviewer:
+        def open_stream(self):
+            return CheckedStream() if checked_stream else None
+
+        async def check(self, content):
+            checks.append(content)
+            assert not delivery.workspace.files
+            if allowed:
+                return OutputDecision("allow", content)
+            return OutputDecision("block", BLOCKED_OUTPUT)
+
+    events = []
+    runtime = PatternRuntime(
+        outbound_message_handler=events.append,
+        inline_file_delivery=delivery,
+        output_guardrail=Reviewer(),
+    )
+    stream = FinalAnswerStreamSession(runtime)
+    for char in source:
+        await stream.emit_delta(char)
+    assert not delivery.workspace.files
+    await stream.finish(source)
+
+    assert events[-1]["type"] == "final_answer_end"
+    assert all(encoded not in str(event) for event in events)
+    assert all("base64 filename" not in str(event) for event in events)
+    if allowed:
+        assert events[-1]["content"] == "Download:\n[report.csv](file:registered-0)"
+        assert len(delivery.workspace.files) == 1
+        assert Path(next(iter(delivery.workspace.files))).read_bytes() == b"a,\n"
+    else:
+        assert events[-1]["content"] == BLOCKED_OUTPUT
+        assert not delivery.workspace.files
+    assert await runtime.prepare_final_answer(source) == events[-1]["content"]
+    assert checks == [source]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("restored", [False, True])
 async def test_runner_wires_delivery_and_normalizes_context(delivery, restored):
     from xagent.core.agent import Agent, ExecutionContext

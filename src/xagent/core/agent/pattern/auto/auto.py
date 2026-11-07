@@ -240,6 +240,9 @@ class _AutoChildRuntime:
     async def prepare_final_answer(self, content: str) -> str:
         return await self.parent.prepare_final_answer(content)
 
+    async def approve_waiting_result(self, result: dict[str, Any]) -> bool:
+        return await self.parent.approve_waiting_result(result)
+
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         await self.parent.fail_final_answer_stream(message_id, error)
 

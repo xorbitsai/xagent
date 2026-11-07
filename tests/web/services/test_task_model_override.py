@@ -839,7 +839,18 @@ async def test_build_tools_for_task_passes_excluded_model_ids() -> None:
     )
     snapshot = apply_task_model_override(_snapshot(["image", "basic"]), override)
     create_tools = AsyncMock(return_value=([], MagicMock()))
-    task = SimpleNamespace(id=42, user_id=1, source="external", agent_config={})
+    # The four columns the team-member grant gate reads, as a task row with no
+    # channel and no SDK key stores them. The gate refuses "external" either way.
+    task = SimpleNamespace(
+        id=42,
+        user_id=1,
+        source="external",
+        agent_config={},
+        channel_id=None,
+        channel_name=None,
+        telegram_user_id=None,
+        sdk_credential_kind=None,
+    )
 
     with (
         patch.object(

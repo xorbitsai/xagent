@@ -148,6 +148,8 @@ from xagent.core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
 
+from ...services.public_trace_events import is_audit_only_trace_data
+
 logger = logging.getLogger(__name__)
 
 
@@ -356,7 +358,7 @@ class PublicStepProjector:
         see the class docstring).
         """
         event_type = _safe_get(event, "event_type")
-        if not event_type:
+        if not event_type or is_audit_only_trace_data(_safe_get(event, "data")):
             return []
 
         # ===== messages: one event per message, no pairing =====

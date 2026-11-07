@@ -449,7 +449,7 @@ class AgentExecutionAdapter:
             output = INTERRUPTED_USER_MESSAGE
         else:
             output = result.get("output", result.get("response", result.get("error")))
-            if not output:
+            if not output and not result.get("_output_guardrail_applied"):
                 # This backfill and the raw ``agent_result`` preserved below
                 # must stay distinguishable: the delegated-child classifier
                 # in ``agent_tool.py`` reads the pre-backfill answer from

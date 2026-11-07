@@ -1,13 +1,15 @@
 """Detect an LLM stream that keeps emitting chunks but stopped making progress.
 
-Some OpenAI-compatible models (Kimi K2.5 behind Bedrock Mantle is the
-measured case, #2785) degenerate into a repetition or whitespace loop and run
-until the endpoint's output cap. The stream never goes quiet, so the
-token-interval timeout cannot fire, and the caller waits ~100 s for output
-that carries nothing. This module is the pure decision half of the fix: the
-provider's raw stream loop feeds it one observation per delta and it answers
-"abort, and why" or "keep going". Closing the stream and shaping what is
-returned stays with the provider.
+Some models (Kimi K2.5 behind Bedrock Mantle is the measured OpenAI-compatible
+case, #2785) degenerate into a repetition or whitespace loop and run until the
+endpoint's output cap. The stream never goes quiet, so the token-interval
+timeout cannot fire, and the caller waits ~100 s for output that carries
+nothing. This module owns the shared abort decision and the shared abort-tail
+chunk: each provider's raw stream loop feeds ``StreamProgressGuard.observe``
+one observation per delta, and on abort calls ``no_progress_tail_chunk`` after
+closing its own SDK stream. The tail helper mutates the supplied tool calls
+in place when rolling back polluted arguments. Providers extract reasoning
+from their own events and can attach it via the shared raw-decoration helper.
 
 Three predicates. The thresholds are configurable; a value of ``0``
 switches off the empty-delta count and the whitespace/periodicity checks.
@@ -49,6 +51,7 @@ from ....config import (
     get_llm_stream_no_payload_abort_models,
     get_llm_stream_no_payload_timeout_seconds,
 )
+from .types import ChunkType, StreamChunk
 
 # ``finish_reason`` value stamped on the chunk that ends an aborted stream, so
 # the runtime's #2786 markers record the abort instead of a clean finish.
@@ -327,7 +330,7 @@ class StreamProgressGuard:
                         "arguments already formed a complete JSON object"
                     ),
                     tool_call_id=call_id,
-                    keep_length=previous,
+                    keep_length=previous if previous is not None else 0,
                 )
             window = self._config.degenerate_window
             if window > 0 and len(extra) >= window:
@@ -339,12 +342,86 @@ class StreamProgressGuard:
                         "JSON object"
                     ),
                     tool_call_id=call_id,
-                    keep_length=previous,
+                    keep_length=previous if previous is not None else 0,
                 )
         return progressed, None
 
 
 # ------------------------------------------------------------------ helpers
+
+
+def attach_reasoning_content_to_raw(
+    raw_payload: Any,
+    reasoning_content: str,
+    *,
+    has_reasoning_content: bool = False,
+) -> Any:
+    """Attach accumulated reasoning text under the runtime's shared raw keys.
+
+    Providers may wrap this with extra provider-owned state, but the
+    ``reasoning_content`` / ``reasoning`` pair is the contract the agent
+    runtime lifts onto the streamed response.
+    """
+    if not has_reasoning_content:
+        return raw_payload
+
+    if hasattr(raw_payload, "model_dump"):
+        raw_payload = raw_payload.model_dump()
+
+    if isinstance(raw_payload, dict):
+        raw_payload = dict(raw_payload)
+        raw_payload["reasoning_content"] = reasoning_content
+        raw_payload["reasoning"] = reasoning_content
+
+    return raw_payload
+
+
+def no_progress_tail_chunk(
+    abort: StreamAbort,
+    accumulated_tool_calls: dict[str, dict[str, Any]],
+    raw_payload: Any,
+) -> StreamChunk:
+    """Build the final chunk for a stream aborted by the progress guard.
+
+    Providers decorate ``raw_payload`` (for example via
+    ``attach_reasoning_content_to_raw``) before calling this helper, and they
+    remain responsible for closing their own SDK stream.  If the triggering
+    delta polluted a completed tool call, trim that call back to the argument
+    length observed immediately before the delta, mutating the supplied tool
+    calls in place.  The returned snapshot
+    therefore equals or extends the last one the runtime received, rather than
+    looking like a new argument delta.
+    """
+    if abort.tool_call_id is not None and abort.keep_length is not None:
+        call = accumulated_tool_calls.get(abort.tool_call_id)
+        if call:
+            call["function"]["arguments"] = call["function"]["arguments"][
+                : abort.keep_length
+            ]
+
+    # The tail contains every call's full accumulated arguments, including
+    # calls that were already emitted before this abort. Tell the runtime to
+    # replace those values instead of appending them as new deltas.
+    for call in accumulated_tool_calls.values():
+        call["function"]["arguments_mode"] = "snapshot"
+
+    if hasattr(raw_payload, "model_dump"):
+        raw_payload = raw_payload.model_dump()
+    raw = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    raw[STREAM_ABORTED_KEY] = abort.reason
+
+    if accumulated_tool_calls:
+        return StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=list(accumulated_tool_calls.values()),
+            finish_reason=NO_PROGRESS_FINISH_REASON,
+            raw=raw,
+        )
+    return StreamChunk(
+        type=ChunkType.END,
+        finish_reason=NO_PROGRESS_FINISH_REASON,
+        raw=raw,
+    )
 
 
 _JSON_DECODER = json.JSONDecoder()

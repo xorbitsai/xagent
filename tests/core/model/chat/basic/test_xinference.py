@@ -14,6 +14,158 @@ from xagent.core.model.chat.types import ChunkType
 
 class TestXinferenceLLM:
     @pytest.mark.asyncio
+    async def test_stream_empty_delta_aborts_and_closes_iterator(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+
+        class ModelHandle:
+            async def chat(self, **kwargs: object):
+                class Stream:
+                    closed = False
+
+                    def __aiter__(self):
+                        return self
+
+                    def __init__(self):
+                        self.items = iter(
+                            [
+                                {"choices": [{"delta": {"content": ""}}]},
+                                {"choices": [{"delta": {"content": "unreachable"}}]},
+                            ]
+                        )
+
+                    async def __anext__(self):
+                        try:
+                            return next(self.items)
+                        except StopIteration:
+                            raise StopAsyncIteration
+
+                    async def aclose(self):
+                        self.closed = True
+                        raise RuntimeError("close failed")
+
+                self.stream = Stream()
+                return self.stream
+
+        llm = XinferenceLLM(model_name="qwen3.8")
+        llm._client = MagicMock()
+        handle = ModelHandle()
+        llm._model_handle = handle
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                messages=[{"role": "user", "content": "hello"}]
+            )
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0].type is ChunkType.END
+        assert chunks[0].finish_reason == "no_progress"
+        assert chunks[0].raw["stream_aborted"] == "empty_deltas"
+        assert handle.stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_reasoning_content_counts_as_progress(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+
+        class ModelHandle:
+            async def chat(self, **kwargs: object):
+                async def generate():
+                    yield {"choices": [{"delta": {"reasoning_content": "Thinking"}}]}
+                    yield {
+                        "choices": [
+                            {
+                                "delta": {"content": "Answer"},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+
+                return generate()
+
+        llm = XinferenceLLM(model_name="qwen3.8")
+        llm._client = MagicMock()
+        llm._model_handle = ModelHandle()
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                messages=[{"role": "user", "content": "hello"}]
+            )
+        ]
+
+        assert [chunk.delta for chunk in chunks if chunk.type is ChunkType.TOKEN] == [
+            "Answer"
+        ]
+        answer_chunk = next(chunk for chunk in chunks if chunk.type is ChunkType.TOKEN)
+        assert answer_chunk.raw["reasoning_content"] == "Thinking"
+        assert answer_chunk.raw["reasoning"] == "Thinking"
+        assert all(chunk.finish_reason != "no_progress" for chunk in chunks)
+
+    @pytest.mark.asyncio
+    async def test_first_tool_delta_with_trailing_bytes_is_rolled_back(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+
+        class ModelHandle:
+            async def chat(self, **kwargs: object):
+                class Stream:
+                    closed = False
+
+                    def __aiter__(self):
+                        return self
+
+                    async def __anext__(self):
+                        if self.closed:
+                            raise StopAsyncIteration
+                        self.closed = True
+                        return {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_1",
+                                                "index": 0,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "search",
+                                                    "arguments": '{"q":"x"}junk',
+                                                },
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+
+                    async def aclose(self):
+                        raise RuntimeError("close failed")
+
+                return Stream()
+
+        llm = XinferenceLLM(model_name="qwen3.8")
+        llm._client = MagicMock()
+        llm._model_handle = ModelHandle()
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                messages=[{"role": "user", "content": "hello"}]
+            )
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0].finish_reason == "no_progress"
+        assert chunks[0].raw["stream_aborted"] == "tool_call_trailing_bytes"
+        assert chunks[0].tool_calls[0]["function"]["arguments"] == ""
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("supports_affinity", [False, True])
     async def test_chat_uses_discovered_session_affinity(
         self, monkeypatch, supports_affinity: bool

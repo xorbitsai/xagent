@@ -32,6 +32,13 @@ from ...public_http import get_model_proxy_url
 from ..error import matches_context_length_error
 from ..exceptions import LLMContextLengthError, LLMRetryableError
 from ..stream_deadline import await_before_deadline
+from ..stream_progress import (
+    StreamAbort,
+    StreamProgressConfig,
+    StreamProgressGuard,
+    attach_reasoning_content_to_raw,
+    no_progress_tail_chunk,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
@@ -883,7 +890,13 @@ class BedrockLLM(BaseLLM):
         tool_calls: dict[int, dict[str, Any]] = {}
         reasoning_deltas: dict[int, dict[str, Any]] = {}
         reasoning_blocks: dict[int, dict[str, Any]] = {}
+        accumulated_reasoning_text = ""
         finish_reason = ""
+        progress_guard = StreamProgressGuard(
+            StreamProgressConfig.from_env(model_name=self._model_name)
+        )
+        stream_abort: StreamAbort | None = None
+        last_raw_event: dict[str, Any] | None = None
 
         def provider_raw(event: dict[str, Any] | None = None) -> dict[str, Any]:
             raw = dict(event or {})
@@ -895,7 +908,12 @@ class BedrockLLM(BaseLLM):
             provider_state = _reasoning_provider_state(ordered_content)
             if provider_state:
                 raw[PROVIDER_STATE_METADATA_KEY] = provider_state
-            return raw
+            attached_raw = attach_reasoning_content_to_raw(
+                raw,
+                accumulated_reasoning_text,
+                has_reasoning_content=bool(accumulated_reasoning_text),
+            )
+            return attached_raw if isinstance(attached_raw, dict) else raw
 
         try:
             # Both limits are deadlines on the wait itself (#3059). Each event
@@ -950,6 +968,14 @@ class BedrockLLM(BaseLLM):
                 if not present:
                     break
                 first_event = False
+                last_raw_event = event
+                event_chunks: list[StreamChunk] = []
+                observe_event = False
+                has_content = False
+                reasoning_texts: list[str] = []
+                reasoning_opaque = False
+                has_finish_reason = False
+                has_usage = False
                 if "contentBlockStart" in event:
                     start_event = event["contentBlockStart"]
                     index = int(start_event.get("contentBlockIndex", 0))
@@ -965,6 +991,7 @@ class BedrockLLM(BaseLLM):
                                 "arguments_mode": "delta",
                             },
                         }
+                        observe_event = True
                     elif start_event.get("start"):
                         raise RuntimeError(
                             "Bedrock stream returned an unsupported content block start"
@@ -980,11 +1007,15 @@ class BedrockLLM(BaseLLM):
                     if "text" in delta:
                         text_delta = str(delta.get("text") or "")
                         current_text += text_delta
-                        yield StreamChunk(
-                            type=ChunkType.TOKEN,
-                            content=current_text,
-                            delta=text_delta,
-                            raw=provider_raw(event),
+                        has_content = bool(text_delta)
+                        observe_event = True
+                        event_chunks.append(
+                            StreamChunk(
+                                type=ChunkType.TOKEN,
+                                content=current_text,
+                                delta=text_delta,
+                                raw=provider_raw(event),
+                            )
                         )
                     if "toolUse" in delta:
                         call = tool_calls.get(index)
@@ -994,10 +1025,13 @@ class BedrockLLM(BaseLLM):
                             )
                         fragment = str(delta["toolUse"].get("input") or "")
                         call["function"]["arguments"] += fragment
-                        yield StreamChunk(
-                            type=ChunkType.TOOL_CALL,
-                            tool_calls=[copy.deepcopy(call)],
-                            raw=provider_raw(event),
+                        observe_event = True
+                        event_chunks.append(
+                            StreamChunk(
+                                type=ChunkType.TOOL_CALL,
+                                tool_calls=[copy.deepcopy(call)],
+                                raw=provider_raw(event),
+                            )
                         )
                     if "reasoningContent" in delta:
                         reasoning_delta = delta["reasoningContent"]
@@ -1028,6 +1062,13 @@ class BedrockLLM(BaseLLM):
                                     "Bedrock stream reasoning text must be text"
                                 )
                             accumulated["text"] = accumulated.get("text", "") + value
+                            # Empty reasoning text still counts as an observed
+                            # delta so empty_deltas can fire (same as Claude
+                            # thinking_delta).
+                            observe_event = True
+                            if value:
+                                reasoning_texts.append(value)
+                                accumulated_reasoning_text += value
                         elif "signature" in reasoning_delta:
                             value = reasoning_delta["signature"]
                             if not isinstance(value, str):
@@ -1046,6 +1087,8 @@ class BedrockLLM(BaseLLM):
                             accumulated["redactedContent"] = (
                                 accumulated.get("redactedContent", b"") + value
                             )
+                            reasoning_opaque = bool(value)
+                            observe_event = reasoning_opaque
                     unsupported_delta = set(delta) - {
                         "text",
                         "toolUse",
@@ -1090,23 +1133,34 @@ class BedrockLLM(BaseLLM):
                         # runtime. The stop event repeats the accumulated value,
                         # so expose it as a snapshot instead of a final delta.
                         completed_call["function"]["arguments_mode"] = "snapshot"
-                        yield StreamChunk(
-                            type=ChunkType.TOOL_CALL,
-                            tool_calls=[completed_call],
-                            raw=provider_raw(event),
+                        # This is a structural event: it adds no new provider
+                        # payload, so the preceding deltas already supplied all
+                        # progress information to the guard.
+                        event_chunks.append(
+                            StreamChunk(
+                                type=ChunkType.TOOL_CALL,
+                                tool_calls=[completed_call],
+                                raw=provider_raw(event),
+                            )
                         )
                 elif "messageStop" in event:
                     raw_stop_reason = event["messageStop"].get("stopReason")
                     finish_reason = _stop_reason(raw_stop_reason)
+                    has_finish_reason = bool(finish_reason)
+                    observe_event = has_finish_reason
                 elif "metadata" in event:
                     usage = self._record_usage(
                         event["metadata"].get("usage"), "stream_chat"
                     )
-                    yield StreamChunk(
-                        type=ChunkType.USAGE,
-                        usage=usage,
-                        finish_reason=finish_reason,
-                        raw=provider_raw(event),
+                    has_usage = bool(usage)
+                    observe_event = has_usage
+                    event_chunks.append(
+                        StreamChunk(
+                            type=ChunkType.USAGE,
+                            usage=usage,
+                            finish_reason=finish_reason,
+                            raw=provider_raw(event),
+                        )
                     )
                 elif any(key.endswith("Exception") for key in event):
                     key = next(key for key in event if key.endswith("Exception"))
@@ -1122,6 +1176,40 @@ class BedrockLLM(BaseLLM):
                     raise RuntimeError(detail)
                 elif "messageStart" not in event:
                     raise RuntimeError("Bedrock stream returned an unknown event")
+                if observe_event:
+                    stream_abort = progress_guard.observe(
+                        has_content=has_content,
+                        reasoning_texts=reasoning_texts,
+                        reasoning_opaque=reasoning_opaque,
+                        has_finish_reason=has_finish_reason,
+                        has_usage=has_usage,
+                        accumulated_tool_calls={
+                            call["id"]: call for call in tool_calls.values()
+                        },
+                    )
+                    if stream_abort is not None:
+                        break
+                for output_chunk in event_chunks:
+                    yield output_chunk
+            if stream_abort is not None:
+                close = getattr(event_stream, "close", None)
+                if callable(close):
+                    try:
+                        await run_in_thread_with_telemetry(
+                            "bedrock.stream_close", close
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Closing aborted Bedrock stream failed (%s)",
+                            type(exc).__name__,
+                        )
+                event_stream = None
+                yield no_progress_tail_chunk(
+                    stream_abort,
+                    {call["id"]: call for call in tool_calls.values()},
+                    provider_raw(last_raw_event),
+                )
+                return
             if reasoning_deltas:
                 raise RuntimeError(
                     "Bedrock stream ended with incomplete reasoning blocks"

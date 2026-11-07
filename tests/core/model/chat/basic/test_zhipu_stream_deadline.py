@@ -18,6 +18,7 @@ import pytest
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
 from xagent.core.model.chat.exceptions import LLMTimeoutError
 from xagent.core.model.chat.timeout_config import TimeoutConfig
+from xagent.core.model.chat.types import ChunkType
 
 FIRST_TOKEN_TIMEOUT = 0.2
 TOKEN_INTERVAL_TIMEOUT = 0.2
@@ -250,6 +251,26 @@ async def test_producer_stops_and_closes_response_after_a_timeout(make_llm):
 
 
 @pytest.mark.asyncio
+async def test_progress_abort_closes_before_the_producer_reads_another_chunk(
+    make_llm, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+    llm, stream = make_llm(
+        [(0.0, _text("")), (0.0, _text("unreachable"))], then_block=True
+    )
+
+    chunks = []
+    async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}]):
+        chunks.append(chunk)
+        assert stream.response.closed is True
+
+    assert len(chunks) == 1
+    assert chunks[0].type is ChunkType.END
+    assert chunks[0].finish_reason == "no_progress"
+    assert stream.pulled == 1
+
+
+@pytest.mark.asyncio
 async def test_producer_stops_when_the_stream_opens_after_a_timeout(make_llm):
     llm, stream = make_llm([(0.0, _text("unread"))], hang_on_open=True)
 
@@ -299,7 +320,7 @@ async def test_caller_abandoning_the_stream_stops_the_producer(make_llm):
 
     assert first.delta == "a"
     await _wait_until(lambda: stream.response.closed)
-    assert stream.pulled == 2
+    assert stream.pulled == 1
 
 
 @pytest.mark.asyncio

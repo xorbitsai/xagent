@@ -16,6 +16,13 @@ from ...public_http import (
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..stream_deadline import await_before_deadline
+from ..stream_progress import (
+    StreamAbort,
+    StreamProgressConfig,
+    StreamProgressGuard,
+    attach_reasoning_content_to_raw,
+    no_progress_tail_chunk,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -519,19 +526,35 @@ class ZhipuLLM(BaseLLM):
         # from the event loop cannot cut the read short, since httpcore's sync
         # close does not shut the socket down (#3097).
         stop_producer = threading.Event()
+        progress_guard = StreamProgressGuard(
+            StreamProgressConfig.from_env(model_name=self._model_name)
+        )
+        stream_abort: Optional[StreamAbort] = None
+        last_raw_chunk: Any = None
+        accumulated_reasoning_content = ""
+
+        def reasoning_raw(raw: Any) -> Any:
+            return attach_reasoning_content_to_raw(
+                raw,
+                accumulated_reasoning_content,
+                has_reasoning_content=bool(accumulated_reasoning_content),
+            )
 
         try:
             # Create a queue to bridge the synchronous stream to async generator
-            queue: asyncio.Queue[Union[Dict[str, Any], Exception, None]] = (
-                asyncio.Queue()
-            )
+            queue: asyncio.Queue[
+                tuple[Union[Dict[str, Any], Exception, None], Optional[threading.Event]]
+            ] = asyncio.Queue()
 
             # Get the event loop in the main thread before spawning the worker thread
             loop = asyncio.get_event_loop()
 
-            def enqueue(item: Union[Dict[str, Any], Exception, None]) -> bool:
+            def enqueue(
+                item: Union[Dict[str, Any], Exception, None],
+                acknowledgment: Optional[threading.Event] = None,
+            ) -> bool:
                 try:
-                    loop.call_soon_threadsafe(queue.put_nowait, item)
+                    loop.call_soon_threadsafe(queue.put_nowait, (item, acknowledgment))
                 except RuntimeError:
                     # The loop is closed, so nobody is left to read the item.
                     stop_producer.set()
@@ -573,6 +596,12 @@ class ZhipuLLM(BaseLLM):
 
                                 if hasattr(delta, "content") and delta.content:
                                     delta_dict["content"] = delta.content
+
+                                reasoning_content = getattr(
+                                    delta, "reasoning_content", None
+                                )
+                                if isinstance(reasoning_content, str):
+                                    delta_dict["reasoning_content"] = reasoning_content
 
                                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                                     tool_calls_list: List[Dict[str, Any]] = []
@@ -632,9 +661,15 @@ class ZhipuLLM(BaseLLM):
                                 }
                             chunk_dict["usage"] = usage_dict
 
-                        # Put chunk in queue using the event loop from main thread
-                        # A closed loop means nobody reads further events.
-                        if not enqueue(chunk_dict):
+                        # Wait for the consumer's guard verdict before asking
+                        # the synchronous SDK iterator for another event.
+                        acknowledgment = threading.Event()
+                        if not enqueue(chunk_dict, acknowledgment):
+                            return
+                        while not acknowledgment.wait(timeout=0.05):
+                            if stop_producer.is_set():
+                                return
+                        if stop_producer.is_set():
                             return
 
                     # Signal end of stream with sentinel value
@@ -684,18 +719,27 @@ class ZhipuLLM(BaseLLM):
                 else:
                     deadline = loop.time() + interval_timeout
                     timeout_message = interval_message
-                chunk_dict = await await_before_deadline(
+                chunk_item, acknowledgment = await await_before_deadline(
                     queue.get(), deadline=deadline, timeout_message=timeout_message
                 )
 
                 # Check for end of stream sentinel
-                if chunk_dict is None:
+                if chunk_item is None:
                     break
 
                 # Check if an exception was put in the queue
-                if isinstance(chunk_dict, Exception):
-                    raise chunk_dict
+                if isinstance(chunk_item, Exception):
+                    if acknowledgment is not None:
+                        acknowledgment.set()
+                    raise chunk_item
+                chunk_dict = chunk_item
                 first_chunk = False
+                last_raw_chunk = chunk_dict
+                output_chunks: List[StreamChunk] = []
+                has_content = False
+                reasoning_texts: List[str] = []
+                has_finish_reason = False
+                has_usage = bool(chunk_dict.get("usage"))
 
                 # Process the chunk data
                 if chunk_dict.get("choices"):
@@ -707,12 +751,19 @@ class ZhipuLLM(BaseLLM):
                         if delta.get("content"):
                             text = delta["content"]
                             current_content += text
-                            yield StreamChunk(
-                                type=ChunkType.TOKEN,
-                                content=current_content,
-                                delta=text,
-                                raw=chunk_dict,
+                            has_content = True
+                            output_chunks.append(
+                                StreamChunk(
+                                    type=ChunkType.TOKEN,
+                                    content=current_content,
+                                    delta=text,
+                                    raw=chunk_dict,
+                                )
                             )
+                        reasoning_content = delta.get("reasoning_content")
+                        if isinstance(reasoning_content, str) and reasoning_content:
+                            reasoning_texts.append(reasoning_content)
+                            accumulated_reasoning_content += reasoning_content
 
                         # Check for tool calls
                         if delta.get("tool_calls"):
@@ -759,32 +810,39 @@ class ZhipuLLM(BaseLLM):
                                         accumulated_tool_calls[tool_id]["index"] = index
 
                             if saw_tool_call_delta:
-                                yield StreamChunk(
-                                    type=ChunkType.TOOL_CALL,
-                                    tool_calls=_zhipu_stream_tool_calls(
-                                        accumulated_tool_calls
-                                    ),
-                                    raw=chunk_dict,
+                                output_chunks.append(
+                                    StreamChunk(
+                                        type=ChunkType.TOOL_CALL,
+                                        tool_calls=_zhipu_stream_tool_calls(
+                                            accumulated_tool_calls
+                                        ),
+                                        raw=chunk_dict,
+                                    )
                                 )
 
                     # Check for finish reason
                     finish_reason = choice.get("finish_reason")
                     if finish_reason:
+                        has_finish_reason = True
                         # Yield tool calls if accumulated
                         if accumulated_tool_calls:
-                            yield StreamChunk(
-                                type=ChunkType.TOOL_CALL,
-                                tool_calls=_zhipu_stream_tool_calls(
-                                    accumulated_tool_calls
-                                ),
-                                finish_reason=finish_reason,
-                                raw=chunk_dict,
+                            output_chunks.append(
+                                StreamChunk(
+                                    type=ChunkType.TOOL_CALL,
+                                    tool_calls=_zhipu_stream_tool_calls(
+                                        accumulated_tool_calls
+                                    ),
+                                    finish_reason=finish_reason,
+                                    raw=chunk_dict,
+                                )
                             )
                         else:
-                            yield StreamChunk(
-                                type=ChunkType.END,
-                                finish_reason=finish_reason,
-                                raw=chunk_dict,
+                            output_chunks.append(
+                                StreamChunk(
+                                    type=ChunkType.END,
+                                    finish_reason=finish_reason,
+                                    raw=chunk_dict,
+                                )
                             )
 
                 # Check for usage information
@@ -813,11 +871,47 @@ class ZhipuLLM(BaseLLM):
                     }
                     if cached_tokens:
                         usage_dict["cached_input_tokens"] = cached_tokens
-                    yield StreamChunk(
-                        type=ChunkType.USAGE,
-                        usage=usage_dict,
-                        raw=chunk_dict,
+                    output_chunks.append(
+                        StreamChunk(
+                            type=ChunkType.USAGE,
+                            usage=usage_dict,
+                            raw=chunk_dict,
+                        )
                     )
+
+                guard_calls = {
+                    call["id"]: call
+                    for call in _zhipu_stream_tool_calls(accumulated_tool_calls)
+                }
+                stream_abort = progress_guard.observe(
+                    has_content=has_content,
+                    reasoning_texts=reasoning_texts,
+                    has_finish_reason=has_finish_reason,
+                    has_usage=has_usage,
+                    accumulated_tool_calls=guard_calls,
+                )
+                if stream_abort is not None:
+                    stop_producer.set()
+                    if acknowledgment is not None:
+                        acknowledgment.set()
+                    break
+                if acknowledgment is not None:
+                    acknowledgment.set()
+                for output_chunk in output_chunks:
+                    output_chunk.raw = reasoning_raw(output_chunk.raw)
+                    yield output_chunk
+
+            if stream_abort is not None:
+                await producer_task
+                yield no_progress_tail_chunk(
+                    stream_abort,
+                    {
+                        call["id"]: call
+                        for call in _zhipu_stream_tool_calls(accumulated_tool_calls)
+                    },
+                    reasoning_raw(last_raw_chunk),
+                )
+                return
 
             await producer_task
 

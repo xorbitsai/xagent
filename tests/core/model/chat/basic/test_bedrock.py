@@ -409,12 +409,211 @@ class _FakeEventStream:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self.events = events
         self.closed = False
+        self.fail_close = False
 
     def __iter__(self):
         return iter(self.events)
 
     def close(self) -> None:
         self.closed = True
+        if self.fail_close:
+            raise RuntimeError("close failed")
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_empty_delta_aborts_and_closes(monkeypatch):
+    monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": ""},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "unreachable"},
+                }
+            },
+        ]
+    )
+    stream.fail_close = True
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    chunks = [
+        chunk async for chunk in llm.stream_chat([{"role": "user", "content": "go"}])
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0].type is ChunkType.END
+    assert chunks[0].finish_reason == "no_progress"
+    assert chunks[0].raw["stream_aborted"] == "empty_deltas"
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_tool_abort_tail_is_runtime_snapshot(monkeypatch):
+    monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "Earlier."},
+                }
+            },
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": 1,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "weather"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 1,
+                    "delta": {"toolUse": {"input": '{"city":"Paris"}'}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 1}},
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": 2,
+                    "start": {"toolUse": {"toolUseId": "call-2", "name": "weather"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 2,
+                    "delta": {"toolUse": {"input": '{"city":"London"}junk'}},
+                }
+            },
+        ]
+    )
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        llm,
+        messages=[{"role": "user", "content": "weather"}],
+        tools=[],
+    )
+
+    assert result["finish_reason"] == "no_progress"
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+    assert json.loads(result["tool_calls"][0]["function"]["arguments"]) == {
+        "city": "Paris"
+    }
+    assert result["tool_calls"][1]["function"]["arguments"] == ""
+    assert result["content"] == "Earlier."
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_tool_stop_is_not_an_empty_guard_observation(monkeypatch):
+    monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": 0,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "weather"}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"messageStop": {"stopReason": "tool_use"}},
+        ]
+    )
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    chunks = [
+        chunk async for chunk in llm.stream_chat([{"role": "user", "content": "go"}])
+    ]
+
+    assert all(chunk.finish_reason != "no_progress" for chunk in chunks)
+    assert any(chunk.type is ChunkType.TOOL_CALL for chunk in chunks)
+    assert chunks[-1].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_reasoning_content_counts_as_progress(monkeypatch):
+    monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "Thinking"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"signature": "signed"}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 1,
+                    "delta": {"text": "Answer"},
+                }
+            },
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+    )
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    chunks = [
+        chunk async for chunk in llm.stream_chat([{"role": "user", "content": "go"}])
+    ]
+
+    assert [chunk.delta for chunk in chunks if chunk.type is ChunkType.TOKEN] == [
+        "Answer"
+    ]
+    answer_chunk = next(chunk for chunk in chunks if chunk.type is ChunkType.TOKEN)
+    assert answer_chunk.raw["reasoning_content"] == "Thinking"
+    assert answer_chunk.raw["reasoning"] == "Thinking"
+    assert chunks[-1].finish_reason == "end_turn"
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_empty_reasoning_text_counts_toward_empty_deltas(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": ""}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "unreachable"},
+                }
+            },
+        ]
+    )
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    chunks = [
+        chunk async for chunk in llm.stream_chat([{"role": "user", "content": "go"}])
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0].finish_reason == "no_progress"
+    assert chunks[0].raw["stream_aborted"] == "empty_deltas"
+    assert stream.closed is True
 
 
 class _FakeClient:

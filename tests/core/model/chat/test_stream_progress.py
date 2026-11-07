@@ -14,10 +14,14 @@ import pytest
 from xagent.core.model.chat.stream_progress import (
     NO_PAYLOAD_STREAM_FALLBACK,
     NO_PROGRESS_FINISH_REASON,
+    STREAM_ABORTED_KEY,
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
+    attach_reasoning_content_to_raw,
+    no_progress_tail_chunk,
 )
+from xagent.core.model.chat.types import ChunkType
 
 
 def _config(**overrides: object) -> StreamProgressConfig:
@@ -304,6 +308,18 @@ class TestToolCallTrailingBytes:
         assert verdict.tool_call_id == "call_1"
         assert verdict.keep_length == len('{"q": "x"}')
 
+    def test_first_tool_delta_with_trailing_bytes_rolls_back_to_empty(self) -> None:
+        guard = StreamProgressGuard(_config())
+        calls = _tool_calls(("call_1", '{"q": "x"}junk'))
+
+        verdict = guard.observe(accumulated_tool_calls=calls)
+
+        assert verdict is not None
+        assert verdict.reason == "tool_call_trailing_bytes"
+        assert verdict.keep_length == 0
+        tail = no_progress_tail_chunk(verdict, calls, None)
+        assert tail.tool_calls[0]["function"]["arguments"] == ""
+
     def test_whitespace_after_complete_object_aborts_at_the_window(self) -> None:
         guard = StreamProgressGuard(_config(degenerate_window=8))
         assert (
@@ -522,6 +538,67 @@ class TestNoPayloadTimeout:
         )
         now[0] = 1000.0
         assert guard.observe(reasoning_texts=("more",)) is None
+
+
+class TestAttachReasoningContentToRaw:
+    def test_attaches_shared_runtime_keys(self) -> None:
+        raw = attach_reasoning_content_to_raw(
+            {"provider": "value"},
+            "think",
+            has_reasoning_content=True,
+        )
+
+        assert raw == {
+            "provider": "value",
+            "reasoning_content": "think",
+            "reasoning": "think",
+        }
+
+    def test_leaves_payload_alone_without_reasoning(self) -> None:
+        payload = {"provider": "value"}
+
+        assert (
+            attach_reasoning_content_to_raw(
+                payload,
+                "think",
+                has_reasoning_content=False,
+            )
+            is payload
+        )
+
+
+class TestNoProgressTailChunk:
+    def test_end_chunk_stamps_abort_reason(self) -> None:
+        abort = StreamAbort(reason="empty_deltas", detail="empty")
+
+        chunk = no_progress_tail_chunk(abort, {}, {"provider": "value"})
+
+        assert chunk.type == ChunkType.END
+        assert chunk.finish_reason == NO_PROGRESS_FINISH_REASON
+        assert chunk.raw == {
+            "provider": "value",
+            STREAM_ABORTED_KEY: "empty_deltas",
+        }
+
+    def test_tool_chunk_repairs_the_rejected_delta(self) -> None:
+        calls = _tool_calls(("call_1", '{"q": "x"}garbage'))
+        keep_length = len('{"q": "x"}')
+        abort = StreamAbort(
+            reason="tool_call_trailing_bytes",
+            detail="trailing bytes",
+            tool_call_id="call_1",
+            keep_length=keep_length,
+        )
+
+        chunk = no_progress_tail_chunk(abort, calls, None)
+
+        assert chunk.type == ChunkType.TOOL_CALL
+        assert chunk.finish_reason == NO_PROGRESS_FINISH_REASON
+        assert chunk.tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert chunk.tool_calls[0]["function"]["arguments_mode"] == "snapshot"
+        assert calls["call_1"]["function"]["arguments"] == '{"q": "x"}'
+        assert calls["call_1"]["function"]["arguments_mode"] == "snapshot"
+        assert chunk.raw == {STREAM_ABORTED_KEY: "tool_call_trailing_bytes"}
 
 
 class TestConfigFromEnv:

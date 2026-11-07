@@ -31,11 +31,11 @@ from ..exceptions import (
 )
 from ..stream_deadline import await_before_deadline
 from ..stream_progress import (
-    NO_PROGRESS_FINISH_REASON,
-    STREAM_ABORTED_KEY,
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
+    attach_reasoning_content_to_raw,
+    no_progress_tail_chunk,
 )
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
@@ -1075,18 +1075,11 @@ class OpenAICompatibleLLM(BaseLLM):
         has_reasoning_content: bool = False,
     ) -> Any:
         """Attach accumulated reasoning content to a raw payload when possible."""
-        if not has_reasoning_content:
-            return raw_payload
-
-        if hasattr(raw_payload, "model_dump"):
-            raw_payload = raw_payload.model_dump()
-
-        if isinstance(raw_payload, dict):
-            raw_payload = dict(raw_payload)
-            raw_payload["reasoning_content"] = reasoning_content
-            raw_payload["reasoning"] = reasoning_content
-
-        return raw_payload
+        return attach_reasoning_content_to_raw(
+            raw_payload,
+            reasoning_content,
+            has_reasoning_content=has_reasoning_content,
+        )
 
     async def vision_chat(
         self,
@@ -1599,12 +1592,15 @@ class OpenAICompatibleLLM(BaseLLM):
                     stream_abort.detail,
                     ",".join(sorted(observed_reasoning_field_names)) or "none",
                 )
-                yield self._no_progress_tail_chunk(
-                    stream_abort,
-                    accumulated_tool_calls,
+                raw = self._attach_reasoning_content_to_raw(
                     last_raw_chunk,
                     accumulated_reasoning_content,
                     has_reasoning_content=has_reasoning_content,
+                )
+                yield no_progress_tail_chunk(
+                    stream_abort,
+                    accumulated_tool_calls,
+                    raw,
                 )
 
             if not accumulated_tool_calls and not saw_content:
@@ -1732,56 +1728,6 @@ class OpenAICompatibleLLM(BaseLLM):
                     f"OpenAI stream connection failed: {str(e)}"
                 ) from e
             raise RuntimeError(f"LLM stream chat failed: {str(e)}") from e
-
-    def _no_progress_tail_chunk(
-        self,
-        abort: StreamAbort,
-        accumulated_tool_calls: Dict[str, Dict],
-        last_raw_chunk: Any,
-        accumulated_reasoning_content: str,
-        *,
-        has_reasoning_content: bool,
-    ) -> StreamChunk:
-        """The chunk that ends an aborted stream (#2785).
-
-        With tool calls accumulated it is a final ``TOOL_CALL`` snapshot with
-        the rejected delta undone: the call the guard named is cut back to
-        ``abort.keep_length``, its length before that delta, which equals or
-        extends the snapshot the runtime holds (a wrapper such as the
-        DeepSeek tool-protocol adapter may have streamed a shorter prefix; a
-        snapshot shorter than the runtime's would be merged as a delta
-        there). Otherwise an ``END``. Either way
-        ``finish_reason`` is ``no_progress`` so the runtime's #2786 markers
-        record the abort.
-        """
-        if abort.tool_call_id is not None and abort.keep_length is not None:
-            call = accumulated_tool_calls.get(abort.tool_call_id)
-            if call is not None:
-                function = call["function"]
-                function["arguments"] = function["arguments"][: abort.keep_length]
-        raw = self._attach_reasoning_content_to_raw(
-            last_raw_chunk,
-            accumulated_reasoning_content,
-            has_reasoning_content=has_reasoning_content,
-        )
-        if hasattr(raw, "model_dump"):
-            raw = raw.model_dump()
-        raw = dict(raw) if isinstance(raw, dict) else {}
-        # The runtime lifts this onto the response (and the no-payload
-        # fallback), so the trace records which predicate fired.
-        raw[STREAM_ABORTED_KEY] = abort.reason
-        if accumulated_tool_calls:
-            return StreamChunk(
-                type=ChunkType.TOOL_CALL,
-                tool_calls=list(accumulated_tool_calls.values()),
-                finish_reason=NO_PROGRESS_FINISH_REASON,
-                raw=raw,
-            )
-        return StreamChunk(
-            type=ChunkType.END,
-            finish_reason=NO_PROGRESS_FINISH_REASON,
-            raw=raw,
-        )
 
     def _parse_stream_chunks(
         self,

@@ -503,8 +503,8 @@ def _is_transport_failure(exc: BaseException) -> bool:
 
     Only the two concrete aiohttp failures the media adapters' HTTP paths
     surface count: the peer closing the connection, and a refused connection.
-    TLS, DNS, proxy and invalid-URL failures are different problems and stay
-    out of the retry-later guidance.
+    TLS, DNS, proxy and invalid-URL failures are not recognized by this helper;
+    the classifier's existing rules still apply to them.
     """
     if isinstance(exc, ServerDisconnectedError):
         return True

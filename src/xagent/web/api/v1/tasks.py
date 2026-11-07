@@ -76,6 +76,10 @@ from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
 from ...services.prompt_context import validate_signed_prompt_context
+from ...services.structured_output_projection import (
+    project_structured_output,
+    response_format_configured,
+)
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
 from ...services.task_delete import (
     TaskDeleteBusy,
@@ -554,6 +558,12 @@ class _TaskInfoSnapshot:
     # Set when an appended turn's START is queued and the row still holds the
     # previous turn (see ``_QUEUED_START_STATUSES``). Applied like ``view``.
     start_queued: bool = False
+    # Read from the same row as ``status`` and ``run_id``: the stored
+    # structured result of the run the row shows, and whether the task has a
+    # response format configured. Raw values; the response fields come from
+    # ``project_structured_output`` applied to the effective status.
+    structured_output_record: Any = None
+    format_configured: bool = False
 
 
 # Terminal statuses an append is accepted from. With shared execution the row
@@ -826,6 +836,8 @@ def _load_task_info_snapshot(
             pending_interactions=pending_interactions,
             view=view,
             start_queued=start_queued,
+            structured_output_record=task.structured_output_record,
+            format_configured=response_format_configured(task.agent_config),
         )
 
 
@@ -971,7 +983,8 @@ def _get_chat_task_sync(
     row's ``updated_at``, so a cached body cannot prove the view is still
     current. The cached body holds the stored values; the view is applied
     to the response after every cache read or write. A queued START is
-    applied the same way, for the same reason.
+    applied the same way, for the same reason. So are the structured output
+    fields: the cached body holds them as null.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -1002,6 +1015,17 @@ def _get_chat_task_sync(
             error=effective.error,
             completed_at=task.view.stopped_at,
         )
+    # Applied on every read, never cached: the record can change without the
+    # row's ``updated_at`` telling a cached body so, and the effective status
+    # decides whether it is shown at all.
+    overlay.update(
+        project_structured_output(
+            status=effective_task_snapshot(task).status,
+            run_id=task.run_id,
+            record=task.structured_output_record,
+            format_configured=task.format_configured,
+        ).as_dict()
+    )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)
@@ -1563,7 +1587,10 @@ async def stream_chat_task_events(
     types (each a ``event: <name>`` / ``data: <json>`` frame pair). Four
     are lifecycle-only:
       - ``task.status``: ``{status}``.
-      - ``task.completed``: ``{status, output, error}``. A failed task
+      - ``task.completed``: ``{status, output, error, structured_output,
+        structured_output_status, structured_output_reason}``. The three
+        structured fields carry the same values as the fields of the
+        same name on ``GET /v1/chat/tasks/{task_id}``. A failed task
         also ends the stream with this event rather than a separate
         one -- ``status`` is ``"failed"`` and ``error`` is set.
       - ``task.input_required``: ``{task_id, prompt}``. ``prompt`` is the

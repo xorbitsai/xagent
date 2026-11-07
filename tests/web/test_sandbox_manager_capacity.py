@@ -45,13 +45,9 @@ def clock(monkeypatch) -> _FakeClock:
 
 @pytest.fixture
 def _env(monkeypatch, tmp_path):
-    """Isolate sandbox env config and neutralize code mounts."""
+    """Isolate sandbox environment configuration."""
     with (
         patch.dict("os.environ", {}, clear=True),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
-        ),
     ):
         yield
 

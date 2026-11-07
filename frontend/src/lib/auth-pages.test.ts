@@ -11,6 +11,8 @@ import {
 describe("auth public paths", () => {
   it("allows the OIDC callback route through the auth guard", () => {
     expect(isAuthPublicPath("/auth/oidc/callback")).toBe(true)
+    expect(isAuthPublicPath("/auth/mcp-complete")).toBe(true)
+    expect(isAuthPublicPath("/auth/mcp-complete/other")).toBe(false)
   })
 
   it("classifies widget and share routes as external provider boundaries", () => {

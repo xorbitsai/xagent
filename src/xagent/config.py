@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -249,6 +250,7 @@ KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
 KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+COMPOSIO_RECONCILE_INTERVAL_SECONDS = "XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS"
 TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
 TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
@@ -1811,6 +1813,32 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
     )
 
 
+def get_composio_reconcile_interval_seconds() -> int | None:
+    """How often unbound Composio accounts are cleaned up (#3548).
+
+    Off (None) unless XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS is set: the
+    cleanup deletes every xagent account in the auth config that this database
+    does not reference, so only an operator who knows no other database shares
+    that auth config can turn it on. A value that is not an integer of at
+    least 300 keeps it off.
+    """
+    value = (os.getenv(COMPOSIO_RECONCILE_INTERVAL_SECONDS) or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = 0
+    if parsed < 300:
+        logger.warning(
+            "Invalid %s=%r; Composio reconcile stays off",
+            COMPOSIO_RECONCILE_INTERVAL_SECONDS,
+            value,
+        )
+        return None
+    return parsed
+
+
 def get_task_cleanup_retry_interval_seconds() -> int:
     """How often the task-cleanup retry driver looks for due obligations (#2587).
 
@@ -2735,6 +2763,121 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
             "actually mean."
         )
     return absolute
+
+
+def _platform_git_roots(checkout: Path) -> set[Path]:
+    """Git metadata and readable object stores for a known application checkout.
+
+    Worktrees and separate-git-dir installs put the object database outside the
+    checkout. Resolve their gitdir/commondir pointers and object alternates using
+    files only; a wheel installation need not have the Git executable installed.
+    """
+    import codecs
+
+    entry = checkout / ".git"
+    roots = {entry.resolve()}
+    git_dir = entry
+    try:
+        if entry.is_file():
+            marker = entry.read_text(errors="surrogateescape").strip()
+            if not marker.startswith("gitdir:"):
+                return roots
+            target = marker.removeprefix("gitdir:").strip()
+            if not target:
+                return roots
+            git_dir = (checkout / target).resolve()
+            roots.add(git_dir)
+    except OSError:
+        return roots
+
+    git_dirs = {git_dir}
+    try:
+        common = (git_dir / "commondir").read_text(errors="surrogateescape").strip()
+        if common:
+            git_dirs.add((git_dir / common).resolve())
+    except OSError:
+        pass
+    roots.update(path.resolve() for path in git_dirs)
+    pending = [path / "objects" for path in git_dirs]
+    visited: set[Path] = set()
+    while pending:
+        objects = pending.pop().resolve()
+        if objects in visited:
+            continue
+        visited.add(objects)
+        roots.add(objects)
+        try:
+            alternates = (objects / "info" / "alternates").read_text(
+                errors="surrogateescape"
+            )
+        except OSError:
+            continue
+        for alternate in alternates.splitlines():
+            if not alternate:
+                continue
+            # Git's quoted paths use C byte escapes, including octal UTF-8.
+            if alternate.startswith('"'):
+                if not alternate.endswith('"'):
+                    continue
+                try:
+                    alternate = os.fsdecode(
+                        codecs.escape_decode(os.fsencode(alternate[1:-1]))[0]
+                    )
+                except ValueError:
+                    continue
+            pending.append(objects / alternate)
+    return roots
+
+
+def get_platform_source_roots() -> list[Path]:
+    """Known installed code, checkout sources and Git object stores.
+
+    The backend image retains its build checkout separately from site-packages.
+    Find that checkout through the local installation origin and working tree;
+    never infer a tests directory from an arbitrary site-packages parent.
+    SANDBOX_HOST_PROJECT_ROOT supplies the sibling Docker host's checkout.
+    """
+    import json
+    import tomllib
+    from importlib.metadata import PackageNotFoundError, distribution
+    from urllib.parse import unquote, urlparse
+
+    package = Path(__file__).resolve().parent
+    candidates = {package.parent.parent, *Path.cwd().parents, Path.cwd()}
+    try:
+        origin = distribution("xagent-ai").read_text("direct_url.json")
+        if origin:
+            url = urlparse(json.loads(origin).get("url", ""))
+            if url.scheme == "file" and url.netloc in ("", "localhost"):
+                candidates.add(Path(unquote(url.path)))
+    except (PackageNotFoundError, OSError, ValueError):
+        pass
+    roots = {package}
+    for checkout in candidates:
+        try:
+            project = tomllib.loads((checkout / "pyproject.toml").read_text())
+            if project.get("project", {}).get("name") != "xagent-ai":
+                continue
+            if (checkout / "src" / "xagent").is_dir():
+                roots.add((checkout / "src" / "xagent").resolve())
+                roots.add((checkout / "tests").resolve())
+                roots.update(_platform_git_roots(checkout))
+        except (OSError, ValueError):
+            continue
+    host_checkout = get_sandbox_host_project_root()
+    if host_checkout is not None:
+        roots.update({host_checkout / "src" / "xagent", host_checkout / "tests"})
+        roots.update(_platform_git_roots(host_checkout))
+    return sorted(root.resolve() for root in roots)
+
+
+def get_legacy_source_uploads_dir() -> Path:
+    """Fixed historical data subtree, used only by source-isolation checks.
+
+    This is not an operator-configurable root. Upload configuration must not
+    turn arbitrary application directories into exempt data mounts.
+    """
+    return Path(__file__).resolve().parent / "web" / "uploads"
 
 
 def get_uploads_dir() -> Path:
@@ -4055,12 +4198,21 @@ def get_sandbox_volumes(
     return volumes
 
 
+def get_sandbox_enabled() -> bool:
+    """Whether task execution requires a sandbox (SANDBOX_ENABLED, default false).
+
+    When enabled, an unavailable sandbox must fail closed rather than executing
+    generated commands in the application process.
+    """
+    return _get_bool_env("SANDBOX_ENABLED", False)
+
+
 def get_sandbox_host_project_root() -> Path | None:
-    """Get the host project root used for Docker sibling sandbox code mounts.
+    """Get the host checkout root used to reject unsafe sandbox source mounts.
 
     Priority:
     1. XAGENT_SANDBOX_HOST_PROJECT_ROOT environment variable
-    2. None, which lets callers use their local runtime project root
+    2. None, which checks only the local application source paths
 
     Returns:
         Path to the project root as resolved from the Docker host's perspective,
@@ -4752,3 +4904,166 @@ def get_zendesk_marketplace_headers() -> dict[str, str]:
             continue
         headers[header] = value
     return headers
+
+
+# Public browser entries are deliberately independent of protocol/API bases.
+PUBLIC_ENTRIES_JSON = "XAGENT_PUBLIC_ENTRIES_JSON"
+PRIMARY_PUBLIC_SITE_URL = "XAGENT_PRIMARY_PUBLIC_SITE_URL"
+DUAL_ENTRY_OAUTH_ENABLED = "XAGENT_DUAL_ENTRY_OAUTH_ENABLED"
+OAUTH_AUTHORIZATION_ENTRY_BASE_URL = "XAGENT_OAUTH_AUTHORIZATION_ENTRY_BASE_URL"
+OAUTH_CALLBACK_ORIGIN_MAP = "XAGENT_OAUTH_CALLBACK_ORIGIN_MAP"
+
+
+def normalize_public_origin(value: str) -> str:
+    """Validate an exact HTTP origin, normalizing case and default ports."""
+    if not isinstance(value, str) or any(c.isspace() for c in value) or "\\" in value:
+        raise ValueError("Invalid public origin")
+    parts = urlsplit(value)
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.path not in {"", "/"}
+        or parts.query
+        or parts.fragment
+        or "?" in value
+        or "#" in value
+    ):
+        raise ValueError("Invalid public origin")
+    host = parts.hostname.lower()
+    if not re.fullmatch(r"[a-z0-9.-]+", host) or ".." in host:
+        raise ValueError("Invalid public origin host")
+    port = parts.port
+    suffix = (
+        ""
+        if port is None or (parts.scheme, port) in {("https", 443), ("http", 80)}
+        else f":{port}"
+    )
+    return f"{parts.scheme}://{host}{suffix}"
+
+
+@dataclass(frozen=True)
+class PublicEntry:
+    origin: str
+    region_cookie_domain: str | None
+    google_oidc_redirect_uri: str | None
+
+
+def public_entries_configured() -> bool:
+    return bool(os.getenv(PUBLIC_ENTRIES_JSON))
+
+
+def get_legacy_public_origin() -> str:
+    """Extract the normalized legacy origin for explicit-entry validation.
+
+    Only meaningful when ``XAGENT_PUBLIC_ENTRIES_JSON`` is configured; it raises
+    for origins that explicit entries could not represent.
+    """
+    parts = urlsplit(get_app_base_url() or get_frontend_url())
+    return normalize_public_origin(f"{parts.scheme}://{parts.netloc}")
+
+
+def get_public_entries() -> tuple[PublicEntry, ...]:
+    """Return trusted entries; explicit null cookie domains remain host-only."""
+    raw = os.getenv(PUBLIC_ENTRIES_JSON)
+    if not raw:
+        # Unconfigured deployments keep their exact legacy frontend origin.
+        # The strict origin validation below applies only to explicit entries,
+        # so hosts such as ``http://xagent_web:3000`` keep working unchanged.
+        # The legacy entry carries no cookie domain: hosting layers keep their
+        # own region-cookie configuration when entries are not configured.
+        parts = urlsplit(get_app_base_url() or get_frontend_url())
+        return (
+            PublicEntry(
+                f"{parts.scheme}://{parts.netloc}",
+                None,
+                get_google_oidc_redirect_uri(),
+            ),
+        )
+    records = json.loads(raw)
+    if not isinstance(records, list) or not records:
+        raise ValueError("Public entries must be a nonempty array")
+    entries = []
+    hosts = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "origin",
+            "region_cookie_domain",
+            "google_oidc_redirect_uri",
+        }:
+            raise ValueError("Invalid public entry fields")
+        origin = normalize_public_origin(record["origin"])
+        host = urlsplit(origin).netloc
+        if host in hosts:
+            raise ValueError("Duplicate public entry host")
+        hosts.add(host)
+        domain = record["region_cookie_domain"]
+        if domain is not None:
+            if not isinstance(domain, str) or not domain or domain.lower() != domain:
+                raise ValueError("Invalid cookie domain")
+            bare = domain.lstrip(".")
+            hostname = urlsplit(origin).hostname
+            assert hostname is not None
+            if not bare or not (hostname == bare or hostname.endswith("." + bare)):
+                raise ValueError("Cookie domain does not match entry")
+        callback = record["google_oidc_redirect_uri"]
+        if not isinstance(callback, str):
+            raise ValueError("Invalid Google callback")
+        callback_parts = urlsplit(callback)
+        if (
+            normalize_public_origin(
+                f"{callback_parts.scheme}://{callback_parts.netloc}"
+            )
+            != origin
+            or callback_parts.path != "/api/auth/oidc/google/callback"
+            or callback_parts.query
+            or callback_parts.fragment
+            or "?" in callback
+            or "#" in callback
+        ):
+            raise ValueError("Google callback must belong to entry")
+        entries.append(PublicEntry(origin, domain, callback))
+    legacy = get_legacy_public_origin()
+    if legacy not in {entry.origin for entry in entries}:
+        raise ValueError("Public entries must retain the legacy entry")
+    return tuple(entries)
+
+
+def get_primary_public_site_url() -> str | None:
+    value = os.getenv(PRIMARY_PUBLIC_SITE_URL)
+    if not value:
+        return get_app_base_url()
+    origin = normalize_public_origin(value)
+    if origin not in {entry.origin for entry in get_public_entries()}:
+        raise ValueError("Primary site must be a trusted public entry")
+    return origin
+
+
+def get_dual_entry_oauth_enabled() -> bool:
+    return _get_bool_env(DUAL_ENTRY_OAUTH_ENABLED, False)
+
+
+def get_oauth_authorization_entry_origin() -> str:
+    origin = normalize_public_origin(
+        os.getenv(OAUTH_AUTHORIZATION_ENTRY_BASE_URL)
+        or get_public_api_base_url()
+        or get_app_base_url()
+        or get_frontend_url()
+    )
+    if origin not in {entry.origin for entry in get_public_entries()}:
+        raise ValueError("Authorization origin must be a trusted public entry")
+    return origin
+
+
+def get_oauth_callback_origin_map() -> dict[str, str]:
+    values = json.loads(os.getenv(OAUTH_CALLBACK_ORIGIN_MAP) or "{}")
+    if not isinstance(values, dict):
+        raise ValueError("Callback origin map must be an object")
+    result = {
+        normalize_public_origin(k): normalize_public_origin(v)
+        for k, v in values.items()
+    }
+    if any(v not in {e.origin for e in get_public_entries()} for v in result.values()):
+        raise ValueError("Callback completion origin must be trusted")
+    return result

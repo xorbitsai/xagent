@@ -380,13 +380,16 @@ async def test_telegram_voice_refused_by_the_gate_tells_the_user_why(
 
     _setup_admin_headers()
     db = _db_session()
-    gate_calls: list[tuple[int, str]] = []
+    gate_calls: list[tuple[int, str, tuple[str, ...]]] = []
 
-    def gate(user_id: int, source: str) -> str:
-        gate_calls.append((user_id, source))
+    def gate(user_id: int, source: str, model_ids: tuple[str, ...]) -> str:
+        gate_calls.append((user_id, source, model_ids))
         return "Your team is out of AI credits."
 
     class _FakeASR:
+        # Stamped by get_asr_model_instance from the channel's model row.
+        model_id = "owner-asr"
+
         def __init__(self) -> None:
             self.closed = False
 
@@ -421,7 +424,7 @@ async def test_telegram_voice_refused_by_the_gate_tells_the_user_why(
         await bot._process_user_messages_batch(123, [message])
 
         assert message.answers == ["Your team is out of AI credits. (Task ID: 1)"]
-        assert [source for _user_id, source in gate_calls] == ["telegram_voice"]
+        assert [call[1:] for call in gate_calls] == [("telegram_voice", ("owner-asr",))]
         assert asr_model.closed is True
     finally:
         quota_hooks.set_standalone_gate_hook(None)

@@ -2638,6 +2638,27 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestComposioReconcileConfig:
+    """How often unbound Composio accounts are cleaned up (#3548)."""
+
+    def test_off_unless_set(self, monkeypatch):
+        from xagent.config import get_composio_reconcile_interval_seconds
+
+        monkeypatch.delenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", raising=False)
+        assert get_composio_reconcile_interval_seconds() is None
+        monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", " ")
+        assert get_composio_reconcile_interval_seconds() is None
+
+    def test_a_set_interval_has_a_floor(self, monkeypatch):
+        from xagent.config import get_composio_reconcile_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", "900")
+        assert get_composio_reconcile_interval_seconds() == 900
+        for invalid in ("5", "hourly"):
+            monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", invalid)
+            assert get_composio_reconcile_interval_seconds() is None
+
+
 class TestTaskCleanupRetryConfig:
     """Config for retrying the external cleanup a task deletion owes (#2587)."""
 
@@ -4774,3 +4795,64 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+def test_public_site_configuration_is_opt_in(monkeypatch):
+    from xagent.config import (
+        get_dual_entry_oauth_enabled,
+        get_primary_public_site_url,
+        get_public_entries,
+    )
+
+    monkeypatch.delenv("XAGENT_PUBLIC_ENTRIES_JSON", raising=False)
+    monkeypatch.delenv("XAGENT_PRIMARY_PUBLIC_SITE_URL", raising=False)
+    monkeypatch.delenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://legacy.example")
+    monkeypatch.setenv("XAGENT_REGION_COOKIE_DOMAIN", ".legacy.example")
+    assert get_primary_public_site_url() == "https://legacy.example"
+    # The unconfigured legacy entry never carries a hosting cookie domain.
+    assert get_public_entries()[0].region_cookie_domain is None
+    assert not get_dual_entry_oauth_enabled()
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, False), ("true", True), ("false", False)]
+)
+def test_get_sandbox_enabled(monkeypatch, value, expected):
+    from xagent.config import get_sandbox_enabled
+
+    if value is None:
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SANDBOX_ENABLED", value)
+    assert get_sandbox_enabled() is expected
+
+
+def test_legacy_source_uploads_boundary_ignores_operator_overrides(monkeypatch):
+    from xagent.config import get_legacy_source_uploads_dir
+
+    expected = get_legacy_source_uploads_dir()
+    monkeypatch.setenv("XAGENT_WEB_DIR", "/unrelated")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", "/")
+    assert get_legacy_source_uploads_dir() == expected
+
+
+def test_platform_git_roots_follow_relative_alternates_without_looping(
+    tmp_path, monkeypatch
+):
+    from xagent.config import get_platform_source_roots
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "xagent").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text('[project]\nname = "xagent-ai"\n')
+    objects = checkout / ".git" / "objects"
+    pool = tmp_path / "pool"
+    for path in (objects, pool):
+        (path / "info").mkdir(parents=True)
+    (objects / "info" / "alternates").write_text(os.path.relpath(pool, objects) + "\n")
+    (pool / "info" / "alternates").write_text(os.path.relpath(objects, pool) + "\n")
+    monkeypatch.chdir(checkout)
+    roots = get_platform_source_roots()
+    assert (checkout / ".git").resolve() in roots
+    assert objects.resolve() in roots
+    assert pool.resolve() in roots

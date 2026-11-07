@@ -193,7 +193,7 @@ const webSearchTool = {
   name: "web_search_tool",
   description: "",
   type: "builtin",
-  category: "web_search",
+  category: "web_tools",
   enabled: true,
   always_available: false,
 }
@@ -329,7 +329,7 @@ describe("AgentBuilder catalog lists load independently", () => {
     fireEvent.click(within(toolsSection()).getByText("common.retry"))
 
     await waitFor(() =>
-      expect(within(toolsSection()).getByTestId("multi-select")).toHaveTextContent("web_search")
+      expect(within(toolsSection()).getByTestId("multi-select")).toHaveTextContent("web_tools")
     )
     expect(calls("/api/tools/available?include_usage=false")).toBe(2)
     expect(within(toolsSection()).queryByText("builds.configForm.listLoadFailed")).toBeNull()
@@ -393,7 +393,7 @@ describe("AgentBuilder catalog lists load independently", () => {
 describe("AgentBuilder tools summary while tools load", () => {
   it("hides the selected-tools count until the tools list has loaded", async () => {
     const tools = gate({ tools: [webSearchTool] })
-    installApi({ tools: tools.handler, agent: json(agentResponse({ tool_categories: ["web_search"] })) })
+    installApi({ tools: tools.handler, agent: json(agentResponse({ tool_categories: ["web_tools"] })) })
     render(<AgentBuilder agentId={AGENT_ID} />)
 
     await waitFor(() => expect(screen.getByDisplayValue("Catalog Agent")).toBeInTheDocument())
@@ -457,7 +457,7 @@ describe("AgentBuilder template entry with lists still loading", () => {
     installApi({
       tools: hang,
       template: json(templateResponse({
-        agent_config: { instructions: "Do it.", skills: [], tool_categories: ["web_search"] },
+        agent_config: { instructions: "Do it.", skills: [], tool_categories: ["web_tools"] },
       })),
     })
     render(<AgentBuilder />)

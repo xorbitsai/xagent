@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, Union
 
+from ...tools.core.media_errors import redact_provider_detail
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
     measure_audio_seconds_async,
@@ -282,7 +283,7 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
                 return str(result)
 
         except Exception as e:
-            logger.error(f"Xinference ASR failed: {e}")
+            logger.error("Xinference ASR failed: %s", redact_provider_detail(e))
             raise RuntimeError(f"Xinference ASR failed: {str(e)}") from e
 
         finally:
@@ -415,5 +416,8 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
             return result
 
         except Exception as e:
-            logger.error(f"Failed to fetch ASR models from Xinference: {e}")
+            logger.error(
+                "Failed to fetch ASR models from Xinference: %s",
+                redact_provider_detail(e),
+            )
             return []

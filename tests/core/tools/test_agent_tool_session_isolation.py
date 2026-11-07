@@ -1640,3 +1640,68 @@ def test_agent_tool_does_not_share_a_live_session_with_child_config(monkeypatch)
             os.remove(db_path)
         except OSError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_delegation_inherits_parent_sandbox_without_mutating_shared_tool(
+    monkeypatch, tmp_path
+):
+    from xagent.core.workspace import TaskWorkspace
+
+    async def execute_task():
+        return {"output": "completed"}
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    captured = {}
+
+    def config(**kwargs):
+        captured.update(kwargs)
+        return _SucceedingCloseConfig()
+
+    monkeypatch.setattr(mod, "WebToolConfig", config)
+    parent = TaskWorkspace(id="parent", base_dir=str(tmp_path))
+    sandbox = object()
+    original = _delegated_agent_tool()
+    bound = original.with_sandbox(sandbox, parent)
+    monkeypatch.setattr(bound, "_create_child_execution_tracer", lambda **_kwargs: None)
+    result = await bound.run_json_async({"task": "run"})
+    assert result["response"] == "completed", result
+    assert bound is not original
+    assert original._sandbox is None
+    assert captured["sandbox"] is sandbox
+    assert captured["workspace_config"]["base_dir"] == str(parent.temp_dir)
+    assert captured["workspace_config"]["task_id"] != "parent"
+
+
+@pytest.mark.asyncio
+async def test_factory_binds_delegation_to_parent_sandbox_and_workspace(
+    monkeypatch, tmp_path
+):
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
+    from xagent.core.workspace import TaskWorkspace
+
+    class MountedSandbox:
+        def workspace_dirs_are_host_mounted(self, _directories):
+            return True
+
+    parent = TaskWorkspace(id="parent", base_dir=str(tmp_path))
+    original = _delegated_agent_tool()
+    sandbox = MountedSandbox()
+    config = ToolConfig({})
+    config.set_task_runtime_workspace(parent)
+    monkeypatch.setattr(config, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(
+        ToolRegistry, "create_registered_tools", AsyncMock(return_value=[original])
+    )
+    monkeypatch.setattr(
+        ToolFactory, "_apply_output_filters", lambda tools, _config: tools
+    )
+    tools = await ToolFactory._create_all_tools_prepared(config)
+    assert len(tools) == 1
+    assert tools[0] is not original
+    assert tools[0]._sandbox is sandbox
+    assert tools[0]._workspace_base_dir == str(parent.temp_dir)
+    assert original._sandbox is None

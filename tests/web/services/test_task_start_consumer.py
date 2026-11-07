@@ -202,7 +202,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
 
     from xagent.web.models.chat_message import TaskChatMessage
     from xagent.web.services import task_event_bridge
-    from xagent.web.services.task_existing_command import enqueue_existing_execution
+    from xagent.web.services.task_existing_command import stage_existing_execution
 
     monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
     with get_session_local()() as db:
@@ -215,7 +215,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         previous_owner = (task.runner_id, task.lease_attempt_id)
         owner_id = task.user_id
         before = db.query(TaskChatMessage).filter_by(task_id=task.id).count()
-    run_id = enqueue_existing_execution(
+    command_db_id = stage_existing_execution(
         task_id=accepted.task_id,
         task_owner_user_id=owner_id,
         actor_user_id=owner_id,
@@ -223,6 +223,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         context={"execution_mode": "react"},
     )
     with get_session_local()() as db:
+        run_id = db.get(TaskExecutionCommand, command_db_id).target_run_id
         task = db.get(Task, accepted.task_id)
         assert task.run_id != run_id
         assert task.output == "previous answer"

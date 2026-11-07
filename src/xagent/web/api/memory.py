@@ -17,6 +17,7 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
+from ..revocable_memory_store import unwrap_memory_store
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.memory_binding import (
     MemoryBindingResolutionError,
@@ -91,6 +92,17 @@ def memory_operation() -> Iterator[None]:
         yield
     except MemoryUnavailableError as error:
         raise HTTPException(status_code=503, detail=error.status.detail) from None
+
+
+def _embedding_model_ids(store: MemoryStore) -> tuple[str, ...]:
+    """The embedding model ``store`` calls, for the standalone usage gate.
+
+    The deployment's memory embedding authority, under the billing id it was
+    given; none when it has no billing id (it is then recorded unpriced) or
+    the store does not embed.
+    """
+    model_id = getattr(unwrap_memory_store(store), "embedding_usage_model_id", "")
+    return (model_id,) if isinstance(model_id, str) and model_id else ()
 
 
 class MemoryListRequest(BaseModel):
@@ -268,6 +280,7 @@ class MemoryManagementRouter:
                                 async with usage_scope(
                                     request_binding.user_id,
                                     usage_source="memory_api",
+                                    model_ids=_embedding_model_ids(store),
                                 ):
                                     memories = store.search(
                                         query=search,
@@ -398,7 +411,9 @@ class MemoryManagementRouter:
 
                     # Update in store; re-embeds the note.
                     async with usage_scope(
-                        request_binding.user_id, usage_source="memory_api"
+                        request_binding.user_id,
+                        usage_source="memory_api",
+                        model_ids=_embedding_model_ids(store),
                     ):
                         response = store.update(updated_memory)
                     if response.success:
@@ -469,7 +484,9 @@ class MemoryManagementRouter:
 
                     # Embeds the note.
                     async with usage_scope(
-                        request_binding.user_id, usage_source="memory_api"
+                        request_binding.user_id,
+                        usage_source="memory_api",
+                        model_ids=_embedding_model_ids(store),
                     ):
                         response = store.add(memory_note)
                     if response.success:

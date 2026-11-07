@@ -1,16 +1,18 @@
-"""Accept legacy execute_task without creating another transcript message."""
+"""Accept legacy execute_task without creating another transcript message.
+
+The accepted START is consumed by ``task_start_consumer`` in both modes."""
 
 from typing import cast
 from uuid import uuid4
 
 from sqlalchemy import select
 
+from ...config import get_shared_task_execution_enabled
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.user import User
 from .mcp_runtime import MCPBuiltinOAuthActorPolicyRequiredError
-from .task_command_transport import notify_task_command_dispatcher
 from .task_event_bridge import get_task_event_bridge
 from .task_orchestrator import TaskTurnError, reserve_task_start_no_commit
 from .task_runtime import mcp_runtime_authorization_policy_required
@@ -21,15 +23,23 @@ from .task_start_protocol import (
 )
 
 
-def enqueue_existing_execution(
+def stage_existing_execution(
     *,
     task_id: int,
     task_owner_user_id: int,
     task_description: str,
     context: dict,
     actor_user_id: int,
-) -> str:
-    get_task_event_bridge().require_ready()
+) -> int:
+    """Durably accept ``execute_task`` as a START of kind ``existing``.
+
+    Returns the START's command row id, so the caller can dispatch it
+    promptly. Works in both modes: shared execution additionally requires the
+    event bridge; combined mode stages the same command and the dispatcher
+    consumes it through the same handoff with a local owner.
+    """
+    if get_shared_task_execution_enabled():
+        get_task_event_bridge().require_ready()
     run_id, turn_id = str(uuid4()), uuid4().hex
     with get_session_local()() as db:
         task = db.execute(
@@ -108,5 +118,4 @@ def enqueue_existing_execution(
                     or saved.payload != start.model_dump(mode="json")
                 ):
                     raise
-    notify_task_command_dispatcher()
-    return run_id
+    return int(staged.staged_db_id)

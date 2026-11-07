@@ -906,3 +906,27 @@ describe("ToolsPage signed upload settings", () => {
     expect(requests.put[0]).toStrictEqual({ signed_uploads: expected })
   })
 })
+
+it("groups search provider configuration with Web Tools rather than Basic Tools", async () => {
+  installApiMock()
+  const fallback = apiRequestMock.getMockImplementation()!
+  apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/api/tools/available")) return jsonResponse({ tools: [
+      { name: "ask_user_question", description: "Ask", type: "builtin", category: "basic_tools", enabled: true },
+      { name: "api_call", description: "HTTP", type: "builtin", category: "web_tools", enabled: true },
+    ] })
+    if (url.endsWith("/api/tools/configurable")) return jsonResponse({ tools: [
+      { tool_name: "tavily_web_search", display_name: "Tavily Search Configuration", category: "web_tools", configured: false, fields: {} },
+    ] })
+    return fallback(url, init)
+  })
+  await renderPage()
+  await screen.findByText("Tavily Search Configuration")
+  fireEvent.click(screen.getByRole("tab", { name: "Basic Tools" }))
+  expect(screen.getByText("ask_user_question")).toBeInTheDocument()
+  expect(screen.queryByText("Tavily Search Configuration")).not.toBeInTheDocument()
+  expect(screen.queryByText("api_call")).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole("tab", { name: "Web Tools" }))
+  expect(screen.getByText("Tavily Search Configuration")).toBeInTheDocument()
+  expect(screen.getByText("api_call")).toBeInTheDocument()
+})

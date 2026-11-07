@@ -123,7 +123,11 @@ class TestChromeDaemonClient:
         assert result == {"running": True}
         run = sandbox.exec.await_args_list[0]
         assert run.args[0] == "python"
-        assert "chrome_daemon_runner.py" in run.args[1]
+        assert run.args[1:3] == ("-I", "-c")
+        assert "--request-file" in run.args
+        request = json.loads(sandbox.write_file.await_args.args[0])
+        assert request["kind"] == "chrome"
+        assert request["arguments"][:3] == ["status", "--session-id", "a" * 32]
         assert run.kwargs["env"] == {
             "NPM_CONFIG_CACHE": "/opt/npm-cache",
             "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",
@@ -590,3 +594,32 @@ class TestChromeExecutionSessionPool:
             and record.exc_info is not None
             for record in caplog.records
         )
+
+
+@pytest.mark.asyncio
+async def test_request_upload_failure_is_retryable_transport_error():
+    sandbox = _sandbox()
+    sandbox.write_file.side_effect = [OSError("temporary write error"), None]
+    sandbox.exec.side_effect = [
+        ExecResult(exit_code=0, stdout="", stderr=""),  # failed request cleanup
+        ExecResult(exit_code=0, stdout="", stderr=""),
+        ExecResult(exit_code=0, stdout="16", stderr=""),
+        ExecResult(exit_code=0, stdout="", stderr=""),
+    ]
+    sandbox.read_file.return_value = '{"running":true}'
+    client = ChromeDaemonClient(sandbox, session_id="a" * 32)
+    with pytest.raises(ChromeSessionTransportError, match="request upload failed"):
+        await client.status()
+    assert client.result_cleanup_failed is False
+    assert await client.status() == {"running": True}
+
+
+@pytest.mark.asyncio
+async def test_request_upload_cancellation_is_not_wrapped():
+    sandbox = _sandbox()
+    sandbox.write_file.side_effect = asyncio.CancelledError()
+    sandbox.exec.return_value = ExecResult(exit_code=0, stdout="", stderr="")
+    client = ChromeDaemonClient(sandbox, session_id="a" * 32)
+    with pytest.raises(asyncio.CancelledError):
+        await client.status()
+    assert sandbox.exec.await_args.args[:2] == ("rm", "-f")

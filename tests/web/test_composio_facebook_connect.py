@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from types import SimpleNamespace
@@ -19,7 +20,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from sqlalchemy import create_engine, event
+from cryptography.fernet import Fernet
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
@@ -86,6 +88,11 @@ class FakeComposio:
         self.account_overrides: dict[str, Any] = {}
         self.me_response: tuple[int, Any] | None = None
         self.raise_on: str | None = None
+        # Pages GET /connected_accounts returns, by cursor ("" is the first).
+        # cursor ("" for the first page; "<auth config>:<cursor>" for an auth
+        # config other than Facebook's) -> page, or an int status to fail it
+        self.listing: dict[str, dict[str, Any] | int] = {}
+        self.listing_status = 200
 
     def paths(self, method: str | None = None) -> list[str]:
         return [path for verb, path, _ in self.calls if method in (None, verb)]
@@ -134,6 +141,15 @@ class FakeComposio:
                     "toolkit_slug": "facebook",
                 },
             )
+        if method == "GET" and path.startswith("/connected_accounts?"):
+            query = {k: v[0] for k, v in parse_qs(urlsplit(path).query).items()}
+            config, cursor = query["auth_config_ids"], query.get("cursor", "")
+            key = cursor if config == AUTH_CONFIG_ID else f"{config}:{cursor}"
+            page = self.listing.get(key, {"items": []})
+            status = self.listing_status if isinstance(page, dict) else page
+            if status != 200:
+                return _Response(status, {"error": {"message": "x"}})
+            return _Response(200, page)
         if method == "GET" and path.startswith("/connected_accounts/"):
             account_id = path.rsplit("/", 1)[1]
             auth_config_id = self.auth_configs.get(account_id, AUTH_CONFIG_ID)
@@ -663,9 +679,7 @@ def test_a_reused_session_uri_is_not_completed_twice(
     response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 400
-    assert "start" in response.body.decode().lower() or "Connect again" in (
-        response.body.decode()
-    )
+    assert "already been used" in response.body.decode()
     assert composio.paths().count("/connected_accounts/complete_auth") == 1
     assert len(_grants(db)) == 1
 
@@ -728,12 +742,12 @@ def test_another_actors_begin_drops_the_first_actors_flow(
     assert (grant.resource_owner_key, grant.access_token) == (OTHER_OWNER, bob)
 
 
-def test_a_session_whose_flow_cookie_expired_is_not_left_active(
+def test_a_session_whose_flow_cookie_expired_is_left_to_the_reconciler(
     db_session, composio_env, composio
 ):
     """A's cookie expired while the member was on Facebook; B is still open.
     Composio activates A (same actor, same user id), which no open flow
-    created: it is deleted once Composio confirms it is this actor's."""
+    claims: nothing is bound or deleted, and B still completes."""
     db, user = db_session
     browser = Browser()
     _begin(db, user, browser)
@@ -746,7 +760,7 @@ def test_a_session_whose_flow_cookie_expired_is_not_left_active(
 
     assert response.status_code == 400
     assert _grants(db) == []
-    assert composio.paths("DELETE") == [f"/connected_accounts/{first}"]
+    assert composio.paths("DELETE") == []
     assert browser.get(db, _verify_url(composio, second)).status_code == 200
 
 
@@ -766,22 +780,21 @@ def test_a_begin_past_the_open_flow_limit_creates_no_link(
     assert composio.paths().count("/connected_accounts/link") == 3
 
 
-def test_a_reloaded_begin_deletes_nothing_and_its_old_link_is_cleaned_if_completed(
+def test_a_reloaded_begin_deletes_nothing_and_the_current_link_still_completes(
     db_session, composio_env, composio
 ):
     """The original window may be completing the replaced link while the
-    reload runs, so the reload deletes nothing. If that old link's session
-    comes back later, no open flow claims it and it is removed there."""
+    reload runs, so the reload deletes nothing; a late completion of the old
+    link is not bound and is left to the reconciler."""
     db, user = db_session
     browser = Browser()
     start = _start(db, user, browser)
     assert browser.get(db, start.headers["location"]).status_code == 302
     assert browser.get(db, start.headers["location"]).status_code == 302
     replaced, current = composio.created
-    assert composio.paths("DELETE") == []
 
     assert browser.get(db, _verify_url(composio, replaced)).status_code == 400
-    assert composio.paths("DELETE") == [f"/connected_accounts/{replaced}"]
+    assert composio.paths("DELETE") == []
     assert browser.get(db, _verify_url(composio, current)).status_code == 200
     assert _grants(db)[0].access_token == current
 
@@ -814,15 +827,16 @@ def test_a_reload_racing_a_completion_never_deletes_the_bound_account(
     assert f"/connected_accounts/{first}" not in composio.paths("DELETE")
 
 
-@pytest.mark.parametrize("lost_answer", [False, True], ids=["reply", "lost-reply"])
 @pytest.mark.parametrize("flow_end", ["expired", "spent-by-another-request"])
-def test_completion_crossing_the_deadline_cleans_only_an_unspent_flow(
-    db_session, composio_env, composio, monkeypatch, lost_answer, flow_end
+def test_completion_crossing_the_deadline_never_binds_or_deletes(
+    db_session, composio_env, composio, monkeypatch, flow_end
 ):
+    """The flow ends while complete_auth is in flight: either it expires (no
+    grant may be stored after that) or another request spends and binds it
+    (its account must survive)."""
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
     account = composio.created[0]
-    composio.lose_completion = lost_answer
     complete = composio_auth.complete_auth
 
     def complete_as_flow_ends(*args, **kwargs):
@@ -830,8 +844,6 @@ def test_completion_crossing_the_deadline_cleans_only_an_unspent_flow(
             return complete(*args, **kwargs)
         finally:
             if flow_end == "expired":
-                # The request began in time, but its network call crossed the
-                # deadline. The server-side flow still exists, unclaimed.
                 db.query(ActorOAuthFlowState).update(
                     {
                         ActorOAuthFlowState.expires_at: datetime.now(timezone.utc)
@@ -840,108 +852,62 @@ def test_completion_crossing_the_deadline_cleans_only_an_unspent_flow(
                 )
                 db.commit()
             else:
-                # Another request owns the flow now and has bound its account.
                 db.query(ActorOAuthFlowState).delete()
                 _store_composio_grant(db, user, account_id=account)
 
     monkeypatch.setattr(composio_auth, "complete_auth", complete_as_flow_ends)
     response = browser.get(db, _verify_url(composio, account))
 
-    assert response.status_code == (503 if lost_answer else 400)
-    assert account in composio.completed
-    assert db.query(ActorOAuthFlowState).count() == 0
+    assert response.status_code == 400
+    assert composio.paths("DELETE") == []
     if flow_end == "expired":
         assert _grants(db) == []
-        assert composio.paths("DELETE") == [f"/connected_accounts/{account}"]
     else:
         assert _grants(db)[0].access_token == account
-        assert composio.paths("DELETE") == []
 
 
-def test_a_lost_completion_ends_the_flow_composio_activated(
-    db_session, composio_env, composio
+@pytest.mark.parametrize("loss", ["timeout", "no-id"])
+def test_a_lost_answer_spends_and_deletes_nothing(
+    db_session, composio_env, composio, loss
 ):
-    """Composio activated the account, then the answer was lost (R2)."""
+    """Composio may have activated the account; which one cannot be told, so
+    nothing is spent or deleted and the reconciler handles an unbound one."""
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
-    composio.lose_completion = True
+    if loss == "timeout":
+        composio.lose_completion = True
+    else:
+        composio.complete_without_id = True
 
     response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 503
     assert _grants(db) == []
-    assert db.query(ActorOAuthFlowState).count() == 0
-    assert _flow_cookies(browser) == []
-    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+    assert composio.paths("DELETE") == []
+    assert db.query(ActorOAuthFlowState).count() == 1
 
 
-def test_a_lost_completion_among_several_flows_ends_only_the_activated_one(
-    db_session, composio_env, composio
+def test_a_lost_answer_never_touches_a_flow_another_window_just_completed(
+    db_session, composio_env, composio, monkeypatch
 ):
+    """Window A has completed flow 1 but not spent it yet when window B's
+    complete_auth for flow 2 loses its answer. A still binds flow 1."""
     db, user = db_session
     browser = Browser()
     _begin(db, user, browser)
     _begin(db, user, browser)
     first, second = composio.created
+    composio.completed.add(first)  # A's complete_auth already activated it
     composio.lose_completion = True
 
-    response = browser.get(db, _verify_url(composio, second))
+    assert browser.get(db, _verify_url(composio, second)).status_code == 503
 
-    assert response.status_code == 503
-    assert composio.paths("DELETE") == [f"/connected_accounts/{second}"]
-    # The other flow is untouched and still completes.
-    assert db.query(ActorOAuthFlowState).count() == 1
+    assert composio.paths("DELETE") == []
+    assert db.query(ActorOAuthFlowState).count() == 2
     composio.lose_completion = False
+    composio.completed.discard(first)
     assert browser.get(db, _verify_url(composio, first)).status_code == 200
-
-
-def test_a_lost_answer_before_activation_deletes_nothing(
-    db_session, composio_env, composio
-):
-    db, user = db_session
-    browser, _ = _connect_until_verification(db, user)
-    composio.raise_on = "/connected_accounts/complete_auth"
-
-    response = browser.get(db, _verify_url(composio))
-
-    assert response.status_code == 503
-    assert composio.paths("DELETE") == []
-    assert db.query(ActorOAuthFlowState).count() == 1
-
-
-def test_a_lost_completion_of_an_expired_flow_does_not_end_another_flow(
-    db_session, composio_env, composio
-):
-    """A's cookie expired and B is open; A's lost completion must not be
-    pinned on B just because B is the only open flow."""
-    db, user = db_session
-    browser = Browser()
-    _begin(db, user, browser)
-    first_cookie = _flow_cookies(browser)[0]
-    _begin(db, user, browser)
-    first, second = composio.created
-    browser.cookies.pop(first_cookie)
-    composio.lose_completion = True
-
-    response = browser.get(db, _verify_url(composio, first))
-
-    assert response.status_code == 503
-    assert composio.paths("DELETE") == []
-    composio.lose_completion = False
-    assert browser.get(db, _verify_url(composio, second)).status_code == 200
-
-
-def test_a_completion_without_an_id_is_handled_as_a_lost_answer(
-    db_session, composio_env, composio
-):
-    db, user = db_session
-    browser, _ = _connect_until_verification(db, user)
-    composio.complete_without_id = True
-
-    response = browser.get(db, _verify_url(composio))
-
-    assert response.status_code == 503
-    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+    assert _grants(db)[0].access_token == first
 
 
 def _denied_url(account_id: str) -> str:
@@ -968,7 +934,8 @@ def test_a_denied_authorization_says_what_to_do_and_ends_its_flow(
     assert _grants(db) == []
     assert db.query(ActorOAuthFlowState).count() == 0
     assert _flow_cookies(browser) == []
-    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+    # The unfinished account is left to the reconciler.
+    assert composio.paths("DELETE") == []
 
 
 def test_a_denied_return_for_an_account_no_flow_created_deletes_nothing(
@@ -986,7 +953,7 @@ def test_a_denied_return_for_an_account_no_flow_created_deletes_nothing(
     assert len(_flow_cookies(browser)) == 1
 
 
-def test_a_return_without_verification_tells_operators_and_deletes_the_account(
+def test_a_return_without_verification_tells_operators_and_ends_the_flow(
     db_session, composio_env, composio, caplog
 ):
     """A Composio project without OAuth user verification activates the
@@ -1004,7 +971,7 @@ def test_a_return_without_verification_tells_operators_and_deletes_the_account(
     assert "verification_not_configured" in caplog.text
     assert _grants(db) == []
     assert db.query(ActorOAuthFlowState).count() == 0
-    assert composio.paths("DELETE") == [f"/connected_accounts/{account}"]
+    assert composio.paths("DELETE") == []
 
 
 def test_a_bare_success_return_is_not_logged_as_an_operator_error(
@@ -1084,8 +1051,6 @@ def test_an_account_this_flow_did_not_create_is_not_stored_or_deleted(
 
     assert response.status_code == 400
     assert _grants(db) == []
-    # Looked up, found not to be this actor's, and left alone.
-    assert "/connected_accounts/ca_belongs_to_someone_else" in composio.paths("GET")
     assert composio.paths("DELETE") == []
 
 
@@ -1107,7 +1072,7 @@ def test_no_facebook_identity_stores_nothing(
 
     response = browser.get(db, _verify_url(composio))
 
-    assert response.status_code in (400, 503)
+    assert response.status_code == 503
     assert _grants(db) == []
     assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
 
@@ -1412,9 +1377,11 @@ def test_an_instagram_only_deployment_connects_instagram(instagram_only):
     assert composio.paths("DELETE") == []
 
 
-def test_an_instagram_only_deployment_deletes_an_unclaimed_account(instagram_only):
-    """The first flow's cookie is gone when its session returns; the account
-    is recognised by the Instagram auth config and deleted."""
+def test_an_instagram_only_deployment_leaves_an_unclaimed_account_to_the_reconciler(
+    instagram_only,
+):
+    """The first flow's cookie is gone when its session returns: the account
+    is not bound, and nothing is deleted."""
     db, user, composio = instagram_only
     browser = Browser()
     _begin(db, user, browser, app_id="instagram")
@@ -1427,7 +1394,7 @@ def test_an_instagram_only_deployment_deletes_an_unclaimed_account(instagram_onl
 
     assert response.status_code == 400
     assert _grants(db) == []
-    assert composio.paths("DELETE") == [f"/connected_accounts/{lost}"]
+    assert composio.paths("DELETE") == []
 
 
 def test_instagram_start_refuses_without_its_auth_config(
@@ -1465,11 +1432,13 @@ def test_the_open_flow_limit_counts_facebook_and_instagram_together(
 @pytest.mark.parametrize(
     "config_removed", [False, True], ids=["configured", "config-removed"]
 )
-def test_a_denied_instagram_flow_ends_and_deletes_its_account(
+def test_a_denied_instagram_flow_ends_even_without_its_config(
     instagram_connect, monkeypatch, config_removed
 ):
-    """The account is deleted with the shared API key, so it is cleaned up
-    even when Instagram's auth config went away after the flow began."""
+    """The flow ends even when Instagram's auth config went away after it
+    began, and nothing is deleted here. The reconciler lists only auth
+    configs that are still set, so with the config removed the unfinished
+    account stays in Composio (see the retirement steps in example.env)."""
     db, user, composio = instagram_connect
     browser, _ = _connect_until_verification(db, user, app_id="instagram")
     if config_removed:
@@ -1481,7 +1450,7 @@ def test_a_denied_instagram_flow_ends_and_deletes_its_account(
     assert "Permission was not granted" in response.body.decode()
     assert _grants(db) == []
     assert _flow_cookies(browser) == []
-    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+    assert composio.paths("DELETE") == []
 
 
 def test_instagram_connect_stores_an_instagram_grant(instagram_connect):
@@ -1572,10 +1541,10 @@ def test_one_apps_missing_config_does_not_block_the_others_verification(
     assert _flow_cookies(browser) == []
 
 
-def test_an_unclaimed_account_of_the_other_app_is_deleted(instagram_connect):
+def test_an_unclaimed_account_of_the_other_app_is_not_bound(instagram_connect):
     """The Instagram flow's cookie is gone and only a Facebook flow is open
-    when the Instagram session returns: the activated Instagram account is
-    still recognised as this actor's and deleted."""
+    when the Instagram session returns: the Facebook flow does not take the
+    Instagram account, and nothing is deleted."""
     db, user, composio = instagram_connect
     browser = Browser()
     _begin(db, user, browser, app_id="instagram")
@@ -1588,7 +1557,7 @@ def test_an_unclaimed_account_of_the_other_app_is_deleted(instagram_connect):
 
     assert response.status_code == 400
     assert _grants(db) == []
-    assert composio.paths("DELETE") == [f"/connected_accounts/{instagram}"]
+    assert composio.paths("DELETE") == []
 
 
 @pytest.mark.parametrize(
@@ -1611,3 +1580,286 @@ def test_an_instagram_flow_refuses_a_facebook_account(instagram_connect, overrid
     assert response.status_code == 400
     assert _grants(db) == []
     assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+
+
+# --- Native callbacks and configuration -----------------------------------------
+
+
+def test_a_native_state_only_meta_callback_keeps_its_native_answer(
+    db_session, composio_env, composio, monkeypatch
+):
+    """Only a state carrying the Composio marker is a begin."""
+    db, user = db_session
+    monkeypatch.setenv(composio_auth.FACEBOOK_AUTH_BACKEND_ENV, "native")
+    browser = Browser()
+    native = _start(db, user, browser)
+    state = parse_qs(urlsplit(native.headers["location"]).query)["state"][0]
+
+    response = browser.get(db, composio_auth.begin_location(CALLBACK_URL, state))
+
+    assert response.status_code == 400
+    assert "Missing code or state" in response.body.decode()
+    assert composio.calls == []
+
+
+def test_a_denial_shaped_callback_is_native_while_the_switch_is_off(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, _ = db_session
+    monkeypatch.setenv(composio_auth.FACEBOOK_AUTH_BACKEND_ENV, "native")
+
+    response = Browser().get(
+        db, f"{CALLBACK_URL}?status=failed&connected_account_id=ca_x"
+    )
+
+    assert response.status_code == 400
+    assert "Permission was not granted" not in response.body.decode()
+    assert composio.calls == []
+
+
+@pytest.mark.parametrize("app_id", ["facebook", "instagram"])
+def test_an_unknown_backend_value_warns_and_stays_native(monkeypatch, caplog, app_id):
+    app = composio_auth.COMPOSIO_APPS[app_id]
+    monkeypatch.setenv(app.backend_env, "composio-x")
+    monkeypatch.setattr(composio_auth, "_WARNED_BACKENDS", set())
+
+    assert composio_auth.composio_app("meta", app_id) is None
+    assert composio_auth.composio_app("meta", app_id) is None
+
+    warnings = [r for r in caplog.records if "composio-x" in r.getMessage()]
+    assert len(warnings) == 1
+    assert app.backend_env in warnings[0].getMessage()
+
+
+def test_a_grant_that_cannot_be_stored_deletes_its_account(
+    db_session, composio_env, composio, monkeypatch
+):
+    """This request spent the flow, so the account is its own to delete."""
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+
+    def fail_to_store(*args, **kwargs):
+        raise RuntimeError("database is gone")
+
+    monkeypatch.setattr(composio_auth, "_store_grant", fail_to_store)
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 500
+    assert _grants(db) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+
+
+# --- Reconciler ---------------------------------------------------------------------
+
+OLD = "2026-01-01T00:00:00.000Z"
+NOW = datetime(2026, 1, 1, 2, tzinfo=timezone.utc)  # two hours later
+
+
+def _listed(
+    account_id: str,
+    *,
+    user_id: str | None = "xagent-" + "a" * 64,
+    created_at: str = OLD,
+    auth_config_id: str = AUTH_CONFIG_ID,
+) -> dict[str, Any]:
+    return {
+        "id": account_id,
+        "user_id": user_id,
+        "status": "ACTIVE",
+        "created_at": created_at,
+        "auth_config": {"id": auth_config_id},
+        "toolkit": {"slug": "facebook"},
+    }
+
+
+def test_the_reconciler_deletes_only_old_unbound_xagent_accounts(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    _store_composio_grant(db, user, account_id="ca_bound")
+    composio.listing[""] = {
+        "items": [
+            _listed("ca_orphan"),
+            _listed("ca_bound"),
+            _listed("ca_young", created_at="2026-01-01T01:50:00Z"),
+            _listed("ca_dashboard", user_id="pg-test-user"),
+            _listed("ca_no_user_id", user_id=None),
+            _listed("ca_other_config", auth_config_id="ac_other"),
+        ]
+    }
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == 1
+
+    assert composio.paths("DELETE") == ["/connected_accounts/ca_orphan"]
+
+
+@pytest.mark.parametrize("failure", ["status", "exception"])
+def test_a_failed_listing_deletes_nothing(db_session, composio_env, composio, failure):
+    db, _ = db_session
+    composio.listing[""] = {"items": [_listed("ca_orphan")]}
+    if failure == "status":
+        composio.listing_status = 500
+    else:
+        composio.raise_on = (
+            "/connected_accounts?auth_config_ids=ac_facebook_test&limit=100"
+        )
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == 0
+
+    assert composio.paths("DELETE") == []
+
+
+def test_a_listing_failing_on_a_later_page_deletes_what_was_collected(
+    db_session, composio_env, composio
+):
+    db, _ = db_session
+    composio.listing[""] = {"items": [_listed("ca_page_1")], "next_cursor": "c2"}
+    composio.listing["c2"] = 500
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == 1
+
+    assert composio.paths("DELETE") == ["/connected_accounts/ca_page_1"]
+
+
+def test_the_reconciler_has_no_page_limit_and_stops_on_a_repeated_cursor(
+    db_session, composio_env, composio
+):
+    db, _ = db_session
+    pages = 60
+    for page in range(pages):
+        composio.listing["" if page == 0 else f"c{page}"] = {
+            "items": [_listed(f"ca_page_{page}")],
+            "next_cursor": f"c{page + 1}" if page + 1 < pages else "c1",
+        }
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == pages
+
+    listed = [p for p in composio.paths("GET") if p.startswith("/connected_accounts?")]
+    assert len(listed) == pages
+
+
+def test_an_undecryptable_grant_stops_the_pass(db_session, composio_env, composio):
+    db, user = db_session
+    _store_composio_grant(db, user, account_id="ca_bound")
+    # A token encrypted under another key, as after a key rotation.
+    foreign = Fernet(Fernet.generate_key()).encrypt(b"ca_bound").decode()
+    db.execute(text("UPDATE user_oauth SET access_token = :t"), {"t": foreign})
+    db.commit()
+    composio.listing[""] = {"items": [_listed("ca_bound"), _listed("ca_orphan")]}
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == 0
+
+    assert composio.paths("DELETE") == []
+
+
+def test_a_stop_signal_ends_the_pass_between_deletes(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, _ = db_session
+    composio.listing[""] = {"items": [_listed("ca_first"), _listed("ca_second")]}
+    stop = threading.Event()
+    delete = composio_auth.delete_account
+
+    def delete_then_stop(api_key: str, account_id: str) -> bool:
+        stop.set()
+        return delete(api_key, account_id)
+
+    monkeypatch.setattr(composio_auth, "delete_account", delete_then_stop)
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW, stop_event=stop) == 1
+
+    assert composio.paths("DELETE") == ["/connected_accounts/ca_first"]
+
+
+def test_a_stop_signal_before_the_pass_lists_nothing(
+    db_session, composio_env, composio
+):
+    db, _ = db_session
+    stop = threading.Event()
+    stop.set()
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW, stop_event=stop) == 0
+
+    assert composio.calls == []
+
+
+def test_the_reconcile_loop_is_off_unless_its_interval_is_set(
+    composio_env, monkeypatch
+):
+    from xagent.web.app import start_composio_reconcile_task
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", raising=False)
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert start_composio_reconcile_task(app) is None
+
+
+async def test_stopping_the_reconcile_loop_reaches_the_running_pass(
+    composio_env, monkeypatch
+):
+    import asyncio
+
+    from xagent.web.app import (
+        start_composio_reconcile_task,
+        stop_composio_reconcile_task,
+    )
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def long_pass(*, stop_event: threading.Event) -> int:
+        started.set()
+        stop_event.wait(timeout=5)
+        finished.set()
+        return 0
+
+    monkeypatch.setattr(composio_auth, "reconcile_orphan_accounts_isolated", long_pass)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", "300")
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    task = start_composio_reconcile_task(app)
+    assert task is not None
+    await asyncio.to_thread(started.wait, 5)
+    await stop_composio_reconcile_task(app)
+
+    assert task.done()
+    assert await asyncio.to_thread(finished.wait, 1)
+
+
+def test_the_reconciler_covers_every_configured_app(
+    db_session, composio_env, composio, monkeypatch
+):
+    """Each app's auth config is listed; a grant of either app is a reference."""
+    db, user = db_session
+    monkeypatch.setenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID", INSTAGRAM_AUTH_CONFIG_ID)
+    _store_composio_grant(db, user, account_id="ca_ig_bound", provider="instagram")
+    composio.listing[""] = {"items": [_listed("ca_fb_orphan")]}
+    composio.listing[f"{INSTAGRAM_AUTH_CONFIG_ID}:"] = {
+        "items": [
+            _listed("ca_ig_orphan", auth_config_id=INSTAGRAM_AUTH_CONFIG_ID),
+            _listed("ca_ig_bound", auth_config_id=INSTAGRAM_AUTH_CONFIG_ID),
+            # Listed under Instagram's config but naming Facebook's: skipped.
+            _listed("ca_mislabelled"),
+        ]
+    }
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == 2
+
+    assert sorted(composio.paths("DELETE")) == [
+        "/connected_accounts/ca_fb_orphan",
+        "/connected_accounts/ca_ig_orphan",
+    ]
+
+
+def test_the_reconciler_does_nothing_without_composio_configuration(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, _ = db_session
+    monkeypatch.delenv(composio_auth.COMPOSIO_API_KEY_ENV)
+
+    assert composio_auth.reconcile_orphan_accounts(db, now=NOW) == 0
+
+    assert composio.calls == []

@@ -56,7 +56,7 @@ def test_download_web_asset_tool_contract(workspace: TaskWorkspace) -> None:
     assert tool.name == "download_web_asset"
     assert tool.args_type() is DownloadWebAssetArgs
     assert tool.return_type() is DownloadWebAssetResult
-    assert tool.metadata.category.value == "web_search"
+    assert tool.metadata.category.value == "web_tools"
     assert tool.metadata.read_only is False
 
 

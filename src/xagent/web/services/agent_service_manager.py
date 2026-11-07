@@ -672,6 +672,15 @@ def _task_model_override_excluded_categories(
     return snapshot.model_override.excluded_tool_categories
 
 
+def _task_model_override_excluded_model_ids(
+    snapshot: Optional[TaskSetupSnapshot],
+) -> frozenset[str]:
+    """Media model ids this run's task model override excludes; empty without one."""
+    if snapshot is None or snapshot.model_override is None:
+        return frozenset()
+    return snapshot.model_override.excluded_model_ids
+
+
 def _build_tool_selection_spec_for_task(
     agent_config: Optional[dict],
     workforce_runtime: Optional[WorkforceTaskRuntime],
@@ -842,6 +851,7 @@ async def create_default_tools(
     file_operation_access_version: Any = None,
     agent_creator_user_id: Optional[int] = None,
     declared_knowledge_bases: Optional[List[str]] = None,
+    excluded_model_ids: frozenset[str] = frozenset(),
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -957,6 +967,7 @@ async def create_default_tools(
         knowledge_base_team_id=connector_team_id,
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
+        excluded_model_ids=excluded_model_ids,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -2206,6 +2217,9 @@ class AgentServiceManager:
         excluded_tool_categories = _task_model_override_excluded_categories(
             task_setup_snapshot
         )
+        excluded_model_ids = _task_model_override_excluded_model_ids(
+            task_setup_snapshot
+        )
         if task_setup_snapshot is not None:
             workforce_runtime = task_setup_snapshot.workforce_runtime
             excluded_agent_id = task_setup_snapshot.excluded_agent_id
@@ -2357,6 +2371,7 @@ class AgentServiceManager:
             declared_knowledge_bases=agent_config["knowledge_bases"]
             if agent_config
             else None,
+            excluded_model_ids=excluded_model_ids,
         )
 
     @agent_setup.measure()
@@ -3115,6 +3130,7 @@ class AgentServiceManager:
                 excluded_tool_categories = _task_model_override_excluded_categories(
                     snapshot
                 )
+                excluded_model_ids = _task_model_override_excluded_model_ids(snapshot)
                 tool_selection_spec = _build_tool_selection_spec_for_task(
                     agent_config,
                     workforce_runtime,
@@ -3211,6 +3227,7 @@ class AgentServiceManager:
                     declared_knowledge_bases=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
+                    excluded_model_ids=excluded_model_ids,
                 )
 
                 with UserContext(runtime_user_id):

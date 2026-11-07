@@ -34,6 +34,7 @@ from ..model.chat.basic.call_boundary import (
     BUDGET_INSENSITIVE_FAILURE_CODES,
     ProviderCallError,
 )
+from ..model.chat.cache_lifecycle import AgentCacheSession
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import (
     LLMContextLengthError,
@@ -399,6 +400,27 @@ class PatternRuntime:
         init=False,
         repr=False,
     )
+    _cache_session: AgentCacheSession = field(
+        default_factory=AgentCacheSession, init=False, repr=False
+    )
+    _cache_pattern_count: int = field(default=0, init=False, repr=False)
+
+    async def _sync_cache_phase(self) -> None:
+        phase = (
+            "waiting"
+            if self._active_tool_tasks and not self._active_llm_tasks
+            else "active"
+        )
+        await self._cache_session.transition(phase)
+
+    async def finish_cache_session(self) -> None:
+        self._cache_pattern_count = 0
+        await self._cache_session.transition("finished")
+
+    async def _cache_pattern_finished(self) -> None:
+        self._cache_pattern_count = max(0, self._cache_pattern_count - 1)
+        if not self._cache_pattern_count:
+            await self.finish_cache_session()
 
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt_requested = True
@@ -509,9 +531,10 @@ class PatternRuntime:
         if not inspect.isawaitable(call):
             return call
 
-        task: asyncio.Future[Any] = asyncio.ensure_future(call)
+        task: asyncio.Future[Any] = self._cache_session.create_task(call)
         self._active_llm_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -526,7 +549,13 @@ class PatternRuntime:
                 raise LLMContextLengthError(str(exc)) from exc
             raise
         finally:
-            self._active_llm_tasks.discard(task)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._active_llm_tasks.discard(task)
+                await self._sync_cache_phase()
 
     async def run_tool_call(self, invoke: Callable[[], Any]) -> Any:
         """Run a tool call as a cancellable subtask owned by this runtime."""
@@ -543,6 +572,7 @@ class PatternRuntime:
         task: asyncio.Future[Any] = asyncio.ensure_future(call)
         self._active_tool_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -551,9 +581,13 @@ class PatternRuntime:
                 ) from exc
             raise
         finally:
-            if not task.done():
-                task.cancel()
-            self._active_tool_tasks.discard(task)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._active_tool_tasks.discard(task)
+                await self._sync_cache_phase()
 
     async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         """Stream only the final user-facing answer through the outbound boundary."""
@@ -755,9 +789,10 @@ class PatternRuntime:
                 return stamp_stream_markers({"content": content, **provider_payload})
             return content
 
-        task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
+        task: asyncio.Future[Any] = self._cache_session.create_task(consume_stream())
         self._active_llm_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -766,7 +801,13 @@ class PatternRuntime:
                 ) from exc
             raise
         finally:
-            self._active_llm_tasks.discard(task)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._active_llm_tasks.discard(task)
+                await self._sync_cache_phase()
 
     def _stamp_stream_fallback(
         self,
@@ -1222,6 +1263,9 @@ class PatternRuntime:
         return payload
 
     async def on_pattern_start(self, *, context: Any, pattern: Any) -> None:
+        if not self._cache_pattern_count and self._cache_session.phase == "finished":
+            self._cache_session = AgentCacheSession()
+        self._cache_pattern_count += 1
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = f"react_{uuid4().hex[:8]}"
             self.active_turn_id = self._dag_turn_id(context)
@@ -1253,72 +1297,25 @@ class PatternRuntime:
         pattern: Any,
         result: dict[str, Any],
     ) -> None:
-        await self._emit_pattern_trace(
-            context=context,
-            pattern=pattern,
-            action="end",
-            data={"result": result, "status": result.get("status")},
-        )
-        if pattern.__class__.__name__ == "ReActPattern":
-            self.active_react_step_id = None
-            self.active_turn_id = None
-        if self.tracer is None:
-            return
-        finish_trace = getattr(self.tracer, "finish_trace", None)
-        if callable(finish_trace):
-            await self._maybe_await(
-                finish_trace(
-                    name=self._pattern_trace_name(pattern),
-                    status="success",
-                    output=result,
-                    metadata={
-                        "execution_id": getattr(
-                            context, "execution_id", self.execution_id
-                        ),
-                        "pattern": pattern.__class__.__name__,
-                    },
-                )
+        try:
+            await self._emit_pattern_trace(
+                context=context,
+                pattern=pattern,
+                action="end",
+                data={"result": result, "status": result.get("status")},
             )
-
-    async def on_pattern_error(
-        self,
-        *,
-        context: Any,
-        pattern: Any,
-        error: Exception,
-    ) -> None:
-        # Set before any I/O below, so a pattern is marked as having
-        # reported its own failure even if a later step here raises --
-        # the runner's fallback terminal-trace reporting (see its
-        # ``CheckpointPersistenceError`` guard) checks this to decide
-        # whether it still needs to report the abort itself.
-        self.pattern_error_reported = True
-        data: dict[str, Any] = {
-            "error_type": "agent_pattern_error",
-            "error_message": str(error),
-            "pattern": pattern.__class__.__name__,
-        }
-        if isinstance(error, ModelProviderError):
-            data["model_error"] = error.structured_fields()
-        await self._emit_trace_event(
-            TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
-            task_id=self._task_id(context),
-            step_id=self._step_id(context),
-            data=data,
-        )
-        if pattern.__class__.__name__ == "ReActPattern":
-            self.active_react_step_id = None
-            self.active_turn_id = None
-        if self.tracer is None:
-            return
-        finish_trace = getattr(self.tracer, "finish_trace", None)
-        if callable(finish_trace):
-            try:
+            if pattern.__class__.__name__ == "ReActPattern":
+                self.active_react_step_id = None
+                self.active_turn_id = None
+            if self.tracer is None:
+                return
+            finish_trace = getattr(self.tracer, "finish_trace", None)
+            if callable(finish_trace):
                 await self._maybe_await(
                     finish_trace(
                         name=self._pattern_trace_name(pattern),
-                        status="error",
-                        output={"error": str(error)},
+                        status="success",
+                        output=result,
                         metadata={
                             "execution_id": getattr(
                                 context, "execution_id", self.execution_id
@@ -1327,15 +1324,72 @@ class PatternRuntime:
                         },
                     )
                 )
-            except Exception:
-                # Trace finalization is best-effort here: this method's job
-                # is to report ``error`` (often a CheckpointPersistenceError
-                # durability abort) to the caller. Letting a ``finish_trace``
-                # failure propagate would replace ``error`` with this
-                # unrelated exception, and the runner's typed guard would
-                # then treat the replacement as an ordinary recoverable
-                # pattern exception instead of aborting the run.
-                logger.exception("finish_trace failed while reporting a pattern error")
+        finally:
+            await self._cache_pattern_finished()
+
+    async def on_pattern_error(
+        self,
+        *,
+        context: Any,
+        pattern: Any,
+        error: Exception,
+    ) -> None:
+        try:
+            # Set before any I/O below, so a pattern is marked as having
+            # reported its own failure even if a later step here raises --
+            # the runner's fallback terminal-trace reporting (see its
+            # ``CheckpointPersistenceError`` guard) checks this to decide
+            # whether it still needs to report the abort itself.
+            self.pattern_error_reported = True
+            data: dict[str, Any] = {
+                "error_type": "agent_pattern_error",
+                "error_message": str(error),
+                "pattern": pattern.__class__.__name__,
+            }
+            if isinstance(error, ModelProviderError):
+                data["model_error"] = error.structured_fields()
+            await self._emit_trace_event(
+                TraceEventType(
+                    TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL
+                ),
+                task_id=self._task_id(context),
+                step_id=self._step_id(context),
+                data=data,
+            )
+            if pattern.__class__.__name__ == "ReActPattern":
+                self.active_react_step_id = None
+                self.active_turn_id = None
+            if self.tracer is None:
+                return
+            finish_trace = getattr(self.tracer, "finish_trace", None)
+            if callable(finish_trace):
+                try:
+                    await self._maybe_await(
+                        finish_trace(
+                            name=self._pattern_trace_name(pattern),
+                            status="error",
+                            output={"error": str(error)},
+                            metadata={
+                                "execution_id": getattr(
+                                    context, "execution_id", self.execution_id
+                                ),
+                                "pattern": pattern.__class__.__name__,
+                            },
+                        )
+                    )
+                except Exception:
+                    # Trace finalization is best-effort here: this method's job
+                    # is to report ``error`` (often a CheckpointPersistenceError
+                    # durability abort) to the caller. Letting a ``finish_trace``
+                    # failure propagate would replace ``error`` with this
+                    # unrelated exception, and the runner's typed guard would
+                    # then treat the replacement as an ordinary recoverable
+                    # pattern exception instead of aborting the run.
+                    logger.exception(
+                        "finish_trace failed while reporting a pattern error"
+                    )
+        finally:
+            await self._cache_pattern_finished()
 
     async def load_committed_tool_outcome(
         self, tool_call: dict[str, Any]

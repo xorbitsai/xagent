@@ -612,6 +612,11 @@
   // Iframe
   var iframe = document.createElement('iframe');
   iframe.className = 'xagent-widget-iframe';
+  // The chat is cross-origin to the host page, and browsers refuse the async
+  // Clipboard API in a cross-origin iframe unless the embedder delegates it
+  // here; without this the chat's copy buttons could only rely on the legacy
+  // execCommand fallback.
+  iframe.setAttribute('allow', 'clipboard-write');
   panel.appendChild(iframe);
 
   // Left-edge resize handle

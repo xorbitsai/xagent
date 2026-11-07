@@ -1001,9 +1001,11 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
     after the control, where a start or a reply is rejected by its
     state-version check when the control moved the version, and a message
     is not.
+
+    In combined mode only a START is settled: the one command combined mode
+    consumes under a release hold with a durable run to refuse is the legacy
+    ``execute_task`` START; any other held command keeps its own handling.
     """
-    if not get_shared_task_execution_enabled():
-        return
     from collections import Counter
 
     from .task_command_terminal_events import (
@@ -1020,6 +1022,8 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
     if task is None:
         return
     predicates = list(cap_held_command_predicates(int(task.id), control_command_id))
+    if not get_shared_task_execution_enabled():
+        predicates.append(TaskExecutionCommand.kind == "start")
     if control.kind == "cancel":
         predicates.append(
             TaskExecutionCommand.target_state_version != task.state_version

@@ -532,6 +532,46 @@ def _resolve_embedding_adapter(
     )
 
 
+def resolve_ingestion_model_ids(
+    collection: str,
+    *,
+    ingestion_config: Optional[IngestionConfigInput] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+) -> Tuple[str, ...]:
+    """The configured embedding model an ingestion will call, resolved as it does.
+
+    For the standalone usage gate: run it, and then the ingestion, under one
+    :class:`~..utils.model_resolution_pin.ModelResolutionPin`, and the
+    ingestion embeds with exactly the model listed -- the one the collection
+    is bound to, else the requested one. A model configured from the
+    environment carries no id and is left out.
+
+    Never raises: a resolution that fails here fails the ingestion the same
+    way, before anything is embedded.
+    """
+    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    cfg = coerce_ingestion_config(ingestion_config)
+    requested_model_id = cfg.embedding_model_id
+    selected_model_id: Optional[str]
+    try:
+        selected_model_id = resolve_effective_embedding_model_sync(
+            collection, requested_model_id
+        )
+    except ValueError:
+        selected_model_id = requested_model_id
+    except Exception:  # noqa: BLE001 - the ingestion reports it
+        return ()
+    effective_cfg = cfg.model_copy(update={"embedding_model_id": selected_model_id})
+    try:
+        with user_scope_context(scope.user_id, scope.is_admin):
+            embedding_config, _ = _resolve_embedding_adapter(effective_cfg)
+    except Exception:  # noqa: BLE001 - the ingestion reports it
+        return ()
+    model_id = embedding_config.usage_model_id
+    return (model_id,) if model_id else ()
+
+
 def _handle_ingestion_error(
     exc: Exception,
     collection: str,

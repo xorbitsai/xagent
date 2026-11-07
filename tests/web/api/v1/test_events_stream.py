@@ -99,6 +99,16 @@ def mock_start_task():
         yield mocked
 
 
+# The raw structured output values of a snapshot that has none, and the fields
+# a conclusion frame then carries.
+NO_STRUCTURED_OUTPUT = {"structured_output_record": None, "format_configured": False}
+NULL_STRUCTURED_OUTPUT_FIELDS = {
+    "structured_output": None,
+    "structured_output_status": None,
+    "structured_output_reason": None,
+}
+
+
 @pytest.fixture(autouse=True)
 def reset_principal_stream_counts():
     es.reset_principal_stream_counts_for_testing()
@@ -403,14 +413,24 @@ def test_events_not_owned_404():
             TaskStatus.COMPLETED,
             "the answer",
             None,
-            {"status": "completed", "output": "the answer", "error": None},
+            {
+                "status": "completed",
+                "output": "the answer",
+                "error": None,
+                **NULL_STRUCTURED_OUTPUT_FIELDS,
+            },
             id="completed",
         ),
         pytest.param(
             TaskStatus.FAILED,
             None,
             "the tool call raised",
-            {"status": "failed", "output": None, "error": "the tool call raised"},
+            {
+                "status": "failed",
+                "output": None,
+                "error": "the tool call raised",
+                **NULL_STRUCTURED_OUTPUT_FIELDS,
+            },
             id="failed",
         ),
     ],
@@ -2831,7 +2851,13 @@ async def test_fast_path_step_read_failure_closes_with_resync_required_not_a_bar
         return SimpleNamespace(max_event_id=1)
 
     terminal_snapshot = SimpleNamespace(
-        task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
+        task_id=1,
+        agent_id=1,
+        status=TaskStatus.COMPLETED,
+        run_id="run-1",
+        output="done",
+        error=None,
+        **NO_STRUCTURED_OUTPUT,
     )
     terminal_frames = [
         chunk
@@ -2920,7 +2946,13 @@ async def test_fast_path_task_not_found_closes_with_task_deleted_not_resync_requ
         return SimpleNamespace(max_event_id=1)
 
     terminal_snapshot = SimpleNamespace(
-        task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
+        task_id=1,
+        agent_id=1,
+        status=TaskStatus.COMPLETED,
+        run_id="run-1",
+        output="done",
+        error=None,
+        **NO_STRUCTURED_OUTPUT,
     )
     terminal_frames = [
         chunk
@@ -2983,7 +3015,7 @@ def test_fast_path_snapshot_bounds_match_the_documented_endpoint_contract():
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3073,7 +3105,7 @@ async def test_fast_path_step_snapshot_is_bounded_by_replay_max_steps(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3184,7 +3216,7 @@ async def test_fast_path_step_snapshot_applies_the_replay_cap_before_the_byte_bu
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3272,7 +3304,7 @@ async def test_fast_path_step_snapshot_replay_max_steps_boundary(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3368,7 +3400,7 @@ async def test_fast_path_step_snapshot_is_bounded_by_the_wire_byte_budget(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3555,7 +3587,11 @@ _FENCE_PRINCIPAL = object()
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "stale output from the superseded run", "error": None},
+            {
+                "output": "stale output from the superseded run",
+                "error": None,
+                **NO_STRUCTURED_OUTPUT,
+            },
             "stale output from the superseded run",
             id="terminal",
         ),
@@ -3672,7 +3708,7 @@ async def test_fast_path_generation_change_withholds_steps_but_still_concludes(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3765,7 +3801,7 @@ async def test_fast_path_confirmed_generation_change_short_circuits_the_cursor_r
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3876,7 +3912,7 @@ async def test_fast_path_failure_exits_never_carry_the_truncation_marker(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -3976,7 +4012,7 @@ async def test_fast_path_trace_row_landing_between_reads_forces_resync(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4070,7 +4106,7 @@ async def test_fast_path_steps_cursor_baseline_is_captured_before_the_steps_read
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4175,7 +4211,7 @@ async def test_fast_path_steps_cursor_baseline_read_failure_closes_before_the_st
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4296,7 +4332,7 @@ async def test_fast_path_steps_cursor_recheck_failure_closes_for_resync_or_delet
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4363,7 +4399,7 @@ async def test_fast_path_empty_steps_skips_the_generation_reread(
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4462,7 +4498,7 @@ async def test_fast_path_generation_reread_failure_concludes_then_closes_for_res
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4553,7 +4589,7 @@ async def test_fast_path_generation_reread_task_deleted_closes_with_task_deleted
             "_terminal_snapshot_stream",
             TaskStatus.COMPLETED,
             "task.completed",
-            {"output": "done", "error": None},
+            {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
             id="terminal",
         ),
         pytest.param(
@@ -4679,7 +4715,13 @@ def test_fast_paths_without_a_steps_version_reader_is_a_call_error():
         raise AssertionError("must not run before the missing-argument TypeError")
 
     terminal_snapshot = SimpleNamespace(
-        task_id=1, agent_id=1, status=TaskStatus.COMPLETED, output="done", error=None
+        task_id=1,
+        agent_id=1,
+        status=TaskStatus.COMPLETED,
+        run_id="run-1",
+        output="done",
+        error=None,
+        **NO_STRUCTURED_OUTPUT,
     )
     with pytest.raises(TypeError, match="read_task_steps_version"):
         es._terminal_snapshot_stream(
@@ -5888,7 +5930,7 @@ _FAST_PATHS = [
         "_terminal_snapshot_stream",
         TaskStatus.COMPLETED,
         "task.completed",
-        {"output": "done", "error": None},
+        {"output": "done", "error": None, **NO_STRUCTURED_OUTPUT},
         id="terminal",
     ),
     pytest.param(

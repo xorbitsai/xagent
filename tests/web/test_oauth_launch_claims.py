@@ -89,3 +89,13 @@ def test_launch_cleanup_does_not_remove_other_proof_namespaces(engine):
         assert "oauth-state:other" in ids
         assert "oidc-exchange-other" in ids
         assert "oauth-launch:old" not in ids
+
+
+def test_regional_ticket_purpose_namespaces_are_independent(engine):
+    proof = _claims()
+    with Session(engine) as db:
+        assert consume_oauth_launch_ticket(db, proof, purpose="builtin")
+        assert not consume_oauth_launch_ticket(db, proof, purpose="builtin")
+        assert consume_oauth_launch_ticket(db, proof, purpose="mcp")
+        assert not consume_oauth_launch_ticket(db, proof, purpose="mcp")
+        assert not consume_oauth_launch_ticket(db, proof, purpose="toby")

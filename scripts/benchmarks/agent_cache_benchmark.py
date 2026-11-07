@@ -36,12 +36,12 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def source_manifest() -> dict[str, Any]:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     revision = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True
     )
     paths = [
-        "scripts/agent_cache_benchmark.py",
+        "scripts/benchmarks/agent_cache_benchmark.py",
         "src/xagent/core/agent/runtime.py",
         "src/xagent/core/agent/prompt_prefix.py",
         "src/xagent/core/agent/trace.py",

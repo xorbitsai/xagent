@@ -1693,5 +1693,869 @@ def github_search_code(
         return _error(str(e))
 
 
+# --- Release tooling -------------------------------------------------------
+# github_get_ref_status / github_get_latest_release / github_create_release /
+# github_update_release / github_list_workflow_runs let an agent run a release
+# procedure (check CI, cut the release, watch the publish workflows) against
+# any repository the connected account can write to.
+
+# Bounded multi-page fetch for a ref's check runs (MAX_PER_PAGE each), same
+# convention as MAX_ISSUE_PAGES: a monorepo can report hundreds of checks,
+# but an unbounded loop must never hold one tool call open.
+MAX_CHECK_RUN_PAGES = 5
+# How many failing/pending check names github_get_ref_status echoes back; the
+# counts always cover everything fetched.
+MAX_REPORTED_CHECKS = 25
+MAX_RELEASE_TAGS = 100
+DEFAULT_WORKFLOW_RUN_LIMIT = 20
+
+# Check-run conclusions. "success"/"neutral"/"skipped" never block a release;
+# the failing set is any completed run that did not pass on its own merits;
+# every other completed conclusion (action_required, stale) needs a human or a
+# re-run, so it is reported as pending rather than as a pass.
+_CHECK_OK_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+_CHECK_FAILING_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "cancelled", "startup_failure"}
+)
+_STATUS_FAILING_STATES = frozenset({"failure", "error"})
+
+_HEX_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{7,40}")
+_EVENT_NAME_PATTERN = re.compile(r"[a-z_]+")
+
+
+def _validate_tag_name(value: str, *, field: str = "tag") -> str:
+    """Reject a blank, ref-qualified or git-invalid tag name. Tags follow the
+    same git-check-ref-format rules as branches, so this delegates the
+    character rules to _validate_branch_name after turning away "refs/..."
+    itself (whose error there would call the tag a "branch name")."""
+    name = _require_nonblank(value, field=field).strip()
+    if name.startswith("refs/"):
+        raise ValueError(
+            f'{field} must be a bare tag name, not a "refs/..." ref: {name!r}'
+        )
+    return _validate_branch_name(name, field=field)
+
+
+def _not_found_error(exc: "_GitHubAPIError", message: str) -> str:
+    return _error(f"{exc} -- {message}")
+
+
+def _resolve_commit_sha(owner: str, name: str, ref: str) -> str:
+    """Resolve a branch, tag or commit sha to its commit sha via the commits
+    endpoint (which, unlike /git/ref, accepts all three and peels annotated
+    tags). Raises _GitHubAPIError (404 for an unknown ref/repo)."""
+    commit = _request("GET", f"/repos/{owner}/{name}/commits/{_encode_file_path(ref)}")
+    _require_object(commit, context=f"commit '{ref}'")
+    sha = commit.get("sha")
+    if not isinstance(sha, str) or not sha:
+        raise ValueError(f"Ref '{ref}' resolved to a commit without a sha")
+    return sha
+
+
+def _default_branch(owner: str, name: str, repo: str) -> str:
+    repository = _request("GET", f"/repos/{owner}/{name}")
+    _require_object(repository, context=f"repository '{repo}'")
+    branch = repository.get("default_branch")
+    if not isinstance(branch, str) or not branch:
+        raise ValueError(
+            f"Could not determine the default branch of '{repo}'; pass target "
+            "explicitly"
+        )
+    return branch
+
+
+def _summarize_release(release: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": release.get("id"),
+        "tag": release.get("tag_name"),
+        "name": release.get("name"),
+        "body": release.get("body"),
+        "draft": release.get("draft"),
+        "prerelease": release.get("prerelease"),
+        "target_commitish": release.get("target_commitish"),
+        "published_at": release.get("published_at"),
+        "created_at": release.get("created_at"),
+        "html_url": release.get("html_url"),
+    }
+
+
+def _summarize_workflow_run(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": run.get("id"),
+        "name": run.get("name"),
+        "event": run.get("event"),
+        "status": run.get("status"),
+        "conclusion": run.get("conclusion"),
+        "head_branch": run.get("head_branch"),
+        "head_sha": run.get("head_sha"),
+        "run_number": run.get("run_number"),
+        "html_url": run.get("html_url"),
+        "created_at": run.get("created_at"),
+    }
+
+
+def _aggregate_ci_state(*, failing: int, pending: int, passing: int) -> str:
+    """Overall CI state: any failure wins, then any pending, then success;
+    no checks and no statuses at all is "none" (distinct from success -- a
+    repo without CI must not read as green)."""
+    if failing:
+        return "failure"
+    if pending:
+        return "pending"
+    if passing:
+        return "success"
+    return "none"
+
+
+@mcp.tool()
+def github_get_ref_status(repo: str, ref: str) -> str:
+    """
+    Report CI state for a branch, tag or commit sha, combining GitHub's
+    legacy commit statuses with check runs (GitHub Actions etc.).
+    repo: "owner/repo".
+    ref: a bare branch name, tag name or commit sha (not "refs/...").
+
+    Returns the resolved sha, an overall `state` ("success", "pending",
+    "failure" or "none" when the commit has no checks or statuses at all),
+    per-kind counts, and the failing/pending check names with URLs. A
+    cancelled, timed-out or startup-failed check counts as failing.
+    If the commit has more checks than this tool pages through, `truncated`
+    is true and a would-be "success" is reported as "pending".
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        ref = _validate_branch_name(ref, field="ref")
+        encoded_ref = _encode_file_path(ref)
+        try:
+            combined = _request(
+                "GET",
+                f"/repos/{owner}/{name}/commits/{encoded_ref}/status",
+                params={"per_page": MAX_PER_PAGE},
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return _not_found_error(
+                    exc, f"repository '{repo}' or ref '{ref}' not found"
+                )
+            raise
+        _require_object(combined, context=f"status of '{ref}' in '{repo}'")
+        raw_statuses = combined.get("statuses") or []
+        _require_object_items(raw_statuses, context="commit statuses")
+
+        failing: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        status_counts = {"total": 0, "success": 0, "failing": 0, "pending": 0}
+        for status in raw_statuses:
+            state = status.get("state")
+            entry = {
+                "kind": "status",
+                "name": status.get("context"),
+                "state": state,
+                "url": status.get("target_url"),
+            }
+            status_counts["total"] += 1
+            if state == "success":
+                status_counts["success"] += 1
+            elif state in _STATUS_FAILING_STATES:
+                status_counts["failing"] += 1
+                failing.append(entry)
+            else:
+                status_counts["pending"] += 1
+                pending.append(entry)
+        check_counts = {"total": 0, "success": 0, "failing": 0, "pending": 0}
+        truncated = False
+        page = 1
+        while True:
+            response = _request_raw(
+                "GET",
+                f"/repos/{owner}/{name}/commits/{encoded_ref}/check-runs",
+                params={"per_page": MAX_PER_PAGE, "page": page},
+            )
+            body = response.json() if response.content else {}
+            _require_object(body, context=f"check runs of '{ref}' in '{repo}'")
+            runs = body.get("check_runs") or []
+            _require_object_items(runs, context="check runs")
+            for run in runs:
+                check_counts["total"] += 1
+                run_status = run.get("status")
+                conclusion = run.get("conclusion")
+                entry = {
+                    "kind": "check_run",
+                    "name": run.get("name"),
+                    "state": conclusion if run_status == "completed" else run_status,
+                    "url": run.get("html_url") or run.get("details_url"),
+                }
+                if run_status != "completed":
+                    check_counts["pending"] += 1
+                    pending.append(entry)
+                elif conclusion in _CHECK_OK_CONCLUSIONS:
+                    check_counts["success"] += 1
+                elif conclusion in _CHECK_FAILING_CONCLUSIONS:
+                    check_counts["failing"] += 1
+                    failing.append(entry)
+                else:
+                    check_counts["pending"] += 1
+                    pending.append(entry)
+            if "next" not in _link_header_rels(response.headers.get("Link")):
+                break
+            if page >= MAX_CHECK_RUN_PAGES:
+                truncated = True
+                break
+            page += 1
+
+        state = _aggregate_ci_state(
+            failing=status_counts["failing"] + check_counts["failing"],
+            pending=status_counts["pending"] + check_counts["pending"],
+            passing=status_counts["success"] + check_counts["success"],
+        )
+        if truncated and state == "success":
+            # Unseen checks could still be failing -- never claim green.
+            state = "pending"
+        sha = combined.get("sha")
+        return _success(
+            ref=ref,
+            sha=sha,
+            state=state,
+            statuses=status_counts,
+            check_runs=check_counts,
+            failing=failing[:MAX_REPORTED_CHECKS],
+            pending=pending[:MAX_REPORTED_CHECKS],
+            truncated=truncated,
+        )
+    except Exception as e:
+        logger.error(
+            f"Error getting GitHub ref status for {repo}@{ref}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def github_get_latest_release(repo: str, tag_limit: int = 0) -> str:
+    """
+    Get a repository's latest published release (tag, name, published_at,
+    url). Drafts and prereleases are never "latest", per GitHub.
+    repo: "owner/repo".
+    tag_limit: also list this many tags (0 = none, capped at 100) as GitHub
+    returns them, so the next version can be inferred when a repo has few or
+    no releases.
+
+    A repo with no published release yet returns status "success" with
+    `release` null -- not an error.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        try:
+            release: dict[str, Any] | None = _request(
+                "GET", f"/repos/{owner}/{name}/releases/latest"
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            # Same 404 for "no releases" and "no such repo" -- tell them apart.
+            try:
+                _request("GET", f"/repos/{owner}/{name}")
+            except _GitHubAPIError as repo_exc:
+                if repo_exc.status_code == 404:
+                    return _not_found_error(repo_exc, f"repository '{repo}' not found")
+                raise
+            release = None
+        if release is not None:
+            _require_object(release, context=f"latest release of '{repo}'")
+            summary = _summarize_release(release)
+            summary.pop("body", None)
+        else:
+            summary = None
+        tags: list[dict[str, Any]] = []
+        try:
+            wanted = int(tag_limit or 0)
+        except (TypeError, ValueError):
+            wanted = 0
+        wanted = max(0, min(wanted, MAX_RELEASE_TAGS))
+        if wanted:
+            raw_tags = _request(
+                "GET", f"/repos/{owner}/{name}/tags", params={"per_page": wanted}
+            )
+            _require_object_items(raw_tags, context="tag list")
+            tags = [
+                {"name": tag.get("name"), "sha": (tag.get("commit") or {}).get("sha")}
+                for tag in raw_tags
+            ]
+        return _success(release=summary, tags=tags)
+    except Exception as e:
+        logger.error(
+            f"Error getting latest GitHub release for {repo}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
+def _peel_tag_to_commit(owner: str, name: str, sha: str, obj_type: str) -> str:
+    """Follow annotated tag objects (a few levels at most) to the commit sha."""
+    for _ in range(5):
+        if obj_type != "tag":
+            return sha
+        tag_obj = _request("GET", f"/repos/{owner}/{name}/git/tags/{sha}")
+        _require_object(tag_obj, context=f"tag object {sha}")
+        target = tag_obj.get("object") or {}
+        sha = target.get("sha") or sha
+        obj_type = target.get("type") or "commit"
+    return sha
+
+
+@mcp.tool()
+def github_create_release(
+    repo: str,
+    tag: str,
+    target: str = "",
+    name: str = "",
+    body: str = "",
+    generate_release_notes: bool = True,
+    draft: bool = False,
+    prerelease: bool = False,
+) -> str:
+    """
+    Create a GitHub release, and the tag too when it does not exist yet.
+    repo: "owner/repo".
+    tag: the tag to release (e.g. "v1.2.3"), a bare name.
+    target: branch name or commit sha the new tag should point at (defaults
+    to the repo's default branch). It is resolved to a sha, which is
+    returned and is what the tag is created on.
+    name: release title (defaults to the tag).
+    body: release notes in Markdown; with generate_release_notes true,
+    GitHub prepends this to the generated notes.
+    generate_release_notes: have GitHub generate the notes (default true).
+    The final notes come back in `release.body`, so the agent can regroup
+    them and call github_update_release.
+    draft / prerelease: create as a draft / prerelease. NOTE: a draft
+    release does not create its tag until it is published.
+
+    Creating the tag by publishing a release triggers `on: push: tags`
+    workflows (watch them with github_list_workflow_runs).
+
+    Refuses when the tag already exists, with one exception: if the tag
+    already points at the requested target and has no release yet, the
+    release is created for that existing tag. This is irreversible
+    (publishing is visible and triggers workflows) -- confirm with the user
+    first.
+    """
+    try:
+        owner, repo_name = _parse_repo(repo)
+        tag = _validate_tag_name(tag)
+        for field, value in (
+            ("target", target),
+            ("name", name),
+            ("body", body),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{field} must be a string, got: {type(value).__name__}"
+                )
+        for field, flag in (
+            ("generate_release_notes", generate_release_notes),
+            ("draft", draft),
+            ("prerelease", prerelease),
+        ):
+            if not isinstance(flag, bool):
+                raise ValueError(f"{field} must be a boolean, got: {flag!r}")
+
+        try:
+            if target:
+                target_ref = _validate_branch_name(target, field="target")
+            else:
+                target_ref = _validate_branch_name(
+                    _default_branch(owner, repo_name, repo), field="target"
+                )
+            target_sha = _resolve_commit_sha(owner, repo_name, target_ref)
+        except _GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return _not_found_error(
+                    exc,
+                    f"repository '{repo}' or target '{target}' not found"
+                    if target
+                    else f"repository '{repo}' not found",
+                )
+            raise
+
+        tag_exists = False
+        try:
+            existing = _request(
+                "GET",
+                f"/repos/{owner}/{repo_name}/git/ref/tags/{_encode_file_path(tag)}",
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            _require_object(existing, context=f"tag '{tag}' in '{repo}'")
+            tag_exists = True
+            obj = existing.get("object") or {}
+            tag_sha = _peel_tag_to_commit(
+                owner, repo_name, obj.get("sha") or "", obj.get("type") or "commit"
+            )
+            if tag_sha != target_sha:
+                return _error(
+                    f"Tag '{tag}' already exists in '{repo}' and points at "
+                    f"{tag_sha}, not the requested target {target_sha} "
+                    f"('{target_ref}'). Choose a new tag, or pass the sha the "
+                    "tag already points at as target"
+                )
+            try:
+                has_release = _request(
+                    "GET",
+                    f"/repos/{owner}/{repo_name}/releases/tags/{_encode_file_path(tag)}",
+                )
+            except _GitHubAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+            else:
+                _require_object(has_release, context=f"release for '{tag}'")
+                return _error(
+                    f"Tag '{tag}' already exists in '{repo}' and already has a "
+                    f"release ({has_release.get('html_url')}); use "
+                    "github_update_release to change it"
+                )
+
+        json_data: dict[str, Any] = {
+            "tag_name": tag,
+            "name": name or tag,
+            "draft": draft,
+            "prerelease": prerelease,
+            "generate_release_notes": generate_release_notes,
+        }
+        if body:
+            json_data["body"] = body
+        if not tag_exists:
+            # A sha, not the branch name: the tag lands exactly on the commit
+            # that was resolved (and reported) above, even if the branch moves.
+            json_data["target_commitish"] = target_sha
+        try:
+            release = _request(
+                "POST", f"/repos/{owner}/{repo_name}/releases", json_data=json_data
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code == 403:
+                return _forbidden_write_error(exc, repo=repo)
+            if exc.status_code == 404:
+                return _not_found_error(exc, f"repository '{repo}' not found")
+            if exc.status_code == 422:
+                return _error(
+                    f"{exc} -- GitHub rejected the release for tag '{tag}' "
+                    f"(target {target_sha}); check the tag/target, or whether "
+                    "the tag or a release for it was created concurrently"
+                )
+            raise
+        _require_object(release, context=f"created release '{tag}' in '{repo}'")
+        return _success(
+            tag=tag,
+            sha=target_sha,
+            target=target_ref,
+            tag_created=not tag_exists,
+            release=_summarize_release(release),
+        )
+    except Exception as e:
+        logger.error(f"Error creating GitHub release {repo}:{tag}: {e}", exc_info=True)
+        return _error(str(e))
+
+
+@mcp.tool()
+def github_update_release(
+    repo: str,
+    release_id_or_tag: str,
+    body: str | None = None,
+    name: str | None = None,
+    draft: bool | None = None,
+    prerelease: bool | None = None,
+) -> str:
+    """
+    Edit an existing release -- typically to replace the generated notes
+    with a regrouped body after github_create_release.
+    repo: "owner/repo".
+    release_id_or_tag: the numeric release id (from github_create_release's
+    `release.id`), or a tag name. An all-digit value is always read as an id.
+    A published release can be found by tag; find a draft by its id.
+    body / name / draft / prerelease: new values; leave None to keep the
+    current one. At least one must be given. Setting draft=false publishes a
+    draft (and creates its tag).
+    """
+    try:
+        owner, repo_name = _parse_repo(repo)
+        fields: dict[str, Any] = {}
+        if body is not None:
+            if not isinstance(body, str):
+                raise ValueError(f"body must be a string, got: {type(body).__name__}")
+            fields["body"] = body
+        if name is not None:
+            fields["name"] = _require_nonblank(name, field="name")
+        for key, flag in (("draft", draft), ("prerelease", prerelease)):
+            if flag is not None:
+                if not isinstance(flag, bool):
+                    raise ValueError(f"{key} must be a boolean, got: {flag!r}")
+                fields[key] = flag
+        if not fields:
+            raise ValueError(
+                "Nothing to update: pass at least one of body, name, draft, prerelease"
+            )
+        ident = _require_nonblank(
+            str(release_id_or_tag), field="release_id_or_tag"
+        ).strip()
+        try:
+            if ident.isdigit():
+                release_id = _validate_positive_number(ident, field="release id")
+            else:
+                found = _request(
+                    "GET",
+                    f"/repos/{owner}/{repo_name}/releases/tags/{_encode_file_path(ident)}",
+                )
+                _require_object(found, context=f"release for tag '{ident}'")
+                release_id = _validate_positive_number(
+                    found.get("id"), field="release id"
+                )
+            release = _request(
+                "PATCH",
+                f"/repos/{owner}/{repo_name}/releases/{release_id}",
+                json_data=fields,
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return _not_found_error(
+                    exc,
+                    f"release '{ident}' not found in '{repo}' (drafts cannot be "
+                    "looked up by tag; use the numeric id)",
+                )
+            if exc.status_code == 403:
+                return _forbidden_write_error(exc, repo=repo)
+            if exc.status_code == 422:
+                return _error(f"{exc} -- GitHub rejected the release update")
+            raise
+        _require_object(release, context=f"updated release '{ident}' in '{repo}'")
+        return _success(release=_summarize_release(release))
+    except Exception as e:
+        logger.error(
+            f"Error updating GitHub release {repo}:{release_id_or_tag}: {e}",
+            exc_info=True,
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def github_list_workflow_runs(
+    repo: str,
+    branch_or_tag: str = "",
+    head_sha: str = "",
+    event: str = "",
+    limit: int = DEFAULT_WORKFLOW_RUN_LIMIT,
+    page: int = 1,
+) -> str:
+    """
+    List recent GitHub Actions workflow runs, newest first -- e.g. to watch
+    the publish workflows a release's tag push triggered.
+    repo: "owner/repo".
+    branch_or_tag: only runs whose head branch or tag is this name (a tag
+    push's runs are filed under the tag name).
+    head_sha: only runs for this commit sha.
+    event: only runs triggered by this event, e.g. "push", "release",
+    "workflow_dispatch".
+    limit: max runs to return (default 20, capped at 100).
+    page: results page (default 1) -- pass next_page when truncated is true.
+
+    Each run: name, event, status (queued/in_progress/completed),
+    conclusion (null until completed), html_url, created_at.
+    """
+    try:
+        owner, repo_name = _parse_repo(repo)
+        start_page = max(1, int(page or 1))
+        params: dict[str, Any] = {
+            "per_page": _clamp_limit(limit, default=DEFAULT_WORKFLOW_RUN_LIMIT),
+            "page": start_page,
+        }
+        for field, value in (
+            ("branch_or_tag", branch_or_tag),
+            ("head_sha", head_sha),
+            ("event", event),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{field} must be a string, got: {type(value).__name__}"
+                )
+        if branch_or_tag:
+            params["branch"] = _validate_branch_name(
+                branch_or_tag, field="branch_or_tag"
+            )
+        if head_sha:
+            sha = head_sha.strip()
+            if not _HEX_SHA_PATTERN.fullmatch(sha):
+                raise ValueError(
+                    f"head_sha must be a 7-40 character hex sha, got: {head_sha!r}"
+                )
+            params["head_sha"] = sha
+        if event:
+            event_name = event.strip()
+            if not _EVENT_NAME_PATTERN.fullmatch(event_name):
+                raise ValueError(
+                    f"event must be a lowercase event name, got: {event!r}"
+                )
+            params["event"] = event_name
+        try:
+            response = _request_raw(
+                "GET", f"/repos/{owner}/{repo_name}/actions/runs", params=params
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return _not_found_error(exc, f"repository '{repo}' not found")
+            raise
+        body = response.json() if response.content else {}
+        _require_object(body, context="workflow runs response")
+        raw_runs = body.get("workflow_runs") or []
+        _require_object_items(raw_runs, context="workflow runs")
+        has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
+        return _success(
+            runs=[_summarize_workflow_run(run) for run in raw_runs],
+            total_count=body.get("total_count"),
+            truncated=has_next_page,
+            truncation_reason="more_pages" if has_next_page else None,
+            next_page=start_page + 1 if has_next_page else None,
+        )
+    except Exception as e:
+        logger.error(
+            f"Error listing GitHub workflow runs for {repo}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
+_GITMODULES_SECTION = re.compile(r'^\s*\[submodule\s+"[^"]*"\]\s*$')
+_GITHUB_REMOTE = re.compile(
+    r"^(?:https?://(?:www\.)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$"
+)
+
+
+def _submodule_compare_url(
+    owner: str, name: str, base: str, path: str, old_sha: str, new_sha: str
+) -> str | None:
+    """Best-effort compare URL for a submodule's own repo, read from
+    `.gitmodules` at `base`. Returns None (never raises) when the file is
+    missing, unparsable, or the submodule is not hosted on github.com."""
+    try:
+        response = _request(
+            "GET",
+            f"/repos/{owner}/{name}/contents/.gitmodules",
+            params={"ref": base},
+        )
+        if not isinstance(response, dict) or response.get("encoding") != "base64":
+            return None
+        text = _decode_base64_content(response.get("content") or "").decode("utf-8")
+        sections: list[dict[str, str]] = []
+        for line in text.splitlines():
+            if _GITMODULES_SECTION.match(line):
+                sections.append({})
+            elif sections and "=" in line:
+                key, _, value = line.partition("=")
+                sections[-1][key.strip()] = value.strip()
+        for section in sections:
+            if section.get("path") == path and section.get("url"):
+                match = _GITHUB_REMOTE.match(section["url"])
+                if match:
+                    return (
+                        f"https://github.com/{match.group(1)}/{match.group(2)}"
+                        f"/compare/{old_sha}...{new_sha}"
+                    )
+    except Exception:
+        logger.debug("Could not derive submodule compare URL", exc_info=True)
+    return None
+
+
+@mcp.tool()
+def github_update_submodule(
+    repo: str,
+    path: str,
+    sha: str,
+    branch: str,
+    base: str = "",
+    message: str = "",
+) -> str:
+    """
+    Point a git submodule at a new commit on a NEW branch (the contents API
+    cannot update a submodule pointer, so this uses the git data API). Open
+    the pull request afterwards with github_create_pull_request.
+    repo: "owner/repo" -- the repository that contains the submodule.
+    path: the submodule's path in that repository (e.g. "xagent"). It must
+    already be a submodule; a regular file or directory is refused.
+    sha: the full 40-character commit sha in the submodule's own repository.
+    branch: the new branch to create (bare name). Refused if it exists.
+    base: the branch to start from (defaults to the default branch).
+    message: commit message (defaults to "chore: bump <path> to <sha[:8]>").
+
+    Returns the old and new submodule sha, the new commit sha, and -- when
+    .gitmodules points at a github.com repo -- a compare URL for old...new.
+    If the submodule is already at `sha`, nothing is created and
+    `updated` is false.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        _require_nonblank(path, field="path")
+        encoded_segments = [
+            _encode_file_path_segment(seg, field="path")
+            for seg in path.strip("/").split("/")
+        ]
+        path = path.strip("/")
+        new_sha = sha.strip().lower() if isinstance(sha, str) else ""
+        if not _COMMIT_SHA_PATTERN.fullmatch(new_sha):
+            raise ValueError(
+                f"sha must be a full 40-character hex commit sha, got: {sha!r}"
+            )
+        branch = _validate_branch_name(branch, field="branch")
+        if not isinstance(base, str) or not isinstance(message, str):
+            raise ValueError("base and message must be strings")
+
+        try:
+            base_branch = (
+                _validate_branch_name(base, field="base")
+                if base
+                else _validate_branch_name(
+                    _default_branch(owner, name, repo), field="base"
+                )
+            )
+            base_ref = _request(
+                "GET",
+                f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(base_branch)}",
+            )
+            _require_object(base_ref, context=f"ref 'heads/{base_branch}' in '{repo}'")
+            base_commit_sha = (base_ref.get("object") or {}).get("sha")
+            if not isinstance(base_commit_sha, str) or not base_commit_sha:
+                return _error(
+                    f"Ref 'heads/{base_branch}' in '{repo}' has no commit sha"
+                )
+            base_commit = _request(
+                "GET", f"/repos/{owner}/{name}/git/commits/{base_commit_sha}"
+            )
+            _require_object(base_commit, context=f"commit {base_commit_sha}")
+            tree_sha = (base_commit.get("tree") or {}).get("sha")
+            if not isinstance(tree_sha, str) or not tree_sha:
+                return _error(f"Commit {base_commit_sha} in '{repo}' has no tree sha")
+
+            # Walk the path one directory level at a time (a recursive tree
+            # fetch can be truncated on big repos) down to the entry itself.
+            entry: dict[str, Any] | None = None
+            current_tree = tree_sha
+            for index, segment in enumerate(path.split("/")):
+                tree = _request(
+                    "GET", f"/repos/{owner}/{name}/git/trees/{current_tree}"
+                )
+                _require_object(tree, context=f"tree {current_tree}")
+                items = tree.get("tree") or []
+                _require_object_items(items, context="tree entries")
+                entry = next((i for i in items if i.get("path") == segment), None)
+                if entry is None:
+                    break
+                if index < len(encoded_segments) - 1:
+                    if entry.get("type") != "tree":
+                        entry = None
+                        break
+                    current_tree = entry.get("sha") or ""
+        except _GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return _not_found_error(
+                    exc,
+                    f"repository '{repo}' or base branch '{base or 'default'}' not found",
+                )
+            raise
+
+        if entry is None:
+            return _error(f"'{path}' does not exist in '{repo}' at '{base_branch}'")
+        if entry.get("mode") != "160000" or entry.get("type") != "commit":
+            return _error(
+                f"'{path}' in '{repo}' is not a submodule (mode "
+                f"{entry.get('mode')}, type {entry.get('type')}); refusing to "
+                "replace it with a submodule pointer"
+            )
+        old_sha = entry.get("sha")
+        if old_sha == new_sha:
+            return _success(
+                updated=False,
+                message=f"Submodule '{path}' in '{repo}' is already at {new_sha}; nothing to do",
+                path=path,
+                old_sha=old_sha,
+                new_sha=new_sha,
+                base=base_branch,
+            )
+
+        # Refuse an existing branch BEFORE writing any objects.
+        try:
+            _request(
+                "GET",
+                f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(branch)}",
+            )
+        except _GitHubAPIError as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            return _error(
+                f"Branch '{branch}' already exists in '{repo}'; choose another name"
+            )
+
+        try:
+            new_tree = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/trees",
+                json_data={
+                    "base_tree": tree_sha,
+                    "tree": [
+                        {
+                            "path": path,
+                            "mode": "160000",
+                            "type": "commit",
+                            "sha": new_sha,
+                        }
+                    ],
+                },
+            )
+            _require_object(new_tree, context="created tree")
+            commit = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/commits",
+                json_data={
+                    "message": message or f"chore: bump {path} to {new_sha[:8]}",
+                    "tree": new_tree.get("sha"),
+                    "parents": [base_commit_sha],
+                },
+            )
+            _require_object(commit, context="created commit")
+            ref = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/refs",
+                json_data={"ref": f"refs/heads/{branch}", "sha": commit.get("sha")},
+            )
+            _require_object(ref, context=f"created branch '{branch}'")
+        except _GitHubAPIError as exc:
+            if exc.status_code == 403:
+                return _forbidden_write_error(exc, repo=repo)
+            if exc.status_code == 422 and "already exists" in str(exc).lower():
+                return _error(
+                    f"{exc} -- branch '{branch}' already exists in '{repo}'; choose another name"
+                )
+            if exc.status_code == 422:
+                return _error(
+                    f"{exc} -- GitHub rejected the submodule update (check that "
+                    f"'{path}' and sha {new_sha} are valid)"
+                )
+            raise
+        return _success(
+            updated=True,
+            path=path,
+            old_sha=old_sha,
+            new_sha=new_sha,
+            commit_sha=commit.get("sha"),
+            branch=branch,
+            base=base_branch,
+            compare_url=_submodule_compare_url(
+                owner, name, base_branch, path, str(old_sha), new_sha
+            ),
+        )
+    except Exception as e:
+        logger.error(
+            f"Error updating GitHub submodule {repo}:{path}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
 if __name__ == "__main__":
     mcp.run()

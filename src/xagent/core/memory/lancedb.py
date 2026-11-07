@@ -112,6 +112,19 @@ class LanceDBMemoryStore(MemoryStore):
         store._verify_admitted_table(admitted, identity)
         return store
 
+    @property
+    def embedding_usage_model_id(self) -> str:
+        """The model id this store's embedding calls are recorded under.
+
+        ``""`` when they carry none: no embedding model, or one configured
+        without a billing id.
+        """
+        model = self._embedding_model
+        config = getattr(model, "model_config", None)
+        if isinstance(config, EmbeddingModelConfig):
+            return config.usage_model_id
+        return str(getattr(model, "model_id", "") or "")
+
     def _verify_admitted_table(
         self, admitted: AdmittedLanceDBMemoryStore, identity: EmbeddingIdentity
     ) -> None:

@@ -131,6 +131,17 @@ class CreateTaskRequest(BaseModel):
             "(trace_id, request_id, etc). Not interpreted server-side."
         ),
     )
+    response_format: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Output format of the task. Omitted, null or "
+            '``{"type": "text"}`` means no format; a ``json_schema`` object '
+            "(``name``, ``schema`` and optionally ``strict`` set to true and "
+            "``description``) sets it for this and later turns. An invalid "
+            "value is rejected with 422 ``invalid_input``; the message starts "
+            "with the rule id and the JSON path of the offending value."
+        ),
+    )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
         default=None,
         description=(
@@ -468,6 +479,23 @@ class CreateTaskResponse(BaseModel):
             "dispatch queue. Later commands on the task are not reported here."
         ),
     )
+    # Both fields have defaults so that a downstream embedder that constructs
+    # these responses directly keeps working; the v1 handlers always assign
+    # them explicitly.
+    response_format_type: str = Field(
+        "text",
+        description=(
+            "Format in force on the task once this request was handled: "
+            "'text' or 'json_schema'."
+        ),
+    )
+    response_format_name: str = Field(
+        "",
+        description=(
+            "Name of the format when response_format_type is 'json_schema'; "
+            "an empty string otherwise."
+        ),
+    )
 
 
 class AppendMessageRequest(BaseModel):
@@ -520,6 +548,19 @@ class AppendMessageRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Free-form correlation data passed through unchanged.",
+    )
+    response_format: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Output format of the task. Omitted or null leaves the stored "
+            'format as it is; ``{"type": "text"}`` clears it; a '
+            "``json_schema`` object (``name``, ``schema`` and optionally "
+            "``strict`` set to true and ``description``) sets it for this and "
+            "later turns. An invalid value is rejected with 422 "
+            "``invalid_input``; the message starts with the rule id and the "
+            "JSON path of the offending value. Not accepted with a workforce "
+            "key (422)."
+        ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
         default=None,
@@ -574,6 +615,23 @@ class AppendMessageResponse(BaseModel):
         ..., description="Monotonic version of the task control state."
     )
     control_state: str = Field(..., description="Detailed task control state.")
+    # Both fields have defaults so that a downstream embedder that constructs
+    # these responses directly keeps working; the v1 handlers always assign
+    # them explicitly.
+    response_format_type: str = Field(
+        "text",
+        description=(
+            "Format in force on the task once this request was handled: "
+            "'text' or 'json_schema'."
+        ),
+    )
+    response_format_name: str = Field(
+        "",
+        description=(
+            "Name of the format when response_format_type is 'json_schema'; "
+            "an empty string otherwise."
+        ),
+    )
 
 
 class ReplyRequest(BaseModel):
@@ -941,6 +999,36 @@ class TaskInfoResponse(BaseModel):
             "already got answered, instead of null. This is a "
             "convenience read, not the historical interaction record; "
             "see #1079 for the full typed interaction surface."
+        ),
+    )
+    structured_output: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The structured result of the run shown in this response, when "
+            "structured_output_status is 'ready'; null otherwise."
+        ),
+    )
+    structured_output_status: Optional[str] = Field(
+        None,
+        description=(
+            "One of: ready / incomplete / failed. Null unless the task is "
+            "completed and either produced a structured result or has a "
+            "response format configured."
+        ),
+    )
+    structured_output_reason: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Why there is no structured result when structured_output_status "
+            "is 'incomplete' or 'failed': an object with code and message, "
+            "and missing_fields or unexpressible_fields (at most 20 paths "
+            "each) when the result lacks or cannot express values. A key with "
+            "no value is absent. code is one of: agent_partial / "
+            "agent_blocked / information_missing / value_not_expressible / "
+            "not_produced (status incomplete); schema_mismatch / "
+            "result_too_large / model_error / invalid_stored_format / "
+            "extraction_timeout / internal_error (status failed). Null "
+            "otherwise."
         ),
     )
 

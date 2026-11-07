@@ -60,7 +60,7 @@ def test_spec_default_includes_everything():
     """A bare ``ToolSelectionSpec()`` carries no restrictions: every
     helper returns True so the legacy "build everything" path runs."""
     spec = ToolSelectionSpec()
-    assert spec.includes_category("basic") is True
+    assert spec.includes_category("basic_tools") is True
     assert spec.includes_category("mcp") is True
     assert spec.includes_mcp() is True
     assert spec.includes_custom_api() is True
@@ -68,9 +68,9 @@ def test_spec_default_includes_everything():
 
 
 def test_spec_categories_restricts_category():
-    spec = ToolSelectionSpec(categories=frozenset({"basic", "file"}))
-    assert spec.includes_category("basic") is True
-    assert spec.includes_category("web_search") is False
+    spec = ToolSelectionSpec(categories=frozenset({"basic_tools", "file"}))
+    assert spec.includes_category("basic_tools") is True
+    assert spec.includes_category("web_tools") is False
     assert spec.includes_category("file") is True
     assert spec.includes_category("mcp") is False
 
@@ -79,7 +79,7 @@ def test_spec_categories_empty_set_excludes_all():
     """Empty frozenset is explicit "no categories allowed" -- distinct
     from None which means "no restriction"."""
     spec = ToolSelectionSpec(categories=frozenset())
-    assert spec.includes_category("basic") is False
+    assert spec.includes_category("basic_tools") is False
     assert spec.includes_category("anything") is False
 
 
@@ -93,7 +93,7 @@ def test_spec_scoped_server_includes_mcp_without_plain_category():
     the plain ``"mcp"`` category is absent -- that is exactly the
     ``mcp:<server>`` intent (categories and mcp_servers are orthogonal)."""
     spec = ToolSelectionSpec(
-        categories=frozenset({"basic"}),
+        categories=frozenset({"basic_tools"}),
         mcp_servers=frozenset({"Gmail"}),
     )
     assert spec.includes_mcp() is True
@@ -120,8 +120,8 @@ def test_spec_published_agent_empty_set_excludes():
 def test_from_raw_drops_agent_category_but_keeps_others():
     """Legacy agents saved with ``agent`` lose only that entry: the rest
     of their selection keeps working, and no delegation is dispatched."""
-    spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "agent"])
-    assert spec.categories == frozenset({"basic"})
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic_tools", "agent"])
+    assert spec.categories == frozenset({"basic_tools"})
     assert spec.includes_published_agent() is False
 
 
@@ -210,7 +210,7 @@ async def test_registry_runs_all_creators_when_spec_none(isolated_registry):
     basic.__name__ = "basic_creator"
     file_c = AsyncMock(return_value=[MagicMock(name="file_tool")])
     file_c.__name__ = "file_creator"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
     isolated_registry.register(file_c, categories={"file"})
 
     tools = await isolated_registry.create_registered_tools(_FakeConfig(None))
@@ -221,16 +221,16 @@ async def test_registry_runs_all_creators_when_spec_none(isolated_registry):
 
 
 async def test_registry_skips_creator_when_categories_disjoint(isolated_registry):
-    """``spec.categories={"basic"}`` skips the file creator at the
+    """``spec.categories={"basic_tools"}`` skips the file creator at the
     registry level -- the creator callable is never awaited."""
     basic = AsyncMock(return_value=[MagicMock(name="basic_tool")])
     basic.__name__ = "basic_creator"
     file_c = AsyncMock(return_value=[MagicMock(name="file_tool")])
     file_c.__name__ = "file_creator"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
     isolated_registry.register(file_c, categories={"file"})
 
-    spec = ToolSelectionSpec(categories=frozenset({"basic"}))
+    spec = ToolSelectionSpec(categories=frozenset({"basic_tools"}))
     tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
 
     assert basic.await_count == 1
@@ -246,13 +246,13 @@ async def test_registry_runs_published_agent_creator_for_workforce_extras(
     only the published-agent creator so the final name filter can keep the
     injected worker tool.
     """
-    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic_tools")])
     basic.__name__ = "basic_creator"
     published_agents = AsyncMock(return_value=[_mock_tool("agent_42", "agent")])
     published_agents.__name__ = "create_agent_tools"
     agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
     agent_management.__name__ = "create_create_agent_tool"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
     isolated_registry.register(
         published_agents,
         categories={"agent"},
@@ -261,7 +261,7 @@ async def test_registry_runs_published_agent_creator_for_workforce_extras(
     isolated_registry.register(agent_management, categories={"agent"})
 
     spec = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"],
+        tool_categories=["basic_tools"],
         published_agent_ids=[42],  # dispatch: run the published-agent creator
         name_allowlist={"agent_42"},  # filter: keep this worker tool
     )
@@ -280,13 +280,13 @@ async def test_registry_skips_agent_creators_for_legacy_agent_category(
     ``agent`` gets neither published-agent delegation tools nor agent
     management tools at runtime (issue #802) — the creators are never
     awaited, while the rest of its selection builds normally."""
-    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic_tools")])
     basic.__name__ = "basic_creator"
     published_agents = AsyncMock(return_value=[_mock_tool("agent_42", "agent")])
     published_agents.__name__ = "create_agent_tools"
     agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
     agent_management.__name__ = "create_create_agent_tool"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
     isolated_registry.register(
         published_agents,
         categories={"agent"},
@@ -294,7 +294,7 @@ async def test_registry_skips_agent_creators_for_legacy_agent_category(
     )
     isolated_registry.register(agent_management, categories={"agent"})
 
-    spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "agent"])
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic_tools", "agent"])
     tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
 
     assert basic.await_count == 1
@@ -309,7 +309,7 @@ async def test_factory_worker_only_mode_keeps_only_injected_agent_tools(
     """Workforce managers with no ordinary categories should only expose
     injected worker agent tools, not the full default tool set.
     """
-    basic = AsyncMock(return_value=[_mock_tool("exa_web_search", "basic")])
+    basic = AsyncMock(return_value=[_mock_tool("exa_web_search", "basic_tools")])
     basic.__name__ = "basic_creator"
     published_agents = AsyncMock(
         return_value=[
@@ -320,7 +320,7 @@ async def test_factory_worker_only_mode_keeps_only_injected_agent_tools(
     published_agents.__name__ = "create_agent_tools"
     agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
     agent_management.__name__ = "create_create_agent_tool"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
     isolated_registry.register(
         published_agents,
         categories={"agent"},
@@ -357,7 +357,7 @@ async def test_registry_always_runs_creator_without_declared_categories(
     dyn.__name__ = "dynamic_creator"
     isolated_registry.register(dyn)  # no categories=
 
-    spec = ToolSelectionSpec(categories=frozenset({"basic"}))
+    spec = ToolSelectionSpec(categories=frozenset({"basic_tools"}))
     await isolated_registry.create_registered_tools(_FakeConfig(spec))
 
     assert dyn.await_count == 1
@@ -1029,7 +1029,7 @@ def test_scoped_mcp_servers_parent_child_table() -> None:
     # explicit none -> initialize nothing
     assert raw(explicit_none=True).scoped_mcp_servers() == frozenset()
     # category without mcp -> nothing
-    assert raw(tool_categories=["basic"]).scoped_mcp_servers() == frozenset()
+    assert raw(tool_categories=["basic_tools"]).scoped_mcp_servers() == frozenset()
 
 
 def test_should_run_creator_mcp_gate_dispatches_server_only() -> None:
@@ -1044,7 +1044,7 @@ def test_should_run_creator_mcp_gate_dispatches_server_only() -> None:
     assert ToolRegistry._should_run_creator(declared, server_only, "mcp") is True
 
     # A non-MCP selection must still skip the MCP creator.
-    basic_only = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    basic_only = ToolSelectionSpec.from_raw(tool_categories=["basic_tools"])
     assert ToolRegistry._should_run_creator(declared, basic_only, "mcp") is False
 
     # Without the gate (category intersection) the server-only spec would
@@ -1099,7 +1099,7 @@ def static_creators(isolated_registry, monkeypatch):
     that the minimal ``_E2EConfig`` doesn't carry.
     """
     creators = {
-        "basic": _make_static_creator("basic_creator"),
+        "basic_tools": _make_static_creator("basic_creator"),
         "file": _make_static_creator("file_creator"),
         "knowledge": _make_static_creator("knowledge_creator"),
         "browser": _make_static_creator("browser_creator"),
@@ -1136,23 +1136,23 @@ class _E2EConfig:
 
 async def test_e2e_single_basic_category_skips_all_others(static_creators):
     """The simplest real-prod shape (e.g. agent "Velvet Assistant" =
-    ['knowledge', 'basic']): with ``tool_categories=["basic"]`` the
-    chat helper produces a spec restricted to {"basic"}, and the
+    ['knowledge', 'basic_tools']): with ``tool_categories=["basic_tools"]`` the
+    chat helper produces a spec restricted to {"basic_tools"}, and the
     factory must dispatch *only* the basic creator. All seven other
     static creators stay un-called.
     """
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    spec = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic_tools"])
     assert spec is not None
-    assert spec.categories == frozenset({"basic"})
+    assert spec.categories == frozenset({"basic_tools"})
     assert spec.mcp_servers is None
 
     await ToolFactory.create_all_tools(
         _E2EConfig(spec), apply_user_override_filter=False
     )
 
-    assert static_creators["basic"].await_count == 1
+    assert static_creators["basic_tools"].await_count == 1
     for cat in ("file", "knowledge", "browser", "image", "ppt", "vision", "database"):
         assert static_creators[cat].await_count == 0, (
             f"{cat} creator unexpectedly dispatched"
@@ -1161,7 +1161,7 @@ async def test_e2e_single_basic_category_skips_all_others(static_creators):
 
 async def test_e2e_multi_category_dispatches_matching_creators(static_creators):
     """A multi-category prod shape (e.g. agent 258 "Testing" =
-    ['basic', 'browser', 'file', 'database', 'image', 'knowledge',
+    ['basic_tools', 'browser', 'file', 'database', 'image', 'knowledge',
     'vision']): the spec includes all of them, the factory dispatches
     exactly those creators and skips the only category absent from
     the agent's selection (``ppt``)."""
@@ -1169,7 +1169,7 @@ async def test_e2e_multi_category_dispatches_matching_creators(static_creators):
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=[
-            "basic",
+            "basic_tools",
             "browser",
             "file",
             "database",
@@ -1183,7 +1183,15 @@ async def test_e2e_multi_category_dispatches_matching_creators(static_creators):
         _E2EConfig(spec), apply_user_override_filter=False
     )
 
-    for cat in ("basic", "browser", "file", "database", "image", "knowledge", "vision"):
+    for cat in (
+        "basic_tools",
+        "browser",
+        "file",
+        "database",
+        "image",
+        "knowledge",
+        "vision",
+    ):
         assert static_creators[cat].await_count == 1, f"{cat} creator should have run"
     assert static_creators["ppt"].await_count == 0, (
         "ppt creator should have been skipped"
@@ -1196,17 +1204,17 @@ async def test_e2e_mcp_server_form_extracts_servers_and_includes_mcp(static_crea
     category is injected, no raw ``mcp:<server>`` string leaks into
     ``categories``. The MCP / Custom-API creators run via
     ``includes_mcp()`` / ``includes_custom_api()`` reading mcp_servers.
-    Mimics agent 252 "Email Agent (Sales)_V2" = ['basic', 'file',
+    Mimics agent 252 "Email Agent (Sales)_V2" = ['basic_tools', 'file',
     'knowledge', 'mcp:Gmail']."""
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     spec = ToolSelectionSpec.from_raw(
-        tool_categories=["basic", "file", "knowledge", "mcp:Gmail"]
+        tool_categories=["basic_tools", "file", "knowledge", "mcp:Gmail"]
     )
 
     # Plain entries land in categories; the server scope lands in
     # mcp_servers. categories carries NO mcp/other/mcp:Gmail.
-    assert spec.categories == frozenset({"basic", "file", "knowledge"})
+    assert spec.categories == frozenset({"basic_tools", "file", "knowledge"})
     assert "mcp" not in spec.categories
     assert "other" not in spec.categories
     assert spec.mcp_servers == frozenset({"gmail"})
@@ -1218,7 +1226,7 @@ async def test_e2e_mcp_server_form_extracts_servers_and_includes_mcp(static_crea
     await ToolFactory.create_all_tools(
         _E2EConfig(spec), apply_user_override_filter=False
     )
-    assert static_creators["basic"].await_count == 1
+    assert static_creators["basic_tools"].await_count == 1
     assert static_creators["file"].await_count == 1
     assert static_creators["knowledge"].await_count == 1
     assert static_creators["browser"].await_count == 0
@@ -1305,7 +1313,7 @@ def test_select_allowed_tool_names_none_input_returns_none() -> None:
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     result = ToolSelectionSpec.from_raw(tool_categories=None).compute_allowed_names(
-        [_mock_tool("calculator", "basic")],
+        [_mock_tool("calculator", "basic_tools")],
     )
     assert result is None, (
         "tool_categories=None must yield None (ALL semantics); a non-None "
@@ -1325,7 +1333,7 @@ def test_select_allowed_tool_names_empty_input_returns_none() -> None:
 
     result = ToolSelectionSpec.from_raw(tool_categories=[]).compute_allowed_names(
         [
-            _mock_tool("calculator", "basic"),
+            _mock_tool("calculator", "basic_tools"),
             _mock_tool("file_read", "file"),
         ],
     )
@@ -1341,11 +1349,11 @@ def test_select_allowed_tool_names_plain_category_match() -> None:
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     result = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"]
+        tool_categories=["basic_tools"]
     ).compute_allowed_names(
         [
-            _mock_tool("calculator", "basic"),
-            _mock_tool("python_executor", "basic"),
+            _mock_tool("calculator", "basic_tools"),
+            _mock_tool("python_executor", "basic_tools"),
             _mock_tool("file_read", "file"),
         ],
     )
@@ -1362,11 +1370,11 @@ def test_basic_category_does_not_admit_web_search_tools() -> None:
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     result = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"]
+        tool_categories=["basic_tools"]
     ).compute_allowed_names(
         [
-            _mock_tool("api_call", "basic"),
-            _mock_tool("fetch_web_content", "web_search"),
+            _mock_tool("api_call", "basic_tools"),
+            _mock_tool("fetch_web_content", "web_tools"),
             _mock_tool("knowledge_search", "knowledge"),
         ],
     )
@@ -1379,11 +1387,11 @@ def test_web_search_category_does_not_admit_all_basic_tools() -> None:
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     result = ToolSelectionSpec.from_raw(
-        tool_categories=["web_search"]
+        tool_categories=["web_tools"]
     ).compute_allowed_names(
         [
-            _mock_tool("api_call", "basic"),
-            _mock_tool("fetch_web_content", "web_search"),
+            _mock_tool("api_call", "basic_tools"),
+            _mock_tool("fetch_web_content", "web_tools"),
         ],
     )
     assert sorted(result or []) == ["fetch_web_content"]
@@ -1403,7 +1411,7 @@ def test_select_allowed_tool_names_mcp_server_form() -> None:
             _mock_tool("mcp_gmail_list_messages", "mcp", source_server="gmail"),
             # different server, excluded
             _mock_tool("mcp_slack_send", "mcp", source_server="slack"),
-            _mock_tool("calculator", "basic"),  # different category, excluded
+            _mock_tool("calculator", "basic_tools"),  # different category, excluded
         ],
     )
     assert sorted(result or []) == [
@@ -1524,7 +1532,7 @@ def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
         tool_categories=["mcp:UnknownServer"]
     ).compute_allowed_names(
         [
-            _mock_tool("calculator", "basic"),
+            _mock_tool("calculator", "basic_tools"),
             _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
         ],
     )
@@ -1565,7 +1573,7 @@ def test_abc_base_cannot_be_instantiated_via_subclass_constructor():
     # Concrete subclasses work.
     assert _SpecAll() is not None
     assert _SpecNone() is not None
-    assert _SpecByCategories(categories=frozenset({"basic"})) is not None
+    assert _SpecByCategories(categories=frozenset({"basic_tools"})) is not None
 
 
 def test_abc_subclass_missing_abstract_method_raises_on_instantiation():
@@ -1629,7 +1637,7 @@ def test_subclasses_are_frozen():
 
     sa = _SpecAll()
     sn = _SpecNone()
-    sc = _SpecByCategories(categories=frozenset({"basic"}))
+    sc = _SpecByCategories(categories=frozenset({"basic_tools"}))
 
     with pytest.raises(FrozenInstanceError):
         sa.categories = frozenset({"x"})  # type: ignore[misc]
@@ -1663,7 +1671,7 @@ def test_spec_none_mode_predicates():
 def test_spec_by_categories_mode_predicates():
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
-    s = _SpecByCategories(categories=frozenset({"basic"}))
+    s = _SpecByCategories(categories=frozenset({"basic_tools"}))
     assert s.is_all() is False
     assert s.is_none() is False
     assert s.is_by_categories() is True
@@ -1693,9 +1701,9 @@ def test_from_raw_empty_categories_yields_none_mode():
 def test_from_raw_categories_yields_by_categories_mode():
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
-    spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "file"])
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic_tools", "file"])
     assert isinstance(spec, _SpecByCategories)
-    assert spec.categories == frozenset({"basic", "file"})
+    assert spec.categories == frozenset({"basic_tools", "file"})
 
 
 def test_from_raw_explicit_none_yields_none_mode():
@@ -1704,7 +1712,7 @@ def test_from_raw_explicit_none_yields_none_mode():
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
 
     spec = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"],  # would normally yield BY_CATEGORIES
+        tool_categories=["basic_tools"],  # would normally yield BY_CATEGORIES
         explicit_none=True,
     )
     assert isinstance(spec, _SpecNone)
@@ -1740,12 +1748,12 @@ def test_from_raw_can_restrict_unconfigured_agent_to_workforce_extras_only():
     assert isinstance(spec, _SpecByCategories)
     assert spec.categories == frozenset()
     assert spec.name_allowlist == frozenset({"agent_42"})
-    assert spec.includes_category("basic") is False
+    assert spec.includes_category("basic_tools") is False
     # Dispatch comes from published_agent_ids, not from the name allow-list.
     assert spec.includes_published_agent() is True
     assert spec.compute_allowed_names(
         [
-            _mock_tool("exa_web_search", "basic"),
+            _mock_tool("exa_web_search", "basic_tools"),
             _mock_tool("agent_42", "agent"),
             _mock_tool("agent_99", "agent"),
         ]
@@ -1776,7 +1784,7 @@ def test_name_allowlist_alone_does_not_trigger_published_dispatch():
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
     spec = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"],
+        tool_categories=["basic_tools"],
         name_allowlist={"worker_tool_a", "worker_tool_b"},
     )
     assert isinstance(spec, _SpecByCategories)
@@ -1789,14 +1797,14 @@ def test_name_allowlist_alone_does_not_trigger_published_dispatch():
 
 
 def test_by_categories_excludes_custom_api_when_other_missing():
-    """P2 fix: ``categories={"basic"}`` excludes ``"other"``, so Custom
+    """P2 fix: ``categories={"basic_tools"}`` excludes ``"other"``, so Custom
     API tools cannot survive the post-build category filter. The
     ``create_db_custom_api_tools`` creator's ``get_custom_api_configs()``
     DB lookup is wasted I/O in this case -- ``includes_custom_api``
     must short-circuit."""
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
-    spec = _SpecByCategories(categories=frozenset({"basic"}))
+    spec = _SpecByCategories(categories=frozenset({"basic_tools"}))
     assert spec.includes_custom_api() is False
 
 
@@ -1840,7 +1848,7 @@ def test_from_raw_unconfigured_can_exclude_custom_api():
     # Everything else keeps ALL-mode semantics: no name-level filter,
     # ordinary categories still admitted.
     assert spec.compute_allowed_names([]) is None
-    assert spec.includes_category("basic") is True
+    assert spec.includes_category("basic_tools") is True
 
 
 def test_exclude_custom_api_flag_is_noop_when_configured():
@@ -1871,7 +1879,7 @@ def test_compute_allowed_names_all_returns_none():
 
     spec = _SpecAll()
     result = spec.compute_allowed_names(
-        [_mock_tool("calc", "basic"), _mock_tool("img", "image")]
+        [_mock_tool("calc", "basic_tools"), _mock_tool("img", "image")]
     )
     assert result is None
 
@@ -1884,7 +1892,7 @@ def test_compute_allowed_names_none_returns_empty_frozenset():
 
     spec = _SpecNone()
     result = spec.compute_allowed_names(
-        [_mock_tool("calc", "basic"), _mock_tool("img", "image")]
+        [_mock_tool("calc", "basic_tools"), _mock_tool("img", "image")]
     )
     assert result == frozenset()
 
@@ -1895,12 +1903,12 @@ def test_compute_allowed_names_by_categories_filters_correctly():
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
     spec = _SpecByCategories(
-        categories=frozenset({"basic"}),
+        categories=frozenset({"basic_tools"}),
         name_allowlist=frozenset({"injected_worker_tool"}),
     )
     result = spec.compute_allowed_names(
         [
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
             _mock_tool("img", "image"),  # not in categories
             _mock_tool("file", "file"),  # not in categories
         ]
@@ -1913,18 +1921,18 @@ def test_compute_allowed_names_workforce_extra_does_not_admit_agent_category():
     selection to every agent-category tool.
     """
     spec = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"],
+        tool_categories=["basic_tools"],
         name_allowlist={"agent_42"},
     )
     result = spec.compute_allowed_names(
         [
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
             _mock_tool("agent_42", "agent"),
             _mock_tool("agent_99", "agent"),
         ]
     )
 
-    assert spec.categories == frozenset({"basic"})
+    assert spec.categories == frozenset({"basic_tools"})
     assert result == frozenset({"calc", "agent_42"})
 
 
@@ -1936,9 +1944,9 @@ async def test_factory_all_mode_keeps_all_tools(isolated_registry):
     registry survive into the returned list."""
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
 
-    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic_tools")])
     basic.__name__ = "basic_creator"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
 
     cfg = MagicMock()
     cfg.get_tool_selection_spec.return_value = _SpecAll()
@@ -1964,9 +1972,9 @@ async def test_factory_none_mode_filters_to_empty(isolated_registry):
     returns frozenset() → caller filters to [])."""
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
 
-    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic_tools")])
     basic.__name__ = "basic_creator"
-    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(basic, categories={"basic_tools"})
 
     cfg = MagicMock()
     cfg.get_tool_selection_spec.return_value = _SpecNone()
@@ -1996,19 +2004,19 @@ async def test_factory_by_categories_filters_by_compute_allowed_names(
 
     basic_creator = AsyncMock(
         return_value=[
-            _mock_tool("calc", "basic"),
-            _mock_tool("search", "basic"),
+            _mock_tool("calc", "basic_tools"),
+            _mock_tool("search", "basic_tools"),
         ]
     )
     basic_creator.__name__ = "basic_creator"
     file_creator = AsyncMock(return_value=[_mock_tool("read", "file")])
     file_creator.__name__ = "file_creator"
-    isolated_registry.register(basic_creator, categories={"basic"})
+    isolated_registry.register(basic_creator, categories={"basic_tools"})
     isolated_registry.register(file_creator, categories={"file"})
 
     cfg = MagicMock()
     cfg.get_tool_selection_spec.return_value = _SpecByCategories(
-        categories=frozenset({"basic"})
+        categories=frozenset({"basic_tools"})
     )
     cfg.get_allowed_tools.return_value = None
     cfg.get_sandbox.return_value = None
@@ -2025,7 +2033,7 @@ async def test_factory_by_categories_filters_by_compute_allowed_names(
 
     tools = await ToolFactory.create_all_tools(cfg)
     # ``file_creator`` is registry-skipped (declared "file", spec wants
-    # only "basic"); ``basic_creator`` runs and both names survive
+    # only "basic_tools"); ``basic_creator`` runs and both names survive
     # the post-build filter.
     assert sorted(t.name for t in tools) == ["calc", "search"]
 
@@ -2044,7 +2052,7 @@ def test_compute_allowed_names_by_categories_mcp_subcategory_match():
             _mock_tool("mcp_gmail_read", "mcp", source_server="gmail"),
             # different server
             _mock_tool("mcp_slack_post", "mcp", source_server="slack"),
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
         ]
     )
     assert result == frozenset({"mcp_gmail_send", "mcp_gmail_read"})
@@ -2141,7 +2149,7 @@ def test_register_tool_must_declare_categories_or_be_allowlisted():
     assert not offenders, (
         f"Unannotated ``@register_tool`` creators found: {offenders}. "
         f"Every creator MUST declare its categories statically "
-        f"(``@register_tool(categories={{'basic'}})``) so the registry "
+        f"(``@register_tool(categories={{'basic_tools'}})``) so the registry "
         f"can skip it without invoking the creator (and any DB / network "
         f"I/O the creator does). The only legitimate exception is "
         f"``create_db_custom_api_tools`` whose tools have dynamic "
@@ -2166,8 +2174,8 @@ def test_factory_falls_back_to_get_allowed_tools_when_spec_none():
     import asyncio
     from unittest.mock import MagicMock as _MagicMock
 
-    tool_allowed = _mock_tool("allowed", "basic")
-    tool_leaked = _mock_tool("leaked", "basic")
+    tool_allowed = _mock_tool("allowed", "basic_tools")
+    tool_leaked = _mock_tool("leaked", "basic_tools")
 
     cfg = _MagicMock()
     cfg.get_tool_selection_spec.return_value = None
@@ -2194,7 +2202,7 @@ def test_factory_falls_back_to_get_allowed_tools_when_spec_none():
             return [tool_allowed, tool_leaked]
 
         creator.__name__ = "test_creator"
-        ToolRegistry.register(creator, categories={"basic"})
+        ToolRegistry.register(creator, categories={"basic_tools"})
 
         tools = asyncio.run(ToolFactory.create_all_tools(cfg))
         assert [t.name for t in tools] == ["allowed"], (
@@ -2215,12 +2223,12 @@ def test_factory_prefers_spec_and_warns_when_allowed_tools_also_set(caplog):
     import logging
     from unittest.mock import MagicMock as _MagicMock
 
-    tool_a = _mock_tool("a", "basic")
-    tool_b = _mock_tool("b", "basic")
+    tool_a = _mock_tool("a", "basic_tools")
+    tool_b = _mock_tool("b", "basic_tools")
 
     cfg = _MagicMock()
     cfg.get_tool_selection_spec.return_value = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"]
+        tool_categories=["basic_tools"]
     )
     cfg.get_allowed_tools.return_value = ["a"]  # stale legacy list
     cfg.get_sandbox.return_value = None
@@ -2245,12 +2253,12 @@ def test_factory_prefers_spec_and_warns_when_allowed_tools_also_set(caplog):
             return [tool_a, tool_b]
 
         creator.__name__ = "test_creator"
-        ToolRegistry.register(creator, categories={"basic"})
+        ToolRegistry.register(creator, categories={"basic_tools"})
 
         with caplog.at_level(logging.WARNING):
             tools = asyncio.run(ToolFactory.create_all_tools(cfg))
 
-        # Spec wins: "basic" admits both; the legacy ["a"] is ignored.
+        # Spec wins: "basic_tools" admits both; the legacy ["a"] is ignored.
         assert {t.name for t in tools} == {"a", "b"}
         assert any("legacy allowed_tools" in r.getMessage() for r in caplog.records)
     finally:
@@ -2268,7 +2276,7 @@ def test_compute_allowed_names_plain_mcp_admits_all_mcp_tools():
         [
             _mock_tool("mcp_gmail_send", "mcp"),
             _mock_tool("mcp_slack_post", "mcp"),
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
         ]
     )
     assert result == frozenset({"mcp_gmail_send", "mcp_slack_post"})
@@ -2281,7 +2289,7 @@ def test_compute_allowed_names_plain_other_is_ignored():
         [
             _mock_tool("api_custom_call", "other"),
             _mock_tool("api_legacy_call", "other"),
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
         ]
     )
     assert result == frozenset()
@@ -2301,10 +2309,11 @@ def test_from_raw_warns_when_dropping_other(caplog):
 
     caplog.clear()
     with caplog.at_level("WARNING"):
-        spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "other"])
-    assert spec.categories == frozenset({"basic"})
+        spec = ToolSelectionSpec.from_raw(tool_categories=["basic_tools", "other"])
+    assert spec.categories == frozenset({"basic_tools"})
     assert any(
-        repr(["basic", "other"]) in record.getMessage() for record in caplog.records
+        repr(["basic_tools", "other"]) in record.getMessage()
+        for record in caplog.records
     )
 
 
@@ -2329,7 +2338,7 @@ def test_compute_allowed_names_mixed_plain_and_server_picks():
             _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
             _mock_tool("mcp_slack_post", "mcp", source_server="slack"),
             _mock_tool("api_custom_call", "other", source_server="custom"),
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
         ]
     )
     assert result == frozenset({"mcp_gmail_send"})
@@ -2345,7 +2354,7 @@ def test_compute_allowed_names_plain_mcp_wins_over_server_scope():
         [
             _mock_tool("mcp_gmail_send", "mcp"),
             _mock_tool("mcp_slack_post", "mcp"),
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
         ]
     )
     assert result == frozenset({"mcp_gmail_send", "mcp_slack_post"})
@@ -2356,13 +2365,13 @@ def test_from_raw_generic_name_allowlist_unions_into_results():
     lands on the spec and is unioned into compute_allowed_names alongside
     the category matches."""
     spec = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"],
+        tool_categories=["basic_tools"],
         name_allowlist={"foo_tool"},
     )
     assert spec.name_allowlist == frozenset({"foo_tool"})
     result = spec.compute_allowed_names(
         [
-            _mock_tool("calc", "basic"),
+            _mock_tool("calc", "basic_tools"),
             _mock_tool("img", "image"),
             _mock_tool("foo_tool", "other"),
         ]
@@ -2385,10 +2394,13 @@ def test_spec_wants_mcp_only_for_explicit_mcp_selection():
         (_SpecNone(), False),
         (ToolSelectionSpec.from_raw(tool_categories=[]), False),
         (ToolSelectionSpec.from_raw(tool_categories=None), False),
-        (ToolSelectionSpec.from_raw(tool_categories=["basic"]), False),
+        (ToolSelectionSpec.from_raw(tool_categories=["basic_tools"]), False),
         (ToolSelectionSpec.from_raw(tool_categories=["mcp"]), True),
         (ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]), True),
-        (ToolSelectionSpec.from_raw(tool_categories=["basic", "mcp:Gmail"]), True),
+        (
+            ToolSelectionSpec.from_raw(tool_categories=["basic_tools", "mcp:Gmail"]),
+            True,
+        ),
     ]
 
     for spec, expected in specs:
@@ -2401,10 +2413,10 @@ def test_ssh_tools_survive_a_selection_that_never_names_ssh() -> None:
     tool-list endpoint cannot enumerate SSH tools), so filtering on it would
     leave every configured agent without the tools its binding grants."""
     result = ToolSelectionSpec.from_raw(
-        tool_categories=["basic"]
+        tool_categories=["basic_tools"]
     ).compute_allowed_names(
         [
-            _mock_tool("calculator", "basic"),
+            _mock_tool("calculator", "basic_tools"),
             _mock_tool("ssh_execute", "ssh"),
             _mock_tool("file_read", "file"),
         ],
@@ -2457,7 +2469,7 @@ def test_should_run_creator_runs_ssh_for_any_configured_selection() -> None:
     """The SSH creator gates on the target binding itself, so a selection that
     never names ``ssh`` must still dispatch it -- zero-tools must not."""
     declared = frozenset({"ssh"})
-    basic_only = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    basic_only = ToolSelectionSpec.from_raw(tool_categories=["basic_tools"])
     assert ToolRegistry._should_run_creator(declared, basic_only, None) is True
     zero_tools = ToolSelectionSpec.from_raw(tool_categories=[])
     assert ToolRegistry._should_run_creator(declared, zero_tools, None) is False
@@ -2478,9 +2490,9 @@ def test_selecting_ssh_explicitly_matches_omitting_it() -> None:
     already-saved list is therefore a no-op today; a real opt-out means
     dropping the binding (or its own switch, out of scope here).
     """
-    tools = [_mock_tool("calculator", "basic"), _mock_tool("ssh_execute", "ssh")]
-    with_ssh = ToolSelectionSpec.from_raw(tool_categories=["basic", "ssh"])
-    without_ssh = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    tools = [_mock_tool("calculator", "basic_tools"), _mock_tool("ssh_execute", "ssh")]
+    with_ssh = ToolSelectionSpec.from_raw(tool_categories=["basic_tools", "ssh"])
+    without_ssh = ToolSelectionSpec.from_raw(tool_categories=["basic_tools"])
 
     assert with_ssh.compute_allowed_names(tools) == without_ssh.compute_allowed_names(
         tools
@@ -2505,7 +2517,7 @@ def test_published_agent_scope_alone_is_not_an_injection() -> None:
 def test_includes_category_agrees_with_the_other_two_gates_on_ssh() -> None:
     """Third gate parity: a future caller asking ``includes_category("ssh")``
     must get the same answer the dispatch and name filters give."""
-    assert ToolSelectionSpec.from_raw(tool_categories=["basic"]).includes_category(
-        "ssh"
-    )
+    assert ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools"]
+    ).includes_category("ssh")
     assert not ToolSelectionSpec.from_raw(tool_categories=[]).includes_category("ssh")

@@ -29,6 +29,7 @@ from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
 from .a2a_task_read import load_a2a_task_snapshot
 from .agent_store import AgentStore
+from .api_idempotency import IdempotencyClaim, bind_task_no_commit
 from .connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -51,6 +52,12 @@ from .managed_file_ref import (
     log_durable_storage_fault,
 )
 from .prompt_context import filter_prompt_context
+from .response_format import (
+    ResponseFormatChange,
+    echo_for_change,
+    echo_for_config,
+    store_response_format,
+)
 from .task_command_transport import (
     _resolve_actor_subject,
     command_identity_matches_task,
@@ -150,6 +157,10 @@ class TaskStartResult:
     run_id: str
     state_version: int
     control_state: str
+    # The format in force on the task once the request was handled. Neither
+    # field has a default, so a construction site that forgets them fails.
+    response_format_type: str
+    response_format_name: str
     # Set only by task creation: the class its start command was given. None for
     # an append, and for a creation that runs in this process.
     dispatch_class: DispatchClass | None = None
@@ -294,6 +305,9 @@ class _PreparedAppendTurn:
     task_owner_user_id: int
     payload: TaskTurnPayload
     claimed_turn: _PreparedTurn
+    # The format on the task as the claiming transaction left it.
+    response_format_type: str
+    response_format_name: str
 
 
 def _prepare_created_task_isolated(
@@ -308,7 +322,9 @@ def _prepare_created_task_isolated(
     timezone: str | None = None,
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
+    response_format: ResponseFormatChange = None,
     credential_kind: SdkCredentialKind,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
@@ -352,12 +368,18 @@ def _prepare_created_task_isolated(
             requested_dispatch_class=requested_dispatch_class,
             dispatch_priority=requested_priority,
         )
-        if prompt_context_value is not None:
-            setattr(
-                task,
-                "agent_config",
-                {PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context_value},
-            )
+        new_task_agent_config = store_response_format(
+            (
+                {PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context_value}
+                if prompt_context_value is not None
+                else {}
+            ),
+            response_format,
+        )
+        # A task that carries neither a prompt context nor a format keeps the
+        # column unset.
+        if new_task_agent_config:
+            setattr(task, "agent_config", new_task_agent_config)
         runtime_plan = prepare_create_connector_runtime(
             db=db,
             agent=agent,
@@ -416,6 +438,9 @@ def _prepare_created_task_isolated(
                     )
                 ).scalar_one(),
             )
+        if idempotency_claim is not None:
+            # Same transaction as the task: the key is bound to it or to nothing.
+            bind_task_no_commit(db, idempotency_claim, task_id)
         commit_claimed_turn_or_reconcile(
             db,
             task_id=task_id,
@@ -515,6 +540,8 @@ def _prepare_append_turn_isolated(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
+    response_format: ResponseFormatChange = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedAppendTurn:
     """Resolve append authorization and runtime inputs into detached values."""
 
@@ -557,6 +584,17 @@ def _prepare_append_turn_isolated(
             else:
                 task_agent_config.pop(PROMPT_CONTEXT_AGENT_CONFIG_KEY, None)
             setattr(task, "agent_config", task_agent_config)
+        # ``None`` keeps the stored format; the write shares this transaction
+        # with the claim below, so a rejected append leaves the format alone.
+        if response_format is not None:
+            setattr(
+                task,
+                "agent_config",
+                store_response_format(
+                    task.agent_config if isinstance(task.agent_config, dict) else {},
+                    response_format,
+                ),
+            )
         runtime_plan = prepare_append_connector_runtime(
             db=db,
             agent=runtime_agent,
@@ -580,12 +618,26 @@ def _prepare_append_turn_isolated(
                 values_by_ref=runtime_plan.ephemeral_by_ref,
             )
 
+        if prompt_context is not None or response_format is not None:
+            # The shared-mode claim re-reads the task row with
+            # ``populate_existing`` and this session does not autoflush, so an
+            # unflushed config write would be discarded there. The flush stays
+            # inside the claim's transaction, so a refused append rolls it back,
+            # and it comes after the file and connector preparation so the row
+            # is not locked while files are fetched.
+            db.flush()
         claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
             db,
             task_id=int(task.id),
             task_owner_user_id=task_owner_user_id,
             payload=payload,
             actor_user_id=actor_user_id,
+        )
+        # The claim reads the config back from the row it accepted, so the echo
+        # matches what this turn runs with even if another append changed the
+        # format after this request loaded the task.
+        response_format_type, response_format_name = echo_for_config(
+            claimed_turn.agent_config
         )
         if not get_shared_task_execution_enabled():
             _store_connector_runtime_values_or_fail(
@@ -601,7 +653,11 @@ def _prepare_append_turn_isolated(
             task_owner_user_id=task_owner_user_id,
             payload=payload,
             claimed_turn=claimed_turn,
+            response_format_type=response_format_type,
+            response_format_name=response_format_name,
         )
+        if idempotency_claim is not None:
+            bind_task_no_commit(db, idempotency_claim, int(task.id))
         commit_claimed_turn_or_reconcile(
             db,
             task_id=int(task.id),
@@ -775,7 +831,9 @@ async def create_sdk_task(
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
     prompt_context: dict[str, Any] | None = None,
+    response_format: ResponseFormatChange = None,
     credential_kind: SdkCredentialKind,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     """Create an SDK task and schedule its first turn.
 
@@ -798,7 +856,9 @@ async def create_sdk_task(
                 timezone=timezone,
                 requested_dispatch_class=requested_dispatch_class,
                 requested_priority=requested_priority,
+                response_format=response_format,
                 credential_kind=credential_kind,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -824,6 +884,9 @@ async def create_sdk_task(
     start_task = asyncio.create_task(_prepare_and_schedule())
     prepared, started = await drain_async_task_cancellation_safe(start_task)
 
+    # A new task has no earlier format, so the request's own change is the
+    # whole story.
+    response_format_type, response_format_name = echo_for_change(response_format)
     return TaskStartResult(
         task_id=prepared.task_id,
         agent_id=prepared.agent_id,
@@ -832,6 +895,8 @@ async def create_sdk_task(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        response_format_type=response_format_type,
+        response_format_name=response_format_name,
         dispatch_class=prepared.dispatch_class,
     )
 
@@ -847,6 +912,8 @@ async def append_sdk_turn(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
+    response_format: ResponseFormatChange = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
         # A runner may still be finishing local cleanup after its terminal
@@ -867,6 +934,8 @@ async def append_sdk_turn(
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
                 prompt_context=prompt_context,
+                response_format=response_format,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -893,6 +962,8 @@ async def append_sdk_turn(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        response_format_type=prepared.response_format_type,
+        response_format_name=prepared.response_format_name,
     )
 
 
@@ -1195,40 +1266,30 @@ async def execute_existing_task(
     *,
     task_id: int,
     task_owner_user_id: int,
-    task_source: str | None,
     task_description: str,
     context: dict[str, Any],
     actor_user_id: int,
 ) -> None:
-    """Submit shared execution, or await the legacy local execution handle."""
-    from .task_execution_host import enqueues_task_turns
+    """Durably accept the legacy ``execute_task``, then dispatch it promptly.
 
-    if enqueues_task_turns():
-        from .task_existing_command import enqueue_existing_execution
+    Both execution modes stage the same START (kind ``existing``). The command
+    dispatcher executes it, so a closed release hold leaves it pending for the
+    successor, and the WebSocket returns once the command is accepted instead
+    of waiting for the execution.
+    """
+    from .task_command_execution import execute_durable_task_command
+    from .task_command_transport import dispatch_task_command_promptly
+    from .task_existing_command import stage_existing_execution
 
-        await run_db_io_cancellation_safe(
-            lambda: enqueue_existing_execution(
-                task_id=task_id,
-                task_owner_user_id=task_owner_user_id,
-                task_description=task_description,
-                context=context,
-                actor_user_id=actor_user_id,
-            )
+    command_db_id = await run_db_io_cancellation_safe(
+        lambda: stage_existing_execution(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            task_description=task_description,
+            context=context,
+            actor_user_id=actor_user_id,
         )
-        # The WebSocket must keep receiving pause/resume commands while the
-        # worker executes. Completion arrives through the shared event bridge.
-        return
-    background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
-        task_id=task_id,
-        task_owner_user_id=task_owner_user_id,
-        task_source=task_source,
-        payload=TaskTurnPayload(
-            transcript_message=task_description,
-            execution_message=task_description,
-        ),
-        context=context,
-        actor_user_id=actor_user_id,
     )
-    # Legacy WebSocket execute_task must not return until execution finishes.
-    # Keep that ordering even though scheduling owns the background handle.
-    await background_task
+    await dispatch_task_command_promptly(
+        execute_durable_task_command, command_db_id=command_db_id
+    )

@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
+    Callable,
     Iterator,
     Literal,
     Optional,
@@ -26,6 +28,7 @@ from sqlalchemy import null as sql_null
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ...config import get_default_task_execution_mode, get_shared_task_execution_enabled
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
@@ -3315,21 +3318,20 @@ async def _pause_cap_held_commands_without_agent(
     ``TypeError``, which ``pause_task`` classifies. A database error raises.
     """
 
-    if not get_shared_task_execution_enabled():
-        return False
     from .task_dispatch_cap import build_dispatch_cap_snapshot
 
     if command.task_id in build_dispatch_cap_snapshot().active_ids:
         return False
     user = message_data["user"]
-    started_run = (
-        ()
-        if held_start_run_id is None
-        else (
+    # Without shared execution the only command a pause may pass is a START.
+    started_run: tuple[ColumnElement[bool], ...] = ()
+    if held_start_run_id is not None:
+        started_run = (
             TaskExecutionCommand.kind == "start",
             TaskExecutionCommand.target_run_id == held_start_run_id,
         )
-    )
+    elif not get_shared_task_execution_enabled():
+        started_run = (TaskExecutionCommand.kind == "start",)
 
     def read() -> Any | None:
         from .task_execution_admission import cap_held_command_predicates
@@ -5128,6 +5130,10 @@ async def execute_durable_task_command(
             if command.kind == TaskCommandKind.START:
                 from .task_start_consumer import execute_task_start
 
+                if not get_shared_task_execution_enabled():
+                    return await _execute_and_report_local_start(
+                        command, execute_task_start
+                    )
                 return await execute_task_start(command)
             return await _execute_and_report_task_command(command)
 
@@ -5140,6 +5146,67 @@ async def execute_durable_task_command(
         if current_task_coordinator(command.task_id) is None:
             return await execute_coordinated_command(command, execute)
     return await execute()
+
+
+async def _execute_and_report_local_start(
+    command: ClaimedTaskCommand,
+    execute: Callable[[ClaimedTaskCommand], Awaitable[SettledTaskCommand]],
+) -> SettledTaskCommand:
+    """Combined-mode START: tell the client when it terminally did not run.
+
+    The WebSocket acknowledged ``execute_task`` when it staged the START, so
+    nothing else says a START that failed for good never ran. A refusal the
+    consumer settles itself (``SettledTaskCommand``) is broadcast from its
+    result; an error that escapes is broadcast once it is final. A lost claim
+    means another dispatcher owns the START and stays silent.
+    """
+    try:
+        settled = await execute(command)
+    except TaskCommandRejected as exc:
+        if exc.reason in ("stale_claim", "stale_owner"):
+            raise
+        finish_task_command_delivery(command.command_id, command.task_id)
+        bind_terminal_event_draft(
+            exc, await _terminal_command_event_draft(command, exc)
+        )
+        await _broadcast_terminal_start_error(command, exc)
+        raise
+    except Exception as exc:
+        if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
+            finish_task_command_delivery(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc, await _terminal_command_event_draft(command, exc)
+            )
+            await _broadcast_terminal_start_error(command, exc)
+        raise
+    result = settled.result
+    reason = result.get("rejection_reason") if isinstance(result, dict) else None
+    if reason is not None:
+        # The consumer settled a refusal in its own transaction, with the
+        # durable event; the live client still has to be told.
+        finish_task_command_delivery(command.command_id, command.task_id)
+        await _broadcast_terminal_start_error(
+            command, TaskCommandRejected("Task could not start.", reason=reason)
+        )
+    return settled
+
+
+async def _broadcast_terminal_start_error(
+    command: ClaimedTaskCommand, exc: BaseException
+) -> None:
+    """Notify the client without letting a failed broadcast replace ``exc``.
+
+    Exception, never BaseException: cancellation propagates.
+    """
+    try:
+        await _broadcast_terminal_command_error(command, exc)
+    except Exception:
+        logger.warning(
+            "task %s START %s is terminal but its broadcast failed",
+            command.task_id,
+            command.command_id,
+            exc_info=True,
+        )
 
 
 async def _execute_and_report_task_command(

@@ -4,6 +4,7 @@ import logging
 import math
 from datetime import timezone
 from typing import Any, Sequence
+from typing import cast as typing_cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import (
@@ -20,7 +21,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.orm import Session, aliased, defer, selectinload
 from sqlalchemy.sql import ColumnElement, visitors
 from sqlalchemy.sql.elements import ColumnClause, TextClause
 from sqlalchemy.types import Boolean
@@ -888,7 +889,16 @@ def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
 def _load_tasks_by_id(db: Session, user: User, task_ids: list[int]) -> dict[int, Task]:
     if not task_ids:
         return {}
-    tasks = _base_task_query(db, user).filter(Task.id.in_(task_ids)).all()
+    # Loaded without structured_output_record: reading the column from these objects, or
+    # from the same rows reached again through Session.get or a relationship in this
+    # session, raises; do not keep using these Task objects after a commit, because the
+    # reload after a commit reads the column back.
+    tasks = (
+        _base_task_query(db, user)
+        .options(defer(typing_cast(Any, Task.structured_output_record), raiseload=True))
+        .filter(Task.id.in_(task_ids))
+        .all()
+    )
     return {int(task.id): task for task in tasks}
 
 

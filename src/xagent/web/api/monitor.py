@@ -2,13 +2,13 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Text
 from sqlalchemy import cast as sql_cast
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 from sqlalchemy.sql import expression
 
 from ..auth_dependencies import get_current_user
@@ -235,7 +235,18 @@ async def get_agents(
             query = query.filter(Task.user_id == current_user.id)
 
         # Get recent tasks
-        recent_tasks = query.order_by(Task.created_at.desc()).limit(10).all()
+        # Loaded without structured_output_record: reading the column from these
+        # objects, or from the same rows reached again through Session.get or a
+        # relationship in this session, raises; do not keep using these Task objects
+        # after a commit, because the reload after a commit reads the column back.
+        recent_tasks = (
+            query.options(
+                defer(cast(Any, Task.structured_output_record), raiseload=True)
+            )
+            .order_by(Task.created_at.desc())
+            .limit(10)
+            .all()
+        )
 
         return [
             {

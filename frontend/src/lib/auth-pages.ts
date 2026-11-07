@@ -8,6 +8,7 @@ export const AUTH_PUBLIC_PATHS = [
   "/forgot-password",
   "/reset-password",
   "/auth/oidc/callback",
+  "/auth/mcp-complete",
 ] as const
 
 const AUTH_MUTATION_UNAVAILABLE_TRANSLATION_KEYS: Record<AuthMutationUnavailableReason, Extract<TranslationKey,

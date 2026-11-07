@@ -1,6 +1,7 @@
 // Shared by the browser runner resolver and the build-time Next CSP.
 export const AUTO_PREVIEW_HOSTS = new Map([
   ["cloud.xagent.co", "preview.xagent.co"],
+  ["tobybot.ai", "preview.xagent.co"],
   ["stage.cloud.xagent.co", "preview-stage.xagent.co"],
   ["dev.cloud.xagent.co", "preview-dev.xagent.co"],
 ])
@@ -9,7 +10,7 @@ export const AUTO_PREVIEW_HOSTS = new Map([
 export function htmlPreviewOrigins(configuredOrigin) {
   const configured = configuredOrigin?.trim()
   if (!configured) return []
-  if (configured === "auto") return [...AUTO_PREVIEW_HOSTS.values()].map(host => `https://${host}`)
+  if (configured === "auto") return [...new Set(AUTO_PREVIEW_HOSTS.values())].map(host => `https://${host}`)
   try {
     // Keep operator configuration in canonical URL form. WHATWG URL parsing
     // otherwise silently rewrites encoded dots, backslashes and short IPv4

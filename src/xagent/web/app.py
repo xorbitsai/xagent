@@ -24,6 +24,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_composio_reconcile_interval_seconds,
     get_cors_origins,
     get_environment,
     get_external_upload_dirs,
@@ -105,6 +106,7 @@ from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
+from .oauth_handoff import router as oauth_handoff_router
 from .runtime_telemetry import (
     start_process_runtime_telemetry,
     stop_process_runtime_telemetry,
@@ -829,6 +831,66 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
                 "Orphan upload GC loop stopped after failure",
                 exc_info=exc,
             )
+
+
+def start_composio_reconcile_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the loop that removes unbound Composio accounts (#3548).
+
+    Only runs when an app's Composio config is complete and
+    XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS is set. Each pass lists xagent's
+    accounts in the Facebook and Instagram auth configs and deletes those no
+    stored grant in this database uses.
+    """
+    from .composio_auth import _configured_apps, run_reconcile_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "composio_reconcile_task", None),
+    )
+    if existing_task is not None and not existing_task.done():
+        return existing_task
+    app_instance.state.composio_reconcile_task = None
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping Composio reconcile loop (test environment)")
+        return None
+    if not _configured_apps():
+        return None
+    interval_seconds = get_composio_reconcile_interval_seconds()
+    if interval_seconds is None:
+        return None
+    stop_event = threading.Event()
+    app_instance.state.composio_reconcile_stop = stop_event
+    task = asyncio.create_task(
+        run_reconcile_loop(interval_seconds=interval_seconds, stop_event=stop_event)
+    )
+    app_instance.state.composio_reconcile_task = task
+    logger.info("Started Composio reconcile loop (interval=%ss)", interval_seconds)
+    return task
+
+
+async def stop_composio_reconcile_task(app_instance: FastAPI) -> None:
+    """Stop this process's Composio reconcile loop.
+
+    The stop event reaches a pass running in its worker thread, which returns
+    at its next request boundary; the cancel ends the awaiting coroutine.
+    """
+    stop_event = getattr(app_instance.state, "composio_reconcile_stop", None)
+    app_instance.state.composio_reconcile_stop = None
+    if stop_event is not None:
+        stop_event.set()
+    task = getattr(app_instance.state, "composio_reconcile_task", None)
+    app_instance.state.composio_reconcile_task = None
+    if task is not None and not task.done():
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Composio reconcile loop stopped after failure", exc_info=exc)
 
 
 def start_task_cleanup_retry_task(
@@ -1679,6 +1741,8 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 
 # API routers
 app.include_router(auth_router)
+
+app.include_router(oauth_handoff_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
 app.include_router(computer_router)
@@ -2407,6 +2471,9 @@ async def startup_event() -> None:
     # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
     if auto_migrate:
         start_temp_file_cleanup_task(app)
+    # Last for the same reason: a Composio reconcile pass runs in an executor
+    # thread that only its stop event (set by shutdown_event) can end.
+    start_composio_reconcile_task(app)
     start_runtime_performance_monitor(app)
     start_app_process_diagnostics(app)
 
@@ -2449,6 +2516,7 @@ async def shutdown_event() -> None:
     _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)
+    await stop_composio_reconcile_task(app)
     await stop_retention_purge_task(app)
     await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)

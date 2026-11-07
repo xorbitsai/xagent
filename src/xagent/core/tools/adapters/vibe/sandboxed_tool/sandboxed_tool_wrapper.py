@@ -5,8 +5,7 @@ Execute tool's run_json_sync/async methods in sandbox environment.
 """
 
 import asyncio
-import base64
-import inspect
+import copy
 import json
 import logging
 import os
@@ -24,11 +23,11 @@ from typing import (
     runtime_checkable,
 )
 
-import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
-from ......config import SANDBOX_TOOL_RUNNER, get_sandbox_host_project_root
+from ......config import SANDBOX_TOOL_RUNNER
 from ......sandbox.base import Sandbox
+from ......sandbox.tool_runtime.bundle import build_runtime_command, sandbox_connection
 from .....workspace import TaskWorkspace
 from ....artifacts import build_generated_file_metadata, build_inline_artifact
 from ..base import AbstractBaseTool, ToolMetadata
@@ -39,14 +38,6 @@ from .sandbox_config import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Base path where project source code is mounted inside the sandbox
-SANDBOX_SRC_ROOT = "/app/src"
-SANDBOX_TOOL_RUNNER_PATH = (
-    f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/tool_runner.py"
-)
-# Kept as the execution seam used by existing local-runner tests.
-_TOOL_RUNNER_PATH = SANDBOX_TOOL_RUNNER_PATH
 
 # `timeout -s KILL` SIGKILLs its whole process group at the deadline, itself
 # included, so the exec reports a SIGKILL death: 128+9 from docker, -9 from
@@ -289,91 +280,12 @@ class SandboxDependencyManager:
                 raise
 
 
-def _extract_init_params(instance: Any) -> dict[str, Any]:
-    """Extract ``__init__`` parameter values from a tool or method-owner instance.
-
-    Uses ``inspect.signature`` to get parameter names from the class
-    ``__init__``, then looks up corresponding attribute values on the
-    instance using the naming convention: ``_name`` or ``name``.
-
-    *instance* is typed as ``Any`` because for the ``kind="method"``
-    path the caller passes the bound-method owner, which can be any
-    class instance — not necessarily an :class:`AbstractBaseTool`
-    subclass.
-
-    Args:
-        instance: Tool instance or bound-method owner to extract init params from.
-
-    Returns:
-        Dict mapping parameter name to its value.
-        Empty dict if the class has no init params (beyond *self*).
-    """
-    sig = inspect.signature(instance.__class__.__init__)
-
-    params: dict[str, Any] = {}
-    instance_dict = getattr(instance, "__dict__", {})
-    for name in sig.parameters:
-        if name == "self":
-            continue
-        # Look up attribute: _name or name
-        found = False
-        for attr_name in (f"_{name}", name):
-            if attr_name in instance_dict:
-                params[name] = instance_dict[attr_name]
-                found = True
-                break
-        if not found:
-            logger.warning(
-                f"Init param '{name}' not found on {instance.__class__.__name__} "
-                f"(tried '_{name}' and '{name}'), skipping"
-            )
-
-    return params
-
-
-def _class_import_path(cls: type[Any]) -> str:
-    """Return stable import path for a top-level class."""
-    return f"{cls.__module__}:{cls.__name__}"
-
-
-def _serialize_init_params(params: dict[str, Any]) -> str | None:
-    """Serialize init params dict to base64-encoded pickle string.
-
-    Args:
-        params: Dict of parameter name -> value
-
-    Returns:
-        base64-encoded pickle string, or None if params is empty.
-
-    Raises:
-        RuntimeError: If any parameter value is not serializable.
-    """
-    if not params:
-        return None
-
-    try:
-        data = cloudpickle.dumps(params)
-    except Exception:
-        for param_name, value in params.items():
-            try:
-                cloudpickle.dumps(value)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Init parameter '{param_name}' (type: {type(value).__name__}) "
-                    f"is not serializable: {e}. "
-                    f"This tool cannot run in sandbox with non-serializable init params."
-                ) from e
-        raise
-
-    return base64.b64encode(data).decode("ascii")
-
-
 class SandboxedToolWrapper(AbstractBaseTool):
     """
     Generic sandboxed tool wrapper
 
     Wrap any AbstractBaseTool as a sandboxed execution version.
-    Execute tool logic in isolated environment by mounting the entire xagent library to the sandbox.
+    Execute supported tools with an execution-only runtime, without platform source mounts.
     """
 
     def __init__(
@@ -406,12 +318,22 @@ class SandboxedToolWrapper(AbstractBaseTool):
         self._visibility = getattr(target_tool, "_visibility", None)
         self._allow_users = getattr(target_tool, "_allow_users", None)
 
-        self._execution_spec, reconstruction_target = self._resolve_execution_spec()
+        reconstruction_target = self._resolve_execution_target()
         self._reconstruction_target = reconstruction_target
 
-        # Extract and serialize init params for sandbox reconstruction
-        init_params = _extract_init_params(reconstruction_target)
-        self._init_params_b64 = _serialize_init_params(init_params)
+        # MCP permission checks, schema validation, delegated credentials and
+        # retries stay on the host. Only the transport call runs in the guest.
+        from ..mcp_adapter import MCPToolAdapter
+
+        self._mcp_target = (
+            copy.copy(reconstruction_target)
+            if isinstance(reconstruction_target, MCPToolAdapter)
+            else None
+        )
+        # An adapter can be supplied to multiple task factories. Never bind a
+        # task-specific sandbox transport on the shared original instance.
+        if self._mcp_target is not None:
+            self._mcp_target._sandbox_transport = self._execute_mcp_in_sandbox
 
     @property
     def is_sandboxed(self) -> bool:
@@ -460,7 +382,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
         # Seeded last: a tool-declared env_var must not be able to override
         # these. A host PYTHONPATH would point the runner outside the sandbox.
-        env["PYTHONPATH"] = SANDBOX_SRC_ROOT
+        env["PYTHONPATH"] = ""
         env[SANDBOX_TOOL_RUNNER] = "1"
         return env
 
@@ -476,80 +398,60 @@ class SandboxedToolWrapper(AbstractBaseTool):
             sandbox = resolve_primary_sandbox(self._sandbox)
         await SandboxDependencyManager.ensure_requirements(sandbox, self._requirements)
 
-    def _resolve_execution_spec(self) -> tuple[dict[str, str], Any]:
-        """
-        Resolve how to execute the tool in sandbox.
-
-        Returns:
-            Execution spec and the instance whose init params should be serialized.
-        """
+    def _resolve_execution_target(self) -> Any:
+        """Unwrap supported bound tools without serializing application objects."""
         if isinstance(self._target, FunctionTool):
-            function_target = extract_bound_method_target(self._target)
-            if function_target is not None:
-                instance, method_name = function_target
-                return (
-                    {
-                        "kind": "method",
-                        "tool_class": _class_import_path(instance.__class__),
-                        "method_name": method_name,
-                    },
-                    instance,
-                )
-
+            bound = extract_bound_method_target(self._target)
+            if bound is not None:
+                return bound[0]
             raise RuntimeError(
-                f"FunctionTool '{self._target.name}' uses a closure or unsupported "
-                "callable form that cannot be reconstructed in sandbox automatically."
+                f"FunctionTool '{self._target.name}' uses an unsupported callable."
             )
+        return self._target
 
-        return (
-            {
-                "kind": "tool",
-                "tool_class": _class_import_path(self._target.__class__),
-            },
-            self._target,
-        )
+    def _build_runtime_request(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        from ..command_executor import CommandExecutorTool
+        from ..javascript_executor import JavaScriptExecutorTool
+        from ..python_executor import PythonExecutorTool
 
-    def _build_execution_command(
-        self,
-        args: Mapping[str, Any],
-        result_file: str,
-        *,
-        args_file: str | None = None,
-        init_params_file: str | None = None,
-    ) -> list[str]:
-        """Build the sandbox command used to execute a tool runner.
-
-        Runtime callers pass private sandbox-side files for tool arguments and
-        constructor parameters.  The base64 form remains only as a compatibility
-        seam for direct runner tests; base64 is encoding, not secret redaction,
-        so production must never put connection environments or user arguments
-        in the process argv.
-        """
-        execution_spec_json = json.dumps(self._execution_spec, ensure_ascii=False)
-        execution_spec_b64 = base64.b64encode(
-            execution_spec_json.encode("utf-8")
-        ).decode("ascii")
-
-        command = [
-            "python",
-            _TOOL_RUNNER_PATH,
-            "--execution-spec-b64",
-            execution_spec_b64,
-            "--result-file",
-            result_file,
-        ]
-        if args_file is not None:
-            command.extend(["--args-file", args_file])
+        target = self._reconstruction_target
+        if isinstance(target, CommandExecutorTool):
+            kind = "command"
+        elif isinstance(target, PythonExecutorTool):
+            kind = "python"
+        elif isinstance(target, JavaScriptExecutorTool):
+            kind = "javascript"
         else:
-            args_json = json.dumps(dict(args), ensure_ascii=False)
-            args_b64 = base64.b64encode(args_json.encode("utf-8")).decode("ascii")
-            command.extend(["--args-b64", args_b64])
-        if self._init_params_b64 is not None:
-            if init_params_file is not None:
-                command.extend(["--init-params-file", init_params_file])
-            else:
-                command.extend(["--init-params-b64", self._init_params_b64])
-        return command
+            raise RuntimeError(
+                "Tool is not supported by the isolated execution runtime. "
+                "Backend execution and platform source mounts are not permitted."
+            )
+        parsed_args = target.args_type().model_validate(dict(args)).model_dump()
+        request: dict[str, Any] = {
+            "kind": kind,
+            "arguments": parsed_args,
+            "working_directory": target._get_working_directory(),
+        }
+        if isinstance(target, PythonExecutorTool):
+            request["workspace_variables"] = target._get_workspace_env() or {}
+        return request
+
+    async def _execute_mcp_in_sandbox(
+        self,
+        connection: Mapping[str, Any],
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        meta: Mapping[str, Any],
+    ) -> Any:
+        return await self._execute_runtime_request(
+            {
+                "kind": "mcp_call",
+                "connection": sandbox_connection(connection),
+                "tool_name": tool_name,
+                "arguments": dict(arguments),
+                "meta": dict(meta),
+            }
+        )
 
     async def get_sandbox_for_test(self) -> Sandbox:
         """Get the sandbox for exec test"""
@@ -564,6 +466,12 @@ class SandboxedToolWrapper(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute the tool in the sandbox, then register its files here."""
         result = await self._run_json_in_sandbox(args)
+        from ..command_executor import CommandExecutorTool, _dump_result
+
+        # Shell output metadata was already registered and validated on the
+        # host. Do not strip its validation or stage its bytes a second time.
+        if isinstance(self._reconstruction_target, CommandExecutorTool):
+            return _dump_result(result)
         # Guest metadata is not evidence about persisted host bytes. Only the
         # host rebuild below can attach an authoritative validation report.
         pending = [result]
@@ -575,7 +483,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
             elif isinstance(value, list):
                 pending.extend(value)
         try:
-            return await self._register_sandbox_outputs(result)
+            result = await self._register_sandbox_outputs(result)
         except Exception:
             # A successful sandbox run must survive a registration failure.
             logger.warning(
@@ -583,7 +491,33 @@ class SandboxedToolWrapper(AbstractBaseTool):
                 self._target.name,
                 exc_info=True,
             )
+        return self._normalize_executor_result(result)
+
+    def _normalize_executor_result(self, result: Any) -> Any:
+        from ..javascript_executor import (
+            JavaScriptExecutorResult,
+            JavaScriptExecutorTool,
+        )
+        from ..python_executor import PythonExecutorResult, PythonExecutorTool
+
+        if not isinstance(result, dict):
             return result
+        target = self._reconstruction_target
+        if not isinstance(target, (PythonExecutorTool, JavaScriptExecutorTool)):
+            return result
+        result.setdefault("output", "")
+        refs = result.get("file_refs") or []
+        result["artifacts"] = [build_inline_artifact(ref) for ref in refs]
+        if isinstance(target, JavaScriptExecutorTool):
+            if result.get("success") and result.get("generated_files"):
+                output = (
+                    result.get("output") or "Code executed successfully (no output)"
+                )
+                result["output"] = (
+                    f"{output}\n\nGenerated files: {', '.join(result['generated_files'])}"
+                )
+            return JavaScriptExecutorResult(**result).model_dump()
+        return PythonExecutorResult(**result).model_dump()
 
     @staticmethod
     def _resolved_ref_key(ref: Mapping[str, Any]) -> str | None:
@@ -711,16 +645,53 @@ class SandboxedToolWrapper(AbstractBaseTool):
         return result
 
     async def _run_json_in_sandbox(self, args: Mapping[str, Any]) -> Any:
-        """Execute tool asynchronously in sandbox"""
+        if self._mcp_target is not None:
+            return await self._mcp_target.run_json_async(args)
+        request = self._build_runtime_request(args)
+        if request["kind"] == "command":
+            from ..command_executor import _register_changed_files, _snapshot_artifacts
 
+            workspace = getattr(self._reconstruction_target, "_workspace", None)
+            root = request["working_directory"]
+            before = (
+                await asyncio.to_thread(_snapshot_artifacts, root, workspace)
+                if workspace is not None and root
+                else {}
+            )
+            result = await self._execute_runtime_request(request)
+            # Only the host's snapshot may describe shell-generated files.
+            for field in (
+                "generated_files",
+                "file_refs",
+                "artifacts",
+                "registration_note",
+                "validation",
+            ):
+                result.pop(field, None)
+            if workspace is not None and root:
+                after = await asyncio.to_thread(_snapshot_artifacts, root, workspace)
+                changed = {
+                    path for path, state in after.items() if before.get(path) != state
+                }
+                # Reuse the host's bulk-output limits and file validation. The
+                # guest receives no workspace object or registration credentials.
+                result.update(
+                    await asyncio.to_thread(
+                        _register_changed_files, workspace, changed, root
+                    )
+                )
+            return result
+        return await self._execute_runtime_request(request)
+
+    async def _execute_runtime_request(self, request: Mapping[str, Any]) -> Any:
+        """Run primitive execution data with private inputs and bounded cleanup."""
         # Keep every per-call payload in a private sandbox-side file. In
-        # particular, MCP adapter init params contain the connection env, and
+        # particular, MCP transport requests contain the connection env, and
         # command-line base64 would expose those secrets through /proc and
         # process listings to other code running as the same sandbox user.
         call_id = uuid.uuid4().hex
         result_file = f"/tmp/xagent_result_{call_id}.json"
         args_file = f"/tmp/xagent_args_{call_id}.json"
-        init_params_file = f"/tmp/xagent_init_{call_id}.b64"
 
         try:
             async with self._lease_sandbox() as sandbox:
@@ -729,25 +700,12 @@ class SandboxedToolWrapper(AbstractBaseTool):
                 try:
                     await _write_sandbox_file_cancellation_safe(
                         sandbox,
-                        json.dumps(dict(args), ensure_ascii=False),
+                        json.dumps(dict(request), ensure_ascii=False),
                         args_file,
                         overwrite=False,
                     )
-                    if self._init_params_b64 is not None:
-                        await _write_sandbox_file_cancellation_safe(
-                            sandbox,
-                            self._init_params_b64,
-                            init_params_file,
-                            overwrite=False,
-                        )
-
-                    # Execute script in sandbox
-                    logger.debug(f"Executing tool {self._target.name} in sandbox")
-                    command = self._build_execution_command(
-                        args,
-                        result_file,
-                        args_file=args_file,
-                        init_params_file=init_params_file,
+                    command = build_runtime_command(
+                        request_file=args_file, result_file=result_file
                     )
                     timeout_seconds = (
                         self._exec_timeout() if self._exec_timeout else None
@@ -815,7 +773,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
                     raise RuntimeError(f"Failed to parse tool output: {e}")
                 finally:
                     # Always clean up private inputs, including when writing the
-                    # second payload, launching the process, or waiting for it
+                    # payload, launching the process, or waiting for it
                     # fails or is cancelled. Do this before releasing the worker
                     # lease so another call cannot observe stale credentials.
                     try:
@@ -824,7 +782,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
                             "-f",
                             result_file,
                             args_file,
-                            init_params_file,
+                            result_file + ".runtime.pyz",
                         )
                     except Exception:
                         pass
@@ -879,38 +837,3 @@ async def create_workspace_in_sandbox(
         return
 
     await sandbox.exec("mkdir", "-p", *dirs)
-
-
-def _get_project_root() -> Path:
-    """Find project root by traversing up to locate pyproject.toml + src/xagent."""
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        if (parent / "pyproject.toml").exists() and (
-            parent / "src" / "xagent"
-        ).exists():
-            return parent
-    raise RuntimeError("Could not find project root")
-
-
-def build_code_mount_volumes() -> list[tuple[str, str, str]]:
-    """Build read-only volume mounts for src/ and tests/ directories.
-
-    Returns:
-        List of (host_path, guest_path, mode) tuples.
-    """
-    host_project_root = get_sandbox_host_project_root()
-    project_root = host_project_root or _get_project_root()
-    volumes: list[tuple[str, str, str]] = []
-
-    src_dir = project_root / "src"
-    src_path = str(src_dir if host_project_root is not None else src_dir.resolve())
-    volumes.append((src_path, SANDBOX_SRC_ROOT, "ro"))
-
-    tests_dir = project_root / "tests"
-    if host_project_root is not None or tests_dir.exists():
-        tests_path = str(
-            tests_dir if host_project_root is not None else tests_dir.resolve()
-        )
-        volumes.append((tests_path, "/app/tests", "ro"))
-
-    return volumes

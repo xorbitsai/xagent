@@ -1,3 +1,4 @@
+import { mcpAuthorizationURL } from "@/lib/oauth-bootstrap"
 import React, { useState } from "react"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
@@ -937,7 +938,7 @@ export function ConnectMcpDialog({
         method: "POST",
         credentials: "include",
         headers: {
-          "Accept": "application/json",
+          "Accept": "application/json", "X-XAgent-OAuth-Launch-Version": "2",
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ redirect_after: "/tools?tab=mcp" }),
@@ -956,7 +957,7 @@ export function ConnectMcpDialog({
         clearAppLoading(app.id)
         return
       }
-      popup.location.href = data.authorization_url
+      popup.location.href = await mcpAuthorizationURL(data)
     } catch (error) {
       console.error("Failed to start MCP OAuth connect:", error)
       popup.close()

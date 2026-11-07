@@ -54,7 +54,7 @@ class DownloadWebAssetResult(BaseModel):
 class DownloadWebAssetTool(AbstractBaseTool):
     """Download and register an exact remote image without model reconstruction."""
 
-    category = ToolCategory.WEB_SEARCH
+    category = ToolCategory.WEB_TOOLS
 
     def __init__(
         self,

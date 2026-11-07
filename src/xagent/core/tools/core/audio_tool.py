@@ -30,6 +30,7 @@ from .audio_tool_descriptions import (
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
     TRANSCRIBE_AUDIO_DESCRIPTION,
 )
+from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,37 @@ class AudioToolCore:
             return next(iter(models.values()))
 
         return None
+
+    def _resolve_model_label(
+        self, models: Dict[str, Any], model: Optional[Any]
+    ) -> Optional[str]:
+        """Best-effort configured id of the model that actually served the request.
+
+        Prefer the id stamped on the instance by the model factory: the
+        registries here are keyed by model name, so a dict lookup alone can
+        report a name rather than the configured model id callers bill by.
+        Fall back to the key the instance is configured under. A value that
+        cannot identify the model is left out instead of guessed.
+        """
+        if model is None:
+            return None
+
+        declared_model_id = getattr(model, "model_id", None)
+        if isinstance(declared_model_id, str) and declared_model_id.strip():
+            model_label = declared_model_id.strip()
+        else:
+            model_label = next(
+                (
+                    str(known_id)
+                    for known_id, configured_model in models.items()
+                    if configured_model is model and known_id
+                ),
+                "",
+            )
+
+        if not model_label or model_label == "default":
+            return None
+        return model_label
 
     def _get_asr_model(self, model_id: Optional[str] = None) -> Optional[BaseASR]:
         """Get ASR model by ID or default model."""
@@ -699,7 +731,8 @@ class AudioToolCore:
             - segments (list): Raw provider segments when verbose=True, otherwise
               processed transcript segments
             - language (str): Detected language code
-            - model_used (str): The actual model used
+            - model_used (str): Configured model ID that actually served the
+              request; omitted when it cannot be identified
             - text_length (int): Length of transcribed text
             - segment_count (int): Number of segments
             - error (str): Error message if success=False
@@ -719,22 +752,37 @@ class AudioToolCore:
                     "text": None,
                 }
 
+            actual_model_id = self._resolve_model_label(self._asr_models, asr_model)
+
             # Resolve audio path
             audio_path = self._resolve_audio_path(audio_file_path)
 
             # Always request provider timing detail. The public verbose flag controls
             # whether callers receive raw provider segments or processed cues.
-            result = await asr_model.transcribe(
-                audio=audio_path,
-                language=language,
-                verbose=True,
-                **kwargs,
-            )
-
-            # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._asr_models else "default"
-            )
+            try:
+                result = await asr_model.transcribe(
+                    audio=audio_path,
+                    language=language,
+                    verbose=True,
+                    **kwargs,
+                )
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Audio transcription failed",
+                        model=asr_model,
+                    ),
+                    "file_id": None,
+                    "transcription_path": None,
+                    "model_used": (
+                        model_id
+                        if model_id and model_id in self._asr_models
+                        else "default"
+                    ),
+                }
 
             # Handle different result types
             text = None
@@ -829,18 +877,20 @@ class AudioToolCore:
                     "No workspace available, transcription not saved locally"
                 )
 
-            return {
+            response: Dict[str, Any] = {
                 "success": True,
                 "file_id": file_id,
                 "file_ref": file_ref,
                 "transcription_path": transcription_path,
                 "segments": segments,
                 "language": language_detected,
-                "model_used": actual_model_id,
                 "saved_to_workspace": transcription_path is not None,
                 "text_length": len(text) if text else 0,
                 "segment_count": len(segments) if segments else 0,
             }
+            if actual_model_id:
+                response["model_used"] = actual_model_id
+            return response
 
         except Exception as e:
             logger.error(f"Audio transcription failed: {e}")
@@ -891,7 +941,8 @@ class AudioToolCore:
             - format (str): Audio format (e.g., 'mp3', 'wav')
             - sample_rate (int): Audio sample rate
             - language (str): Detected/specified language
-            - model_used (str): The actual model used for synthesis
+            - model_used (str): Configured model ID that actually served the
+              request; omitted when it cannot be identified
             - saved_to_workspace (bool): Whether the audio was saved to workspace
             - error (str): Error message if success=False
         """
@@ -905,6 +956,8 @@ class AudioToolCore:
                     "error": "No available TTS models configured",
                     "audio_path": None,
                 }
+
+            actual_model_id = self._resolve_model_label(self._tts_models, tts_model)
 
             self._validate_tts_reference_audio(
                 tts_model=tts_model,
@@ -926,18 +979,30 @@ class AudioToolCore:
                 )
 
             # Synthesize the speech (async)
-            result = await tts_model.synthesize(
-                text=text,
-                voice=voice,
-                language=language,
-                format=audio_format,
-                **synthesis_kwargs,
-            )
-
-            # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._tts_models else "default"
-            )
+            try:
+                result = await tts_model.synthesize(
+                    text=text,
+                    voice=voice,
+                    language=language,
+                    format=audio_format,
+                    **synthesis_kwargs,
+                )
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Speech synthesis failed",
+                        model=tts_model,
+                    ),
+                    "audio_path": None,
+                    "model_used": (
+                        model_id
+                        if model_id and model_id in self._tts_models
+                        else "default"
+                    ),
+                }
 
             audio_data: Optional[bytes] = None
             result_audio_format: Optional[str] = None
@@ -989,7 +1054,7 @@ class AudioToolCore:
             elif audio_data and not self._workspace:
                 logger.warning("No workspace available, audio not saved locally")
 
-            return {
+            response: Dict[str, Any] = {
                 "success": True,
                 "audio_path": audio_path,
                 "file_id": audio_file_id,
@@ -997,9 +1062,11 @@ class AudioToolCore:
                 "format": result_audio_format,
                 "sample_rate": result_sample_rate,
                 "language": language_detected,
-                "model_used": actual_model_id,
                 "saved_to_workspace": audio_path is not None,
             }
+            if actual_model_id:
+                response["model_used"] = actual_model_id
+            return response
 
         except Exception as e:
             logger.error(f"Speech synthesis failed: {e}")
@@ -1083,10 +1150,13 @@ class AudioToolCore:
             }
 
         except Exception as e:
-            logger.error(f"Failed to list available models: {e}")
             return {
                 "success": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list available audio models",
+                ),
                 "models": [],
                 "asr_count": 0,
                 "tts_count": 0,
@@ -1115,6 +1185,7 @@ class AudioToolCore:
             - supported_providers (list): Providers that currently support this API
         """
         supported_providers = self._get_voice_listing_supported_providers()
+        tts_model: Optional[BaseTTS] = None
         try:
             tts_model, actual_model_id = self._get_provider_tts_model(
                 provider=provider,
@@ -1178,14 +1249,21 @@ class AudioToolCore:
             }
 
         except Exception as e:
-            logger.error(f"Failed to list TTS voices: {e}")
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
             )
             return {
                 "success": False,
                 "supported": False,
-                "error": str(e),
+                # The provider's own words stay in the log; what the model
+                # reads is the category and one plain sentence, exactly as on
+                # the synthesis path.
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list TTS voices",
+                    model=tts_model,
+                ),
                 "voices": [],
                 "count": 0,
                 "model_used": actual_model_id,
@@ -1203,6 +1281,7 @@ class AudioToolCore:
         model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a persistent voice clone with a configured provider account."""
+        tts_model: Optional[BaseTTS] = None
         try:
             tts_model, actual_model_id = self._get_provider_tts_model(
                 provider=provider,
@@ -1259,14 +1338,18 @@ class AudioToolCore:
                 "model_used": actual_model_id,
             }
         except Exception as e:
-            logger.error(f"Failed to clone TTS voice: {e}")
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
             )
             return {
                 "success": False,
                 "supported": True,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to clone TTS voice",
+                    model=tts_model,
+                ),
                 "provider": provider,
                 "model_used": actual_model_id,
             }
@@ -1278,6 +1361,7 @@ class AudioToolCore:
         model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Permanently delete a voice from a configured provider account."""
+        tts_model: Optional[BaseTTS] = None
         try:
             tts_model, actual_model_id = self._get_provider_tts_model(
                 provider=provider,
@@ -1325,7 +1409,6 @@ class AudioToolCore:
                 "model_used": actual_model_id,
             }
         except Exception as e:
-            logger.error(f"Failed to delete TTS voice: {e}")
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
             )
@@ -1333,7 +1416,12 @@ class AudioToolCore:
                 "success": False,
                 "supported": True,
                 "deleted": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to delete TTS voice",
+                    model=tts_model,
+                ),
                 "provider": provider,
                 "model_used": actual_model_id,
             }
@@ -1383,11 +1471,14 @@ class AudioToolCore:
         Returns:
             Dictionary with batch synthesis result containing:
             - success (bool): Whether all syntheses succeeded
-            - results (list): List of synthesis results, one per segment
+            - results (list): List of synthesis results, one per segment; each
+              successful result names the configured model it used
             - total (int): Total number of segments processed
             - successful (int): Number of successful syntheses
             - failed (int): Number of failed syntheses
             - errors (list): List of error messages for failed segments
+            - model_used (str): Configured model ID that served the batch on
+              success; omitted when it cannot be identified
             - saved_to_workspace (bool): Whether audio files were saved to workspace
 
         JSON Format Example:
@@ -1594,6 +1685,8 @@ class AudioToolCore:
                 "errors": ["No TTS models configured"] * total,
             }
 
+        actual_model_id = self._resolve_model_label(self._tts_models, tts_model)
+
         # Process segments in batches with progress tracking
         import asyncio
 
@@ -1620,6 +1713,7 @@ class AudioToolCore:
                     audio_format,
                     sample_rate,
                     tts_model,
+                    actual_model_id,
                     idx,
                 )
                 results.append(result)
@@ -1657,6 +1751,7 @@ class AudioToolCore:
                         audio_format,
                         sample_rate,
                         tts_model,
+                        actual_model_id,
                         idx,
                     )
                     batch_results.append(result)
@@ -1697,7 +1792,7 @@ class AudioToolCore:
                         if result.get("error"):
                             errors.append(result["error"])
 
-        return {
+        batch_response: Dict[str, Any] = {
             "success": failed_count == 0,
             "results": results,
             "total": total,
@@ -1706,6 +1801,9 @@ class AudioToolCore:
             "errors": errors if errors else None,
             "saved_to_workspace": self._workspace is not None,
         }
+        if failed_count == 0 and actual_model_id:
+            batch_response["model_used"] = actual_model_id
+        return batch_response
 
     async def _synthesize_single_segment(
         self,
@@ -1722,6 +1820,7 @@ class AudioToolCore:
         audio_format: str,
         sample_rate: Optional[int],
         tts_model: Any,
+        model_used: Optional[str],
         index: int,
     ) -> Dict[str, Any]:
         """
@@ -1741,6 +1840,7 @@ class AudioToolCore:
             audio_format: Audio format
             sample_rate: Sample rate
             tts_model: TTS model instance
+            model_used: Configured model id that actually serves the segments
             index: Segment index for error reporting
 
         Returns:
@@ -1807,12 +1907,31 @@ class AudioToolCore:
                 kwargs["reference_audio"] = self._resolve_audio_path(ref_audio_id)
 
             # Synthesize speech
-            audio_data = await tts_model.synthesize(
-                text=text,
-                voice=voice,
-                language=language,
-                **kwargs,
-            )
+            try:
+                audio_data = await tts_model.synthesize(
+                    text=text,
+                    voice=voice,
+                    language=language,
+                    **kwargs,
+                )
+            except Exception as e:
+                failure = media_failure_fields(
+                    e,
+                    logger=logger,
+                    action=f"Segment {index} synthesis failed",
+                    model=tts_model,
+                )
+                # The batch aggregates these into its own ``errors`` list,
+                # where the segment number is the only thing that says which
+                # input failed; the sentence itself carries no provider text.
+                failure["error"] = f"Segment {index}: {failure['error']}"
+                return {
+                    "success": False,
+                    **failure,
+                    "index": index,
+                    "text": text,
+                    "saved_to_workspace": False,
+                }
 
             # Handle result
             if isinstance(audio_data, bytes):
@@ -1852,7 +1971,7 @@ class AudioToolCore:
                 except Exception as e:
                     logger.warning(f"Failed to save audio to workspace: {e}")
 
-            return {
+            response: Dict[str, Any] = {
                 "success": True,
                 "index": index,
                 "text": text,
@@ -1863,6 +1982,9 @@ class AudioToolCore:
                 "format": audio_format,
                 "saved_to_workspace": audio_path is not None,
             }
+            if model_used:
+                response["model_used"] = model_used
+            return response
 
         except Exception as e:
             logger.error(f"Segment {index} synthesis failed: {e}")

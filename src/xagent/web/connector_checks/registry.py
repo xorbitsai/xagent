@@ -24,7 +24,8 @@ from .declarations import (
 )
 from .fixtures import FixtureRef
 
-# Connectors that have adopted V2, by catalog app id.
+# Connectors that have adopted V2, by catalog app id. Tool coverage and
+# exemptions for the six document connectors follow with #3565.
 CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     "excel": ConnectorChecks(
         "excel",

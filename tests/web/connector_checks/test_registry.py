@@ -260,11 +260,11 @@ def test_a_document_connector_declares_its_fixture_read(app_id: str) -> None:
     assert connector_checks_for(app_id) == _expected_checks(app_id)
 
 
-def test_every_declared_fixture_key_is_namespaced_by_its_app() -> None:
+def test_every_document_fixture_key_is_namespaced_by_its_app() -> None:
     refs = [
         (app_id, ref)
-        for app_id, checks in CONNECTOR_CHECKS.items()
-        for check in checks.reads
+        for app_id in _DOCUMENT_READS
+        for check in CONNECTOR_CHECKS[app_id].reads
         if isinstance(check, ReadCheck)
         for ref in _fixture_refs(check.arguments)
     ]
@@ -301,6 +301,13 @@ def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
         for name in bound:
             assert name in parameters
             assert parameters[name].default is inspect.Parameter.empty
+        required = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.default is inspect.Parameter.empty
+            and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        }
+        assert required <= set(check.arguments), (check.tool, required)
 
 
 def test_google_docs_read_fixture_output_satisfies_its_declaration(

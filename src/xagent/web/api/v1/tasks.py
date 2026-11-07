@@ -1005,7 +1005,7 @@ def _get_chat_task_sync(
 
     The terminal view of a status-only caller's task is kept out of the
     cache for the same reason: automatic resume stops by writing only the
-    recovery row, and an append queues a START without touching the task
+    recovery row, and an append can queue a START without touching the task
     row's ``updated_at``, so a cached body cannot prove the view is still
     current. The cached body holds the stored values; the view is applied
     to the response after every cache read or write. A queued START is

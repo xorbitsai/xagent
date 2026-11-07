@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from sqlalchemy import event
@@ -19,7 +19,7 @@ from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.schemas.v1 import AppendMessageResponse, CreateTaskResponse
-from xagent.web.services import task_start
+from xagent.web.services import task_auto_resume, task_event_bridge, task_start
 from xagent.web.services.response_format import RESPONSE_FORMAT_CONFIG_KEY
 
 from ..conftest import _admin_headers, _direct_db_session, client
@@ -533,6 +533,121 @@ def test_a_downstream_can_build_the_responses_without_the_echo_fields() -> None:
     for response in (created, appended):
         assert response.response_format_type == "text"
         assert response.response_format_name == ""
+
+
+# --- shared execution ---------------------------------------------------------------
+
+
+@pytest.fixture
+def combined_until_the_append(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The task is created and completed in combined mode, so no START is
+    pending; ``_go_shared`` then switches the append itself to shared mode."""
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+
+
+def _go_shared(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: Mock())
+    monkeypatch.setattr(
+        task_auto_resume, "notify_task_command_dispatcher", lambda: None
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "change", "expected"),
+    [
+        (None, _format(name="two"), ("json_schema", "two")),
+        ("one", _format(name="two"), ("json_schema", "two")),
+        ("one", {"type": "text"}, ("text", "")),
+    ],
+    ids=["set", "replace", "clear"],
+)
+@pytest.mark.usefixtures("combined_until_the_append")
+def test_a_shared_append_stores_the_format_it_echoes(
+    monkeypatch: pytest.MonkeyPatch,
+    before: str | None,
+    change: dict[str, Any],
+    expected: tuple[str, str],
+) -> None:
+    agent_id, key = create_agent_with_key()
+    extra = {} if before is None else {"response_format": _format(name=before)}
+    task_id = _completed_task(key, agent_id, **extra)
+    _go_shared(monkeypatch)
+
+    response = _append(key, agent_id, task_id, response_format=change)
+
+    assert response.status_code == 202, response.text
+    assert _echo(response) == expected
+    stored = _stored_format(task_id)
+    assert (stored["name"] if stored else "") == expected[1]
+
+
+@pytest.mark.usefixtures("combined_until_the_append")
+def test_a_refused_shared_append_leaves_the_stored_format_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, key = create_agent_with_key()
+    task_id = _completed_task(key, agent_id, response_format=_format(name="kept"))
+    _set_status(task_id, TaskStatus.RUNNING)
+    _go_shared(monkeypatch)
+
+    response = _append(key, agent_id, task_id, response_format=_format(name="two"))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "task_busy"
+    assert _stored_format(task_id)["name"] == "kept"
+
+
+@pytest.mark.usefixtures("combined_until_the_append")
+def test_a_shared_append_stores_a_prompt_context_sent_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, key = create_agent_with_key()
+    task_id = _completed_task(key, agent_id)
+    _go_shared(monkeypatch)
+
+    response = _append(key, agent_id, task_id, prompt_context={"date": "2026-10-19"})
+
+    assert response.status_code == 202, response.text
+    assert _echo(response) == ("text", "")
+    assert set(_raw_agent_config(task_id)) == {"prompt_context"}
+
+
+@pytest.mark.usefixtures("combined_until_the_append")
+@pytest.mark.parametrize("shared", [True, False], ids=["shared", "combined"])
+def test_the_echo_follows_a_format_changed_after_the_task_was_loaded(
+    monkeypatch: pytest.MonkeyPatch, shared: bool
+) -> None:
+    agent_id, key = create_agent_with_key()
+    task_id = _completed_task(key, agent_id, response_format=_format(name="F1"))
+    if shared:
+        _go_shared(monkeypatch)
+    real = task_start._resolve_turn_files
+
+    def another_append_completes_first(**kwargs: Any) -> Any:
+        db = _direct_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            config = dict(task.agent_config)
+            config[RESPONSE_FORMAT_CONFIG_KEY] = dict(
+                config[RESPONSE_FORMAT_CONFIG_KEY], name="F2"
+            )
+            task.agent_config = config
+            task.status = TaskStatus.COMPLETED
+            db.commit()
+        finally:
+            db.close()
+        return real(**kwargs)
+
+    monkeypatch.setattr(
+        task_start, "_resolve_turn_files", another_append_completes_first
+    )
+
+    response = _append(key, agent_id, task_id)
+
+    assert response.status_code == 202, response.text
+    assert _stored_format(task_id)["name"] == "F2"
+    assert _echo(response) == ("json_schema", "F2")
 
 
 # --- workforce keys ---------------------------------------------------------------

@@ -595,7 +595,6 @@ def _prepare_append_turn_isolated(
                     response_format,
                 ),
             )
-        response_format_type, response_format_name = echo_for_config(task.agent_config)
         runtime_plan = prepare_append_connector_runtime(
             db=db,
             agent=runtime_agent,
@@ -619,12 +618,26 @@ def _prepare_append_turn_isolated(
                 values_by_ref=runtime_plan.ephemeral_by_ref,
             )
 
+        if prompt_context is not None or response_format is not None:
+            # The shared-mode claim re-reads the task row with
+            # ``populate_existing`` and this session does not autoflush, so an
+            # unflushed config write would be discarded there. The flush stays
+            # inside the claim's transaction, so a refused append rolls it back,
+            # and it comes after the file and connector preparation so the row
+            # is not locked while files are fetched.
+            db.flush()
         claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
             db,
             task_id=int(task.id),
             task_owner_user_id=task_owner_user_id,
             payload=payload,
             actor_user_id=actor_user_id,
+        )
+        # The claim reads the config back from the row it accepted, so the echo
+        # matches what this turn runs with even if another append changed the
+        # format after this request loaded the task.
+        response_format_type, response_format_name = echo_for_config(
+            claimed_turn.agent_config
         )
         if not get_shared_task_execution_enabled():
             _store_connector_runtime_values_or_fail(

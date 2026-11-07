@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, update
 from sqlalchemy.orm import Session
 
 from tests.web.services.test_task_execution_event_writer import (
@@ -1952,7 +1952,17 @@ async def test_scheduled_turn_whose_settlement_raises_while_cancelled_is_not_rep
 
 
 @pytest.mark.usefixtures("_clear_bg_manager")
-async def test_resume_finalizer_keeps_a_terminal_row_and_says_so(canonical) -> None:
+@pytest.mark.parametrize(
+    "competing_write", [False, True], ids=["alone", "row_rewritten_after_commit"]
+)
+async def test_resume_finalizer_keeps_a_terminal_row_and_says_so(
+    canonical, competing_write
+) -> None:
+    """The resumed finalizer finds the task already FAILED, releases its lease
+    and reports the status it kept. With ``competing_write`` another session
+    rewrites the row to RUNNING right after the finalizer's commit (a later
+    run taking the task over); the status reported is still the one read
+    under the row lock."""
     from xagent.web.services.task_execution import (
         _finalize_resumed_task,
         _PreparedTaskFileOutputs,
@@ -1965,23 +1975,47 @@ async def test_resume_finalizer_keeps_a_terminal_row_and_says_so(canonical) -> N
         task.status = TaskStatus.FAILED
         db.commit()
 
-    finalized = await asyncio.to_thread(
-        _finalize_resumed_task,
-        tid,
-        status="completed",
-        success=True,
-        output="ok",
-        task_owner_user_id=None,
-        result={"success": True, "output": "ok", "status": "completed"},
-        task_lease=lease,
-        prepared_outputs=_PreparedTaskFileOutputs((), (), ()),
-    )
+    fired: list[bool] = []
+    competitors: set[int] = set()
 
+    def rewrite_after_commit(session: Session) -> None:
+        if not competing_write or fired or id(session) in competitors:
+            return
+        fired.append(True)
+        other = factory()
+        competitors.add(id(other))
+        try:
+            other.execute(
+                update(Task).where(Task.id == tid).values(status=TaskStatus.RUNNING)
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    event.listen(Session, "after_commit", rewrite_after_commit)
+    try:
+        finalized = await asyncio.to_thread(
+            _finalize_resumed_task,
+            tid,
+            status="completed",
+            success=True,
+            output="ok",
+            task_owner_user_id=None,
+            result={"success": True, "output": "ok", "status": "completed"},
+            task_lease=lease,
+            prepared_outputs=_PreparedTaskFileOutputs((), (), ()),
+        )
+    finally:
+        event.remove(Session, "after_commit", rewrite_after_commit)
+
+    assert fired == ([True] if competing_write else [])
     assert finalized["late_result"] is True
     assert finalized["kept_terminal_status"] == "failed"
     with factory() as db:
         row = db.get(Task, tid)
-        assert row.status == TaskStatus.FAILED
+        assert row.status == (
+            TaskStatus.RUNNING if competing_write else TaskStatus.FAILED
+        )
         assert row.runner_id is None
 
 

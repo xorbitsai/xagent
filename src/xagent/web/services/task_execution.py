@@ -3314,7 +3314,8 @@ def _finalize_resumed_task(
         "error_code": result.get("error_code"),
         "error_details": result.get("error_details"),
         "late_result": False,
-        # Set when the task was already terminal: the status kept, this run's
+        # Set when the task was already terminal and this run's lease release
+        # committed: the status kept, as read under the row lock; this run's
         # result discarded.
         "kept_terminal_status": None,
     }
@@ -3361,12 +3362,16 @@ def _finalize_resumed_task(
             # discarded, so "applied" is not proven. DISPATCHED already means
             # "do not resend"; a still-PENDING row is advanced to that by the
             # orphan sweep once the task is quiescent.
-            if not release_task_lease_no_commit(db, task_lease, status=task.status):
+            # Read while the row is still locked: the commit below expires
+            # ``task`` and ends the lock, so a read after it would be a fresh
+            # query returning whatever the row says by then.
+            kept_status = task.status
+            if not release_task_lease_no_commit(db, task_lease, status=kept_status):
                 db.rollback()
                 finalized["late_result"] = True
                 return finalized
             db.commit()
-            finalized["kept_terminal_status"] = task.status.value
+            finalized["kept_terminal_status"] = kept_status.value
             finalized["late_result"] = True
             return finalized
 

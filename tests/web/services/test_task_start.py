@@ -179,6 +179,8 @@ async def test_sdk_start_cancellation_after_claim_still_schedules(monkeypatch, k
         payload=SimpleNamespace(turn_id="turn-1"),
         claimed_turn=Mock(),
         dispatch_class=None,
+        response_format_type="text",
+        response_format_name="",
     )
 
     def prepare(**kwargs):

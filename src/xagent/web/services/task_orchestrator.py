@@ -776,8 +776,8 @@ class _AcceptedTurn:
     control_state: str = TaskControlState.RUNNING.value
     agent_config: Optional[dict[str, Any]] = None
     # When the turn was accepted: the claimed row's update time in process,
-    # the START command's creation time when queued (the row's values are not
-    # changed, so its update time is the previous turn's).
+    # the START command's creation time when queued (the claim need not change
+    # the row, so its update time can still be the previous turn's).
     accepted_at: Optional[datetime] = None
 
 

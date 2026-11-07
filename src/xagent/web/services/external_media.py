@@ -374,11 +374,13 @@ def _validate_instagram_source(image: ImageFile.ImageFile) -> None:
     if image.width <= 0 or image.height <= 0:
         raise ExternalMediaUnavailable("Registered image has invalid dimensions")
     # The higher JPEG limit relies on draft() letting libjpeg decode a JPEG at
-    # a fraction of its size, which holds only when it is coded in one scan.
-    # With more than one (progressive, or a first scan that codes only some
-    # components) libjpeg keeps coefficients for the whole image whatever
-    # draft() asks for: about 370 MB at 100 million pixels, and about 650 MB
-    # without chroma subsampling. Those JPEGs get the PNG limit.
+    # a fraction of its size. That takes a draft target well below the image's
+    # size, which instagram_jpeg_bytes() asks for by drafting to the size it
+    # sends, and a JPEG coded in one scan. With more than one (progressive, or
+    # a first scan that codes only some components) libjpeg keeps coefficients
+    # for the whole image whatever draft() asks for: about 370 MB at 100
+    # million pixels, and about 650 MB without chroma subsampling. Those JPEGs
+    # get the PNG limit.
     if image.format != "JPEG":
         pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, str(image.format)
     elif image.info.get("progressive"):
@@ -651,21 +653,24 @@ def _instagram_canvas_size(image: Image.Image) -> tuple[int, int]:
     return image.size
 
 
-def _resize_for_instagram_canvas(image: Image.Image) -> Image.Image:
+def _instagram_fitted_size(width: int, height: int) -> tuple[int, int]:
+    """An upright size scaled down to Instagram's maximum width and height.
+
+    It is never scaled up.
+    """
     max_height = floor(INSTAGRAM_MAX_WIDTH / INSTAGRAM_MIN_ASPECT_RATIO)
-    scale = min(
-        1.0,
-        INSTAGRAM_MAX_WIDTH / image.width,
-        max_height / image.height,
-    )
-    if scale < 1.0:
-        image = image.resize(
-            (
-                max(1, floor(image.width * scale)),
-                max(1, floor(image.height * scale)),
-            ),
-            Image.Resampling.LANCZOS,
-        )
+    scale = min(1.0, INSTAGRAM_MAX_WIDTH / width, max_height / height)
+    return max(1, floor(width * scale)), max(1, floor(height * scale))
+
+
+def _resize_for_instagram_canvas(
+    image: Image.Image, upright_size: tuple[int, int]
+) -> Image.Image:
+    # Fit from the source's full upright size, not the decoded one: a drafted
+    # JPEG is decoded smaller, and the size sent must not depend on that.
+    fitted = _instagram_fitted_size(*upright_size)
+    if image.size != fitted:
+        image = image.resize(fitted, Image.Resampling.LANCZOS)
 
     canvas_width, _ = _instagram_canvas_size(image)
     if canvas_width < INSTAGRAM_MIN_WIDTH:
@@ -689,8 +694,23 @@ def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
     try:
         with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
             _validate_instagram_source(opened)
+            # Orientations 5-8 swap width and height, as exif_transpose() does.
+            width, height = opened.size
+            turned = opened.getexif().get(ExifTags.Base.Orientation, 1) in (5, 6, 7, 8)
+            upright_size = (height, width) if turned else (width, height)
             if opened.format == "JPEG":
-                opened.draft("RGB", (INSTAGRAM_MAX_WIDTH, 1800))
+                # libjpeg scales a single-scan JPEG down by up to 8 toward the
+                # draft target, so ask for the size it is sent at. A fixed
+                # target box left a long, narrow image at full size. libjpeg
+                # does not scale a lossless JPEG, so drafting one by 2 or more
+                # fails its decode; that refusal is accepted (#3596).
+                fitted_width, fitted_height = _instagram_fitted_size(*upright_size)
+                opened.draft(
+                    "RGB",
+                    (fitted_height, fitted_width)
+                    if turned
+                    else (fitted_width, fitted_height),
+                )
             image = ImageOps.exif_transpose(opened)
             image.load()
 
@@ -702,7 +722,7 @@ def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
         else:
             image = image.convert("RGB")
 
-        image = _resize_for_instagram_canvas(image)
+        image = _resize_for_instagram_canvas(image, upright_size)
         canvas_size = _instagram_canvas_size(image)
         if canvas_size != image.size:
             canvas = Image.new("RGB", canvas_size, "white")

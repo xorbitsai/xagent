@@ -449,6 +449,89 @@ def test_instagram_conversion_applies_exif_orientation(tmp_path):
         assert image.getexif().get(274, 1) == 1
 
 
+def _jpeg(size, orientation=1):
+    exif = Image.Exif()
+    exif[274] = orientation
+    buffer = BytesIO()
+    Image.new("RGB", size, "blue").save(buffer, "JPEG", exif=exif.tobytes())
+    return BytesIO(buffer.getvalue())
+
+
+@pytest.mark.parametrize(
+    ("stored", "orientation"),
+    [((400, 12000), 1), ((12000, 400), 6)],
+    ids=["narrow-tall", "narrow-tall-after-exif-orientation-6"],
+)
+def test_instagram_conversion_decodes_a_narrow_jpeg_at_reduced_size(
+    monkeypatch, stored, orientation
+):
+    # Why: a fixed draft target left a long, narrow JPEG decoding at full size,
+    # about 1.2 GB at 100 million pixels (#3596). Drafting to the size it is
+    # sent at lets libjpeg scale it down, but never below that size: upright,
+    # this 400x12000 image is resized to 60x1800 before padding.
+    decoded = []
+    exif_transpose = external_media.ImageOps.exif_transpose
+
+    def record_decoded_size(image, **kwargs):
+        decoded.append(image.size)  # drafted, not yet loaded
+        return exif_transpose(image, **kwargs)
+
+    monkeypatch.setattr(external_media.ImageOps, "exif_transpose", record_decoded_size)
+
+    external_media.instagram_jpeg_bytes(_jpeg(stored, orientation))
+
+    [(width, height)] = decoded
+    assert stored[0] // width > 1 and stored[1] // height > 1
+    upright = (width, height) if orientation == 1 else (height, width)
+    assert upright[0] >= 60 and upright[1] >= 1800
+
+
+@pytest.mark.parametrize(
+    ("stored", "orientation", "sent"),
+    [
+        ((4000, 4000), 1, (1440, 1440)),
+        ((4000, 3000), 1, (1440, 1080)),
+        ((3013, 1800), 1, (1440, 860)),
+        ((400, 12000), 1, (1440, 1800)),
+        ((6000, 1000), 1, (1440, 754)),
+        ((3000, 1200), 2, (1440, 754)),
+        ((3000, 1200), 3, (1440, 754)),
+        ((3000, 1200), 4, (1440, 754)),
+        ((3000, 1200), 5, (1440, 1800)),
+        ((3000, 1200), 6, (1440, 1800)),
+        ((3000, 1200), 7, (1440, 1800)),
+        ((3000, 1200), 8, (1440, 1800)),
+    ],
+    ids=[
+        "square",
+        "photo",
+        "photo-fitted-from-full-size",
+        "narrow-tall",
+        "wide-panorama",
+        "exif-orientation-2",
+        "exif-orientation-3",
+        "exif-orientation-4",
+        "exif-orientation-5",
+        "exif-orientation-6",
+        "exif-orientation-7",
+        "exif-orientation-8",
+    ],
+)
+def test_instagram_conversion_sends_the_same_size_whatever_it_decodes_at(
+    stored, orientation, sent
+):
+    # Why: how small a JPEG is decoded must not change what is sent. These are
+    # the sizes the fixed draft target produced before (#3596). The 3013x1800
+    # photo was decoded at full size then; fitting it from a drafted copy
+    # instead would send 1440x859. Orientations 2-4 keep the stored 3000x1200
+    # image's width and height; 5-8 (mirrored or not) turn it upright as
+    # 1200x3000.
+    converted = external_media.instagram_jpeg_bytes(_jpeg(stored, orientation))
+
+    with Image.open(BytesIO(converted)) as image:
+        assert image.size == sent
+
+
 def test_instagram_conforming_jpeg_does_not_require_normalization(tmp_path):
     source = tmp_path / "ready.jpg"
     Image.new("RGB", (1080, 1080), "blue").save(source)

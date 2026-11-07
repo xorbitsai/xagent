@@ -111,9 +111,14 @@ async def _dispatch() -> bool:
     )
 
 
-async def _wait_for_status(task_id: int, status: str) -> None:
+async def _wait_for_schedule(task_id: int, schedule: Mock) -> None:
+    # The START handoff commits the command as completed in a database thread
+    # and only then, back on the event loop, hands the run to the scheduler.
+    # When the handoff outlasts the handler's inline wait, the dispatch carries
+    # on detached and the row can read completed before the scheduler is
+    # called, so wait for the hand-off itself.
     for _ in range(100):
-        if _commands(task_id) and _commands(task_id)[0][1] == status:
+        if schedule.called:
             return
         await asyncio.sleep(0.05)
     raise AssertionError(_commands(task_id))
@@ -126,7 +131,7 @@ async def test_combined_execute_task_is_staged_and_run_by_the_dispatcher(
     task_id, user = task_and_user
     websocket = MagicMock(name="origin")
     await websocket_api.handle_execute_task(websocket, task_id, {"user": user})
-    await _wait_for_status(task_id, "completed")
+    await _wait_for_schedule(task_id, schedule)
 
     assert _commands(task_id) == [("start", "completed", "existing")]
     schedule.assert_called_once()

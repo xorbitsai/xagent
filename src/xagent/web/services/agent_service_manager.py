@@ -175,6 +175,7 @@ from .task_workspace_cleanup import (
     capture_workspace_cleanup_target,
     remove_task_workspace,
 )
+from .turn_settlement import TurnUsage
 from .workforce_runtime import (
     WorkforceTaskRuntime,
     release_task_lease_with_workforce_sync,
@@ -4084,6 +4085,7 @@ class AgentServiceManager:
         task_lease_heartbeat_task: (
             asyncio.Task[TaskLeaseHeartbeatOutcome] | None
         ) = None,
+        turn_usage_sink: Callable[[TurnUsage], None] | None = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
@@ -4116,6 +4118,13 @@ class AgentServiceManager:
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
+            turn_usage_sink: Handed to the run's tracker, which passes it this
+                run's usage whenever tracking completion returns, including
+                when the final write was not persisted because the database
+                ownership check failed. Not called when tracking is off, when
+                completion raises (a pool timeout), or when this method has
+                already seen lease ownership lost and only stops the tracker.
+                Its own failure is logged and never changes the run's result.
 
         Returns:
             Execution result dictionary
@@ -4357,6 +4366,9 @@ class AgentServiceManager:
                             else None
                         ),
                     )
+                    # The tracker hands this run's usage to the sink each
+                    # time its completion returns.
+                    tracker.turn_usage_sink = turn_usage_sink
                     await tracker.start_tracking()
                     # Enforce quota mid-run: the pattern loop polls this every step
                     # (each LLM reply / tool call) and stops the run once its live

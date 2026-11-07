@@ -8,6 +8,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Callable, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -394,6 +395,9 @@ class PatternRuntime:
     # report for a custom pattern that only raises.
     pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
+    # When this run emitted its first non-empty final-answer chunk; None when
+    # it streamed no answer text.
+    first_final_answer_delta_at: datetime | None = None
     inline_file_delivery: InlineFileDelivery | None = None
     _approved_answers: dict[str, OutputDecision] = field(
         default_factory=dict, init=False, repr=False
@@ -1086,6 +1090,8 @@ class PatternRuntime:
     async def _publish_final_answer_delta(self, message_id: str, delta: str) -> None:
         if not delta:
             return
+        if self.first_final_answer_delta_at is None:
+            self.first_final_answer_delta_at = datetime.now(timezone.utc)
         await self._emit_outbound(
             {
                 "type": "final_answer_delta",
@@ -1713,6 +1719,14 @@ class PatternRuntime:
         error: Exception,
         result: Any | None = None,
     ) -> None:
+        # One failed invocation, counted beside the per-invocation tool-call
+        # counter so a run's usage says how many of its tool calls failed.
+        try:
+            from ..model.chat.token_context import add_tool_error_usage
+
+            add_tool_error_usage(1)
+        except Exception:
+            logger.debug("tool error usage counter failed", exc_info=True)
         data = {
             "error_type": "agent_tool_error",
             "error": str(error),

@@ -1754,7 +1754,8 @@ def _child_never_answered(result: dict[str, Any]) -> bool:
     if result.get("empty_final_answer") is True:
         return True
     # ``AgentExecutionAdapter._normalize_result`` keeps the pattern's own result
-    # under ``agent_result``; the marker only survives there once normalized.
+    # under ``agent_result`` and lifts this marker to the top level; a raw
+    # pattern result carries it at the top level too.
     agent_result = result.get("agent_result")
     return isinstance(agent_result, dict) and (
         agent_result.get("empty_final_answer") is True

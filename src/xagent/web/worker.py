@@ -62,6 +62,7 @@ from .services.task_execution import background_task_manager
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.task_lease_service import wait_for_heartbeat_manager_idle
 from .services.task_runtime import shutdown_task_runtime_hook_executor
+from .services.turn_settlement import drain_turn_settlement_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,7 @@ async def run_worker(
                 await asyncio.gather(recovery, return_exceptions=True)
             await close_task_coordinators()
             await background_task_manager.shutdown()
+            await drain_turn_settlement_hooks()
             await wait_for_heartbeat_manager_idle()
             await stop_task_event_bridge()
             if idle_sweep is not None:

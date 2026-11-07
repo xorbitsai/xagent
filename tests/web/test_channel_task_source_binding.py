@@ -27,6 +27,7 @@ name that does not exist.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -44,6 +45,7 @@ from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
 from xagent.web.services.task_lease_service import TaskLease
+from xagent.web.services.turn_settlement import TurnFacts
 
 _EVENT_WATERMARK = {"scope_id": "root", "event_id": "channel-history", "sequence": 9}
 
@@ -445,6 +447,7 @@ async def test_shared_channel_turn_binds_the_snapshot_source(
                 attachments=[],
                 file_ids=(),
             ),
+            turn_facts=TurnFacts(started_at=datetime.now(timezone.utc)),
         )
 
     assert len(contexts) == 1

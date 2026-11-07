@@ -7,14 +7,16 @@ with support for periodic updates to the database.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ...core.model.chat.token_context import (
     TokenUsage,
+    aggregate_token_usage_by_model,
     get_token_usage,
     set_token_usage,
 )
 from ..services.db_runtime import run_db_io_cancellation_safe
+from ..services.turn_settlement import TurnModelUsage, TurnUsage
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,7 @@ def _copy_usage(usage: TokenUsage) -> TokenUsage:
         output_tokens=usage.output_tokens,
         llm_calls=usage.llm_calls,
         tool_calls=usage.tool_calls,
+        tool_errors=usage.tool_errors,
         details=_copy_details(usage.details),
     )
 
@@ -354,6 +357,8 @@ class TaskTracker:
         expected_run_id: str | None = None,
         expected_runner_id: str | None = None,
         expected_attempt_id: str | None = None,
+        *,
+        turn_usage_sink: Callable[[TurnUsage], None] | None = None,
     ) -> None:
         """Initialize the task tracker.
 
@@ -368,12 +373,17 @@ class TaskTracker:
             expected_runner_id: Optional durable runner fence. When provided,
                 seed reads and writes require the run, runner, and acquisition.
             expected_attempt_id: Acquisition that owns the tracked counters.
+            turn_usage_sink: Receives this run's ``turn_usage`` each time
+                completion returns, whether or not the final write was
+                persisted. Not called when completion raises. Its own failure
+                is logged and never changes the completion result.
         """
         self.task_id = task_id
         self.update_interval_seconds = update_interval_seconds
         self.expected_run_id = expected_run_id
         self.expected_runner_id = expected_runner_id
         self.expected_attempt_id = expected_attempt_id
+        self.turn_usage_sink = turn_usage_sink
         self._is_tracking = False
         self._update_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
@@ -381,6 +391,10 @@ class TaskTracker:
         # Per-turn baselines captured in start_tracking; used to meter deltas.
         self._initial_details_len = 0
         self._initial_tool_calls = 0
+        self._initial_tool_errors = 0
+        self._initial_llm_calls = 0
+        self._initial_input_tokens = 0
+        self._initial_output_tokens = 0
 
         # Compatibility callers may still hand us their request session. Read
         # and detach the primitive seed now, but never retain the Session or ORM
@@ -431,6 +445,10 @@ class TaskTracker:
         # everything past _initial_details_len.
         self._initial_details_len = len(initial_usage.details)
         self._initial_tool_calls = initial_usage.tool_calls
+        self._initial_tool_errors = initial_usage.tool_errors
+        self._initial_llm_calls = initial_usage.llm_calls
+        self._initial_input_tokens = initial_usage.input_tokens
+        self._initial_output_tokens = initial_usage.output_tokens
 
         logger.info(f"Started token tracking for task {self.task_id}")
 
@@ -566,13 +584,41 @@ class TaskTracker:
 
     def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
         """This turn's (detail entries, tool-call count) over the baseline seeded
-        in start_tracking. Single source for the completion meter and the mid-run
-        gate so they can't disagree on what 'this run's usage' means."""
+        in start_tracking. Single source for the completion meter, the mid-run
+        gate and ``turn_usage`` so they can't disagree on what 'this run's
+        usage' means."""
         if usage is None:
             usage = get_token_usage()
         return (
             usage.details[self._initial_details_len :],
             max(0, usage.tool_calls - self._initial_tool_calls),
+        )
+
+    def turn_usage(self, usage: TokenUsage | None = None) -> TurnUsage:
+        """This run's usage over the baseline seeded in ``start_tracking``.
+
+        Same delta the completion meter and the mid-run quota gate use, so the
+        three cannot disagree on what "this run's usage" means.
+        """
+        if usage is None:
+            usage = get_token_usage()
+        details, tool_calls = self._turn_delta(usage)
+        groups = aggregate_token_usage_by_model(details)
+        return TurnUsage(
+            input_tokens=max(0, usage.input_tokens - self._initial_input_tokens),
+            output_tokens=max(0, usage.output_tokens - self._initial_output_tokens),
+            llm_calls=max(0, usage.llm_calls - self._initial_llm_calls),
+            tool_calls=tool_calls,
+            tool_errors=max(0, usage.tool_errors - self._initial_tool_errors),
+            by_model=tuple(
+                TurnModelUsage(
+                    model_id=group["model_id"],
+                    model_name=group["model_name"],
+                    input_tokens=group["input_tokens"],
+                    output_tokens=group["output_tokens"],
+                )
+                for group in groups
+            ),
         )
 
     async def interrupt_reason_for_quota(self) -> str | None:
@@ -640,7 +686,9 @@ class TaskTracker:
                 # retain the current run's lease for TTL recovery instead of
                 # immediately performing a second blocking DB checkout.
                 raise
+            self._deliver_turn_usage(usage)
             return usage
+        self._deliver_turn_usage(usage)
         if not persisted:
             return usage
 
@@ -681,6 +729,17 @@ class TaskTracker:
         )
 
         return usage
+
+    def _deliver_turn_usage(self, usage: TokenUsage) -> None:
+        sink = self.turn_usage_sink
+        if sink is None:
+            return
+        try:
+            sink(self.turn_usage(usage))
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "turn usage sink failed for task %s", self.task_id, exc_info=True
+            )
 
     async def complete_tracking(self) -> TokenUsage:
         """Complete tracking and return final statistics.

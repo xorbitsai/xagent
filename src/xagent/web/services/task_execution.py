@@ -130,6 +130,7 @@ from .task_lease_service import (
     task_lease_attempt_predicate,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
+from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -2646,11 +2647,16 @@ async def execute_task_background(
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
     mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
+    turn_facts: TurnFacts | None = None,
 ) -> None:
     """Execute one task without checking out a DB connection on the event loop.
 
     Setup and finalization use worker-owned short Sessions. The long-running
     agent await receives only detached runtime state and primitive identifiers.
+
+    ``turn_facts``, when given, receives this run's usage and, once its result
+    finalizer ran, the outcome it settled (committed, or a terminal status it
+    found and kept); the caller reports the settlement.
     """
     from .task_execution_context_service import (
         materialize_task_execution_recovery_state,
@@ -2851,6 +2857,9 @@ async def execute_task_background(
                 db_session=None,
                 manage_task_lease=False,
                 task_lease=task_lease,
+                turn_usage_sink=(
+                    turn_facts.record_usage if turn_facts is not None else None
+                ),
             )
 
         finalize_run_id = (
@@ -2880,6 +2889,18 @@ async def execute_task_background(
         with propagate_deferred_cancellation(finalization_cancellation):
             if finalized.late_result:
                 return
+            if turn_facts is not None:
+                turn_facts.absorb_result(result)
+                turn_facts.outcome = settled_outcome(
+                    finalized.final_task_status,
+                    failure_code=finalized.error_code,
+                    visible_text=safe_str(finalized.ai_response),
+                    output_missing=turn_facts.output_missing,
+                    ignored_result=not finalized.terminal_state_committed,
+                )
+                turn_facts.completion_outcome = finalized.broadcast_meta.get(
+                    "completion_outcome"
+                )
 
             normalized_outputs = finalized.normalized_outputs
             if normalized_outputs:
@@ -3305,6 +3326,10 @@ def _finalize_resumed_task(
         "error_code": result.get("error_code"),
         "error_details": result.get("error_details"),
         "late_result": False,
+        # Set when the task was already terminal and this run's lease release
+        # committed: the status kept, as read under the row lock; this run's
+        # result discarded.
+        "kept_terminal_status": None,
     }
     if task_lease.run_id is None:
         _settle_prepared_task_file_outputs(
@@ -3349,11 +3374,16 @@ def _finalize_resumed_task(
             # discarded, so "applied" is not proven. DISPATCHED already means
             # "do not resend"; a still-PENDING row is advanced to that by the
             # orphan sweep once the task is quiescent.
-            if not release_task_lease_no_commit(db, task_lease, status=task.status):
+            # Read while the row is still locked: the commit below expires
+            # ``task`` and ends the lock, so a read after it would be a fresh
+            # query returning whatever the row says by then.
+            kept_status = task.status
+            if not release_task_lease_no_commit(db, task_lease, status=kept_status):
                 db.rollback()
                 finalized["late_result"] = True
                 return finalized
             db.commit()
+            finalized["kept_terminal_status"] = kept_status.value
             finalized["late_result"] = True
             return finalized
 
@@ -3699,17 +3729,36 @@ async def execute_resume_background(
     # never injected, so the message can be accepted as a new turn; any other
     # refusal keeps the ordinary failed-delivery answer.
     delivery_claimed_fresh: bool = False,
+    # Appended for the same reason. The facts bag this resume's settlement
+    # report is built from; None means this function creates its own.
+    turn_facts: TurnFacts | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
+
+    Once the resume's outcome is settled -- by the result finalizer (including
+    one that found the task already terminal), or by the failure/pause
+    settlement in its cleanup -- this function reports the settlement once
+    through ``report_turn_settled``.
     """
     from .agent_service_manager import caller_facing_execution_metadata
 
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+
+    facts = (
+        turn_facts
+        if turn_facts is not None
+        else TurnFacts(started_at=datetime.now(timezone.utc))
+    )
+    # Set by the cleanup when its own settlement committed (a failure or a
+    # pause); the result finalizer's outcome (its commit, or the terminal
+    # status it kept) is recorded on ``facts``.
+    resume_settled_by_cleanup = False
+    resume_settled_paused = False
 
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
@@ -4389,6 +4438,9 @@ async def execute_resume_background(
                 expected_runner_id=lease.runner_id,
                 expected_attempt_id=lease.attempt_id,
             )
+            # Both completion points below (the normal one and the cleanup's)
+            # report this run's usage through the tracker.
+            resume_tracker.turn_usage_sink = facts.record_usage
             await resume_tracker.start_tracking()
             agent_service.set_interrupt_checker(
                 resume_tracker.interrupt_reason_for_quota
@@ -4493,22 +4545,47 @@ async def execute_resume_background(
 
         outputs_for_finalizer = prepared_outputs
         try:
-            finalized = await run_db_io_cancellation_safe(
-                lambda: _finalize_resumed_task(
-                    task_id,
-                    status=status,
-                    success=success,
-                    output=output,
-                    task_owner_user_id=task_owner_user_id,
-                    result=result,
-                    task_lease=lease,
-                    prepared_outputs=outputs_for_finalizer,
+            finalization_worker = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(
+                    lambda: _finalize_resumed_task(
+                        task_id,
+                        status=status,
+                        success=success,
+                        output=output,
+                        task_owner_user_id=task_owner_user_id,
+                        result=result,
+                        task_lease=lease,
+                        prepared_outputs=outputs_for_finalizer,
+                    )
                 )
+            )
+            finalized, finalization_cancellation = await await_task_settlement(
+                finalization_worker
             )
         finally:
             # Once invoked, the fenced finalizer owns success cleanup or
             # compensation, including cancellation-safe late completion.
             prepared_outputs = None
+        # A cancellation that arrived while the result was written is raised
+        # only after the settled outcome is recorded for the cleanup's report.
+        with propagate_deferred_cancellation(finalization_cancellation):
+            if not finalized["late_result"]:
+                facts.absorb_result(result)
+                facts.outcome = settled_outcome(
+                    finalized["final_status"],
+                    failure_code=finalized.get("error_code"),
+                    visible_text=str(finalized["output"] or ""),
+                    output_missing=facts.output_missing,
+                )
+                facts.completion_outcome = finalized.get("completion_outcome")
+            elif finalized.get("kept_terminal_status") is not None:
+                # The task was already terminal: report the status it kept.
+                facts.absorb_result(result)
+                facts.outcome = settled_outcome(
+                    finalized["kept_terminal_status"],
+                    output_missing=facts.output_missing,
+                    ignored_result=True,
+                )
         if finalized["late_result"]:
             logger.info(
                 "Ignoring late resume result for task %s run %s; ownership changed",
@@ -4794,6 +4871,7 @@ async def execute_resume_background(
             nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
             nonlocal settlement_error
             nonlocal prepared_outputs
+            nonlocal resume_settled_by_cleanup, resume_settled_paused
             settlement_returned = False
 
             try:
@@ -4996,6 +5074,13 @@ async def execute_resume_background(
                         settlement_returned = True
                         if settled:
                             lease_released = True
+                            resume_settled_by_cleanup = True
+                            # ``pause_unknown_task_lease`` pauses without
+                            # filling the report.
+                            resume_settled_paused = bool(
+                                settlement_report.paused
+                                or (pause_for_input and not explicit_cancel)
+                            )
                             if settlement_report.paused:
                                 from .task_orchestrator import (
                                     publish_settlement_pause,
@@ -5066,6 +5151,59 @@ async def execute_resume_background(
                 except Exception:
                     logger.warning(
                         "Settling the cached runtime for task %s failed",
+                        task_id,
+                        exc_info=True,
+                    )
+                # Report the settled run last, after every broadcast. The
+                # finalizer's commit and the cleanup settlement are exclusive:
+                # the cleanup only settles a lease the finalizer did not
+                # release.
+                try:
+                    if not facts.notified and (
+                        facts.outcome is not None or resume_settled_by_cleanup
+                    ):
+                        outcome = facts.outcome
+                        if outcome is None:
+                            from .external_task_cancel import (
+                                EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+                            )
+
+                            # This cleanup's own settlement committed the
+                            # outcome; an interrupted external run carries the
+                            # code the scheduler reports for it.
+                            outcome = settled_outcome(
+                                TaskStatus.PAUSED.value
+                                if resume_settled_paused
+                                else TaskStatus.FAILED.value,
+                                failure_code=(
+                                    ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
+                                    if settlement_error
+                                    == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+                                    else None
+                                ),
+                            )
+                        report_turn_settled(
+                            facts,
+                            task_id=task_id,
+                            run_id=(
+                                lease.run_id if lease is not None else expected_run_id
+                            ),
+                            turn_id=(
+                                history_turn_id
+                                or (
+                                    _latest_result_user_turn_id(result)
+                                    if isinstance(result, dict)
+                                    else None
+                                )
+                                or None
+                            ),
+                            task_source=trusted_task_source,
+                            outcome=outcome,
+                            ended_at=datetime.now(timezone.utc),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "turn settlement notification failed for task %s",
                         task_id,
                         exc_info=True,
                     )

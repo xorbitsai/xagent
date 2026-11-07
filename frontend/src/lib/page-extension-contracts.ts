@@ -49,6 +49,23 @@ export type BuildPageExtensionProviderComponent =
 export type BuildAgentCardExtensionComponent =
   ComponentType<BuildAgentCardExtensionProps>
 
+export interface AgentBuilderSettingsExtensionOptions {
+  /** Undefined when creating an Agent. */
+  agentId?: number
+  /** True when the Builder can render editable settings. */
+  enabled: boolean
+  /** True while an Agent save is in progress. */
+  saving: boolean
+}
+
+export interface AgentBuilderSettingsExtension {
+  panel?: ReactNode
+  /** Immutable JSON settings to submit. Omit or return an empty object when clean. */
+  changes?: Record<string, unknown>
+  /** Acknowledge the submitted settings after a successful save. Keep newer edits dirty. */
+  markSaved?: (submitted: Record<string, unknown>) => void
+}
+
 // Wraps the Deploy dialog's key-based embed snippet. A replacement may render
 // `children` alongside alternative embed instructions; the OSS default renders only `children`.
 export interface DeployAgentEmbedExtensionProps {

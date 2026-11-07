@@ -60,7 +60,7 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 
 ### Fixture keys
 
-A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The probe route's document fixtures (#3284) use the same keys.
+A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The document connectors' `read_fixture` checks use these keys; the probe route does not take fixtures yet (#3284).
 
 ### Today's L3 probes
 
@@ -73,6 +73,8 @@ A connector that has not adopted V2 keeps `web/connector_probes.py` as its singl
 A connector adopts V2 by adding an entry to `CONNECTOR_CHECKS`. To keep its L3 call, it lists `l3_read_check(app_id)` among its reads.
 
 `notion`, `miro` and `atlassian` have adopted V2 with a `current_user` read check that sets `require_read_only_hint`, because their tools are vendor-owned: the check is skipped unless the server advertises the tool with `readOnlyHint: true`. The check takes the place of their unprobeable `l3_probe` row. `connector_probes.py` has no such guard, so the probe route still records them as `covered_by_l2`. The other remote MCP connectors keep the derived `covered_by_l2` row until their result shapes are verified against a test account; `fireflies` returns plain text, which no payload source reads. A remote (`url`) connector's tool list is vendor-owned and changes without a release, so per-tool coverage (#3565) does not apply to it: it declares the checks it has and no exemptions.
+
+The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `powerpoint`, `word` and `excel`) declare a `read_fixture` read check that reads the object named by its fixture key: `google-docs.document_id`, `google-sheets.spreadsheet_id`, `google-slides.presentation_id`, `powerpoint.file_path`, `word.file_path` and `excel.file_path`. Each object must be a document or file the identity's account can read, and a `file_path` is relative to that account's drive root, not a local task-workspace path. Without a value the check reports `skip` with `fixture_missing`, and the probe route, which does not take fixtures yet (#3284), still records these connectors as `needs_fixture`. Use a small document as each fixture, since `google_docs_get_document` returns the whole document; `word` also needs a tool output cap (`XAGENT_TOOL_MAX_OUTPUT_LENGTH`) of at least 16,384 characters.
 
 ## Identity adapters
 

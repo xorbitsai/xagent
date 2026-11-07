@@ -386,16 +386,15 @@ async def _call_declared_probe(
             _LISTING_OUTCOMES[listing.outcome], tool=tool_name, reason=listing.reason
         )
 
-    tool = _find_tool(listing.load_result.tools, tool_name)
+    tool = find_tool(listing.load_result.tools, tool_name)
     if tool is None:
         return result(
             ConnectorProbeOutcome.PROBE_TOOL_MISSING, tool=tool_name, reason=None
         )
 
-    timeout = get_mcp_tool_init_timeout_seconds()
     try:
         call = tool.run_json_async(dict(probe.arguments))
-        raw = await asyncio.wait_for(call, timeout or _PROBE_CALL_FALLBACK_SECONDS)
+        raw = await asyncio.wait_for(call, probe_call_timeout_seconds())
     except asyncio.TimeoutError:
         return result(
             ConnectorProbeOutcome.TIMED_OUT, tool=tool_name, reason="probe_call"
@@ -413,6 +412,13 @@ async def _call_declared_probe(
 
     outcome, reason = evaluate_probe_result(raw, probe)
     return result(outcome, tool=tool_name, reason=reason)
+
+
+def probe_call_timeout_seconds() -> float:
+    """The bound on one probe call, which the smoke V2 engine also gives
+    each check's call: the MCP init timeout, or
+    ``_PROBE_CALL_FALLBACK_SECONDS`` when it is 0."""
+    return get_mcp_tool_init_timeout_seconds() or _PROBE_CALL_FALLBACK_SECONDS
 
 
 def evaluate_probe_result(
@@ -458,7 +464,7 @@ def _single_json_object(content: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _find_tool(tools: Any, name: str) -> Any | None:
+def find_tool(tools: Any, name: str) -> Any | None:
     """The loaded adapter whose MCP tool is ``name``.
 
     The loader prefixes and sanitizes the agent-facing name, so the match is

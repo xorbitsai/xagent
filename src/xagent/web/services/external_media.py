@@ -15,7 +15,7 @@ from typing import Any, BinaryIO
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageOps, JpegImagePlugin, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -44,6 +44,9 @@ _IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".png": "image/png",
 }
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
+_JPEG_END_OF_IMAGE = b"\xff\xd9"
 
 
 class ExternalMediaPurpose(str, Enum):
@@ -136,6 +139,21 @@ def _image_media_type(record: Any) -> str:
     if media_type is None:
         raise ExternalMediaUnsupportedImage("Only PNG or JPEG images can be delivered")
     return media_type
+
+
+def delivered_image_media_type(content: bytes, registered_type: str) -> str:
+    """The type of the image bytes being delivered, read from their signature.
+
+    Issuance accepts PNG or JPEG bytes whatever the file's extension, and
+    image_tool saves every edited image as .png, so the extension can name the
+    wrong type; delivery sends nosniff, so the declared type is final. Bytes
+    with neither signature keep the registered type.
+    """
+    if content.startswith(_PNG_SIGNATURE):
+        return "image/png"
+    if content.startswith(_JPEG_SIGNATURE):
+        return "image/jpeg"
+    return registered_type
 
 
 def _load_record(
@@ -466,14 +484,36 @@ def _validate_facebook_record(record: UploadedFile) -> None:
     if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
         raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
     try:
-        # verify() checks the whole stream (a truncated body fails) without
-        # decoding pixels. The bytes are in memory, so any error is a decode error.
+        # Neither check decodes pixels. PNG's verify() reads every chunk and
+        # checks its CRC, so a truncated or damaged PNG fails. JPEG's verify()
+        # only parses the header, so the main image must also be seen to end;
+        # a JPEG damaged in the middle still passes. The bytes are in memory,
+        # so any error is a decode error.
         with Image.open(BytesIO(content), formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+            is_jpeg = image.format in {"JPEG", "MPO"}
             image.verify()
+        if is_jpeg and not _jpeg_main_image_ends(content):
+            raise SyntaxError("JPEG ends before its main image does")
     except Exception as exc:
         raise ExternalMediaUnsupportedImage(
             "Registered image could not be decoded as PNG or JPEG"
         ) from exc
+
+
+def _jpeg_main_image_ends(content: bytes) -> bool:
+    """Whether the end-of-image marker follows the main image's scan data.
+
+    Pillow's JPEG open stops right after the first start-of-scan header, so
+    the position it leaves is where the main image's scan data begins. An EXIF
+    thumbnail ends with its own marker before that point and does not count;
+    data after the marker, such as extra MPF images, is allowed. The plugin is
+    opened directly because ``Image.open`` turns a JPEG carrying MPF images
+    into an ``MpoImageFile``, which rewinds to the start of the file.
+    """
+    buffer = BytesIO(content)
+    with JpegImagePlugin.JpegImageFile(buffer):
+        scan_start = buffer.tell()
+    return content.find(_JPEG_END_OF_IMAGE, scan_start) != -1
 
 
 def instagram_image_requires_normalization(source: Path | BinaryIO) -> bool:

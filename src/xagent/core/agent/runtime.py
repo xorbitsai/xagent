@@ -1036,7 +1036,7 @@ class PatternRuntime:
             local_stream = self.output_guardrail.open_stream()
             if local_stream is not None:
                 self._reviewed_output_streams[message_id] = local_stream
-        elif self.inline_file_delivery is not None:
+        if self.inline_file_delivery is not None:
             self._inline_stream_guards[message_id] = InlineFileStreamGuard()
         self.last_final_answer_stream_message_id = None
         try:
@@ -1064,7 +1064,7 @@ class PatternRuntime:
         if self.output_guardrail is not None:
             local_stream = self._reviewed_output_streams.get(message_id)
             delta = await local_stream.feed(delta) if local_stream is not None else ""
-        elif (guard := self._inline_stream_guards.get(message_id)) is not None:
+        if delta and (guard := self._inline_stream_guards.get(message_id)) is not None:
             delta = guard.feed(delta)
         await self._publish_final_answer_delta(message_id, delta)
 
@@ -1092,8 +1092,14 @@ class PatternRuntime:
             if cached is not None:
                 return cached
             decision = await self.output_guardrail.check(content)
-            self._approved_answers[fingerprint] = decision.text
-            return decision.text
+            delivered = decision.text
+            if decision.action == "allow":
+                delivered = await self._deliver_inline_answer(delivered)
+            self._approved_answers[fingerprint] = delivered
+            return delivered
+        return await self._deliver_inline_answer(content)
+
+    async def _deliver_inline_answer(self, content: str) -> str:
         if self.inline_file_delivery is None or "base64" not in content.lower():
             return content
         return await asyncio.to_thread(self.inline_file_delivery.transform, content)
@@ -1101,13 +1107,18 @@ class PatternRuntime:
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
         guard = self._inline_stream_guards.pop(message_id, None)
         local_stream = self._reviewed_output_streams.pop(message_id, None)
+        original = content
         content = await self.prepare_final_answer(content)
-        if guard is not None:
-            await self._publish_final_answer_delta(message_id, guard.flush())
         if local_stream is not None:
-            await self._publish_final_answer_delta(
-                message_id, local_stream.approved_suffix(content)
-            )
+            suffix = local_stream.approved_suffix(content)
+            if guard is not None:
+                if suffix:
+                    suffix = guard.feed(suffix) + guard.flush()
+                elif content == original:
+                    suffix = guard.flush()
+            await self._publish_final_answer_delta(message_id, suffix)
+        elif guard is not None:
+            await self._publish_final_answer_delta(message_id, guard.flush())
         self.last_final_answer_stream_message_id = message_id
         await self._emit_outbound(
             {

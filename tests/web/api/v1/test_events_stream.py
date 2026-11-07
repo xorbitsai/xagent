@@ -50,6 +50,7 @@ from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
+    cache_set,
     set_cache_backend_for_testing,
 )
 from xagent.web.services.task_event_trace_handler import (
@@ -2785,6 +2786,80 @@ def test_fast_path_step_snapshot_hits_the_steps_cache(monkeypatch):
         assert resp.status_code == 200
         assert "event: step.started" in resp.text
         assert calls == []  # cache hit -- the uncached full trace read never ran
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("status", [TaskStatus.COMPLETED, TaskStatus.WAITING_FOR_USER])
+def test_legacy_steps_and_fast_path_hide_audit_only_traces(status):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _set_task_status(task_id, status, output="done", control_state="idle")
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="public-history",
+        timestamp=base,
+        data={"message": "approved-reply"},
+    )
+    for phase in ("start", "end"):
+        _insert_trace_event(
+            task_id=task_id,
+            event_type=f"tool_execution_{phase}",
+            event_id=f"audit-{phase}",
+            timestamp=base,
+            step_id="private-step",
+            data={
+                "__audit_only__": True,
+                "tool_call_id": "private-tool-call",
+                "tool_name": "search",
+                "success": True,
+                "result": {"content": "private-value"},
+            },
+        )
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        task.conversation_storage_version = 1
+        db.commit()
+        audit_row = (
+            db.query(TraceEvent).filter_by(task_id=task_id, event_id="audit-end").one()
+        )
+        assert audit_row.data["result"] == {"content": "private-value"}
+        max_event_id = audit_row.id
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        cache_set(
+            f"task:steps:{task_id}",
+            {
+                "storage_version": 1,
+                "max_event_id": max_event_id,
+                "response": {
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "steps": [
+                        {
+                            "id": "tool_call:private-tool-call",
+                            "type": "tool_call",
+                            "status": "completed",
+                            "started_at": base.isoformat(),
+                            "data": {"result": {"content": "private-value"}},
+                        }
+                    ],
+                },
+            },
+            ttl_seconds=60,
+        )
+        for path in ("steps", "events"):
+            resp = client.get(
+                f"/v1/chat/tasks/{task_id}/{path}", headers=_bearer(full_key)
+            )
+            assert resp.status_code == 200, resp.text
+            assert "approved-reply" in resp.text
+            assert "private-tool-call" not in resp.text
+            assert "private-value" not in resp.text
     finally:
         set_cache_backend_for_testing(None)
 

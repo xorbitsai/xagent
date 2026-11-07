@@ -27,7 +27,7 @@ from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
-from .tool_choice import supports_forced_tool_choice
+from .tool_choice import is_auto_only_claude_model, supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,9 @@ def _fix_claude_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     return schema
 
 
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+
+
 class ClaudeLLM(BaseLLM):
     """
     Anthropic Claude LLM client using the official Anthropic SDK.
@@ -234,7 +237,7 @@ class ClaudeLLM(BaseLLM):
 
     def __init__(
         self,
-        model_name: str = "claude-3-5-sonnet-20241022",
+        model_name: str = DEFAULT_CLAUDE_MODEL,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         default_temperature: Optional[float] = None,
@@ -594,8 +597,11 @@ class ClaudeLLM(BaseLLM):
                 **kwargs,
             }
 
-            # Set temperature
-            if temperature is not None:
+            # Set temperature. Claude 5.x models reject non-default sampling
+            # parameters with a 400, so omit it for them.
+            if is_auto_only_claude_model(self._model_name):
+                pass
+            elif temperature is not None:
                 completion_params["temperature"] = temperature
             elif self.default_temperature is not None:
                 completion_params["temperature"] = self.default_temperature
@@ -650,10 +656,14 @@ class ClaudeLLM(BaseLLM):
             # Handle thinking mode (extended thinking)
             if thinking is not None:
                 if thinking.get("type") == "enabled" or thinking.get("enable", False):
-                    completion_params["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": thinking.get("budget_tokens", 10240),
-                    }
+                    if is_auto_only_claude_model(self._model_name):
+                        # Claude 5.x models only accept adaptive thinking
+                        completion_params["thinking"] = {"type": "adaptive"}
+                    else:
+                        completion_params["thinking"] = {
+                            "type": "enabled",
+                            "budget_tokens": thinking.get("budget_tokens", 10240),
+                        }
                 elif thinking.get("type") == "disabled":
                     completion_params["thinking"] = {"type": "disabled"}
 
@@ -867,8 +877,11 @@ class ClaudeLLM(BaseLLM):
                 **kwargs,
             }
 
-            # Set temperature
-            if temperature is not None:
+            # Set temperature. Claude 5.x models reject non-default sampling
+            # parameters with a 400, so omit it for them.
+            if is_auto_only_claude_model(self._model_name):
+                pass
+            elif temperature is not None:
                 completion_params["temperature"] = temperature
             elif self.default_temperature is not None:
                 completion_params["temperature"] = self.default_temperature
@@ -917,10 +930,14 @@ class ClaudeLLM(BaseLLM):
             # Handle thinking mode (extended thinking)
             if thinking is not None:
                 if thinking.get("type") == "enabled" or thinking.get("enable", False):
-                    completion_params["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": thinking.get("budget_tokens", 10240),
-                    }
+                    if is_auto_only_claude_model(self._model_name):
+                        # Claude 5.x models only accept adaptive thinking
+                        completion_params["thinking"] = {"type": "adaptive"}
+                    else:
+                        completion_params["thinking"] = {
+                            "type": "enabled",
+                            "budget_tokens": thinking.get("budget_tokens", 10240),
+                        }
                 elif thinking.get("type") == "disabled":
                     completion_params["thinking"] = {"type": "disabled"}
 

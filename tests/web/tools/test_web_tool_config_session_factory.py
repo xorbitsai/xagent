@@ -477,7 +477,17 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
 
     await manager._build_tools_for_task(
         task_id=11,
-        task=SimpleNamespace(user_id=7, agent_config=agent_config, source="internal"),
+        # channel_id through sdk_credential_kind are the columns the team-member
+        # grant gate reads; None is how a web chat task row stores them.
+        task=SimpleNamespace(
+            user_id=7,
+            agent_config=agent_config,
+            source="internal",
+            channel_id=None,
+            channel_name=None,
+            telegram_user_id=None,
+            sdk_credential_kind=None,
+        ),
         db=None,
         user=SimpleNamespace(id=7, is_admin=False),
         agent_config=None,

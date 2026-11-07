@@ -977,6 +977,12 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
             for grant in grants
             if required_scopes.issubset(_scope_set(grant.scope))
         ]
+    # The association lookup below only matters for grants under the caller's
+    # own default owner key; an empty match or another owner key is returned
+    # without it.
+    member_path_owner = resource_owner_key in (None, f"xagent:user:{user_id}")
+    if not grants or not member_path_owner:
+        return list(grants)
     holds_association = (
         db.query(UserMCPServer.id)
         .filter(
@@ -986,13 +992,9 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         .first()
         is not None
     )
-    if (
-        resource_owner_key in (None, f"xagent:user:{user_id}")
-        and not holds_association
-        and not allow_team_member_grants
-    ):
-        return []
-    return list(grants)
+    if holds_association or allow_team_member_grants:
+        return list(grants)
+    return []
 
 
 async def _discover_with_client(  # noqa: PLR0913

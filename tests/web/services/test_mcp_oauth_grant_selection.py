@@ -10,7 +10,7 @@ association is unaffected by the parameter.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
@@ -93,11 +93,122 @@ def _add_grant(db, *, server: MCPServer, user: User) -> MCPOAuthGrant:
     return grant
 
 
+def _add_other_server(db) -> MCPServer:
+    server = MCPServer.from_config(
+        {
+            "name": "selection-other-server",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://mcp.other-selection.test/mcp",
+            "auth": AUTH,
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    return server
+
+
+@pytest.mark.parametrize(
+    ("unrelated_association", "allow", "expect_returned"),
+    [
+        # An association row only counts when it is the caller's own row for
+        # this server; each case below holds a row that is not.
+        pytest.param(
+            "other_user_same_server",
+            False,
+            False,
+            id="other_users_association_on_server",
+        ),
+        pytest.param(
+            "caller_other_server",
+            False,
+            False,
+            id="callers_association_on_other_server",
+        ),
+        pytest.param(None, True, True, id="no_association_allowed"),
+    ],
+)
+def test_grant_selection_counts_only_the_callers_association_for_the_server(
+    db_session, unrelated_association: str | None, allow: bool, expect_returned: bool
+) -> None:
+    user = _add_user(db_session, "selection-member")
+    server = _add_server(db_session)
+    grant = _add_grant(db_session, server=server, user=user)
+    if unrelated_association == "other_user_same_server":
+        other_user = _add_user(db_session, "selection-other-user")
+        db_session.add(UserMCPServer(user_id=other_user.id, mcpserver_id=server.id))
+    elif unrelated_association == "caller_other_server":
+        other_server = _add_other_server(db_session)
+        db_session.add(UserMCPServer(user_id=user.id, mcpserver_id=other_server.id))
+    db_session.commit()
+
+    selected = select_mcp_oauth_grants(
+        db_session,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=AUTH,
+        resource_owner_key=f"xagent:user:{user.id}",
+        allow_team_member_grants=allow,
+    )
+
+    assert [g.id for g in selected] == ([grant.id] if expect_returned else [])
+
+
+@pytest.mark.parametrize(
+    ("seed_grant", "owner_key", "expect_lookups", "expect_returned"),
+    [
+        pytest.param(False, "default", 0, False, id="no_matching_grant"),
+        pytest.param(True, "external:account:1", 0, True, id="other_owner_key"),
+        pytest.param(True, "default", 1, False, id="default_owner_key"),
+    ],
+)
+def test_grant_selection_looks_up_association_only_when_the_rule_applies(
+    db_session,
+    seed_grant: bool,
+    owner_key: str,
+    expect_lookups: int,
+    expect_returned: bool,
+) -> None:
+    user = _add_user(db_session, "selection-member")
+    server = _add_server(db_session)
+    resource_owner_key = (
+        f"xagent:user:{user.id}" if owner_key == "default" else owner_key
+    )
+    if seed_grant:
+        grant = _add_grant(db_session, server=server, user=user)
+        db_session.query(MCPOAuthGrant).filter(MCPOAuthGrant.id == grant.id).update(
+            {MCPOAuthGrant.resource_owner_key: resource_owner_key}
+        )
+        db_session.commit()
+
+    statements: list[str] = []
+
+    def _record(_conn, _cursor, statement, *_args) -> None:
+        statements.append(statement)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        selected = select_mcp_oauth_grants(
+            db_session,
+            server_id=server.id,
+            user_id=user.id,
+            auth_config=AUTH,
+            resource_owner_key=resource_owner_key,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert sum("user_mcpservers" in s for s in statements) == expect_lookups
+    assert len(selected) == (1 if expect_returned else 0)
+
+
 @pytest.mark.parametrize(
     ("holds_association", "expect_returned"),
     [
         pytest.param(False, False, id="no_association_not_allowed"),
-        pytest.param(True, True, id="association_holder_not_allowed"),
+        pytest.param(True, True, id="association_holder_gets_grant"),
     ],
 )
 def test_grant_selection_resource_rule_for_callers_without_association(

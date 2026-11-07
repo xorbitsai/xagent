@@ -29,6 +29,7 @@ Out of scope:
 
 from __future__ import annotations
 
+import enum
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -53,23 +54,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _NotLoaded:
-    """Type of the marker for a task column the constructor never filled in."""
+class _NotLoaded(enum.Enum):
+    """Type of the marker for a task column the constructor never filled in.
 
-    __slots__ = ()
+    An enum member stays the same object through copying and pickling, so the
+    identity comparison callers rely on survives a copied ``_TaskFields``.
+    """
 
-    def __repr__(self) -> str:
-        return "TASK_FIELD_NOT_LOADED"
-
-    def __reduce__(self) -> str:
-        # Copying or pickling must hand back the module-level marker, because
-        # callers compare it by identity.
-        return "TASK_FIELD_NOT_LOADED"
+    TASK_FIELD_NOT_LOADED = 0
 
 
 # Compared by identity only. A field holding this marker was not read from the
 # task row, which is different from a column that was read and is NULL.
-TASK_FIELD_NOT_LOADED = _NotLoaded()
+TASK_FIELD_NOT_LOADED = _NotLoaded.TASK_FIELD_NOT_LOADED
 
 
 @dataclass(frozen=True)

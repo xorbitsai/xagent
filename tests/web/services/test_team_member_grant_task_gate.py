@@ -10,6 +10,7 @@ ORM ``Task`` row itself.
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
 import json
 import pickle
@@ -384,6 +385,8 @@ def test_gate_reads_fields_without_getattr_defaults() -> None:
         assert defaults[name] is TASK_FIELD_NOT_LOADED
 
     assert pickle.loads(pickle.dumps(TASK_FIELD_NOT_LOADED)) is TASK_FIELD_NOT_LOADED
+    copied = copy.deepcopy(_hand_built_task_fields())
+    assert copied.channel_id is TASK_FIELD_NOT_LOADED
 
 
 def test_gate_refuses_when_only_sdk_credential_kind_is_not_loaded() -> None:

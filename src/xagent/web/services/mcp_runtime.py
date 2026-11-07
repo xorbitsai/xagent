@@ -42,8 +42,12 @@ def team_member_mcp_grants_allowed_for_task(
     """Say whether a task may use OAuth grants a team member made for themselves.
 
     Only the member's own tasks qualify: their web chat, their triggers, and
-    their personal-key SDK tasks. The list is an allow-list so that a task
-    source added later is refused until it is deliberately added here.
+    their personal-key SDK tasks. The sources are an allow-list, so a task
+    whose ``source`` holds any other value, including a value introduced
+    later, is refused. That only covers values written to ``source``: the
+    column defaults to ``"internal"``, so a task created without setting
+    ``source`` reads as web chat here. IM channel tasks are created that way;
+    they are refused by the channel columns below, not by ``source``.
 
     All three channel columns must be empty. Unbinding an IM channel nulls
     ``channel_id`` through its foreign key, but ``channel_name`` and
@@ -52,29 +56,24 @@ def team_member_mcp_grants_allowed_for_task(
 
     A field still holding the not-loaded marker means the task was built
     without reading that column; it is refused rather than guessed.
+
+    The verdict only narrows what grant selection may return. A token supplied
+    by the OAuth token resolver hook (``set_oauth_token_resolver_hook``) does
+    not go through grant selection, so this gate does not apply to it.
     """
     if task is None:
         return False
-    if (
-        task.channel_id is TASK_FIELD_NOT_LOADED
-        or task.channel_name is TASK_FIELD_NOT_LOADED
-        or task.telegram_user_id is TASK_FIELD_NOT_LOADED
-        or task.sdk_credential_kind is TASK_FIELD_NOT_LOADED
+    channel_fields = (task.channel_id, task.channel_name, task.telegram_user_id)
+    if any(
+        value is TASK_FIELD_NOT_LOADED
+        for value in (*channel_fields, task.sdk_credential_kind)
     ):
         return False
-    if (
-        task.channel_id is not None
-        or task.channel_name is not None
-        or task.telegram_user_id is not None
-    ):
+    if any(value is not None for value in channel_fields):
         return False
-    if task.source in (None, "internal"):
-        return True
-    if task.source == "trigger":
-        return True
-    if task.source == "sdk" and task.sdk_credential_kind == "personal":
-        return True
-    return False
+    return task.source in (None, "internal", "trigger") or (
+        task.source == "sdk" and task.sdk_credential_kind == "personal"
+    )
 
 
 class MCPBuiltinOAuthActorPolicyRequiredError(RuntimeError):

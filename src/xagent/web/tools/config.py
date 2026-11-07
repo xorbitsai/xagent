@@ -1935,9 +1935,6 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
-        # Keyword argument, closed by default; the task builder passes the
-        # task-source gate's verdict for the task this config serves.
-        mcp_team_member_grants_allowed: bool = False,
         # Appended after every pre-existing parameter (not inserted
         # alongside its closest siblings above) so a caller still using
         # positional arguments for anything after agent_call_stack keeps
@@ -1947,6 +1944,9 @@ class WebToolConfig(BaseToolConfig):
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
         knowledge_base_team_id: Optional[int] = None,
         excluded_model_ids: frozenset[str] = frozenset(),
+        # Closed by default; the task builder passes the task-source gate's
+        # verdict for the task this config serves.
+        mcp_team_member_grants_allowed: bool = False,
     ):
         # Media model ids this task excludes; the getters drop them from the
         # kind's dict and re-pick an excluded default (see the filter helper).

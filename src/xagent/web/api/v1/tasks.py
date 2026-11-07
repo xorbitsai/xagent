@@ -113,7 +113,6 @@ from .deps import (
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
 from .idempotency import (
     IDEMPOTENCY_KEY_HEADER,
-    fingerprint_payload,
     run_with_idempotency,
 )
 
@@ -423,8 +422,10 @@ async def create_chat_task(
             original 202 response (``Idempotent-Replayed: true``) without
             starting another task; with a different body it is 422
             ``idempotency_key_reused``; while the first request is still
-            running it is 409 ``idempotency_key_in_progress``. Without the
-            header the call behaves exactly as before.
+            running it is 409 ``idempotency_key_in_progress``. A body that
+            cannot be encoded as JSON is 422 ``invalid_input`` with the
+            header, before anything is reserved. Without the header the call
+            behaves exactly as before.
     Returns:
         :class:`CreateTaskResponse` with the new ``task_id``,
         ``agent_id``, ``status='running'`` (the atomic claim inside
@@ -453,7 +454,7 @@ async def create_chat_task(
             principal=principal,
             operation="create_task",
             header_value=idempotency_key,
-            request_payload=fingerprint_payload(request),
+            request=request,
             run=lambda claim: _create_chat_task(request, principal, claim),
         ),
     )
@@ -1184,7 +1185,7 @@ async def append_message_to_task(
             principal=principal,
             operation=f"append_message:{task_id}",
             header_value=idempotency_key,
-            request_payload=fingerprint_payload(request),
+            request=request,
             run=lambda claim: _append_message_to_task(
                 task_id, request, principal, claim
             ),

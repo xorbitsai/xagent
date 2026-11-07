@@ -66,12 +66,33 @@ def raise_idempotency_rejection(exc: api_idempotency.IdempotencyRejected) -> NoR
     raise V1ApiError(V1ErrorCode.IDEMPOTENCY_CONFLICT, 409)
 
 
+def _request_fingerprint(request: BaseModel) -> str:
+    """Digest of ``request`` for matching a retry, or a 422.
+
+    Some bodies pass request validation but cannot be written back as JSON:
+    an ``Any`` field may hold an object key with a lone surrogate, or nesting
+    deeper than the serializer allows. Such a body cannot be matched against
+    a retry, so it is rejected before anything is reserved.
+    """
+    try:
+        return api_idempotency.request_fingerprint(fingerprint_payload(request))
+    except ValueError as exc:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            422,
+            message=(
+                "The request body cannot be encoded as JSON, so it cannot be "
+                "matched against an Idempotency-Key."
+            ),
+        ) from exc
+
+
 async def run_with_idempotency(
     *,
     principal: ApiKeyPrincipal,
     operation: str,
     header_value: str | None,
-    request_payload: dict,
+    request: BaseModel,
     run: Callable[[api_idempotency.IdempotencyClaim | None], Awaitable[BaseModel]],
 ) -> BaseModel | JSONResponse:
     """Run ``run`` once per ``Idempotency-Key``.
@@ -88,7 +109,7 @@ async def run_with_idempotency(
         return await run(None)
 
     scope_kind, scope_id = idempotency_scope(principal)
-    fingerprint = api_idempotency.request_fingerprint(request_payload)
+    fingerprint = _request_fingerprint(request)
     acquired: list[api_idempotency.IdempotencyClaim] = []
 
     def acquire() -> (

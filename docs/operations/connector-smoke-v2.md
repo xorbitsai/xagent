@@ -36,8 +36,6 @@ ConnectorChecks(
 
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`; a write step's value can also be a `RunScopedName`. Neither ever comes from the caller of the engine.
 
-The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `powerpoint`, `word` and `excel`) declare a `read_fixture` read check that reads the object named by its fixture key: `google-docs.document_id`, `google-sheets.spreadsheet_id`, `google-slides.presentation_id`, `powerpoint.file_path`, `word.file_path` and `excel.file_path`. Each object must be a document or file the identity's account can read, and a `file_path` is relative to that account's drive root, not a local task-workspace path. Without a value the check reports `skip` with `fixture_missing`, and the probe route, which takes no fixtures, still records these connectors as `needs_fixture`.
-
 ### Assertions
 
 Assertions read a **payload** taken from the tool's normalized result (`{"content": [...], "structured_content": ..., "is_error": ...}`). A result flagged `is_error` fails before any assertion runs.
@@ -73,6 +71,8 @@ A connector that has not adopted V2 keeps `web/connector_probes.py` as its singl
 - an app with neither (a custom catalog app) has no declaration, and its `<connector>.l3_probe` row is `skip` with `not_declared`.
 
 A connector adopts V2 by adding an entry to `CONNECTOR_CHECKS`. To keep its L3 call, it lists `l3_read_check(app_id)` among its reads.
+
+The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `powerpoint`, `word` and `excel`) declare a `read_fixture` read check that reads the object named by its fixture key: `google-docs.document_id`, `google-sheets.spreadsheet_id`, `google-slides.presentation_id`, `powerpoint.file_path`, `word.file_path` and `excel.file_path`. Each object must be a document or file the identity's account can read, and a `file_path` is relative to that account's drive root, not a local task-workspace path. Without a value the check reports `skip` with `fixture_missing`, and the probe route, which takes no fixtures, still records these connectors as `needs_fixture`.
 
 ## Identity adapters
 

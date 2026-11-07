@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -362,6 +363,7 @@ class AgentStore:
         share_updated_at: datetime | None = None,
         visibility: str | None = None,
         template_id: str | None = None,
+        before_commit: Callable[[Agent], None] | None = None,
     ) -> Agent:
         agent = self.add_agent(
             user_id=user_id,
@@ -386,6 +388,8 @@ class AgentStore:
             visibility=visibility,
             template_id=template_id,
         )
+        if before_commit is not None:
+            before_commit(agent)
         self.db.commit()
         self.db.refresh(agent)
         # Agents are created personal (team_id NULL); promotion is explicit.

@@ -11,6 +11,11 @@ import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const useBuilderSettingsMock = vi.hoisted(() => vi.fn())
+
+vi.mock("@/lib/agent-builder-settings-extension", () => ({
+  useAgentBuilderSettingsExtension: useBuilderSettingsMock,
+}))
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -163,7 +168,7 @@ function agentResponse(toolCategories: string[]) {
 
 function installApi(
   toolCategories: string[],
-  putResponse: () => Response = () =>
+  putResponse: () => Response | Promise<Response> = () =>
     new Response(JSON.stringify(agentResponse(toolCategories)), { status: 200 }),
   toolsBody: unknown = { tools: AVAILABLE_TOOLS },
   skills: unknown[] = []
@@ -201,10 +206,61 @@ const toolCategorySelector = () =>
 beforeEach(() => {
   apiRequestMock.mockReset()
   toastErrorMock.mockReset()
+  useBuilderSettingsMock.mockReset().mockReturnValue({})
   ;(globalThis as any).WebSocket = vi.fn()
 })
 
 afterEach(() => cleanup())
+
+describe("AgentBuilder host settings", () => {
+  it("renders the extension, gates publishing, and acknowledges only the submitted settings", async () => {
+    let finishSave!: (response: Response) => void
+    const response = new Promise<Response>(resolve => { finishSave = resolve })
+    installApi(["basic_tools"], () => response)
+    const markSaved = vi.fn()
+    const panel = <div>Host settings panel</div>
+    useBuilderSettingsMock.mockReturnValue({ panel, changes: {}, markSaved })
+    const { rerender } = render(<AgentBuilder agentId={AGENT_ID} />)
+
+    expect(await screen.findByText("Host settings panel")).toBeInTheDocument()
+    const update = screen.getByRole("button", { name: "builds.editor.header.update" })
+    const publish = screen.getByRole("button", { name: "builds.editor.header.publish" })
+    await waitFor(() => expect(publish).toBeEnabled())
+    expect(update).toBeDisabled()
+
+    const submitted = { policy: "strict" }
+    useBuilderSettingsMock.mockReturnValue({ panel, changes: submitted, markSaved })
+    rerender(<AgentBuilder agentId={AGENT_ID} />)
+    expect(update).toBeEnabled()
+    expect(publish).toBeDisabled()
+    fireEvent.click(update)
+    const put = apiRequestMock.mock.calls.find(([, options]) => options?.method === "PUT")
+    expect(JSON.parse(put?.[1].body)).toMatchObject({ host_settings: submitted })
+    expect(markSaved).not.toHaveBeenCalled()
+
+    useBuilderSettingsMock.mockReturnValue({ panel, changes: { policy: "new draft" }, markSaved })
+    rerender(<AgentBuilder agentId={AGENT_ID} />)
+    finishSave(Response.json(agentResponse(["basic_tools"])))
+    await waitFor(() => {
+      expect(markSaved).toHaveBeenCalledExactlyOnceWith(submitted)
+      expect(update).toBeEnabled()
+    })
+    expect(publish).toBeDisabled()
+  })
+
+  it("keeps the settings dirty when the save is rejected", async () => {
+    installApi(["basic_tools"], () => Response.json({ detail: "Invalid policy" }, { status: 422 }))
+    const markSaved = vi.fn()
+    useBuilderSettingsMock.mockReturnValue({ changes: { policy: "invalid" }, markSaved })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    const update = screen.getByRole("button", { name: "builds.editor.header.update" })
+    await waitFor(() => expect(update).toBeEnabled())
+    fireEvent.click(update)
+    await waitFor(() => expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe("Invalid policy"))
+    expect(markSaved).not.toHaveBeenCalled()
+    expect(update).toBeEnabled()
+  })
+})
 
 describe("AgentBuilder agent tool category (issue #802)", () => {
   it("does not offer unassignable categories even when such tools exist", async () => {

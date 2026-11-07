@@ -7,6 +7,13 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
 from ..exceptions import LLMTimeoutError
+from ..stream_progress import (
+    StreamAbort,
+    StreamProgressConfig,
+    StreamProgressGuard,
+    attach_reasoning_content_to_raw,
+    no_progress_tail_chunk,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -15,6 +22,18 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 _MODEL_DISCOVERY_TIMEOUT_SECONDS = 30.0
+
+
+async def _close_stream_iterator(iterator: Any) -> None:
+    close_stream = getattr(iterator, "aclose", None)
+    if not callable(close_stream):
+        return
+    try:
+        await close_stream()
+    except Exception as exc:
+        logger.debug(
+            "Closing aborted Xinference stream failed (%s)", type(exc).__name__
+        )
 
 
 async def _await_with_timeout(
@@ -519,6 +538,19 @@ class XinferenceLLM(BaseLLM):
             usage_emitted = False
             first_payload_seen = False
             next_payload_deadline = first_deadline
+            progress_guard = StreamProgressGuard(
+                StreamProgressConfig.from_env(model_name=self._model_name)
+            )
+            stream_abort: Optional[StreamAbort] = None
+            last_raw_chunk: Any = None
+            accumulated_reasoning_content = ""
+
+            def reasoning_raw(raw: Any) -> Any:
+                return attach_reasoning_content_to_raw(
+                    raw,
+                    accumulated_reasoning_content,
+                    has_reasoning_content=bool(accumulated_reasoning_content),
+                )
 
             def parse_item(item: Any) -> Optional[StreamChunk]:
                 nonlocal last_usage, usage_emitted
@@ -548,6 +580,33 @@ class XinferenceLLM(BaseLLM):
                     break
 
                 parsed_chunk = parse_item(item)
+                item_dict = dict(item) if not isinstance(item, dict) else item
+                last_raw_chunk = item_dict
+                choices = item_dict.get("choices") or []
+                choice = choices[0] if choices else {}
+                delta = choice.get("delta") or {}
+                reasoning = delta.get("reasoning_content")
+                reasoning_texts = (
+                    [reasoning] if isinstance(reasoning, str) and reasoning else []
+                )
+                if reasoning_texts:
+                    accumulated_reasoning_content += reasoning_texts[0]
+                stream_abort = progress_guard.observe(
+                    has_content=bool(delta.get("content")),
+                    reasoning_texts=reasoning_texts,
+                    has_finish_reason=bool(choice.get("finish_reason")),
+                    has_usage=bool(item_dict.get("usage")),
+                    accumulated_tool_calls=accumulated_tool_calls,
+                )
+                if stream_abort is not None:
+                    await _close_stream_iterator(iterator)
+                    iterator = None
+                    yield no_progress_tail_chunk(
+                        stream_abort,
+                        accumulated_tool_calls,
+                        reasoning_raw(last_raw_chunk),
+                    )
+                    return
                 if parsed_chunk:
                     if parsed_chunk.type in {
                         ChunkType.TOKEN,
@@ -558,6 +617,7 @@ class XinferenceLLM(BaseLLM):
                         next_payload_deadline = (
                             loop.time() + self.timeout_config.token_interval_timeout
                         )
+                    parsed_chunk.raw = reasoning_raw(parsed_chunk.raw)
                     yield parsed_chunk
 
             if last_usage and not usage_emitted:
@@ -565,7 +625,7 @@ class XinferenceLLM(BaseLLM):
                 yield StreamChunk(
                     type=ChunkType.USAGE,
                     usage=last_usage,
-                    raw={"choices": [], "usage": last_usage},
+                    raw=reasoning_raw({"choices": [], "usage": last_usage}),
                 )
         except LLMTimeoutError:
             raise
@@ -576,9 +636,7 @@ class XinferenceLLM(BaseLLM):
 
         finally:
             if iterator is not None:
-                close_stream = getattr(iterator, "aclose", None)
-                if callable(close_stream):
-                    await close_stream()
+                await _close_stream_iterator(iterator)
 
     def _parse_stream_chunk(
         self, raw_chunk: Any, accumulated_tool_calls: Dict

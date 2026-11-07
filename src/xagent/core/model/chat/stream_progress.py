@@ -330,7 +330,7 @@ class StreamProgressGuard:
                         "arguments already formed a complete JSON object"
                     ),
                     tool_call_id=call_id,
-                    keep_length=previous,
+                    keep_length=previous if previous is not None else 0,
                 )
             window = self._config.degenerate_window
             if window > 0 and len(extra) >= window:
@@ -342,7 +342,7 @@ class StreamProgressGuard:
                         "JSON object"
                     ),
                     tool_call_id=call_id,
-                    keep_length=previous,
+                    keep_length=previous if previous is not None else 0,
                 )
         return progressed, None
 
@@ -398,6 +398,12 @@ def no_progress_tail_chunk(
             call["function"]["arguments"] = call["function"]["arguments"][
                 : abort.keep_length
             ]
+
+    # The tail contains every call's full accumulated arguments, including
+    # calls that were already emitted before this abort. Tell the runtime to
+    # replace those values instead of appending them as new deltas.
+    for call in accumulated_tool_calls.values():
+        call["function"]["arguments_mode"] = "snapshot"
 
     if hasattr(raw_payload, "model_dump"):
         raw_payload = raw_payload.model_dump()

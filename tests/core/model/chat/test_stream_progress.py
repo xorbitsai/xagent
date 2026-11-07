@@ -308,6 +308,18 @@ class TestToolCallTrailingBytes:
         assert verdict.tool_call_id == "call_1"
         assert verdict.keep_length == len('{"q": "x"}')
 
+    def test_first_tool_delta_with_trailing_bytes_rolls_back_to_empty(self) -> None:
+        guard = StreamProgressGuard(_config())
+        calls = _tool_calls(("call_1", '{"q": "x"}junk'))
+
+        verdict = guard.observe(accumulated_tool_calls=calls)
+
+        assert verdict is not None
+        assert verdict.reason == "tool_call_trailing_bytes"
+        assert verdict.keep_length == 0
+        tail = no_progress_tail_chunk(verdict, calls, None)
+        assert tail.tool_calls[0]["function"]["arguments"] == ""
+
     def test_whitespace_after_complete_object_aborts_at_the_window(self) -> None:
         guard = StreamProgressGuard(_config(degenerate_window=8))
         assert (
@@ -583,7 +595,9 @@ class TestNoProgressTailChunk:
         assert chunk.type == ChunkType.TOOL_CALL
         assert chunk.finish_reason == NO_PROGRESS_FINISH_REASON
         assert chunk.tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert chunk.tool_calls[0]["function"]["arguments_mode"] == "snapshot"
         assert calls["call_1"]["function"]["arguments"] == '{"q": "x"}'
+        assert calls["call_1"]["function"]["arguments_mode"] == "snapshot"
         assert chunk.raw == {STREAM_ABORTED_KEY: "tool_call_trailing_bytes"}
 
 

@@ -1,12 +1,15 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
-from xagent.core.agent import PatternRuntime
+from xagent.core.agent import Agent, ExecutionContext, PatternRuntime
 from xagent.core.agent.execution_adapter import (
     AgentExecutionAdapter,
     AgentExecutionConfig,
 )
+from xagent.core.agent.pattern import ReActPattern
+from xagent.core.agent.trace import ACTION_START_TOOL, Tracer
 from xagent.core.guardrails import output
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.user_context import current_user_id
@@ -92,6 +95,162 @@ async def test_question_cannot_park_after_rejection():
             metadata={"options": ["private-value"]},
         )
     outbound.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_unavailable_review_closes_stream_and_rejects_questions(
+    monkeypatch, timeout
+):
+    from xagent.core.agent import runtime as runtime_module
+
+    class UnavailableReviewer:
+        def open_stream(self):
+            return self
+
+        async def feed(self, delta):
+            return await self.check(delta)
+
+        async def check(self, text, *, structured=False):
+            if timeout:
+                await asyncio.Event().wait()
+            raise RuntimeError(text)
+
+    monkeypatch.setattr(runtime_module, "OUTPUT_REVIEW_TIMEOUT_SECONDS", 0.01)
+    events = []
+    runtime = PatternRuntime(
+        output_guardrail=UnavailableReviewer(), outbound_message_handler=events.append
+    )
+    message_id = await runtime.start_final_answer_stream()
+    assert message_id is not None
+    await runtime.emit_final_answer_delta(message_id, "private-value")
+    await runtime.end_final_answer_stream(message_id, "private-value")
+    assert (
+        await runtime.prepare_final_answer("private-value") == output.UNAVAILABLE_OUTPUT
+    )
+    assert [event["type"] for event in events] == [
+        "final_answer_start",
+        "final_answer_error",
+    ]
+    assert events[-1]["error"] == output.UNAVAILABLE_OUTPUT
+    with pytest.raises(output.ProtectedInteractionError) as exc:
+        await runtime.send_message(message="private-value", expect_response=True)
+    assert str(exc.value) == output.UNAVAILABLE_OUTPUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restored", [False, True])
+async def test_rejected_question_checkpoint_allows_followup_to_replan(restored):
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "tool_calls": [
+                        {
+                            "id": "question",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": '{"message":"private-value","message_type":"question","expect_response":true}',
+                            },
+                        }
+                    ]
+                }
+            return {"content": "safe follow-up", "done": True}
+
+    llm = LLM()
+    runner = Agent("reviewed", patterns=[ReActPattern()], llm=llm).get_runner(
+        workspace_enabled=False
+    )
+    runtime = PatternRuntime(output_guardrail=Reviewer())
+    if restored:
+        unprotected = PatternRuntime()
+        first = await runner.run("Start", runtime=unprotected)
+        assert first["status"] == "waiting_for_user"
+        rejected = await runner.run(
+            None, runtime=runtime, checkpoint=unprotected.last_checkpoint
+        )
+    else:
+        rejected = await runner.run("Start", runtime=runtime)
+    assert rejected["status"] == "failed"
+    assert rejected["error"] == output.BLOCKED_OUTPUT
+    assert not runtime.outbound_messages
+    assert llm.calls == 1
+    checkpoint = runtime.last_checkpoint
+    assert checkpoint["status"] == "failed"
+    assert checkpoint["pattern_state"]["pending_tool_calls"] == []
+    assert checkpoint["pattern_state"]["waiting_for_user_request"] is None
+
+    context = ExecutionContext.from_dict(checkpoint["context"])
+    context.add_user_message("Try again")
+    followup = await runner.run(
+        None,
+        runtime=PatternRuntime(output_guardrail=Reviewer()),
+        checkpoint={**checkpoint, "context": context.to_dict()},
+    )
+    assert followup["success"] is True
+    assert followup["output"] == "safe follow-up"
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_unreviewed_waiting_results_from_patterns():
+    context = ExecutionContext()
+    runtime = PatternRuntime(output_guardrail=Reviewer())
+    runner = Agent("reviewed", patterns=[]).get_runner(workspace_enabled=False)
+    result = {
+        "success": False,
+        "status": "waiting_for_user",
+        "message": "private-value",
+        "interactions": [{"label": "private-value"}],
+    }
+    await runner._finish_run(context, result, runtime=runtime)
+    assert result["status"] == "failed"
+    assert result["error"] == output.BLOCKED_OUTPUT
+    assert "message" not in result
+    assert "interactions" not in result
+
+
+@pytest.mark.asyncio
+async def test_protected_failures_keep_provider_classification_without_diagnostics():
+    context = ExecutionContext()
+    runtime = PatternRuntime(output_guardrail=Reviewer())
+    runner = Agent("reviewed", patterns=[]).get_runner(workspace_enabled=False)
+    result = {
+        "success": False,
+        "error": "private-value",
+        "diagnostic_error": "private-value",
+        "pattern_errors": [{"error": "private-value"}],
+        "model_error": {
+            "kind": "rate_limited",
+            "status_code": 429,
+            "message": "private-value",
+            "provider_code": "private-value",
+        },
+    }
+    await runner._finish_run(context, result, runtime=runtime)
+    assert result["model_error"] == {"kind": "rate_limited", "status_code": 429}
+    assert "private-value" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_protected_trace_markers_reach_audit_writer():
+    tracer = Tracer()
+    tracer.event_writer = AsyncMock()
+    runtime = PatternRuntime(output_guardrail=Reviewer(), tracer=tracer)
+    with output.bind_output_guardrail(runtime.output_guardrail):
+        await tracer.trace_event(
+            ACTION_START_TOOL, step_id="step", data={"content": "private-value"}
+        )
+    await runtime._emit_trace_event(
+        ACTION_START_TOOL, step_id="step", data={"content": "private-value"}
+    )
+    for call in tracer.event_writer.await_args_list:
+        assert call.args[0].data == {"content": "private-value", "__audit_only__": True}
+    assert tracer.event_writer.await_count == 2
 
 
 @pytest.mark.asyncio

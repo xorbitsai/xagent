@@ -10,6 +10,7 @@ from ..user_context import current_user_id
 
 BLOCKED_OUTPUT = "I can't share that information."
 UNAVAILABLE_OUTPUT = "I couldn't complete the output safety check. Please try again."
+OUTPUT_REVIEW_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,12 @@ class ReviewedOutputStream(Protocol):
 
 
 class OutputGuardrail(Protocol):
+    """Review user-visible text and interactions.
+
+    Hosts must separately review workspace files before exposing their contents
+    or publishing file outputs. A text verdict does not inspect those bytes.
+    """
+
     async def check(self, text: str, *, structured: bool = False) -> OutputDecision: ...
 
     def open_stream(self) -> ReviewedOutputStream | None: ...
@@ -54,8 +61,8 @@ _delegated_agent_id: ContextVar[int | None] = ContextVar(
 class ProtectedInteractionError(RuntimeError):
     """A rejected question must not park the run waiting for a reply."""
 
-    def __init__(self) -> None:
-        super().__init__(BLOCKED_OUTPUT)
+    def __init__(self, *, unavailable: bool = False) -> None:
+        super().__init__(UNAVAILABLE_OUTPUT if unavailable else BLOCKED_OUTPUT)
 
 
 def set_output_review_resolver(resolver: OutputReviewResolver | None) -> None:

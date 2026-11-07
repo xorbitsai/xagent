@@ -185,6 +185,9 @@ class _DAGStepRuntime:
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         del message_id, error
 
+    async def approve_waiting_result(self, result: dict[str, Any]) -> bool:
+        return await self.parent.approve_waiting_result(result)
+
     async def send_message(
         self,
         *,

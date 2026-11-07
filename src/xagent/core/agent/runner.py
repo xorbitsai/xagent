@@ -26,12 +26,13 @@ from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
 from ..guardrails.output import (
     BLOCKED_OUTPUT,
+    UNAVAILABLE_OUTPUT,
     ProtectedInteractionError,
     bind_output_guardrail,
     resolve_output_guardrail,
 )
 from ..inline_file_delivery import InlineFileDelivery
-from ..model.chat.exceptions import ModelProviderError
+from ..model.chat.exceptions import MODEL_PROVIDER_FAILURE_KINDS, ModelProviderError
 from ..model.chat.routing_context import xinference_routing_key
 from ..model.chat.token_context import token_usage_observer
 from ..model.intent import enter_goal, exit_goal
@@ -704,9 +705,9 @@ class AgentRunner:
                                 )
                         raise
                     except ProtectedInteractionError as exc:
-                        teardown_status = "failed"
                         result = {
                             "success": False,
+                            "status": "failed",
                             "error": str(exc),
                             "execution_id": execution_id,
                             "context": context,
@@ -2284,10 +2285,23 @@ class AgentRunner:
             result["_output_guardrail_applied"] = True
             if not result.get("success") and result.get("status") != "waiting_for_user":
                 error = result.get("error")
-                if error != BLOCKED_OUTPUT:
+                if error not in (BLOCKED_OUTPUT, UNAVAILABLE_OUTPUT):
                     result["error"] = "The agent could not complete this request."
                 result.pop("diagnostic_error", None)
-                result.pop("model_error", None)
+                result.pop("pattern_errors", None)
+                model_error = result.pop("model_error", None)
+                if isinstance(model_error, dict):
+                    kind = model_error.get("kind")
+                    status_code = model_error.get("status_code")
+                    result["model_error"] = {
+                        "kind": kind
+                        if isinstance(kind, str)
+                        and kind in MODEL_PROVIDER_FAILURE_KINDS
+                        else "unknown",
+                        "status_code": status_code
+                        if type(status_code) is int and 100 <= status_code <= 599
+                        else None,
+                    }
         # Drain an in-flight injection before publishing a terminal result.
         # Once closed, late live input takes the existing deferred-post path;
         # callbacks and tool teardown must not reopen this acceptance window.

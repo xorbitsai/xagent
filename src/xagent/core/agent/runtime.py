@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -30,6 +30,9 @@ from ..context_materializer import (
 )
 from ..guardrails.output import (
     BLOCKED_OUTPUT,
+    OUTPUT_REVIEW_TIMEOUT_SECONDS,
+    UNAVAILABLE_OUTPUT,
+    OutputDecision,
     OutputGuardrail,
     ProtectedInteractionError,
     ReviewedOutputStream,
@@ -392,7 +395,7 @@ class PatternRuntime:
     pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     inline_file_delivery: InlineFileDelivery | None = None
-    _approved_answers: dict[str, str] = field(
+    _approved_answers: dict[str, OutputDecision] = field(
         default_factory=dict, init=False, repr=False
     )
     _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
@@ -1033,7 +1036,11 @@ class PatternRuntime:
             return None
         message_id = f"final_answer_{uuid4().hex}"
         if self.output_guardrail is not None:
-            local_stream = self.output_guardrail.open_stream()
+            try:
+                local_stream = self.output_guardrail.open_stream()
+            except Exception:
+                # The entire answer can still be reviewed before delivery.
+                local_stream = None
             if local_stream is not None:
                 self._reviewed_output_streams[message_id] = local_stream
         if self.inline_file_delivery is not None:
@@ -1063,7 +1070,15 @@ class PatternRuntime:
     async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
         if self.output_guardrail is not None:
             local_stream = self._reviewed_output_streams.get(message_id)
-            delta = await local_stream.feed(delta) if local_stream is not None else ""
+            if local_stream is None:
+                return
+            try:
+                async with asyncio.timeout(OUTPUT_REVIEW_TIMEOUT_SECONDS):
+                    delta = await local_stream.feed(delta)
+            except Exception:
+                self._reviewed_output_streams.pop(message_id, None)
+                self._inline_stream_guards.pop(message_id, None)
+                return
         if delta and (guard := self._inline_stream_guards.get(message_id)) is not None:
             delta = guard.feed(delta)
         await self._publish_final_answer_delta(message_id, delta)
@@ -1081,6 +1096,23 @@ class PatternRuntime:
         )
 
     async def prepare_final_answer(self, content: str) -> str:
+        return (await self._prepare_final_answer(content)).text
+
+    async def _check_output(
+        self, content: str, *, structured: bool = False
+    ) -> OutputDecision:
+        if self.output_guardrail is None:
+            return OutputDecision("allow", content)
+        try:
+            async with asyncio.timeout(OUTPUT_REVIEW_TIMEOUT_SECONDS):
+                if structured:
+                    return await self.output_guardrail.check(content, structured=True)
+                return await self.output_guardrail.check(content)
+        except Exception:
+            # Reviewer failures may include the candidate in their exception.
+            return OutputDecision("block", UNAVAILABLE_OUTPUT)
+
+    async def _prepare_final_answer(self, content: str) -> OutputDecision:
         if self.output_guardrail is not None:
             from .result import unwrap_final_answer_content
 
@@ -1091,13 +1123,14 @@ class PatternRuntime:
             cached = self._approved_answers.get(fingerprint)
             if cached is not None:
                 return cached
-            decision = await self.output_guardrail.check(content)
-            delivered = decision.text
+            decision = await self._check_output(content)
             if decision.action == "allow":
-                delivered = await self._deliver_inline_answer(delivered)
-            self._approved_answers[fingerprint] = delivered
-            return delivered
-        return await self._deliver_inline_answer(content)
+                decision = replace(
+                    decision, text=await self._deliver_inline_answer(decision.text)
+                )
+            self._approved_answers[fingerprint] = decision
+            return decision
+        return OutputDecision("allow", await self._deliver_inline_answer(content))
 
     async def _deliver_inline_answer(self, content: str) -> str:
         if self.inline_file_delivery is None or "base64" not in content.lower():
@@ -1108,9 +1141,20 @@ class PatternRuntime:
         guard = self._inline_stream_guards.pop(message_id, None)
         local_stream = self._reviewed_output_streams.pop(message_id, None)
         original = content
-        content = await self.prepare_final_answer(content)
+        if self.output_guardrail is None:
+            content = await self.prepare_final_answer(content)
+        else:
+            decision = await self._prepare_final_answer(content)
+            content = decision.text
+            if decision.action == "block" and content == UNAVAILABLE_OUTPUT:
+                await self.fail_final_answer_stream(message_id, UNAVAILABLE_OUTPUT)
+                return
         if local_stream is not None:
-            suffix = local_stream.approved_suffix(content)
+            try:
+                suffix = local_stream.approved_suffix(content)
+            except Exception:
+                suffix = ""
+                guard = None
             if guard is not None:
                 if suffix:
                     suffix = guard.feed(suffix) + guard.flush()
@@ -1144,7 +1188,7 @@ class PatternRuntime:
         self._reviewed_output_streams.clear()
 
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
-        if self.output_guardrail is not None:
+        if self.output_guardrail is not None and error != UNAVAILABLE_OUTPUT:
             error = "The answer stream could not be completed."
         self._inline_stream_guards.pop(message_id, None)
         self._reviewed_output_streams.pop(message_id, None)
@@ -1269,10 +1313,9 @@ class PatternRuntime:
                 )
             )
         for candidate in candidates - self._approved_questions:
-            if (
-                await self.output_guardrail.check(candidate, structured=True)
-            ).action != "allow":
+            if (await self._check_output(candidate, structured=True)).action != "allow":
                 return False
+        self._approved_questions.update(candidates)
         result["message"] = message
         result["message_type"] = message_type
         result["output"] = message
@@ -1310,9 +1353,7 @@ class PatternRuntime:
                 if structured
                 else message
             )
-            decision = await self.output_guardrail.check(
-                candidate, structured=structured
-            )
+            decision = await self._check_output(candidate, structured=structured)
             if expect_response and decision.action == "allow":
                 self._approved_questions.add(
                     self._question_candidate(
@@ -1321,8 +1362,14 @@ class PatternRuntime:
                 )
             if decision.action != "allow":
                 if expect_response or message_type == "question":
-                    raise ProtectedInteractionError()
-                message = BLOCKED_OUTPUT if structured else decision.text
+                    raise ProtectedInteractionError(
+                        unavailable=decision.text == UNAVAILABLE_OUTPUT
+                    )
+                message = (
+                    BLOCKED_OUTPUT
+                    if structured and decision.text != UNAVAILABLE_OUTPUT
+                    else decision.text
+                )
                 outbound_metadata = {}
                 message_type = "info"
         step_id = (

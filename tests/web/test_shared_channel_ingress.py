@@ -7,6 +7,39 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_channel_progress_drops_audit_only_tool_events():
+    from xagent.core.agent.trace import ACTION_START_TOOL, TraceEvent
+    from xagent.web.channels.slack.trace_handler import SlackTraceHandler
+    from xagent.web.channels.telegram.handler import TelegramTraceHandler
+
+    slack_update = AsyncMock()
+    telegram_update = AsyncMock()
+    slack = SlackTraceHandler(
+        45, AsyncMock(), "channel", "ts", send_update=slack_update
+    )
+    telegram = TelegramTraceHandler(45, AsyncMock(), 7, 1, send_update=telegram_update)
+    for handler, update in ((slack, slack_update), (telegram, telegram_update)):
+        await handler.handle_event(
+            TraceEvent(
+                ACTION_START_TOOL,
+                task_id="45",
+                step_id="step",
+                data={"tool_name": "private_tool", "__audit_only__": True},
+            )
+        )
+        update.assert_not_awaited()
+        await handler.handle_event(
+            TraceEvent(
+                ACTION_START_TOOL,
+                task_id="45",
+                step_id="step",
+                data={"tool_name": "public_tool"},
+            )
+        )
+        update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "platform,manager_name",
     [

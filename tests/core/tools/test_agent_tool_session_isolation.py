@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 import xagent.core.tools.adapters.vibe.agent_tool as mod
 import xagent.core.tools.adapters.vibe.db_session as db_session_module
 from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.guardrails import output
 from xagent.core.tools.adapters.vibe.agent_tool import (
     _CHILD_NO_ANSWER_MESSAGE,
     AgentTool,
@@ -340,7 +341,11 @@ async def test_agent_tool_normal_child_result_unchanged(monkeypatch):
     it does not disturb this case either.
     """
 
+    resolver = AsyncMock(return_value=None)
+    monkeypatch.setattr(output, "_resolver", resolver)
+
     async def execute_task():
+        await output.resolve_output_guardrail("delegated-run")
         return {"output": "all good"}
 
     _patch_delegated_runtime(
@@ -352,6 +357,9 @@ async def test_agent_tool_normal_child_result_unchanged(monkeypatch):
     result = await tool.run_json_async({"task": "run"})
 
     assert result == {"response": "all good"}
+    assert resolver.await_args.args[0] == output.OutputReviewRequest(
+        "delegated-run", 1, 1
+    )
 
 
 def test_classifier_leaves_statusless_results_untouched():

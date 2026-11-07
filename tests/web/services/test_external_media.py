@@ -12,6 +12,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from tests.web.services.external_media_source_shared import (
+    OVERSIZED,
+    OVERSIZED_SOURCES,
+    SOURCE_LIMIT,
+    count_source_reads,
+    write_png_with_private_chunk,
+    write_small_image,
+)
 from xagent.web import models
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import external_media
@@ -559,6 +567,117 @@ def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="normalized"):
         external_media.instagram_jpeg_bytes(source)
+
+
+def _instagram_issue(monkeypatch, tmp_path, *, name="launch.png", write):
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / name
+    source.parent.mkdir(parents=True)
+    write(source)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db = _DB(
+        _record(
+            file_id,
+            filename=name,
+            storage_path=str(source),
+            storage_status="legacy",
+            storage_key=None,
+        )
+    )
+    issue = lambda: external_media.issue_external_media_url(  # noqa: E731
+        db,
+        file_id=file_id,
+        user_id=7,
+        task_id=11,
+        purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+    )
+    return source, issue
+
+
+@OVERSIZED_SOURCES
+@pytest.mark.parametrize(
+    ("rewritten", "bytes_read"),
+    [("before-open", 0), ("while-open", SOURCE_LIMIT + 1)],
+)
+def test_issue_instagram_bounds_what_it_reads_of_an_oversized_source(
+    monkeypatch, tmp_path, filename, write_oversized, rewritten, bytes_read
+):
+    # Why: Pillow reads a PNG chunk or JPEG segment it does not decode in full
+    # and keeps it, so a few pixels in a large file cost memory by the file's
+    # size, and the sandbox can rewrite its outputs at any time (#3596). A file
+    # already over the limit is refused unread; one rewritten after that check
+    # is read only to one byte past the limit.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_BYTES", SOURCE_LIMIT)
+    if rewritten == "before-open":
+        _, issue = _instagram_issue(
+            monkeypatch,
+            tmp_path,
+            name=filename,
+            write=lambda path: write_oversized(path, OVERSIZED),
+        )
+        opened = count_source_reads(monkeypatch, external_media)
+    else:
+        source, issue = _instagram_issue(
+            monkeypatch, tmp_path, name=filename, write=write_small_image
+        )
+        opened = count_source_reads(
+            monkeypatch,
+            external_media,
+            before_first_read=lambda: write_oversized(source, OVERSIZED),
+        )
+    tickets = _count_encode_calls(monkeypatch)
+
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="exceeds the 1 MB Instagram source limit; compress or downscale",
+    ):
+        issue()
+
+    assert [reader.bytes_read for reader in opened] == [bytes_read]
+    assert tickets == []
+
+
+def test_issue_instagram_refuses_a_source_over_50_mb_unread(monkeypatch, tmp_path):
+    # Why: the other byte-limit tests lower the limit to stay fast; this one
+    # pins the production default. A sparse file one byte over 50 MB is
+    # refused from its size alone, without reading any of it.
+    source, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        write=lambda path: write_png_with_private_chunk(path, 50 * 1024 * 1024 + 1),
+    )
+    opened = count_source_reads(monkeypatch, external_media)
+
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="exceeds the 50 MB Instagram source limit",
+    ):
+        issue()
+
+    assert source.stat().st_size == 50 * 1024 * 1024 + 1
+    assert [reader.bytes_read for reader in opened] == [0]
+
+
+@pytest.mark.parametrize(("slack", "issued"), [(0, True), (-1, False)])
+def test_issue_instagram_source_byte_limit_includes_the_limit(
+    monkeypatch, tmp_path, slack, issued
+):
+    # Why: an ordinary image is held to the same byte limit, and one within it
+    # still issues; the limit itself is allowed.
+    source, issue = _instagram_issue(monkeypatch, tmp_path, write=write_small_image)
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_BYTES", source.stat().st_size + slack
+    )
+
+    if issued:
+        assert issue().url.startswith("https://api.example.test/")
+    else:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable, match="Instagram source limit"
+        ):
+            issue()
 
 
 def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):

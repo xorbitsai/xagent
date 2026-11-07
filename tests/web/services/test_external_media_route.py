@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -12,6 +13,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from tests.web.services.external_media_source_shared import (
+    OVERSIZED,
+    OVERSIZED_SOURCES,
+    SOURCE_LIMIT,
+    count_source_reads,
+    write_small_image,
+)
 from xagent.web import models
 from xagent.web.api import files
 from xagent.web.models.database import get_db
@@ -310,6 +318,142 @@ def test_route_maps_decode_failure_to_422(
     assert response.json()["detail"] == (
         "Registered image could not be decoded for Instagram"
     )
+
+
+def _instagram_source_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    *,
+    filename: str,
+    write: Callable[[Path], None],
+) -> tuple[Path, str]:
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / filename
+    image_path.parent.mkdir(parents=True)
+    write(image_path)
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename=filename,
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    return image_path, f"/api/files/external-media/{file_id}?ticket={_ticket(file_id)}"
+
+
+@OVERSIZED_SOURCES
+@pytest.mark.parametrize(
+    ("rewritten", "bytes_read"),
+    [("before-open", 0), ("while-open", SOURCE_LIMIT + 1)],
+)
+def test_route_bounds_what_it_reads_of_an_oversized_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+    filename: str,
+    write_oversized: Callable[[Path, int], None],
+    rewritten: str,
+    bytes_read: int,
+):
+    # Why: every GET of an issued URL parses the file again, and the sandbox
+    # can rewrite it after issuing (#3596). A file over the limit is refused
+    # unread; one rewritten after that check is read only to one byte past it.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_BYTES", SOURCE_LIMIT)
+    if rewritten == "before-open":
+        _, url = _instagram_source_url(
+            monkeypatch,
+            tmp_path,
+            db,
+            filename=filename,
+            write=lambda path: write_oversized(path, OVERSIZED),
+        )
+        opened = count_source_reads(monkeypatch, files)
+    else:
+        image_path, url = _instagram_source_url(
+            monkeypatch, tmp_path, db, filename=filename, write=write_small_image
+        )
+        opened = count_source_reads(
+            monkeypatch,
+            files,
+            before_first_read=lambda: write_oversized(image_path, OVERSIZED),
+        )
+
+    response = client.get(url)
+
+    assert [reader.bytes_read for reader in opened] == [bytes_read]
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Registered image exceeds the 1 MB Instagram source limit; "
+        "compress or downscale it and try again"
+    )
+
+
+@pytest.mark.parametrize(("slack", "status"), [(0, 200), (-1, 422)])
+def test_route_holds_a_conforming_jpeg_to_the_source_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+    slack: int,
+    status: int,
+):
+    # Why: a JPEG that needs no conversion is sent from the same bounded copy
+    # that was checked, byte for byte; over the limit it is refused.
+    image_path, url = _instagram_source_url(
+        monkeypatch,
+        tmp_path,
+        db,
+        filename="ready.jpg",
+        write=lambda path: Image.new("RGB", (1080, 1080), "blue").save(path, "JPEG"),
+    )
+    expected = image_path.read_bytes()
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_BYTES", len(expected) + slack
+    )
+
+    response = client.get(url)
+
+    assert response.status_code == status
+    if status == 200:
+        assert response.content == expected
+
+
+def test_route_converts_a_conforming_jpeg_over_the_jpeg_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    # Why: the route sends a JPEG that needs no conversion without checking its
+    # size again; that holds only because one over Meta's JPEG byte limit is
+    # always converted.
+    image_path, url = _instagram_source_url(
+        monkeypatch,
+        tmp_path,
+        db,
+        filename="ready.jpg",
+        write=lambda path: (
+            Image.radial_gradient("L")
+            .resize((1080, 1080))
+            .convert("RGB")
+            .save(path, "JPEG", quality=100)
+        ),
+    )
+    original = image_path.read_bytes()
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_JPEG_BYTES", len(original) - 1)
+
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.content != original
+    assert len(response.content) < len(original)
+    assert response.content.startswith(b"\xff\xd8")
 
 
 def test_route_requires_and_validates_ticket(client: TestClient):

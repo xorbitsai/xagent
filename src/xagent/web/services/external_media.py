@@ -106,6 +106,11 @@ class RedeemedExternalMedia:
 # Matches the Facebook connector's own limit for an uploaded image.
 FACEBOOK_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 INSTAGRAM_MAX_JPEG_BYTES = 8 * 1024 * 1024
+# A source may be larger than the JPEG Meta accepts, since it is converted
+# first (a large generated PNG, say). This limit bounds what Pillow reads: it
+# reads a PNG chunk or JPEG segment it does not decode in full, and keeps some,
+# so its memory follows the file's size, not its pixels.
+INSTAGRAM_MAX_SOURCE_BYTES = 50 * 1024 * 1024
 INSTAGRAM_MIN_ASPECT_RATIO = 4 / 5
 INSTAGRAM_MAX_ASPECT_RATIO = 1.91
 INSTAGRAM_MIN_WIDTH = 320
@@ -409,9 +414,32 @@ def open_delivery_file(record: UploadedFile, path: Path) -> BinaryIO:
         raise
 
 
+def read_instagram_source(source: BinaryIO) -> BytesIO:
+    """Read an opened Instagram source into memory, within its byte limit.
+
+    Pillow is given this copy, never the file, so it cannot read more than the
+    limit. A file already over the limit is refused unread; reading at most one
+    byte past it catches a file the sandbox grows or rewrites after that check.
+
+    Raises ``OSError`` when the file cannot be read.
+    """
+    limit = INSTAGRAM_MAX_SOURCE_BYTES
+    if os.fstat(source.fileno()).st_size <= limit:
+        content = source.read(limit + 1)
+        if len(content) <= limit:
+            return BytesIO(content)
+    raise ExternalMediaUnavailable(
+        f"Registered image exceeds the {limit // (1024 * 1024)} MB Instagram "
+        "source limit; compress or downscale it and try again"
+    )
+
+
 def _source_size(source: Path | BinaryIO) -> int:
     if isinstance(source, Path):
         return source.stat().st_size
+    if isinstance(source, BytesIO):
+        with source.getbuffer() as content:
+            return content.nbytes
     return os.fstat(source.fileno()).st_size
 
 
@@ -455,11 +483,12 @@ def _validate_instagram_record(record: UploadedFile) -> None:
         # The same safe open as delivery: a FIFO or link swapped in after
         # materialization fails here instead of blocking or being followed.
         with open_delivery_file(record, path) as source:
-            _validate_instagram_header(source)
+            content = read_instagram_source(source)
     except OSError as exc:
         raise ExternalMediaUnavailable(
             "Registered image could not be read for external delivery"
         ) from exc
+    _validate_instagram_header(content)
 
 
 def _validate_facebook_record(record: UploadedFile) -> None:

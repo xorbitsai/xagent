@@ -627,6 +627,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     scope: str | None = None,
     issuer: str | None = None,
     client: httpx.AsyncClient | None = None,
+    allow_team_member_grants: bool = False,
 ) -> MCPOAuthRuntimeAuth:
     """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
     from ...core.utils.encryption import decrypt_value
@@ -656,6 +657,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             resource=resource,
             issuer=issuer,
             scope="",
+            allow_team_member_grants=allow_team_member_grants,
         )
         grant = _select_runtime_grant(candidate_grants, required_scopes)
         if not _grant_needs_refresh(grant.expires_at):
@@ -909,13 +911,25 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     resource: str | None = None,
     issuer: str | None = None,
     scope: str | None = None,
+    allow_team_member_grants: bool = False,
 ) -> list[Any]:
     """Return active MCP OAuth grants matching the current server auth config.
 
     This selector is intentionally side-effect free: it does not decrypt tokens,
     refresh grants, or mutate persistence. Runtime code can build on the selected
     grants when it needs bearer material.
+
+    A caller that holds no association row for the server (in any ``is_active``
+    state) is a team member who authorized the shared connector themselves.
+    For that caller nothing is returned unless ``allow_team_member_grants`` is
+    true, so the caller must opt in explicitly. A caller that holds an
+    association gets the grants matched below, unchanged.
+    The rule applies to grants held under the caller's own default owner key;
+    grants selected under another owner key (an actor policy) are returned as
+    before.
+    A missing owner key is treated as the caller's own default key.
     """
+    from ..models.mcp import UserMCPServer
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
@@ -957,11 +971,28 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
 
     grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
     required_scopes = _scope_set(selected_scope)
-    if not required_scopes:
-        return list(grants)
-    return [
-        grant for grant in grants if required_scopes.issubset(_scope_set(grant.scope))
-    ]
+    if required_scopes:
+        grants = [
+            grant
+            for grant in grants
+            if required_scopes.issubset(_scope_set(grant.scope))
+        ]
+    holds_association = (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .first()
+        is not None
+    )
+    if (
+        resource_owner_key in (None, f"xagent:user:{user_id}")
+        and not holds_association
+        and not allow_team_member_grants
+    ):
+        return []
+    return list(grants)
 
 
 async def _discover_with_client(  # noqa: PLR0913

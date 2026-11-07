@@ -2424,9 +2424,9 @@ def _check_mcp_permission(
     return is_owner
 
 
-# Owner-only global fields that are safe to compare (non-secret; secret values
-# like env/headers and auth's SENSITIVE_AUTH_FIELDS round-trip as masks and
-# can't be diffed reliably, so they keep the silent-preserve behavior).
+# Owner-only global fields that are safe to compare. env, headers and auth's
+# SENSITIVE_AUTH_FIELDS are masked in responses and a mask on update means
+# "keep the stored value", so they are not compared here.
 _GLOBAL_CONFIG_KEYS = ("command", "args", "url")
 
 
@@ -2555,6 +2555,11 @@ def _db_server_to_response(
     # Env values are secrets: mask them (keys stay visible so the UI can edit them).
     if isinstance(config.get("env"), dict):
         config["env"] = _mask_env(config["env"])
+
+    # Header values are secrets too (for example access-proxy client secrets):
+    # mask them the same way; names stay visible so the form can edit them.
+    if isinstance(config.get("headers"), dict):
+        config["headers"] = _mask_env(config["headers"])
 
     stored_signed_uploads = server.signed_uploads
     # Computed without raising, so one row's malformed value cannot fail a
@@ -4654,6 +4659,8 @@ def create_mcp_server(
             )
             if isinstance(config.env, dict):
                 _merge_masked_env(config.env, {})
+            if isinstance(config.headers, dict):
+                _merge_masked_env(config.headers, {})
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -5041,6 +5048,10 @@ def update_mcp_server(
             # Build and validate config
             try:
                 config = _build_server_config(update_data, server)
+                if isinstance(config.headers, dict):
+                    config.headers = _merge_masked_env(
+                        config.headers, dict(server.headers or {})
+                    )
                 runtime_input_schema = (
                     server_data.runtime_input_schema
                     if can_edit_global and "runtime_input_schema" in fields_set

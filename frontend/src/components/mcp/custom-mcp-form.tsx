@@ -394,9 +394,13 @@ export function CustomMcpForm({
 
   // Handle headers state (array of {key, value} for the UI, but config expects an object)
   const headersObj = mcpFormData.config?.headers || {}
-  const [headersList, setHeadersList] = useState<{ key: string, value: string }[]>(
+  const [headersList, setHeadersList] = useState<EnvRow[]>(
     Object.keys(headersObj).length > 0
-      ? Object.entries(headersObj).map(([k, v]) => ({ key: k, value: String(v) }))
+      ? Object.entries(headersObj).map(([k, v]) => ({
+        key: k,
+        value: String(v),
+        persistedKey: String(v) === MASKED_SECRET_VALUE ? k : undefined,
+      }))
       : []
   )
 
@@ -492,7 +496,7 @@ export function CustomMcpForm({
     clientSecretValue,
   ])
 
-  const syncHeaders = (newList: { key: string, value: string }[]) => {
+  const syncHeaders = (newList: EnvRow[]) => {
     setHeadersList(newList)
     const newHeadersObj: Record<string, string> = {}
     newList.forEach(h => {
@@ -504,17 +508,23 @@ export function CustomMcpForm({
   const renderEnvRows = (
     list: EnvRow[],
     sync: (l: EnvRow[]) => void,
-    readOnly: boolean
+    readOnly: boolean,
+    labels?: {
+      keyPlaceholder?: string
+      valuePlaceholder?: string
+      emptyText?: string
+      addLabel?: string
+    }
   ) => (
     <>
       {list.length === 0 ? (
-        <p className="text-sm text-slate-500">{t('tools.mcp.dialog.noEnvVariables')}</p>
+        <p className="text-sm text-slate-500">{labels?.emptyText ?? t('tools.mcp.dialog.noEnvVariables')}</p>
       ) : (
         <div className="space-y-2">
           {list.map((e, i) => (
             <div key={i} className="flex gap-2 items-center">
               <Input
-                placeholder={t('tools.mcp.dialog.envKeyPlaceholder')}
+                placeholder={labels?.keyPlaceholder ?? t('tools.mcp.dialog.envKeyPlaceholder')}
                 value={e.key}
                 disabled={readOnly || e.persistedKey !== undefined}
                 onChange={(ev) => {
@@ -526,7 +536,7 @@ export function CustomMcpForm({
               />
               <Input
                 type="password"
-                placeholder={t('tools.mcp.dialog.envValuePlaceholder')}
+                placeholder={labels?.valuePlaceholder ?? t('tools.mcp.dialog.envValuePlaceholder')}
                 value={e.value}
                 disabled={readOnly}
                 // Select-all on focus so typing replaces the mask. Persisted rows
@@ -583,7 +593,7 @@ export function CustomMcpForm({
           className="w-full border-dashed text-blue-600 border-blue-200 hover:bg-blue-50 hover:text-blue-700"
           onClick={() => sync([...list, { key: "", value: "" }])}
         >
-          <Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.addEnvVariable')}
+          <Plus className="h-4 w-4 mr-2" /> {labels?.addLabel ?? t('tools.mcp.dialog.addEnvVariable')}
         </Button>
       )}
     </>
@@ -1031,58 +1041,12 @@ export function CustomMcpForm({
               <p className="text-xs text-slate-500">{t('tools.mcp.dialog.customHeadersDesc')}</p>
             </div>
 
-            {headersList.length === 0 ? (
-              <p className="text-sm text-slate-500">{t('tools.mcp.dialog.noCustomHeaders')}</p>
-            ) : (
-              <div className="space-y-2">
-                {headersList.map((h, i) => (
-                  <div key={i} className="flex gap-2 items-center">
-                    <Input
-                      placeholder={t('tools.mcp.dialog.headerKeyPlaceholder')}
-                      value={h.key}
-                      onChange={(e) => {
-                        const newList = [...headersList]
-                        newList[i].key = e.target.value
-                        syncHeaders(newList)
-                      }}
-                      className="flex-1"
-                    />
-                    <Input
-                      placeholder={t('tools.mcp.dialog.headerValuePlaceholder')}
-                      value={h.value}
-                      onChange={(e) => {
-                        const newList = [...headersList]
-                        newList[i].value = e.target.value
-                        syncHeaders(newList)
-                      }}
-                      className="flex-1"
-                    />
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => {
-                        const newList = [...headersList]
-                        newList.splice(i, 1)
-                        syncHeaders(newList)
-                      }}
-                      className="text-red-500 hover:text-red-700"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="w-full border-dashed text-blue-600 border-blue-200 hover:bg-blue-50 hover:text-blue-700"
-              onClick={() => syncHeaders([...headersList, { key: "", value: "" }])}
-            >
-              <Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.addHeader')}
-            </Button>
+            {renderEnvRows(headersList, syncHeaders, !canEditGlobal, {
+              keyPlaceholder: t('tools.mcp.dialog.headerKeyPlaceholder'),
+              valuePlaceholder: t('tools.mcp.dialog.headerValuePlaceholder'),
+              emptyText: t('tools.mcp.dialog.noCustomHeaders'),
+              addLabel: t('tools.mcp.dialog.addHeader'),
+            })}
           </div>
 
           <div className="space-y-2">

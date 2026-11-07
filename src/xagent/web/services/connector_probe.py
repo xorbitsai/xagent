@@ -147,8 +147,7 @@ class ConnectorProbeBusy(Exception):
     """Another probe is running in this process.
 
     A probe starts a connector and calls the vendor, so probes run one at a
-    time per process instead of queueing (GET /servers/{id}/tools has no cap
-    either, #3265).
+    time per process instead of queueing.
     """
 
 

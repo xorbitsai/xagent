@@ -496,6 +496,25 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
     return _mcp_connection_test_timeout_result()
 
 
+# GET /servers/{id}/tools starts the server and lists its tools on every call,
+# so it carries its own cap too: at most this many loads run at once per event
+# loop, and a call beyond it is answered 503 without starting anything (#3265).
+# Unlike the connection test it does not queue. Admission follows the actual
+# load and cleanup lifetime, not the request's willingness to keep waiting.
+_MCP_SERVER_TOOLS_MAX_INFLIGHT = 4
+
+_mcp_server_tools_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _mcp_server_tools_gate() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    gate = _mcp_server_tools_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(_MCP_SERVER_TOOLS_MAX_INFLIGHT)
+        _mcp_server_tools_gates[loop] = gate
+    return gate
+
+
 class MCPOAuthDiscoverRequest(BaseModel):
     """Request model for MCP OAuth metadata discovery."""
 
@@ -6247,8 +6266,38 @@ async def get_mcp_server_tools(
     """Get tools available from a specific MCP server.
 
     The server is started exactly as an agent task would start it
-    (services/mcp_connector_session.py).
+    (services/mcp_connector_session.py). At most
+    ``_MCP_SERVER_TOOLS_MAX_INFLIGHT`` loads run at once; a call beyond that
+    is answered 503 before anything is started.
     """
+    gate = _mcp_server_tools_gate()
+    if gate.locked():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "mcp_tools_busy",
+                "message": "Too many MCP tool listings are running; try again later",
+            },
+        )
+    from ...core.tools.adapters.vibe.mcp_load_lifetime import (
+        MCPLoadLifetime,
+        current_load_lifetime,
+    )
+
+    # Not locked and nothing ever waits on this gate, so this does not yield.
+    await gate.acquire()
+    lifetime = MCPLoadLifetime(gate.release)
+    token = current_load_lifetime.set(lifetime)
+    try:
+        return await _list_mcp_server_tools(server_id, current_user, db)
+    finally:
+        current_load_lifetime.reset(token)
+        lifetime.finish()
+
+
+async def _list_mcp_server_tools(
+    server_id: int, current_user: User, db: Session
+) -> dict:
     try:
         from ..services.mcp_connector_session import (
             ConnectorToolsOutcome,

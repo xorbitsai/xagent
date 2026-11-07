@@ -558,11 +558,12 @@ def test_a_retry_that_only_changes_metadata_replays_the_original() -> None:
 
 # Bodies Pydantic accepts but cannot write back as JSON. ``prompt_context``
 # values are ``Any`` until the route checks them, so a list nested past the
-# serializer's depth limit, or an object key holding a lone surrogate, reaches
-# the fingerprint.
+# serializer's depth limit (255), or an object key holding a lone surrogate,
+# reaches the fingerprint. 400 levels stay below the depth at which
+# ``json.loads`` itself fails on Python 3.11, so the body is still parsed.
 _UNENCODABLE_VALUES = pytest.mark.parametrize(
     "value",
-    ["[" * 2000 + "]" * 2000, '{"\\ud800": 1}'],
+    ["[" * 400 + "]" * 400, '{"\\ud800": 1}'],
     ids=["deep_nesting", "lone_surrogate_key"],
 )
 _ROUTE_CHECK_MESSAGE = "prompt_context values must be strings, numbers, or booleans."

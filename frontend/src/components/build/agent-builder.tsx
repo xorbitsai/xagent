@@ -1410,7 +1410,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
   // Enables Update, so the seeded value has a way into the database: Publish
   // posts no body and never persists models.
-  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers || Boolean(builderSettings.changes)
+  const hostSettings = builderSettings.changes
+  const hasHostSettingsChanges = Boolean(hostSettings && Object.keys(hostSettings).length > 0)
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers || hasHostSettingsChanges
   // ...but a slot holding the seeded value is not an edit worth blocking
   // Publish over, for the very agents the seed exists to unblock. Picking the
   // seeded model by hand is indistinguishable from the seed itself, which is
@@ -1420,7 +1422,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const seedStillUnsaved = !(originalData?.models || {}).general
   const publishBlockedByEdits =
     isDirtyBeyondGeneralModel ||
-    Boolean(builderSettings.changes) ||
+    hasHostSettingsChanges ||
     (generalModelDiffers &&
       !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
@@ -1575,6 +1577,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const promptContextPayload = toPromptContextFieldsPayload(promptContextFields)
 
     const finalToolCategories = buildToolCategories()
+    const submittedHostSettings = hasHostSettingsChanges ? hostSettings : undefined
 
     setIsCreating(true)
 
@@ -1615,17 +1618,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // Ownership transitions go through promote-team/demote-personal.
           ...(ownership === "team" ? { visibility } : {}),
           logo_base64,
-          host_settings: builderSettings.changes,
+          host_settings: submittedHostSettings,
         }),
       })
 
       if (response.ok) {
         const savedAgent = await response.json()
-        builderSettings.markSaved?.()
+        if (submittedHostSettings) builderSettings.markSaved?.(submittedHostSettings)
         setPromptContextFields(draftsFromDeclarations(promptContextPayload))
         setPromptContextSaveAttempted(false)
         if (isEditMode) {
-          const updatedAgent = savedAgent
           const trimmedName = name.trim()
           const trimmedDesc = description.trim()
           const trimmedInstr = instructions.trim()
@@ -1655,7 +1657,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             knowledge_bases: selectedKbs,
             skills: selectedSkills,
             tool_categories: finalToolCategories,
-            logo_url: updatedAgent.logo_url,
+            logo_url: savedAgent.logo_url,
             ...(ownershipResult ?? {}),
           })
           // Re-seed selectedMcpServers to match: see
@@ -1665,21 +1667,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Sync the saved logo URL so the preview doesn't fall back to the
           // stale URL captured at initial load once logoFile is cleared below.
-          setLogoUrl(updatedAgent.logo_url || null)
+          setLogoUrl(savedAgent.logo_url || null)
           setLogoFile(null)
           setLogoRemoved(false)
         } else {
-          const newAgent = savedAgent
-          setCreatedAgent(newAgent)
+          setCreatedAgent(savedAgent)
           // Preview uploads must not block saving triggers or ownership.
-          void bindPreviewTask(newAgent.id)
+          void bindPreviewTask(savedAgent.id)
 
           // Staged triggers (configured before the agent existed, #928) go
           // through the regular trigger API now that a real agent id exists.
           // Failures don't roll back the agent; failed configs are kept in
           // failedStagedTriggers for retry/discard instead of being dropped.
           if (stagedTriggers.length > 0) {
-            const outcome = await createStagedTriggers(newAgent.id, stagedTriggers)
+            const outcome = await createStagedTriggers(savedAgent.id, stagedTriggers)
             outcome.failed.forEach((entry) => {
               toast.error(
                 t("triggers.messages.stagedCreateFailed", {
@@ -1692,20 +1693,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             setFailedStagedTriggers(outcome.failed)
             setCreatedWebhookSecrets(outcome.generatedSecrets)
             try {
-              setTriggerSummary(await listAgentTriggers(newAgent.id))
+              setTriggerSummary(await listAgentTriggers(savedAgent.id))
             } catch (error) {
               console.error("Failed to refresh trigger summary:", error)
             }
           }
 
           // Newly created agents are always personal; promote if the user chose Team.
-          const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
+          const ownershipResult = await reconcileOwnership(savedAgent.id.toString(), savedAgent.team_id)
           // tool_categories: finalToolCategories explicitly, not whatever
-          // newAgent.tool_categories echoes back -- matches the edit-mode
+          // savedAgent.tool_categories echoes back -- matches the edit-mode
           // branch above, which sources both originalData and the reseed
           // below from the same local value rather than mixing a server
           // response with a local one.
-          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, prompt_context_fields: promptContextPayload, ...(ownershipResult ?? {}) })
+          setOriginalData({ ...savedAgent, tool_categories: finalToolCategories, prompt_context_fields: promptContextPayload, ...(ownershipResult ?? {}) })
           // Same re-seed as the edit-mode branch above, and for the same
           // reason: selectedMcpServers must hold the resolved selectors
           // this request submitted, not the possibly-unresolved values it
@@ -1720,13 +1721,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           } else {
             pendingCreationDialogRef.current = true
           }
-          setLocalAgentId(newAgent.id.toString())
+          setLocalAgentId(savedAgent.id.toString())
 
           // Silently update URL to include ID so refreshing works
           // We don't want to trigger a full navigation that might close the dialog or reset state if not handled carefully
           // But since we are setting state, a replace might be fine.
           // Let's use history API to be safe and avoid component remount
-          window.history.pushState({}, '', `/build/${newAgent.id}`)
+          window.history.pushState({}, '', `/build/${savedAgent.id}`)
 
           // Also update internal state so "Edit Mode" logic kicks in effectively if we were to re-render
           // Note: agentId comes from searchParams which won't update until router.push/replace

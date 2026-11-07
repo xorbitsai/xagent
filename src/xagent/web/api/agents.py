@@ -4,6 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -122,7 +123,9 @@ class AgentCreateRequest(BaseModel):
         None, description="Logo image as base64 data URL"
     )
     visibility: Optional[Literal["team", "admins"]] = None
-    host_settings: dict[str, Any] | None = None
+    host_settings: dict[str, Any] | None = Field(
+        None, description="Non-empty settings require a registered host writer."
+    )
 
 
 class AgentUpdateRequest(BaseModel):
@@ -150,7 +153,9 @@ class AgentUpdateRequest(BaseModel):
     visibility: Optional[Literal["team", "admins"]] = Field(
         None, description="Team visibility: 'team' or 'admins' (team admins only)"
     )
-    host_settings: dict[str, Any] | None = None
+    host_settings: dict[str, Any] | None = Field(
+        None, description="Non-empty settings require a registered host writer."
+    )
 
 
 class AgentResponse(BaseModel):
@@ -771,10 +776,6 @@ async def create_agent(
         # IntegrityError here.
         host_settings = agent_data.host_settings
 
-        def stage_settings(agent: Agent) -> None:
-            if host_settings is not None:
-                stage_agent_host_settings(db, agent, current_user, host_settings)
-
         try:
             agent = store.create_agent(
                 user_id=user_id,
@@ -792,7 +793,16 @@ async def create_agent(
                     for declaration in agent_data.prompt_context_fields
                 ],
                 visibility=agent_data.visibility,
-                before_commit=stage_settings if host_settings is not None else None,
+                before_commit=(
+                    partial(
+                        stage_agent_host_settings,
+                        db,
+                        user=current_user,
+                        settings=host_settings,
+                    )
+                    if host_settings
+                    else None
+                ),
             )
         except IntegrityError as exc:
             db.rollback()
@@ -1209,7 +1219,7 @@ async def update_agent(
         if agent_data.visibility is not None:
             updates["visibility"] = agent_data.visibility
 
-        if agent_data.host_settings is not None:
+        if agent_data.host_settings:
             stage_agent_host_settings(db, agent, current_user, agent_data.host_settings)
 
         # Handle logo
@@ -1222,7 +1232,7 @@ async def update_agent(
             logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
             updates["logo_url"] = logo_url
 
-        if updates or agent_data.host_settings is not None:
+        if updates or agent_data.host_settings:
             # agent_name_exists above is a fast-path pre-check, not the source
             # of truth: uq_agents_user_id_name_active is what actually
             # prevents a concurrent-rename race, so the write itself can

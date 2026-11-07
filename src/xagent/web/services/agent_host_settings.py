@@ -21,7 +21,12 @@ def set_agent_host_settings_writer(writer: AgentHostSettingsWriter | None) -> No
 def stage_agent_host_settings(
     db: Session, agent: Agent, user: User, settings: dict[str, Any]
 ) -> None:
-    """Stage host settings without committing the caller's transaction."""
+    """Stage settings in the caller's session. Writers must never commit or roll back.
+
+    Raise a 4xx HTTPException for invalid input. On create the agent has been
+    flushed and is personal. On update its fields are still the pre-update
+    values, and later Agent validation can still reject the transaction.
+    """
     if _writer is None:
         raise HTTPException(422, "This deployment does not support Agent host settings")
     _writer(db, agent, user, settings)

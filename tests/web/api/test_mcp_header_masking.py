@@ -195,44 +195,45 @@ def _read_via(surface: str, db) -> Any:
         "update",
         "toggle",
     ],
-    ids=[
-        "list_personal",
-        "list_team_overlay",
-        "detail_owner",
-        "connect_mcp_app",
-        "create",
-        "update",
-        "toggle",
-    ],
 )
 def test_mcp_header_values_masked_on_every_read_surface(db, surface):
     response = _read_via(surface, db)
     _assert_masked(response, empty=True)
 
 
-def test_db_server_to_response_call_sites_are_the_known_seven():
+def _response_construction_sites(tree: ast.AST) -> list[str]:
+    """Name the innermost enclosing function of each MCPServerResponse call.
+
+    Both ``MCPServerResponse(...)`` and ``MCPServerResponse.<method>(...)``
+    count; a call outside any function is reported as ``<module>``.
+    """
+    sites: list[str] = []
+
+    def visit(node: ast.AST, scope: str) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = node.name
+        if isinstance(node, ast.Call):
+            target = (
+                node.func.value if isinstance(node.func, ast.Attribute) else node.func
+            )
+            if isinstance(target, ast.Name) and target.id == "MCPServerResponse":
+                sites.append(scope)
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree, "<module>")
+    return sites
+
+
+def test_mcp_server_response_is_built_only_by_the_known_mappers():
+    # Within mcp.py, MCPServerResponse is constructed only by these two
+    # functions, once each. _custom_api_to_mcp_response returns Custom API
+    # headers as stored.
     tree = ast.parse(Path(mcp_module.__file__).read_text())
-    callers: list[str] = []
-    for func in ast.walk(tree):
-        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(func):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "_db_server_to_response"
-            ):
-                callers.append(func.name)
-    # Nested defs would be double counted by ast.walk on the outer function.
-    assert len(callers) == 7
-    assert set(callers) == {
-        "get_mcp_servers",
-        "get_mcp_server",
-        "connect_mcp_app",
-        "create_mcp_server",
-        "update_mcp_server",
-        "toggle_mcp_server",
-    }
+    assert sorted(_response_construction_sites(tree)) == [
+        "_custom_api_to_mcp_response",
+        "_db_server_to_response",
+    ]
 
 
 def test_mcp_header_mask_rejected_on_create(db):
@@ -264,49 +265,37 @@ _ABSENT = object()
 
 
 @pytest.mark.parametrize(
-    "case, incoming, stored_after, response_names",
+    "incoming, stored_after, response_names",
     [
-        (
-            "mask_same_key",
+        pytest.param(
             {ID_KEY: MASKED_SECRET_VALUE, SECRET_KEY: MASKED_SECRET_VALUE},
             STORED,
             {ID_KEY, SECRET_KEY},
+            id="mask_same_key",
         ),
-        (
-            "new_value",
+        pytest.param(
             {ID_KEY: MASKED_SECRET_VALUE, SECRET_KEY: "proxy-secret-2"},
             {ID_KEY: ID_VALUE, SECRET_KEY: "proxy-secret-2"},
             {ID_KEY, SECRET_KEY},
+            id="new_value",
         ),
-        (
-            "omitted_key",
+        pytest.param(
             {ID_KEY: MASKED_SECRET_VALUE},
             {ID_KEY: ID_VALUE},
             {ID_KEY},
+            id="omitted_key",
         ),
-        ("mask_unknown_key", {"X-Other": MASKED_SECRET_VALUE}, None, None),
-        (
-            "mask_case_variant",
-            {ID_KEY.lower(): MASKED_SECRET_VALUE},
-            None,
-            None,
+        pytest.param(
+            {"X-Other": MASKED_SECRET_VALUE}, None, None, id="mask_unknown_key"
         ),
-        ("headers_absent", _ABSENT, STORED, {ID_KEY, SECRET_KEY}),
-        ("headers_empty", {}, {}, set()),
-    ],
-    ids=[
-        "mask_same_key",
-        "new_value",
-        "omitted_key",
-        "mask_unknown_key",
-        "mask_case_variant",
-        "headers_absent",
-        "headers_empty",
+        pytest.param(
+            {ID_KEY.lower(): MASKED_SECRET_VALUE}, None, None, id="mask_case_variant"
+        ),
+        pytest.param(_ABSENT, STORED, {ID_KEY, SECRET_KEY}, id="headers_absent"),
+        pytest.param({}, {}, set(), id="headers_empty"),
     ],
 )
-def test_mcp_header_mask_merge_on_update(
-    db, case, incoming, stored_after, response_names
-):
+def test_mcp_header_mask_merge_on_update(db, incoming, stored_after, response_names):
     owner, server = _owned_server(db)
     config: dict[str, Any] = {"url": URL}
     if incoming is not _ABSENT:
@@ -331,3 +320,32 @@ def test_mcp_header_mask_merge_on_update(
         _assert_masked(response, response_names)
     else:
         assert not response.config.get("headers")
+
+
+@pytest.mark.parametrize(
+    "incoming",
+    [
+        pytest.param({ID_KEY: "changed", SECRET_KEY: "changed"}, id="changed"),
+        pytest.param(
+            {ID_KEY: MASKED_SECRET_VALUE, SECRET_KEY: MASKED_SECRET_VALUE},
+            id="mask_same_key",
+        ),
+        pytest.param({"X-Other": MASKED_SECRET_VALUE}, id="mask_unknown_key"),
+        pytest.param({}, id="headers_empty"),
+    ],
+)
+def test_mcp_header_update_by_non_owner_keeps_stored_headers(db, incoming):
+    _owner, server = _owned_server(db)
+    member = _make_user(db, 2)
+    _link(db, member, server, is_owner=False)
+
+    response = update_mcp_server(
+        server.id,
+        MCPServerUpdate(config={"url": URL, "headers": incoming}),
+        current_user=member,
+        db=db,
+    )
+
+    db.refresh(server)
+    assert server.headers == STORED
+    _assert_masked(response)

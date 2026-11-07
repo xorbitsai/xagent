@@ -17,6 +17,7 @@ from tests.web.services.external_media_source_shared import (
     OVERSIZED_SOURCES,
     SOURCE_LIMIT,
     count_source_reads,
+    jpeg_400px,
     write_png_with_private_chunk,
     write_small_image,
 )
@@ -547,7 +548,14 @@ def test_issue_rejects_corrupt_image_before_ticket(monkeypatch, tmp_path):
 
 
 def test_large_jpeg_header_uses_higher_source_pixel_limit():
-    image = Mock(format="JPEG", width=8000, height=6000)
+    # The scan layout is read from the stream Pillow opened: one interleaved scan.
+    image = Mock(
+        format="JPEG",
+        width=8000,
+        height=6000,
+        info={},
+        fp=BytesIO(jpeg_400px("interleaved")),
+    )
 
     external_media._validate_instagram_source(image)
 
@@ -678,6 +686,118 @@ def test_issue_instagram_source_byte_limit_includes_the_limit(
             external_media.ExternalMediaUnavailable, match="Instagram source limit"
         ):
             issue()
+
+
+@pytest.mark.parametrize(
+    ("layout", "slack", "refused_as"),
+    [
+        ("progressive", -1, "progressive JPEG"),
+        ("progressive", 0, None),
+        ("non-interleaved", -1, "multi-scan JPEG"),
+        ("non-interleaved", 0, None),
+        ("interleaved", -1, None),
+    ],
+    ids=[
+        "progressive-over",
+        "progressive-at-limit",
+        "non-interleaved-over",
+        "non-interleaved-at-limit",
+        "interleaved-same-size",
+    ],
+)
+def test_issue_instagram_holds_a_multi_scan_jpeg_to_the_png_pixel_limit(
+    monkeypatch, tmp_path, layout, slack, refused_as
+):
+    # Why: the higher JPEG pixel limit relies on draft() letting libjpeg decode
+    # a JPEG at a fraction of its size. With more than one scan (progressive,
+    # or a first scan that codes only some components) libjpeg keeps
+    # coefficients for the whole image, so such a JPEG gets the PNG limit
+    # (#3596). One interleaved scan of the same size keeps the higher limit.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(jpeg_400px(layout)),
+    )
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 + slack
+    )
+
+    if refused_as is None:
+        assert issue().url.startswith("https://api.example.test/")
+    else:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable,
+            match=f"pixel limit of 159,999 for {refused_as}; downscale it",
+        ):
+            issue()
+
+
+def _with_fill_bytes(jpeg: bytes) -> bytes:
+    # Extra FF bytes may precede any marker.
+    return jpeg.replace(b"\xff\xc0", b"\xff\xff\xff\xc0").replace(
+        b"\xff\xda", b"\xff\xff\xda"
+    )
+
+
+def _with_fake_scan_in_a_comment(jpeg: bytes) -> bytes:
+    # A COM segment whose payload looks like a one-component scan header.
+    return (
+        jpeg[:2] + b"\xff\xfe\x00\x0a" + b"\xff\xda\x00\x08\x01\x01\x00\x00" + jpeg[2:]
+    )
+
+
+def _with_second_soi(jpeg: bytes) -> bytes:
+    # A second SOI before the first scan: Pillow opens it, libjpeg refuses it.
+    return jpeg[:2] + b"\xff\xd8" + jpeg[2:]
+
+
+def _with_zero_length_segment(jpeg: bytes) -> bytes:
+    # An APP5 segment before the frame whose length field is 0, below the 2 it
+    # must count; Pillow and libjpeg both read past it.
+    return jpeg[:2] + b"\xff\xe5\x00\x00" + jpeg[2:]
+
+
+@pytest.mark.parametrize(
+    ("transform", "layout", "refused"),
+    [
+        (_with_fill_bytes, "interleaved", False),
+        (_with_fill_bytes, "non-interleaved", True),
+        (_with_fake_scan_in_a_comment, "interleaved", False),
+        (_with_second_soi, "interleaved", True),
+        (_with_zero_length_segment, "non-interleaved", True),
+    ],
+    ids=[
+        "fill-bytes-interleaved",
+        "fill-bytes-non-interleaved",
+        "fake-scan-in-a-comment",
+        "unreadable-second-soi",
+        "unreadable-zero-length-segment",
+    ],
+)
+def test_issue_instagram_reads_the_jpeg_scan_layout_from_its_markers(
+    monkeypatch, tmp_path, transform, layout, refused
+):
+    # Why: the scan layout comes from the markers up to the first scan. Fill
+    # bytes before a marker are skipped, and each segment by its length, so a
+    # scan header inside a comment does not count. Markers that cannot be read
+    # that far (a second SOI, which Pillow opens but libjpeg refuses, or a
+    # segment length below 2) must not earn the higher limit.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(transform(jpeg_400px(layout))),
+    )
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 - 1)
+
+    if refused:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable, match="for multi-scan JPEG"
+        ):
+            issue()
+    else:
+        assert issue().url.startswith("https://api.example.test/")
 
 
 def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):

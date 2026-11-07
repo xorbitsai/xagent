@@ -18,6 +18,7 @@ from tests.web.services.external_media_source_shared import (
     OVERSIZED_SOURCES,
     SOURCE_LIMIT,
     count_source_reads,
+    jpeg_400px,
     write_small_image,
 )
 from xagent.web import models
@@ -454,6 +455,62 @@ def test_route_converts_a_conforming_jpeg_over_the_jpeg_byte_limit(
     assert response.content != original
     assert len(response.content) < len(original)
     assert response.content.startswith(b"\xff\xd8")
+
+
+@pytest.mark.parametrize(
+    ("layout", "slack", "refused_as"),
+    [
+        ("progressive", -1, "progressive JPEG"),
+        ("progressive", 0, None),
+        ("non-interleaved", -1, "multi-scan JPEG"),
+        ("non-interleaved", 0, None),
+        ("interleaved", -1, None),
+    ],
+    ids=[
+        "progressive-over",
+        "progressive-at-limit",
+        "non-interleaved-over",
+        "non-interleaved-at-limit",
+        "interleaved-same-size",
+    ],
+)
+def test_route_holds_a_multi_scan_jpeg_to_the_png_pixel_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+    layout: str,
+    slack: int,
+    refused_as: str | None,
+):
+    # Why: every GET decodes the image, and draft() does not shrink what
+    # libjpeg holds for a JPEG with more than one scan (progressive, or a first
+    # scan that codes only some components), so concurrent fetches of a large
+    # one add up (#3596). It gets the PNG limit; one interleaved scan of the
+    # same size does not.
+    source = jpeg_400px(layout)
+    _, url = _instagram_source_url(
+        monkeypatch,
+        tmp_path,
+        db,
+        filename="launch.jpg",
+        write=lambda path: path.write_bytes(source),
+    )
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 + slack
+    )
+
+    response = client.get(url)
+
+    if refused_as is None:
+        assert response.status_code == 200
+        assert response.content == source
+    else:
+        assert response.status_code == 422
+        assert response.json()["detail"] == (
+            "Registered image exceeds the Instagram source pixel limit of 159,999 "
+            f"for {refused_as}; downscale it and try again"
+        )
 
 
 def test_route_requires_and_validates_ticket(client: TestClient):

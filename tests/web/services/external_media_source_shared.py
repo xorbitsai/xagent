@@ -1,9 +1,10 @@
-"""Oversized Instagram sources and a byte-counting reader (#3596).
+"""Instagram source images for the #3596 tests.
 
-Pillow reads a PNG chunk or JPEG segment it does not decode in full and keeps
-it, so these sources cost memory by their size, not their pixels. The tests
-lower ``INSTAGRAM_MAX_SOURCE_BYTES`` to ``SOURCE_LIMIT`` and write sources
-twice that size, so they stay small and fast.
+Oversized sources and a byte-counting reader: Pillow reads a PNG chunk or JPEG
+segment it does not decode in full and keeps it, so these sources cost memory
+by their size, not their pixels. The tests lower ``INSTAGRAM_MAX_SOURCE_BYTES``
+to ``SOURCE_LIMIT`` and write sources twice that size, so they stay small and
+fast. Also small JPEGs of each scan layout, for the pixel limits.
 """
 
 from __future__ import annotations
@@ -70,6 +71,26 @@ OVERSIZED_SOURCES = pytest.mark.parametrize(
     ],
     ids=["png-private-chunk", "jpeg-app-segments"],
 )
+
+
+# A baseline (SOF0) 400x400 JPEG whose three components each have their own
+# scan. It is a lossless rewrite of Image.new("RGB", (400, 400), "blue") saved
+# as JPEG by Pillow 12.3.0, made with jpegtran from libjpeg-turbo 3.2.1:
+#   printf '0;\n1;\n2;\n' > scans.txt
+#   jpegtran -scans scans.txt -outfile noninterleaved_400x400.jpg interleaved.jpg
+NONINTERLEAVED_JPEG = Path(__file__).parent / "fixtures" / "noninterleaved_400x400.jpg"
+
+
+def jpeg_400px(layout: str) -> bytes:
+    """A blue 400x400 JPEG: "progressive", "interleaved" in one scan, or
+    "non-interleaved" with one scan per component."""
+    if layout == "non-interleaved":
+        return NONINTERLEAVED_JPEG.read_bytes()
+    buffer = BytesIO()
+    Image.new("RGB", (400, 400), "blue").save(
+        buffer, "JPEG", progressive=layout == "progressive"
+    )
+    return buffer.getvalue()
 
 
 def write_small_image(path: Path) -> None:

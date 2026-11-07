@@ -170,6 +170,22 @@ _PROVIDER_UNAVAILABLE_CLASS_NAMES = (
     "transport",
 )
 
+# A structured quota or spend-limit code: the request may be perfectly well
+# formed, and the account cannot pay for it. Retrying the same request cannot
+# help, so this must not become ``provider_unavailable``; the media categories
+# have no quota member, and adding one would change the public contract, so
+# the honest existing answer is ``unknown``. Matched against the provider's
+# ``code``/``type`` fields only: an ordinary per-minute 429 can mention a
+# quota in its message, and that one is still an outage.
+_QUOTA_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "insufficient_balance",
+        "billing_hard_limit_reached",
+        "quota_exceeded",
+    }
+)
+
 # HTTP statuses that mean the caller has to change the request.
 _INVALID_REQUEST_STATUSES = frozenset({400, 409, 413, 415, 422})
 # Transient by definition: 408 request timeout, 425 too early, 429 too many
@@ -453,6 +469,33 @@ def _code_strings(exc: BaseException) -> list[str]:
     return codes
 
 
+def _provider_codes(exc: BaseException) -> Iterator[str]:
+    """The provider's own ``code``/``type`` strings, never its message.
+
+    A message can mention a quota while describing a rate limit, so only the
+    fields that name the failure's kind are read here.
+    """
+    for link in _exception_chain(exc):
+        containers: list[Any] = [link]
+        body = getattr(link, "body", None)
+        if isinstance(body, Mapping):
+            containers.append(body)
+            error = body.get("error")
+            if isinstance(error, Mapping):
+                containers.append(error)
+        for container in containers:
+            if isinstance(container, Mapping):
+                for key in ("code", "type"):
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        yield value
+            else:
+                for attribute in ("code", "type"):
+                    value = getattr(container, attribute, None)
+                    if isinstance(value, str) and value.strip():
+                        yield value
+
+
 def _code_and_target_strings(exc: BaseException) -> list[str]:
     """The provider's code and the request target it blames, as strings.
 
@@ -517,6 +560,12 @@ def classify_media_failure(exc: BaseException) -> str:
         "model" in value.lower() for value in _code_and_target_strings(exc)
     ):
         return MODEL_NOT_ENABLED
+    # An explicit quota code says the account cannot pay, which is not an
+    # outage however the provider wrapped it. This has to come before the
+    # status rules: the structured 429 that names a quota is otherwise
+    # collected by the generic 429 branch and reads as "try again later".
+    if any(code.strip().lower() in _QUOTA_CODES for code in _provider_codes(exc)):
+        return UNKNOWN
     if any(status in _INVALID_REQUEST_STATUSES for status in statuses):
         return INVALID_REQUEST
     if any(marker in lowered for marker in _INVALID_REQUEST_MARKERS):

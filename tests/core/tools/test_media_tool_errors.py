@@ -74,6 +74,7 @@ class ProviderStatusError(Exception):
         message: str,
         request_id: str = SDK_REQUEST_ID,
         param: str = "",
+        error_type: str = "Not Found",
     ) -> None:
         self.status_code = status_code
         self.request_id = request_id
@@ -82,7 +83,7 @@ class ProviderStatusError(Exception):
                 "code": code,
                 "message": message,
                 "param": param,
-                "type": "Not Found",
+                "type": error_type,
             }
         }
         super().__init__(
@@ -1038,6 +1039,63 @@ class TestDashScopeStatusCodes:
         assert result["success"] is False
         assert result["error_category"] == PROVIDER_UNAVAILABLE
         assert "upstream temporarily busy" not in json.dumps(result, default=str)
+
+
+class TestStructuredQuotaStatus:
+    """A quota 429 is an account limit, not an outage; an ordinary 429 still
+    says that the same request may work later."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "code",
+        ["insufficient_quota", "billing_hard_limit_reached"],
+    )
+    async def test_a_structured_quota_429_is_not_a_retryable_outage(
+        self, workspace: Mock, code: str
+    ) -> None:
+        error = ProviderStatusError(
+            status_code=429,
+            code=code,
+            error_type="insufficient_quota",
+            message="You exceeded your current quota, please check your plan.",
+        )
+        image_model = Mock()
+        image_model.has_ability = Mock(return_value=True)
+        image_model.abilities = ["generate"]
+        image_model.generate_image = AsyncMock(side_effect=error)
+        tool = ImageGenerationToolCore(
+            {"image-model": image_model},
+            workspace=workspace,
+            default_generate_model=image_model,
+        )
+
+        result = await tool.generate_image("A product shot")
+
+        assert result["success"] is False
+        assert result["error_category"] == UNKNOWN
+        assert "may work later" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_429_remains_an_outage(self, workspace: Mock) -> None:
+        error = ProviderStatusError(
+            status_code=429,
+            code="rate_limit_exceeded",
+            message="Rate limit reached for requests.",
+        )
+        image_model = Mock()
+        image_model.has_ability = Mock(return_value=True)
+        image_model.abilities = ["generate"]
+        image_model.generate_image = AsyncMock(side_effect=error)
+        tool = ImageGenerationToolCore(
+            {"image-model": image_model},
+            workspace=workspace,
+            default_generate_model=image_model,
+        )
+
+        result = await tool.generate_image("A product shot")
+
+        assert result["success"] is False
+        assert result["error_category"] == PROVIDER_UNAVAILABLE
 
 
 class TestVoiceTools:

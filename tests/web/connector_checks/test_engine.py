@@ -24,12 +24,17 @@ from xagent.web.connector_checks.declarations import (
     RunScopedName,
     StatusSuccess,
     TenantPin,
+    ToolExemption,
     ToolStep,
     UnprobeableCheck,
     WriteCheck,
 )
 from xagent.web.connector_checks.engine import run_checks
-from xagent.web.connector_checks.fixtures import FixtureRef, FixtureValue
+from xagent.web.connector_checks.fixtures import (
+    FixtureMissing,
+    FixtureRef,
+    FixtureValue,
+)
 from xagent.web.connector_checks.identity import (
     ConnectorTarget,
     IdentitySetupError,
@@ -481,7 +486,9 @@ async def test_a_fixture_that_is_not_a_scalar_fails_before_anything_starts() -> 
     assert adapter.opened == []
 
 
-async def test_a_resolver_that_raises_fails_before_anything_starts() -> None:
+async def test_a_resolver_that_raises_fails_the_run_without_its_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class Raising(FakeAdapter):
         def resolve_fixture(self, key: str) -> FixtureValue | None:
             raise RuntimeError("config store unavailable")
@@ -491,8 +498,56 @@ async def test_a_resolver_that_raises_fails_before_anything_starts() -> None:
         {"gmail": listed(FakeTool("gmail_x")), "google-docs": listed()},
     )
 
-    with pytest.raises(RuntimeError):
-        await run_checks(adapter, declarations=declared(*fixture_checks()))
+    result = await run_checks(adapter, declarations=declared(*fixture_checks()))
+
+    assert result.failure == "fixtures:exception"
+    assert result.rows == ()
+    assert result.complete is False
+    assert adapter.opened == []
+    assert "config store unavailable" not in json.dumps(result.to_document())
+    assert "config store unavailable" not in caplog.text
+
+
+async def test_an_adapter_that_raises_fixture_missing_means_a_missing_key() -> None:
+    class Missing(FakeAdapter):
+        def resolve_fixture(self, key: str) -> FixtureValue | None:
+            # The row names the requested key, never the one the adapter gave.
+            raise FixtureMissing("Store key for person@example.com")
+
+    adapter = Missing(
+        targets("gmail", "google-docs"),
+        {"gmail": listed(FakeTool("gmail_x")), "google-docs": listed()},
+    )
+
+    result = await run_checks(adapter, declarations=declared(*fixture_checks()))
+
+    assert result.failure is None
+    assert (
+        "google-docs",
+        "google-docs.read_fixture",
+        "skip",
+        "fixture_missing",
+        "google-docs.document_id",
+    ) in rows(result)
+
+
+async def test_an_invalid_declaration_raises_whatever_the_target_order() -> None:
+    class Raising(FakeAdapter):
+        def resolve_fixture(self, key: str) -> FixtureValue | None:
+            raise RuntimeError("config store unavailable")
+
+    adapter = Raising(
+        targets("google-docs", "gmail"),
+        {"google-docs": listed(), "gmail": listed()},
+    )
+    docs = fixture_checks()[1]
+    wrong_app = ConnectorChecks("jira", reads=(read("jira.x", "jira_x"),))
+
+    with pytest.raises(ValueError):
+        await run_checks(
+            adapter,
+            declarations=lambda app: docs if app == "google-docs" else wrong_app,
+        )
     assert adapter.opened == []
 
 
@@ -973,3 +1028,234 @@ async def test_l3_envelope_checks_run_through_the_probe_judgement() -> None:
     result = await run_checks(adapter, declarations=declared(checks))
 
     assert rows(result)[1] == ("linkedin", "linkedin.l3_probe", "pass", None, None)
+
+
+# Timeouts
+
+
+@pytest.mark.parametrize("keyword", ["total_timeout", "check_timeout"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0, -1, True])
+async def test_a_timeout_must_be_a_finite_number_above_zero(
+    keyword: str, value: float
+) -> None:
+    adapter = FakeAdapter(targets("gmail"), {"gmail": listed(FakeTool("gmail_x"))})
+    checks = ConnectorChecks("gmail", reads=(read("gmail.x", "gmail_x"),))
+
+    with pytest.raises(ValueError):
+        await run_checks(
+            adapter,
+            declarations=declared(checks),
+            **cast(Any, {keyword: value}),
+        )
+    assert adapter.opened == []
+
+
+# A declaration with only exemptions
+
+
+async def test_a_connector_with_only_exemptions_still_gets_its_session_row() -> None:
+    adapter = FakeAdapter(targets("jira"), {"jira": listed()})
+    checks = ConnectorChecks(
+        "jira", exemptions=(ToolExemption("jira_x", "moves a real issue"),)
+    )
+
+    result = await run_checks(adapter, declarations=declared(checks))
+
+    assert rows(result) == [("jira", None, "pass", None, None)]
+    assert adapter.opened == [("jira", SessionPurpose.LIST_ONLY)]
+    assert result.failure is None
+
+
+async def test_a_check_selector_leaves_out_a_connector_none_of_whose_checks_it_names() -> (
+    None
+):
+    adapter = FakeAdapter(
+        targets("gmail", "jira"),
+        {"gmail": listed(FakeTool("gmail_x")), "jira": listed()},
+    )
+    checks = declared(
+        ConnectorChecks("gmail", reads=(read("gmail.x", "gmail_x"),)),
+        ConnectorChecks(
+            "jira", exemptions=(ToolExemption("jira_x", "moves a real issue"),)
+        ),
+    )
+
+    result = await run_checks(adapter, declarations=checks, checks=["gmail.x"])
+
+    assert {row[0] for row in rows(result)} == {"gmail"}
+    assert [app for app, _ in adapter.opened] == ["gmail"]
+
+
+# Cancellation and tools that turn it into another error
+
+
+async def test_cancelling_the_run_while_a_session_opens_propagates() -> None:
+    async def hang() -> ConnectorToolsResult:
+        await asyncio.sleep(10.0)
+        return listed()
+
+    adapter = FakeAdapter(targets("gmail"), {"gmail": hang})
+    checks = ConnectorChecks("gmail", reads=(read("gmail.x", "gmail_x"),))
+
+    task = asyncio.create_task(run_checks(adapter, declarations=declared(checks)))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_cancelling_the_run_during_a_call_propagates() -> None:
+    adapter = FakeAdapter(
+        targets("gmail"), {"gmail": listed(FakeTool("gmail_x", delay=10.0))}
+    )
+    checks = ConnectorChecks("gmail", reads=(read("gmail.x", "gmail_x"),))
+
+    task = asyncio.create_task(run_checks(adapter, declarations=declared(checks)))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_call_that_turns_its_cancellation_into_an_error_still_timed_out() -> (
+    None
+):
+    class Converting(FakeTool):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                raise RuntimeError("cancelled") from None
+            return SUCCESS
+
+    adapter = FakeAdapter(
+        targets("gmail"),
+        {"gmail": listed(Converting("gmail_x"), FakeTool("gmail_y"))},
+    )
+    checks = ConnectorChecks(
+        "gmail", reads=(read("gmail.x", "gmail_x"), read("gmail.y", "gmail_y"))
+    )
+
+    by_call = await run_checks(
+        adapter, declarations=declared(checks), check_timeout=0.05
+    )
+    by_deadline = await run_checks(
+        adapter, declarations=declared(checks), check_timeout=5, total_timeout=0.05
+    )
+
+    assert rows(by_call)[1:] == [
+        ("gmail", "gmail.x", "fail", "timed_out", "check_call"),
+        ("gmail", "gmail.y", "pass", None, None),
+    ]
+    assert by_call.complete is True
+    assert rows(by_deadline)[1:] == [
+        ("gmail", "gmail.x", "fail", "timed_out", "run_deadline"),
+        ("gmail", "gmail.y", "fail", "not_reached", None),
+    ]
+    assert by_deadline.complete is False
+
+
+async def test_a_session_that_turns_the_deadline_into_an_error_still_timed_out() -> (
+    None
+):
+    async def convert() -> ConnectorToolsResult:
+        try:
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            raise RuntimeError("cancelled") from None
+        return listed(FakeTool("gmail_x"))
+
+    adapter = FakeAdapter(targets("gmail"), {"gmail": convert})
+    checks = ConnectorChecks("gmail", reads=(read("gmail.x", "gmail_x"),))
+
+    result = await run_checks(
+        adapter, declarations=declared(checks), total_timeout=0.05
+    )
+
+    assert rows(result) == [
+        ("gmail", None, "fail", "timed_out", "run_deadline"),
+        ("gmail", "gmail.x", "skip", "session_unavailable", None),
+    ]
+    assert result.complete is False
+
+
+# Cancellation from outside the run
+
+
+async def test_an_outer_cancel_is_not_swallowed_by_a_tool_that_converts_it() -> None:
+    class Converting(FakeTool):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            self.calls.append(dict(args))
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                raise RuntimeError("cancelled") from None
+
+    second = FakeTool("gmail_y")
+    adapter = FakeAdapter(
+        targets("gmail"), {"gmail": listed(Converting("gmail_x"), second)}
+    )
+    checks = ConnectorChecks(
+        "gmail", reads=(read("gmail.x", "gmail_x"), read("gmail.y", "gmail_y"))
+    )
+
+    task = asyncio.create_task(run_checks(adapter, declarations=declared(checks)))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert second.calls == []
+
+
+async def test_an_outer_cancel_is_not_swallowed_by_a_tool_that_returns() -> None:
+    class Swallowing(FakeTool):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            try:
+                await asyncio.sleep(10.0)
+            except asyncio.CancelledError:
+                return SUCCESS
+            return SUCCESS
+
+    second = FakeTool("gmail_y")
+    adapter = FakeAdapter(
+        targets("gmail"), {"gmail": listed(Swallowing("gmail_x"), second)}
+    )
+    checks = ConnectorChecks(
+        "gmail", reads=(read("gmail.x", "gmail_x"), read("gmail.y", "gmail_y"))
+    )
+
+    task = asyncio.create_task(run_checks(adapter, declarations=declared(checks)))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert second.calls == []
+
+
+async def test_an_outer_cancel_is_not_swallowed_by_a_session_that_converts_it() -> None:
+    async def convert() -> ConnectorToolsResult:
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            raise RuntimeError("cancelled") from None
+        return listed()
+
+    adapter = FakeAdapter(
+        targets("gmail", "jira"), {"gmail": convert, "jira": listed()}
+    )
+    checks = declared(
+        ConnectorChecks("gmail", reads=(read("gmail.x", "gmail_x"),)),
+        ConnectorChecks("jira", reads=(read("jira.x", "jira_x"),)),
+    )
+
+    task = asyncio.create_task(run_checks(adapter, declarations=checks))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [app for app, _ in adapter.opened] == ["gmail"]

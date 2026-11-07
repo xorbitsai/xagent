@@ -459,7 +459,8 @@ def _single_json_object(content: Any) -> dict[str, Any] | None:
         return None
     try:
         parsed = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Text nested past the parser's depth limit raises RecursionError.
         return None
     return parsed if isinstance(parsed, dict) else None
 

@@ -335,6 +335,7 @@ def test_resolve_expected_raises_for_a_fixture_without_a_value() -> None:
         [],
         [{"type": "image", "data": "..."}],
         [{"type": "text", "text": "{}"}, {"type": "image", "data": "..."}],
+        [{"type": "text", "text": "[" * 100000}],
         [{"type": "text", "text": 7}],
         ["{}"],
         None,
@@ -350,3 +351,21 @@ def test_json_text_takes_the_object_the_l3_probe_takes(content: Any) -> None:
     )
 
     assert rejected == (_single_json_object(content) is None)
+
+
+def test_a_deeply_nested_text_is_not_json_rather_than_a_crash() -> None:
+    # json.loads raises RecursionError, not ValueError, on this text.
+    raw = text_result("[" * 100000)
+
+    assert judge_result(raw, "json_text", (HasKeys((), ()),)) == (
+        FailureClass.ASSERTION_FAILED,
+        "not_a_json_object",
+    )
+    assert judge_result(raw, "json_text_items", (StatusSuccess(),)) == (
+        FailureClass.ASSERTION_FAILED,
+        "not_json_text",
+    )
+    assert judge_result(raw, "json_text", (L3Envelope(()),)) == (
+        FailureClass.ASSERTION_FAILED,
+        "not_a_json_object",
+    )

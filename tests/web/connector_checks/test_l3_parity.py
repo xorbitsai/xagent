@@ -88,6 +88,7 @@ _CASES: dict[str, Callable[[ConnectorProbe], FakeTool | None]] = {
         probe.tool, {**_text({"status": "success"}), "is_error": True}
     ),
     "plain_text": lambda probe: FakeTool(probe.tool, _text("Error: unauthorized")),
+    "deeply_nested": lambda probe: FakeTool(probe.tool, _text("[" * 100000)),
     "two_items": lambda probe: FakeTool(
         probe.tool, _text({"status": "success"}, {"status": "success"})
     ),

@@ -164,7 +164,8 @@ def _texts(content: Any) -> list[str] | None:
 def _parse(text: str) -> Any:
     try:
         return json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Text nested past the parser's depth limit raises RecursionError.
         return _MISSING
 
 

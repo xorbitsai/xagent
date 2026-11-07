@@ -7,8 +7,11 @@ its hooks) turns it into the JSON document.
 
 Before any connector starts, the engine enumerates the targets, validates
 every selected declaration (``registry.connector_checks_for`` by default) and
-resolves every selected read check's fixtures through the adapter. A check
-whose key has no value is ``skip``/``fixture_missing`` and is never called.
+resolves, through the adapter, the fixtures of every selected read check on
+a target the adapter does not skip. A check whose key has no value is
+``skip``/``fixture_missing`` and is never called. A resolver that raises fails
+the run as ``fixtures:exception``: a broken fixture store is a failure of the
+run, never a skipped check.
 Then, for each target in the adapter's order:
 
 1. A target the adapter skips is never started.
@@ -47,7 +50,9 @@ rows carry codes, check ids and tool names only.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import math
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -131,6 +136,28 @@ class _ConnectorPlan:
         return self.target.connector
 
 
+class _ResolverFailed(Exception):
+    """The adapter's fixture resolver raised; carries nothing from the error."""
+
+
+class _SafeResolver:
+    """Wraps the adapter's resolver so a raise becomes ``_ResolverFailed``."""
+
+    def __init__(self, adapter: IdentityAdapter) -> None:
+        self._adapter = adapter
+
+    def resolve_fixture(self, key: str) -> Any:
+        try:
+            return self._adapter.resolve_fixture(key)
+        except FixtureMissing:
+            # A missing key all the same; reported under the requested key,
+            # which is a validated code, never under one the adapter chose.
+            raise FixtureMissing(key) from None
+        except Exception as error:
+            logger.warning("Resolving fixture %s raised %s", key, type(error).__name__)
+            raise _ResolverFailed() from None
+
+
 class _Clock:
     """The run's deadline, and whether it has cut anything."""
 
@@ -164,18 +191,21 @@ async def run_checks(
     """Run ``adapter``'s connectors' checks and return the run result.
 
     ``connectors`` selects connectors by their result label and ``checks``
-    selects check ids; a connector with no selected check is left out. A
-    call's timeout defaults to the L3 probe call's
-    (``connector_probe.probe_call_timeout_seconds``).
+    selects check ids; with a check selector, a connector none of whose
+    checks it names is left out. A call's timeout defaults to the L3 probe
+    call's (``connector_probe.probe_call_timeout_seconds``).
 
     Raises before any connector starts: ``ValueError`` for an invalid
-    identity or environment label, or a declaration that breaks the format
-    or names another app; ``TypeError`` for a selector given as one string,
-    or a fixture value that is not a JSON scalar; and whatever the adapter's
-    ``resolve_fixture`` raises. A broken resolver is a failure of the run,
-    never a skipped check.
+    identity or environment label, a declaration that breaks the format or
+    names another app, or a timeout that is a bool, NaN, infinite or not above
+    0; ``TypeError`` for a selector given as one string, a timeout that is not
+    a number, or a fixture value that is not a JSON scalar. A resolver that
+    raises fails the run as ``fixtures:exception``.
     """
     started_at = datetime.now(timezone.utc)
+    _require_finite_positive(total_timeout)
+    if check_timeout is not None:
+        _require_finite_positive(check_timeout)
     clock = _Clock(total_timeout)
     if isinstance(connectors, str) or isinstance(checks, str):
         raise TypeError("a selector is a collection of names, not one string")
@@ -211,7 +241,10 @@ async def run_checks(
     if len({target.connector for target in targets}) != len(targets):
         return finish((), "enumeration:duplicate_connector")
 
-    plans = _plan(adapter, targets, declarations, connectors, checks)
+    try:
+        plans = _plan(adapter, targets, declarations, connectors, checks)
+    except _ResolverFailed:
+        return finish((), "fixtures:exception")
     if not plans:
         return finish((), "selection:no_targets")
 
@@ -252,27 +285,48 @@ def _plan(
             for check in (*declaration.reads, *declaration.writes)
             if checks is None or check.id in checks
         )
-        if not selected:
+        if not selected and checks is not None:
             continue
-        prepared = (
-            {}
-            if target.skip_reason is not None
-            else {
+        plans.append(_ConnectorPlan(target, declaration, selected, {}))
+    # Fixtures resolve only after every declaration has been validated, so an
+    # invalid declaration raises whatever the order of the targets.
+    return [
+        plan
+        if plan.target.skip_reason is not None
+        else dataclasses.replace(
+            plan,
+            prepared={
                 check.id: _prepare(check, adapter)
-                for check in selected
+                for check in plan.checks
                 if isinstance(check, ReadCheck)
-            }
+            },
         )
-        plans.append(_ConnectorPlan(target, declaration, selected, prepared))
-    return plans
+        for plan in plans
+    ]
+
+
+def _raise_if_cancelled() -> None:
+    # The bound's own cancellation is uncancelled when its block exits, so a
+    # count left over is an outer cancel that a tool or adapter swallowed.
+    task = asyncio.current_task()
+    if task is not None and task.cancelling() > 0:
+        raise asyncio.CancelledError
+
+
+def _require_finite_positive(timeout: float) -> None:
+    # A bool is an int; NaN breaks the event loop's timer ordering, and
+    # infinity never expires.
+    if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("a timeout must be a finite number of seconds above 0")
 
 
 def _prepare(check: ReadCheck, adapter: IdentityAdapter) -> _Prepared:
     """``check`` with its fixtures resolved; only an unresolved key is a
-    skip, anything the resolver raises propagates."""
+    skip, and a resolver that raises is ``_ResolverFailed``."""
+    resolver = _SafeResolver(adapter)
     try:
-        arguments = resolve_fixtures(dict(check.arguments), adapter)
-        assertions = resolve_expected(check.assertions, adapter)
+        arguments = resolve_fixtures(dict(check.arguments), resolver)
+        assertions = resolve_expected(check.assertions, resolver)
     except FixtureMissing as missing:
         return _Prepared(check, missing_key=missing.key)
     return _Prepared(check, arguments, assertions)
@@ -309,6 +363,7 @@ async def _run_connector(
             listing = await adapter.open_session(target, purpose=purpose)
     except Exception as error:
         error_type = type(error).__name__
+    _raise_if_cancelled()
     duration_ms = _elapsed_ms(started)
     tools: Any = ()
     if bound.expired():
@@ -394,6 +449,7 @@ async def _run_read(
             raw = await tool.run_json_async(dict(prepared.arguments))
     except Exception as error:
         call_error = error
+    _raise_if_cancelled()
     duration_ms = _elapsed_ms(started)
     if isinstance(call_error, TimeoutError) or bound.expired():
         # Any TimeoutError times the call out, as for the L3 probe call, and

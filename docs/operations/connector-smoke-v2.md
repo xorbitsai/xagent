@@ -1,8 +1,8 @@
-# Connector smoke V2: check declarations and run results
+# Connector smoke V2: check declarations, engine and run results
 
-Smoke V2 (xorbitsai/xagent-saas#2532) runs many checks per connector, under more than one identity, and writes a result that a later job compares across runs. This page documents the two interfaces the rest of V2 builds on: the **declaration format**, which says what a connector's checks are, and the **result document**, which says what a run found. Both live in `src/xagent/web/connector_checks/` and are versioned.
+Smoke V2 (xorbitsai/xagent-saas#2532) runs many checks per connector, under more than one identity, and writes a result that a later job compares across runs. This page documents the two interfaces the rest of V2 builds on: the **declaration format**, which says what a connector's checks are, and the **result document**, which says what a run found. It also documents the **engine** that runs the checks under an identity and produces the result. All three live in `src/xagent/web/connector_checks/`, and the two interfaces are versioned.
 
-The engine that runs the checks, its CLI and a local `user` identity adapter come in a follow-up to #3563. Until then these modules are used by the declarations, the coverage rule (#3565), the result diff (xorbitsai/xagent-saas#2538) and the Toby adapter (xorbitsai/xagent-saas#2534).
+The engine is a library call (`engine.run_checks`). Its CLI and a local `user` identity adapter come in a follow-up to #3563; until then the engine runs under an adapter its caller supplies, such as the Toby adapter (xorbitsai/xagent-saas#2534).
 
 V1 is unchanged: L1 to L3 still run from `scripts/connector_smoke`, and the probe route still serves L3 (`scripts/connector_smoke/README.md`).
 
@@ -58,6 +58,8 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 | `Equals(path, value)` | the value at `path` equals `value`, typically a seeded fixture |
 | `L3Envelope(expect_keys=())` | the L3 probe would pass the result (`evaluate_probe_result`, which reads the whole result); must be the only assertion, with the default `json_text` payload |
 
+`assertions.judge_result` runs the assertions in order, and the first that does not hold fails the check as `assertion_failed` with its kind as the `reason`: `status_success`, `has_keys`, `each_has_keys`, `is_type`, `length` or `equals`. A path that does not exist fails the assertion that reads it. `Equals` compares as JSON does: a boolean never equals a number, and `1` equals `1.0`. A payload that cannot be taken fails the same way, with the reason `not_a_json_object` (`json_text`), `not_json_text` (a text item of `json_text_items` that is not JSON) or `no_structured_content`. A result that is not a mapping is `call_failed`/`invalid_result`, and one flagged `is_error` is `call_failed`/`tool_error`. `L3Envelope` keeps the probe's own reasons (`not_a_json_object`, `status_not_success`, `no_status`, `missing_keys`).
+
 ### Fixture keys
 
 A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The document connectors' `read_fixture` checks use these keys; the probe route does not take fixtures yet (#3284).
@@ -88,6 +90,31 @@ The engine runs as an identity through an `IdentityAdapter` (`identity.py`):
 An adapter offers a target only for a connection that is the catalog's own: for a server row, the probe route's catalog-identity rule (`_owns_catalog_identity` in `services/connector_probe.py`); an actor stdio connection is synthesized from the catalog. A lookalike or custom row never gets a builtin app's checks. App ids are unique per enumeration: where an identity has several rows of one app, the adapter offers the one its catalog resolution selects, the one a task of that identity would load.
 
 `SessionPurpose.CALL_TOOLS` refuses a sandboxed (`npx`/`uvx`) connection, because the listing's lease is released before any call. `SessionPurpose.LIST_ONLY`, for a connector where no check will call a tool (each is unprobeable, or the app has no declaration), lets such a connection list through a lease, as V1's Toby probe does. This is the one departure from "sandboxed connections stay refused": no tool is called after the lease is released.
+
+## Engine
+
+`engine.run_checks(adapter, ...)` runs the identity's checks and returns a `RunResult`. It is meant for a one-shot CLI process: it does not take the web process's probe slot (`services/connector_probe.py`), so it must not run inside the web server. Its keywords are `environment` (the result's label), `connectors` (connector labels) and `checks` (check ids) as selectors, `check_timeout` (each call's bound, by default the L3 probe call's, `connector_probe.probe_call_timeout_seconds`), `total_timeout` (the run's bound, 900 seconds by default) and `declarations` (`registry.connector_checks_for` by default). A timeout that is a bool, NaN, infinite or not above 0 raises `ValueError` (a non-number raises `TypeError`). With a check selector, a selected connector none of whose checks it names is left out; without one, a connector whose declaration has only exemptions still gets its session row (it opens as `LIST_ONLY`) and no check rows.
+
+Before any connector starts, the engine enumerates the targets, validates every selected declaration and resolves, through the adapter, the fixtures of every selected read check on a target the adapter does not skip. An invalid declaration, or one that names another app, raises `ValueError`. A key without a value makes its check `skip`/`fixture_missing`, and the check is never called; a value that is not a JSON scalar raises `TypeError`, and a resolver that raises fails the run as `fixtures:exception`, because a broken fixture store is a failure of the run, never a skipped check. Then, for each target in the adapter's order:
+
+1. A target with a `skip_reason` is never started.
+2. One session: one config build and one tool listing (`adapter.open_session`), which becomes the `session` row. It opens as `LIST_ONLY` when the app has no declaration or every check it declares is unprobeable, otherwise as `CALL_TOOLS`. The purpose follows the whole declaration, so neither a selector, setting a fixture nor turning on writes changes how a connector starts or its session row. An exception while opening it is `failed_to_start`/`exception`.
+3. The checks run in declaration order on the listed tools. A read check's tool is found by its wire name (`connector_probe.find_tool`), and each call opens its own MCP session, so an in-repo server spawns one process per check. A check that requires `readOnlyHint` is skipped unless the tool's raw annotations say `readOnlyHint: true` without `destructiveHint` (`MCPToolAdapter.write_hint`). A call that exceeds `check_timeout` is `timed_out`/`check_call`, and the next check still runs.
+
+A check's row depends on the session:
+
+| Check | Session passed | Session did not pass |
+|---|---|---|
+| read check | run; or `fixture_missing`, `read_only_hint_missing`, `tool_missing` | `skip`/`session_unavailable` |
+| unprobeable check | `unprobeable` | `unprobeable` |
+| write check | `skip`/`writes_disabled` | `skip`/`writes_disabled` |
+| app with no declaration | `<connector>.l3_probe` `skip`/`not_declared` | the same |
+
+Connectors run in sequence under the total timeout. The step it interrupts, a session or a call, fails as `timed_out` with the reason `run_deadline`, also when the step swallowed the cancellation and returned. A connector it keeps from starting has a `fail`/`not_reached` session row and the check rows of any session that did not pass; under a session that passed, a call it keeps from starting is `fail`/`not_reached`. The run is then not `complete`.
+
+A run with no rows carries a `failure`. It is the adapter's `IdentitySetupError` code, or one of the engine's codes: `enumeration:exception` (the enumeration raised something else), `enumeration:no_connectors`, `enumeration:duplicate_connector` (two targets with one label), `fixtures:exception` (the fixture resolver raised) or `selection:no_targets` (the selectors matched nothing).
+
+Today's L3 probes run as their derived `<app_id>.l3_probe` checks with the probe route's verdicts: `tests/web/connector_checks/test_l3_parity.py` feeds the same listing and tool behaviour to the route's call path and to the engine, and compares them. A probe outcome maps to a check row as `ok` → `pass`, `probe_failed` → `call_failed`, `probe_assertion_failed` → `assertion_failed`, `probe_tool_missing` → `tool_missing` and `timed_out` → `timed_out`, with the same reasons except the call's own bound (`probe_call` there, `check_call` here). A listing outcome is the session row's class.
 
 ## Result document
 
@@ -123,8 +150,8 @@ An adapter offers a target only for a connection that is the catalog's own: for 
 - **Rows.** Each connector has one `session` row (starting it and listing its tools), followed by one `check` row per declared check. The diff keys on `(identity, connector, check)`, with `check` null for the session row. When a session does not pass, none of its checks runs: each is `skip` with `session_unavailable` (`writes_disabled` for a write check) or stays `unprobeable`, so one broken connector is one failure.
 - **`connector`** is the catalog app id. An admin-created app's id is free text, so one that is not a kebab-case id of at most 64 characters, or that starts with `custom-`, is named `custom-<16 hex digits>` from its SHA-256 (`ConnectorTarget.connector`): stable across runs, and never the text itself. Hashing ids that start with `custom-` too means a generated label never names another app.
 - **`environment`** is the deployment's label, or null when the caller gives none, so the diff can confirm it compares runs of one environment.
-- **`complete`** is false when the run's total timeout cut it, or when it failed to set up; connectors not reached fail with `not_reached`.
-- **`failure`** is a code for a run that could not be set up (`<stage>:<reason>`, such as `enumeration:no_connectors`), and null otherwise. Such a run has no rows; the diff reads it as no data, never as every connector recovering.
+- **`complete`** is false when the run's total timeout cut it, or when it failed to set up; what the timeout kept from starting fails with `not_reached` (see [Engine](#engine)).
+- **`failure`** is a code for a run that could not be set up (`<stage>:<reason>`, such as `enumeration:no_connectors`; the engine's codes are listed under [Engine](#engine)), and null otherwise. Such a run has no rows; the diff reads it as no data, never as every connector recovering.
 - **Outcomes.** `pass` and `unprobeable` carry no class; an `unprobeable` row's `reason` is its L3 reason. `fail` and `skip` carry a class from the tables below, and `reason` optionally refines it with a code.
 - **What a document never holds.** Tokens, secrets, response bodies, fixture values or end-user ids. Every reason is a code (`^[a-z0-9][a-z0-9_.:-]{0,79}$`): a listing's reason that is not a code is dropped, and a row refuses one. A code-shaped value can still be anything, so the callers that build rows put only codes in them.
 - **The schema enforces the pairing** of outcome and class: `pass` carries none, `fail` only a failure class, `skip` only a skip class, and `unprobeable` (a check row) an L3 reason. The schema checks each row on its own. The cross-row rules (a check id starts with its connector, one session row per connector, a session row precedes its checks, no check runs under a failed session) are enforced only by `RunResult`.
@@ -135,12 +162,12 @@ An adapter offers a target only for a connection that is the catalog's own: for 
 | `not_connected` | the user's credential is missing or unusable: a dead grant; `reason` is the builder's code (`oauth_token_required`, `auth_rejected`, …) |
 | `client_rejected` | the vendor rejected the platform's own client credential (#3580): every user of the provider is affected; `reason` is `client_rejected`, or `client_rejected:<provider>` when the session names the credential |
 | `unsupported` | the connector cannot run outside a task (`execution_scoped`) or with tool calls (`sandboxed`) |
-| `failed_to_start` | the server did not start; `reason` is the load phase |
+| `failed_to_start` | the server did not start; `reason` is the load phase, or `exception` when opening the session raised |
 | `no_tools` | the server listed no tools |
-| `timed_out` | starting, listing or a check's call exceeded its bound |
-| `not_reached` | the run's total timeout ended before this connector |
+| `timed_out` | starting, listing or a check's call exceeded its bound; `reason` is `check_call` for a call's own bound and `run_deadline` for the run's |
+| `not_reached` | the run's total timeout ended before this connector, or before this check's call |
 | `tool_missing` | the server does not list the check's tool |
-| `call_failed` | the call raised, or the result was flagged as an error |
+| `call_failed` | the call raised (`exception`), the result was flagged as an error (`tool_error`), or it was not a mapping (`invalid_result`) |
 | `assertion_failed` | an assertion did not hold; `reason` names which kind |
 | `tenant_mismatch`, `verdict_mismatch`, `cleanup_failed` | write-check safety (#3564) |
 

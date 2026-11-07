@@ -344,7 +344,10 @@ def test_workspace_maps_external_media_errors(
 
     from xagent.core.workspace import ExternalMediaNotIssuableError
 
-    # Only a missing base URL or an unsupported image may trigger a fallback.
+    # Neither is "cannot be issued": not found stays FileNotFoundError, which
+    # the adapter handles on its own, and a base ExternalMediaUnavailable (a
+    # read, integrity or storage failure) stays a ValueError, which does not
+    # fall back.
     assert not isinstance(raised.value, ExternalMediaNotIssuableError)
     assert db.closed is True
 
@@ -355,9 +358,14 @@ def test_workspace_maps_external_media_errors(
 def test_workspace_marks_external_media_that_cannot_be_issued(
     monkeypatch, tmp_path: Path, service_error: str
 ) -> None:
-    # Why: the adapter falls back to a connector upload only on this error, so
-    # a missing base URL and an unsupported image must both map to it, and
-    # nothing else may (see test_workspace_maps_external_media_errors).
+    # Why: this error tells the adapter that the file exists in this task but
+    # gets no URL, so it falls back to a connector upload. A missing base URL,
+    # an unsupported image (wrong type, too large, or bytes that do not
+    # decode) and bytes out of external media's scope must all map to it; a
+    # base ExternalMediaUnavailable must not (see
+    # test_workspace_maps_external_media_errors).
+    # The adapter also falls back on FileNotFoundError and on a path that is
+    # not a registered file.
     from xagent.core.storage import manager
     from xagent.core.workspace import ExternalMediaNotIssuableError
     from xagent.web.services import external_media

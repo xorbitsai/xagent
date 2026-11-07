@@ -306,9 +306,12 @@ def facebook_publish_image_post(
 ) -> str:
     """Publish an image post from a public URL or a workspace image file.
 
-    Provide exactly one of image_url and file_path. file_path is a workspace
-    image (PNG or JPEG, up to 10 MB), for example one generated or attached in
-    this task.
+    Provide exactly one of image_url and file_path. file_path must be an
+    absolute path inside the current task workspace, for example an image
+    generated or attached in this task. A PNG or JPEG of at most 10 MB works
+    on every connection. GIF, BMP and TIFF work only on connections that can
+    upload local files; on the others file_path returns an error and image_url
+    must be used.
     """
     try:
         url_value = (

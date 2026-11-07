@@ -71,6 +71,7 @@ import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentSshBindings } from "./agent-ssh-bindings"
+import { useAgentBuilderSettingsExtension } from "@/lib/agent-builder-settings-extension"
 import { getAgentTaskHref } from "@/lib/agent-ui-access"
 import { PromptContextFieldsEditor } from "./prompt-context-fields-editor"
 import { AgentFlowView } from "./agent-flow-view"
@@ -785,6 +786,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, setTaskId])
 
   const loadedAgentId = originalData?.id
+  const builderSettings = useAgentBuilderSettingsExtension({
+    agentId: localAgentId ? Number(localAgentId) : undefined,
+    enabled: !readOnly && (!localAgentId || String(loadedAgentId) === localAgentId),
+    saving: isCreating,
+  })
   // previewConfigKey reads the model seed and the MCP list; opening a record
   // before either lands would have it invalidated straight away. This waits
   // for the mount-time MCP fetch only, not an admin's owner-scoped reload.
@@ -1404,7 +1410,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
   // Enables Update, so the seeded value has a way into the database: Publish
   // posts no body and never persists models.
-  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers || Boolean(builderSettings.changes)
   // ...but a slot holding the seeded value is not an edit worth blocking
   // Publish over, for the very agents the seed exists to unblock. Picking the
   // seeded model by hand is indistinguishable from the seed itself, which is
@@ -1414,6 +1420,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const seedStillUnsaved = !(originalData?.models || {}).general
   const publishBlockedByEdits =
     isDirtyBeyondGeneralModel ||
+    Boolean(builderSettings.changes) ||
     (generalModelDiffers &&
       !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
@@ -1608,14 +1615,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // Ownership transitions go through promote-team/demote-personal.
           ...(ownership === "team" ? { visibility } : {}),
           logo_base64,
+          host_settings: builderSettings.changes,
         }),
       })
 
       if (response.ok) {
+        const savedAgent = await response.json()
+        builderSettings.markSaved?.()
         setPromptContextFields(draftsFromDeclarations(promptContextPayload))
         setPromptContextSaveAttempted(false)
         if (isEditMode) {
-          const updatedAgent = await response.json()
+          const updatedAgent = savedAgent
           const trimmedName = name.trim()
           const trimmedDesc = description.trim()
           const trimmedInstr = instructions.trim()
@@ -1659,7 +1669,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setLogoFile(null)
           setLogoRemoved(false)
         } else {
-          const newAgent = await response.json()
+          const newAgent = savedAgent
           setCreatedAgent(newAgent)
           // Preview uploads must not block saving triggers or ownership.
           void bindPreviewTask(newAgent.id)
@@ -2986,6 +2996,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             )}
           </div>
         )}
+        {builderSettings.panel}
       </div>
     </fieldset>
 

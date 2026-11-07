@@ -49,6 +49,18 @@ export type BuildPageExtensionProviderComponent =
 export type BuildAgentCardExtensionComponent =
   ComponentType<BuildAgentCardExtensionProps>
 
+export interface AgentBuilderSettingsExtensionOptions {
+  agentId?: number
+  enabled: boolean
+  saving: boolean
+}
+
+export interface AgentBuilderSettingsExtension {
+  panel?: ReactNode
+  changes?: Record<string, unknown>
+  markSaved?: () => void
+}
+
 // Wraps the Deploy dialog's key-based embed snippet. A replacement may render
 // `children` alongside alternative embed instructions; the OSS default renders only `children`.
 export interface DeployAgentEmbedExtensionProps {

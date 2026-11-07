@@ -40,6 +40,39 @@ describe("guessProfile", () => {
       ]),
     ).toBe("openai/gpt-5.5")
   })
+
+  it("skips a name match whose input modalities differ from the model abilities", () => {
+    const textOnly: Model = {
+      ...model,
+      model_provider: "deepseek",
+      model_name: "deepseek-flash",
+      abilities: ["chat", "tool_calling", "thinking_mode"],
+    }
+
+    expect(
+      guessProfile(textOnly, [
+        {
+          id: "deepseek/deepseek-v4.1-flash",
+          aliases: ["deepseek-flash"],
+          input_modalities: ["text", "image"],
+        },
+      ]),
+    ).toBeUndefined()
+  })
+
+  it("returns the name match whose image, audio and video inputs match the abilities", () => {
+    const multimodal: Model = { ...model, abilities: ["chat", "vision", "audio"] }
+    const profiles = [
+      { id: "openai/gpt-5.5", input_modalities: ["text", "image"] },
+      {
+        id: "openai/gpt-5.5-audio",
+        aliases: ["gpt-5.5"],
+        input_modalities: ["text", "image", "audio", "file"],
+      },
+    ]
+
+    expect(guessProfile(multimodal, profiles)).toBe("openai/gpt-5.5-audio")
+  })
 })
 
 describe("AutoModelConfigCard", () => {

@@ -2760,11 +2760,20 @@ async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
         ]
     )
     pattern = DAGPattern(generator, max_completion_replans=1)
+    assessments: list[tuple[str, Any]] = []
+
+    class AssessmentTracer(TracerCheckpointStore):
+        async def trace_event(
+            self, event_type: Any, *, data: dict[str, Any], **_: Any
+        ) -> None:
+            if data.get("phase") == "dag_completion_assessment":
+                assessments.append((event_type.action.value, data.get("prompt_prefix")))
 
     result = await pattern.run(
         context=ExecutionContext(execution_id="dag-completion-replan"),
         tools=[],
         llm=llm,
+        runtime=PatternRuntime(tracer=AssessmentTracer()),
     )
 
     assert result["success"] is True
@@ -2777,6 +2786,9 @@ async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
     assert generator.requests[1].replan is True
     assert generator.requests[1].completion_feedback == "Add a second step."
     assert generator.requests[1].completed_step_results == {"first": "first done"}
+    assert [action for action, _ in assessments] == ["start", "end", "start", "end"]
+    assert assessments[0][1] is not None and assessments[0][1] == assessments[1][1]
+    assert assessments[2][1] is not None and assessments[2][1] == assessments[3][1]
 
 
 def test_dag_completion_assessment_keeps_user_request_as_scope_authority() -> None:
@@ -8213,6 +8225,48 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     assert "Output language: Simplified Chinese" not in instruction
     # A restored step must not run without the fact-source rule.
     assert step_intent_not_fact_rule() in instruction
+
+
+@pytest.mark.asyncio
+async def test_dag_step_receives_selected_memory_tool_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = PlanStep(id="remember", task="Remember the result")
+    pattern = DAGPattern(lambda **_: build_plan(step))
+    pattern.plan = build_plan(step)
+    store = object()
+    captured: dict[str, Any] = {}
+
+    def factory(_request: object) -> list[object]:
+        return []
+
+    class CapturingReActPattern:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def seed_memory_input(self, memory_text: str) -> None:
+            del memory_text
+
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {"success": True, "status": "completed", "output": "done"}
+
+    monkeypatch.setattr(dag_module, "ReActPattern", CapturingReActPattern)
+    root_context = ExecutionContext(execution_id="dag-memory-binding")
+    root_context.add_user_message("Remember this result.")
+
+    await pattern._execute_step_impl(
+        step=step,
+        root_context=root_context,
+        tools=[],
+        llm=object(),
+        runtime=PatternRuntime(execution_id="dag-memory-binding"),
+        memory_store=store,
+        memory_tools_factory=factory,
+    )
+
+    assert captured["memory_store"] is store
+    assert captured["memory_tools_factory"] is factory
 
 
 _FILE_REFERENCE_BLOCK = (

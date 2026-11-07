@@ -774,6 +774,7 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
                 "_ASRSessionTimeout",
                 "ValidationError",
                 "ValueError",
+                "StandaloneUsageRefused",
                 "HTTPException",
                 "Exception",
             ),

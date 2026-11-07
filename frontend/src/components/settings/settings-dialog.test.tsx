@@ -16,6 +16,8 @@ vi.mock("@/lib/task-runtime-ui-extension", () => ({
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: (key: string) => key }),
 }))
+vi.mock("@/contexts/auth-context", () => ({ useAuth: () => ({ session: { sessionId: "login" } }) }))
+vi.mock("./voice-settings", () => ({ VoiceSettings: () => <div data-testid="voice-settings" /> }))
 
 import { SettingsDialog } from "./settings-dialog"
 
@@ -25,7 +27,7 @@ describe("SettingsDialog", () => {
     cleanup()
   })
 
-  it("shows only General and Computer use and switches embedded content", () => {
+  it("shows General, Voice and Computer use and switches embedded content", () => {
     render(<SettingsDialog open onOpenChange={vi.fn()} />)
 
     const dialog = screen.getByRole("dialog")
@@ -35,7 +37,7 @@ describe("SettingsDialog", () => {
     )
     expect(dialog).not.toHaveClass("sm:max-w-lg")
     const navigation = screen.getByRole("navigation", { name: "settings.title" })
-    expect(navigation.querySelectorAll("button")).toHaveLength(2)
+    expect(navigation.querySelectorAll("button")).toHaveLength(3)
     expect(screen.getByRole("button", { name: "settings.tabs.general" })).toHaveAttribute("aria-current", "page")
     expect(settingsPageProps).toHaveBeenCalledTimes(1)
     expect(screen.getByTestId("settings-content").parentElement).toHaveClass(
@@ -46,6 +48,8 @@ describe("SettingsDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "settings.tabs.computerAccess" }))
     expect(screen.getByRole("button", { name: "settings.tabs.computerAccess" })).toHaveAttribute("aria-current", "page")
     expect(screen.getByTestId("computer-use-content")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "settings.tabs.voice" }))
+    expect(screen.getByTestId("voice-settings")).toBeInTheDocument()
   })
 
   it("opens a deep link on Computer use", () => {

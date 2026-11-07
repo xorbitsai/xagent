@@ -7,6 +7,13 @@ import type { TranslationKey } from "@/i18n/translations"
 type JsonObject = Record<string, unknown>
 type RuntimeBindings = JsonObject[]
 const MASKED_SECRET_VALUE = "********"
+const RESPONSE_ONLY_MCP_CONFIG_FIELDS: ReadonlySet<string> = new Set([
+  "managed",
+  "volumes",
+  "bind_ports",
+  "restart_policy",
+  "auto_start",
+])
 
 // Transports whose connectors may carry signed-upload settings. Must equal
 // SIGNED_UPLOAD_TRANSPORTS in
@@ -160,6 +167,21 @@ function cloneJson<T>(value: T): T {
     ) as T
   }
   return value
+}
+
+/**
+ * Project an MCP config returned by the detail API onto the user-editable
+ * mutation contract. Deployment metadata is intentionally readable but must
+ * never be round-tripped by either editor. The API independently rejects
+ * these fields, so this projection is compatibility glue rather than the
+ * security boundary.
+ */
+function editableMcpConfig(value: JsonObject): JsonObject {
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !RESPONSE_ONLY_MCP_CONFIG_FIELDS.has(key) && !key.startsWith("docker_"))
+      .map(([key, item]) => [key, cloneJson(item)]),
+  )
 }
 
 function invalidDetail(field: string): never {
@@ -335,7 +357,7 @@ export function mcpServerDetailToEditState(detail: McpServerDetail): McpServerEd
       name: detail.name,
       transport: detail.transport,
       description: detail.description ?? "",
-      config: cloneJson(detail.config),
+      config: editableMcpConfig(detail.config),
       user_env: cloneJson(detail.user_env ?? {}),
       can_edit_global: detail.can_edit_global,
       runtime_input_schema: cloneJson(detail.runtime_input_schema),
@@ -475,10 +497,14 @@ function mcpMutationValues(
     throw new Error("Invalid MCP server form data: allow_delegated_authorization")
   }
 
-  const config = cloneJson(configValue)
+  const config = editableMcpConfig(configValue)
   const baselineConfigEnv = baseline?.config.env
   if (isStringRecord(config.env) && isStringRecord(baselineConfigEnv)) {
     config.env = preserveBlankMaskedValues(config.env, baselineConfigEnv)
+  }
+  const baselineConfigHeaders = baseline?.config.headers
+  if (isStringRecord(config.headers) && isStringRecord(baselineConfigHeaders)) {
+    config.headers = preserveBlankMaskedValues(config.headers, baselineConfigHeaders)
   }
   const userEnv = preserveBlankMaskedValues(userEnvValue, baseline?.user_env)
 
@@ -517,7 +543,7 @@ function baselineMcpMutationValues(detail: McpServerDetail): Required<McpServerM
     name: detail.name,
     transport: detail.transport,
     description: detail.description ?? "",
-    config: detail.config,
+    config: editableMcpConfig(detail.config),
     user_env: detail.user_env ?? {},
     runtime_input_schema: detail.runtime_input_schema,
     runtime_bindings: detail.runtime_bindings,
@@ -623,6 +649,7 @@ export function buildMcpServerPayload(
 
 export interface McpOAuthConnectResponse {
   authorization_url: string
+  launch_mode?: string
 }
 
 /** Extract a human-readable message from an MCP OAuth endpoint error body.

@@ -41,7 +41,12 @@ Suppression markers never ride the read-side key
 Hard invariant enforced by this module and by the static guards that check
 it: the interaction rollout mode can only decide whether a *new* native row
 gets produced. It can never decide how an already-published row is read,
-answered, or closed.
+answered, or closed. The only exception is the resume command seam when it
+cannot read a task's active interaction row at all: it refuses the resume
+if this process's frozen mode is ``native`` and it runs shared task
+execution, and lets it proceed otherwise (see
+``native_publication_enabled_in_this_process``). A row the seam did read is
+handled the same way under every mode.
 """
 
 from __future__ import annotations
@@ -431,17 +436,17 @@ def validate_interaction_rollout_at_startup() -> InteractionRolloutPolicy:
 def _require_policy() -> InteractionRolloutPolicy:
     """Shared uninitialized-singleton guard.
 
-    Not itself a tracked consumer-facing symbol -- both the public
-    accessor below and the gate's own internal read go through this, so
-    the gate reading its own owner module's state does not inflate the
-    call-site count the ``get_interaction_rollout_policy`` guard tracks
-    for *external* consumers.
+    Not itself a tracked consumer-facing symbol -- the public accessor
+    below, ``native_publication_enabled_in_this_process`` and the gate's
+    own internal read all go through this, so this module reading its own
+    state does not inflate the call-site count the
+    ``get_interaction_rollout_policy`` guard tracks for *external*
+    consumers.
     """
     if _policy is None:
         raise RuntimeError(
-            "get_interaction_rollout_policy() called before "
-            "validate_interaction_rollout_at_startup() initialized the "
-            "interaction rollout policy singleton."
+            "the interaction rollout policy singleton was read before "
+            "validate_interaction_rollout_at_startup() initialized it."
         )
     return _policy
 
@@ -458,6 +463,23 @@ def get_interaction_rollout_policy() -> InteractionRolloutPolicy:
     recover from, so it is treated as one.
     """
     return _require_policy()
+
+
+def native_publication_enabled_in_this_process() -> bool:
+    """Whether this process can publish native interaction rows at all.
+
+    True only when the policy frozen at startup is in ``native`` mode and
+    this process runs shared task execution -- the two checks
+    ``evaluate_native_publication`` makes before anything that depends on
+    a task. The resume command seam reads it to decide what to do when it
+    could not read a task's active interaction row; a static guard pins
+    that seam as its only production caller.
+
+    Raises ``RuntimeError`` before ``validate_interaction_rollout_at_startup()``
+    has run, like ``get_interaction_rollout_policy()``.
+    """
+    policy = _require_policy()
+    return policy.mode == "native" and policy.shared_task_execution
 
 
 # ---------------------------------------------------------------------------

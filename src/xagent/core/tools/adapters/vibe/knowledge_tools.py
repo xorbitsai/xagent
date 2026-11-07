@@ -39,20 +39,12 @@ async def _create_knowledge_tools_impl(config: "BaseToolConfig") -> List[Any]:
         allowed_collections = config.get_allowed_collections()
         user_id = config.get_user_id()
         is_admin = config.is_admin()
-        # The governing agent's team, read the same way the six existing
-        # WebToolConfig-internal call sites already read it: as the private
-        # attribute, defaulting to None for every config that has no such
-        # attribute at all (every non-web config).
-        #
-        # Deliberately not behind a dedicated accessor. The attribute already
-        # has six direct readers inside WebToolConfig (config.py:1593, :1792,
-        # :2078, :3530, :3546, :3592), none of which an accessor added here
-        # would convert; a seventh reader asking the same question a seventh
-        # way is a second convention nothing else adopts, and the next reader
-        # then has to learn which of the two is authoritative. The two
-        # genuinely new values below get accessors because they have no
-        # existing readers to be inconsistent with.
-        governing_team_id = getattr(config, "_connector_team_id", None)
+        # The governing agent's team for knowledge-base resolution. This is
+        # its own config value, not the connector team: delegated sub-agents
+        # keep team connectors closed while still resolving knowledge bases
+        # against the delegated agent's team, so the two must not share a
+        # field.
+        governing_team_id = config.get_knowledge_base_team_id()
         agent_creator_user_id = config.get_agent_creator_user_id()
         declared_knowledge_bases = config.get_declared_knowledge_bases()
 

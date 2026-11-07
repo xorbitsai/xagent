@@ -19,6 +19,8 @@ from xagent.web.models.user import User
 from xagent.web.services.agent_service_manager import (
     AgentServiceManager,
     AgentServiceMemoryPolicy,
+    _task_model_override_excluded_categories,
+    _task_model_override_excluded_model_ids,
 )
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
@@ -148,6 +150,92 @@ class TestApply:
             "basic",
         ]
 
+    def test_explicit_exclusions_stay_on_the_snapshot_override(self):
+        applied = apply_task_model_override(
+            _snapshot(["web_search", "mcp", "basic"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert applied.agent_config["tool_categories"] == ["web_search", "basic"]
+        assert applied.model_override is not None
+        assert applied.model_override.excluded_tool_categories == frozenset({"mcp"})
+        # No side-channel key in agent_config: the tool build reads the
+        # exclusion set off the snapshot's model_override instead.
+        assert not any(key.startswith("__xagent_") for key in applied.agent_config)
+
+    def test_an_exclusion_the_selection_never_listed_stays_on_the_override(self):
+        # An old agent created before it had an "mcp" category still honours
+        # the run's explicit exclusion: the actor-marked MCP add-back must not
+        # re-introduce it just because its persisted list never held it.
+        applied = apply_task_model_override(
+            _snapshot(["web_search", "basic"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert applied.agent_config["tool_categories"] == ["web_search", "basic"]
+        assert applied.model_override is not None
+        assert applied.model_override.excluded_tool_categories == frozenset({"mcp"})
+
+    def test_a_later_override_replaces_the_exclusions_on_the_snapshot(self):
+        # A second apply replaces model_override wholesale, so the set is
+        # whatever that apply requested -- never a union with the earlier one.
+        first = apply_task_model_override(
+            _snapshot(["mcp", "basic", "web_search"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        same = apply_task_model_override(
+            first,
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert same.model_override is not None
+        assert same.model_override.excluded_tool_categories == frozenset({"mcp"})
+
+        replaced = apply_task_model_override(
+            same,
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"web_search"}),
+            ),
+        )
+        assert replaced.model_override is not None
+        assert replaced.model_override.excluded_tool_categories == frozenset(
+            {"web_search"}
+        )
+
+    def test_the_vision_removal_is_not_part_of_the_exclusions(self):
+        # The vision category has its own stand-in mechanism; only the
+        # caller's explicit exclusions feed the downstream MCP guard.
+        applied = apply_task_model_override(
+            _snapshot(["basic", "vision", "mcp"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert applied.agent_config["tool_categories"] == ["basic"]
+        assert applied.model_override is not None
+        assert applied.model_override.excluded_tool_categories == frozenset({"mcp"})
+
+    def test_without_explicit_exclusions_the_override_carries_none(self):
+        selected = NamedLLM("selected", ["chat", "vision"])
+        applied = apply_task_model_override(
+            _snapshot(["basic"]),
+            TaskModelOverride(llm=selected, vision_llm=selected),
+        )
+        assert applied.model_override is not None
+        assert applied.model_override.excluded_tool_categories == frozenset()
+        assert not any(key.startswith("__xagent_") for key in applied.agent_config)
+
     def test_a_missing_vision_model_takes_vision_tools_out_of_the_selection(self):
         applied = apply_task_model_override(
             _snapshot(["basic", "vision", "image"]),
@@ -218,6 +306,69 @@ class TestExcludedCategories:
     def test_names_must_be_strings(self):
         with pytest.raises(TypeError):
             TaskModelOverride(llm=NamedLLM("selected"), excluded_tool_categories={1})  # type: ignore[arg-type]
+
+    def test_the_reader_takes_the_set_from_the_snapshot_override(self):
+        # The tool build reads the exclusion set off the snapshot's
+        # model_override; without one it means "nothing excluded", so the
+        # legacy MCP add-back / forced load stay in place.
+        assert _task_model_override_excluded_categories(None) == frozenset()
+        assert (
+            _task_model_override_excluded_categories(_snapshot(["basic"]))
+            == frozenset()
+        )
+        applied = apply_task_model_override(
+            _snapshot(["basic"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert _task_model_override_excluded_categories(applied) == frozenset({"mcp"})
+
+
+class TestExcludedModelIds:
+    def test_any_collection_becomes_a_frozenset(self):
+        override = TaskModelOverride(
+            llm=NamedLLM("selected"),
+            excluded_model_ids=["img-1", "vid-1"],  # type: ignore[arg-type]
+        )
+        assert override.excluded_model_ids == frozenset({"img-1", "vid-1"})
+
+    def test_the_default_is_empty(self):
+        assert (
+            TaskModelOverride(llm=NamedLLM("selected")).excluded_model_ids
+            == frozenset()
+        )
+
+    @pytest.mark.parametrize("value", ["img-1", b"img-1"])
+    def test_a_single_string_is_refused(self, value):
+        with pytest.raises(TypeError):
+            TaskModelOverride(llm=NamedLLM("selected"), excluded_model_ids=value)  # type: ignore[arg-type]
+
+    def test_ids_must_be_strings(self):
+        with pytest.raises(TypeError):
+            TaskModelOverride(llm=NamedLLM("selected"), excluded_model_ids={1})  # type: ignore[arg-type]
+
+    def test_apply_carries_the_set_on_the_snapshot_override(self):
+        override = TaskModelOverride(
+            llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+        )
+        applied = apply_task_model_override(_snapshot(["image"]), override)
+        assert applied.model_override is override
+        assert applied.model_override.excluded_model_ids == frozenset({"img-1"})
+
+    def test_the_reader_takes_the_set_from_the_snapshot_override(self):
+        assert _task_model_override_excluded_model_ids(None) == frozenset()
+        assert (
+            _task_model_override_excluded_model_ids(_snapshot(["image"])) == frozenset()
+        )
+        applied = apply_task_model_override(
+            _snapshot(["image"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+            ),
+        )
+        assert _task_model_override_excluded_model_ids(applied) == frozenset({"img-1"})
 
 
 def test_the_stand_in_is_not_reported_as_a_configured_vision_model() -> None:
@@ -657,3 +808,68 @@ async def test_the_built_service_and_its_tools_use_only_the_override() -> None:
         tool_kwargs["llm"],
         tool_kwargs["vision_model"],
     }
+
+
+@pytest.mark.asyncio
+async def test_get_agent_for_task_passes_excluded_model_ids() -> None:
+    builds = _Builds()
+    override = TaskModelOverride(
+        llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+    )
+    await builds.get(apply_task_model_override(_snapshot(["image"]), override))
+
+    assert builds.tool_calls[-1]["excluded_model_ids"] == frozenset({"img-1"})
+
+
+@pytest.mark.asyncio
+async def test_get_agent_for_task_without_override_passes_no_excluded_model_ids() -> (
+    None
+):
+    builds = _Builds()
+    await builds.get(_snapshot(["image"]))
+
+    assert builds.tool_calls[-1]["excluded_model_ids"] == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_build_tools_for_task_passes_excluded_model_ids() -> None:
+    manager = AgentServiceManager()
+    override = TaskModelOverride(
+        llm=NamedLLM("selected"), excluded_model_ids=frozenset({"img-1"})
+    )
+    snapshot = apply_task_model_override(_snapshot(["image", "basic"]), override)
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+    # The four columns the team-member grant gate reads, as a task row with no
+    # channel and no SDK key stores them. The gate refuses "external" either way.
+    task = SimpleNamespace(
+        id=42,
+        user_id=1,
+        source="external",
+        agent_config={},
+        channel_id=None,
+        channel_name=None,
+        telegram_user_id=None,
+        sdk_credential_kind=None,
+    )
+
+    with (
+        patch.object(
+            manager, "_get_or_create_task_sandbox", new=AsyncMock(return_value=None)
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+    ):
+        await manager._build_tools_for_task(
+            task_id=42,
+            task=task,
+            db=None,
+            user=RuntimeUserFields(id=1, is_admin=False),
+            agent_config=snapshot.agent_config,
+            task_llm=snapshot.task_llm,
+            task_vision_llm=snapshot.task_vision_llm,
+            task_setup_snapshot=snapshot,
+        )
+
+    assert create_tools.await_args.kwargs["excluded_model_ids"] == frozenset({"img-1"})

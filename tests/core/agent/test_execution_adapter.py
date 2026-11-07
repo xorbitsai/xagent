@@ -10,7 +10,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig, ReActPattern
+from xagent.core.agent import (
+    AgentExecutionAdapter,
+    AgentExecutionConfig,
+    ExecutionContext,
+    PatternRuntime,
+    ReActPattern,
+)
 from xagent.core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
@@ -119,6 +125,41 @@ class RecordingRegistry:
         return StartHandle()
 
 
+class BindingSnapshotRegistry:
+    def __init__(self) -> None:
+        self.handles: dict[str, SimpleNamespace] = {}
+        self.started_runners: list[Any] = []
+        self.resumed_binding: tuple[Any, Any] | None = None
+        self.resume_kwargs: dict[str, Any] | None = None
+
+    def start(
+        self,
+        runner: Any,
+        *,
+        execution_id: str,
+        metadata: dict[str, Any],
+        **_kwargs: Any,
+    ) -> StartHandle:
+        self.started_runners.append(runner)
+        self.handles[execution_id] = SimpleNamespace(
+            runner=runner,
+            metadata=dict(metadata),
+        )
+        return StartHandle()
+
+    def get(self, execution_id: str) -> SimpleNamespace | None:
+        return self.handles.get(execution_id)
+
+    async def resume(self, execution_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.resume_kwargs = dict(kwargs)
+        runner = self.handles[execution_id].runner
+        self.resumed_binding = (
+            runner.agent.memory_store,
+            runner.agent.memory_tools_factory,
+        )
+        return {"success": True, "output": "resumed"}
+
+
 class NoSkillManager:
     async def list_skills(self) -> list[dict[str, Any]]:
         return []
@@ -135,6 +176,34 @@ class ReusedExecutionAdapter:
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         self.execute_kwargs = dict(kwargs)
         return {"success": True}
+
+
+def test_runner_pattern_kwargs_include_custom_memory_tool_factory() -> None:
+    def factory(**_kwargs: Any) -> list[Any]:
+        return []
+
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="memory-factory-kwargs",
+            pattern="auto",
+            llm=FakeLLM([]),
+            memory_store=InMemoryMemoryStore(),
+            memory_tools_factory=factory,
+        )
+    )
+    runner, _ = adapter._build_runner()
+    pattern = runner.agent.patterns[0]
+
+    kwargs = runner._build_pattern_kwargs(
+        pattern=pattern,
+        task="remember",
+        context=ExecutionContext(execution_id="memory-factory-kwargs"),
+        tools=[],
+        runtime=PatternRuntime(execution_id="memory-factory-kwargs"),
+        streaming_handler=None,
+    )
+
+    assert kwargs["memory_tools_factory"] is factory
 
 
 def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -> None:
@@ -176,6 +245,71 @@ def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -
     assert metadata["builtin_agent_name"] == "internal_worker"
     assert normalized["metadata"]["agent_type"] == "builtin"
     assert normalized["metadata"]["builtin_agent_name"] == "internal_worker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern_name", ["react", "dag_plan_execute", "auto"])
+async def test_execution_binding_is_snapshotted_until_next_start_or_resume(
+    pattern_name: str,
+) -> None:
+    old_store = InMemoryMemoryStore()
+    new_store = InMemoryMemoryStore()
+
+    def old_factory(_request: object) -> list[str]:
+        return ["old"]
+
+    def new_factory(_request: object) -> list[str]:
+        return ["new"]
+
+    registry = BindingSnapshotRegistry()
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="memory-binding-snapshot",
+            pattern=pattern_name,
+            llm=FakeLLM([]),
+            registry=cast(Any, registry),
+            memory_store=old_store,
+            memory_tools_factory=old_factory,
+            execution_metadata={
+                MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "old-fingerprint"
+            },
+        )
+    )
+
+    adapter.start(task="active turn", task_id="active")
+    active_runner = registry.started_runners[-1]
+
+    adapter.config.memory_store = new_store
+    adapter.config.memory_tools_factory = new_factory
+    adapter.config.execution_metadata = {
+        MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "new-fingerprint"
+    }
+
+    assert active_runner.agent.memory_store is old_store
+    assert active_runner.agent.memory_tools_factory is old_factory
+    assert (
+        active_runner.agent.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY]
+        == "old-fingerprint"
+    )
+
+    adapter.start(task="next turn", task_id="next")
+    next_runner = registry.started_runners[-1]
+    assert next_runner.agent.memory_store is new_store
+    assert next_runner.agent.memory_tools_factory is new_factory
+    assert (
+        next_runner.agent.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY]
+        == "new-fingerprint"
+    )
+
+    await adapter.resume("active")
+    assert registry.resumed_binding == (new_store, new_factory)
+    assert registry.resume_kwargs is not None
+    assert (
+        registry.resume_kwargs["metadata"][
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+        ]
+        == "new-fingerprint"
+    )
 
 
 @pytest.mark.asyncio

@@ -809,7 +809,8 @@ def _acquire_reply_prelease_sync(
 
     ``agent_id`` re-checks the task row against the value
     ``_resolve_task_or_404`` already authorized for this call -- ownership
-    itself (agent-bound vs workforce-bound key) was established there;
+    itself (agent-bound, workforce-bound or personal key, including a
+    personal key holder's access to the agent) was established there;
     this claim only needs to confirm the row's identity hasn't moved
     since, which a scalar ``agent_id`` match does without a join.
 

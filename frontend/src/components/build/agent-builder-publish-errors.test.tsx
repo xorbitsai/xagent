@@ -144,7 +144,7 @@ function agentResponse(status: "draft" | "published") {
     models: { general: "10" },
     knowledge_bases: [],
     skills: [],
-    tool_categories: ["basic"],
+    tool_categories: ["basic_tools"],
     suggested_prompts: [],
     logo_url: null,
     status,

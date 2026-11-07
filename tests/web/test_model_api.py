@@ -23,7 +23,7 @@ from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig
-from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.database import Base, get_db, get_engine, get_session_local
 from xagent.web.models.model import Model as DBModel
 from xagent.web.models.user import UserDefaultModel, UserModel
 from xagent.web.services.llm_utils import (
@@ -775,6 +775,134 @@ def test_xinference_tts_models_route_is_removed():
 
     assert response.status_code == 404
     list_models.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_speech_voice_listing_uses_accessible_model_and_closes_client(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, caplog, failure
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    provider = SimpleNamespace(
+        api_key="synthetic-secret",
+        supports_voice_listing=True,
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "voice-one", "name": "Rachel", "extra": "private metadata"}
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    if failure:
+        provider.list_available_voices.side_effect = RuntimeError("synthetic-secret")
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    assert client.get(
+        "/api/models/speech/voices", params={"model_id": model_id}
+    ).status_code in {401, 403}
+    factory.assert_not_called()
+    assert (
+        client.get(
+            "/api/models/speech/voices",
+            params={"model_id": "missing"},
+            headers=regular_headers,
+        ).status_code
+        == 404
+    )
+    factory.assert_not_called()
+    with monkeypatch.context() as hidden:
+        hidden.setattr(model_module, "_passes_model_visibility_hook", lambda *_: False)
+        assert (
+            client.get(
+                "/api/models/speech/voices",
+                params={"model_id": model_id},
+                headers=regular_headers,
+            ).status_code
+            == 404
+        )
+    factory.assert_not_called()
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (502 if failure else 200), response.text
+    if not failure:
+        assert response.json() == [{"voice_id": "voice-one", "name": "Rachel"}]
+    assert "synthetic-secret" not in response.text + caplog.text
+    provider.aclose.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "case", ["inactive", "non_speech", "non_tts", "unsupported", "malformed_ids"]
+)
+def test_speech_voice_listing_capability_and_output_boundaries(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, case
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    if case in {"inactive", "non_speech", "non_tts"}:
+        with get_session_local()() as db:
+            saved = db.query(DBModel).filter_by(model_id=model_id).one()
+            if case == "inactive":
+                saved.is_active = False
+            if case == "non_speech":
+                saved.category = "llm"
+            if case == "non_tts":
+                saved.abilities = ["asr"]
+            db.commit()
+    provider = SimpleNamespace(
+        supports_voice_listing=case != "unsupported",
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "safe-voice", "name": "Rachel"},
+                {"voice_id": "../private"},
+                {"voice_id": 123},
+                {},
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (
+        200 if case == "malformed_ids" else 404 if case == "inactive" else 400
+    ), response.text
+    if case in {"inactive", "non_speech", "non_tts"}:
+        factory.assert_not_called()
+    else:
+        provider.aclose.assert_awaited_once()
+        if case == "unsupported":
+            provider.list_available_voices.assert_not_called()
+        else:
+            assert response.json() == [{"voice_id": "safe-voice", "name": "Rachel"}]
 
 
 class TestModelAPI:
@@ -3169,6 +3297,45 @@ class TestModelAPI:
             )
 
         assert response.status_code == 500
+        assert standalone_hook.calls == []
+
+    def test_transcribe_speech_refused_by_the_gate_is_a_402_without_a_call(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        from xagent.core.model.asr.xinference import XinferenceASR
+        from xagent.web.services import quota_hooks
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+        handle = AsyncMock()
+        gate_calls: list = []
+
+        def gate(user_id, source, model_ids):
+            gate_calls.append((user_id, source, model_ids))
+            return {"code": "ai_credits_exhausted", "message": "Out of AI credits"}
+
+        quota_hooks.set_standalone_gate_hook(gate)
+        try:
+            with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+                response = client.post(
+                    "/api/models/speech/transcribe",
+                    files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                    headers=regular_headers,
+                )
+        finally:
+            quota_hooks.set_standalone_gate_hook(None)
+
+        assert response.status_code == 402
+        detail = response.json()["detail"]
+        assert detail["code"] == "standalone_usage_refused"
+        assert detail["reason"]["code"] == "ai_credits_exhausted"
+        # The request names no model: the gate gets the user's default.
+        assert gate_calls == [(regular_user["id"], "speech_transcribe", ("test-asr",))]
+        handle.assert_not_called()
         assert standalone_hook.calls == []
 
     @pytest.mark.parametrize("category", ["embedding", "rerank"])

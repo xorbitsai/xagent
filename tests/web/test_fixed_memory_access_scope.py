@@ -103,6 +103,70 @@ def test_memory_access_scope_copies_and_freezes_dimensions() -> None:
         scope.memory_dimensions["principal"] = "person-3"  # type: ignore[index]
 
 
+def test_memory_access_scope_requires_explicit_strict_owner_only() -> None:
+    scope = MemoryAccessScope(
+        owner_user_id=700,
+        memory_dimensions={},
+        strict_owner_only=True,
+    )
+
+    assert dict(scope.memory_dimensions) == {}
+    assert scope.strict_owner_only is True
+    with pytest.raises(ValueError, match="cannot include"):
+        MemoryAccessScope(
+            owner_user_id=700,
+            memory_dimensions={"principal": "person-1"},
+            strict_owner_only=True,
+        )
+    with pytest.raises(TypeError, match="must be a bool"):
+        MemoryAccessScope(
+            owner_user_id=700,
+            memory_dimensions={},
+            strict_owner_only=1,  # type: ignore[arg-type]
+        )
+
+
+def test_strict_owner_only_scope_excludes_dimension_stamped_notes() -> None:
+    base = InMemoryMemoryStore()
+    ambient = UserIsolatedMemoryStore(base)
+    owner_only = ambient.with_memory_access_scope(
+        MemoryAccessScope(
+            owner_user_id=700,
+            memory_dimensions={},
+            strict_owner_only=True,
+        )
+    )
+    dimensioned = ambient.with_memory_access_scope(SCOPE_A)
+    other_owner = ambient.with_memory_access_scope(
+        MemoryAccessScope(
+            owner_user_id=701,
+            memory_dimensions={},
+            strict_owner_only=True,
+        )
+    )
+
+    owner_note = MemoryNote(content="owner only")
+    dimensioned_note = MemoryNote(content="dimensioned")
+    other_owner_note = MemoryNote(content="other owner")
+    assert owner_only.add(owner_note).success
+    assert dimensioned.add(dimensioned_note).success
+    assert other_owner.add(other_owner_note).success
+
+    with (
+        UserContext(999),
+        ExecutionScopeContext(
+            ExecutionScope(memory_dimensions={"principal": "ambient"})
+        ),
+    ):
+        assert [note.id for note in owner_only.list_all()] == [owner_note.id]
+        assert not owner_only.get(dimensioned_note.id).success
+        assert not owner_only.get(other_owner_note.id).success
+        assert not owner_only.update(
+            MemoryNote(id=dimensioned_note.id, content="forged")
+        ).success
+        assert not owner_only.delete(dimensioned_note.id).success
+
+
 @pytest.mark.asyncio
 async def test_fixed_scope_covers_crud_filters_clear_stats_and_thread_hops() -> None:
     base = InMemoryMemoryStore()

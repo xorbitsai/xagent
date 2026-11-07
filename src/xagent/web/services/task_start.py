@@ -13,7 +13,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, cast
+from typing import Any, Literal, Optional, cast
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -28,6 +28,8 @@ from ..models.task_input_receipt import TaskInputReceipt
 from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
 from .a2a_task_read import load_a2a_task_snapshot
+from .agent_store import AgentStore
+from .api_idempotency import IdempotencyClaim, bind_task_no_commit
 from .connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -49,7 +51,13 @@ from .managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
-from .prompt_context import build_prompt_context_value
+from .prompt_context import filter_prompt_context
+from .response_format import (
+    ResponseFormatChange,
+    echo_for_change,
+    echo_for_config,
+    store_response_format,
+)
 from .task_command_transport import (
     _resolve_actor_subject,
     command_identity_matches_task,
@@ -86,7 +94,9 @@ class TaskStartRejected(Exception):
     """A domain rejection for the API to translate to its protocol.
 
     ``expired_at`` is set only on a ``task_expired`` rejection (see
-    :func:`resolve_sdk_task`), together with ``task_id``.
+    :func:`resolve_sdk_task`), together with ``task_id``. ``fields`` is set
+    only on a ``prompt_context_fields_rejected`` rejection: the rejected
+    ``prompt_context`` field names, in input order.
     """
 
     def __init__(
@@ -96,20 +106,39 @@ class TaskStartRejected(Exception):
         task_id: int | None = None,
         context_id: str | None = None,
         expired_at: datetime | None = None,
+        fields: tuple[str, ...] = (),
     ):
         super().__init__(reason)
         self.reason = reason
         self.task_id = task_id
         self.context_id = context_id
         self.expired_at = expired_at
+        self.fields = fields
 
 
 @dataclass(frozen=True)
 class SdkTaskScope:
-    """Authenticated SDK owner; exactly one owner ID is set."""
+    """Authenticated SDK owner; exactly one owner ID is set.
+
+    ``agent_id`` or ``workforce_id`` is the owner a runtime key is bound to;
+    ``user_id`` is the holder of a personal key. A scope with none of them
+    set matches no task.
+    """
 
     agent_id: int | None
     workforce_id: int | None
+    user_id: int | None = None
+
+
+SdkCredentialKind = Literal["runtime", "personal"]
+_PERSONAL_CREDENTIAL = "personal"
+# ``tasks.sdk_credential_kind`` for each SDK credential kind. A runtime key
+# stores NULL, which is also what every other task writer leaves, so a task
+# created before the column existed reads as a runtime-key task.
+_SDK_CREDENTIAL_KIND_COLUMN: dict[str, str | None] = {
+    "runtime": None,
+    "personal": _PERSONAL_CREDENTIAL,
+}
 
 
 @dataclass(frozen=True)
@@ -128,6 +157,10 @@ class TaskStartResult:
     run_id: str
     state_version: int
     control_state: str
+    # The format in force on the task once the request was handled. Neither
+    # field has a default, so a construction site that forgets them fails.
+    response_format_type: str
+    response_format_name: str
     # Set only by task creation: the class its start command was given. None for
     # an append, and for a creation that runs in this process.
     dispatch_class: DispatchClass | None = None
@@ -203,13 +236,25 @@ def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPay
 
 
 def _prompt_context_value_for_agent(
-    prompt_context: dict[str, Any] | None, agent: Agent
+    prompt_context: dict[str, Any] | None, agent: Agent, *, signed: bool
 ) -> dict[str, Any] | None:
+    """Return the value to store for ``prompt_context``, or None for none.
+
+    Signed values (runtime keys) skip the field whitelist and the length
+    limits; declarations still supply field descriptions.
+    Unsigned values (personal keys) are all or nothing: a field the agent
+    does not declare, or longer than its declared length, rejects the whole
+    request with ``prompt_context_fields_rejected``. Callers run this before
+    any write, so a rejection leaves nothing behind.
+    """
     if prompt_context is None:
         return None
-    return build_prompt_context_value(
-        prompt_context, agent.prompt_context_fields, signed=True
+    value, rejected = filter_prompt_context(
+        prompt_context, agent.prompt_context_fields, signed=signed
     )
+    if rejected and not signed:
+        raise TaskStartRejected("prompt_context_fields_rejected", fields=rejected)
+    return value
 
 
 def _store_connector_runtime_values_or_fail(
@@ -260,6 +305,9 @@ class _PreparedAppendTurn:
     task_owner_user_id: int
     payload: TaskTurnPayload
     claimed_turn: _PreparedTurn
+    # The format on the task as the claiming transaction left it.
+    response_format_type: str
+    response_format_name: str
 
 
 def _prepare_created_task_isolated(
@@ -274,18 +322,32 @@ def _prepare_created_task_isolated(
     timezone: str | None = None,
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
+    response_format: ResponseFormatChange = None,
+    credential_kind: SdkCredentialKind,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
+    stored_credential_kind = _SDK_CREDENTIAL_KIND_COLUMN[credential_kind]
     SessionLocal = get_session_local()
     db = SessionLocal()
     payload: TaskTurnPayload | None = None
     owned_task_id = 0
     try:
-        agent = db.get(Agent, agent_id)
+        if stored_credential_kind == _PERSONAL_CREDENTIAL:
+            # A personal key runs only an agent its holder can see. Nothing
+            # the agent declares, and no file or connector input, is read
+            # before this check.
+            agent = AgentStore(db).get_owned_agent(task_owner_user_id, agent_id)
+        else:
+            agent = db.get(Agent, agent_id)
         if agent is None:
             raise TaskStartRejected("agent_not_found")
-        prompt_context_value = _prompt_context_value_for_agent(prompt_context, agent)
+        prompt_context_value = _prompt_context_value_for_agent(
+            prompt_context,
+            agent,
+            signed=stored_credential_kind != _PERSONAL_CREDENTIAL,
+        )
 
         file_infos = _resolve_turn_files(
             file_ids=list(file_ids),
@@ -301,16 +363,23 @@ def _prepare_created_task_isolated(
             agent_id=agent_id,
             input=message,
             source="sdk",
+            sdk_credential_kind=stored_credential_kind,
             is_visible=False,
             requested_dispatch_class=requested_dispatch_class,
             dispatch_priority=requested_priority,
         )
-        if prompt_context_value is not None:
-            setattr(
-                task,
-                "agent_config",
-                {PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context_value},
-            )
+        new_task_agent_config = store_response_format(
+            (
+                {PROMPT_CONTEXT_AGENT_CONFIG_KEY: prompt_context_value}
+                if prompt_context_value is not None
+                else {}
+            ),
+            response_format,
+        )
+        # A task that carries neither a prompt context nor a format keeps the
+        # column unset.
+        if new_task_agent_config:
+            setattr(task, "agent_config", new_task_agent_config)
         runtime_plan = prepare_create_connector_runtime(
             db=db,
             agent=agent,
@@ -369,6 +438,9 @@ def _prepare_created_task_isolated(
                     )
                 ).scalar_one(),
             )
+        if idempotency_claim is not None:
+            # Same transaction as the task: the key is bound to it or to nothing.
+            bind_task_no_commit(db, idempotency_claim, task_id)
         commit_claimed_turn_or_reconcile(
             db,
             task_id=task_id,
@@ -399,6 +471,7 @@ def validate_sdk_owner_scope(
     *,
     request_agent_id: int | None,
     request_workforce_id: int | None,
+    task_agent_id: int,
 ) -> None:
     """Validate a request body's owner-scoping fields against the key.
 
@@ -407,10 +480,12 @@ def validate_sdk_owner_scope(
     agent-bound key must pass a matching ``agent_id`` and no
     ``workforce_id``; a workforce-bound key must not pass ``agent_id``
     and, if it passes ``workforce_id``, it must match the bound
-    workforce. Task ownership itself must already be resolved (e.g. via
-    :func:`resolve_sdk_task`) before calling this, so an unrelated
-    task stays an opaque ``task_not_found`` even when the body also
-    names the wrong owner.
+    workforce; a personal key may pass ``agent_id`` only as the task's
+    own ``task_agent_id`` and never passes ``workforce_id``. A scope with
+    no owner is ``task_not_found``. Task ownership itself must already be
+    resolved (e.g. via :func:`resolve_sdk_task`) before calling this, so
+    an unrelated task stays an opaque ``task_not_found`` even when the
+    body also names the wrong owner.
     """
     if scope.agent_id is not None:
         if request_agent_id is None:
@@ -419,8 +494,7 @@ def validate_sdk_owner_scope(
             raise TaskStartRejected("agent_not_found")
         if request_workforce_id is not None:
             raise TaskStartRejected("workforce_not_found")
-    else:
-        assert scope.workforce_id is not None
+    elif scope.workforce_id is not None:
         if request_agent_id is not None:
             raise TaskStartRejected("agent_not_found")
         if (
@@ -428,6 +502,31 @@ def validate_sdk_owner_scope(
             and request_workforce_id != scope.workforce_id
         ):
             raise TaskStartRejected("workforce_not_found")
+    elif scope.user_id is not None:
+        if request_agent_id is not None and request_agent_id != task_agent_id:
+            raise TaskStartRejected("agent_not_found")
+        if request_workforce_id is not None:
+            raise TaskStartRejected("workforce_not_found")
+    else:
+        raise TaskStartRejected("task_not_found")
+
+
+def ensure_sdk_task_agent_reachable(
+    db: Session, scope: SdkTaskScope, task: Task
+) -> None:
+    """Raise ``agent_not_found`` unless a personal key's holder can still run
+    the task's agent.
+
+    Called by the writes that start work on an existing task (append,
+    reply), in the session that authorized the task and before anything
+    the agent declares is read. A runtime key is bound to its agent or
+    workforce, so nothing is re-checked for one.
+    """
+    if scope.user_id is None:
+        return
+    agent = AgentStore(db).get_owned_agent(int(task.user_id), int(task.agent_id))
+    if agent is None:
+        raise TaskStartRejected("agent_not_found")
 
 
 def _prepare_append_turn_isolated(
@@ -441,6 +540,8 @@ def _prepare_append_turn_isolated(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
+    response_format: ResponseFormatChange = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> _PreparedAppendTurn:
     """Resolve append authorization and runtime inputs into detached values."""
 
@@ -457,7 +558,9 @@ def _prepare_append_turn_isolated(
             scope,
             request_agent_id=request_agent_id,
             request_workforce_id=request_workforce_id,
+            task_agent_id=int(task.agent_id),
         )
+        ensure_sdk_task_agent_reachable(db, scope, task)
 
         runtime_agent = db.get(Agent, int(task.agent_id))
         if runtime_agent is None:
@@ -466,7 +569,10 @@ def _prepare_append_turn_isolated(
         # A provided object replaces the stored value; ``{}`` clears the key.
         if prompt_context is not None:
             prompt_context_value = _prompt_context_value_for_agent(
-                prompt_context, runtime_agent
+                prompt_context,
+                runtime_agent,
+                signed=cast("str | None", task.sdk_credential_kind)
+                != _PERSONAL_CREDENTIAL,
             )
             task_agent_config = (
                 dict(task.agent_config) if isinstance(task.agent_config, dict) else {}
@@ -478,6 +584,17 @@ def _prepare_append_turn_isolated(
             else:
                 task_agent_config.pop(PROMPT_CONTEXT_AGENT_CONFIG_KEY, None)
             setattr(task, "agent_config", task_agent_config)
+        # ``None`` keeps the stored format; the write shares this transaction
+        # with the claim below, so a rejected append leaves the format alone.
+        if response_format is not None:
+            setattr(
+                task,
+                "agent_config",
+                store_response_format(
+                    task.agent_config if isinstance(task.agent_config, dict) else {},
+                    response_format,
+                ),
+            )
         runtime_plan = prepare_append_connector_runtime(
             db=db,
             agent=runtime_agent,
@@ -501,12 +618,26 @@ def _prepare_append_turn_isolated(
                 values_by_ref=runtime_plan.ephemeral_by_ref,
             )
 
+        if prompt_context is not None or response_format is not None:
+            # The shared-mode claim re-reads the task row with
+            # ``populate_existing`` and this session does not autoflush, so an
+            # unflushed config write would be discarded there. The flush stays
+            # inside the claim's transaction, so a refused append rolls it back,
+            # and it comes after the file and connector preparation so the row
+            # is not locked while files are fetched.
+            db.flush()
         claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
             db,
             task_id=int(task.id),
             task_owner_user_id=task_owner_user_id,
             payload=payload,
             actor_user_id=actor_user_id,
+        )
+        # The claim reads the config back from the row it accepted, so the echo
+        # matches what this turn runs with even if another append changed the
+        # format after this request loaded the task.
+        response_format_type, response_format_name = echo_for_config(
+            claimed_turn.agent_config
         )
         if not get_shared_task_execution_enabled():
             _store_connector_runtime_values_or_fail(
@@ -522,7 +653,11 @@ def _prepare_append_turn_isolated(
             task_owner_user_id=task_owner_user_id,
             payload=payload,
             claimed_turn=claimed_turn,
+            response_format_type=response_format_type,
+            response_format_name=response_format_name,
         )
+        if idempotency_claim is not None:
+            bind_task_no_commit(db, idempotency_claim, int(task.id))
         commit_claimed_turn_or_reconcile(
             db,
             task_id=int(task.id),
@@ -550,11 +685,17 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
       2. Belongs to the key's owner -- directly (``Task.agent_id`` for
          an agent-bound key) or through a workforce run
          (``WorkforceRun.task_id`` for a workforce-bound key; the
-         binding is 1:1 unique).
+         binding is 1:1 unique) -- and was created by that kind of key:
+         a runtime key reaches only tasks whose ``sdk_credential_kind``
+         is NULL. A personal key reaches only tasks its holder owns
+         (``Task.user_id``), that a personal key created
+         (``sdk_credential_kind == "personal"``) and whose agent still
+         exists.
       3. Was created by the SDK (``source == "sdk"``).
 
-    Any other case — missing row, row belongs to a different owner,
-    or row was created by the Web UI / internal paths — raises
+    A scope with no owner matches nothing. Any other case — missing row,
+    row belongs to a different owner or credential kind, or row was
+    created by the Web UI / internal paths — raises
     :class:`TaskStartRejected` with ``task_not_found``. Missing and
     inaccessible tasks share one rejection so adapters can preserve
     non-disclosing error responses.
@@ -587,25 +728,38 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
             ``task_expired`` (with ``task_id`` and ``expired_at``) when
             retention expired a task the calling key could have seen.
     """
-    # This predicate (source == "sdk", plus the key's agent or workforce)
-    # must stay column-for-column identical to the tombstone predicate in
-    # _raise_if_expired_for_scope below -- otherwise a key could see a task
-    # live that its tombstone would hide, or vice versa, after retention
-    # deletes the row. tests/web/api/v1/test_expired_tasks.py's
+    # This predicate (source == "sdk", plus the key's agent, workforce or
+    # holder and the credential kind) must stay column-for-column identical
+    # to the tombstone predicate in _raise_if_expired_for_scope below --
+    # otherwise a key could see a task live that its tombstone would hide,
+    # or vice versa, after retention deletes the row.
+    # tests/web/api/v1/test_expired_tasks.py's
     # test_resolve_sdk_task_live_and_tombstone_predicates_agree checks the
-    # two predicates against each other across agent/workforce keys and
-    # task sources; update it alongside either predicate.
+    # two predicates against each other across agent, workforce and
+    # personal keys, credential kinds and task sources; update it alongside
+    # either predicate.
     query = db.query(Task).filter(
         Task.id == task_id,
         Task.source == "sdk",
     )
     if scope.agent_id is not None:
-        query = query.filter(Task.agent_id == scope.agent_id)
-    else:
-        assert scope.workforce_id is not None
-        query = query.join(WorkforceRun, WorkforceRun.task_id == Task.id).filter(
-            WorkforceRun.workforce_id == scope.workforce_id
+        query = query.filter(
+            Task.agent_id == scope.agent_id,
+            Task.sdk_credential_kind.is_(None),
         )
+    elif scope.workforce_id is not None:
+        query = query.join(WorkforceRun, WorkforceRun.task_id == Task.id).filter(
+            WorkforceRun.workforce_id == scope.workforce_id,
+            Task.sdk_credential_kind.is_(None),
+        )
+    elif scope.user_id is not None:
+        query = query.filter(
+            Task.user_id == scope.user_id,
+            Task.sdk_credential_kind == _PERSONAL_CREDENTIAL,
+            Task.agent_id.is_not(None),
+        )
+    else:
+        raise TaskStartRejected("task_not_found")
     task = query.first()
     if task is None:
         _raise_if_expired_for_scope(task_id, scope, db)
@@ -617,8 +771,10 @@ def _raise_if_expired_for_scope(task_id: int, scope: SdkTaskScope, db: Session) 
     """Raise ``task_expired`` if retention expired a task ``scope`` could see.
 
     The tombstone is held to :func:`resolve_sdk_task`'s own predicate,
-    column for column: ``source == "sdk"``, and the key's agent or
-    workforce. The workforce is read from the tombstone rather than
+    column for column: ``source == "sdk"``, the key's agent, workforce or
+    holder, and the credential kind (NULL for a runtime key; ``personal``
+    with an agent still set for a personal key). A scope with no owner
+    matches no tombstone. The workforce is read from the tombstone rather than
     through ``WorkforceRun``: the purge SETs ``WorkforceRun.task_id``
     NULL, so the join the live lookup uses can no longer prove the
     binding, and the tombstone recorded it before the delete for exactly
@@ -636,9 +792,25 @@ def _raise_if_expired_for_scope(task_id: int, scope: SdkTaskScope, db: Session) 
     if tombstone is None or tombstone.source != "sdk":
         return
     if scope.agent_id is not None:
-        if tombstone.agent_id != scope.agent_id:
+        if (
+            tombstone.agent_id != scope.agent_id
+            or tombstone.sdk_credential_kind is not None
+        ):
             return
-    elif tombstone.workforce_id != scope.workforce_id:
+    elif scope.workforce_id is not None:
+        if (
+            tombstone.workforce_id != scope.workforce_id
+            or tombstone.sdk_credential_kind is not None
+        ):
+            return
+    elif scope.user_id is not None:
+        if (
+            tombstone.user_id != scope.user_id
+            or tombstone.sdk_credential_kind != _PERSONAL_CREDENTIAL
+            or tombstone.agent_id is None
+        ):
+            return
+    else:
         return
     raise TaskStartRejected(
         "task_expired",
@@ -659,7 +831,18 @@ async def create_sdk_task(
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
     prompt_context: dict[str, Any] | None = None,
+    response_format: ResponseFormatChange = None,
+    credential_kind: SdkCredentialKind,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
+    """Create an SDK task and schedule its first turn.
+
+    ``credential_kind`` is the kind of key that authorized the call and is
+    recorded on the task. For ``"personal"``, the agent must be one
+    ``task_owner_user_id`` can see; otherwise the caller has already bound
+    ``agent_id`` to the key.
+    """
+
     async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
         prepared = await run_db_io_cancellation_safe(
             lambda: _prepare_created_task_isolated(
@@ -673,6 +856,9 @@ async def create_sdk_task(
                 timezone=timezone,
                 requested_dispatch_class=requested_dispatch_class,
                 requested_priority=requested_priority,
+                response_format=response_format,
+                credential_kind=credential_kind,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -698,6 +884,9 @@ async def create_sdk_task(
     start_task = asyncio.create_task(_prepare_and_schedule())
     prepared, started = await drain_async_task_cancellation_safe(start_task)
 
+    # A new task has no earlier format, so the request's own change is the
+    # whole story.
+    response_format_type, response_format_name = echo_for_change(response_format)
     return TaskStartResult(
         task_id=prepared.task_id,
         agent_id=prepared.agent_id,
@@ -706,6 +895,8 @@ async def create_sdk_task(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        response_format_type=response_format_type,
+        response_format_name=response_format_name,
         dispatch_class=prepared.dispatch_class,
     )
 
@@ -721,6 +912,8 @@ async def append_sdk_turn(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     prompt_context: dict[str, Any] | None = None,
+    response_format: ResponseFormatChange = None,
+    idempotency_claim: IdempotencyClaim | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
         # A runner may still be finishing local cleanup after its terminal
@@ -741,6 +934,8 @@ async def append_sdk_turn(
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
                 prompt_context=prompt_context,
+                response_format=response_format,
+                idempotency_claim=idempotency_claim,
             )
         )
         try:
@@ -767,6 +962,8 @@ async def append_sdk_turn(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        response_format_type=prepared.response_format_type,
+        response_format_name=prepared.response_format_name,
     )
 
 
@@ -1069,40 +1266,30 @@ async def execute_existing_task(
     *,
     task_id: int,
     task_owner_user_id: int,
-    task_source: str | None,
     task_description: str,
     context: dict[str, Any],
     actor_user_id: int,
 ) -> None:
-    """Submit shared execution, or await the legacy local execution handle."""
-    from .task_execution_host import enqueues_task_turns
+    """Durably accept the legacy ``execute_task``, then dispatch it promptly.
 
-    if enqueues_task_turns():
-        from .task_existing_command import enqueue_existing_execution
+    Both execution modes stage the same START (kind ``existing``). The command
+    dispatcher executes it, so a closed release hold leaves it pending for the
+    successor, and the WebSocket returns once the command is accepted instead
+    of waiting for the execution.
+    """
+    from .task_command_execution import execute_durable_task_command
+    from .task_command_transport import dispatch_task_command_promptly
+    from .task_existing_command import stage_existing_execution
 
-        await run_db_io_cancellation_safe(
-            lambda: enqueue_existing_execution(
-                task_id=task_id,
-                task_owner_user_id=task_owner_user_id,
-                task_description=task_description,
-                context=context,
-                actor_user_id=actor_user_id,
-            )
+    command_db_id = await run_db_io_cancellation_safe(
+        lambda: stage_existing_execution(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            task_description=task_description,
+            context=context,
+            actor_user_id=actor_user_id,
         )
-        # The WebSocket must keep receiving pause/resume commands while the
-        # worker executes. Completion arrives through the shared event bridge.
-        return
-    background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
-        task_id=task_id,
-        task_owner_user_id=task_owner_user_id,
-        task_source=task_source,
-        payload=TaskTurnPayload(
-            transcript_message=task_description,
-            execution_message=task_description,
-        ),
-        context=context,
-        actor_user_id=actor_user_id,
     )
-    # Legacy WebSocket execute_task must not return until execution finishes.
-    # Keep that ordering even though scheduling owns the background handle.
-    await background_task
+    await dispatch_task_command_promptly(
+        execute_durable_task_command, command_db_id=command_db_id
+    )

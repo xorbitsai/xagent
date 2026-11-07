@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 import time
 from collections import Counter
 from collections.abc import AsyncIterator
@@ -14,7 +15,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any, Literal, cast
 from uuid import uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 import tiktoken
 
@@ -35,6 +36,7 @@ from ...model.chat.types import (
     CONTENT_SOURCE_REASONING_FALLBACK,
 )
 from ...runtime_performance import increment_counter, observe_value
+from ...tools.adapters.vibe.tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -47,6 +49,7 @@ from ...tools.tool_result_spill import (
     spill_dir_for_workspace,
     spill_record_shape_is_valid,
 )
+from ...utils.timezones import resolve_zone
 from ..grounding import VALUE_KINDS, step_intent_not_fact_rule
 from ..language import (
     effective_output_language,
@@ -127,6 +130,7 @@ def snapshot_container(value: Any) -> Any:
 
 
 READ_FILE_CONTEXT_LIMIT = 12_000
+_INVALID_TOOL_NAME_PLACEHOLDER = "invalid_tool_name"
 SPILL_REGISTRY_MAX_RECORDS = 64
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
 # largest persisted transcript row id the context was built from. The agent
@@ -295,6 +299,22 @@ def estimate_provider_prompt_tokens(
             serialized_tools = str(tools)
         total += max(1, len(serialized_tools) // 4)
     return total
+
+
+def provider_safe_tool_name(name: Any) -> str:
+    """Return ``name`` in a spelling that providers accept in a replayed call.
+
+    The result may be shown to the model: in LLM requests, and in a tool error
+    that names it as a suggestion. It must never be used to look up or run a
+    tool: ``create report`` becomes ``create_report``, which may be a real tool
+    the model did not call.
+    """
+    # Bedrock's toolUse.name and OpenAI-compatible function names share this
+    # character rule, and the cut is the same provider limit generated tool
+    # names are built to. A name already within the rule comes back unchanged.
+    text = "" if name is None else str(name)
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", text)[:MAX_AGENT_TOOL_NAME_LENGTH]
+    return safe or _INVALID_TOOL_NAME_PLACEHOLDER
 
 
 def _utcnow() -> datetime:
@@ -1092,6 +1112,36 @@ class ExecutionContext:
             sanitized.append(copied)
         return sanitized
 
+    @staticmethod
+    def _tool_calls_for_provider(
+        tool_calls: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Copy tool calls with names every provider accepts on replay.
+
+        A model can emit a name outside the provider's character rule, and the
+        provider then rejects every later request that replays it. Stored
+        messages keep the emitted name, so nothing that reads the history can
+        mistake a rewritten name for a call to a real tool of that spelling.
+        """
+        rendered: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                tool_call = {
+                    **tool_call,
+                    "function": {
+                        **function,
+                        "name": provider_safe_tool_name(function.get("name")),
+                    },
+                }
+            elif "name" in tool_call:
+                tool_call = {
+                    **tool_call,
+                    "name": provider_safe_tool_name(tool_call["name"]),
+                }
+            rendered.append(tool_call)
+        return rendered
+
     def _sanitize_write_file_arguments(self, arguments: Any) -> Any:
         if not isinstance(arguments, str):
             return arguments
@@ -1165,6 +1215,10 @@ class ExecutionContext:
 
         for message in visible_messages:
             message_dict = message.to_dict()
+            if message.tool_calls:
+                message_dict["tool_calls"] = self._tool_calls_for_provider(
+                    message.tool_calls
+                )
             if message.role == "assistant":
                 provider_state = message.metadata.get("_xagent_provider_state")
                 if isinstance(provider_state, dict):
@@ -1238,16 +1292,10 @@ class ExecutionContext:
     def clock_zone(self) -> ZoneInfo | None:
         """The end user's timezone, or None when none was supplied or the name
         is unusable. The value is caller-controlled, so an unparsable name
-        degrades to the UTC wording instead of failing the run."""
-        name = self.metadata.get(CLOCK_TIMEZONE_METADATA_KEY)
-        if not isinstance(name, str) or not name.strip():
-            return None
-        try:
-            return ZoneInfo(name.strip())
-        except (ZoneInfoNotFoundError, ValueError, OSError, TypeError, KeyError):
-            # OSError is an over-long name, ValueError a path-shaped one; both
-            # are reachable because the name comes from the client.
-            return None
+        degrades to the UTC wording instead of failing the run. Resolved the
+        same way as the time tools, so the zone named in the prompt is a
+        canonical IANA name those tools accept back."""
+        return resolve_zone(self.metadata.get(CLOCK_TIMEZONE_METADATA_KEY))
 
     def _current_clock_text(self) -> str:
         utc_stamp = self.created_at.astimezone(timezone.utc).strftime(

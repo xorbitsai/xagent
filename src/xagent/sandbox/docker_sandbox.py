@@ -17,6 +17,7 @@ import stat
 import tarfile
 import tempfile
 import textwrap
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -31,14 +32,19 @@ from typing import (
     cast,
 )
 
+from docker.types import Mount as DockerMount
+
 from docker import errors, from_env
 
 from ..config import (
     get_sandbox_image,
     get_sandbox_namespace,
+    get_sandbox_network,
     get_sandbox_pids_limit,
+    get_sandbox_workspace_mount_mode,
     get_uploads_dir,
     validate_sandbox_namespace,
+    validate_sandbox_network,
 )
 from .base import (
     SANDBOX_RUNTIME_GID,
@@ -53,6 +59,7 @@ from .base import (
     SandboxConfig,
     SandboxInfo,
     SandboxInspection,
+    SandboxMount,
     SandboxNotFoundError,
     SandboxRuntimeConflictError,
     SandboxService,
@@ -90,7 +97,18 @@ MANAGED_LABEL_VALUE = "v2"
 CONTAINER_NAME_PREFIX = "xagent_sandbox_"
 SNAPSHOT_REPOSITORY = "xagent-sandbox-snapshot"
 _CPU_NANOS = 1_000_000_000
-_DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-egress-unfiltered-v1"
+_DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-dedicated-network-v2"
+SANDBOX_NETWORK_LABEL = "xagent.sandbox.network"
+SANDBOX_NETWORK_LABEL_VALUE = "v1"
+_SANDBOX_ARCHIVE_PAX_VERSION_KEY = "Xagent.archive.version"
+_SANDBOX_ARCHIVE_PAX_VERSION = "1"
+_MAX_SANDBOX_ARCHIVE_NAME_BYTES = 255
+_MAX_SANDBOX_ARCHIVE_FILE_SIZE = 8**11
+
+
+def _version_at_least(value: object, minimum: tuple[int, int]) -> bool:
+    match = re.match(r"^(\d+)\.(\d+)", str(value or ""))
+    return bool(match and tuple(map(int, match.groups())) >= minimum)
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -106,6 +124,11 @@ def _ownership_label_filters(namespace: str) -> list[str]:
         f"{LABEL_MANAGED}={MANAGED_LABEL_VALUE}",
         f"{LABEL_NAMESPACE}={namespace}",
     ]
+
+
+def _expected_runtime_networks(network_isolated: bool, network: str) -> set[str]:
+    """Return Docker inspect's exact network keys for one sandbox mode."""
+    return {"none"} if network_isolated else {network}
 
 
 class DockerStore(abc.ABC):
@@ -275,6 +298,57 @@ def _get_state(status: str | None) -> str:
     return "unknown"
 
 
+def _parse_mount_facts(
+    attrs: dict[str, Any],
+) -> tuple[list[tuple[str, str, str]], list[SandboxMount]]:
+    """Read legacy binds and structured mounts from Docker inspect data.
+
+    Docker reports effective mount points in top-level ``Mounts``, but keeps
+    ``VolumeOptions.Subpath`` only in ``HostConfig.Mounts``.  The latter is
+    therefore authoritative for structured mounts.  Binds represented there
+    are excluded from the legacy list so one mount is not compared twice.
+    """
+    host_config = cast(dict[str, Any], attrs.get("HostConfig") or {})
+    structured: list[SandboxMount] = []
+    structured_keys: set[tuple[str, str]] = set()
+    for raw in cast(list[dict[str, Any]], host_config.get("Mounts") or []):
+        mount_type = str(raw.get("Type") or "")
+        if mount_type not in {"bind", "volume"}:
+            raise SandboxRuntimeConflictError(
+                f"Unsupported structured sandbox mount type: {mount_type!r}"
+            )
+        source = str(raw.get("Source") or "")
+        target = str(raw.get("Target") or "")
+        volume_options = cast(dict[str, Any], raw.get("VolumeOptions") or {})
+        subpath = volume_options.get("Subpath")
+        try:
+            mount = SandboxMount(
+                type=cast(Any, mount_type),
+                source=source,
+                target=target,
+                mode=cast(Any, "ro" if bool(raw.get("ReadOnly")) else "rw"),
+                subpath=str(subpath) if subpath is not None else None,
+            )
+        except ValueError as exc:
+            raise SandboxRuntimeConflictError(
+                "Docker reported an invalid structured sandbox mount"
+            ) from exc
+        structured.append(mount)
+        structured_keys.add((mount.source, mount.target))
+
+    volumes: list[tuple[str, str, str]] = []
+    for raw in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
+        if raw.get("Type") != "bind":
+            continue
+        source = str(raw.get("Source") or "")
+        target = str(raw.get("Destination") or "")
+        if not source or not target or (source, target) in structured_keys:
+            continue
+        mode = "ro" if bool(raw.get("RW")) is False else "rw"
+        volumes.append((source, target, mode))
+    return volumes, structured
+
+
 def _parse_container_config(container: Container) -> SandboxInfo:
     """Reconstruct SandboxInfo from Docker inspect data."""
     attrs = cast(dict[str, Any], container.attrs)
@@ -289,16 +363,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
             key, value = item.split("=", 1)
             env_map[key] = value
 
-    volumes: list[tuple[str, str, str]] = []
-    # Only bind mounts
-    for mount in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
-        if mount.get("Type") != "bind":
-            continue
-        source = str(mount.get("Source") or "")
-        target = str(mount.get("Destination") or "")
-        mode = "ro" if bool(mount.get("RW")) is False else "rw"
-        if source and target:
-            volumes.append((source, target, mode))
+    volumes, mounts = _parse_mount_facts(attrs)
 
     ports: list[tuple[int, int]] = []
     port_bindings = cast(
@@ -335,6 +400,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
         pids_limit=pids_limit,
         env=env_map or None,
         volumes=volumes or None,
+        mounts=mounts or None,
         network_isolated=bool(
             attrs.get("NetworkSettings", {}).get("Networks") == {}
             or host_config.get("NetworkMode") == "none"
@@ -387,15 +453,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
             key, value = item.split("=", 1)
             env_map[key] = value
 
-    volumes: list[tuple[str, str, str]] = []
-    for mount in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
-        if mount.get("Type") != "bind":
-            continue
-        source = str(mount.get("Source") or "")
-        target = str(mount.get("Destination") or "")
-        mode = "ro" if bool(mount.get("RW")) is False else "rw"
-        if source and target:
-            volumes.append((source, target, mode))
+    volumes, mounts = _parse_mount_facts(attrs)
 
     ports: list[tuple[int, int]] = []
     port_bindings = cast(
@@ -425,11 +483,15 @@ def _build_inspection(container: Container) -> SandboxInspection:
         env=env_map,
         volumes=tuple(volumes),
         ports=tuple(ports),
-        network_isolated=bool(config_data.get("NetworkDisabled")),
+        network_isolated=bool(
+            config_data.get("NetworkDisabled")
+            or host_config.get("NetworkMode") == "none"
+        ),
         runtime_networks=runtime_networks,
         labels=labels,
         created_at=cast(Optional[str], attrs.get("Created")),
         working_dir=cast(Optional[str], config_data.get("WorkingDir")),
+        mounts=tuple(mounts),
     )
     return SandboxInspection(
         state="running" if _get_state(raw_status) == "running" else "stopped",
@@ -461,6 +523,7 @@ def _attestation_label(value: Optional[str]) -> Optional[str]:
 
 def _check_no_conflicting_volumes(
     volumes: Optional[list[tuple[str, str, str]]],
+    mounts: Optional[list[SandboxMount]] = None,
 ) -> None:
     """Reject desired volumes that collide on either side of the mount.
 
@@ -484,11 +547,11 @@ def _check_no_conflicting_volumes(
     uses) so equivalent-but-differently-spelled paths are treated as the
     same key on both sides.
     """
-    if not volumes:
+    if not volumes and not mounts:
         return
     seen_by_host: dict[str, tuple[str, str]] = {}
-    seen_by_guest: dict[str, tuple[str, str]] = {}
-    for host_path, guest_path, mode in volumes:
+    seen_by_guest: dict[str, tuple[str, ...]] = {}
+    for host_path, guest_path, mode in volumes or []:
         normalized_host = canonical_sandbox_path(host_path)
         normalized_guest = canonical_sandbox_path(guest_path)
 
@@ -509,6 +572,20 @@ def _check_no_conflicting_volumes(
                 f"{normalized_guest!r}: {prior_for_guest} vs {guest_key}"
             )
         seen_by_guest[normalized_guest] = guest_key
+
+    for mount in mounts or []:
+        structured_guest_key = (
+            mount.type,
+            mount.source,
+            mount.mode,
+            mount.subpath or "",
+        )
+        prior_for_guest = seen_by_guest.get(mount.target)
+        if prior_for_guest is not None and prior_for_guest != structured_guest_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting desired mounts for guest path {mount.target!r}"
+            )
+        seen_by_guest[mount.target] = structured_guest_key
 
 
 def _check_no_conflicting_ports(
@@ -561,6 +638,7 @@ def _find_publish_mismatches(
     desired: ResolvedSandboxRuntimeSpec,
     resolved_image: str,
     inspection: SandboxInspection,
+    expected_network: str,
 ) -> list[str]:
     """Return the field names whose observed value disagrees with ``desired``.
 
@@ -611,12 +689,19 @@ def _find_publish_mismatches(
         mismatches.append("image")
     if set(facts.volumes) != set(desired.volumes):
         mismatches.append("volumes")
+    if set(facts.mounts) != set(desired.mounts):
+        mismatches.append("mounts")
     if set(facts.ports) != set(desired.ports):
         mismatches.append("ports")
     if facts.working_dir != desired.working_dir:
         mismatches.append("working_dir")
     if facts.network_isolated != desired.network_isolated:
         mismatches.append("network_isolated")
+    expected_networks = _expected_runtime_networks(
+        desired.network_isolated, expected_network
+    )
+    if set(facts.runtime_networks) != expected_networks:
+        mismatches.append("runtime_networks")
     if (facts.raw_nano_cpus or 0) != int(desired.cpus * _CPU_NANOS):
         mismatches.append("cpus")
     if (facts.raw_memory_bytes or 0) != int(desired.memory * 1024 * 1024):
@@ -627,10 +712,69 @@ def _find_publish_mismatches(
     return mismatches
 
 
+def _validate_sandbox_archive_name(arcname: str) -> None:
+    """Reject names that cannot be represented by the broker wire contract."""
+    try:
+        encoded_name = arcname.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Sandbox upload file names must be valid UTF-8") from exc
+    if (
+        not arcname
+        or arcname in {".", ".."}
+        or "\x00" in arcname
+        or posixpath.basename(arcname) != arcname
+        or len(encoded_name) > _MAX_SANDBOX_ARCHIVE_NAME_BYTES
+    ):
+        raise ValueError("Sandbox uploads require a single valid file name")
+
+
+def _sandbox_archive_info(
+    arcname: str,
+    *,
+    size: int,
+    mode: int,
+) -> tarfile.TarInfo:
+    """Build the one regular member allowed by the sandbox upload protocol."""
+    _validate_sandbox_archive_name(arcname)
+    # A POSIX tar size field has eleven octal digits. Larger values make
+    # tarfile add a PAX ``size`` record, widening the broker wire contract.
+    if size < 0 or size >= _MAX_SANDBOX_ARCHIVE_FILE_SIZE:
+        raise ValueError("Sandbox upload file size is outside the archive contract")
+
+    info = tarfile.TarInfo(name=arcname)
+    info.size = size
+    # Never inherit a local timestamp: negative or very large mtimes cause
+    # tarfile to emit a PAX ``mtime`` key, and ordinary mtimes make the wire
+    # bytes depend on host filesystem state.
+    info.mtime = 0
+    info.uid = SANDBOX_RUNTIME_UID
+    info.gid = SANDBOX_RUNTIME_GID
+    info.mode = mode
+    # Every upload carries an explicit local PAX marker. The restricted Docker
+    # broker can therefore accept one bounded wire format instead of trying to
+    # distinguish arbitrary tar dialects. ``path`` is the only additional PAX
+    # key tarfile may add, for a long or non-ASCII basename.
+    info.pax_headers = {_SANDBOX_ARCHIVE_PAX_VERSION_KEY: _SANDBOX_ARCHIVE_PAX_VERSION}
+    return info
+
+
+def _open_sandbox_upload_archive(
+    file_obj: io.BufferedRandom,
+) -> tarfile.TarFile:
+    """Open a deterministic PAX archive with no global extension headers."""
+    return tarfile.open(
+        fileobj=file_obj,
+        mode="w",
+        format=tarfile.PAX_FORMAT,
+        encoding="utf-8",
+        errors="strict",
+    )
+
+
 def _write_tar_from_local_path(
     local_path: str, arcname: str, file_obj: io.BufferedRandom
 ) -> None:
-    """Pack a local file into a tar stream for Docker put_archive."""
+    """Pack a local file into the versioned single-file upload protocol."""
     # O_NOFOLLOW rejects symlinks, while O_NONBLOCK makes opening a FIFO or
     # device return promptly so the regular-file check can reject it without
     # blocking the async caller's event-loop thread.
@@ -645,15 +789,14 @@ def _write_tar_from_local_path(
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
             raise ValueError("Sandbox uploads require a regular local file")
-        info = tarfile.TarInfo(name=arcname)
-        info.size = source_stat.st_size
-        info.mtime = int(source_stat.st_mtime)
-        info.uid = SANDBOX_RUNTIME_UID
-        info.gid = SANDBOX_RUNTIME_GID
-        info.mode = stat.S_IMODE(source_stat.st_mode) & 0o755
+        info = _sandbox_archive_info(
+            arcname,
+            size=source_stat.st_size,
+            mode=stat.S_IMODE(source_stat.st_mode) & 0o755,
+        )
         with os.fdopen(source_fd, "rb", closefd=True) as source:
             source_fd = -1
-            with tarfile.open(fileobj=file_obj, mode="w") as tar:
+            with _open_sandbox_upload_archive(file_obj) as tar:
                 tar.addfile(info, source)
     finally:
         if source_fd >= 0:
@@ -666,14 +809,10 @@ def _write_tar_from_content(
     arcname: str,
     file_obj: io.BufferedRandom,
 ) -> None:
-    """Pack in-memory text content into a tar stream for Docker put_archive."""
+    """Pack text into the versioned single-file upload protocol."""
     data = content.encode("utf-8")
-    info = tarfile.TarInfo(name=arcname)
-    info.size = len(data)
-    info.uid = SANDBOX_RUNTIME_UID
-    info.gid = SANDBOX_RUNTIME_GID
-    info.mode = 0o600
-    with tarfile.open(fileobj=file_obj, mode="w") as tar:
+    info = _sandbox_archive_info(arcname, size=len(data), mode=0o600)
+    with _open_sandbox_upload_archive(file_obj) as tar:
         tar.addfile(info, io.BytesIO(data))
     file_obj.seek(0)
 
@@ -972,6 +1111,8 @@ class DockerSandbox(Sandbox):
         self, local_path: str, remote_path: str, overwrite: bool = False
     ) -> None:
         """Upload a local file into the sandbox filesystem."""
+        arcname = posixpath.basename(remote_path)
+        _validate_sandbox_archive_name(arcname)
         if not os.path.isfile(local_path):
             raise FileNotFoundError(f"Local file not found: {local_path}")
 
@@ -995,9 +1136,7 @@ class DockerSandbox(Sandbox):
 
                 container = await self._require_container()
                 with tempfile.TemporaryFile() as archive_file:
-                    _write_tar_from_local_path(
-                        local_path, posixpath.basename(remote_path), archive_file
-                    )
+                    _write_tar_from_local_path(local_path, arcname, archive_file)
                     ok = await asyncio.to_thread(
                         container.put_archive, remote_dir, archive_file
                     )
@@ -1035,6 +1174,8 @@ class DockerSandbox(Sandbox):
         self, content: str, remote_path: str, overwrite: bool = False
     ) -> None:
         """Write text content directly to a file inside the sandbox."""
+        arcname = posixpath.basename(remote_path)
+        _validate_sandbox_archive_name(arcname)
         async with self._control.operation():
             async with self._control.file_lock:
                 if not overwrite:
@@ -1054,9 +1195,7 @@ class DockerSandbox(Sandbox):
 
                 container = await self._require_container()
                 with tempfile.TemporaryFile() as archive_file:
-                    _write_tar_from_content(
-                        content, posixpath.basename(remote_path), archive_file
-                    )
+                    _write_tar_from_content(content, arcname, archive_file)
                     ok = await asyncio.to_thread(
                         container.put_archive, remote_dir, archive_file
                     )
@@ -1100,6 +1239,7 @@ async def _create_container(
     image: str,
     template: SandboxTemplate,
     config: SandboxConfig,
+    network: str,
     extra_labels: Optional[dict[str, str]] = None,
 ) -> Container:
     """Create a managed Docker container from sandbox template and config.
@@ -1132,6 +1272,7 @@ async def _create_container(
     deployment's owner. This function is the single owner of their value
     for every container it creates."""
     await _ensure_image(client, image)
+    _check_no_conflicting_volumes(config.volumes, config.mounts)
 
     volumes: dict[str, dict[str, str]] | None = None
     if config.volumes:
@@ -1139,6 +1280,20 @@ async def _create_container(
             host_path: {"bind": guest_path, "mode": mode}
             for host_path, guest_path, mode in config.volumes
         }
+
+    mounts: list[DockerMount] | None = None
+    if config.mounts:
+        mounts = [
+            DockerMount(
+                target=mount.target,
+                source=mount.source,
+                type=mount.type,
+                read_only=mount.mode == "ro",
+                no_copy=mount.type == "volume",
+                subpath=mount.subpath,
+            )
+            for mount in sorted(set(config.mounts))
+        ]
 
     ports: dict[str, int] | None = None
     if config.ports:
@@ -1177,18 +1332,27 @@ async def _create_container(
         # intentionally configured another value.
         "environment": {"HOME": "/home/sandbox", **(config.env or {})},
         "volumes": volumes,
+        "mounts": mounts,
         "ports": ports,
         "nano_cpus": int((config.cpus or 1) * _CPU_NANOS),
         "mem_limit": (config.memory or 512) * 1024 * 1024,
-        "network_disabled": bool(config.network_isolated),
         # Security config
         "security_opt": ["no-new-privileges:true"],
         "cap_drop": ["ALL"],
         "labels": labels,
     }
+    if config.network_isolated:
+        # Explicitly use Docker's disconnected network namespace. Do not rely
+        # on NetworkDisabled alone, which does not attest the runtime mode.
+        kwargs["network_mode"] = "none"
+    else:
+        # The deployment creates this dedicated bridge and owns its firewall
+        # policy. Never fall back to Docker's daemon-global default bridge.
+        kwargs["network"] = network
     if effective_pids_limit is not None:
         kwargs["pids_limit"] = effective_pids_limit
     guest_paths = [guest for _, guest, _ in (config.volumes or [])]
+    guest_paths.extend(mount.target for mount in (config.mounts or []))
     if any(path.startswith("/root/") for path in guest_paths):
         # The stock image keeps /root at 0700. A private tmpfs supplies only
         # traversable parents for nested workspace bind mounts; it exposes no
@@ -1213,6 +1377,7 @@ class DockerSandboxService(SandboxService):
         client: Optional[Any] = None,
         *,
         namespace: Optional[str] = None,
+        network: Optional[str] = None,
     ) -> None:
         """Initialize the Docker sandbox service and validate daemon access.
 
@@ -1227,6 +1392,10 @@ class DockerSandboxService(SandboxService):
                 is restricted to it, so multiple deployments sharing one
                 Docker daemon can never discover or mutate each other's
                 sandboxes.
+            network: Dedicated deployment-created bridge for network-enabled
+                sandboxes. When omitted, resolve it from
+                ``XAGENT_SANDBOX_NETWORK``. Built-in Docker networks are
+                rejected and live attachments are verified before reuse.
         """
         resolved_namespace = (
             namespace if namespace is not None else get_sandbox_namespace()
@@ -1237,10 +1406,23 @@ class DockerSandboxService(SandboxService):
                 "DockerSandboxService without an explicit namespace"
             )
         validate_sandbox_namespace(resolved_namespace)
+        resolved_network = network if network is not None else get_sandbox_network()
+        if resolved_network is None:
+            raise RuntimeError(
+                "XAGENT_SANDBOX_NETWORK is required when constructing "
+                "DockerSandboxService without an explicit network"
+            )
+        validate_sandbox_network(resolved_network)
         self._namespace = resolved_namespace
+        self._network = resolved_network
         self._client = client or _create_docker_client()
         self._client.ping()
         self._store = store
+        # DockerClient.version() performs a blocking daemon request. Cache the
+        # result behind a thread lock so concurrent async creates neither block
+        # the event loop nor repeat the capability probe.
+        self._volume_subpath_versions: tuple[str | None, str | None] | None = None
+        self._volume_subpath_versions_lock = threading.Lock()
         # Per-name lifecycle locks, one entry per sandbox name currently held
         # or waited on. The registry evicts unreferenced entries so it does
         # not grow with every sandbox name ever seen (names such as
@@ -1265,6 +1447,37 @@ class DockerSandboxService(SandboxService):
         a container name).
         """
         return self._locks.locked(name)
+
+    def _require_volume_subpath_support(self) -> None:
+        """Fail before create when the daemon cannot enforce volume subpaths."""
+        with self._volume_subpath_versions_lock:
+            if self._volume_subpath_versions is None:
+                try:
+                    daemon_version = self._client.version()
+                    api_client = getattr(self._client, "api", None)
+                    negotiated_api = getattr(api_client, "_version", None)
+                except Exception as exc:
+                    raise SandboxRuntimeConflictError(
+                        "Cannot verify Docker Engine support for volume subpaths"
+                    ) from exc
+                self._volume_subpath_versions = (
+                    daemon_version.get("Version"),
+                    negotiated_api,
+                )
+            engine_version, negotiated_api = self._volume_subpath_versions
+
+        if not _version_at_least(engine_version, (26, 0)) or not (
+            _version_at_least(negotiated_api, (1, 45))
+        ):
+            raise SandboxRuntimeConflictError(
+                "Named-volume subpath mounts require Docker Engine >= 26.0 and "
+                "a negotiated API >= 1.45; bind fallback is intentionally disabled"
+            )
+
+    async def _validate_structured_mount_support(self, config: SandboxConfig) -> None:
+        """Validate daemon features required by an explicit sandbox config."""
+        if any(mount.type == "volume" for mount in config.mounts or ()):
+            await asyncio.to_thread(self._require_volume_subpath_support)
 
     @staticmethod
     async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -1377,12 +1590,16 @@ class DockerSandboxService(SandboxService):
         config: Optional[SandboxConfig] = None,
     ) -> DockerSandbox:
         """Get, resume, or create a Docker-backed sandbox."""
+        if config is not None:
+            await self._validate_structured_mount_support(config)
         async with self._named_lock(name):
             control = self._get_live_control(name)
 
             container = await self._find_container(name)
             if container is not None:
                 await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                self._require_network_policy(name, inspection)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
                     await asyncio.to_thread(container.start)
@@ -1414,14 +1631,20 @@ class DockerSandboxService(SandboxService):
                 image,
                 template,
                 cfg,
+                self._network,
             )
             try:
                 await asyncio.to_thread(container.start)
-            except Exception:
-                await asyncio.to_thread(container.remove, force=True)
-                raise
-            await asyncio.to_thread(container.reload)
-            runtime_info = _parse_container_config(container)
+                await asyncio.to_thread(container.reload)
+                runtime_info = _parse_container_config(container)
+            except BaseException as create_exc:
+                try:
+                    await self._await_shielded(
+                        asyncio.to_thread(container.remove, force=True)
+                    )
+                except Exception as remove_exc:
+                    raise create_exc from remove_exc
+                raise create_exc
             stored_info = SandboxInfo(
                 name=name,
                 state=runtime_info.state,
@@ -1442,8 +1665,10 @@ class DockerSandboxService(SandboxService):
     # create_snapshot() code paths above, aside from sharing
     # `_create_container` (which owns the spec-attestation label keys for
     # every container either path creates, blanking them when there is no
-    # attestation to make -- see its docstring) and the
-    # `_named_lock`/`_get_live_control` infrastructure.
+    # attestation to make -- see its docstring), the
+    # `_named_lock`/`_get_live_control` infrastructure, and
+    # `_require_network_policy`, which guards every reused container before
+    # publication. Fingerprint/spec verdicts remain the manager's concern.
     #
     # All of it assumes a single process is the sole owner of the containers
     # it manages. `_named_lock` and `_get_live_control` are in-process
@@ -1464,6 +1689,20 @@ class DockerSandboxService(SandboxService):
         """Docker backs the explicit spec-reconciliation lifecycle."""
         return True
 
+    def _runtime_network_policy_matches(self, inspection: SandboxInspection) -> bool:
+        expected_networks = _expected_runtime_networks(
+            inspection.facts.network_isolated, self._network
+        )
+        return set(inspection.facts.runtime_networks) == expected_networks
+
+    def _require_network_policy(self, name: str, inspection: SandboxInspection) -> None:
+        """Reject adoption when the live container escaped its network mode."""
+        if not self._runtime_network_policy_matches(inspection):
+            raise SandboxRuntimeConflictError(
+                f"Sandbox {name!r} is not attached exclusively to the "
+                "configured sandbox network"
+            )
+
     async def inspect(self, name: str) -> Optional[SandboxInspection]:
         """Observe a sandbox's current state and runtime facts.
 
@@ -1482,7 +1721,11 @@ class DockerSandboxService(SandboxService):
         if container is None:
             return None
         await asyncio.to_thread(container.reload)
-        return _build_inspection(container)
+        inspection = _build_inspection(container)
+        inspection.runtime_policy_matches = self._runtime_network_policy_matches(
+            inspection
+        )
+        return inspection
 
     async def create(
         self, name: str, template: SandboxTemplate, config: SandboxConfig
@@ -1508,6 +1751,7 @@ class DockerSandboxService(SandboxService):
         inspect-then-create sequence: that window belongs to the caller's
         critical section (see ``_named_lock``).
         """
+        await self._validate_structured_mount_support(config)
         async with self._named_lock(name):
             existing = await self._find_container(name)
             if existing is not None:
@@ -1526,7 +1770,7 @@ class DockerSandboxService(SandboxService):
                 resolved_image = template.image or DEFAULT_SANDBOX_IMAGE
                 spec_image, spec_snapshot_id = resolved_image, None
 
-            _check_no_conflicting_volumes(config.volumes)
+            _check_no_conflicting_volumes(config.volumes, config.mounts)
             _check_no_conflicting_ports(config.ports)
 
             desired = ResolvedSandboxRuntimeSpec.from_parts(
@@ -1538,6 +1782,7 @@ class DockerSandboxService(SandboxService):
                 memory=config.memory,
                 env=config.env,
                 volumes=config.volumes,
+                mounts=config.mounts,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
                 pids_limit=_effective_pids_limit(config),
@@ -1565,6 +1810,7 @@ class DockerSandboxService(SandboxService):
                     resolved_image,
                     backend_template,
                     backend_config,
+                    self._network,
                     extra_labels=extra_labels,
                 )
             except errors.APIError as exc:
@@ -1576,31 +1822,34 @@ class DockerSandboxService(SandboxService):
 
             try:
                 await asyncio.to_thread(container.start)
-            except BaseException as start_exc:
+                await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                mismatches = _find_publish_mismatches(
+                    desired, resolved_image, inspection, self._network
+                )
+            except BaseException as observation_exc:
                 # Compensate with a raw container removal, never
                 # self.delete(): delete() acquires this same _named_lock
                 # entry, so calling it here would self-deadlock. The
-                # original start failure (including a cancellation) is
+                # original creation/observation failure (including a
+                # cancellation) is
                 # preserved as the raised exception regardless of whether
                 # the compensating remove itself succeeds. The remove runs
                 # through _await_shielded so that a cancellation landing
                 # here (e.g. a second cancel on top of the one that failed
-                # start) cannot cut the remove short and let this method's
+                # observation) cannot cut the remove short and let this method's
                 # `_named_lock(name)` release while it is still in flight —
                 # that would let a same-name create() race an in-flight
                 # remove. If such a cancellation occurs, it is re-raised
-                # once the remove settles, taking priority over start_exc.
+                # once the remove settles, taking priority over the original
+                # observation failure.
                 try:
                     await self._await_shielded(
                         asyncio.to_thread(container.remove, force=True)
                     )
                 except Exception as remove_exc:
-                    raise start_exc from remove_exc
-                raise start_exc
-
-            await asyncio.to_thread(container.reload)
-            inspection = _build_inspection(container)
-            mismatches = _find_publish_mismatches(desired, resolved_image, inspection)
+                    raise observation_exc from remove_exc
+                raise observation_exc
             if mismatches:
                 # A container whose observed facts disagree with what we
                 # asked for must never be published: remove it directly
@@ -1683,10 +1932,11 @@ class DockerSandboxService(SandboxService):
         """Start a previously-created sandbox, idempotent if already running.
 
         Adopts whatever container currently answers to ``name``: this method
-        performs no spec verification of any kind, and neither reads nor
-        writes the fingerprint attestation. A caller that cares whether the
-        running container still matches a desired spec must call ``inspect()``
-        and ``spec_matches_inspection()`` itself before adopting the result.
+        does not verify the desired spec or fingerprint attestation, but it
+        requires the live Docker network attachment to satisfy the shared
+        runtime policy before publishing the handle. A caller that cares
+        whether the remaining runtime facts match a desired spec must call
+        ``inspect()`` and ``spec_matches_inspection()`` itself first.
 
         Like every method on this service, this is also reference-count-blind
         (see ``create()``).
@@ -1707,6 +1957,8 @@ class DockerSandboxService(SandboxService):
             control = self._get_live_control(name)
             async with control.exclusive_access(mark_deleted=False):
                 await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                self._require_network_policy(name, inspection)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
                     await asyncio.to_thread(container.start)
@@ -1883,7 +2135,7 @@ class DockerSandboxService(SandboxService):
         return SANDBOX_RUNTIME_GID
 
     def validate_host_workspace_access(self) -> None:
-        """Exercise the ownership operations required by writable bind mounts."""
+        """Validate Docker network policy and writable-bind ownership support."""
         if os.geteuid() != 0:
             raise SandboxRuntimeConflictError(
                 "Docker sandbox workspace preparation requires the Xagent "
@@ -1897,6 +2149,48 @@ class DockerSandboxService(SandboxService):
                 "docker-socket-proxy is in use, allow the /info endpoint "
                 "(for Tecnativa/docker-socket-proxy, set INFO=1)."
             ) from exc
+        if get_sandbox_workspace_mount_mode() == "volume_subpath":
+            self._require_volume_subpath_support()
+        try:
+            sandbox_network = self._client.networks.get(self._network)
+        except errors.NotFound as exc:
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} is not "
+                "available on the daemon"
+            ) from exc
+        except errors.APIError as exc:
+            raise SandboxRuntimeConflictError(
+                "Cannot inspect the configured sandbox Docker network. If a "
+                "docker-socket-proxy is in use, allow the /networks endpoint "
+                "(for Tecnativa/docker-socket-proxy, set NETWORKS=1)."
+            ) from exc
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                f"Failed to inspect configured sandbox Docker network {self._network!r}"
+            ) from exc
+        network_attrs = cast(dict[str, Any], sandbox_network.attrs or {})
+        if sandbox_network.name != self._network:
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network must be addressed by its "
+                f"exact name {self._network!r}, not by an ID or prefix"
+            )
+        if network_attrs.get("Driver") != "bridge":
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} must use "
+                "the bridge driver"
+            )
+        labels = cast(dict[str, str], network_attrs.get("Labels") or {})
+        if labels.get(SANDBOX_NETWORK_LABEL) != SANDBOX_NETWORK_LABEL_VALUE:
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} must carry "
+                f"the label {SANDBOX_NETWORK_LABEL}={SANDBOX_NETWORK_LABEL_VALUE}"
+            )
+        options = cast(dict[str, str], network_attrs.get("Options") or {})
+        if options.get("com.docker.network.bridge.enable_icc") != "false":
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} must disable "
+                "inter-container communication"
+            )
         security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(
             (

@@ -362,6 +362,7 @@ function SessionConversationContent({
                 description={agent.description}
                 prompts={agent.suggestedPrompts}
                 onSend={handleStartMessage}
+                sendPromptOnClick={true}
                 isSending={
                   state.isProcessing
                   || isConversationResetPending

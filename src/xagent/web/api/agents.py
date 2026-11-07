@@ -14,7 +14,11 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
+from ...config import (
+    get_agent_pattern_for_execution_mode,
+    get_sandbox_enabled,
+    get_uploads_dir,
+)
 from ...core.agent.language import (
     detect_prose_script_mismatch,
     render_structured_request_language_policy,
@@ -108,7 +112,10 @@ class AgentCreateRequest(BaseModel):
     )
     prompt_context_fields: PromptContextFieldList = Field(
         default_factory=list,
-        description="Fields the unsigned widget entry may pass to prompt context",
+        description=(
+            "Fields unsigned callers (the widget entry and personal keys) "
+            "may pass to prompt context"
+        ),
     )
     logo_base64: Optional[str] = Field(
         None, description="Logo image as base64 data URL"
@@ -1887,6 +1894,8 @@ async def preview_agent(
     db: Session = Depends(get_db),
 ) -> AgentPreviewResponse:
     """Preview agent response without saving to database."""
+    preview_sandbox_manager = None
+    preview_task_id = None
     try:
         # Resolve LLMs from model IDs
         default_llm = None
@@ -2000,6 +2009,28 @@ async def preview_agent(
             voice=current_user_voice,
         )
 
+        if get_sandbox_enabled() and (
+            tool_selection_spec.includes_category("basic")
+            or tool_selection_spec.includes_category("code_execution")
+            or tool_selection_spec.includes_category("browser")
+            or tool_selection_spec.includes_published_agent()
+            or tool_selection_spec.includes_mcp()
+        ):
+            from ...sandbox.base import SandboxMountIntent
+            from ..sandbox_manager import get_sandbox_manager
+
+            release_db_connection_if_clean(db)
+            preview_sandbox_manager = get_sandbox_manager()
+            if preview_sandbox_manager is not None:
+                provider = await preview_sandbox_manager.get_or_create_lease_provider(
+                    "task",
+                    preview_task_id,
+                    mount_intent=SandboxMountIntent(
+                        mount_root=str(get_uploads_dir() / "preview" / preview_task_id)
+                    ),
+                )
+                tool_config.set_sandbox(provider)
+
         # Determine execution mode (default to "think")
         execution_mode = request.execution_mode or "think"
 
@@ -2072,3 +2103,9 @@ async def preview_agent(
     except Exception as e:
         logger.error(f"Failed to preview agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if preview_sandbox_manager is not None and preview_task_id is not None:
+            try:
+                await preview_sandbox_manager.delete_sandbox("task", preview_task_id)
+            except Exception:
+                logger.warning("Could not remove preview sandbox", exc_info=True)

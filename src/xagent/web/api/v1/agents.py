@@ -1,12 +1,15 @@
 """SDK management endpoints for user-owned agents."""
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Path, Request
 
 from ...schemas.v1 import (
     RuntimeKeyResponse,
     V1AgentCreateRequest,
     V1AgentCreateResponse,
     V1AgentResponse,
+    V1AgentSkillsResponse,
+    V1AgentSkillsUpdateRequest,
+    V1AgentSkillsUpdateResponse,
     V1AgentSummary,
     V1AgentTemplateCreateRequest,
 )
@@ -17,6 +20,7 @@ from ...services.agent_management import (
     AgentSummarySnapshot,
     DuplicateAgentNameError,
     InvalidAgentModelConfigError,
+    InvalidAgentSkillNamesError,
     InvalidKnowledgeBaseError,
     RuntimeKeySnapshot,
     TemplateNotFoundError,
@@ -211,3 +215,50 @@ async def rotate_agent_runtime_key(
     if api_key is None:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
     return _runtime_key_response(api_key)
+
+
+@router.get("/{agent_id}/skills", response_model=V1AgentSkillsResponse)
+async def get_agent_skills(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentSkillsResponse:
+    """Read the skill names of an agent the key holder can see."""
+    user, _key = authed
+    skills = await AgentManagementRuntime().get_agent_skills(
+        user_id=int(user.id), agent_id=agent_id
+    )
+    if skills is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return V1AgentSkillsResponse(agent_id=agent_id, skills=list(skills))
+
+
+@router.put("/{agent_id}/skills", response_model=V1AgentSkillsUpdateResponse)
+async def set_agent_skills(
+    request: V1AgentSkillsUpdateRequest,
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentSkillsUpdateResponse:
+    """Replace the skill names of an agent the key holder can see."""
+    user, key = authed
+    try:
+        result = await AgentManagementRuntime().set_agent_skills(
+            user_id=int(user.id),
+            key_prefix=key.key_prefix,
+            agent_id=agent_id,
+            skills=request.skills,
+        )
+    except InvalidAgentSkillNamesError as e:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 400, str(e))
+    if result is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return V1AgentSkillsUpdateResponse(
+        agent_id=agent_id,
+        skills=list(result.skills),
+        unresolved_for_caller=list(result.unresolved_for_caller),
+    )

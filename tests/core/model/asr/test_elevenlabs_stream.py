@@ -171,9 +171,17 @@ async def test_batch_and_realtime_models_use_their_own_endpoints(
     assert transport.model.supports_vad
     assert transport.model.abilities == ["asr"]
     local = XinferenceASR()
+    capabilities = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        "xagent.core.model.asr.xinference.fetch_audio_capabilities", capabilities
+    )
     assert not local.supports_streaming
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="does not support live ASR with VAD"):
         await local.open_stream()
+    capabilities.assert_awaited_once_with(local)
+    assert not local.supports_streaming
+    assert not local.supports_vad
+    await local.aclose()
 
 
 @pytest.mark.parametrize(
@@ -307,9 +315,13 @@ async def test_external_close_ends_a_pending_receive_normally(transport):
     t.client.close.assert_awaited_once()
 
 
-async def test_realtime_model_is_not_advertised_to_existing_batch_consumers():
+async def test_catalogue_includes_the_model_used_by_live_voice_conversations():
     models = await ElevenLabsASR.async_list_available_models()
-    assert {model["id"] for model in models} == {"scribe_v1", "scribe_v2"}
+    assert {model["id"] for model in models} == {
+        "scribe_v1",
+        "scribe_v2",
+        "scribe_v2_realtime",
+    }
 
 
 async def test_close_does_not_wait_for_the_default_ten_second_peer_timeout(monkeypatch):

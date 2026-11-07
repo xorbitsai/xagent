@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Callable, Iterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette import convertors as starlette_url  # codespell:ignore
 
 from xagent.core.memory.base import MemoryStore
@@ -16,7 +17,14 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
+from ..revocable_memory_store import unwrap_memory_store
 from ..services.db_runtime import run_db_io_cancellation_safe
+from ..services.memory_binding import (
+    MemoryBindingResolutionError,
+    MemoryManagementBindingRequest,
+    MemoryStoreBinding,
+    resolve_trusted_memory_binding_async,
+)
 from ..tracking.standalone_usage import usage_scope
 from ..user_isolated_memory import UserContext
 
@@ -86,6 +94,17 @@ def memory_operation() -> Iterator[None]:
         raise HTTPException(status_code=503, detail=error.status.detail) from None
 
 
+def _embedding_model_ids(store: MemoryStore) -> tuple[str, ...]:
+    """The embedding model ``store`` calls, for the standalone usage gate.
+
+    The deployment's memory embedding authority, under the billing id it was
+    given; none when it has no billing id (it is then recorded unpriced) or
+    the store does not embed.
+    """
+    model_id = getattr(unwrap_memory_store(store), "embedding_usage_model_id", "")
+    return (model_id,) if isinstance(model_id, str) and model_id else ()
+
+
 class MemoryListRequest(BaseModel):
     category: Optional[str] = Field(None, description="Filter by memory category")
     tags: Optional[list[str]] = Field(
@@ -115,6 +134,13 @@ class MemoryUpdateRequest(BaseModel):
         None, description="Updated memory metadata"
     )
 
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, content: Optional[str]) -> Optional[str]:
+        if content is not None and not content.strip():
+            raise ValueError("content must not be blank")
+        return content
+
 
 class MemoryListResponse(BaseModel):
     memories: list[dict[str, Any]]
@@ -128,6 +154,12 @@ class MemoryStatsResponse(BaseModel):
     tag_counts: dict[str, int]
     memory_store_type: str
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _ManagementMemoryBinding:
+    user_id: int
+    binding: MemoryStoreBinding | None
 
 
 class MemoryManagementRouter:
@@ -166,6 +198,31 @@ class MemoryManagementRouter:
             raise HTTPException(status_code=503, detail=error.status.detail) from None
 
     def _setup_routes(self) -> None:
+        async def bind_authenticated_user(user: User) -> _ManagementMemoryBinding:
+            user_id = int(user.id)
+            try:
+                binding = await resolve_trusted_memory_binding_async(
+                    MemoryManagementBindingRequest(
+                        authenticated_user_id=user_id,
+                    )
+                )
+            except MemoryBindingResolutionError:
+                raise HTTPException(
+                    status_code=503,
+                    detail=MEMORY_READ_UNAVAILABLE_DETAIL,
+                ) from None
+            return _ManagementMemoryBinding(user_id=user_id, binding=binding)
+
+        async def resolve_request_binding(
+            user: User = Depends(get_current_user),
+        ) -> _ManagementMemoryBinding:
+            return await bind_authenticated_user(user)
+
+        def request_store(request_binding: _ManagementMemoryBinding) -> MemoryStore:
+            if request_binding.binding is not None:
+                return request_binding.binding.store
+            return self.memory_store
+
         @self.router.get("/list", response_model=MemoryListResponse)
         async def list_memories(
             category: Optional[str] = Query(None, description="Filter by category"),
@@ -191,11 +248,14 @@ class MemoryManagementRouter:
                 100, ge=1, le=1000, description="Maximum results to return"
             ),
             offset: int = Query(0, ge=0, description="Offset for pagination"),
-            user: User = Depends(get_current_user),
+            request_binding: _ManagementMemoryBinding = Depends(
+                resolve_request_binding
+            ),
         ) -> MemoryListResponse:
+            store = request_store(request_binding)
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(request_binding.user_id):
                     # Build filters
                     filters: dict[str, Any] = {}
                     if category:
@@ -218,16 +278,18 @@ class MemoryManagementRouter:
                             if search:
                                 # Embeds the query.
                                 async with usage_scope(
-                                    int(user.id), usage_source="memory_api"
+                                    request_binding.user_id,
+                                    usage_source="memory_api",
+                                    model_ids=_embedding_model_ids(store),
                                 ):
-                                    memories = self.memory_store.search(
+                                    memories = store.search(
                                         query=search,
                                         k=1000,
                                         filters=filters if filters else None,
                                         similarity_threshold=similarity_threshold,
                                     )
                             else:
-                                memories = self.memory_store.list_all(filters)
+                                memories = store.list_all(filters)
                     except HTTPException:
                         raise
                     except Exception:
@@ -271,12 +333,16 @@ class MemoryManagementRouter:
 
         @self.router.delete(MEMORY_ID_ROUTE)
         async def delete_memory(
-            memory_id: MemoryIdPath, user: User = Depends(get_current_user)
+            memory_id: MemoryIdPath,
+            request_binding: _ManagementMemoryBinding = Depends(
+                resolve_request_binding
+            ),
         ) -> dict[str, Any]:
+            store = request_store(request_binding)
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)), memory_operation():
-                    response = self.memory_store.delete(memory_id)
+                with UserContext(request_binding.user_id), memory_operation():
+                    response = store.delete(memory_id)
                     if response.success:
                         return {
                             "success": True,
@@ -299,11 +365,16 @@ class MemoryManagementRouter:
             update_request: MemoryUpdateRequest,
             user: User = Depends(get_current_user),
         ) -> dict[str, Any]:
+            # Body validation completes before a remote binding is selected.
+            # Authentication remains a dependency, so unauthenticated callers
+            # cannot use validation responses to probe this endpoint.
+            request_binding = await bind_authenticated_user(user)
+            store = request_store(request_binding)
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)), memory_operation():
+                with UserContext(request_binding.user_id), memory_operation():
                     # Get existing memory
-                    get_response = self.memory_store.get(memory_id)
+                    get_response = store.get(memory_id)
                     if not get_response.success:
                         raise HTTPException(status_code=404, detail="Memory not found")
 
@@ -339,8 +410,12 @@ class MemoryManagementRouter:
                     )
 
                     # Update in store; re-embeds the note.
-                    async with usage_scope(int(user.id), usage_source="memory_api"):
-                        response = self.memory_store.update(updated_memory)
+                    async with usage_scope(
+                        request_binding.user_id,
+                        usage_source="memory_api",
+                        model_ids=_embedding_model_ids(store),
+                    ):
+                        response = store.update(updated_memory)
                     if response.success:
                         return {
                             "success": True,
@@ -361,12 +436,15 @@ class MemoryManagementRouter:
 
         @self.router.get("/stats", response_model=MemoryStatsResponse)
         async def get_memory_stats(
-            user: User = Depends(get_current_user),
+            request_binding: _ManagementMemoryBinding = Depends(
+                resolve_request_binding
+            ),
         ) -> MemoryStatsResponse:
+            store = request_store(request_binding)
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)), memory_operation():
-                    stats = self.memory_store.get_stats()
+                with UserContext(request_binding.user_id), memory_operation():
+                    stats = store.get_stats()
                     return MemoryStatsResponse(**stats)
             except HTTPException:
                 raise
@@ -377,21 +455,27 @@ class MemoryManagementRouter:
 
         @self.router.post("")
         async def create_memory(
-            memory_request: dict[str, Any], user: User = Depends(get_current_user)
+            memory_request: dict[str, Any],
+            user: User = Depends(get_current_user),
         ) -> dict[str, Any]:
             # Validate required fields
-            if "content" not in memory_request:
-                raise HTTPException(status_code=422, detail="Content field is required")
+            content = memory_request.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="Content field must be a non-blank string",
+                )
+            request_binding = await bind_authenticated_user(user)
             # Resolved before the try block on purpose: the lifecycle 503 must
             # reach the caller as itself, while the handler below keeps
             # wrapping store failures the way it always has.
-            store = self.memory_store
+            store = request_store(request_binding)
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)), memory_operation():
+                with UserContext(request_binding.user_id), memory_operation():
                     # Create new memory note
                     memory_note = MemoryNote(
-                        content=memory_request.get("content", ""),
+                        content=content,
                         keywords=memory_request.get("keywords", []),
                         tags=memory_request.get("tags", []),
                         category=memory_request.get("category", "general"),
@@ -399,7 +483,11 @@ class MemoryManagementRouter:
                     )
 
                     # Embeds the note.
-                    async with usage_scope(int(user.id), usage_source="memory_api"):
+                    async with usage_scope(
+                        request_binding.user_id,
+                        usage_source="memory_api",
+                        model_ids=_embedding_model_ids(store),
+                    ):
                         response = store.add(memory_note)
                     if response.success:
                         return {
@@ -427,13 +515,19 @@ class MemoryManagementRouter:
         # swallow this path and answer it as a lookup for a note called
         # "store-info".
         @self.router.get("/store-info")
-        async def get_store_info(user: User = Depends(get_current_user)) -> dict:
-            """Report the memory lifecycle state.
+        async def get_store_info(
+            request_binding: _ManagementMemoryBinding = Depends(
+                resolve_request_binding
+            ),
+        ) -> dict:
+            """Report public diagnostics for the active memory backend.
 
-            This stays available in every lifecycle state, including
-            BLOCKED_REPAIR, so an operator can see why memory is fenced off
-            while the rest of the deployment keeps serving.
+            The legacy backend reports its lifecycle state, including
+            BLOCKED_REPAIR. A trusted host binding reports only its declared
+            public diagnostics, and binding resolution failures return 503.
             """
+            if request_binding.binding is not None:
+                return dict(request_binding.binding.public_diagnostics)
             try:
                 # Off the event loop, like every other caller of the manager:
                 # the report reaches the drift check, which checks out a
@@ -453,12 +547,16 @@ class MemoryManagementRouter:
 
         @self.router.get(MEMORY_ID_ROUTE)
         async def get_memory(
-            memory_id: MemoryIdPath, user: User = Depends(get_current_user)
+            memory_id: MemoryIdPath,
+            request_binding: _ManagementMemoryBinding = Depends(
+                resolve_request_binding
+            ),
         ) -> dict[str, Any]:
+            store = request_store(request_binding)
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)), memory_operation():
-                    response = self.memory_store.get(memory_id)
+                with UserContext(request_binding.user_id), memory_operation():
+                    response = store.get(memory_id)
                     if response.success and response.content:
                         memory = response.content
                         if isinstance(memory, MemoryNote):

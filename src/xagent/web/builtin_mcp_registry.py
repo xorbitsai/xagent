@@ -1155,8 +1155,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         },
         {
             "app_id": "atlassian",
-            "name": "Atlassian (Jira, Confluence, Bitbucket)",
-            "description": "Connect to Atlassian to search and work with Jira issues, Confluence pages and Bitbucket repositories through Atlassian's hosted MCP server.",
+            "name": "Atlassian (Confluence, Bitbucket)",
+            "description": "Connect to Atlassian to search and work with Confluence pages and Bitbucket repositories through Atlassian's hosted MCP server. For Jira, use the Jira connector.",
             "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
             "transport": "streamable_http",
             "provider_name": None,
@@ -1174,8 +1174,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # vendor's current endpoint — the legacy /v1/sse endpoint is
             # unsupported after 2026-06-30. This row sits alongside the
             # separate "jira" row (our own local Jira tool launched behind
-            # Atlassian 3LO, transport "oauth"); both are visible in the
-            # connector picker because they expose different tool sets.
+            # Atlassian 3LO, transport "oauth"). Jira is served by that row,
+            # so this one is named and described as the Confluence +
+            # Bitbucket connector even though the hosted server still exposes
+            # Jira tools (20261105_update_atlassian_name_and_description).
             # auth.scope overrides the discovered scopes_supported, which is
             # too long to request (see ATLASSIAN_MCP_OAUTH_SCOPES);
             # auth.required_scope is the part of it a grant must include (see
@@ -1574,11 +1576,17 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "category": "Support",
             # "read" covers every read tool, including /search.json, which
             # has no resource-scoped variant; "tickets:write" covers create,
-            # update, delete, reply, and internal notes.
-            "oauth_scopes": ["read", "tickets:write"],
+            # update, delete, reply, and internal notes;
+            # "side_conversations:write" covers starting, replying to, and
+            # closing side conversations. A required scope, not an
+            # optional_oauth_scopes entry: Zendesk's authorize request has
+            # no optional_scope parameter. Grants made before it was added
+            # lack it until the user reconnects (20261102_zendesk_side_conv).
+            "oauth_scopes": ["read", "tickets:write", "side_conversations:write"],
             # Hidden until manually verified against a live account, same
             # precedent as the intercom row above: it ships customer-facing
-            # *write* tools (reply/internal note/create/update/delete)
+            # *write* tools (reply/internal note/create/update/delete, and
+            # side conversations that email outside recipients)
             # discoverable by every user the moment it's visible, and that
             # verification hasn't happened yet. Flip to True via a
             # follow-up once done --

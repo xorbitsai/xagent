@@ -205,7 +205,9 @@ def test_upgrade_target_matches_the_registry_row():
     assert registry_row["description"] == migration.OAUTH_DESCRIPTION
     assert registry_row["transport"] == "oauth"
     assert registry_row["provider_name"] == migration.APP_ID
-    assert registry_row["oauth_scopes"] == migration.OAUTH_SCOPES
+    # 20261102_zendesk_side_conv later adds side_conversations:write; its own
+    # test pins the full list.
+    assert set(migration.OAUTH_SCOPES).issubset(registry_row["oauth_scopes"])
     # 20261019_zendesk_marketplace later adds static_env; its own test pins it.
     assert {
         key: value

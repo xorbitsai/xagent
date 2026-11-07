@@ -424,6 +424,16 @@ class BaseToolConfig(ABC):
         """Get allowed knowledge base collections. None means all collections are allowed."""
         pass
 
+    def get_knowledge_base_team_id(self) -> Optional[int]:
+        """Get the team the governing agent's knowledge bases resolve against.
+
+        Separate from connector team visibility, so a caller can open one
+        without the other. Fail-closed default for every config that is not
+        web-backed: ``None`` keeps knowledge-base resolution keyed on the
+        runner alone.
+        """
+        return None
+
     def get_agent_creator_user_id(self) -> Optional[int]:
         """Get the governing agent's creator, for the knowledge-base seam.
 
@@ -570,6 +580,10 @@ class BaseToolConfig(ABC):
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""
         return None
+
+    def get_excluded_model_ids(self) -> frozenset[str]:
+        """Media model ids this task excludes, inherited by delegated agents."""
+        return frozenset()
 
     @abstractmethod
     def get_db(self) -> Optional[Any]:

@@ -12,8 +12,8 @@ const AUTH_LOGIN_INTENT_SCHEMA_VERSION = 1
 const AUTH_MUTATION_LOCK = "xagent-auth-cache"
 const MAX_REVISION = Number.MAX_SAFE_INTEGER
 
-export interface AuthUser { id: string | number; username: string; email?: string | null; is_admin?: boolean; has_password?: boolean }
-export interface AuthCacheUser { id: string; username: string; email?: string | null; is_admin?: boolean; has_password?: boolean }
+export interface AuthUser { id: string | number; username: string; email?: string | null; first_name?: string | null; is_admin?: boolean; has_password?: boolean }
+export interface AuthCacheUser { id: string; username: string; email?: string | null; first_name?: string | null; is_admin?: boolean; has_password?: boolean }
 export interface AuthTokenPayload {
   user: AuthUser
   access_token: string
@@ -143,7 +143,8 @@ function normalizeUser(value: unknown): AuthCacheUser | null {
   if (user.email !== undefined && user.email !== null && typeof user.email !== "string") return null
   if (user.is_admin !== undefined && typeof user.is_admin !== "boolean") return null
   if (user.has_password !== undefined && typeof user.has_password !== "boolean") return null
-  return { id, username: user.username, email: user.email, is_admin: user.is_admin, has_password: user.has_password }
+  const firstName = typeof user.first_name === "string" ? user.first_name : undefined
+  return { id, username: user.username, email: user.email, first_name: firstName, is_admin: user.is_admin, has_password: user.has_password }
 }
 function normalizeToken(value: unknown): string | null {
   // Signed and bearer values are opaque. Trim only to reject an all-whitespace value.
@@ -566,6 +567,7 @@ export async function updateAuthSessionUser(captured: AuthSessionSnapshot, next:
         ...cache.user,
         username: user.username,
         email: user.email,
+        first_name: user.first_name ?? cache.user.first_name,
         is_admin: user.is_admin,
         // Keep the password-capability marker in the canonical cache.  OIDC
         // users have no local password, and dropping this field here makes

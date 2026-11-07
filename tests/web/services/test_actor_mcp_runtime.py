@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import inspect
 import json
 import logging
@@ -497,10 +496,15 @@ async def test_create_default_tools_registers_production_adapter_only_for_actor_
 def test_web_tool_config_actor_parameters_are_appended_after_voice() -> None:
     parameters = list(inspect.signature(WebToolConfig.__init__).parameters)
 
-    assert parameters[-3:] == [
+    # Later parameters are appended after these, never inserted before
+    # them, so positional callers keep binding the same values.
+    assert parameters[-6:] == [
         "voice",
         "mcp_actor_stdio_connection_adapter",
         "mcp_actor_execution_identity",
+        "knowledge_base_team_id",
+        "excluded_model_ids",
+        "mcp_team_member_grants_allowed",
     ]
 
 
@@ -1405,18 +1409,10 @@ async def test_tool_factory_keeps_actor_stdio_session_identity_out_of_connection
         connection_config = kwargs["connection"]
         serialized = json.dumps(connection_config).encode()
         assert owner_bytes not in serialized
-        from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
-            _serialize_connection,
-        )
+        from xagent.sandbox.tool_runtime.bundle import sandbox_connection
 
-        file_payload = _serialize_connection(connection_config).encode()
+        file_payload = json.dumps(sandbox_connection(connection_config)).encode()
         assert owner_bytes not in file_payload
-        import cloudpickle
-
-        pickled = base64.b64decode(
-            base64.b64encode(cloudpickle.dumps(connection_config))
-        )
-        assert owner_bytes not in pickled
         return []
 
     monkeypatch.setattr(

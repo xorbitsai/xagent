@@ -20,6 +20,20 @@ from .base import (
 from .usage import record_image_usage, record_unusable_response
 
 
+class DashScopeAPIError(RuntimeError):
+    """A non-200 DashScope response, keeping the status the provider sent.
+
+    The status used to survive only inside the message text, so a 429 or a 503
+    reached the media tools as an unclassified failure. ``status_code`` is the
+    attribute ``classify_media_failure`` reads off the cause chain, so the
+    retryable statuses still read as a provider outage.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class DashScopeImageModel(BaseImageModel):
     """
     DashScope image generation model client.
@@ -208,8 +222,9 @@ class DashScopeImageModel(BaseImageModel):
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        raise RuntimeError(
-                            f"DashScope API error ({response.status}): {error_text}"
+                        raise DashScopeAPIError(
+                            f"DashScope API error ({response.status}): {error_text}",
+                            status_code=response.status,
                         )
 
                     # Inside the billing boundary: the 200 is already charged, so a
@@ -461,8 +476,9 @@ class DashScopeImageModel(BaseImageModel):
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
-                        raise RuntimeError(
-                            f"DashScope API error ({response.status}): {error_text}"
+                        raise DashScopeAPIError(
+                            f"DashScope API error ({response.status}): {error_text}",
+                            status_code=response.status,
                         )
 
                     # Inside the billing boundary: the 200 is already charged, so a

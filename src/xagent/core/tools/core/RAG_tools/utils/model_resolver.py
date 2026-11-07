@@ -50,6 +50,8 @@ from xagent.core.model.storage.error import ModelNotFoundError
 from xagent.core.storage.manager import get_default_db_url
 
 from ..core.exceptions import EmbeddingAdapterError, RagCoreException
+from .model_resolution_pin import pinned_resolution
+from .user_scope import get_user_scope
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +262,26 @@ def _close_model_hub(hub: Any) -> None:
         db_close()
 
 
+def _visible_name_matches(db: Any, candidates: list[Any]) -> list[Any]:
+    """Scope the hub's ``model_name`` fallback to the request's user.
+
+    ``model_name`` is shared across users, so a bare name such as
+    ``"text-embedding-v4"`` may only resolve to a row the caller can use:
+    their own, or one shared with them. Without a request-scoped user only
+    admin-shared rows count.
+    """
+    try:
+        from xagent.web.services.model_service import rank_name_matched_models
+    except ImportError:
+        logger.warning(
+            "Model visibility rules are unavailable; not resolving models by "
+            "model_name.",
+            exc_info=True,
+        )
+        return []
+    return rank_name_matched_models(db, candidates, get_user_scope().user_id)
+
+
 @contextmanager
 def _managed_model_hub(model_type_name: str) -> Any:
     """Yield a model hub and always close its DB session after use."""
@@ -335,7 +357,7 @@ def _load_model_from_hub(
 
         # Load model configuration first
         try:
-            cfg = hub.load(model_id)
+            cfg = hub.load(model_id, name_match_scope=_visible_name_matches)
         except ModelNotFoundError as exc:
             raise exception_cls(
                 f"Failed to load {config_type.__name__} from model hub",
@@ -545,7 +567,49 @@ def _resolve_adapter_generic(
         exception_type: If no model available from hub or environment
     """
     adapter_kwargs = adapter_kwargs or {}
+    # Under a ModelResolutionPin the config is resolved once per request, so
+    # the models its usage gate was told about are the ones called. The
+    # user scope decides which rows a bare model name may match.
+    resolution_key = (
+        "model_config",
+        model_type_name,
+        model_id,
+        tuple(sorted(env_kwargs.items())),
+        get_user_scope(),
+    )
+    cfg, from_env = pinned_resolution(
+        resolution_key,
+        lambda: _resolve_config_generic(
+            model_id=model_id,
+            config_type=config_type,
+            exception_type=exception_type,
+            model_type_name=model_type_name,
+            env_resolver=env_resolver,
+            env_kwargs=env_kwargs,
+        ),
+    )
+    adapter = _create_adapter_safe(
+        cfg,
+        adapter_factory,
+        exception_type,
+        " from environment configuration" if from_env else "",
+        **adapter_kwargs,
+    )
+    return cfg, adapter
 
+
+def _resolve_config_generic(
+    model_id: Optional[str],
+    config_type: Type[ConfigType],
+    exception_type: Type[ExceptionType],
+    model_type_name: str,
+    env_resolver: Callable[..., Optional[ConfigType]],
+    env_kwargs: dict[str, Any],
+) -> Tuple[ConfigType, bool]:
+    """Resolve the config for ``model_id``: hub first, then the environment.
+
+    Returns the config and whether it came from the environment.
+    """
     hub_unavailable_error: Optional[str] = None
     hub_missing_model = False
     lookup_id = "default"
@@ -557,7 +621,7 @@ def _resolve_adapter_generic(
         hub_unavailable_error = unavailable_error
         if hub is not None:
             try:
-                cfg = hub.load(lookup_id)
+                cfg = hub.load(lookup_id, name_match_scope=_visible_name_matches)
             except ModelNotFoundError as hub_error:
                 hub_missing_model = True
                 logger.warning(
@@ -587,10 +651,7 @@ def _resolve_adapter_generic(
                 )
             else:
                 if isinstance(cfg, config_type):
-                    adapter = _create_adapter_safe(
-                        cfg, adapter_factory, exception_type, **adapter_kwargs
-                    )
-                    return cfg, adapter
+                    return cfg, False
 
                 raise exception_type(
                     f"Model '{lookup_id}' exists but is not a {config_type.__name__}",
@@ -602,14 +663,7 @@ def _resolve_adapter_generic(
 
     env_cfg = env_resolver(**env_kwargs)
     if env_cfg:
-        adapter = _create_adapter_safe(
-            env_cfg,
-            adapter_factory,
-            exception_type,
-            " from environment configuration",
-            **adapter_kwargs,
-        )
-        return env_cfg, adapter
+        return env_cfg, True
 
     if hub_unavailable_error:
         logger.warning(

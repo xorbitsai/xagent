@@ -45,6 +45,7 @@ from ..conftest import (
     _register_second_user,
     client,
 )
+from .test_auth import _create_personal_key
 from .test_workforces import (
     _create_active_workforce,
     _create_workforce_key,
@@ -409,7 +410,9 @@ def test_an_agent_tombstone_stays_404_for_a_workforce_key(route):
 # ===== resolve_sdk_task: live query and tombstone predicate must agree =====
 
 
-def _create_web_sourced_task(*, agent_id: int) -> int:
+def _create_web_sourced_task(
+    *, agent_id: int, source: str = "web", sdk_credential_kind: str | None = None
+) -> int:
     """A ``source="web"`` task owned by ``agent_id``, inserted directly since
     no v1 route creates one -- same pattern as
     ``test_task_reply.test_reply_to_non_sdk_source_task_returns_404``."""
@@ -422,7 +425,8 @@ def _create_web_sourced_task(*, agent_id: int) -> int:
             control_state=TaskControlState.WAITING_FOR_USER.value,
             run_id=f"run-web-{uuid.uuid4()}",
             agent_id=agent_id,
-            source="web",
+            source=source,
+            sdk_credential_kind=sdk_credential_kind,
             is_visible=True,
         )
         db.add(task)
@@ -436,7 +440,9 @@ def _create_web_sourced_task(*, agent_id: int) -> int:
 def test_resolve_sdk_task_live_and_tombstone_predicates_agree():
     """Matrix over key type x task, driven by the real purge: whichever way
     a key's live GET resolves a task -- 200 or 404 -- its GET after the
-    purge must be 410 iff it was 200, else 404. ``resolve_sdk_task``'s live
+    purge must be 410 iff it was 200, else 404. Keys are agent, workforce
+    and personal keys; tasks vary by the credential kind that created them,
+    whether their agent was deleted, and their source. ``resolve_sdk_task``'s live
     query and ``_raise_if_expired_for_scope``'s tombstone read are two
     separate predicates over the same columns; this is what would catch
     them drifting apart.
@@ -458,15 +464,22 @@ def test_resolve_sdk_task_live_and_tombstone_predicates_agree():
     )
     assert agent_a_key_resp.status_code == 200, agent_a_key_resp.text
     agent_a_key = agent_a_key_resp.json()["full_key"]
-    _agent_b_id, agent_b_key = _create_agent_with_key()
+    agent_b_id, agent_b_key = _create_agent_with_key()
     workforce_w_key = _create_workforce_key(headers, workforce_w)
     workforce_w2_key = _create_workforce_key(headers, workforce_w2)
+    personal_key = _create_personal_key()[0]
+    other_personal = client.post(
+        "/api/me/personal-keys", headers=_register_second_user("bob", "bobpass1")
+    )
+    assert other_personal.status_code == 200, other_personal.text
 
     keys: dict[str, str] = {
         "agent_a": agent_a_key,
         "agent_b": agent_b_key,
         "workforce_w": workforce_w_key,
         "workforce_w2": workforce_w2_key,
+        "personal": personal_key,
+        "other_personal": other_personal.json()["full_key"],
     }
 
     def _make_sdk_task_of_agent_a() -> int:
@@ -484,12 +497,30 @@ def test_resolve_sdk_task_live_and_tombstone_predicates_agree():
     def _make_web_task_of_agent_a() -> int:
         return _create_web_sourced_task(agent_id=manager_agent_a)
 
+    def _make_personal_task_whose_agent_was_deleted() -> int:
+        task_id = _create_task(personal_key, agent_b_id)
+        db = _direct_db_session()
+        try:
+            # What agent deletion does to the live task.
+            db.query(Task).filter(Task.id == task_id).update({"agent_id": None})
+            db.commit()
+        finally:
+            db.close()
+        return task_id
+
     task_factories = {
         "sdk_agent_a": _make_sdk_task_of_agent_a,
         "sdk_run_workforce_w": _make_sdk_run_task_of_workforce_w,
         "web_agent_a": _make_web_task_of_agent_a,
+        "sdk_agent_b": lambda: _create_task(agent_b_key, agent_b_id),
+        "sdk_personal_agent_b": lambda: _create_task(personal_key, agent_b_id),
+        "sdk_personal_agent_deleted": _make_personal_task_whose_agent_was_deleted,
+        "internal_personal_agent_b": lambda: _create_web_sourced_task(
+            agent_id=agent_b_id, source="internal", sdk_credential_kind="personal"
+        ),
     }
 
+    seen_live: set[tuple[str, str]] = set()
     for task_label, make_task in task_factories.items():
         for key_label, full_key in keys.items():
             task_id = make_task()
@@ -498,6 +529,8 @@ def test_resolve_sdk_task_live_and_tombstone_predicates_agree():
             live = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
             assert live.status_code in (200, 404), f"{case}: {live.text}"
             was_live = live.status_code == 200
+            if was_live:
+                seen_live.add((key_label, task_label))
 
             _purge_conversation(task_id)
 
@@ -508,6 +541,12 @@ def test_resolve_sdk_task_live_and_tombstone_predicates_agree():
             else:
                 assert after.status_code == 404, f"{case}: {after.text}"
                 assert after.json()["error"]["code"] == "task_not_found"
+    # Each key kind proves its own cell, so no row of the matrix is vacuous.
+    assert {
+        ("agent_b", "sdk_agent_b"),
+        ("workforce_w", "sdk_run_workforce_w"),
+        ("personal", "sdk_personal_agent_b"),
+    } <= seen_live
 
 
 # ===== /steps: trace-only expiry =====

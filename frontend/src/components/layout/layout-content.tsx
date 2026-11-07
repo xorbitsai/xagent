@@ -26,13 +26,13 @@ export function LayoutContent({ children }: LayoutContentProps) {
   // For other pages, show sidebar and main layout
   return (
     <AppProvider>
-      <div className="flex h-screen bg-background relative">
+      <div className="flex h-dvh overflow-hidden bg-background relative">
         <div className="hidden xl:flex xl:shrink-0">
           <Sidebar />
         </div>
-        <div className="flex flex-1 flex-col overflow-hidden bg-background">
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden bg-background">
           <MobileHeader />
-          <main className="flex-1 overflow-hidden bg-background">
+          <main className="min-h-0 flex-1 overflow-hidden bg-background">
             {children}
           </main>
         </div>

@@ -54,6 +54,7 @@ from ...core.task_runtime import (
     requires_exact_file_operation_scope as requires_exact_file_operation_scope,
 )
 from ..models.task import Task
+from .response_format import RESPONSE_FORMAT_CONFIG_KEY
 
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROVIDER_METHODS = (
@@ -238,6 +239,7 @@ CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
         MCP_RUNTIME_AUTHORIZATION_POLICY_STDIO_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
         PROMPT_CONTEXT_AGENT_CONFIG_KEY,
+        RESPONSE_FORMAT_CONFIG_KEY,
         QUESTION_CANCELLED_AGENT_CONFIG_KEY,
         FILE_OPERATION_ACCESS_VERSION_KEY,
         "auth_mode",

@@ -1071,6 +1071,9 @@ def test_none_as_null_is_limited_to_explicit_column_contracts() -> None:
     so unclaimed uploads do not block migration downgrade.
     MCP server signed-upload settings store SQL NULL when a connector has none,
     matching the rows that predate the column.
+    A task's structured output record stores SQL NULL when its latest completed
+    run produced no structured result, which is also how rows that predate the
+    column read.
 
     Imports xagent.web.models first (same reason as
     test_table_is_registered_in_metadata above) so every model's table is
@@ -1092,6 +1095,7 @@ def test_none_as_null_is_limited_to_explicit_column_contracts() -> None:
         ("task_interaction_requests", "response_payload"),
         ("uploaded_files", "cleanup_manifest"),
         ("mcp_servers", "signed_uploads"),
+        ("tasks", "structured_output_record"),
     }
 
 

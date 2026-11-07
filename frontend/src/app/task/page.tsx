@@ -6,6 +6,7 @@ import { Bot, CalendarDays, PenLine } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
+import { useTaskVoice } from "@/contexts/task-voice-context";
 import { ChatStartScreen, AgentCard } from "@/components/chat/ChatStartScreen";
 import { FilePreviewDialog } from "@/components/file/file-preview-dialog";
 import { getBrandingFromEnv } from "@/lib/branding";
@@ -35,6 +36,7 @@ function TaskHomePageContent() {
   }, []);
   const { t, locale } = useI18n();
   const { sendMessage, state, dispatch, closeFilePreview } = useApp();
+  const openVoice = useTaskVoice();
   const searchParams = useSearchParams();
   const starter = searchParams.get("starter");
   const promptFromQuery = searchParams.get("prompt");
@@ -465,6 +467,7 @@ function TaskHomePageContent() {
             onAgentClick={handleAgentClick}
             selectedAgents={resolvedSelectedAgents}
             onSend={handleSend}
+            onVoiceConversation={openVoice ? config => openVoice({ ...config, agentId: toAgentId(selectedAgents[0]) ?? undefined }) : undefined}
             isSending={state.isProcessing}
             files={files}
             onFilesChange={setFiles}

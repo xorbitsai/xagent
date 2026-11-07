@@ -21,12 +21,15 @@ from ...core.tools.core.RAG_tools.kb import (
     get_kb_coordinator,
 )
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
+    resolve_ingestion_model_ids,
     run_document_ingestion,
 )
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
     FileHandlerResult,
     run_web_ingestion,
 )
+from ...core.tools.core.RAG_tools.utils.config_utils import IngestionConfigInput
+from ...core.tools.core.RAG_tools.utils.model_resolution_pin import ModelResolutionPin
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from ..config import get_upload_path
 from ..models.background_job import BackgroundJob
@@ -36,7 +39,8 @@ from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
 from ..services.kb_reference_protection import coordinate_ingest_job
-from ..tracking.standalone_usage import usage_scope
+from ..services.quota_hooks import get_standalone_gate
+from ..tracking.standalone_usage import StandaloneUsageRefused, usage_scope
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
@@ -190,6 +194,28 @@ def _cleanup_failed_job_collection_metadata_after_api_ingest(
     )
 
 
+def _resolve_job_ingestion_models(
+    payload: dict[str, Any], ingestion_config: IngestionConfigInput
+) -> tuple[ModelResolutionPin, tuple[str, ...]]:
+    """Resolve the job's embedding model under a fresh pin, for its gate.
+
+    Run the ingestion under the pin and it embeds with the models returned.
+    With no gate registered nothing is resolved, the ids are empty and the
+    pin binds nothing.
+    """
+    if get_standalone_gate() is None:
+        return ModelResolutionPin(enabled=False), ()
+    pin = ModelResolutionPin()
+    model_ids = pin.run(
+        resolve_ingestion_model_ids,
+        str(payload["collection"]),
+        ingestion_config=ingestion_config,
+        user_id=int(payload["user_id"]),
+        is_admin=bool(payload.get("is_admin", False)),
+    )
+    return pin, model_ids
+
+
 @coordinate_ingest_job
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
@@ -215,10 +241,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
     try:
+        model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not
         # the storage tenant in payload["user_id"].
         with (
-            usage_scope(int(job.user_id), usage_source="kb_ingest_job"),
+            usage_scope(
+                int(job.user_id), usage_source="kb_ingest_job", model_ids=model_ids
+            ),
+            model_pin.bound(),
             user_scope_context(
                 user_id=int(payload["user_id"]),
                 is_admin=bool(payload.get("is_admin", False)),
@@ -248,7 +278,9 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         )
         return _superseded_staged_document_result(payload)
     except Exception as exc:
-        if int(job.attempts or 0) >= int(job.max_attempts or 1):
+        # A refused job is not retried: the gate would refuse the retry too.
+        refused = isinstance(exc, StandaloneUsageRefused)
+        if refused or int(job.attempts or 0) >= int(job.max_attempts or 1):
             # Last attempt only: a retry re-registers the same doc_id and reuses
             # its parse, chunk and embedding rows.
             _rollback_raised_staged_document_ingestion(db, payload, exc)
@@ -257,6 +289,8 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             payload,
             context="background staged document ingest exception",
         )
+        if refused:
+            raise BackgroundJobHandlerError(str(exc), retryable=False) from exc
         raise
 
     result_payload = result.model_dump(mode="json")
@@ -394,8 +428,12 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
 
     update_job_progress(db, job, message="Crawling website")
     try:
+        model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         with (
-            usage_scope(int(job.user_id), usage_source="kb_ingest_web_job"),
+            usage_scope(
+                int(job.user_id), usage_source="kb_ingest_web_job", model_ids=model_ids
+            ),
+            model_pin.bound(),
             user_scope_context(user_id=user_id, is_admin=is_admin),
         ):
             # asyncio.run carries this context into the crawl's tasks.
@@ -415,8 +453,10 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
                 )
             )
             result = api_result.result
-    except Exception:
+    except Exception as exc:
         _cleanup_failed_web_collection_metadata_if_new(db, payload)
+        if isinstance(exc, StandaloneUsageRefused):
+            raise BackgroundJobHandlerError(str(exc), retryable=False) from exc
         raise
 
     from ..api.kb import _demote_empty_crawl_to_error

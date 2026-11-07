@@ -14,12 +14,17 @@ from ..models.oidc_consumed_token import OidcConsumedToken
 _PREFIX = "oauth-launch:"
 
 
-def consume_oauth_launch_ticket(db: Session, claims: dict[str, Any]) -> bool:
+def consume_oauth_launch_ticket(
+    db: Session, claims: dict[str, Any], *, purpose: str | None = None
+) -> bool:
     """Caller verifies signature, purpose, provider and current user first.
 
     Keep the claim committed if later launch setup fails, including across API
     workers and restarts. Both admission and cleanup use the database clock.
     """
+    if purpose not in {None, "builtin", "mcp"}:
+        return False
+    prefix = _PREFIX if purpose is None else _PREFIX + purpose + ":"
     token_id = claims.get("jti")
     expiry = claims.get("exp")
     if not isinstance(token_id, str) or not re.fullmatch(
@@ -41,10 +46,10 @@ def consume_oauth_launch_ticket(db: Session, claims: dict[str, Any]) -> bool:
         if expires_at <= now:
             return False
         db.query(OidcConsumedToken).filter(
-            OidcConsumedToken.token_id.startswith(_PREFIX),
+            OidcConsumedToken.token_id.startswith(prefix),
             OidcConsumedToken.expires_at <= now,
         ).delete(synchronize_session=False)
-        db.add(OidcConsumedToken(token_id=_PREFIX + token_id, expires_at=expires_at))
+        db.add(OidcConsumedToken(token_id=prefix + token_id, expires_at=expires_at))
         db.commit()
     except IntegrityError:
         db.rollback()

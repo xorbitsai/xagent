@@ -497,6 +497,16 @@ def _is_retryable_stream_transport_error(error: BaseException) -> bool:
     return False
 
 
+def _cached_usage_field(usage: Any) -> Dict[str, int]:
+    """``cached_input_tokens`` for a streamed usage dict, empty when none.
+
+    The trace reads cache hits from the usage the stream hands back, so a
+    count that is only recorded in the token context never reaches it.
+    """
+    cached = extract_cached_input_tokens(usage)
+    return {"cached_input_tokens": cached} if cached else {}
+
+
 class OpenAICompatibleLLM(BaseLLM):
     """
     Internal OpenAI-compatible chat client using the official OpenAI SDK.
@@ -1662,6 +1672,7 @@ class OpenAICompatibleLLM(BaseLLM):
                                 "prompt_tokens": input_tokens,
                                 "completion_tokens": output_tokens,
                                 "total_tokens": input_tokens + output_tokens,
+                                **_cached_usage_field(usage),
                             },
                             raw=last_raw_chunk,
                         )
@@ -1761,6 +1772,7 @@ class OpenAICompatibleLLM(BaseLLM):
                             "prompt_tokens": raw_chunk.usage.prompt_tokens,
                             "completion_tokens": raw_chunk.usage.completion_tokens,
                             "total_tokens": raw_chunk.usage.total_tokens,
+                            **_cached_usage_field(raw_chunk.usage),
                         },
                         raw=raw_chunk,
                     )

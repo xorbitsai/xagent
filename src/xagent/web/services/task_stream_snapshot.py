@@ -1,9 +1,10 @@
 """Read-only reconciliation for lossy shared event streams."""
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select
+from sqlalchemy.orm import defer
 
 from ..models.database import get_session_local
 from ..models.task import Task
@@ -23,7 +24,17 @@ def load_task_stream_snapshots(task_ids: list[int]) -> list[dict[str, Any]]:
         return []
     with get_session_local()() as db:
         snapshots = []
-        for task in db.query(Task).filter(Task.id.in_(task_ids)).all():
+        # Loaded without structured_output_record: reading the column from these
+        # objects, or from the same rows reached again through Session.get or a
+        # relationship in this session, raises; do not keep using these Task objects
+        # after a commit, because the reload after a commit reads the column back.
+        tasks = (
+            db.query(Task)
+            .options(defer(cast(Any, Task.structured_output_record), raiseload=True))
+            .filter(Task.id.in_(task_ids))
+            .all()
+        )
+        for task in tasks:
             snapshot = {
                 "type": "task_stream_snapshot",
                 "task_id": int(task.id),

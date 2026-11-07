@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
+from ..agent.prompt_composition import (
+    PROMPT_COMPOSITION_KEY,
+    build_prompt_composition,
+    call_kind_from_metadata,
+)
 from ..agent.trace import (
     TraceAction,
     TraceCategory,
@@ -22,12 +28,22 @@ from ..context_materializer import (
     ContextReferenceResolver,
     materialize_llm_kwargs,
 )
+from ..guardrails.output import (
+    BLOCKED_OUTPUT,
+    OUTPUT_REVIEW_TIMEOUT_SECONDS,
+    UNAVAILABLE_OUTPUT,
+    OutputDecision,
+    OutputGuardrail,
+    ProtectedInteractionError,
+    ReviewedOutputStream,
+)
 from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.basic.call_boundary import (
     BUDGET_INSENSITIVE_FAILURE_CODES,
     ProviderCallError,
 )
+from ..model.chat.cache_lifecycle import AgentCacheSession
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import (
     LLMContextLengthError,
@@ -71,6 +87,7 @@ from .context.execution import (
     context_checkpoint_gate,
     derive_compact_threshold,
 )
+from .prompt_prefix import PROMPT_PREFIX_KEY, PromptPrefixObserver
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -342,10 +359,15 @@ class PatternRuntime:
     """
 
     tracer: Any | None = None
+    _prompt_prefix_observer: PromptPrefixObserver | None = field(
+        default=None, init=False, repr=False
+    )
     execution_id: str | None = None
     interrupt_checker: Callable[[], bool] | Callable[[], Any] | None = None
     outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
     context_ref_resolver: ContextReferenceResolver | None = None
+    output_guardrail: OutputGuardrail | None = None
+    _approved_questions: set[str] = field(default_factory=set, init=False, repr=False)
     _interrupt_requested: bool = False
     interrupt_reason: str | None = None
     budget_stopped: bool = False
@@ -373,7 +395,13 @@ class PatternRuntime:
     pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     inline_file_delivery: InlineFileDelivery | None = None
+    _approved_answers: dict[str, OutputDecision] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _reviewed_output_streams: dict[str, ReviewedOutputStream] = field(
         default_factory=dict, init=False, repr=False
     )
     _active_llm_tasks: set[asyncio.Future[Any]] = field(
@@ -386,6 +414,27 @@ class PatternRuntime:
         init=False,
         repr=False,
     )
+    _cache_session: AgentCacheSession = field(
+        default_factory=AgentCacheSession, init=False, repr=False
+    )
+    _cache_pattern_count: int = field(default=0, init=False, repr=False)
+
+    async def _sync_cache_phase(self) -> None:
+        phase = (
+            "waiting"
+            if self._active_tool_tasks and not self._active_llm_tasks
+            else "active"
+        )
+        await self._cache_session.transition(phase)
+
+    async def finish_cache_session(self) -> None:
+        self._cache_pattern_count = 0
+        await self._cache_session.transition("finished")
+
+    async def _cache_pattern_finished(self) -> None:
+        self._cache_pattern_count = max(0, self._cache_pattern_count - 1)
+        if not self._cache_pattern_count:
+            await self.finish_cache_session()
 
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt_requested = True
@@ -496,9 +545,10 @@ class PatternRuntime:
         if not inspect.isawaitable(call):
             return call
 
-        task: asyncio.Future[Any] = asyncio.ensure_future(call)
+        task: asyncio.Future[Any] = self._cache_session.create_task(call)
         self._active_llm_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -513,7 +563,13 @@ class PatternRuntime:
                 raise LLMContextLengthError(str(exc)) from exc
             raise
         finally:
-            self._active_llm_tasks.discard(task)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._active_llm_tasks.discard(task)
+                await self._sync_cache_phase()
 
     async def run_tool_call(self, invoke: Callable[[], Any]) -> Any:
         """Run a tool call as a cancellable subtask owned by this runtime."""
@@ -530,6 +586,7 @@ class PatternRuntime:
         task: asyncio.Future[Any] = asyncio.ensure_future(call)
         self._active_tool_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -538,9 +595,13 @@ class PatternRuntime:
                 ) from exc
             raise
         finally:
-            if not task.done():
-                task.cancel()
-            self._active_tool_tasks.discard(task)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._active_tool_tasks.discard(task)
+                await self._sync_cache_phase()
 
     async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         """Stream only the final user-facing answer through the outbound boundary."""
@@ -742,9 +803,10 @@ class PatternRuntime:
                 return stamp_stream_markers({"content": content, **provider_payload})
             return content
 
-        task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
+        task: asyncio.Future[Any] = self._cache_session.create_task(consume_stream())
         self._active_llm_tasks.add(task)
         try:
+            await self._sync_cache_phase()
             return await task
         except asyncio.CancelledError as exc:
             if self._interrupt_requested:
@@ -753,7 +815,13 @@ class PatternRuntime:
                 ) from exc
             raise
         finally:
-            self._active_llm_tasks.discard(task)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._active_llm_tasks.discard(task)
+                await self._sync_cache_phase()
 
     def _stamp_stream_fallback(
         self,
@@ -967,6 +1035,14 @@ class PatternRuntime:
         if self.outbound_message_handler is None:
             return None
         message_id = f"final_answer_{uuid4().hex}"
+        if self.output_guardrail is not None:
+            try:
+                local_stream = self.output_guardrail.open_stream()
+            except Exception:
+                # The entire answer can still be reviewed before delivery.
+                local_stream = None
+            if local_stream is not None:
+                self._reviewed_output_streams[message_id] = local_stream
         if self.inline_file_delivery is not None:
             self._inline_stream_guards[message_id] = InlineFileStreamGuard()
         self.last_final_answer_stream_message_id = None
@@ -980,6 +1056,7 @@ class PatternRuntime:
             )
         except BaseException:
             self._inline_stream_guards.pop(message_id, None)
+            self._reviewed_output_streams.pop(message_id, None)
             raise
         logger.info(
             "final_answer stream opened. task_id=%s step=%s turn=%s message_id=%s",
@@ -991,9 +1068,22 @@ class PatternRuntime:
         return message_id
 
     async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
-        guard = self._inline_stream_guards.get(message_id)
-        if guard is not None:
+        if self.output_guardrail is not None:
+            local_stream = self._reviewed_output_streams.get(message_id)
+            if local_stream is None:
+                return
+            try:
+                async with asyncio.timeout(OUTPUT_REVIEW_TIMEOUT_SECONDS):
+                    delta = await local_stream.feed(delta)
+            except Exception:
+                self._reviewed_output_streams.pop(message_id, None)
+                self._inline_stream_guards.pop(message_id, None)
+                return
+        if delta and (guard := self._inline_stream_guards.get(message_id)) is not None:
             delta = guard.feed(delta)
+        await self._publish_final_answer_delta(message_id, delta)
+
+    async def _publish_final_answer_delta(self, message_id: str, delta: str) -> None:
         if not delta:
             return
         await self._emit_outbound(
@@ -1006,15 +1096,73 @@ class PatternRuntime:
         )
 
     async def prepare_final_answer(self, content: str) -> str:
+        return (await self._prepare_final_answer(content)).text
+
+    async def _check_output(
+        self, content: str, *, structured: bool = False
+    ) -> OutputDecision:
+        if self.output_guardrail is None:
+            return OutputDecision("allow", content)
+        try:
+            async with asyncio.timeout(OUTPUT_REVIEW_TIMEOUT_SECONDS):
+                if structured:
+                    return await self.output_guardrail.check(content, structured=True)
+                return await self.output_guardrail.check(content)
+        except Exception:
+            # Reviewer failures may include the candidate in their exception.
+            return OutputDecision("block", UNAVAILABLE_OUTPUT)
+
+    async def _prepare_final_answer(self, content: str) -> OutputDecision:
+        if self.output_guardrail is not None:
+            from .result import unwrap_final_answer_content
+
+            content = unwrap_final_answer_content(content)
+            fingerprint = hashlib.sha256(
+                content.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+            cached = self._approved_answers.get(fingerprint)
+            if cached is not None:
+                return cached
+            decision = await self._check_output(content)
+            if decision.action == "allow":
+                decision = replace(
+                    decision, text=await self._deliver_inline_answer(decision.text)
+                )
+            self._approved_answers[fingerprint] = decision
+            return decision
+        return OutputDecision("allow", await self._deliver_inline_answer(content))
+
+    async def _deliver_inline_answer(self, content: str) -> str:
         if self.inline_file_delivery is None or "base64" not in content.lower():
             return content
         return await asyncio.to_thread(self.inline_file_delivery.transform, content)
 
     async def end_final_answer_stream(self, message_id: str, content: str) -> None:
         guard = self._inline_stream_guards.pop(message_id, None)
-        content = await self.prepare_final_answer(content)
-        if guard is not None:
-            await self.emit_final_answer_delta(message_id, guard.flush())
+        local_stream = self._reviewed_output_streams.pop(message_id, None)
+        original = content
+        if self.output_guardrail is None:
+            content = await self.prepare_final_answer(content)
+        else:
+            decision = await self._prepare_final_answer(content)
+            content = decision.text
+            if decision.action == "block" and content == UNAVAILABLE_OUTPUT:
+                await self.fail_final_answer_stream(message_id, UNAVAILABLE_OUTPUT)
+                return
+        if local_stream is not None:
+            try:
+                suffix = local_stream.approved_suffix(content)
+            except Exception:
+                suffix = ""
+                guard = None
+            if guard is not None:
+                if suffix:
+                    suffix = guard.feed(suffix) + guard.flush()
+                elif content == original:
+                    suffix = guard.flush()
+            await self._publish_final_answer_delta(message_id, suffix)
+        elif guard is not None:
+            await self._publish_final_answer_delta(message_id, guard.flush())
         self.last_final_answer_stream_message_id = message_id
         await self._emit_outbound(
             {
@@ -1034,12 +1182,16 @@ class PatternRuntime:
             len(content),
         )
 
-    def discard_inline_file_streams(self) -> None:
+    def discard_final_answer_streams(self) -> None:
         """Release per-run buffers even if a pattern abandoned a candidate."""
         self._inline_stream_guards.clear()
+        self._reviewed_output_streams.clear()
 
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        if self.output_guardrail is not None and error != UNAVAILABLE_OUTPUT:
+            error = "The answer stream could not be completed."
         self._inline_stream_guards.pop(message_id, None)
+        self._reviewed_output_streams.pop(message_id, None)
         if self.last_final_answer_stream_message_id == message_id:
             self.last_final_answer_stream_message_id = None
         await self._emit_outbound(
@@ -1130,6 +1282,45 @@ class PatternRuntime:
             self.checkpoints.append(payload)
             return payload
 
+    @staticmethod
+    def _question_candidate(message: str, message_type: str, interactions: Any) -> str:
+        return json.dumps(
+            [message, message_type, interactions or []],
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+        )
+
+    async def approve_waiting_result(self, result: dict[str, Any]) -> bool:
+        """Check a restored question that did not pass through send_message this run."""
+        if self.output_guardrail is None:
+            return True
+        message = str(
+            result.get("message")
+            or result.get("output")
+            or result.get("response")
+            or ""
+        )
+        message_type = str(result.get("message_type") or "question")
+        candidates = {
+            self._question_candidate(message, message_type, result.get("interactions"))
+        }
+        draft = result.get("clarification_draft")
+        if draft is not None:
+            candidates.add(
+                self._question_candidate(
+                    draft.message, draft.message_type, draft.interactions
+                )
+            )
+        for candidate in candidates - self._approved_questions:
+            if (await self._check_output(candidate, structured=True)).action != "allow":
+                return False
+        self._approved_questions.update(candidates)
+        result["message"] = message
+        result["message_type"] = message_type
+        result["output"] = message
+        return True
+
     async def send_message(
         self,
         *,
@@ -1142,6 +1333,45 @@ class PatternRuntime:
         """Emit an agent-to-user message through the runtime boundary."""
 
         outbound_metadata = dict(metadata or {})
+        if self.output_guardrail is not None and (visible or expect_response):
+            # Check structured metadata as well as the display text. A
+            # provider rewrite cannot safely preserve interaction identity.
+            structured = bool(outbound_metadata) or message_type not in {
+                "info",
+                "question",
+            }
+            candidate = (
+                json.dumps(
+                    {
+                        "message": message,
+                        "type": message_type,
+                        "metadata": outbound_metadata,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                if structured
+                else message
+            )
+            decision = await self._check_output(candidate, structured=structured)
+            if expect_response and decision.action == "allow":
+                self._approved_questions.add(
+                    self._question_candidate(
+                        message, message_type, outbound_metadata.get("interactions")
+                    )
+                )
+            if decision.action != "allow":
+                if expect_response or message_type == "question":
+                    raise ProtectedInteractionError(
+                        unavailable=decision.text == UNAVAILABLE_OUTPUT
+                    )
+                message = (
+                    BLOCKED_OUTPUT
+                    if structured and decision.text != UNAVAILABLE_OUTPUT
+                    else decision.text
+                )
+                outbound_metadata = {}
+                message_type = "info"
         step_id = (
             outbound_metadata.get("step_id")
             or outbound_metadata.get("dag_step_id")
@@ -1207,6 +1437,9 @@ class PatternRuntime:
         return payload
 
     async def on_pattern_start(self, *, context: Any, pattern: Any) -> None:
+        if not self._cache_pattern_count and self._cache_session.phase == "finished":
+            self._cache_session = AgentCacheSession()
+        self._cache_pattern_count += 1
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = f"react_{uuid4().hex[:8]}"
             self.active_turn_id = self._dag_turn_id(context)
@@ -1238,72 +1471,25 @@ class PatternRuntime:
         pattern: Any,
         result: dict[str, Any],
     ) -> None:
-        await self._emit_pattern_trace(
-            context=context,
-            pattern=pattern,
-            action="end",
-            data={"result": result, "status": result.get("status")},
-        )
-        if pattern.__class__.__name__ == "ReActPattern":
-            self.active_react_step_id = None
-            self.active_turn_id = None
-        if self.tracer is None:
-            return
-        finish_trace = getattr(self.tracer, "finish_trace", None)
-        if callable(finish_trace):
-            await self._maybe_await(
-                finish_trace(
-                    name=self._pattern_trace_name(pattern),
-                    status="success",
-                    output=result,
-                    metadata={
-                        "execution_id": getattr(
-                            context, "execution_id", self.execution_id
-                        ),
-                        "pattern": pattern.__class__.__name__,
-                    },
-                )
+        try:
+            await self._emit_pattern_trace(
+                context=context,
+                pattern=pattern,
+                action="end",
+                data={"result": result, "status": result.get("status")},
             )
-
-    async def on_pattern_error(
-        self,
-        *,
-        context: Any,
-        pattern: Any,
-        error: Exception,
-    ) -> None:
-        # Set before any I/O below, so a pattern is marked as having
-        # reported its own failure even if a later step here raises --
-        # the runner's fallback terminal-trace reporting (see its
-        # ``CheckpointPersistenceError`` guard) checks this to decide
-        # whether it still needs to report the abort itself.
-        self.pattern_error_reported = True
-        data: dict[str, Any] = {
-            "error_type": "agent_pattern_error",
-            "error_message": str(error),
-            "pattern": pattern.__class__.__name__,
-        }
-        if isinstance(error, ModelProviderError):
-            data["model_error"] = error.structured_fields()
-        await self._emit_trace_event(
-            TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
-            task_id=self._task_id(context),
-            step_id=self._step_id(context),
-            data=data,
-        )
-        if pattern.__class__.__name__ == "ReActPattern":
-            self.active_react_step_id = None
-            self.active_turn_id = None
-        if self.tracer is None:
-            return
-        finish_trace = getattr(self.tracer, "finish_trace", None)
-        if callable(finish_trace):
-            try:
+            if pattern.__class__.__name__ == "ReActPattern":
+                self.active_react_step_id = None
+                self.active_turn_id = None
+            if self.tracer is None:
+                return
+            finish_trace = getattr(self.tracer, "finish_trace", None)
+            if callable(finish_trace):
                 await self._maybe_await(
                     finish_trace(
                         name=self._pattern_trace_name(pattern),
-                        status="error",
-                        output={"error": str(error)},
+                        status="success",
+                        output=result,
                         metadata={
                             "execution_id": getattr(
                                 context, "execution_id", self.execution_id
@@ -1312,15 +1498,72 @@ class PatternRuntime:
                         },
                     )
                 )
-            except Exception:
-                # Trace finalization is best-effort here: this method's job
-                # is to report ``error`` (often a CheckpointPersistenceError
-                # durability abort) to the caller. Letting a ``finish_trace``
-                # failure propagate would replace ``error`` with this
-                # unrelated exception, and the runner's typed guard would
-                # then treat the replacement as an ordinary recoverable
-                # pattern exception instead of aborting the run.
-                logger.exception("finish_trace failed while reporting a pattern error")
+        finally:
+            await self._cache_pattern_finished()
+
+    async def on_pattern_error(
+        self,
+        *,
+        context: Any,
+        pattern: Any,
+        error: Exception,
+    ) -> None:
+        try:
+            # Set before any I/O below, so a pattern is marked as having
+            # reported its own failure even if a later step here raises --
+            # the runner's fallback terminal-trace reporting (see its
+            # ``CheckpointPersistenceError`` guard) checks this to decide
+            # whether it still needs to report the abort itself.
+            self.pattern_error_reported = True
+            data: dict[str, Any] = {
+                "error_type": "agent_pattern_error",
+                "error_message": str(error),
+                "pattern": pattern.__class__.__name__,
+            }
+            if isinstance(error, ModelProviderError):
+                data["model_error"] = error.structured_fields()
+            await self._emit_trace_event(
+                TraceEventType(
+                    TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL
+                ),
+                task_id=self._task_id(context),
+                step_id=self._step_id(context),
+                data=data,
+            )
+            if pattern.__class__.__name__ == "ReActPattern":
+                self.active_react_step_id = None
+                self.active_turn_id = None
+            if self.tracer is None:
+                return
+            finish_trace = getattr(self.tracer, "finish_trace", None)
+            if callable(finish_trace):
+                try:
+                    await self._maybe_await(
+                        finish_trace(
+                            name=self._pattern_trace_name(pattern),
+                            status="error",
+                            output={"error": str(error)},
+                            metadata={
+                                "execution_id": getattr(
+                                    context, "execution_id", self.execution_id
+                                ),
+                                "pattern": pattern.__class__.__name__,
+                            },
+                        )
+                    )
+                except Exception:
+                    # Trace finalization is best-effort here: this method's job
+                    # is to report ``error`` (often a CheckpointPersistenceError
+                    # durability abort) to the caller. Letting a ``finish_trace``
+                    # failure propagate would replace ``error`` with this
+                    # unrelated exception, and the runner's typed guard would
+                    # then treat the replacement as an ordinary recoverable
+                    # pattern exception instead of aborting the run.
+                    logger.exception(
+                        "finish_trace failed while reporting a pattern error"
+                    )
+        finally:
+            await self._cache_pattern_finished()
 
     async def load_committed_tool_outcome(
         self, tool_call: dict[str, Any]
@@ -1589,6 +1832,36 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
+        if callable(getattr(self.tracer, "trace_event", None)):
+            if self._prompt_prefix_observer is None:
+                self._prompt_prefix_observer = PromptPrefixObserver()
+            observation = self._prompt_prefix_observer.observe(
+                messages,
+                tools,
+                scope=(
+                    str(getattr(context, "execution_id", "")),
+                    str(event_metadata.get("step_id") or self._step_id(context)),
+                    str(event_metadata.get("selected_model") or ""),
+                ),
+                call_kind=call_kind_from_metadata(event_metadata),
+                phase=str(event_metadata.get("phase") or ""),
+            )
+            if metadata is not None:
+                metadata[PROMPT_PREFIX_KEY] = observation
+            event_metadata = {**event_metadata, PROMPT_PREFIX_KEY: observation}
+        if PROMPT_COMPOSITION_KEY not in event_metadata:
+            # Call sites without tool-origin knowledge (compaction) still get
+            # sizes. Written into the caller's dict so the matching
+            # llm_call_end carries it too.
+            fallback = build_prompt_composition(
+                messages,
+                tools,
+                call_kind=call_kind_from_metadata(event_metadata),
+                iteration=event_metadata.get("iteration"),
+            )
+            if metadata is not None:
+                metadata[PROMPT_COMPOSITION_KEY] = fallback
+            event_metadata = {**event_metadata, PROMPT_COMPOSITION_KEY: fallback}
         context_data: dict[str, Any] = {
             "context_messages_count": len(messages),
             "tools_count": len(tools or []),
@@ -1607,6 +1880,13 @@ class PatternRuntime:
         threshold = getattr(compact_config, "threshold", None)
         if isinstance(threshold, int) and threshold > 0:
             context_data["context_threshold"] = threshold
+        composition = event_metadata.get(PROMPT_COMPOSITION_KEY)
+        if isinstance(composition, dict):
+            logger.info(
+                "LLM call prompt composition. execution_id=%s composition=%s",
+                getattr(context, "execution_id", None),
+                json.dumps(composition, sort_keys=True, separators=(",", ":")),
+            )
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -2287,6 +2567,10 @@ class PatternRuntime:
         trace_event = getattr(self.tracer, "trace_event", None)
         if not callable(trace_event):
             return
+        if self.output_guardrail is not None:
+            # Keep diagnostic and recovery facts server-side; LLM/tool trace
+            # bodies can contain the candidate before final delivery approves it.
+            data = {**(data or {}), "__audit_only__": True}
         # Cap LLM event payloads at the tracer boundary. The normalizer
         # preserves reserved control / routing / metrics fields and only
         # truncates bulky content (messages, response, tool_calls, ...).

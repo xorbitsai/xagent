@@ -727,6 +727,7 @@ async def test_dispatch_reservation_released_after_real_handler(
             file_ids=(),
             connector_runtime_context=(),
             timezone=None,
+            credential_kind="runtime",
         )
         target = int(created.task_id)
     elif kind == "message":

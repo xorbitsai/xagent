@@ -28,7 +28,7 @@ from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
 from ...core.retry import create_retry_wrapper
 from ..models.model import Model as DBModel
-from .llm_utils import AutoModelUnavailableError
+from .llm_utils import PLATFORM_MODEL_MANAGER, AutoModelUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +177,60 @@ def _is_model_visible_to_user(
             user_id,
         )
         return False
+
+
+def rank_name_matched_models(
+    db: Session, candidates: list[Any], user_id: Optional[int]
+) -> list[Any]:
+    """Return the *candidates* that *user_id* may use, best match first.
+
+    *candidates* are active ``models`` rows that share the ``model_name`` a
+    caller asked for. Visibility matches ``_is_model_visible_to_user``: the
+    model visibility hook can hide a row, otherwise the user sees rows they
+    own and rows shared by a user ``_get_visible_user_ids`` returns. Without
+    a user (standalone / non-web context) only that shared part applies, so
+    another user's private row is never returned.
+
+    Order: the user's own rows, then platform-managed rows, then other shared
+    rows; ties by primary key, so the choice does not depend on scan order.
+    """
+    from ..models.user import UserModel
+
+    pks = [int(row.id) for row in candidates]
+    if not pks:
+        return []
+
+    sharer_ids = set(_get_visible_user_ids(db, user_id))
+    owned: set[int] = set()
+    shared: set[int] = set()
+    for pk, link_user_id, is_owner, is_shared in db.query(
+        UserModel.model_id,
+        UserModel.user_id,
+        UserModel.is_owner,
+        UserModel.is_shared,
+    ).filter(UserModel.model_id.in_(pks)):
+        if user_id is not None and link_user_id == user_id and is_owner:
+            owned.add(pk)
+        if is_shared and link_user_id in sharer_ids:
+            shared.add(pk)
+
+    visible = [
+        row
+        for row in candidates
+        if (int(row.id) in owned or int(row.id) in shared)
+        and _passes_model_visibility_hook(db, user_id, row)
+    ]
+
+    def _rank(row: Any) -> tuple[int, int]:
+        if int(row.id) in owned:
+            tier = 0
+        elif row.managed_by == PLATFORM_MODEL_MANAGER:
+            tier = 1
+        else:
+            tier = 2
+        return tier, int(row.id)
+
+    return sorted(visible, key=_rank)
 
 
 def _create_default_llm_instance(

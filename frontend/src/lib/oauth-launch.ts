@@ -1,3 +1,4 @@
+import { regionalBootstrapURL } from "@/lib/oauth-bootstrap"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { toast } from "@/components/ui/sonner"
@@ -35,7 +36,7 @@ export function openOAuthAuthorizationPopup(options: {
         {
           method: "POST",
           credentials: "include",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          headers: { "X-XAgent-OAuth-Launch-Version": "2", "Content-Type": "application/json", Accept: "application/json" },
           body: JSON.stringify({
             app_id: options.appId,
             account: options.account,
@@ -55,6 +56,12 @@ export function openOAuthAuthorizationPopup(options: {
       if (!["https:", "http:"].includes(callback.protocol) || callback.username || callback.password
         || callback.pathname !== "/" || callback.search || callback.hash) {
         throw new Error("Invalid callback origin")
+      }
+      const regional = await regionalBootstrapURL(data as { authorization_url: string; launch_mode?: string })
+      if (regional) {
+        callbackOrigins.set(popup, callback.origin)
+        if (!popup.closed) popup.location.replace(regional)
+        return
       }
       const endpoint = new URL(`${getApiUrl()}/api/auth/${encodeURIComponent(options.provider)}/login`, window.location.href)
       if (!raw.startsWith(`/api/auth/${encodeURIComponent(options.provider)}/login?`)) {

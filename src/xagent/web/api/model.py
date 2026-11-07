@@ -48,9 +48,10 @@ from xagent.core.model.providers import (
 from xagent.core.utils.security import redact_sensitive_text
 
 from ...core.model.asr.adapter import supports_batch_asr
+from ...core.model.tts.adapter import get_tts_model_instance
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.auto_model import AutoModelCandidate, AutoModelConfig
-from ..models.database import get_db
+from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.user import User, UserDefaultModel, UserModel
 from ..schemas.model import (
@@ -73,13 +74,19 @@ from ..services.auto_model_service import (
     is_reserved_auto_router_model_id,
     list_router_profiles,
 )
+from ..services.db_runtime import drain_async_task_cancellation_safe
 from ..services.llm_utils import (
     PLATFORM_MODEL_MANAGER,
     CoreStorage,
     is_platform_model_id,
 )
+from ..services.model_service import _passes_model_visibility_hook
 from ..services.model_store import ModelSharingConflictError, ModelStore
-from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
+from ..tracking.standalone_usage import (
+    StandaloneUsageRefused,
+    run_in_usage_scope,
+    usage_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -996,6 +1003,7 @@ async def test_model_connection(
                     run_in_usage_scope,
                     int(user.id),
                     "model_probe",
+                    (),
                     embedding_model.encode,
                     "hello",
                 ),
@@ -1178,7 +1186,7 @@ async def test_model_connection(
 
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    run_in_usage_scope, int(user.id), "model_probe", _probe_rerank
+                    run_in_usage_scope, int(user.id), "model_probe", (), _probe_rerank
                 ),
                 timeout=timeout_seconds,
             )
@@ -1224,6 +1232,64 @@ async def test_model_connection(
         )
 
 
+@model_router.get("/speech/voices")
+async def list_speech_voices(
+    model_id: str = Query(min_length=1, max_length=512),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, str]]:
+    """List selectable voices through an accessible configured TTS model."""
+    _, config, _ = _resolve_accessible_model(db, user, model_id)
+    if not config.is_active or not _passes_model_visibility_hook(
+        db, int(user.id), config
+    ):
+        raise HTTPException(status_code=404, detail="Model not found")
+    if config.category != "speech" or "tts" not in (config.abilities or []):
+        raise HTTPException(status_code=400, detail="Select a speech synthesis model")
+    try:
+        model = get_tts_model_instance(config)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid TTS model configuration"
+        ) from None
+    try:
+        release_db_connection_if_clean(db)
+        await model.get_streaming_capabilities()
+        if not model.supports_voice_listing:
+            raise HTTPException(
+                status_code=400, detail="Voice listing is not supported"
+            )
+        voices = await asyncio.wait_for(model.list_available_voices(), timeout=30)
+        return [
+            {
+                "voice_id": voice["voice_id"],
+                "name": str(voice.get("name") or voice["voice_id"]),
+            }
+            for voice in voices
+            if isinstance(voice.get("voice_id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", voice["voice_id"])
+        ]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        key = getattr(model, "api_key", None)
+        detail = str(exc).replace(key, "[REDACTED]") if key else str(exc)
+        logger.warning("Speech voice listing failed: %s", redact_sensitive_text(detail))
+        raise HTTPException(
+            status_code=502, detail="Could not load available voices"
+        ) from None
+    finally:
+
+        async def close() -> None:
+            method = getattr(model, "aclose", None)
+            if callable(method):
+                result = method()
+                if isawaitable(result):
+                    await result
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(close()))
+
+
 @model_router.post("/speech/transcribe")
 async def transcribe_speech_input(
     file: UploadFile = File(...),
@@ -1248,7 +1314,11 @@ async def transcribe_speech_input(
     try:
         # The provider records the transcription; this delivers it for the
         # requesting user, since no agent run is tracking it.
-        async with usage_scope(int(user.id), usage_source="speech_transcribe"):
+        async with usage_scope(
+            int(user.id),
+            usage_source="speech_transcribe",
+            model_ids=(str(db_model.model_id),),
+        ):
             result = await asyncio.wait_for(
                 asr_model.transcribe(
                     audio_bytes,
@@ -1257,6 +1327,8 @@ async def transcribe_speech_input(
                 ),
                 timeout=180.0,
             )
+    except StandaloneUsageRefused:
+        raise
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc
     except Exception as exc:
@@ -2120,6 +2192,7 @@ async def update_model(
     ]
     if routing_candidates and "abilities" in update_data:
         from ..services.auto_model_service import (
+            UnknownAutoProfileError,
             load_router_profile_catalog,
             validate_candidate_modalities,
         )
@@ -2127,11 +2200,17 @@ async def update_model(
         try:
             catalog = load_router_profile_catalog()
             for candidate in routing_candidates:
-                validate_candidate_modalities(
-                    catalog,
-                    str(candidate.routing_model_id),
-                    update_data["abilities"] or [],
-                )
+                try:
+                    validate_candidate_modalities(
+                        catalog,
+                        str(candidate.routing_model_id),
+                        update_data["abilities"] or [],
+                    )
+                except UnknownAutoProfileError:
+                    # Routing skips a binding whose profile is not in the
+                    # installed catalog, so that binding does not constrain
+                    # this edit. A known profile still has to match.
+                    continue
         except AutoModelConfigurationError as exc:
             raise HTTPException(409, detail=str(exc)) from exc
         except AutoModelDependencyError as exc:

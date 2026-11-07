@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 class JavaScriptExecutorFunctionTool(FunctionTool):
-    """JavaScript executor tool with BASIC category."""
+    """JavaScript executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
 
 class JavaScriptExecutorArgs(BaseModel):
@@ -60,9 +60,16 @@ class JavaScriptExecutorTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return """Execute JavaScript using Node.js runtime.
+        working_directory = self._get_working_directory()
+        workspace_line = (
+            f"JavaScript runs with current working directory: {working_directory}."
+            if working_directory
+            else "JavaScript runs in a temporary directory."
+        )
+        return f"""Execute JavaScript using Node.js runtime.
         Supports npm packages for extended functionality including PPTX generation, HTTP requests, and more.
-        Captures stdout and stderr from the execution."""
+        Captures stdout and stderr from the execution.
+        {workspace_line}"""
 
     @property
     def tags(self) -> list[str]:
@@ -128,9 +135,9 @@ class JavaScriptExecutorTool(AbstractBaseTool):
 
 @sandbox_config()
 class JavaScriptExecutorToolForBasic(JavaScriptExecutorTool):
-    """JavaScript executor tool with BASIC category."""
+    """JavaScript executor tool with CODE_EXECUTION category."""
 
-    category = ToolCategory.BASIC
+    category = ToolCategory.CODE_EXECUTION
 
     @property
     def name(self) -> str:
@@ -167,7 +174,9 @@ def get_javascript_executor_tool(info: Optional[dict[str, Any]] = None) -> Funct
         )
         return result
 
-    return JavaScriptExecutorFunctionTool(execute_javascript_code)
+    return JavaScriptExecutorFunctionTool(
+        execute_javascript_code, description=executor.description
+    )
 
 
 def create_javascript_executor_tool(workspace: TaskWorkspace) -> AbstractBaseTool:

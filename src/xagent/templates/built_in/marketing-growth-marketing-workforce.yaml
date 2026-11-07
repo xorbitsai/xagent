@@ -62,7 +62,9 @@ workforce_config:
     description: Orchestrates the GA Analyzer and Ads Recommendation sub-agents in a measure, recommend, human-input, measure loop.
     execution_mode: think
     tool_categories:
-    - basic
+    - basic_tools
+    - code_execution
+    - web_tools
     skills: []
     instructions: |
       # Role & Purpose

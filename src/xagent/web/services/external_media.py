@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -9,7 +11,7 @@ from enum import Enum
 from io import BytesIO
 from math import ceil, floor
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
@@ -48,6 +50,7 @@ class ExternalMediaPurpose(str, Enum):
     """Providers allowed to receive a purpose-scoped media URL."""
 
     INSTAGRAM_PUBLISH = "instagram-publish"
+    FACEBOOK_PUBLISH = "facebook-publish"
 
 
 class ExternalMediaError(RuntimeError):
@@ -60,6 +63,23 @@ class ExternalMediaNotFound(ExternalMediaError):
 
 class ExternalMediaUnavailable(ExternalMediaError):
     """The image exists but cannot currently be delivered externally."""
+
+
+class ExternalMediaNotConfigured(ExternalMediaUnavailable):
+    """This deployment has no public HTTPS base URL to deliver media from."""
+
+
+class ExternalMediaUnsupportedImage(ExternalMediaUnavailable):
+    """The image's type, size or encoding cannot be delivered for this purpose."""
+
+
+class ExternalMediaOutOfScope(ExternalMediaUnavailable):
+    """External media cannot reach the image's bytes within its own scope.
+
+    It trusts a local copy only inside the user's upload root with no symbolic
+    link below it, and otherwise needs the durable object. A workspace may
+    still read a local copy elsewhere under its own rules.
+    """
 
 
 class ExternalMediaTicketRejected(ExternalMediaError):
@@ -80,6 +100,8 @@ class RedeemedExternalMedia:
     media_type: str
 
 
+# Matches the Facebook connector's own limit for an uploaded image.
+FACEBOOK_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 INSTAGRAM_MAX_JPEG_BYTES = 8 * 1024 * 1024
 INSTAGRAM_MIN_ASPECT_RATIO = 4 / 5
 INSTAGRAM_MAX_ASPECT_RATIO = 1.91
@@ -112,7 +134,7 @@ def _image_media_type(record: Any) -> str:
     filename = str(getattr(record, "filename", "") or "").strip().lower()
     media_type = _IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
     if media_type is None:
-        raise ExternalMediaUnavailable("Instagram accepts PNG or JPEG images")
+        raise ExternalMediaUnsupportedImage("Only PNG or JPEG images can be delivered")
     return media_type
 
 
@@ -186,16 +208,19 @@ def issue_external_media_url(
     ttl = get_external_media_url_ttl_seconds()
     base_url = get_s2s_api_base_url()
     if not base_url:
-        raise ExternalMediaUnavailable(
+        raise ExternalMediaNotConfigured(
             "A public HTTPS XAGENT_S2S_API_BASE_URL or XAGENT_PUBLIC_API_BASE_URL "
             "is required for external media delivery"
         )
     if urlsplit(base_url).scheme != "https":
-        raise ExternalMediaUnavailable(
+        raise ExternalMediaNotConfigured(
             "XAGENT_S2S_API_BASE_URL (or XAGENT_PUBLIC_API_BASE_URL when S2S is "
             "unset) must be HTTPS for external media delivery"
         )
-    _validate_instagram_record(record)
+    if purpose is ExternalMediaPurpose.FACEBOOK_PUBLISH:
+        _validate_facebook_record(record)
+    else:
+        _validate_instagram_record(record)
     ticket = _encode_ticket(
         file_id=normalized_file_id,
         user_id=int(user_id),
@@ -279,16 +304,102 @@ def _validate_instagram_source(image: Image.Image) -> None:
         )
 
 
-def _local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
+def _below_user_root(record: UploadedFile, path: Path) -> tuple[Path, Path] | None:
+    """The owner's upload root a path lies in, and the part of the path below it.
+
+    The root may be a link (a mounted volume can be), so it is tried both as
+    configured and resolved; it must still resolve inside the uploads directory.
+    """
     uploads_root = get_uploads_dir().resolve()
-    user_root = scoped_user_root(get_uploads_dir(), int(record.user_id)).resolve()
-    resolved = path.resolve()
-    return resolved.is_relative_to(uploads_root) and resolved.is_relative_to(user_root)
+    user_root = scoped_user_root(get_uploads_dir(), int(record.user_id))
+    candidate = Path(os.path.abspath(path))
+    for base in (Path(os.path.abspath(user_root)), user_root.resolve()):
+        try:
+            below = candidate.relative_to(base)
+        except ValueError:
+            continue
+        if not base.resolve().is_relative_to(uploads_root):
+            return None
+        return base, below
+    return None
 
 
-def _validate_instagram_header(path: Path) -> None:
+def local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
+    """Whether a local copy may be delivered externally instead of the durable one.
+
+    The path must lie inside the record owner's upload root, and nothing below
+    that root may be a symbolic link: a registered file replaced by a link
+    would otherwise deliver another task's image. The root itself may be a
+    link, as a mounted volume can be. Delivery opens the file again with
+    ``open_delivery_file``, which holds the same rule at the moment of opening.
+    """
+    anchored = _below_user_root(record, path)
+    if anchored is None:
+        return False
+    current, below = anchored
+    for part in below.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
+
+
+def open_delivery_file(record: UploadedFile, path: Path) -> BinaryIO:
+    """Open a registered image for issuing or delivery, without following links.
+
+    Checking a path and opening it are separate steps, and a file replaced by a
+    link in between would read the link's target. Below the owner's upload root
+    each component is opened relative to its parent's descriptor with
+    ``O_NOFOLLOW``, so the bytes come from the file the check allowed, or the
+    open fails. The root itself may be a link. Any other path is a host-private
+    copy from durable storage; only the file itself must not be a link.
+
+    Raises ``OSError`` when the file cannot be opened this way or is not a
+    regular file.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    anchored = _below_user_root(record, path)
+    names: tuple[str, ...]
+    if anchored is None:
+        directory, names = Path(os.path.abspath(path)).parent, (path.name,)
+    else:
+        directory, below = anchored
+        names = below.parts
+    if not names:
+        raise IsADirectoryError(str(path))
+    current_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+        for name in names[:-1]:
+            next_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=current_fd
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            names[-1],
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow,
+            dir_fd=current_fd,
+        )
+    finally:
+        os.close(current_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise FileNotFoundError(str(path))
+        return os.fdopen(file_fd, "rb")
+    except BaseException:
+        os.close(file_fd)
+        raise
+
+
+def _source_size(source: Path | BinaryIO) -> int:
+    if isinstance(source, Path):
+        return source.stat().st_size
+    return os.fstat(source.fileno()).st_size
+
+
+def _validate_instagram_header(source: BinaryIO) -> None:
+    try:
+        with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
     except ExternalMediaUnavailable:
         raise
@@ -298,11 +409,11 @@ def _validate_instagram_header(path: Path) -> None:
         ) from exc
 
 
-def _validate_instagram_record(record: UploadedFile) -> None:
+def _materialize_record(record: UploadedFile) -> Path:
     file_ref = ManagedFileRef(record)
     try:
         path = file_ref.materialize(
-            allow_existing_local=_local_record_path_is_trusted(
+            allow_existing_local=local_record_path_is_trusted(
                 record,
                 file_ref.local_path,
             )
@@ -312,22 +423,65 @@ def _validate_instagram_record(record: UploadedFile) -> None:
             "Registered image failed integrity verification"
         ) from exc
     except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
-        raise ExternalMediaUnavailable(
-            "Registered image bytes are unavailable"
-        ) from exc
+        raise ExternalMediaOutOfScope("Registered image bytes are unavailable") from exc
     except DurableStorageOperationError as exc:
         raise ExternalMediaUnavailable(
             "Registered image could not be prepared for external delivery"
         ) from exc
-    _validate_instagram_header(path)
+    return path
 
 
-def instagram_image_requires_normalization(path: Path) -> bool:
+def _validate_instagram_record(record: UploadedFile) -> None:
+    path = _materialize_record(record)
+    try:
+        # The same safe open as delivery: a FIFO or link swapped in after
+        # materialization fails here instead of blocking or being followed.
+        with open_delivery_file(record, path) as source:
+            _validate_instagram_header(source)
+    except OSError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be read for external delivery"
+        ) from exc
+
+
+def _validate_facebook_record(record: UploadedFile) -> None:
+    """Facebook fetches the image as stored: a whole PNG or JPEG within 10 MB.
+
+    Reading and decoding fail differently on purpose. An unreadable file is a
+    storage problem (base ``ExternalMediaUnavailable``); a file that reads but
+    is the wrong type, too large or does not decode is an unsupported image,
+    which a connector able to upload the bytes itself may still take.
+    """
+
+    _image_media_type(record)
+    path = _materialize_record(record)
+    try:
+        # Pin the opened file and bound the read even if a sandbox writer grows it.
+        with open_delivery_file(record, path) as source:
+            content = source.read(FACEBOOK_MAX_IMAGE_BYTES + 1)
+    except OSError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be read for external delivery"
+        ) from exc
+    if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
+        raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
+    try:
+        # verify() checks the whole stream (a truncated body fails) without
+        # decoding pixels. The bytes are in memory, so any error is a decode error.
+        with Image.open(BytesIO(content), formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+            image.verify()
+    except Exception as exc:
+        raise ExternalMediaUnsupportedImage(
+            "Registered image could not be decoded as PNG or JPEG"
+        ) from exc
+
+
+def instagram_image_requires_normalization(source: Path | BinaryIO) -> bool:
     """Return whether a local image must be normalized before Instagram fetches it."""
 
     try:
-        file_size = path.stat().st_size
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+        file_size = _source_size(source)
+        with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
             if image.format != "JPEG":
                 return True
@@ -393,11 +547,11 @@ def _resize_for_instagram_canvas(image: Image.Image) -> Image.Image:
     return image
 
 
-def instagram_jpeg_bytes(path: Path) -> bytes:
+def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
     """Normalize a local image to Instagram's JPEG and aspect-ratio contract."""
 
     try:
-        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
+        with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
             _validate_instagram_source(opened)
             if opened.format == "JPEG":
                 opened.draft("RGB", (INSTAGRAM_MAX_WIDTH, 1800))

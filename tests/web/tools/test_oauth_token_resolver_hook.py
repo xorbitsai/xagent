@@ -231,6 +231,7 @@ def _add_user_oauth(
     provider: str = "google",
     access_token: str = "user-token",
     instance_url: str | None = None,
+    token_type: str | None = None,
 ) -> UserOAuth:
     account = UserOAuth(
         user_id=user.id,
@@ -238,6 +239,7 @@ def _add_user_oauth(
         access_token=access_token,
         provider_user_id=f"{provider}-user",
         instance_url=instance_url,
+        token_type=token_type,
     )
     db.add(account)
     db.commit()
@@ -643,6 +645,140 @@ async def test_legacy_missing_instance_url_retains_unavailable_server(db_session
     _assert_unavailable_mcp_config(
         config, server, reason="oauth_token_required", oauth_token_required=True
     )
+
+
+_FACEBOOK_LAUNCH_CONFIG = {
+    "command": "python",
+    "args": ["-m", "xagent.web.tools.mcp.facebook"],
+    "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+}
+
+
+def _add_facebook_grant(db, user: User, **grant: Any) -> MCPServer:
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Facebook Pages",
+        app_id="facebook",
+        provider="meta",
+        launch_config=dict(_FACEBOOK_LAUNCH_CONFIG),
+    )
+    _add_user_oauth(db, user, provider="facebook", **grant)
+    return server
+
+
+@pytest.mark.asyncio
+async def test_native_facebook_grant_ignores_composio_configuration(
+    db_session, monkeypatch
+):
+    """#3531: the backend follows the grant. Configuring Composio on the host
+    must leave a native grant's launch exactly as it was."""
+    db, user = db_session
+    _add_facebook_grant(db, user, access_token="meta-user-token")
+    monkeypatch.delenv("COMPOSIO_API_KEY", raising=False)
+    without_key = (await _tool_config(db, user).get_mcp_server_configs())[0]
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    with_key = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert with_key == without_key
+    env = with_key["config"]["env"]
+    assert env["META_ACCESS_TOKEN"] == "meta-user-token"
+    assert not any(key.startswith("COMPOSIO_") for key in env)
+
+
+@pytest.mark.asyncio
+async def test_composio_facebook_grant_launches_with_composio_env(
+    db_session, monkeypatch
+):
+    """The ordinary (non-actor) path also hands a Composio grant the
+    Composio values instead of a Meta token."""
+    db, user = db_session
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    _add_facebook_grant(
+        db,
+        user,
+        access_token="ca_123",
+        instance_url="actor-hmac",
+        token_type="composio",
+    )
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert config["transport"] == "stdio"
+    env = config["config"]["env"]
+    assert "META_ACCESS_TOKEN" not in env
+    assert env["COMPOSIO_API_KEY"] == "composio-key"
+    assert env["COMPOSIO_CONNECTED_ACCOUNT_ID"] == "ca_123"
+    assert env["COMPOSIO_USER_ID"] == "actor-hmac"
+
+
+@pytest.mark.asyncio
+async def test_composio_grant_for_an_app_that_cannot_proxy_is_unavailable(
+    db_session, monkeypatch
+):
+    """Only Facebook's and Instagram's subprocesses can proxy a Composio
+    grant. Any other app's Composio grant (here WhatsApp, which stays native)
+    is reported unavailable instead of being misrouted."""
+    db, user = db_session
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    server = _add_oauth_server(
+        db,
+        user,
+        name="WhatsApp",
+        app_id="whatsapp",
+        provider="meta",
+        launch_config=dict(_FACEBOOK_LAUNCH_CONFIG),
+    )
+    _add_user_oauth(
+        db,
+        user,
+        provider="whatsapp",
+        access_token="ca_456",
+        instance_url="actor-hmac",
+        token_type="composio",
+    )
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
+    )
+    assert "ca_456" not in str(config)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["COMPOSIO_API_KEY", "COMPOSIO_USER_ID"])
+async def test_composio_facebook_grant_without_its_values_is_unavailable(
+    db_session, monkeypatch, missing, caplog
+):
+    """A Composio grant that cannot be proxied comes back unavailable and
+    reconnect-required, not as a subprocess that fails on its first call."""
+    db, user = db_session
+    if missing == "COMPOSIO_API_KEY":
+        monkeypatch.delenv("COMPOSIO_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    server = _add_facebook_grant(
+        db,
+        user,
+        access_token="ca_123",
+        instance_url=None if missing == "COMPOSIO_USER_ID" else "actor-hmac",
+        token_type="composio",
+    )
+
+    with caplog.at_level(logging.INFO):
+        config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
+    )
+    # A missing host key is a deployment fault: operators must see it.
+    key_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "COMPOSIO_API_KEY" in record.message
+    ]
+    assert bool(key_warnings) == (missing == "COMPOSIO_API_KEY")
 
 
 @pytest.mark.asyncio

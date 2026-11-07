@@ -25,9 +25,9 @@ Design notes:
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints
 
 from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
 from .agent import PromptContextFieldDeclaration, PromptContextFieldList
@@ -91,31 +91,37 @@ class ConnectorRuntimeContextBody(BaseModel):
 class CreateTaskRequest(BaseModel):
     """Body for ``POST /v1/chat/tasks``.
 
-    ``agent_id`` is required and must match the agent bound to the
-    presented API key; the server enforces ``body.agent_id ==
-    authed.agent.id`` and returns 404 ``agent_not_found`` on mismatch.
+    ``agent_id`` is required. With an agent key it must be the agent the
+    key is bound to; with a personal key it may be any agent the key
+    holder can see, and the task then runs as the holder. Anything else
+    returns 404 ``agent_not_found``.
     """
 
     agent_id: int = Field(
         ...,
         description=(
-            "Target agent's primary key. Must match the agent the "
-            "presented API key is bound to."
+            "Target agent's primary key. With an agent key, must match the "
+            "agent the key is bound to; with a personal key, any agent the "
+            "key holder can see."
         ),
     )
     message: MessageBody = Field(..., description="First user message of the task.")
     prompt_context: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Trusted reference data stored on the task and replayed on every "
-            "turn until an append replaces or clears it. Keys must match "
+            "Reference data stored on the task and replayed on every turn "
+            "until an append replaces or clears it. Keys must match "
             "``^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`` and values must be strings, "
-            "finite numbers, or booleans. Values are passed through without "
-            "the agent's field whitelist and stamped signed. The size limit "
-            "is 4096 UTF-8 bytes of the rendered form: JSON with sorted keys, "
-            "default separators (``, `` and ``: ``), non-ASCII kept as-is, and "
-            "backticks escaped to ``\\u0060`` (six bytes); a client measuring "
-            "compact JSON undercounts."
+            "finite numbers, or booleans. The size limit is 4096 UTF-8 bytes "
+            "of the rendered form: JSON with sorted keys, default separators "
+            "(``, `` and ``: ``), non-ASCII kept as-is, and backticks escaped "
+            "to ``\\u0060`` (six bytes); a client measuring compact JSON "
+            "undercounts. With an agent key, values are passed through "
+            "without the agent's field whitelist and stamped signed. With a "
+            "personal key, every field must be declared in the agent's "
+            "``prompt_context_fields`` and be no longer than its "
+            "``max_length``, otherwise 422 names the rejected fields; "
+            "accepted values are stamped unsigned."
         ),
     )
     metadata: Optional[Dict[str, Any]] = Field(
@@ -123,6 +129,17 @@ class CreateTaskRequest(BaseModel):
         description=(
             "Free-form correlation data the SDK caller can pass through "
             "(trace_id, request_id, etc). Not interpreted server-side."
+        ),
+    )
+    response_format: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Output format of the task. Omitted, null or "
+            '``{"type": "text"}`` means no format; a ``json_schema`` object '
+            "(``name``, ``schema`` and optionally ``strict`` set to true and "
+            "``description``) sets it for this and later turns. An invalid "
+            "value is rejected with 422 ``invalid_input``; the message starts "
+            "with the rule id and the JSON path of the offending value."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
@@ -369,6 +386,62 @@ class V1SkillDeleteResponse(BaseModel):
     name: str
 
 
+class V1AgentSkillsResponse(BaseModel):
+    """Response of ``GET /v1/agents/{agent_id}/skills``."""
+
+    agent_id: int
+    skills: list[str] = Field(..., description="The agent's skill names, in order.")
+
+
+class V1AgentSkillsUpdateRequest(BaseModel):
+    """Body for ``PUT /v1/agents/{agent_id}/skills``.
+
+    ``skills`` replaces the agent's whole skill list, so read the current list
+    with ``GET`` first and send it back with your change. There is no conflict
+    detection: of two concurrent replacements the later one wins. A list holds
+    at most 100 names, so an agent that already has more than 100 cannot be
+    sent back with an edit through this endpoint; it can only be given a
+    shorter list.
+
+    New tasks use the new list at once. An existing task keeps using the
+    previous list while its cached agent runtime is alive: the cache is
+    released after 120 seconds idle, or after 1800 seconds for a task that is
+    paused or waiting for the user, and each server process has its own cache.
+    If the agent is the manager or an enabled worker of a workforce and its
+    list now differs, other than in order, from the list it had when an
+    ongoing workforce conversation started, that conversation is rejected with
+    ``workforce_config_changed`` on its next turn.
+    """
+
+    skills: list[Annotated[str, StringConstraints(min_length=1, max_length=1000)]] = (
+        Field(
+            ...,
+            max_length=100,
+            description=(
+                "The complete new list; a repeated name is kept once, at its "
+                "first position. A name that is not on the agent yet must be "
+                "the name of a skill the key holder can see, or a valid "
+                "personal skill name (1-100 ASCII letters, digits, '_' or '-'). "
+                "Names already on the agent are kept as they are."
+            ),
+        )
+    )
+
+
+class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
+    """Response of ``PUT /v1/agents/{agent_id}/skills``."""
+
+    unresolved_for_caller: list[str] = Field(
+        ...,
+        description=(
+            "Names this request added that are not among the skills the key "
+            "holder can see. They are stored anyway, because a task loads the "
+            "skills of the user who runs it, and that user may have a skill "
+            "with this name."
+        ),
+    )
+
+
 class CreateTaskResponse(BaseModel):
     """``POST /v1/chat/tasks`` -> 202 Accepted response.
 
@@ -406,6 +479,23 @@ class CreateTaskResponse(BaseModel):
             "dispatch queue. Later commands on the task are not reported here."
         ),
     )
+    # Both fields have defaults so that a downstream embedder that constructs
+    # these responses directly keeps working; the v1 handlers always assign
+    # them explicitly.
+    response_format_type: str = Field(
+        "text",
+        description=(
+            "Format in force on the task once this request was handled: "
+            "'text' or 'json_schema'."
+        ),
+    )
+    response_format_name: str = Field(
+        "",
+        description=(
+            "Name of the format when response_format_type is 'json_schema'; "
+            "an empty string otherwise."
+        ),
+    )
 
 
 class AppendMessageRequest(BaseModel):
@@ -419,9 +509,10 @@ class AppendMessageRequest(BaseModel):
     forward-compat and Python/TS SDK symmetry: agent-bound keys pass
     ``agent_id`` (required for that case; the endpoint returns 422 if
     omitted with an agent key), workforce-bound keys optionally pass
-    ``workforce_id``. Both are optional at the schema level so one
-    request model serves both owner types; the endpoint enforces the
-    per-owner requirement.
+    ``workforce_id``, and personal keys optionally pass ``agent_id``,
+    which must then be the task's agent. Both are optional at the schema
+    level so one request model serves every key type; the endpoint
+    enforces the per-owner requirement.
     """
 
     agent_id: Optional[int] = Field(
@@ -429,7 +520,8 @@ class AppendMessageRequest(BaseModel):
         description=(
             "Target agent's primary key. Required for agent-bound keys; "
             "must match the agent the key is bound to and the task's "
-            "agent_id. Omit for workforce-bound keys."
+            "agent_id. Optional for personal keys; when provided, must "
+            "match the task's agent_id. Omit for workforce-bound keys."
         ),
     )
     workforce_id: Optional[int] = Field(
@@ -437,24 +529,38 @@ class AppendMessageRequest(BaseModel):
         description=(
             "Target workforce's primary key. Optional for workforce-bound "
             "keys; must match the workforce the key is bound to when "
-            "provided. Omit for agent-bound keys."
+            "provided. Omit for agent-bound and personal keys."
         ),
     )
     message: MessageBody = Field(..., description="Next user message in the task.")
     prompt_context: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Trusted reference data stored on the task. A non-empty object "
-            "fully replaces the stored context for this and later turns; an "
-            "empty object clears it so later turns carry none; omitted or null "
-            "replays the stored value. Not accepted with a workforce key. Key "
-            "and value rules, signing and the 4096-byte limit (measured on the "
-            "rendered JSON, not compact JSON) are the same as on task create."
+            "Reference data stored on the task. A non-empty object fully "
+            "replaces the stored context for this and later turns; an empty "
+            "object clears it so later turns carry none; omitted or null "
+            "replays the stored value. Not accepted with a workforce key "
+            "(422). Key and value rules, the personal-key field check, signing "
+            "and the 4096-byte limit (measured on the rendered JSON, not "
+            "compact JSON) are the same as on task create."
         ),
     )
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Free-form correlation data passed through unchanged.",
+    )
+    response_format: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Output format of the task. Omitted or null leaves the stored "
+            'format as it is; ``{"type": "text"}`` clears it; a '
+            "``json_schema`` object (``name``, ``schema`` and optionally "
+            "``strict`` set to true and ``description``) sets it for this and "
+            "later turns. An invalid value is rejected with 422 "
+            "``invalid_input``; the message starts with the rule id and the "
+            "JSON path of the offending value. Not accepted with a workforce "
+            "key (422)."
+        ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
         default=None,
@@ -509,6 +615,23 @@ class AppendMessageResponse(BaseModel):
         ..., description="Monotonic version of the task control state."
     )
     control_state: str = Field(..., description="Detailed task control state.")
+    # Both fields have defaults so that a downstream embedder that constructs
+    # these responses directly keeps working; the v1 handlers always assign
+    # them explicitly.
+    response_format_type: str = Field(
+        "text",
+        description=(
+            "Format in force on the task once this request was handled: "
+            "'text' or 'json_schema'."
+        ),
+    )
+    response_format_name: str = Field(
+        "",
+        description=(
+            "Name of the format when response_format_type is 'json_schema'; "
+            "an empty string otherwise."
+        ),
+    )
 
 
 class ReplyRequest(BaseModel):
@@ -519,7 +642,8 @@ class ReplyRequest(BaseModel):
     starting a new turn. Owner-scoping fields have the same shape and
     semantics as :class:`AppendMessageRequest`: agent-bound keys pass
     ``agent_id`` (required), workforce-bound keys optionally pass
-    ``workforce_id``.
+    ``workforce_id``, and personal keys optionally pass ``agent_id``
+    (the task's agent).
 
     Deliberately narrower than :class:`AppendMessageRequest`:
 
@@ -546,7 +670,8 @@ class ReplyRequest(BaseModel):
         description=(
             "Target agent's primary key. Required for agent-bound keys; "
             "must match the agent the key is bound to and the task's "
-            "agent_id. Omit for workforce-bound keys."
+            "agent_id. Optional for personal keys; when provided, must "
+            "match the task's agent_id. Omit for workforce-bound keys."
         ),
     )
     workforce_id: Optional[int] = Field(
@@ -554,7 +679,7 @@ class ReplyRequest(BaseModel):
         description=(
             "Target workforce's primary key. Optional for workforce-bound "
             "keys; must match the workforce the key is bound to when "
-            "provided. Omit for agent-bound keys."
+            "provided. Omit for agent-bound and personal keys."
         ),
     )
     message: MessageBody = Field(
@@ -874,6 +999,36 @@ class TaskInfoResponse(BaseModel):
             "already got answered, instead of null. This is a "
             "convenience read, not the historical interaction record; "
             "see #1079 for the full typed interaction surface."
+        ),
+    )
+    structured_output: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The structured result of the run shown in this response, when "
+            "structured_output_status is 'ready'; null otherwise."
+        ),
+    )
+    structured_output_status: Optional[str] = Field(
+        None,
+        description=(
+            "One of: ready / incomplete / failed. Null unless the task is "
+            "completed and either produced a structured result or has a "
+            "response format configured."
+        ),
+    )
+    structured_output_reason: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Why there is no structured result when structured_output_status "
+            "is 'incomplete' or 'failed': an object with code and message, "
+            "and missing_fields or unexpressible_fields (at most 20 paths "
+            "each) when the result lacks or cannot express values. A key with "
+            "no value is absent. code is one of: agent_partial / "
+            "agent_blocked / information_missing / value_not_expressible / "
+            "not_produced (status incomplete); schema_mismatch / "
+            "result_too_large / model_error / invalid_stored_format / "
+            "extraction_timeout / internal_error (status failed). Null "
+            "otherwise."
         ),
     )
 

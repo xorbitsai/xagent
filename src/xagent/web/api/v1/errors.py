@@ -73,6 +73,20 @@ class V1ErrorCode(str, Enum):
     # be reused. 409.
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
+    # The ``Idempotency-Key`` header on a create / append call is malformed,
+    # or was already used with a different request body. 422.
+    IDEMPOTENCY_KEY_INVALID = "idempotency_key_invalid"
+    IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
+
+    # A request with this ``Idempotency-Key`` is still being processed. 409;
+    # retry later with the same key.
+    IDEMPOTENCY_KEY_IN_PROGRESS = "idempotency_key_in_progress"
+
+    # The first request with this ``Idempotency-Key`` was accepted but its
+    # outcome was never recorded, so it can be neither replayed nor re-run.
+    # 409; read the task named in ``details.task_id`` instead.
+    IDEMPOTENCY_OUTCOME_UNKNOWN = "idempotency_outcome_unknown"
+
     # A file id passed in ``message.files`` on run creation isn't
     # accessible to the caller. 404 -- distinct from workforce_not_found
     # so SDK clients can tell "bad file" from "bad workforce".
@@ -194,6 +208,20 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.IDEMPOTENCY_CONFLICT: (
         "This idempotency key was already used by a run that can no longer be replayed."
     ),
+    V1ErrorCode.IDEMPOTENCY_KEY_INVALID: (
+        "Idempotency-Key must be 1-255 printable ASCII characters."
+    ),
+    V1ErrorCode.IDEMPOTENCY_KEY_REUSED: (
+        "This Idempotency-Key was already used with a different request body."
+    ),
+    V1ErrorCode.IDEMPOTENCY_KEY_IN_PROGRESS: (
+        "A request with this Idempotency-Key is still being processed; "
+        "retry with the same key shortly."
+    ),
+    V1ErrorCode.IDEMPOTENCY_OUTCOME_UNKNOWN: (
+        "The first request with this Idempotency-Key was accepted but its "
+        "outcome was not recorded."
+    ),
     V1ErrorCode.FILE_NOT_FOUND: "One or more file ids are not accessible.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
     V1ErrorCode.TASK_EXPIRED: (
@@ -268,12 +296,14 @@ class V1ApiError(Exception):
         http_status: int,
         message: str | None = None,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message or _DEFAULT_MESSAGES[code])
         self.code = code
         self.http_status = http_status
         self.message = message or _DEFAULT_MESSAGES[code]
         self.details = details
+        self.headers = headers
 
 
 # Turn-rejection reasons (``TaskTurnError.reason``) that are NOT the
@@ -319,4 +349,8 @@ async def v1_api_error_handler(_request: Request, exc: V1ApiError) -> JSONRespon
     error: dict[str, Any] = {"code": exc.code.value, "message": exc.message}
     if exc.details is not None:
         error["details"] = exc.details
-    return JSONResponse(status_code=exc.http_status, content={"error": error})
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"error": error},
+        headers=exc.headers,
+    )

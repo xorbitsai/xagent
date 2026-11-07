@@ -246,8 +246,13 @@ def _record_usage_on_event_loop(
     user_id: int | None,
     delta_details: list[dict[str, Any]],
     delta_actions: int,
+    task_id: int,
 ) -> None:
-    """Invoke the legacy completion hook on its established event-loop thread."""
+    """Invoke the legacy completion hook on its established event-loop thread.
+
+    ``task_id`` is the metered run's task, forwarded so the hook can attribute
+    the usage to it.
+    """
     from ..services.quota_hooks import record_usage
 
     db_session = _new_short_session()
@@ -257,6 +262,7 @@ def _record_usage_on_event_loop(
             user_id,
             delta_details,
             delta_actions,
+            task_id=task_id,
         )
     finally:
         # The callback owns separate durability and must not leave work pending
@@ -648,6 +654,7 @@ class TaskTracker:
                 self._user_id,
                 _copy_details(delta_details),
                 delta_actions,
+                self.task_id,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")

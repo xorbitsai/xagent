@@ -153,9 +153,11 @@ async def test_ws_chat_liveness_negotiation(
 @pytest.mark.asyncio
 async def test_ws_chat_heartbeat_survives_blocked_loop() -> None:
     manager = websocket_api.ConnectionManager()
+    handler_started = asyncio.Event()
     release_handler = asyncio.Event()
 
     async def blocked_execute_task(*_: Any) -> None:
+        handler_started.set()
         await release_handler.wait()
 
     # Phase 1: the read loop is stuck inside a long handler, and the heartbeat
@@ -167,23 +169,30 @@ async def test_ws_chat_heartbeat_survives_blocked_loop() -> None:
         handle_execute_task=blocked_execute_task,
     ):
         endpoint = _run_endpoint(first)
-        first.client_sends(json.dumps({"type": "execute_task"}))
-        await asyncio.sleep(0.4)
-        assert not endpoint.done()
-        assert first.frames.count(HEARTBEAT_FRAME) >= 2
-
-        release_handler.set()
-        first.client_sends(WebSocketDisconnect())
-        await _finished(endpoint)
+        try:
+            first.client_sends(json.dumps({"type": "execute_task"}))
+            await eventually(lambda: handler_started.is_set() or endpoint.done())
+            assert handler_started.is_set()
+            beats = first.frames.count(HEARTBEAT_FRAME)
+            await eventually(
+                lambda: first.frames.count(HEARTBEAT_FRAME) >= beats + 2
+                or endpoint.done()
+            )
+            assert not endpoint.done()
+        finally:
+            release_handler.set()
+            first.client_sends(WebSocketDisconnect())
+            assert await _finished(endpoint) == [None]
 
         assert manager.connection_count() == 0
-        beats_at_exit = first.frames.count(HEARTBEAT_FRAME)
-        await asyncio.sleep(0.2)
-        assert first.frames.count(HEARTBEAT_FRAME) == beats_at_exit
+        assert _running_heartbeats() == []
 
     # Phase 2: a stand-in heartbeat task raises past the real task's own
     # handling; teardown still removes the connection from the manager.
+    heartbeat_started = asyncio.Event()
+
     async def failing_heartbeat(*_: Any) -> None:
+        heartbeat_started.set()
         raise ValueError("heartbeat fault")
 
     second = _FakeSocket(["heartbeat"])
@@ -192,10 +201,13 @@ async def test_ws_chat_heartbeat_survives_blocked_loop() -> None:
         _run_chat_heartbeat=failing_heartbeat,
     ):
         endpoint = _run_endpoint(second)
-        await asyncio.sleep(0.1)
-        assert manager.connection_count() == 1
-        second.client_sends(WebSocketDisconnect())
-        assert await _finished(endpoint) == [None]
+        try:
+            await eventually(lambda: heartbeat_started.is_set() or endpoint.done())
+            assert heartbeat_started.is_set()
+            assert manager.connection_count() == 1
+        finally:
+            second.client_sends(WebSocketDisconnect())
+            assert await _finished(endpoint) == [None]
         assert manager.connection_count() == 0
 
 
@@ -328,6 +340,16 @@ async def test_ws_chat_heartbeat_in_shared_mode_goes_through_the_writer(
     manager = websocket_api.ConnectionManager()
     websocket = _FakeSocket(["heartbeat"])
     bridge = SimpleNamespace(discard_recipient=lambda recipient: None)
+    queued_heartbeats: list[_FakeSocket] = []
+    enqueue = websocket_api.TaskSocketWriter.enqueue
+
+    def record_enqueue(
+        writer: websocket_api.TaskSocketWriter, text: str, **kwargs: Any
+    ) -> asyncio.Future[None] | None:
+        delivery = enqueue(writer, text, **kwargs)
+        if json.loads(text) == HEARTBEAT_FRAME:
+            queued_heartbeats.append(writer.socket)
+        return delivery
 
     with (
         caplog.at_level(logging.WARNING, logger=HEARTBEAT_LOGGER),
@@ -335,6 +357,7 @@ async def test_ws_chat_heartbeat_in_shared_mode_goes_through_the_writer(
             "xagent.web.services.task_event_bridge.get_task_event_bridge",
             return_value=bridge,
         ),
+        patch.object(websocket_api.TaskSocketWriter, "enqueue", record_enqueue),
         _endpoint_env(
             manager,
             HEARTBEAT_INTERVAL_SECONDS=0.01,
@@ -342,23 +365,27 @@ async def test_ws_chat_heartbeat_in_shared_mode_goes_through_the_writer(
         ),
     ):
         endpoint = _run_endpoint(websocket)
-        await asyncio.sleep(0.1)
+        try:
+            await eventually(
+                lambda: HEARTBEAT_FRAME in websocket.frames or endpoint.done()
+            )
+            assert HEARTBEAT_FRAME in websocket.frames
+            assert websocket.frames[0] == CAPABILITIES_FRAME
+            assert queued_heartbeats and all(
+                socket is websocket for socket in queued_heartbeats
+            )
 
-        # Heartbeats are queued and written by the socket writer's own task.
-        assert websocket.frames[0] == CAPABILITIES_FRAME
-        assert websocket.heartbeat_senders
-        assert set(websocket.heartbeat_senders) == {"TaskSocketWriter._run"}
-
-        # A failed write closes the writer, which fails the heartbeat's pending
-        # delivery with ``ConnectionError``; the heartbeat ends quietly.
-        websocket._heartbeat_error = OSError("write failed")
-        await asyncio.sleep(0.1)
-        assert _running_heartbeats() == []
-        assert manager.connection_count() == 0
-        websocket.close.assert_awaited_with(code=1013)
-
-        websocket.client_sends(WebSocketDisconnect())
-        assert await _finished(endpoint) == [None]
+            # A failed write closes the writer and ends the heartbeat quietly.
+            websocket._heartbeat_error = OSError("write failed")
+            await eventually(
+                lambda: not _running_heartbeats()
+                and manager.connection_count() == 0
+                and websocket.close.await_count > 0
+            )
+            websocket.close.assert_awaited_with(code=1013)
+        finally:
+            websocket.client_sends(WebSocketDisconnect())
+            assert await _finished(endpoint) == [None]
 
     assert _heartbeat_warnings(caplog) == []
 

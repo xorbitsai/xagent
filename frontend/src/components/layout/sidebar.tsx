@@ -517,7 +517,7 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
   useEffect(() => {
     const params = new URLSearchParams(settingsQuery)
     const requestedTab = params.get("settings")
-    if (requestedTab !== "general" && requestedTab !== "computer") return
+    if (requestedTab !== "general" && requestedTab !== "computer" && requestedTab !== "voice") return
 
     setSettingsTab(requestedTab)
     setSettingsTargetId(window.location.hash.replace(/^#/, "") || undefined)

@@ -22,6 +22,11 @@ from .db_runtime import (
     run_db_io_cancellation_safe,
     task_returned,
 )
+from .db_write_retry import (
+    CommitAttempt,
+    bound_rerun_lock_wait_no_commit,
+    run_with_commit_witness_sync,
+)
 from .execution_result_projection import (
     completion_outcome_for_status,
     interrupted_channel_result,
@@ -62,6 +67,7 @@ def finalize_managed_task_lease_result(
     completion: tuple[int, dict[str, Any]] | None = None,
     settle_interruption: bool = False,
     report: SettlementReport | None = None,
+    attempt: CommitAttempt | None = None,
 ) -> bool:
     """Atomically persist one inline transport result under its exact lease.
 
@@ -88,6 +94,11 @@ def finalize_managed_task_lease_result(
     and left untouched for every other outcome: it receives the pause's
     recorded reason and its committed control identity, so the caller can
     announce it.
+
+    ``attempt`` is for a caller that owns ``db`` and retries it with
+    ``run_with_commit_witness_sync``: it receives the witness of the result
+    fact staged here and the post-commit step to run once a lost
+    acknowledgement's COMMIT is proven applied.
     """
 
     if status == TaskStatus.RUNNING:
@@ -197,7 +208,7 @@ def finalize_managed_task_lease_result(
                 message_type=history_message_type,
                 turn_id=history_turn_id,
             )
-        stage_result_fact_no_commit(
+        witness = stage_result_fact_no_commit(
             db,
             task,
             # Like lease recovery's: the unsuccessful result would read as a
@@ -208,6 +219,8 @@ def finalize_managed_task_lease_result(
             else dict(execution_result or {"error": error_message}),
             turn_id=history_turn_id,
         )
+        if attempt is not None:
+            attempt.witness = witness
         if completion is not None:
             from ..models.task_command import TaskExecutionCommand
 
@@ -243,36 +256,42 @@ def finalize_managed_task_lease_result(
                     history_content if status == TaskStatus.COMPLETED else None,
                 )
         paused_state = task_control_snapshot(task).as_dict() if paused else None
-        # A lost acknowledgement is not reconciled here: the lease is released
-        # in this transaction, so only the result fact's witness can prove the
-        # commit. That belongs with the same-identity retry work.
-        db.commit()
     except Exception:
         db.rollback()
         raise
 
-    if unknown_tool_effect:
-        log_unknown_tool_effect_settlement(
-            lease.task_id, lease.run_id, unknown_tool_attempt_id
-        )
-    if paused_state is not None and interruption is not None:
-        if report is not None:
-            report.control_state = dict(paused_state)
-            report.paused_for = interruption.reason
-            report.recovery = recorded
-        logger.warning(
-            "task_id=%s run_id=%s component=settlement paused interrupted "
-            "channel run (reason=%s): %s",
-            lease.task_id,
-            lease.run_id,
-            interruption.reason.value,
-            run_error,
-        )
-    invalidate_task_cache_best_effort(lease.task_id)
-    return True
+    def confirm() -> bool:
+        if unknown_tool_effect:
+            log_unknown_tool_effect_settlement(
+                lease.task_id, lease.run_id, unknown_tool_attempt_id
+            )
+        if paused_state is not None and interruption is not None:
+            if report is not None:
+                report.control_state = dict(paused_state)
+                report.paused_for = interruption.reason
+                report.recovery = recorded
+            logger.warning(
+                "task_id=%s run_id=%s component=settlement paused interrupted "
+                "channel run (reason=%s): %s",
+                lease.task_id,
+                lease.run_id,
+                interruption.reason.value,
+                run_error,
+            )
+        invalidate_task_cache_best_effort(lease.task_id)
+        return True
+
+    if attempt is not None:
+        attempt.confirm = confirm
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return confirm()
 
 
-def _finalize_managed_task_lease_result_sync(
+def finalize_managed_task_lease_result_sync(
     lease: TaskLease,
     *,
     status: TaskStatus,
@@ -282,22 +301,46 @@ def _finalize_managed_task_lease_result_sync(
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
     execution_result: Mapping[str, Any] | None = None,
+    completion: tuple[int, dict[str, Any]] | None = None,
+    settle_interruption: bool = False,
+    report: SettlementReport | None = None,
 ) -> bool:
+    """Finalize in owned Sessions, confirming a lost acknowledgement.
+
+    A COMMIT whose acknowledgement was lost is read back by its result
+    fact's witness (``run_with_commit_witness_sync``): applied, it returns
+    ``True`` and fills ``report`` as a committed pause does; not applied, it
+    is rerun. The exception types are unchanged; after reruns the last
+    attempt's error is raised.
+    """
     from ..models.database import get_session_local
 
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        return finalize_managed_task_lease_result(
-            db,
-            lease,
-            status=status,
-            assistant_content=assistant_content,
-            turn_id=turn_id,
-            interactions=interactions,
-            message_type=message_type,
-            error_message=error_message,
-            execution_result=execution_result,
-        )
+    def attempt_finalize(attempt: CommitAttempt) -> bool:
+        with get_session_local()() as db:
+            if attempt.rerun:
+                bound_rerun_lock_wait_no_commit(db)
+            return finalize_managed_task_lease_result(
+                db,
+                lease,
+                status=status,
+                assistant_content=assistant_content,
+                turn_id=turn_id,
+                interactions=interactions,
+                message_type=message_type,
+                error_message=error_message,
+                execution_result=execution_result,
+                completion=completion,
+                settle_interruption=settle_interruption,
+                report=report,
+                attempt=attempt,
+            )
+
+    return run_with_commit_witness_sync(
+        attempt_finalize,
+        site="managed_settlement",
+        task_id=lease.task_id,
+        run_id=lease.run_id,
+    )
 
 
 async def finalize_managed_task_lease_result_isolated(
@@ -314,7 +357,7 @@ async def finalize_managed_task_lease_result_isolated(
     """Settle one exact managed lease using a worker-owned short Session."""
 
     return await run_db_io_cancellation_safe(
-        lambda: _finalize_managed_task_lease_result_sync(
+        lambda: finalize_managed_task_lease_result_sync(
             lease,
             status=status,
             assistant_content=assistant_content,
@@ -328,21 +371,33 @@ async def finalize_managed_task_lease_result_isolated(
 
 
 def _release_managed_task_lease_sync(lease: TaskLease) -> bool:
+    """Release in owned Sessions, confirming a lost acknowledgement as
+    ``finalize_managed_task_lease_result_sync`` does."""
     from ..models.database import get_session_local
 
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        task = db.query(Task).filter(Task.id == lease.task_id).first()
-        if task is None or task.run_id != lease.run_id:
-            return False
-        final_status = (
-            TaskStatus.FAILED if task.status == TaskStatus.RUNNING else task.status
-        )
-        return finalize_managed_task_lease_result(
-            db,
-            lease,
-            status=final_status,
-        )
+    def attempt_release(attempt: CommitAttempt) -> bool:
+        with get_session_local()() as db:
+            if attempt.rerun:
+                bound_rerun_lock_wait_no_commit(db)
+            task = db.query(Task).filter(Task.id == lease.task_id).first()
+            if task is None or task.run_id != lease.run_id:
+                return False
+            final_status = (
+                TaskStatus.FAILED if task.status == TaskStatus.RUNNING else task.status
+            )
+            return finalize_managed_task_lease_result(
+                db,
+                lease,
+                status=final_status,
+                attempt=attempt,
+            )
+
+    return run_with_commit_witness_sync(
+        attempt_release,
+        site="managed_settlement",
+        task_id=lease.task_id,
+        run_id=lease.run_id,
+    )
 
 
 @dataclass

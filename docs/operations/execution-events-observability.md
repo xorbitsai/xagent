@@ -82,7 +82,9 @@ literal format strings.
   `retried` (an attempt was rerun), `recovered` (a rerun succeeded) or
   `failed` (a write that was retried at least once ended in failure). Each
   retryable trace-fact attempt also logs WARNING `Trace event commit attempt failed for
-  task %s: %s`.
+  task %s: %s`. The settlement sites (`settlement`, `managed_settlement`)
+  read a failed COMMIT back by its result fact first and rerun only when it
+  did not apply; a confirmed one is `settlement_ack_reconciled` in (2).
 - `xagent.trace.database.writes`, attributes `outcome` (`succeeded`,
   `retryable_failed`, `failed`) and `storage` (`v1`/`v2`).
 - After a failed write the run is aborted and settled by the existing failure
@@ -103,13 +105,16 @@ literal format strings.
     COMMIT outcome could not be reconciled; `ref` is the turn id.
   - `finalize_ack_unresolved`: a finalize COMMIT lost its acknowledgement
     (dropped connection) and the read-back could not decide.
+  - `settlement_ack_unresolved`: the same for a V2 settlement (a run that
+    raised, an interruption pause, or a managed inline-transport result).
+    The lease is retained for TTL recovery.
   - `resume_finalize_unreconciled`: the same for a resumed run's finalize,
     which has no read-back yet.
   - `settlement_deferred`: settlement could not decide from the checkpoint
     and left the lease to TTL recovery.
-  - `finalize_ack_reconciled` (INFO): a lost acknowledgement the read-back
-    proved applied. A confirmed success counted for visibility; exclude it
-    from alerts on this counter.
+  - `finalize_ack_reconciled`, `settlement_ack_reconciled` (INFO): a lost
+    acknowledgement the read-back proved applied. A confirmed success counted
+    for visibility; exclude both from alerts on this counter.
 - WARNING `Settlement unknown-effect classification unavailable: task_id=...`
   and WARNING `Event recovery unavailable: task_id=...`: the classification
   read itself failed; the degradation `checkpoint_recovery_unavailable` is set.

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import difflib
 import hashlib
 import inspect
 import itertools
@@ -75,9 +76,11 @@ from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
 )
+from ....guardrails.output import ProtectedInteractionError
 from ....model.chat.basic.base import compatible_tool_choice_for_llm
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.adapters.vibe.base import ToolCategory
 from ....tools.adapters.vibe.interaction_types import (
     CLARIFICATION_GUIDANCE,
     DEFAULT_WAITING_INTERACTION,
@@ -107,6 +110,8 @@ from ....tools.user_interaction import (
 )
 from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
+from ...context import ExecutionContext
+from ...context.components import LoadedToolsComponent
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
@@ -116,13 +121,34 @@ from ...context.enrichment import (
 )
 from ...context.execution import (
     note_compaction_evidence_loss,
+    provider_safe_tool_name,
     snapshot_container,
     tool_evidence_state,
 )
-from ...context.memory_tool import build_memory_tools
+from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
+from ...deferred_tools import (
+    AVAILABLE_NAMES_SUFFIX,
+    DEFAULT_PRELOAD_TOKEN_BUDGET,
+    DEFERRED_RULE,
+    LOAD_TOOLS_NAME,
+    LOADED_TOOLS_COMPONENT,
+    MAX_AUTO_LOAD_RETRIES,
+    MAX_TOOLS_PER_LOAD,
+    LoadToolsTool,
+    servers_mentioned,
+    tool_names_mentioned,
+)
 from ...grounding import evidence_facts, grounding_rule
 from ...language import effective_output_language, final_answer_language_rule
+from ...prompt_composition import (
+    BUILTIN_TOOL_ORIGIN,
+    CALL_KIND_DECISION,
+    CALL_KIND_MAIN,
+    CALL_KIND_PROTOCOL_RETRY,
+    PROMPT_COMPOSITION_KEY,
+    build_prompt_composition,
+)
 from ...result import (
     CONTROL_TOOL_NAMES,
     normalize_tool_failure_code,
@@ -185,7 +211,9 @@ REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
-UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
+UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset(
+    {ToolCategory.BASIC.value, ToolCategory.OTHER.value}
+)
 # Argument names that mark a call as one page of a larger list. A repeated run
 # of such calls has not read the whole list just because several pages came back.
 PAGINATION_ARGUMENT_NAMES = frozenset(
@@ -210,6 +238,12 @@ PAGINATION_ARGUMENT_NAMES = frozenset(
         "startAt",
     }
 )
+# Hints in the error for an unknown tool name. Close names are preferred; the
+# listing is the fallback for a name nothing resembles and stays short because
+# the model already has the full set in its tool schemas.
+TOOL_NOT_FOUND_CLOSE_CUTOFF = 0.8
+TOOL_NOT_FOUND_MAX_CLOSE_NAMES = 3
+TOOL_NOT_FOUND_MAX_LISTED_NAMES = 20
 # Bounds for the final_answer-strip warning's tool-name list. Tool names come
 # straight from the model, so the log line is shaped like the rest of this
 # module's untrusted-input logging: bounded length, escaped, never raw.
@@ -766,8 +800,19 @@ class ReActPattern(AgentPattern):
         tool_parallel_enabled: bool = False,
         tool_max_concurrency: int = 3,
         user_interaction_enabled: bool = True,
+        defer_connector_schemas: bool = False,
+        deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET,
     ) -> None:
         self.llm = llm
+        # Host opt-in: connector tool schemas are withheld until the model
+        # loads them (see ``deferred_tools``). Off keeps every schema sent.
+        self.defer_connector_schemas = defer_connector_schemas
+        self.deferred_preload_token_budget = max(0, int(deferred_preload_token_budget))
+        self._deferred_tool_names: frozenset[str] = frozenset()
+        self._deferred_order: tuple[str, ...] = ()
+        # Deferred tools the last provider refusal auto-loaded; the retry
+        # instruction names them once and clears this.
+        self._just_auto_loaded: list[str] = []
         self.max_iterations = max_iterations
         self.tool_choice = tool_choice
         self.reasoning_mode = ReActReasoningMode(reasoning_mode)
@@ -820,6 +865,7 @@ class ReActPattern(AgentPattern):
         self.task_text: str | None = None
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
+        self._memory_tools_factory: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
         self._connector_tool_sources: dict[str, str] = {}
 
@@ -853,13 +899,9 @@ class ReActPattern(AgentPattern):
                 runtime=runtime,
                 tools=tools,
             )
-        except CheckpointPersistenceError as exc:
-            # This runs before the main try/except below, so without this
-            # handler a durability failure while checkpointing the received
-            # user response (see ``_resume_waiting_for_user_if_needed``'s
-            # ``"tool_interaction_response_received"`` checkpoint) would
-            # propagate straight past ``on_pattern_error``: no terminal
-            # ``trace_error`` would be recorded, even though the run aborts.
+        except (CheckpointPersistenceError, ProtectedInteractionError) as exc:
+            # The resume path runs before the main try/except. Record a
+            # terminal trace for rejected questions and checkpoint failures.
             await runtime.on_pattern_error(context=context, pattern=self, error=exc)
             raise
         if waiting_result is not None:
@@ -891,6 +933,7 @@ class ReActPattern(AgentPattern):
             task_text = self._task_text(context)
             memory_text = self._memory_text(context, execution_text=task_text)
             self._memory_store = kwargs.get("memory_store")
+            self._memory_tools_factory = kwargs.get("memory_tools_factory")
             # DAG steps skip the automatic retrieval: the root run already
             # retrieved for the whole task, and steps can search_memory on
             # demand.
@@ -938,6 +981,8 @@ class ReActPattern(AgentPattern):
                 raise
             result = interrupted
         except Exception as exc:
+            if isinstance(exc, ProtectedInteractionError):
+                await self._checkpoint_rejected_question(context, runtime)
             await runtime.on_pattern_error(context=context, pattern=self, error=exc)
             raise
 
@@ -962,12 +1007,27 @@ class ReActPattern(AgentPattern):
         """
         if self.finalize_after_tool_result:
             return tools
-        extra_tools: list[Any] = build_memory_tools(
-            memory_store=self._memory_store,
-            task=task_text,
-            runtime=runtime,
-            context=context,
-        )
+        if self._memory_tools_factory is None:
+            extra_tools: list[Any] = build_memory_tools(
+                memory_store=self._memory_store,
+                task=task_text,
+                runtime=runtime,
+                context=context,
+            )
+        else:
+            # Host factories are synchronous setup hooks and must not perform
+            # blocking I/O. Copy their result so adding run-local tools never
+            # mutates a list retained by the host.
+            extra_tools = list(
+                self._memory_tools_factory(
+                    memory_store=self._memory_store,
+                    task=task_text,
+                    runtime=runtime,
+                    context=context,
+                )
+            )
+            if extra_tools and hasattr(context, "metadata"):
+                context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
         skill_tool = await build_load_skill_tool(
             skill_manager=skill_manager,
             context=context,
@@ -989,6 +1049,7 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
     ) -> dict[str, Any]:
         self.status = "thinking"
+        tools = self._tools_with_deferral(tools, context)
         self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
         self._connector_tool_sources = connector_tool_sources(tools)
         # Read by get_system_context to contradict skill text naming edit_image.
@@ -996,6 +1057,7 @@ class ReActPattern(AgentPattern):
             "generate_image" in self._tool_decision_groups_by_name
             and "edit_image" not in self._tool_decision_groups_by_name
         )
+        self._tool_origins = self._tool_origin_map(tools)
         base_tool_schemas = (
             []
             if self.tool_choice == "none"
@@ -1060,8 +1122,8 @@ class ReActPattern(AgentPattern):
             force_final_answer_now = self._forced_answer_turn_now(
                 context, settlement_fence=settlement_fence
             )
-            normal_tool_schemas = self._tool_schemas_with_spill_read(
-                base_tool_schemas, spill_read_schema, context
+            normal_tool_schemas = self._normal_tool_schemas(
+                base_tool_schemas, spill_read_schema, tools, context
             )
             if not force_final_answer_now:
                 tool_schemas = normal_tool_schemas
@@ -1186,6 +1248,13 @@ class ReActPattern(AgentPattern):
                 ),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
+            llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+                context,
+                messages,
+                tool_schemas,
+                call_kind=CALL_KIND_MAIN,
+                iteration=iteration,
+            )
             await runtime.on_llm_start(
                 context=context,
                 messages=messages,
@@ -1256,6 +1325,13 @@ class ReActPattern(AgentPattern):
                     # Past max_iterations only a forced answer turn may run;
                     # stop rather than restore the full tool set there.
                     break
+                auto_load_allowed = unavailable_tool_call and not settlement_fence
+                if auto_load_allowed and self._auto_load_refused(
+                    context, _unavailable_tool_call_names({"details": exc.details})
+                ):
+                    normal_tool_schemas = self._normal_tool_schemas(
+                        base_tool_schemas, spill_read_schema, tools, context
+                    )
                 try:
                     # The settlement fence outranks unavailable-tool recovery:
                     # restoring the full tool set here is exactly the hole that
@@ -1267,7 +1343,11 @@ class ReActPattern(AgentPattern):
                     (
                         response,
                         answer_streamer,
-                    ) = await self._retry_tool_protocol_response(
+                    ) = await self._retry_auto_loading(
+                        auto_load=auto_load_allowed,
+                        rebuild=lambda: self._normal_tool_schemas(
+                            base_tool_schemas, spill_read_schema, tools, context
+                        ),
                         context=context,
                         llm=call_llm,
                         runtime=runtime,
@@ -1391,6 +1471,16 @@ class ReActPattern(AgentPattern):
                         sorted(self._tool_call_args_dict(empty_final_answer), key=str),
                     )
                 protocol_error = get_tool_protocol_error(response)
+                if (
+                    recover_full_tool_set
+                    and isinstance(protocol_error, dict)
+                    and self._auto_load_refused(
+                        context, _unavailable_tool_call_names(protocol_error)
+                    )
+                ):
+                    normal_tool_schemas = self._normal_tool_schemas(
+                        base_tool_schemas, spill_read_schema, tools, context
+                    )
                 if recover_full_tool_set:
                     recovery_reason: str | None = "unavailable_tool_call"
                 elif truncated and not settlement_fence:
@@ -1422,7 +1512,11 @@ class ReActPattern(AgentPattern):
                     (
                         response,
                         answer_streamer,
-                    ) = await self._retry_tool_protocol_response(
+                    ) = await self._retry_auto_loading(
+                        auto_load=recover_full_tool_set,
+                        rebuild=lambda: self._normal_tool_schemas(
+                            base_tool_schemas, spill_read_schema, tools, context
+                        ),
                         context=context,
                         llm=call_llm,
                         runtime=runtime,
@@ -1977,7 +2071,16 @@ class ReActPattern(AgentPattern):
             )
         elif has_tools:
             active_tool_names = tool_names or []
-            available_tools = ", ".join(active_tool_names) or "(none)"
+            # Names and the connector inventory must not change when a tool is
+            # loaded mid-run, or the system message (and every cached prefix
+            # after it) would change on the call that follows a load. Loaded
+            # deferred tools are therefore left out of the list below and the
+            # inventory is built from the whole deferred index.
+            stable_tool_names = [
+                n for n in active_tool_names if n not in self._deferred_tool_names
+            ]
+            inventory_tool_names = [*stable_tool_names, *self._deferred_order]
+            available_tools = ", ".join(stable_tool_names) or "(none)"
             can_lookup_output_files = (
                 WORKSPACE_OUTPUT_FILES_TOOL_NAME in active_tool_names
             )
@@ -2082,12 +2185,18 @@ class ReActPattern(AgentPattern):
                 "the provided skill context."
                 f"\n\nAvailable tool names for this LLM call are exactly: {available_tools}. "
                 "Never call a tool name that is not in this list."
+                f"{AVAILABLE_NAMES_SUFFIX if self._deferred_tool_names else ''}"
             )
             access_context = tool_access_context(
-                self._connector_tool_sources, active_tool_names
+                self._connector_tool_sources,
+                inventory_tool_names
+                if self._deferred_tool_names
+                else active_tool_names,
             )
             if access_context:
                 instruction = f"{instruction}\n\n{access_context}"
+            if self._deferred_tool_names:
+                instruction = f"{instruction}\n\n{DEFERRED_RULE}"
         else:
             # Reachable only with tool_choice="none", which no production
             # construction site sets. If that ever changes, this branch needs
@@ -2105,6 +2214,56 @@ class ReActPattern(AgentPattern):
                 *messages[1:],
             ]
         return [{"role": "system", "content": instruction}, *messages]
+
+    async def _retry_auto_loading(
+        self,
+        *,
+        auto_load: bool,
+        rebuild: Callable[[], list[dict[str, Any]]],
+        context: Any,
+        tool_schemas: list[dict[str, Any]],
+        **retry: Any,
+    ) -> tuple[Any, Any]:
+        """The protocol retry, repeated while the provider refuses deferred tools.
+
+        A provider that checks calls against the schemas it sent reports one
+        refused call at a time (DeepSeek returns the first violation only), so a
+        response that calls several unloaded connector tools is refused once per
+        tool. Each refusal loads that tool and retries with the schemas
+        rebuilt, up to MAX_AUTO_LOAD_RETRIES times. The refusal is raised by
+        some providers and carried in the response by others; both are handled.
+        """
+        attempts = 0
+        while True:
+            refused: frozenset[str] | None = None
+            try:
+                response, streamer = await self._retry_tool_protocol_response(
+                    context=context, tool_schemas=tool_schemas, **retry
+                )
+            except LLMToolProtocolError as exc:
+                if not auto_load or exc.code != "unavailable_tool_call":
+                    raise
+                refused = _unavailable_tool_call_names({"details": exc.details})
+                error: LLMToolProtocolError | None = exc
+            else:
+                error = None
+                protocol_error = get_tool_protocol_error(response)
+                if (
+                    auto_load
+                    and isinstance(protocol_error, dict)
+                    and protocol_error.get("code") == "unavailable_tool_call"
+                ):
+                    refused = _unavailable_tool_call_names(protocol_error)
+            if (
+                refused is None
+                or attempts >= MAX_AUTO_LOAD_RETRIES
+                or not self._auto_load_refused(context, refused)
+            ):
+                if error is not None:
+                    raise error
+                return response, streamer
+            attempts += 1
+            tool_schemas = rebuild()
 
     async def _retry_tool_protocol_response(
         self,
@@ -2156,6 +2315,7 @@ class ReActPattern(AgentPattern):
                 "set. If the requested work or artifact has not been successfully "
                 "produced, call the appropriate work tool; call final_answer only "
                 "when the task is actually complete and its required results exist."
+                + self._deferred_retry_sentence()
             )
             retry_phase = "unavailable_tool_call_recovery"
         elif recovery_reason == "settlement_final_answer_required":
@@ -2270,6 +2430,13 @@ class ReActPattern(AgentPattern):
             context=context,
             pattern=self,
             metadata=metadata,
+        )
+        metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+            context,
+            messages,
+            tools,
+            call_kind=CALL_KIND_PROTOCOL_RETRY,
+            iteration=iteration,
         )
         await runtime.on_llm_start(
             context=context,
@@ -2979,13 +3146,7 @@ class ReActPattern(AgentPattern):
             self.waiting_for_user_request.get("message_count", 0)
         )
         if len(getattr(context, "messages", [])) <= waiting_message_count:
-            await runtime.checkpoint(
-                "waiting_for_user",
-                context=context,
-                pattern=self,
-                metadata={"waiting_for_user_request": self.waiting_for_user_request},
-            )
-            return {
+            result = {
                 "success": False,
                 "status": "waiting_for_user",
                 "message": self.waiting_for_user_request.get("message", ""),
@@ -3000,6 +3161,16 @@ class ReActPattern(AgentPattern):
                     step_id=None,
                 ),
             }
+            if not await runtime.approve_waiting_result(result):
+                await self._checkpoint_rejected_question(context, runtime)
+                raise ProtectedInteractionError()
+            await runtime.checkpoint(
+                "waiting_for_user",
+                context=context,
+                pattern=self,
+                metadata={"waiting_for_user_request": self.waiting_for_user_request},
+            )
+            return result
 
         response = self._mark_latest_user_message_as_waiting_response(
             context=context,
@@ -4250,12 +4421,13 @@ class ReActPattern(AgentPattern):
             for tool in tools
             if (name := self._tool_name(tool)) not in control_tool_names
             # Unconditional: this function only sees the static tool list
-            # (it runs once per run, before the iteration loop even starts),
+            # (the loop builds it once, before the first iteration),
             # so it cannot know whether the run has stored anything yet.
             # _tool_schemas_with_spill_read adds the reader back once the
             # registry is non-empty -- a dynamic fact this function has no
             # way to observe.
             and name != SPILL_READ_TOOL_NAME
+            and name not in self._deferred_tool_names
         ]
         can_lookup_output_files = any(
             schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
@@ -4315,6 +4487,290 @@ class ReActPattern(AgentPattern):
             "which items you did not read. "
         )
 
+    def _tools_with_deferral(self, tools: list[Any], context: Any) -> list[Any]:
+        """Apply the host's deferral opt-in to this run's tool list.
+
+        Returns ``tools`` unchanged when deferral is off, no connector tool is
+        present, or the host already supplies a ``load_tools`` tool. Otherwise
+        records which names are deferred, appends the ``load_tools`` tool, and
+        pre-loads connectors that user messages not yet scanned name. Runs on
+        every entry to the loop, so a resumed run rebuilds the same state; the
+        loaded set itself comes back from the checkpointed context.
+        """
+        self._deferred_tool_names = frozenset()
+        self._deferred_order = ()
+        if not self.defer_connector_schemas or self.tool_choice == "none":
+            return tools
+        if any(self._tool_name(tool) == LOAD_TOOLS_NAME for tool in tools):
+            return tools
+        sources = connector_tool_sources(tools)
+        reserved = {*self._control_tool_names(), SPILL_READ_TOOL_NAME}
+        deferred = [
+            name
+            for name in (self._tool_name(tool) for tool in tools)
+            if name in sources and name not in reserved
+        ]
+        if not deferred:
+            return tools
+        self._deferred_order = tuple(deferred)
+        self._deferred_tool_names = frozenset(deferred)
+        self._preload_mentioned(tools, sources, context)
+        return [
+            *tools,
+            LoadToolsTool(
+                lambda names: self._execute_load_tools({"names": names}, context)
+            ),
+        ]
+
+    def _loaded_component(self, context: Any) -> LoadedToolsComponent:
+        component = context.get_component(LOADED_TOOLS_COMPONENT)
+        if not isinstance(component, LoadedToolsComponent):
+            component = LoadedToolsComponent()
+            context.set_component(LOADED_TOOLS_COMPONENT, component)
+        return component
+
+    def _deferred_tool_unloaded(self, name: str, context: Any) -> bool:
+        """Whether ``name`` is deferred and its schema was not in the tool list
+        last built for a model call: the only state in which a call to it may
+        run, because only then can the model have written valid arguments."""
+        if name not in self._deferred_tool_names:
+            return False
+        component = context.get_component(LOADED_TOOLS_COMPONENT)
+        return name not in (getattr(component, "sent_names", None) or [])
+
+    def _deferred_tool_unloaded_message(self, name: Any, context: Any) -> str:
+        component = context.get_component(LOADED_TOOLS_COMPONENT)
+        if name in (getattr(component, "names", None) or []):
+            return (
+                f"Tool {name!r} was loaded, but its schema was not part of the "
+                "request that produced this call, so it was not run. Call it "
+                "again in your next step."
+            )
+        return (
+            f"Tool {name!r} is a connector tool whose schema is not loaded, so "
+            f"it was not run. Call {LOAD_TOOLS_NAME} with names=[{name!r}] first, "
+            "then call it in the next step."
+        )
+
+    def _load_names(self, context: Any, names: list[str]) -> None:
+        """Record ``names`` as loaded. They become callable only once a model
+        call has been built with their schemas (see ``sent_names``)."""
+        component = self._loaded_component(context)
+        for name in names:
+            if name not in component.names:
+                component.names.append(name)
+
+    def _auto_load_refused(self, context: Any, refused: frozenset[str] | None) -> bool:
+        """Load deferred tools a provider refused as unavailable.
+
+        A provider that checks calls against the schemas it was sent rejects a
+        call to a tool whose schema is deferred before the loop can answer it.
+        Loading the refused tools lets the retry send their schemas, so the
+        model re-decides with them in view. True when anything was loaded.
+        """
+        wanted = [
+            n for n in sorted(refused or ()) if self._deferred_tool_unloaded(n, context)
+        ]
+        if not wanted:
+            return False
+        self._load_names(context, wanted)
+        self._just_auto_loaded = wanted
+        return True
+
+    def _deferred_retry_sentence(self) -> str:
+        """Retry wording naming the deferred tools a refusal just loaded."""
+        if not self._just_auto_loaded:
+            return ""
+        names = self._just_auto_loaded
+        self._just_auto_loaded = []
+        verb = "is" if len(names) == 1 else "are"
+        call = "it" if len(names) == 1 else "them"
+        return f" {', '.join(names)} {verb} now loaded; call {call} directly."
+
+    def _tool_schema_cost(self, tool: Any) -> int:
+        """Estimated tokens of one tool's schema (characters / 4)."""
+        return len(json.dumps(self._build_tool_schema(tool), default=str)) // 4
+
+    def _preload_text(self, context: Any) -> tuple[str | None, str]:
+        """Timestamp and typed text of the newest user message, or (None, "").
+
+        An explicit ``display_message`` is what the user typed even when it is
+        empty (an attachment-only turn); only a message without one falls back
+        to its content, which can carry injected context.
+        """
+        for message in reversed(getattr(context, "messages", []) or []):
+            if getattr(message, "role", None) != "user":
+                continue
+            stamp = getattr(message, "timestamp", None)
+            metadata = getattr(message, "metadata", None)
+            if isinstance(metadata, dict) and isinstance(
+                metadata.get("display_message"), str
+            ):
+                text = metadata["display_message"]
+            else:
+                text = str(getattr(message, "content", "") or "")
+            return (stamp.isoformat() if stamp is not None else None), text
+        return None, ""
+
+    def _preload_mentioned(
+        self, tools: list[Any], sources: dict[str, str], context: Any
+    ) -> None:
+        """Pre-load connectors, and exact tool names, a new user message names.
+
+        Scans the newest user message only when it is newer than the last one
+        scanned, so a follow-up message is scanned, a resume without a new
+        message is not rescanned, and compaction cannot hide a later message.
+        These loads are effective at once: they happen before a model call and
+        are not requests from a response, so they never touch ``pending``.
+        """
+        component = self._loaded_component(context)
+        stamp, text = self._preload_text(context)
+        if stamp is None or (
+            component.last_scanned_at is not None and stamp <= component.last_scanned_at
+        ):
+            return
+        component.last_scanned_at = stamp
+        if not text:
+            return
+        by_name = {self._tool_name(t): t for t in tools}
+        remaining = self.deferred_preload_token_budget
+        to_load: list[str] = []
+        for name in tool_names_mentioned(text, self._deferred_order):
+            cost = self._tool_schema_cost(by_name[name])
+            if name not in component.names and cost <= remaining:
+                to_load.append(name)
+                remaining -= cost
+        # dict.fromkeys keeps tool order, so which connector the budget has
+        # room for does not depend on the process's hash seed.
+        for server in servers_mentioned(
+            text, dict.fromkeys(sources[n] for n in self._deferred_order)
+        ):
+            group = [
+                n
+                for n in self._deferred_order
+                if sources[n] == server
+                and n not in to_load
+                and n not in component.names
+            ]
+            cost = sum(self._tool_schema_cost(by_name[n]) for n in group)
+            if group and cost <= remaining:
+                to_load.extend(group)
+                remaining -= cost
+        self._load_names(context, to_load)
+
+    def _normal_tool_schemas(
+        self,
+        base_schemas: list[dict[str, Any]],
+        spill_read_schema: dict[str, Any] | None,
+        tools: list[Any],
+        context: Any,
+    ) -> list[dict[str, Any]]:
+        """The ordinary tool surface: base, stored-result reader, loaded tools."""
+        return self._tool_schemas_with_loaded(
+            self._tool_schemas_with_spill_read(
+                base_schemas, spill_read_schema, context
+            ),
+            tools,
+            context,
+        )
+
+    def _tool_schemas_with_loaded(
+        self, schemas: list[dict[str, Any]], tools: list[Any], context: Any
+    ) -> list[dict[str, Any]]:
+        """Append the schemas of deferred tools this run has loaded.
+
+        Always appended at the very end, after the stored-result reader, in
+        load order, so a load only ever grows the tool list. Records which
+        deferred tools the list carries as ``sent_names``: the gate that lets a
+        call to one run. Byte-identical to ``schemas`` when nothing is
+        deferred.
+        """
+        if not self._deferred_tool_names:
+            return schemas
+        component = self._loaded_component(context)
+        loaded = [n for n in component.names if n in self._deferred_tool_names]
+        component.sent_names = list(loaded)
+        if not loaded:
+            return schemas
+        by_name = {self._tool_name(t): t for t in tools}
+        return [
+            *schemas,
+            *(self._build_tool_schema(by_name[n]) for n in loaded if n in by_name),
+        ]
+
+    def _plan_load(
+        self, requested: list[str], context: Any
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Split ``requested`` into (accepted, already, skipped, unknown).
+
+        Already-loaded and pending names are set aside before the per-call cap
+        is applied, so they never use up its slots. Shared by live execution
+        and replay of a committed outcome, which must agree on what loaded.
+        """
+        component = self._loaded_component(context)
+        taken = set(component.names)
+        requested = list(dict.fromkeys(requested))
+        known = [n for n in requested if n in self._deferred_tool_names]
+        unknown = [n for n in requested if n not in self._deferred_tool_names]
+        already = [n for n in known if n in taken]
+        new = [n for n in known if n not in taken]
+        return new[:MAX_TOOLS_PER_LOAD], already, new[MAX_TOOLS_PER_LOAD:], unknown
+
+    def _execute_load_tools(self, args: dict[str, Any], context: Any) -> str:
+        requested = args.get("names")
+        if not isinstance(requested, list) or not all(
+            isinstance(n, str) for n in requested
+        ):
+            raise ValueError("load_tools requires names: a list of tool names.")
+        accepted, already, skipped, unknown = self._plan_load(requested, context)
+        self._load_names(context, accepted)
+        parts = []
+        if accepted:
+            parts.append(
+                "Loaded: "
+                + ", ".join(accepted)
+                + ". Their schemas are available from the next step; call them then."
+            )
+        if already:
+            parts.append("Already loaded earlier: " + ", ".join(already) + ".")
+        if skipped:
+            parts.append(
+                f"Not loaded (limit {MAX_TOOLS_PER_LOAD} per call): "
+                + ", ".join(skipped)
+                + ". Call load_tools again for these."
+            )
+        for name in unknown:
+            close = difflib.get_close_matches(name, list(self._deferred_order), n=3)
+            hint = f" Did you mean: {', '.join(close)}?" if close else ""
+            parts.append(
+                f"Unknown tool {name!r}: not in the connector inventory.{hint}"
+            )
+        return " ".join(parts) or "No tool names given."
+
+    def _reapply_committed_load(
+        self, tool_call: dict[str, Any], result: Any, context: Any
+    ) -> None:
+        """Re-apply a load whose outcome was committed but whose state was not.
+
+        A crash between committing the outcome and the checkpoint replays the
+        stored "Loaded: X" without running the tool; the load has to be put
+        back or X is reported loaded while its schema is never sent. Only a
+        successful outcome loaded anything, and the same plan as live
+        execution decides what.
+        """
+        if (
+            context is None
+            or tool_call.get("name") != LOAD_TOOLS_NAME
+            or not self._deferred_tool_names
+            or not self._tool_result_success(result)
+        ):
+            return
+        names = self._tool_call_args_dict(tool_call).get("names")
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            return
+        accepted, _, _, _ = self._plan_load(names, context)
+        self._load_names(context, accepted)
+
     def _tool_schemas_with_spill_read(
         self,
         base_schemas: list[dict[str, Any]],
@@ -4323,12 +4779,14 @@ class ReActPattern(AgentPattern):
     ) -> list[dict[str, Any]]:
         """Add the stored-result reader once this run has actually stored one.
 
-        base_schemas is built once per run, before the iteration loop, so it
-        cannot know about a registry that fills up mid-run. This runs on
-        every iteration instead, which is the only place that sees the
-        spill that just happened. spill_read_schema is None when the run
-        has no reader to offer (tool_choice "none", or no reader tool), and
-        base_schemas then comes back unchanged whatever the registry holds.
+        base_schemas never lists the reader: _tool_schemas_with_builtin_controls
+        leaves it out whatever the registry holds, and the loop builds
+        base_schemas once, before the first iteration. This runs on every
+        iteration instead, and when a tool-not-found hint is built, so both
+        see the spill that just happened. spill_read_schema is None when there
+        is no reader tool (the loop also passes None under tool_choice
+        "none"), and base_schemas then comes back unchanged whatever the
+        registry holds.
         """
         if spill_read_schema is None or not self._spilled_paths(context):
             return base_schemas  # byte-identical to the baseline surface
@@ -4852,6 +5310,18 @@ class ReActPattern(AgentPattern):
             ),
         )
         self._forget_tool_call_content(tool_call)
+
+    async def _checkpoint_rejected_question(
+        self, context: ExecutionContext, runtime: PatternRuntime
+    ) -> None:
+        self._discard_pending_tool_plan_after_pause(
+            context, reason="The question was rejected by output review."
+        )
+        self.waiting_for_user_request = None
+        self.status = "failed"
+        await runtime.checkpoint(
+            "output_review_rejected_question", context=context, pattern=self
+        )
 
     def _discard_pending_tool_plan_after_pause(
         self, context: Any, *, reason: str | None = None
@@ -5476,6 +5946,13 @@ class ReActPattern(AgentPattern):
             **resolved_llm_metadata(call_llm),
             **metadata,
         }
+        llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+            context,
+            messages,
+            decision_tools,
+            call_kind=CALL_KIND_DECISION,
+            iteration=self.current_iteration,
+        )
         await runtime.on_llm_start(
             context=context,
             messages=messages,
@@ -6268,6 +6745,7 @@ class ReActPattern(AgentPattern):
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
             committed = await runtime.load_committed_tool_outcome(tool_call)
             if committed is not None:
+                self._reapply_committed_load(tool_call, committed["result"], context)
                 result = committed["result"]
                 self._record_tool_call(
                     tool_call,
@@ -6326,7 +6804,7 @@ class ReActPattern(AgentPattern):
                     self._mcp_gate_execution_context(tool_call, context, runtime)
                 ):
                     result = await runtime.run_tool_call(
-                        lambda: self._execute_tool(tool_call, tools)
+                        lambda: self._execute_tool(tool_call, tools, context=context)
                     )
             except ToolCallInterrupted as exc:
                 await runtime.on_tool_cancelled(
@@ -6699,6 +7177,54 @@ class ReActPattern(AgentPattern):
             raise ValueError("Tool call args must be a JSON object.")
         return {}
 
+    def _tool_origin_map(self, tools: list[Any]) -> dict[str, str]:
+        """Tool name -> category (plus MCP/connector server), for sizing only."""
+        origins: dict[str, str] = {}
+        for tool in tools:
+            try:
+                name = self._tool_name(tool)
+            except ValueError:
+                continue
+            metadata = getattr(tool, "metadata", None)
+            category = getattr(metadata, "category", None)
+            origin = str(getattr(category, "value", category) or "other")
+            server = getattr(metadata, "source_server", None)
+            if isinstance(server, str) and server:
+                origin = f"{origin}:{server}"
+            origins[name] = origin
+        return origins
+
+    def _prompt_composition(
+        self,
+        context: Any,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]] | None,
+        *,
+        call_kind: str,
+        iteration: int,
+    ) -> dict[str, Any]:
+        """Sizes of this call's request; counts and lengths, never content."""
+        origins = {
+            name: BUILTIN_TOOL_ORIGIN
+            for name in self._schema_tool_names(tool_schemas or [])
+        }
+        origins.update(getattr(self, "_tool_origins", {}))
+        context_tokens: int | None = None
+        estimate = getattr(context, "estimate_context_tokens", None)
+        if callable(estimate):
+            try:
+                context_tokens = estimate(messages, tool_schemas or None)
+            except Exception:  # noqa: BLE001 - diagnostics must not break the call
+                context_tokens = None
+        return build_prompt_composition(
+            messages,
+            tool_schemas,
+            call_kind=call_kind,
+            iteration=iteration,
+            tool_origins=origins,
+            context_tokens=context_tokens,
+        )
+
     def _tool_name(self, tool: Any) -> str:
         metadata = getattr(tool, "metadata", None)
         if metadata is not None and getattr(metadata, "name", None):
@@ -6780,8 +7306,18 @@ class ReActPattern(AgentPattern):
             return {"type": "array"}
         return {}
 
-    async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:
-        tool = self._find_tool(tool_call["name"], tools)
+    async def _execute_tool(
+        self, tool_call: dict[str, Any], tools: list[Any], *, context: Any
+    ) -> Any:
+        tool = self._match_tool(tool_call["name"], tools)
+        if tool is None:
+            raise ValueError(
+                self._tool_not_found_message(tool_call["name"], tools, context)
+            )
+        if self._deferred_tool_unloaded(self._tool_name(tool), context):
+            raise ValueError(
+                self._deferred_tool_unloaded_message(tool_call["name"], context)
+            )
         args = self._tool_args_for_execution(tool_call, tool)
 
         execute = getattr(tool, "execute", None)
@@ -6817,7 +7353,11 @@ class ReActPattern(AgentPattern):
             args.setdefault("_xagent_step_id", str(step_id))
         return args
 
-    def _find_tool(self, name: str, tools: list[Any]) -> Any:
+    def _match_tool(self, name: str, tools: list[Any]) -> Any | None:
+        """The tool ``name`` resolves to, or None.
+
+        Matches the emitted name only, never a provider-safe respelling of it.
+        """
         for tool in tools:
             if self._tool_name(tool) == name:
                 return tool
@@ -6828,7 +7368,69 @@ class ReActPattern(AgentPattern):
             matches_name = getattr(tool, "matches_name", None)
             if callable(matches_name) and matches_name(name):
                 return tool
-        raise ValueError(f"Tool not found: {name}")
+        return None
+
+    def _find_tool(self, name: str, tools: list[Any]) -> Any:
+        tool = self._match_tool(name, tools)
+        if tool is None:
+            raise ValueError(f"Tool not found: {name}")
+        return tool
+
+    def _tool_not_found_message(self, name: Any, tools: list[Any], context: Any) -> str:
+        """Name what the model emitted and what it could have called instead.
+
+        The candidates are the tool names an ordinary turn offers the model,
+        built by the same functions as that turn's schema list, so the
+        stored-result reader is a candidate only once this run has stored a
+        result. Forced turns offer fewer tools, but a call outside a forced
+        turn's list is refused before any tool is looked up.
+
+        ``repr`` keeps an invalid name visibly different from a real tool whose
+        name it resembles. The replayed call shows the provider-safe spelling
+        instead, so when that spelling is itself an offered tool it is named
+        first: the model sees that name in its history and has to be told the
+        call did not run it. The spelling is only named here; lookup always
+        uses the emitted name.
+        """
+        spill_read_tool = next(
+            (tool for tool in tools if self._tool_name(tool) == SPILL_READ_TOOL_NAME),
+            None,
+        )
+        offered = self._tool_schemas_with_spill_read(
+            self._tool_schemas_with_builtin_controls(tools),
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool),
+            context,
+        )
+        available = list(dict.fromkeys(self._schema_tool_names(offered)))
+        message = f"Tool not found: {name!r}."
+        # Deferred connector tools are real tools the model may have misspelled
+        # while looking for a schema it was never sent.
+        candidates = [*available, *self._deferred_order]
+        close = difflib.get_close_matches(
+            str(name),
+            candidates,
+            n=TOOL_NOT_FOUND_MAX_CLOSE_NAMES,
+            cutoff=TOOL_NOT_FOUND_CLOSE_CUTOFF,
+        )
+        replayed = provider_safe_tool_name(name)
+        if replayed in available:
+            close = [replayed, *(match for match in close if match != replayed)][
+                :TOOL_NOT_FOUND_MAX_CLOSE_NAMES
+            ]
+        if close:
+            load_hint = (
+                f" Load deferred connector tools with {LOAD_TOOLS_NAME} before "
+                "calling them."
+                if any(self._deferred_tool_unloaded(match, context) for match in close)
+                else ""
+            )
+            return f"{message} Did you mean: {', '.join(close)}?{load_hint}"
+        listed = ", ".join(available[:TOOL_NOT_FOUND_MAX_LISTED_NAMES])
+        hidden = len(available) - TOOL_NOT_FOUND_MAX_LISTED_NAMES
+        more = f" (and {hidden} more)" if hidden > 0 else ""
+        return f"{message} Available tools: {listed}{more}."
 
     async def _invoke_callable(self, fn: Any, **kwargs: Any) -> Any:
         if inspect.iscoroutinefunction(fn):

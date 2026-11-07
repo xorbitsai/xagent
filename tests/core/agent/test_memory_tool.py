@@ -1,7 +1,7 @@
 """Tests for the model-invocable ``store_memory`` tool."""
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -13,6 +13,7 @@ from xagent.core.agent.context.memory_tool import (
     build_memory_tools,
     build_store_memory_tool,
 )
+from xagent.core.agent.pattern.react.react import ReActPattern
 from xagent.core.execution_scope import ExecutionScope, ExecutionScopeContext
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.in_memory import InMemoryMemoryStore
@@ -640,6 +641,54 @@ def test_build_memory_tools_stamps_guidance_flag_on_context() -> None:
         == []
     )
     assert "memory_tools_enabled" not in disabled_context.metadata
+
+
+@pytest.mark.asyncio
+async def test_react_uses_selected_custom_memory_tool_factory() -> None:
+    class SkillManager:
+        async def list_skills(self) -> list[dict[str, str]]:
+            return [{"name": "memory-skill", "description": "Use memory"}]
+
+        async def get_skill(self, _name: str) -> None:
+            return None
+
+    pattern = ReActPattern()
+    store = InMemoryMemoryStore()
+    custom_tool = object()
+    calls: list[dict[str, Any]] = []
+
+    factory_tools = [custom_tool]
+
+    def factory(**kwargs: Any) -> list[Any]:
+        calls.append(kwargs)
+        return factory_tools
+
+    pattern._memory_store = store
+    pattern._memory_tools_factory = factory
+    context = type("Context", (), {"metadata": {}})()
+    runtime = FakeRuntime()
+
+    tools = await pattern._with_context_tools(
+        tools=[],
+        context=context,
+        task_text="remember this",
+        runtime=cast(Any, runtime),
+        skill_manager=SkillManager(),
+        allowed_skills=None,
+    )
+
+    assert tools[0] is custom_tool
+    assert tools[1].name == "load_skill"
+    assert factory_tools == [custom_tool]
+    assert context.metadata["memory_tools_enabled"] is True
+    assert calls == [
+        {
+            "memory_store": store,
+            "task": "remember this",
+            "runtime": runtime,
+            "context": context,
+        }
+    ]
 
 
 @pytest.mark.asyncio

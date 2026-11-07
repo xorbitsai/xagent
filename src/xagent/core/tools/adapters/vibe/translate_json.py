@@ -371,7 +371,7 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 
-@register_tool(categories={"basic"})
+@register_tool(categories={ToolCategory.BASIC.value})
 async def create_translate_json_tool(config: "BaseToolConfig") -> List[Any]:
     """Create translate_json tool with LLM and workspace from configuration."""
     llm = config.get_llm()

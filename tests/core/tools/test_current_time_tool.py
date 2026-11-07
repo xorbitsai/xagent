@@ -100,6 +100,39 @@ def test_resolves_a_differently_cased_zone_name() -> None:
     assert result.utc_offset == "+10:00"
 
 
+@pytest.mark.parametrize(
+    ("supplied", "zone", "local", "offset"),
+    [
+        ("Melbourne", "Australia/Melbourne", "2026-08-25 08:03:37", "+10:00"),
+        ("Sydney", "Australia/Sydney", "2026-08-25 08:03:37", "+10:00"),
+        ("Wellington", "Pacific/Auckland", "2026-08-25 10:03:37", "+12:00"),
+        (
+            "Pacific Time (US & Canada)",
+            "America/Los_Angeles",
+            "2026-08-24 15:03:37",
+            "-07:00",
+        ),
+        ("toronto", "America/Toronto", "2026-08-24 18:03:37", "-04:00"),
+    ],
+)
+def test_resolves_a_common_alias_and_reports_the_iana_zone(
+    supplied: str, zone: str, local: str, offset: str
+) -> None:
+    result = current_time(supplied)
+
+    assert result.timezone == zone
+    assert result.local == local
+    assert result.utc_offset == offset
+
+
+def test_an_ambiguous_city_still_degrades_to_utc() -> None:
+    # America/Indianapolis and America/Indiana/Indianapolis both end in it.
+    result = current_time("Indianapolis")
+
+    assert result.timezone == "UTC"
+    assert result.local == result.utc
+
+
 def test_tool_runs_through_the_json_surface() -> None:
     tool = CurrentTimeTool()
 
@@ -119,7 +152,7 @@ def test_tool_runs_through_the_json_surface() -> None:
 
 def test_json_surface_rejects_a_non_string_timezone() -> None:
     # A non-string timezone fails pydantic validation at the JSON boundary,
-    # before _resolve_zone runs. The tool must not raise; the caller catches
+    # before resolve_zone runs. The tool must not raise; the caller catches
     # the validation error and reports a normal failed tool call.
     tool = CurrentTimeTool()
 
@@ -127,17 +160,11 @@ def test_json_surface_rejects_a_non_string_timezone() -> None:
         tool.run_json_sync({"timezone": 42})
 
 
-def test_intrinsic_category_is_not_user_assignable() -> None:
-    # D1: an always-on tool must not sit in a togglable builder category, or
-    # unchecking that category would falsely imply it disables the tool.
-    from xagent.core.tools.adapters.vibe.base import (
-        AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
-    )
+def test_intrinsic_time_tool_is_displayed_with_basic_helpers() -> None:
+    from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
 
-    assert (
-        CurrentTimeTool().metadata.category.value
-        in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
-    )
+    assert CurrentTimeTool().metadata.category is ToolCategory.BASIC
+    assert CurrentTimeTool().name in INTRINSIC_TOOL_NAMES
 
 
 def test_tool_declares_a_read_only_intrinsic_identity() -> None:
@@ -146,7 +173,7 @@ def test_tool_declares_a_read_only_intrinsic_identity() -> None:
     assert metadata.name == "get_current_time"
     # OTHER, not BASIC: it is intrinsic (never category-gated), so it must not
     # appear as a togglable category in the builder picker.
-    assert metadata.category == ToolCategory.OTHER
+    assert metadata.category == ToolCategory.BASIC
     # Reading a clock touches nothing, so the ReAct scheduler may run it
     # alongside other concurrency-safe tools.
     assert metadata.read_only is True
@@ -189,7 +216,7 @@ class _FakeConfig:
     ("spec", "expected"),
     [
         (ToolSelectionSpec.from_raw(tool_categories=None), 1),  # ALL
-        (ToolSelectionSpec.from_raw(tool_categories=["web_search"]), 1),  # non-basic
+        (ToolSelectionSpec.from_raw(tool_categories=["web_tools"]), 1),  # non-basic
         (ToolSelectionSpec.from_raw(tool_categories=[]), 0),  # explicit NONE
     ],
 )
@@ -247,7 +274,7 @@ async def test_registry_import_path_registers_the_tool() -> None:
         delattr(pkg, attr)
     try:
         tools = await ToolFactory.create_all_tools(
-            _FakeConfig(ToolSelectionSpec.from_raw(tool_categories=["web_search"])),
+            _FakeConfig(ToolSelectionSpec.from_raw(tool_categories=["web_tools"])),
             apply_user_override_filter=False,
         )
         assert [t.name for t in tools].count("get_current_time") == 1

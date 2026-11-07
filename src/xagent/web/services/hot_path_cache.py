@@ -215,7 +215,8 @@ def task_snapshot_key(task_id: int) -> str:
 
 
 def task_steps_key(task_id: int) -> str:
-    return f"task:steps:{task_id}"
+    # Old projections may contain audit-only trace data.
+    return f"task:steps:public-v2:{task_id}"
 
 
 def web_task_detail_key(task_id: int) -> str:

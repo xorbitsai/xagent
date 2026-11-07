@@ -5,8 +5,10 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-  push:
-    branches: [main]
+  # No `push` trigger: the merge queue already ran this workflow on the exact
+  # commit it moves main to. main-push-check.yml calls it, through
+  # workflow_call, for a push that did not come through the queue.
+  workflow_call:
   # Required once "CI Summary" is a required status check and a merge queue is
   # enabled: without this the context is never reported on a merge group, its
   # entries time out, and every merge stalls. Harmless before a queue exists --
@@ -43,7 +45,7 @@ jobs:
       # every pull request fails here. Fail-closed, but total -- do not drop it.
       pull-requests: read
     outputs:
-      # Non-pull_request events (merge_group, push to main, workflow_dispatch)
+      # Non-pull_request events (merge_group, workflow_dispatch)
       # never filter. The merge queue is the last gate before main and has to
       # behave exactly as it did before this job existed, which also makes it
       # the safety net for anything the pull-request filters get wrong.
@@ -366,6 +368,20 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v7
 
+      # The web leg installs the full backend environment and pulls a sandbox
+      # image before running a large test shard. GitHub's stock image otherwise
+      # runs out of disk while pytest is still writing the runner diagnostic log.
+      - name: Free GitHub-hosted runner disk space
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
+        uses: endersonmenezes/free-disk-space@e6ed9b02e683a3b55ed0252f1ee469ce3b39a885
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          rm_cmd: rmz
+          rmz_version: "3.1.1"
+
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
         shell: bash
@@ -439,7 +455,10 @@ jobs:
 
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    # Keep the command-policy, CSV and sandbox regressions on the validated
+    # toolchain. ubuntu-latest now rolls to 26.04 with different coreutils and
+    # Python behavior; migrate that environment separately from feature PRs.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, prepare-deepdoc-cache, pre-commit]

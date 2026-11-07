@@ -451,6 +451,9 @@ async def test_list_tool_built_only_without_declaration(
         def is_admin(self):
             return False
 
+        def get_knowledge_base_team_id(self):
+            return None
+
         def get_agent_creator_user_id(self):
             return CREATOR
 

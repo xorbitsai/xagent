@@ -242,3 +242,72 @@ def test_search_documents_hybrid_failure_fallback_preserves_resolved_scope(
 
     assert result.status == "success"
     assert sparse_calls == [(46, True)]
+
+
+def test_ingestion_resolves_its_embedding_model_in_the_callers_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A bare model name must resolve among the ingesting user's models."""
+    seen: list[int | None] = []
+
+    def _capture_scope(_cfg: Any) -> Any:
+        seen.append(get_user_scope().user_id)
+        raise RuntimeError("stop after resolving the embedding model")
+
+    monkeypatch.setattr(
+        document_ingestion, "validate_document_processing_sync", lambda **_kw: None
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        lambda _collection, model_id: model_id,
+    )
+    monkeypatch.setattr(
+        document_ingestion, "_resolve_embedding_adapter", _capture_scope
+    )
+    source = tmp_path / "doc.md"
+    source.write_text("hello")
+
+    result = document_ingestion._process_document_impl(
+        "ctx_collection", str(source), user_id=48, is_admin=False
+    )
+
+    assert result.failed_step == "resolve_embedding_adapter"
+    assert seen == [48]
+    assert get_user_scope().user_id is None
+
+
+def test_search_resolves_its_embedding_model_in_the_callers_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit search scope must reach the embedding and rerank resolvers."""
+    _patch_search_pipeline_common(monkeypatch)
+    seen: list[int | None] = []
+
+    def _capture_scope(*_args: Any, **_kwargs: Any) -> tuple[object, object]:
+        seen.append(get_user_scope().user_id)
+        return object(), object()
+
+    def _capture_rerank_scope(
+        results: Any, _query_text: str, _cfg: SearchConfig
+    ) -> tuple[Any, bool, list[str]]:
+        seen.append(get_user_scope().user_id)
+        return results, False, []
+
+    monkeypatch.setattr(document_search, "resolve_embedding_adapter", _capture_scope)
+    monkeypatch.setattr(
+        document_search, "_apply_rerank_if_needed", _capture_rerank_scope
+    )
+
+    document_search.search_documents(
+        collection="ctx_collection",
+        query_text="query",
+        config=SearchConfig(
+            search_type=SearchType.SPARSE,
+            embedding_model_id="fake-model",
+        ),
+        user_id=49,
+        is_admin=False,
+    )
+
+    assert seen == [49, 49]

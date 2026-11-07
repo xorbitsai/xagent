@@ -139,8 +139,9 @@ agent_config:
   execution_mode: balanced
   skills: []
   tool_categories:
-  - basic
-  - web_search
+  - basic_tools
+  - code_execution
+  - web_tools
   - browser
   - file
   - image

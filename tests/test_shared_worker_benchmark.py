@@ -11,10 +11,10 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from scripts import shared_worker_benchmark as benchmark
-from scripts import shared_worker_report as report
-from scripts import shared_worker_workload as workload
-from scripts.shared_worker_benchmark import (
+from scripts.benchmarks import shared_worker_benchmark as benchmark
+from scripts.benchmarks import shared_worker_report as report
+from scripts.benchmarks import shared_worker_workload as workload
+from scripts.benchmarks.shared_worker_benchmark import (
     parse_args,
     validate_prewarm,
     warmed_execution_pids,
@@ -405,7 +405,7 @@ def test_run_case_retains_failure_and_logs_when_killed_host_does_not_exit(
             return process.returncode
 
         process.wait.side_effect = wait
-        if "scripts.shared_worker_workload" in command:
+        if "scripts.benchmarks.shared_worker_workload" in command:
             process.returncode = 1
             handles.append(kwargs["stderr"])
             kwargs["stdout"].write('{"type":"safety_stop"}\n')
@@ -421,9 +421,11 @@ def test_run_case_retains_failure_and_logs_when_killed_host_does_not_exit(
     monkeypatch.setattr(
         benchmark.subprocess,
         "check_output",
-        lambda command, **kwargs: "source"
-        if command[1] == "rev-parse"
-        else ("" if kwargs.get("text") else b""),
+        lambda command, **kwargs: (
+            "source"
+            if command[1] == "rev-parse"
+            else ("" if kwargs.get("text") else b"")
+        ),
     )
     with pytest.raises(RuntimeError, match="workload failed"):
         benchmark.run_case(args, {}, 1)
@@ -551,7 +553,7 @@ def test_private_environment_does_not_inherit_shell_secrets(tmp_path, monkeypatc
 async def test_model_observer_preserves_calls_and_closes_stream(tmp_path, monkeypatch):
     import atexit
 
-    from scripts import shared_worker_observer as observer
+    from scripts.benchmarks import shared_worker_observer as observer
     from xagent.core.model.chat.basic import openai
     from xagent.web.services import task_lease_service
 
@@ -753,7 +755,7 @@ def test_combined_single_process_is_warmed(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("spacing", [0, 0.2])
 async def test_warmup_client_pacing_does_not_change_default_burst(monkeypatch, spacing):
-    from scripts import shared_worker_workload as module
+    from scripts.benchmarks import shared_worker_workload as module
 
     sleeps, submitted = [], []
     original_sleep = asyncio.sleep

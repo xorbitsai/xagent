@@ -148,8 +148,9 @@ agent_config:
   skills:
   - static-visual-design
   tool_categories:
-  - basic
-  - web_search
+  - basic_tools
+  - code_execution
+  - web_tools
   - browser
   - file
   - image

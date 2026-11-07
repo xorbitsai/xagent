@@ -266,7 +266,7 @@ async def test_mcp_loader_direct_retry_exhaustion_logs_debug_traceback(
 
     monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
     monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
-    caplog.set_level("DEBUG")
+    caplog.set_level("DEBUG", logger="xagent.core.tools.adapters.vibe.mcp_adapter")
 
     result = await load_mcp_tools_as_agent_tools(
         {"broken": {"transport": "stdio", "command": "python", "args": []}}
@@ -834,6 +834,321 @@ async def test_instagram_registered_workspace_path_is_substituted():
         "image_url": temporary_url,
     }
     assert replacements[temporary_url] == f"file:{file_id}"
+
+
+def test_facebook_page_image_binding_falls_back_to_the_connector_upload():
+    # Why: the catalog name is "Facebook Pages"; a "facebook" key would never
+    # match, and native grants must keep their multipart upload as a fallback.
+    binding = _external_media_binding("Facebook Pages", "facebook_publish_image_post")
+
+    assert binding is not None
+    assert binding.purpose == "facebook-publish"
+    assert (binding.file_argument, binding.url_argument) == ("file_path", "image_url")
+    assert binding.upload_fallback is True
+    instagram = _external_media_binding("Instagram", "instagram_publish_image")
+    assert instagram.upload_fallback is False
+
+
+_FACEBOOK_FILE_ID = "5b0e2d4c-3a7f-4c11-9a54-0d2f6c1e8b21"
+_FACEBOOK_STAGED_PATH = "/task/temp/.xagent-internal/mcp-upload/staged/photo.png"
+
+
+class _FacebookWorkspace:
+    """Records which way a workspace image was handed to the connector."""
+
+    def __init__(self, *, issue, registered_paths=None):
+        self._issue = issue
+        self.registered_paths = registered_paths or {}
+        self.issued = []
+        self.staged = []
+        self.discarded = []
+
+    def issue_external_media_url_detached(self, file_id, purpose):
+        self.issued.append((file_id, purpose))
+        return self._issue(file_id)
+
+    def resolve_path(self, path):
+        return Path(path)
+
+    def get_file_id_from_path(self, path):
+        return self.registered_paths.get(path)
+
+    def stage_file_for_external_upload(self, file_id):
+        self.staged.append(file_id)
+        return _FACEBOOK_STAGED_PATH
+
+    def discard_staged_external_upload(self, path):
+        self.discarded.append(path)
+
+
+async def _run_facebook_publish(monkeypatch, workspace, file_path, reply="ok"):
+    adapter = _build_mcp_tool_adapter(
+        "Facebook Pages",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="facebook_publish_image_post",
+            description="Publish an image post",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "image_url": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+                "required": ["page_id"],
+            },
+        ),
+        workspace=workspace,
+    )
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["arguments"] = arguments
+            return CallToolResult(
+                content=[TextContent(type="text", text=reply)], isError=False
+            )
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    result = await adapter.run_json_async({"page_id": "p-1", "file_path": file_path})
+    return adapter, captured.get("arguments"), result
+
+
+@pytest.mark.asyncio
+async def test_facebook_workspace_image_is_sent_as_a_url_not_staged(monkeypatch):
+    # Why: a Composio-proxied grant cannot upload bytes (#3586); Meta must get
+    # a URL, nothing may be staged, and the URL must not reach the model.
+    temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+    workspace = _FacebookWorkspace(issue=lambda _file_id: temporary_url)
+
+    adapter, arguments, result = await _run_facebook_publish(
+        monkeypatch,
+        workspace,
+        f"file:{_FACEBOOK_FILE_ID}",
+        reply=f"posted from {temporary_url}",
+    )
+
+    assert arguments == {"page_id": "p-1", "image_url": temporary_url}
+    assert workspace.issued == [(_FACEBOOK_FILE_ID, "facebook-publish")]
+    assert workspace.staged == []
+    assert temporary_url not in result["content"][0]["text"]
+    assert f"file:{_FACEBOOK_FILE_ID}" in result["content"][0]["text"]
+    assert "TTL-bound access" in adapter.description
+    assert "staged in the current task workspace" not in adapter.description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["no public base URL", "Only PNG or JPEG images can be delivered"],
+)
+async def test_facebook_image_falls_back_to_staging_when_no_url_can_be_issued(
+    monkeypatch, reason
+):
+    # Why: native grants upload today. Without a public base URL, or for a
+    # GIF/BMP/TIFF or oversized image the URL path refuses, they must keep the
+    # staged multipart upload rather than regress (#3586 review).
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+
+    def not_issuable(_file_id):
+        raise ExternalMediaNotIssuableError(reason)
+
+    workspace = _FacebookWorkspace(issue=not_issuable)
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, f"file:{_FACEBOOK_FILE_ID}"
+    )
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "file_path": _FACEBOOK_STAGED_PATH}
+    assert workspace.staged == [_FACEBOOK_FILE_ID]
+    assert workspace.discarded == [_FACEBOOK_STAGED_PATH]
+
+
+@pytest.mark.asyncio
+async def test_facebook_unregistered_workspace_path_is_left_to_the_connector(
+    monkeypatch,
+):
+    # Why: native grants read a plain workspace path themselves today; a path
+    # with no registered file must not turn into a host error.
+    workspace = _FacebookWorkspace(issue=lambda _file_id: "unused")
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, "/task/output/chart.png"
+    )
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "file_path": "/task/output/chart.png"}
+    assert workspace.issued == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_ref",
+    ["file:5b0e2d4c-3a7f-4c11-9a54-0d2f6c1e8b21", "file:internal-upload-7"],
+    ids=["task-less upload", "internal id"],
+)
+async def test_facebook_file_outside_issuance_scope_falls_back_to_staging(
+    monkeypatch, file_ref
+):
+    # Why: issuance only sees files of this exact task, but staging also takes
+    # task-less uploads and internal-* ids; native grants staged those before
+    # the binding and must keep doing so (#3588 review).
+    def outside_scope(_file_id):
+        raise FileNotFoundError("Registered image was not found")
+
+    workspace = _FacebookWorkspace(issue=outside_scope)
+
+    _, arguments, result = await _run_facebook_publish(monkeypatch, workspace, file_ref)
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "file_path": _FACEBOOK_STAGED_PATH}
+    assert workspace.staged == [file_ref.removeprefix("file:")]
+
+
+@pytest.mark.asyncio
+async def test_facebook_missing_file_still_errors_after_the_fallback(monkeypatch):
+    # Why: falling back on "not found" must not hide a file that is really
+    # missing; staging resolves it again and reports it, and nothing runs.
+    class Workspace(_FacebookWorkspace):
+        def stage_file_for_external_upload(self, file_id):
+            raise FileNotFoundError(file_id)
+
+    def missing(_file_id):
+        raise FileNotFoundError("Registered image was not found")
+
+    workspace = Workspace(issue=missing)
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, f"file:{_FACEBOOK_FILE_ID}"
+    )
+
+    assert result["is_error"] is True
+    assert "not found or not accessible" in result["content"][0]["text"]
+    assert arguments is None
+
+
+@pytest.mark.asyncio
+async def test_facebook_other_issuance_errors_do_not_fall_back(monkeypatch):
+    # Why: only "cannot issue" and "not in issuance scope" may fall back; any
+    # other failure must surface, with nothing staged and no connector call.
+    def broken(_file_id):
+        raise ValueError("Registered image could not be read for external delivery")
+
+    workspace = _FacebookWorkspace(issue=broken)
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, f"file:{_FACEBOOK_FILE_ID}"
+    )
+
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == (
+        "Registered image could not be read for external delivery"
+    )
+    assert workspace.staged == []
+    assert arguments is None
+
+
+@pytest.mark.asyncio
+async def test_facebook_rejects_both_image_url_and_file_path(monkeypatch):
+    # Why: the binding replaces file_path with image_url; with both supplied
+    # it must refuse rather than pick one or post twice.
+    workspace = _FacebookWorkspace(issue=lambda _file_id: "unused")
+    adapter = _build_mcp_tool_adapter(
+        "Facebook Pages",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="facebook_publish_image_post",
+            description="Publish an image post",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "image_url": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+            },
+        ),
+        workspace=workspace,
+    )
+
+    result = await adapter.run_json_async(
+        {
+            "page_id": "p-1",
+            "image_url": "https://example.test/a.png",
+            "file_path": f"file:{_FACEBOOK_FILE_ID}",
+        }
+    )
+
+    assert result["is_error"] is True
+    assert (
+        result["content"][0]["text"] == "Provide exactly one of image_url or file_path."
+    )
+    assert workspace.issued == []
+    assert workspace.staged == []
+
+
+@pytest.mark.asyncio
+async def test_facebook_registered_workspace_path_becomes_a_url(monkeypatch):
+    # Why: the model often passes the workspace path of a generated image
+    # rather than file:<id>; a registered path must also go out as a URL.
+    temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+    workspace = _FacebookWorkspace(
+        issue=lambda _file_id: temporary_url,
+        registered_paths={"/task/output/generated.png": _FACEBOOK_FILE_ID},
+    )
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, "/task/output/generated.png"
+    )
+
+    assert result["is_error"] is False
+    assert arguments == {"page_id": "p-1", "image_url": temporary_url}
+    assert workspace.issued == [(_FACEBOOK_FILE_ID, "facebook-publish")]
+    assert workspace.staged == []
+
+
+@pytest.mark.asyncio
+async def test_instagram_still_fails_without_a_public_base_url(monkeypatch):
+    # Why: only Facebook has an upload to fall back to; Instagram must keep
+    # reporting the missing base URL instead of passing file_path through.
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+
+    class Workspace:
+        def issue_external_media_url_detached(self, file_id, purpose):
+            raise ExternalMediaNotIssuableError("no public base URL")
+
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["called"] = True
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    adapter = _instagram_adapter_for_workspace(Workspace())
+
+    result = await adapter.run_json_async(
+        {"instagram_account_id": "ig-1", "file_path": f"file:{_FACEBOOK_FILE_ID}"}
+    )
+
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == "no public base URL"
+    assert "called" not in captured
 
 
 @pytest.mark.asyncio
@@ -1688,7 +2003,7 @@ def test_resolver_401_evidence_degrades_when_mcp_oauth_unimportable():
     which needs sqlalchemy (directly, and transitively through
     xagent.web.services.__init__'s other eager imports). That's fine on
     the backend host, but this function runs inside MCPToolAdapter.
-    run_json_async -- the exact class/method tool_runner.py reconstructs
+    run_json_async -- the host-owned adapter entrypoint
     and calls for every sandboxed npx/uvx MCP tool call (see PR #1710) --
     and the sandbox never installs sqlalchemy. A 401 from a sandboxed
     OAuth-protected connector (e.g. Xero, once its access token expires
@@ -5913,6 +6228,301 @@ async def test_nested_enum_argument_is_rejected_before_mcp_execution(monkeypatch
         "is_error": True,
     }
     create_session_mock.assert_not_called()
+
+
+def _invalid_arguments(location, reason):
+    return {
+        "content": [
+            {
+                "text": (
+                    f"Invalid MCP tool arguments at {location}: {reason}. "
+                    "Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+
+
+_TOP_LEVEL_PROPERTIES = {
+    "item_id": {"type": "integer"},
+    "description": {"type": "string"},
+    "reasoning": {"type": "string"},
+    "category": {"type": "string"},
+}
+_TOP_LEVEL_REQUIRED = ["item_id", "description", "reasoning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "location", "reason"),
+    [
+        pytest.param(
+            {"item_id": 1, "description": "x"},
+            "reasoning",
+            "a required value is missing",
+            id="missing-required",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": 5, "reasoning": "y"},
+            "description",
+            'the value has the wrong type (expected "string")',
+            id="wrong-type-required",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": "x", "reasoning": "y", "category": 5},
+            "category",
+            'the value has the wrong type (expected "string")',
+            id="wrong-type-optional",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": None, "reasoning": "y"},
+            "description",
+            'the value has the wrong type (expected "string")',
+            id="null-for-required-non-nullable",
+        ),
+    ],
+)
+async def test_top_level_argument_error_is_returned_before_mcp_execution(
+    monkeypatch, args, location, reason
+):
+    adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(args)
+
+    assert result == _invalid_arguments(location, reason)
+    create_session_mock.assert_not_called()
+
+
+def _assert_rejection_logged_without_secret(caplog, secret):
+    assert secret not in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert any(
+        record.levelno == logging.WARNING
+        and "rejected supplied arguments" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_top_level_argument_error_does_not_echo_supplied_values(
+    monkeypatch, caplog
+):
+    adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+    caplog.set_level(logging.DEBUG, logger=mcp_adapter_module.logger.name)
+
+    result = await adapter.run_json_async(
+        {"item_id": 1, "description": ["top-secret-value"], "reasoning": "y"}
+    )
+
+    assert result["is_error"] is True
+    assert "top-secret-value" not in repr(result)
+    assert "pydantic" not in repr(result).lower()
+    _assert_rejection_logged_without_secret(caplog, "top-secret-value")
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "coerced_schema",
+    [
+        pytest.param({"type": "boolean"}, id="plain-type"),
+        pytest.param(
+            {"anyOf": [{"type": "integer"}, {"type": "boolean"}]}, id="any-of"
+        ),
+    ],
+)
+async def test_argument_error_names_a_field_the_args_model_rejected(
+    monkeypatch, coerced_schema
+):
+    """A value the args model coerces is not reported in place of a rejected one."""
+    adapter = _schema_adapter(
+        {"flag": coerced_schema, "b2": {"type": "boolean"}}, ["flag", "b2"]
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"flag": "true", "b2": [1]})
+
+    assert result == _invalid_arguments(
+        "b2", 'the value has the wrong type (expected "boolean")'
+    )
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "location", "reason"),
+    [
+        pytest.param(
+            {"item_id": 1, "description": "x"},
+            "reasoning",
+            "a required value is missing",
+            id="missing-required",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": ["top-secret-value"], "reasoning": "y"},
+            "description",
+            "the schema constraint was not satisfied",
+            id="wrong-type",
+        ),
+    ],
+)
+async def test_top_level_argument_error_without_compiled_validator(
+    monkeypatch, caplog, args, location, reason
+):
+    """A schema that failed to compile still yields a correctable error."""
+    adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
+    adapter._args_validator = None
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+    caplog.set_level(logging.DEBUG, logger=mcp_adapter_module.logger.name)
+
+    result = await adapter.run_json_async(args)
+
+    assert result == _invalid_arguments(location, reason)
+    assert "top-secret-value" not in repr(result)
+    _assert_rejection_logged_without_secret(caplog, "top-secret-value")
+    create_session_mock.assert_not_called()
+
+
+def _runtime_bound_adapter():
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="list_clients",
+            description="List clients",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "account_id": {"type": "string"},
+                },
+                "required": ["account_id", "query"],
+            },
+        ),
+        connection={
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "tool_arguments", "key": "account_id"},
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_bound_required_argument_is_not_reported_missing(monkeypatch):
+    adapter = _runtime_bound_adapter()
+    execute_mock = AsyncMock(return_value={"content": [], "is_error": False})
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute_mock)
+
+    result = await adapter.run_json_async({"query": "active"})
+
+    assert result["is_error"] is False
+    assert execute_mock.await_args.args[1] == {
+        "query": "active",
+        "account_id": "6185",
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_argument_error_skips_runtime_bound_required_argument(
+    monkeypatch,
+):
+    adapter = _runtime_bound_adapter()
+    execute_mock = AsyncMock()
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute_mock)
+
+    result = await adapter.run_json_async({})
+
+    assert result == _invalid_arguments("query", "a required value is missing")
+    execute_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schema", "value", "reason"),
+    [
+        pytest.param(
+            {"type": "integer"},
+            "12",
+            'the value has the wrong type (expected "integer")',
+            id="numeric-string",
+        ),
+        pytest.param(
+            {"type": "integer"},
+            True,
+            'the value has the wrong type (expected "integer")',
+            id="boolean",
+        ),
+        pytest.param(
+            {"type": "integer"},
+            1.0,
+            'the value has the wrong type (expected "integer")',
+            id="integral-float",
+        ),
+        pytest.param(
+            {"type": "integer", "minimum": 1},
+            0,
+            "the minimum constraint (1) was not satisfied",
+            id="minimum",
+        ),
+        pytest.param(
+            {"type": "integer", "maximum": 10},
+            11,
+            "the maximum constraint (10) was not satisfied",
+            id="maximum",
+        ),
+        pytest.param(
+            {"type": "integer", "exclusiveMinimum": 1},
+            1,
+            "the exclusiveMinimum constraint (1) was not satisfied",
+            id="exclusive-minimum",
+        ),
+        pytest.param(
+            {"type": "integer", "exclusiveMaximum": 10},
+            10,
+            "the exclusiveMaximum constraint (10) was not satisfied",
+            id="exclusive-maximum",
+        ),
+    ],
+)
+async def test_strict_integer_error_is_returned_before_mcp_execution(
+    monkeypatch, schema, value, reason
+):
+    adapter = _schema_adapter({"scan_id": schema}, ["scan_id"])
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"scan_id": value})
+
+    assert result == _invalid_arguments("scan_id", reason)
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_value_the_args_model_coerces_still_reaches_the_server(monkeypatch):
+    """Pydantic still runs before the schema check, so its coercions keep working."""
+    adapter = _schema_adapter({"flag": {"type": "boolean"}}, ["flag"])
+    execute_mock = AsyncMock(return_value={"content": [], "is_error": False})
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute_mock)
+
+    result = await adapter.run_json_async({"flag": "true"})
+
+    assert result["is_error"] is False
+    assert execute_mock.await_args.args[1] == {"flag": True}
 
 
 def test_an_unusable_numeric_bound_costs_only_its_own_key():

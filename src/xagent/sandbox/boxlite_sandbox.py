@@ -533,6 +533,10 @@ async def _create_or_reuse_box(  # type: ignore[no-any-unimported]
     runtime: boxlite.Boxlite,
 ) -> SimpleBox:
     """Create a new Box."""
+    if config.mounts:
+        raise ValueError(
+            "Structured named-volume mounts require the Docker sandbox backend"
+        )
     if config.ports and config.network_isolated:
         raise ValueError(
             "Published ports cannot be combined with isolated guest networking"
@@ -635,6 +639,11 @@ class BoxliteSandboxService(SandboxService):
             desired_config = (
                 config or (info.config if info is not None else SandboxConfig())
             ).model_copy(update={"security_profile": _BOXLITE_SECURITY_PROFILE})
+            if desired_config.mounts:
+                raise ValueError(
+                    "Structured named-volume mounts require the Docker sandbox "
+                    "backend; BoxLite cannot preserve volume subpath isolation"
+                )
             if raw_box:
                 # BoxLite has no immutable labels. Persisted desired state is
                 # therefore the only way to detect a network-policy upgrade.

@@ -10,6 +10,7 @@ from typing import Any, Optional
 from ...file_ref import build_workspace_file_ref
 from ...model.music import BaseMusicModel, MusicResult
 from ...workspace import TaskWorkspace
+from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ file_id/file_ref.
         model_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Generate music and save it to the task workspace."""
+        model: Optional[BaseMusicModel] = None
         try:
             model, configured_model_id = self._get_model(model_id)
             if model is None:
@@ -131,12 +133,28 @@ file_id/file_ref.
                     "saved_to_workspace": False,
                 }
 
-            result = await model.generate_music(
-                prompt=prompt,
-                music_length_seconds=music_length_seconds,
-                force_instrumental=force_instrumental,
-                output_format=output_format,
-            )
+            try:
+                result = await model.generate_music(
+                    prompt=prompt,
+                    music_length_seconds=music_length_seconds,
+                    force_instrumental=force_instrumental,
+                    output_format=output_format,
+                )
+            except Exception as exc:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        exc,
+                        logger=logger,
+                        action="Music generation failed",
+                        model=model,
+                    ),
+                    "audio_path": None,
+                    "file_id": None,
+                    "model_used": configured_model_id,
+                    "saved_to_workspace": False,
+                }
+
             if not isinstance(result, MusicResult):
                 raise RuntimeError(f"Unexpected music response: {type(result)}")
             if not result.audio:

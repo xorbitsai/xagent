@@ -140,6 +140,9 @@ class BaseASR(ABC):
         """Whether the live ASR service can commit segments using its own VAD."""
         return False
 
+    async def get_streaming_capabilities(self) -> dict[str, Any]:
+        return {"streaming": self.supports_streaming, "server_vad": self.supports_vad}
+
     async def open_stream(
         self,
         *,

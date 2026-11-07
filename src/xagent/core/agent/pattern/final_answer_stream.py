@@ -53,7 +53,9 @@ class FinalAnswerStreamSession:
             await self.runtime.emit_final_answer_delta(self.message_id, delta)
 
     async def emit_prefix(self, content: str) -> None:
-        if len(content) <= len(self._content):
+        # A rewritten candidate cannot be appended to a previously checked
+        # prefix. Let finish() deliver the canonical text through the guard.
+        if not content.startswith(self._content):
             return
         await self.emit_delta(content[len(self._content) :])
 

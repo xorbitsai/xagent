@@ -12,6 +12,7 @@ from inspect import isawaitable
 from pathlib import Path
 from typing import Any, BinaryIO, Optional, Union
 
+from ...tools.core.media_errors import redact_provider_detail
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -51,6 +52,15 @@ _ELEVENLABS_ASR_MODELS: tuple[dict[str, Any], ...] = (
         "abilities": ["asr"],
         "name": "Scribe v1",
         "description": "ElevenLabs speech-to-text model",
+    },
+    {
+        "id": REALTIME_ASR_MODEL,
+        "object": "model",
+        "owned_by": "elevenlabs",
+        "category": "speech",
+        "abilities": ["asr"],
+        "name": "Scribe v2 Realtime",
+        "description": "Live transcription for voice conversations with server VAD",
     },
 )
 
@@ -374,7 +384,7 @@ class ElevenLabsASR(BaseASR):
                 # charged, with no reported duration to read.
                 await self._record_usage(None, None, audio, format)
             redacted_error = redact_sensitive_text(str(exc))
-            logger.error("ElevenLabs ASR failed: %s", redacted_error)
+            logger.error("ElevenLabs ASR failed: %s", redact_provider_detail(exc))
             raise RuntimeError(f"ElevenLabs ASR failed: {redacted_error}") from exc
         finally:
             if file_handle is not None:

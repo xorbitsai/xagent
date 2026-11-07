@@ -49,6 +49,7 @@ async def test_sdk_create_and_append_return_durable_acceptance(ingress):
         file_ids=(),
         connector_runtime_context=(),
         timezone="Asia/Taipei",
+        credential_kind="runtime",
     )
     with get_session_local()() as db:
         task = db.get(Task, first.task_id)
@@ -190,8 +191,17 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
 
 
 @pytest.mark.asyncio
-async def test_legacy_existing_execution_returns_after_durable_acceptance(ingress):
+async def test_legacy_existing_execution_returns_after_durable_acceptance(
+    ingress, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
     owner, _ = ingress
+    # Acceptance is what is asserted; consumption is dispatched separately.
+    monkeypatch.setattr(
+        "xagent.web.services.task_command_transport.dispatch_task_command_promptly",
+        AsyncMock(),
+    )
     with get_session_local()() as db:
         task = Task(user_id=owner, title="legacy", status=TaskStatus.PENDING)
         db.add(task)
@@ -201,7 +211,6 @@ async def test_legacy_existing_execution_returns_after_durable_acceptance(ingres
         task_start.execute_existing_task(
             task_id=task_id,
             task_owner_user_id=owner,
-            task_source="internal",
             task_description="saved",
             context={},
             actor_user_id=owner,
@@ -315,6 +324,7 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         timezone=None,
         file_ids=(),
         connector_runtime_context=(),
+        credential_kind="runtime",
     )
     with get_session_local()() as db:
         actor = User(username="new-owner", password_hash="unused")

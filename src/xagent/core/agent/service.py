@@ -306,6 +306,8 @@ class AgentService:
                 raise ValueError("Task cannot be empty or whitespace-only")
         await self._ensure_tools_initialized()
         result = await self._execute_agent_task(task, context, task_id)
+        # Hosts control publication of these workspace files separately from
+        # text output review.
         file_outputs = self.get_output_files()
         if file_outputs:
             result["file_outputs"] = file_outputs

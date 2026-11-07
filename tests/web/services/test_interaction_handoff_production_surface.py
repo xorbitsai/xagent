@@ -22,15 +22,13 @@ instead of the absence of every caller:
   three that need to (unchanged by this delivery -- see ``create()``'s own
   docstring on what it reuses).
 
-Window-not-lost note: the static create()/respond() production-caller gate
-(``test_task_interaction_service_create_gate.py``) still separately watches
-``create()``/``respond()`` for a *production caller* -- neither name has one
-yet in this delivery. These three guards watch a narrower thing: given that
-``create()``'s own call body now exists, does it reach the staging
-primitive only the one sanctioned way. The two gates are not redundant;
-together they are what keeps this delivery's "no production caller, and
-what caller entry it would use is well-formed" window closed from both
-ends.
+The call-site gates in ``test_task_interaction_service_create_gate.py``
+separately watch who calls ``create()`` and ``respond()``: ``create()`` is
+called only from the modules holding the three finalizers, and ``respond()``
+has no production caller. These three guards watch a narrower thing: does
+``create()`` reach the staging primitive only the one sanctioned way. The
+two sets of gates are not redundant: one pins who may enter the seam, the
+other how the seam reaches the primitive.
 """
 
 from __future__ import annotations

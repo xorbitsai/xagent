@@ -13,10 +13,12 @@ import threading
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Callable, cast
+from typing import Any, Awaitable, Callable, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
@@ -787,7 +789,10 @@ async def _schedule_turn(
     task_source: str = "sdk",
     channel_command: Any = None,
     extra_patches: tuple[Any, ...] = (),
+    drive: Callable[[asyncio.Task[None]], Awaitable[None]] | None = None,
 ) -> tuple[TaskLease, TaskTurnPayload, type[BaseException] | None]:
+    # ``drive``, when given, is awaited with the scheduled runner before the
+    # runner itself is awaited, so a test can act on the run in flight.
     from xagent.web.services import task_execution
 
     factory, tid = canonical
@@ -818,17 +823,20 @@ async def _schedule_turn(
             *extra_patches,
         ):
             stack.enter_context(active)
+        runner = _schedule_bg(
+            task_id=tid,
+            task_owner_user_id=1,
+            task_source=task_source,
+            task_lease=lease,
+            payload=payload,
+            force_fresh=False,
+            context=None,
+            channel_command=channel_command,
+        )
+        if drive is not None:
+            await drive(runner)
         try:
-            await _schedule_bg(
-                task_id=tid,
-                task_owner_user_id=1,
-                task_source=task_source,
-                task_lease=lease,
-                payload=payload,
-                force_fresh=False,
-                context=None,
-                channel_command=channel_command,
-            )
+            await runner
         except BaseException as error:  # noqa: BLE001 -- the outcome is the datum
             raised = type(error)
     await _settle_inflight()
@@ -843,6 +851,26 @@ def _result_manager(outcome: dict[str, Any] | BaseException) -> Any:
     else:
         manager.execute_task = AsyncMock(return_value=dict(outcome))
     return manager
+
+
+def _held_settlement(
+    entered: asyncio.Event, release: threading.Event, results: list[bool]
+) -> Callable[..., bool]:
+    """The real scheduler settlement, held in its worker thread until
+    ``release`` is set. ``entered`` is set once the thread is holding; the
+    real settlement's own return value is recorded and returned unchanged."""
+    loop = asyncio.get_running_loop()
+    settle = orchestrator.settle_task_lease_isolated
+
+    def held(*args: Any, **kwargs: Any) -> bool:
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(5):
+            raise AssertionError("the held settlement was never released")
+        settled = settle(*args, **kwargs)
+        results.append(settled)
+        return settled
+
+    return held
 
 
 SCHEDULED_CELLS = {
@@ -1740,6 +1768,187 @@ async def test_resume_finding_the_task_terminal_reports_the_kept_status(
     assert [(s.status, s.error_code, s.empty_visible_answer) for s in received] == [
         ("failed", "task_execution_failed", False)
     ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_cancelled_again_during_its_settlement_is_reported(
+    canonical,
+) -> None:
+    """A cancel lands while the run executes and the scheduler settles the run
+    FAILED. ``cancel_task`` stops waiting while that settlement is still being
+    written and cancels the runner again. The settlement still commits, so the
+    run is reported once, and the cancellation propagates after the report."""
+    from xagent.web.services.task_execution import background_task_manager
+
+    received = _capture()
+    entered, release, settled = asyncio.Event(), threading.Event(), []
+    run_started = asyncio.Event()
+
+    async def run_until_cancelled(**_kwargs: Any) -> dict[str, Any]:
+        run_started.set()
+        await asyncio.Event().wait()
+        return {}
+
+    manager = _result_manager({})
+    manager.execute_task = run_until_cancelled
+    cancel_requested: list[bool] = []
+
+    async def cancel_twice(runner: asyncio.Task[None]) -> None:
+        await asyncio.wait_for(run_started.wait(), 5)
+        cancel = asyncio.create_task(background_task_manager.cancel_task(canonical[1]))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert runner.cancelling() == 1
+            # cancel_task's own 0.5 s wait expires while the settlement is
+            # held, and it cancels the runner a second time.
+            async with asyncio.timeout(5):
+                while runner.cancelling() < 2:
+                    await asyncio.sleep(0.01)
+        finally:
+            release.set()
+        cancel_requested.append((await cancel).requested)
+
+    _lease, payload, raised = await _schedule_turn(
+        canonical,
+        manager,
+        extra_patches=(
+            patch.object(
+                orchestrator,
+                "settle_task_lease_isolated",
+                new=_held_settlement(entered, release, settled),
+            ),
+        ),
+        drive=cancel_twice,
+    )
+
+    factory, tid = canonical
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.FAILED
+        assert task.runner_id is None
+    assert cancel_requested == [True]
+    assert settled == [True]
+    assert raised is asyncio.CancelledError
+    assert [(s.status, s.error_code, s.turn_id) for s in received] == [
+        ("failed", "task_execution_failed", payload.turn_id)
+    ]
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+@pytest.mark.parametrize(
+    ("already_terminal", "settled_value", "reported"),
+    [
+        (False, True, [("failed", "task_execution_failed")]),
+        (True, False, []),
+    ],
+    ids=["settlement_committed", "task_already_terminal"],
+)
+async def test_scheduled_turn_cancelled_during_its_settlement_reports_what_it_committed(
+    canonical, already_terminal, settled_value, reported
+) -> None:
+    """The run failed, and one cancel lands while the scheduler writes its
+    FAILED settlement. A settlement that committed is reported. One that found
+    the task already terminal (another writer finished it) committed nothing
+    for this run and is not reported. The cancel changes neither."""
+    received = _capture()
+    entered, release, settled = asyncio.Event(), threading.Event(), []
+    factory, tid = canonical
+
+    async def cancel_once(runner: asyncio.Task[None]) -> None:
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            if already_terminal:
+                with factory() as db:
+                    db.get(Task, tid).status = TaskStatus.COMPLETED
+                    db.commit()
+            runner.cancel()
+        finally:
+            release.set()
+
+    _lease, _payload, raised = await _schedule_turn(
+        canonical,
+        _result_manager(RuntimeError("agent failed")),
+        extra_patches=(
+            patch.object(
+                orchestrator,
+                "settle_task_lease_isolated",
+                new=_held_settlement(entered, release, settled),
+            ),
+        ),
+        drive=cancel_once,
+    )
+
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == (
+            TaskStatus.COMPLETED if already_terminal else TaskStatus.FAILED
+        )
+        assert task.runner_id is None
+    assert settled == [settled_value]
+    assert raised is asyncio.CancelledError
+    assert [(s.status, s.error_code) for s in received] == reported
+
+
+@pytest.mark.usefixtures("_clear_bg_manager")
+async def test_scheduled_turn_whose_settlement_raises_while_cancelled_is_not_reported(
+    canonical,
+) -> None:
+    """The run failed, one cancel lands while the scheduler writes its FAILED
+    settlement, and that real settlement then fails to commit. Nothing was
+    committed for the run, so nothing is reported, the cancellation still
+    propagates, and the lease is left for the timeout reclaim."""
+    received = _capture()
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    settle = orchestrator.settle_task_lease_isolated
+    settlement_errors: list[BaseException] = []
+    refused_threads: set[int] = set()
+    factory, tid = canonical
+
+    def refuse_commit(_session: Session) -> None:
+        if threading.get_ident() in refused_threads:
+            raise RuntimeError("commit refused")
+
+    def held(*args: Any, **kwargs: Any) -> bool:
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(5):
+            raise AssertionError("the held settlement was never released")
+        refused_threads.add(threading.get_ident())
+        try:
+            return settle(*args, **kwargs)
+        except BaseException as error:
+            settlement_errors.append(error)
+            raise
+        finally:
+            refused_threads.discard(threading.get_ident())
+
+    async def cancel_once(runner: asyncio.Task[None]) -> None:
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            runner.cancel()
+        finally:
+            release.set()
+
+    event.listen(Session, "before_commit", refuse_commit)
+    try:
+        _lease, _payload, raised = await _schedule_turn(
+            canonical,
+            _result_manager(RuntimeError("agent failed")),
+            extra_patches=(
+                patch.object(orchestrator, "settle_task_lease_isolated", new=held),
+            ),
+            drive=cancel_once,
+        )
+    finally:
+        event.remove(Session, "before_commit", refuse_commit)
+
+    with factory() as db:
+        task = db.get(Task, tid)
+        assert task.status == TaskStatus.RUNNING
+        assert task.runner_id is not None
+    assert [type(error) for error in settlement_errors] == [RuntimeError]
+    assert raised is asyncio.CancelledError
+    assert received == []
 
 
 @pytest.mark.usefixtures("_clear_bg_manager")

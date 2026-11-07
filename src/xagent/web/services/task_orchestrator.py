@@ -3038,8 +3038,10 @@ def _schedule_bg(
         finally:
             turn_id = getattr(payload, "turn_id", None)
             # Whether this coroutine's own settlement committed, and what it
-            # reported; read by the settlement report below.
-            lease_settled = False
+            # reported; read by the settlement report below. Whether it
+            # committed is read from the settlement task itself, not from how
+            # the wait for it ended (see below).
+            own_settlement_committed = False
             report = SettlementReport()
             if lease is not None:
                 try:
@@ -3107,6 +3109,7 @@ def _schedule_bg(
                         "settlement deferred; lease retained for TTL recovery",
                     )
                 else:
+                    lease_settled = False
                     # An owned task, so the record below can follow what the
                     # settlement did even when this runner is cancelled again
                     # while it runs (that wait then ends in CancelledError
@@ -3188,6 +3191,12 @@ def _schedule_bg(
                             settle_err,
                             exc_info=True,
                         )
+                    # The settlement's own return value. A cancellation of the
+                    # wait above skips ``lease_settled`` although the settlement
+                    # still ran to completion, so the report below reads this.
+                    own_settlement_committed = task_returned(settlement) and bool(
+                        settlement.result()
+                    )
                     if not task_returned(settlement):
                         # The settlement raised (possibly under a cancel that
                         # surfaced instead). A returned ``False`` is no
@@ -3246,18 +3255,23 @@ def _schedule_bg(
             # task already terminal releases the lease but returns False, and
             # a settlement deferred to lease recovery leaves the committed
             # terminal row alone. Otherwise the settlement here must have
-            # committed; a channel run is then only reported when it failed,
+            # committed, as the settlement task's own return value says: a
+            # cancellation landing while this coroutine waits for the
+            # settlement ends that wait in CancelledError even when it
+            # committed. A channel run is then only reported when it failed,
             # because a channel run that returned normally was settled by its
             # own finalizer, which reports it. Skipped when the turn body
             # never ran and nothing failed (a pre-execution short-circuit),
             # and for a run already reported through the shared facts bag.
+            # A cancellation deferred above is raised after this report, at
+            # the end of this ``finally``.
             if (
                 lease is not None
                 and not facts.notified
                 and (
                     facts.outcome is not None
                     or (
-                        lease_settled
+                        own_settlement_committed
                         and (channel_command is None or settlement_error is not None)
                     )
                 )

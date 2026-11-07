@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
+from ..guardrails.output import output_guardrail_active
 from ..runtime_performance import increment_counter, observe_duration
 from ..utils.security import redact_sensitive_text
 
@@ -1282,6 +1283,8 @@ class Tracer:
                 list(data.keys()) if data else [],
             )
 
+        if output_guardrail_active():
+            data = {**(data or {}), "__audit_only__": True}
         event = TraceEvent(
             event_type=event_type,
             task_id=task_id,

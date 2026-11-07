@@ -14,11 +14,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..models.task import TaskStatus
+from .response_format import RESPONSE_FORMAT_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
-
-# The key of ``tasks.agent_config`` that holds the format of a task.
-_FORMAT_KEY = "response_format"
 
 # The message of each reason code. A response carries the text of its code
 # from this table and never text from a record.
@@ -152,7 +150,10 @@ _NO_FIELDS = StructuredOutputFields()
 def response_format_configured(agent_config: Any) -> bool:
     """Whether ``agent_config`` holds a format: a dict with the format key set
     to something other than None."""
-    return type(agent_config) is dict and agent_config.get(_FORMAT_KEY) is not None
+    return (
+        type(agent_config) is dict
+        and agent_config.get(RESPONSE_FORMAT_CONFIG_KEY) is not None
+    )
 
 
 def _reason_fields(

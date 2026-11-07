@@ -27,6 +27,18 @@ from .fixtures import FixtureRef
 # Connectors that have adopted V2, by catalog app id. Tool coverage and
 # exemptions for the six document connectors follow with #3565.
 CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
+    "atlassian": ConnectorChecks(
+        "atlassian",
+        reads=(
+            ReadCheck(
+                "atlassian.current_user",
+                "atlassianUserInfo",
+                payload="json_text",
+                assertions=(HasKeys(("data",), ("accountId",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+    ),
     "excel": ConnectorChecks(
         "excel",
         reads=(
@@ -80,6 +92,33 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                     StatusSuccess(),
                     HasKeys((), ("presentation_id", "title", "slides")),
                 ),
+            ),
+        ),
+    ),
+    "miro": ConnectorChecks(
+        "miro",
+        reads=(
+            ReadCheck(
+                "miro.current_user",
+                "user_who_am_i",
+                payload="structured_content",
+                assertions=(HasKeys((), ("user_id",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+    ),
+    "notion": ConnectorChecks(
+        "notion",
+        reads=(
+            ReadCheck(
+                "notion.current_user",
+                "notion-get-self",
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("workspace", "user")),
+                    HasKeys(("user",), ("id",)),
+                ),
+                require_read_only_hint=True,
             ),
         ),
     ),

@@ -17,9 +17,63 @@ from .mcp_oauth import (
     redact_oauth_url_for_diagnostics,
     resolve_mcp_oauth_runtime_auth,
 )
+from .task_setup_snapshot import TASK_FIELD_NOT_LOADED
 from .user_oauth import normalize_user_oauth_resource_owner_key
 
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
+
+
+class TeamMemberGrantTaskFields(Protocol):
+    """Task columns the team-member grant gate reads.
+
+    Both the ORM ``Task`` row and the detached snapshot fields satisfy it.
+    """
+
+    source: Any
+    channel_id: Any
+    channel_name: Any
+    telegram_user_id: Any
+    sdk_credential_kind: Any
+
+
+def team_member_mcp_grants_allowed_for_task(
+    task: TeamMemberGrantTaskFields | None,
+) -> bool:
+    """Say whether a task may use OAuth grants a team member made for themselves.
+
+    Only the member's own tasks qualify: their web chat, their triggers, and
+    their personal-key SDK tasks. The sources are an allow-list, so a task
+    whose ``source`` holds any other value, including a value introduced
+    later, is refused. That only covers values written to ``source``: the
+    column defaults to ``"internal"``, so a task created without setting
+    ``source`` reads as web chat here. IM channel tasks are created that way;
+    they are refused by the channel columns below, not by ``source``.
+
+    All three channel columns must be empty. Unbinding an IM channel nulls
+    ``channel_id`` through its foreign key, but ``channel_name`` and
+    ``telegram_user_id`` stay on the row, so checking ``channel_id`` alone
+    would let an old IM task look like a web chat task.
+
+    A field still holding the not-loaded marker means the task was built
+    without reading that column; it is refused rather than guessed.
+
+    The verdict only narrows what grant selection may return. A token supplied
+    by the OAuth token resolver hook (``set_oauth_token_resolver_hook``) does
+    not go through grant selection, so this gate does not apply to it.
+    """
+    if task is None:
+        return False
+    channel_fields = (task.channel_id, task.channel_name, task.telegram_user_id)
+    if any(
+        value is TASK_FIELD_NOT_LOADED
+        for value in (*channel_fields, task.sdk_credential_kind)
+    ):
+        return False
+    if any(value is not None for value in channel_fields):
+        return False
+    return task.source in (None, "internal", "trigger") or (
+        task.source == "sdk" and task.sdk_credential_kind == "personal"
+    )
 
 
 class MCPBuiltinOAuthActorPolicyRequiredError(RuntimeError):
@@ -460,11 +514,15 @@ async def build_mcp_runtime_connection(
     user_env_overrides: dict[int, dict] | None = None,
     shared_env_overrides: dict[int, dict] | None = None,
     env_source_overrides: dict[int, str] | None = None,
+    allow_team_member_grants: bool = False,
 ) -> MCPRuntimeConnectionBuild:
     """Build an executable MCP connection for a specific user runtime.
 
     Static MCP connection serialization belongs to the MCP server model. Per-user
     MCP OAuth grant selection belongs here, at the web runtime boundary.
+
+    ``allow_team_member_grants`` is the task-source gate's verdict for the task
+    this connection is built for; it is forwarded unchanged to grant selection.
     """
     connection = server.to_connection_dict()
 
@@ -521,6 +579,7 @@ async def build_mcp_runtime_connection(
             resource=selection.get("resource"),
             scope=selection.get("scope"),
             issuer=selection.get("issuer"),
+            allow_team_member_grants=allow_team_member_grants,
         )
     except MCPOAuthRuntimeError as exc:
         return MCPRuntimeConnectionBuild(

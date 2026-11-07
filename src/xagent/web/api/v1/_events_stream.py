@@ -851,13 +851,8 @@ def _feed_trace_event(
          otherwise fall through to the catch-all "not a known step
          family" drop below.
       3. ``is_audit_only_trace_data``: server-only RCA payloads that must
-         never reach a client.
-         ``steps()`` applies no equivalent filter on its own read. No
-         audit-only row reaches a public step there today because the
-         event types that carry audit-only data are not in the
-         projector's exposed set, but that equivalence is a coincidence
-         of the current producer rather than something either surface
-         enforces (#1405).
+         never reach a client. The shared projector also applies this
+         filter when replaying persisted events for ``steps()``.
 
     An ``ai_message`` event carrying ``data["stream_message_id"]`` --
     the trace-event mirror of a final answer already delivered

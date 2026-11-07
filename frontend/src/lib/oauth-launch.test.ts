@@ -32,7 +32,7 @@ describe("OAuth navigation launch", () => {
     expect(open).toHaveBeenCalledWith("about:blank", "OAuth", "width=600")
     expect(popup.location.replace).not.toHaveBeenCalled()
     expect(apiRequestMock).toHaveBeenCalledWith("https://api.example/api/auth/custom/login", expect.objectContaining({
-      method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+      method: "POST", headers: { "X-XAgent-OAuth-Launch-Version": "2", "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ app_id: "app", account: "tenant", redirect: window.location.origin }),
       signal: expect.any(AbortSignal),
     }))

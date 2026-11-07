@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 
 from tests.web import test_auth_api as auth_tests
@@ -478,6 +479,11 @@ def test_password_change_wins_against_in_flight_token_publication(
         assert rejected.value.status_code == 401
 
 
+def _legacy_entry_request() -> Request:
+    """A bare request; unconfigured deployments resolve the single legacy entry."""
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+
+
 def test_password_change_revokes_pending_oidc_exchange_code():
     auth_tests.setup_first_admin(password="old-password-123")
     with auth_tests.TestingSessionLocal() as session:
@@ -487,14 +493,18 @@ def test_password_change_revokes_pending_oidc_exchange_code():
     with auth_tests.TestingSessionLocal() as session:
         with pytest.raises(HTTPException) as error:
             oidc_google.google_oidc_exchange(
-                oidc_google.OidcExchangeRequest(code=code), session
+                oidc_google.OidcExchangeRequest(code=code),
+                _legacy_entry_request(),
+                session,
             )
         assert error.value.status_code == 400
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).one()
         current_code = oidc_google._create_exchange_code(user.id, user.session_epoch)
         response = oidc_google.google_oidc_exchange(
-            oidc_google.OidcExchangeRequest(code=current_code), session
+            oidc_google.OidcExchangeRequest(code=current_code),
+            _legacy_entry_request(),
+            session,
         )
         assert get_user_from_token(response["access_token"], session) is not None
 

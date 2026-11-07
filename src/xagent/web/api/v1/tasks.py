@@ -76,6 +76,12 @@ from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
 from ...services.prompt_context import validate_signed_prompt_context
+from ...services.response_format import (
+    ResponseFormatChange,
+    ResponseFormatError,
+    normalize_response_format,
+    violation_message,
+)
 from ...services.structured_output_projection import (
     project_structured_output,
     response_format_configured,
@@ -326,6 +332,20 @@ def _validate_prompt_context(prompt_context: dict[str, Any] | None) -> None:
         raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
 
 
+async def _normalize_request_format(raw: Any) -> ResponseFormatChange:
+    """Check the ``response_format`` of a request, off the event loop.
+
+    A rejection becomes a 422 ``invalid_input`` whose message is the rule id,
+    the path of the offending value and the fixed sentence of the rule.
+    """
+    if raw is None:
+        return None
+    try:
+        return await asyncio.to_thread(normalize_response_format, raw)
+    except ResponseFormatError as exc:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
+
+
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
     try:
         code = V1ErrorCode(exc.code)
@@ -440,9 +460,10 @@ async def create_chat_task(
         V1ApiError 404: ``agent_not_found`` -- the agent is not the one
             bound to the agent key, or not one the personal key's holder
             can see.
-        V1ApiError 422: ``prompt_context`` is malformed, or a personal
+        V1ApiError 422: ``prompt_context`` is malformed, a personal
             key sent a field the agent does not declare or longer than its
-            declared length.
+            declared length, or ``response_format`` breaks a rule (the message
+            names the rule and the path of the offending value).
         500 (V1 envelope): any unexpected exception -- the global
             handler in ``web/app.py`` translates to
             ``{"error": {"code": "internal_error", ...}}`` and the raw
@@ -479,6 +500,7 @@ async def _create_chat_task(
         credential_kind = "runtime"
     else:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    format_change = await _normalize_request_format(request.response_format)
 
     try:
         started = await task_start_service.create_sdk_task(
@@ -494,6 +516,7 @@ async def _create_chat_task(
             requested_dispatch_class=request.dispatch_class,
             requested_priority=request.priority,
             prompt_context=request.prompt_context,
+            response_format=format_change,
             credential_kind=credential_kind,
             idempotency_claim=idempotency_claim,
         )
@@ -524,6 +547,8 @@ async def _create_chat_task(
         state_version=started.state_version,
         control_state=started.control_state,
         dispatch_class=started.dispatch_class,
+        response_format_type=started.response_format_type,
+        response_format_name=started.response_format_name,
     )
 
 
@@ -980,7 +1005,7 @@ def _get_chat_task_sync(
 
     The terminal view of a status-only caller's task is kept out of the
     cache for the same reason: automatic resume stops by writing only the
-    recovery row, and an append queues a START without touching the task
+    recovery row, and an append can queue a START without touching the task
     row's ``updated_at``, so a cached body cannot prove the view is still
     current. The cached body holds the stored values; the view is applied
     to the response after every cache read or write. A queued START is
@@ -1173,7 +1198,9 @@ async def append_message_to_task(
             ``task_id`` and ``expired_at``.
         V1ApiError 422: ``prompt_context`` is malformed, sent with a
             workforce key, or, with a personal key, has a field the agent
-            does not declare or longer than its declared length.
+            does not declare or longer than its declared length;
+            ``response_format`` is sent with a workforce key (anything but
+            null) or breaks a rule.
         V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
             code (not retryable), or ``interaction_response_required``
             (use ``reply`` instead).
@@ -1206,6 +1233,11 @@ async def _append_message_to_task(
             422,
             message="prompt_context is not supported for workforce keys.",
         )
+    if request.response_format is not None and principal.workforce is not None:
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT, 422, message=violation_message("N8")
+        )
+    format_change = await _normalize_request_format(request.response_format)
     try:
         started = await task_start_service.append_sdk_turn(
             task_id=task_id,
@@ -1219,6 +1251,7 @@ async def _append_message_to_task(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
             prompt_context=request.prompt_context,
+            response_format=format_change,
             idempotency_claim=idempotency_claim,
         )
     except task_start_service.TaskStartRejected as exc:
@@ -1252,6 +1285,8 @@ async def _append_message_to_task(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        response_format_type=started.response_format_type,
+        response_format_name=started.response_format_name,
     )
 
 

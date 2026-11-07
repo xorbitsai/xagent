@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -237,7 +238,8 @@ class MCPOAuthFlowState(Base):  # type: ignore
     # Snapshot of the exact UserMCPServer lifecycle that created this flow.
     # NULL is reserved for flows created before the lifecycle fence migration;
     # callbacks for those rows fail closed because their association identity
-    # cannot be proven after a delete-and-recreate race.
+    # cannot be proven after a delete-and-recreate race. It is also NULL on a
+    # "team_member" flow, where the flow row itself is the lifecycle anchor.
     association_lifecycle_generation = Column(Uuid, nullable=True)
     mcp_oauth_client_id = Column(
         Integer,
@@ -254,10 +256,28 @@ class MCPOAuthFlowState(Base):  # type: ignore
     expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
     consumed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Which access the flow was started through. "association": the caller
+    # held a UserMCPServer row and association_lifecycle_generation pins it
+    # (NULL there still means a pre-fence legacy row, which fails closed).
+    # "team_member": the caller held no UserMCPServer row and reached the
+    # server through the team overlay; association_lifecycle_generation is NULL
+    # and the flow row itself is the lifecycle anchor. The owner key of a
+    # "team_member" flow is always the caller's own default, xagent:user:{id}.
+    access_path = Column(
+        String(16), nullable=False, default="association", server_default="association"
+    )
 
     mcp_server = relationship("MCPServer")
     oauth_client = relationship("MCPOAuthClient")
     user = relationship("User")
+
+    __table_args__ = (
+        CheckConstraint(
+            "(access_path = 'association') OR "
+            "(access_path = 'team_member' AND association_lifecycle_generation IS NULL)",
+            name="ck_mcp_oauth_flow_states_access_path",
+        ),
+    )
 
     def __repr__(self) -> str:
         return (

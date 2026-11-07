@@ -35,23 +35,27 @@ def test_summary_keeps_failed_work_in_the_denominator():
 
 
 @pytest.mark.asyncio
-async def test_admission_cancellation_does_not_leak_capacity():
+@pytest.mark.parametrize("foreground", [False, True])
+async def test_admission_cancellation_does_not_leak_capacity(foreground):
     gate = bench.AdmissionGate(1)
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def hold():
-        async with gate.slot():
+    async def hold(*, foreground=False):
+        async with gate.slot(foreground=foreground):
             entered.set()
             await release.wait()
 
     first = asyncio.create_task(hold())
     await entered.wait()
-    second = asyncio.create_task(hold())
+    second = asyncio.create_task(hold(foreground=foreground))
     await asyncio.sleep(0)
+    queue = gate.foreground_waiters if foreground else gate.waiters
+    assert len(queue) == 1
     second.cancel()
     with pytest.raises(asyncio.CancelledError):
         await second
+    assert not queue
     assert gate.active == 1
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -60,6 +64,42 @@ async def test_admission_cancellation_does_not_leak_capacity():
     async with asyncio.timeout(1):
         async with gate.slot():
             assert gate.active == 1
+
+
+def test_admission_rejects_unknown_policy():
+    with pytest.raises(ValueError, match="Unknown admission policy"):
+        bench.AdmissionGate(1, admission_policy="foreground_first")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,order",
+    [
+        ("foreground-first", ["probe-1", "probe-2", "agent"]),
+        ("fifo", ["agent", "probe-1", "probe-2"]),
+    ],
+)
+async def test_admission_orders_waiters_without_interrupting_active_work(policy, order):
+    gate = bench.AdmissionGate(1, admission_policy=policy)
+    admitted = []
+
+    async def enter(name, foreground):
+        async with gate.slot(foreground=foreground):
+            admitted.append(name)
+
+    async with gate.slot():
+        tasks = [
+            asyncio.create_task(enter(name, foreground))
+            for name, foreground in (
+                ("agent", False),
+                ("probe-1", True),
+                ("probe-2", True),
+            )
+        ]
+        await asyncio.sleep(0)
+        assert admitted == []
+    await asyncio.wait_for(asyncio.gather(*tasks), 1)
+    assert admitted == order
 
 
 @pytest.mark.asyncio
@@ -331,6 +371,7 @@ async def test_batch_retains_failed_agent_and_still_finishes_foreground(
         ]
     )
     result = await bench.run(args)
+    assert result["configuration"]["admission_policy"] == "foreground-first"
     assert not result["passed"] and result["successful_agents"] == 1
     assert result["successful_foreground"] == 1
     assert result["agents"][0] == {"passed": False, "error_type": "RuntimeError"}

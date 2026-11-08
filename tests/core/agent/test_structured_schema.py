@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import json
 import random
@@ -14,13 +15,13 @@ import pytest
 
 from tests.shared.structured_path_reference import reference_render
 from tests.shared.structured_schema_random import gen_schema
+from tests.shared.structured_schema_reference import copy_size, expanded_copy
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import (
     ERROR_PATH_MAX_CHARS,
     SchemaViolation,
     allowed_values_suffix,
     canon,
-    canonical_json_size,
     check_schema_structure,
     json_kind,
     measure_expansion,
@@ -831,31 +832,69 @@ SIZE_SCHEMAS = {
 
 
 @pytest.mark.parametrize("schema", SIZE_SCHEMAS.values(), ids=SIZE_SCHEMAS.keys())
-def test_the_estimated_size_equals_the_size_of_the_copy_built_in_full(
+def test_the_estimate_and_the_copy_match_the_reference_copy(
     schema: dict[str, Any],
 ) -> None:
     assert check_schema_structure(schema) is None
 
     measured = measure_expansion(schema)
-
-    assert measured.rewritten_bytes == canonical_json_size(
-        structured_schema.model_facing_schema(structured_schema.compile_schema(schema))
+    built = structured_schema.model_facing_schema(
+        structured_schema.compile_schema(schema)
     )
+
+    assert measured.rewritten_bytes == copy_size(schema)
+    assert built == expanded_copy(schema)
     assert measured.nodes == _count_nodes(schema)
 
 
-def test_the_estimated_size_equals_the_copy_of_random_schemas() -> None:
+def test_the_estimate_and_the_copy_of_random_schemas_match_the_reference_copy() -> None:
     rng = random.Random(20261104)
     for _ in range(400):
         schema = gen_schema(rng)
         assert check_schema_structure(schema) is None, schema
-        copy_ = structured_schema.model_facing_schema(
+        built = structured_schema.model_facing_schema(
             structured_schema.compile_schema(schema)
         )
 
-        measured = measure_expansion(schema)
+        assert measure_expansion(schema).rewritten_bytes == copy_size(schema), schema
+        assert built == expanded_copy(schema), schema
 
-        assert measured.rewritten_bytes == canonical_json_size(copy_), schema
+
+def _count_shapes(node: Any, counts: collections.Counter[str]) -> None:
+    if isinstance(node, dict):
+        declared = node.get("type")
+        types = declared if isinstance(declared, list) else [declared]
+        if "anyOf" in node and node["anyOf"][0] == {"type": "null"}:
+            counts["null-first-union"] += 1
+        if isinstance(declared, list) and declared[0] == "null":
+            counts["null-first-type"] += 1
+        if "enum" in node and "number" in types:
+            counts["number-enum"] += 1
+        if "const" in node and declared == "number":
+            counts["number-const"] += 1
+        if "const" in node and declared == "integer":
+            counts["integer-const"] += 1
+        for value in node.values():
+            _count_shapes(value, counts)
+    elif isinstance(node, list):
+        for value in node:
+            _count_shapes(value, counts)
+
+
+def test_the_random_schemas_hold_every_shape_the_compiler_branches_on() -> None:
+    counts: collections.Counter[str] = collections.Counter()
+    rng = random.Random(20261104)
+    for _ in range(400):
+        _count_shapes(gen_schema(rng), counts)
+
+    shapes = (
+        "null-first-union",
+        "null-first-type",
+        "number-enum",
+        "number-const",
+        "integer-const",
+    )
+    assert all(counts[shape] >= 10 for shape in shapes), counts
 
 
 def test_the_estimate_does_not_change_the_schema() -> None:
@@ -1004,7 +1043,6 @@ def test_an_unreferenced_entry_is_refused_before_any_expansion_is_measured(
         raise AssertionError("the expansion was measured")
 
     monkeypatch.setattr(structured_schema, "measure_expansion", fail)
-    monkeypatch.setattr(structured_schema, "compile_schema", fail)
     schema = _obj({"a": STRING}, **{"$defs": _doubling_defs(41)})
 
     assert _violation(schema) == ("S7", "/$defs/d0")

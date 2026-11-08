@@ -14,9 +14,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 STR_POOL = ["open", "closed", "approved", "rejected", "a", "b", "x"]
+# How deep the root object nests.
+MAX_DEPTH = 4
 
 
-def gen_schema(rng: random.Random, max_depth: int = 4) -> dict[str, Any]:
+def gen_schema(rng: random.Random) -> dict[str, Any]:
     """A schema that passes the structural checks.
 
     Entries of ``$defs`` the root cannot reach are dropped, because every entry
@@ -30,7 +32,7 @@ def gen_schema(rng: random.Random, max_depth: int = 4) -> dict[str, Any]:
         defs[name] = node
         if isinstance(node.get("type"), str):
             plain_defs.append(name)
-    root = _gen_object(rng, max_depth, defs, plain_defs, nprops=rng.randint(1, 5))
+    root = _gen_object(rng, MAX_DEPTH, defs, plain_defs, nprops=rng.randint(1, 5))
     reachable = _reachable_defs(root, defs)
     kept = {name: node for name, node in defs.items() if name in reachable}
     if kept:
@@ -108,6 +110,9 @@ def _gen_plain(
         "ienum",
         "const",
         "bconst",
+        "nenum",
+        "nconst",
+        "iconst",
     ]
     if depth > 0:
         kinds += ["object", "object", "array", "array"]
@@ -125,9 +130,21 @@ def _gen_plain(
         return _maybe_desc(rng, {"type": "integer", "enum": values})
     if k == "const":
         return _maybe_desc(rng, {"type": "string", "const": rng.choice(STR_POOL)})
+    if k == "nenum":
+        values = rng.sample([1.5, 2, -0.25, 3.0, 1e3], rng.randint(1, 3))
+        return _maybe_desc(rng, {"type": "number", "enum": values})
+    if k == "nconst":
+        return _maybe_desc(rng, {"type": "number", "const": rng.choice([7, 2.5, 4.0])})
+    if k == "iconst":
+        return _maybe_desc(rng, {"type": "integer", "const": rng.choice([7, 0, -2])})
     if k == "bconst":
         return {"type": "boolean", "const": rng.choice([True, False])}
     return _maybe_desc(rng, {"type": k})
+
+
+def _either_order(rng: random.Random, first: Any, second: Any) -> list[Any]:
+    """``[first, second]`` or ``[second, first]``, each half of the time."""
+    return [first, second] if rng.random() < 0.5 else [second, first]
 
 
 def _gen_node(
@@ -141,18 +158,20 @@ def _gen_node(
         name = rng.choice(list(defs))
         ref = {"$ref": f"#/$defs/{name}"}
         if allow_nullable and name in plain_defs and rng.random() < 0.5:
-            return _maybe_desc(rng, {"anyOf": [ref, {"type": "null"}]})
+            return _maybe_desc(
+                rng, {"anyOf": _either_order(rng, ref, {"type": "null"})}
+            )
         return ref
     node = _gen_plain(rng, depth, defs, plain_defs)
     if allow_nullable and rng.random() < 0.4:
         if rng.random() < 0.5:
-            node["type"] = [node["type"], "null"]
+            node["type"] = _either_order(rng, node["type"], "null")
             if "enum" in node:
                 node["enum"] = node["enum"] + [None]
             if "const" in node:
                 node["enum"] = [node.pop("const"), None]
         else:
-            return {"anyOf": [node, {"type": "null"}]}
+            return {"anyOf": _either_order(rng, node, {"type": "null"})}
     return node
 
 

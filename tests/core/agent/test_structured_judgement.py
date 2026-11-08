@@ -25,6 +25,7 @@ from tests.shared.structured_schema_random import (
     root_rnode,
     synth_valid,
 )
+from tests.shared.structured_schema_reference import expanded_copy
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import check_schema_structure
 
@@ -580,7 +581,7 @@ def test_the_shape_check_agrees_with_jsonschema_on_every_corpus_instance(
     entry: dict[str, Any],
 ) -> None:
     compiled = _compile(entry["schema"])
-    validator = Draft202012Validator(ss.model_facing_schema(compiled))
+    validator = Draft202012Validator(expanded_copy(entry["schema"]))
 
     assert _agrees_with_jsonschema(validator, compiled, entry["instance"])
 
@@ -592,9 +593,7 @@ def random_cases() -> list[tuple[dict[str, Any], Any, dict[str, Any], RNode]]:
     for _ in range(200):
         schema = gen_schema(rng)
         compiled = _compile(schema)
-        cases.append(
-            (schema, compiled, ss.model_facing_schema(compiled), root_rnode(schema))
-        )
+        cases.append((schema, compiled, expanded_copy(schema), root_rnode(schema)))
     return cases
 
 
@@ -1225,20 +1224,22 @@ def test_the_counted_bytes_equal_the_serialized_bytes_of_random_results(
     assert ready > 400
 
 
-def test_the_judgement_does_not_serialize_the_output(
+def test_the_judgement_serializes_no_object_or_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail(_value: object) -> int:
-        raise AssertionError("the output was serialized")
+    compiled = _compile(SPECIAL)
+    instance = SPECIAL_WRITINGS[0] | {"kind": None, "flag": None, "opts": None}
+    real_dumps = json.dumps
 
-    monkeypatch.setattr(ss, "canonical_json_size", fail)
+    def scalar_only_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
+        assert not isinstance(value, (dict, list)), "the output was serialized"
+        return real_dumps(value, *args, **kwargs)
 
-    assert isinstance(
-        _judge(
-            SPECIAL, SPECIAL_WRITINGS[0] | {"kind": None, "flag": None, "opts": None}
-        ),
-        ss.Ready,
-    )
+    monkeypatch.setattr(json, "dumps", scalar_only_dumps)
+    result = ss.judge_instance(compiled, instance)
+    monkeypatch.undo()
+
+    assert isinstance(result, ss.Ready)
 
 
 def test_an_empty_answer_counts_the_bytes_of_its_output() -> None:

@@ -753,6 +753,54 @@ def test_the_counts_cover_blanks_at_any_type_markers_and_gaps() -> None:
     assert result.blank_as_null_count == 2
 
 
+UNSTORABLE = _obj(
+    {
+        "n": {"type": "number"},
+        "m": {"type": ["number", "null"]},
+        "s": STRING,
+        "e": {"type": "string", "enum": ["a"]},
+        "xs": {"type": "array", "items": {"type": "number"}},
+    }
+)
+STORABLE = {"n": 1.5, "m": None, "s": "x", "e": "a", "xs": [1.0]}
+
+
+@pytest.mark.parametrize(
+    ("changed", "path", "rule"),
+    [
+        ({"n": float("nan")}, "/n", "type"),
+        ({"n": float("inf")}, "/n", "type"),
+        ({"m": float("-inf")}, "/m", "type"),
+        ({"xs": [1.0, float("nan")]}, "/xs/1", "type"),
+        ({"s": "a\u0000b"}, "/s", "type"),
+        ({"s": "\ud800"}, "/s", "type"),
+        ({"e": "a\u0000"}, "/e", "type"),
+        ({"s": "\u0000" + MARKER}, "/s", "marker"),
+    ],
+    ids=[
+        "nan",
+        "infinity",
+        "negative-infinity-on-a-nullable-number",
+        "nan-in-a-list",
+        "nul",
+        "lone-surrogate",
+        "nul-at-an-enum",
+        "marker-is-checked-first",
+    ],
+)
+def test_values_a_json_column_cannot_store_are_type_errors(
+    changed: dict[str, Any], path: str, rule: str
+) -> None:
+    assert _judge(UNSTORABLE, STORABLE | changed) == ss.Err(path=path, rule=rule)
+
+
+def test_finite_extremes_and_non_ascii_text_are_still_values() -> None:
+    result = _judge(UNSTORABLE, STORABLE | {"n": 1e308, "s": "é中\U0001f600"})
+
+    assert isinstance(result, ss.Ready)
+    assert (result.output["n"], result.output["s"]) == (1e308, "é中\U0001f600")
+
+
 def test_the_output_follows_the_order_of_the_properties_not_the_instance() -> None:
     result = _judge(
         _obj({"a": STRING, "b": STRING, "c": STRING}), {"c": "3", "a": "1", "b": "2"}

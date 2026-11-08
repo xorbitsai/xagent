@@ -1322,6 +1322,13 @@ def _reduce(
                 ):
                     return _UNEXPRESSIBLE
                 raise _Stop(Err(_pointer_of(link), "marker"))
+        # Neither can be stored in a JSON column. The argument parser refuses
+        # both before judging; this keeps any other caller from getting them
+        # back in an output.
+        if (type(value) is float and not math.isfinite(value)) or (
+            type(value) is str and has_forbidden_char(value)
+        ):
+            raise _Stop(Err(_pointer_of(link), "type"))
         if not conforms_to_type(value, node.types):
             raise _Stop(Err(_pointer_of(link), "type"))
         if node.enum_keys is not None and canon(value) not in node.enum_keys:
@@ -1517,10 +1524,14 @@ def judge_instance(
     holds its only allowed value, and a list is empty when it has items and all
     are empty. What each empty position stands for, and whether the result is
     :class:`Ready`, :class:`Incomplete` or :class:`TooComplex`, follows from
-    the compiled nodes. The instance must hold only finite numbers and no NUL
-    or lone surrogate, and no integer too long for the interpreter to turn into
-    text (``str`` raises ``ValueError`` past 4300 digits); it is read, never
-    changed.
+    the compiled nodes. A NaN, an infinity, or a string holding U+0000 or a
+    surrogate code point is an :class:`Err` with rule ``type`` wherever it
+    appears, since none of them can be stored as JSON. The instance must hold
+    no integer too long for the interpreter to turn into text (``str`` raises
+    ``ValueError`` past the interpreter's digit limit, 4300 by default). An
+    integer decoded from JSON text under that limit never is, because the
+    decoder refuses a longer literal, so only an integer built in Python can
+    break this. The instance is read, never changed.
     """
     try:
         reduced, steps, blanks = _reduce(compiled.nodes, compiled.root, instance)

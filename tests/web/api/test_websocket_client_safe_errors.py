@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+from dataclasses import replace
 from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from xagent.web.services.client_error_messages import (
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from xagent.web.services.task_command_transport import ClaimedTaskCommand
 
 from .conftest import _direct_db_session
 
@@ -2671,8 +2673,8 @@ def _clean_origins() -> Iterator[None]:
 
 def _pause_command(
     task_id: int = 7, command_id: str = "pause:origin"
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> ClaimedTaskCommand:
+    return ClaimedTaskCommand(
         id=1,
         task_id=task_id,
         actor_user_id=1,
@@ -2681,8 +2683,6 @@ def _pause_command(
         payload={"type": "pause_task"},
         target_run_id=None,
         attempt_count=1,
-        failure_count=0,
-        defer_count=0,
     )
 
 
@@ -2841,8 +2841,9 @@ async def test_origin_entry_dies_with_its_command_or_socket(
     assert origins.has(command.command_id, command.task_id), (
         "retrying deferral keeps the origin"
     )
-    exhausted = _pause_command(command_id="pause:cleanup")
-    exhausted.defer_count = command_execution_service.max_command_defers()
+    exhausted = replace(
+        command, defer_count=command_execution_service.max_command_defers()
+    )
     with pytest.raises(command_execution_service.TaskCommandDeferred):
         await command_execution_service.execute_durable_task_command(exhausted)
     assert not origins.has(command.command_id, command.task_id)

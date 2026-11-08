@@ -286,18 +286,18 @@ def test_han_characters_near_the_limit_are_measured_the_same_on_both_paths():
     # 522,000 bytes once escaped as \uXXXX, so only the canonical measure passes.
     text = json.dumps({"a": "汉" * 87_000}, ensure_ascii=False)
     value = json.loads(text)
-    assert ss.canonical_json_bytes(value) < 256 * 1024 < len(json.dumps(value))
+    assert ss.canonical_json_size(value) < 256 * 1024 < len(json.dumps(value))
     assert _good(text) == _good(value)
 
 
 def _padded(total_bytes: int) -> dict[str, str]:
-    base = ss.canonical_json_bytes({"a": ""})
+    base = ss.canonical_json_size({"a": ""})
     return {"a": "x" * (total_bytes - base)}
 
 
 def test_exactly_the_argument_limit_passes_and_one_byte_more_is_too_long():
     at_limit = _padded(so.MAX_ARGUMENTS_BYTES)
-    assert ss.canonical_json_bytes(at_limit) == 262_144
+    assert ss.canonical_json_size(at_limit) == 262_144
     assert _good(json.dumps(at_limit)) == at_limit
     assert _good(at_limit) == at_limit
     over = _padded(so.MAX_ARGUMENTS_BYTES + 1)

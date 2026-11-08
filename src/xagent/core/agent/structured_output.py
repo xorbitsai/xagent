@@ -33,7 +33,7 @@ from .structured_schema import (
     Incomplete,
     Ready,
     TooComplex,
-    canonical_json_bytes,
+    canonical_json_size,
     compile_schema,
     has_forbidden_char,
     judge_empty_answer,
@@ -281,7 +281,7 @@ def _parse_arguments(arguments: Any) -> _ParsedArguments | _BadArguments:
         return _BadArguments("invalid_json")
 
     try:
-        size = canonical_json_bytes(value)
+        size = canonical_json_size(value)
     except (ValueError, RecursionError, TypeError):
         return _BadArguments("invalid_json")
     if size > MAX_ARGUMENTS_BYTES:

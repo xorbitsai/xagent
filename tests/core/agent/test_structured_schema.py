@@ -556,6 +556,10 @@ def test_the_same_names_without_the_newline_are_accepted() -> None:
 
 # --- scale attacks are refused quickly -------------------------------------------
 
+# These checks are pinned by what they return and, for S11, by how much text
+# they serialize. This bound only catches a slowdown by an order of magnitude.
+BACKSTOP_SECONDS = 10.0
+
 
 def _nested_any_of(levels: int) -> dict[str, Any]:
     node: dict[str, Any] = STRING
@@ -603,16 +607,14 @@ SCALE_ATTACKS = [
 
 
 @pytest.mark.parametrize(("schema", "rule"), SCALE_ATTACKS)
-def test_scale_attacks_are_rejected_within_a_second(
-    schema: dict[str, Any], rule: str
-) -> None:
+def test_scale_attacks_are_rejected(schema: dict[str, Any], rule: str) -> None:
     start = time.perf_counter()
     found = check_schema_structure(schema)
     elapsed = time.perf_counter() - start
 
     assert found is not None
     assert found.rule == rule
-    assert elapsed < 1.0
+    assert elapsed < BACKSTOP_SECONDS
 
 
 def test_an_unreferenced_entry_is_reported_with_the_first_one_in_key_order() -> None:
@@ -967,24 +969,32 @@ def test_a_small_schema_whose_copy_would_be_over_a_megabyte_is_refused() -> None
     assert _violation(schema) == ("S11", "")
 
 
-def test_a_500_value_enum_expanded_nine_times_is_refused_within_a_second(
+def test_a_500_value_enum_expanded_nine_times_is_refused_without_building_the_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail(_compiled: object) -> None:
-        raise AssertionError("the copy was built")
-
-    monkeypatch.setattr(structured_schema, "model_facing_schema", fail)
     values = [f"{i:04d}-" + "v" * 14 for i in range(500)]
     schema = _layered_schema(9, {"type": "string", "enum": values})
     original = len(json.dumps(schema, separators=(",", ":")).encode())
     assert 8000 < original < 16384
+    real_dumps = json.dumps
+    written: list[int] = []
 
+    def counting_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
+        text = real_dumps(value, *args, **kwargs)
+        written.append(len(text.encode("utf-8", "surrogatepass")))
+        return text
+
+    monkeypatch.setattr(json, "dumps", counting_dumps)
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found == ("S11", "")
-    assert elapsed < 1.0, f"took {elapsed * 1000:.1f} ms"
+    # S11 refuses this schema because its copy is over MAX_EXPANDED_BYTES, so a
+    # check that serialized less than that in total never serialized the copy.
+    assert sum(written) <= structured_schema.MAX_EXPANDED_BYTES
+    assert elapsed < BACKSTOP_SECONDS
 
 
 def test_an_unreferenced_entry_is_refused_before_any_expansion_is_measured(
@@ -1034,7 +1044,7 @@ def test_a_500_layer_alias_chain_is_refused_quickly() -> None:
     elapsed = time.perf_counter() - start
 
     assert found == ("S11", "")
-    assert elapsed < 1.0
+    assert elapsed < BACKSTOP_SECONDS
 
 
 def test_a_100_layer_doubling_chain_is_refused_quickly() -> None:
@@ -1045,4 +1055,4 @@ def test_a_100_layer_doubling_chain_is_refused_quickly() -> None:
     elapsed = time.perf_counter() - start
 
     assert found == ("S11", "")
-    assert elapsed < 1.0
+    assert elapsed < BACKSTOP_SECONDS

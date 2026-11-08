@@ -22,6 +22,9 @@ from xagent.core.model.chat.basic import claude, gemini
 MARKER = "__NOT_EXPRESSIBLE__"
 STRING: dict[str, Any] = {"type": "string"}
 NULLABLE_STRING: dict[str, Any] = {"type": ["string", "null"]}
+# This bound only catches a slowdown by an order of magnitude; the cost of
+# stopping early is pinned by how much text is serialized.
+BACKSTOP_SECONDS = 10.0
 
 
 def _obj(properties: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -544,14 +547,30 @@ def test_a_copy_over_the_byte_limit_stops_with_a_value_error() -> None:
     assert structured_schema.model_facing_schema(compiled)
 
 
-def test_a_copy_that_would_be_megabytes_is_cut_off_before_it_is_built() -> None:
+def test_a_copy_that_would_be_megabytes_is_cut_off_before_it_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     values = [f"{i:04d}-" + "v" * 14 for i in range(500)]
     schema = _layered_schema(9, {"type": "string", "enum": values})
     compiled = structured_schema.compile_schema(schema)
+    real_dumps = json.dumps
+    written: list[int] = []
 
+    def counting_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
+        text = real_dumps(value, *args, **kwargs)
+        written.append(len(text.encode("utf-8", "surrogatepass")))
+        return text
+
+    monkeypatch.setattr(json, "dumps", counting_dumps)
     start = time.perf_counter()
     with pytest.raises(ValueError):
         structured_schema.model_facing_schema(compiled)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
-    assert elapsed < 0.05, f"took {elapsed * 1000:.1f} ms"
+    # Building stops at the first node that takes the copy past
+    # MAX_EXPANDED_BYTES, and each node is serialized at most twice (itself and
+    # its enum for the allowed-values text), so less than four times the limit
+    # is written; the whole copy would be about 6 MB.
+    assert sum(written) <= 4 * structured_schema.MAX_EXPANDED_BYTES
+    assert elapsed < BACKSTOP_SECONDS

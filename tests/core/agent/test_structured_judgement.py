@@ -6,7 +6,6 @@ import copy
 import dataclasses
 import json
 import random
-import statistics
 import time
 import tracemalloc
 from pathlib import Path
@@ -865,13 +864,20 @@ def _nodes(value: Any) -> int:
     return 1
 
 
-def _timed(schema: dict[str, Any], instance: Any) -> tuple[Any, float]:
+# The cost of a judgement is pinned by the step, node and byte counts each test
+# asserts. This bound only catches a slowdown by an order of magnitude; the
+# slowest case takes well under two seconds on a loaded CI runner.
+BACKSTOP_SECONDS = 10.0
+
+
+def _judge_with_backstop(schema: dict[str, Any], instance: Any) -> Any:
     start = time.perf_counter()
     compiled = _compile(schema)
-    assert time.perf_counter() - start < 1
+    assert time.perf_counter() - start < BACKSTOP_SECONDS
     start = time.perf_counter()
     result = ss.judge_instance(compiled, instance)
-    return result, time.perf_counter() - start
+    assert time.perf_counter() - start < BACKSTOP_SECONDS
+    return result
 
 
 def _layered(leaf: dict[str, Any]) -> dict[str, Any]:
@@ -891,9 +897,9 @@ def test_a_flat_list_of_integers_costs_one_step_per_node() -> None:
     schema = _obj({"xs": {"type": "array", "items": {"type": "integer"}}})
     instance, _ = _fit("0")
 
-    result, seconds = _timed(schema, instance)
+    result = _judge_with_backstop(schema, instance)
 
-    assert isinstance(result, ss.Ready) and seconds < 1
+    assert isinstance(result, ss.Ready)
     assert result.r1_steps == _nodes(instance)
 
 
@@ -905,16 +911,19 @@ def test_a_flat_list_of_integers_costs_one_step_per_node() -> None:
     ],
     ids=["nullable-items", "empty-lists"],
 )
-def test_lists_of_nulls_and_of_empty_lists_are_judged_within_a_second(
+def test_lists_of_nulls_and_of_empty_lists_cost_one_step_per_node(
     items: dict[str, Any], item: str, first: Any
 ) -> None:
     instance, _ = _fit(item)
     if first is not None:
         instance["xs"][0] = first
 
-    result, seconds = _timed(_obj({"xs": {"type": "array", "items": items}}), instance)
+    result = _judge_with_backstop(
+        _obj({"xs": {"type": "array", "items": items}}), instance
+    )
 
-    assert isinstance(result, ss.Ready) and seconds < 1
+    assert isinstance(result, ss.Ready)
+    assert result.r1_steps == _nodes(instance)
 
 
 def test_a_thousand_empty_leaves_per_element_cost_the_size_of_the_template_only() -> (
@@ -924,12 +933,12 @@ def test_a_thousand_empty_leaves_per_element_cost_the_size_of_the_template_only(
     required = _layered(STRING)
     instance, count = _fit('{"a":1,"big":null}')
 
-    result, seconds = _timed(nullable, instance)
+    result = _judge_with_backstop(nullable, instance)
     assert isinstance(result, ss.TooComplex) and result.stage == "r4"
-    assert result.r1_steps == _nodes(instance) and seconds < 1
+    assert result.r1_steps == _nodes(instance)
 
-    result, seconds = _timed(required, instance)
-    assert isinstance(result, ss.Incomplete) and seconds < 1
+    result = _judge_with_backstop(required, instance)
+    assert isinstance(result, ss.Incomplete)
     assert result.missing_count == count * 1000 == 13_796_000
     assert result.r1_steps == _nodes(instance)
 
@@ -939,13 +948,15 @@ def test_a_small_template_per_element_is_still_ready() -> None:
         {"p": {"type": ["string", "null"]}, "q": {"type": ["integer", "null"]}}
     )
     element = _obj({"a": {"type": "integer"}, "o": small})
-    instance, _ = _fit('{"a":1,"o":null}')
+    instance, count = _fit('{"a":1,"o":null}')
 
-    result, seconds = _timed(
+    result = _judge_with_backstop(
         _obj({"xs": {"type": "array", "items": element}}), instance
     )
 
-    assert isinstance(result, ss.Ready) and seconds < 1
+    assert isinstance(result, ss.Ready)
+    assert result.r1_steps == _nodes(instance)
+    assert result.expansion_nodes == 3 * count
 
 
 def _elements(
@@ -964,15 +975,15 @@ def _elements(
 
 def test_elements_whose_only_property_is_empty_make_the_whole_list_empty() -> None:
     schema, instance = _elements(2000, STRING, with_id=False)
-    result, seconds = _timed(schema, instance)
-    assert isinstance(result, ss.Incomplete) and seconds < 1
+    result = _judge_with_backstop(schema, instance)
+    assert isinstance(result, ss.Incomplete)
     assert result.missing_fields == ["/items"] and result.r1_steps == 4002
 
     nullable = copy.deepcopy(schema)
     nullable["properties"]["items"]["type"] = ["array", "null"]
-    result, seconds = _timed(nullable, instance)
+    result = _judge_with_backstop(nullable, instance)
     assert isinstance(result, ss.Ready) and result.output == {"items": None}
-    assert result.r1_steps == 4002 and seconds < 1
+    assert result.r1_steps == 4002
 
 
 def test_elements_with_a_gap_in_their_empty_part_are_incomplete_and_cheap() -> None:
@@ -980,9 +991,9 @@ def test_elements_with_a_gap_in_their_empty_part_are_incomplete_and_cheap() -> N
     schema, instance = _elements(2000, leaves, with_id=True)
     schema["$defs"]["Sub"]["properties"]["f1"] = STRING
 
-    result, seconds = _timed(schema, instance)
+    result = _judge_with_backstop(schema, instance)
 
-    assert isinstance(result, ss.Incomplete) and result.r1_steps == 6002 and seconds < 1
+    assert isinstance(result, ss.Incomplete) and result.r1_steps == 6002
     assert (result.missing_count, result.expansion_nodes) == (2000, 0)
 
 
@@ -1004,9 +1015,9 @@ def test_only_the_template_of_an_empty_required_object_adds_expansion_nodes() ->
 
 def test_elements_whose_empty_part_is_too_big_to_return_are_too_complex() -> None:
     schema, instance = _elements(2000, {"type": ["string", "null"]}, with_id=True)
-    result, seconds = _timed(schema, instance)
+    result = _judge_with_backstop(schema, instance)
     assert isinstance(result, ss.TooComplex) and result.stage == "r4"
-    assert result.r1_steps + result.expansion_nodes == 208_002 and seconds < 1
+    assert result.r1_steps + result.expansion_nodes == 208_002
 
 
 def test_the_template_is_not_copied_when_the_result_is_too_complex(
@@ -1027,22 +1038,22 @@ def test_a_result_that_is_incomplete_is_not_checked_for_size() -> None:
     schema["required"].append("z")
     instance["z"] = None
 
-    result, seconds = _timed(schema, instance)
+    result = _judge_with_backstop(schema, instance)
 
     assert isinstance(result, ss.Incomplete) and result.missing_fields == ["/z"]
-    assert result.r1_steps + result.expansion_nodes == 208_003 and seconds < 1
+    assert result.r1_steps + result.expansion_nodes == 208_003
 
 
 @pytest.mark.parametrize(("count", "ready"), [(199_998, True), (199_999, False)])
 def test_the_shape_check_stops_just_past_200_000_steps(count: int, ready: bool) -> None:
     schema = _obj({"a": {"type": "array", "items": {"type": "integer"}}})
-    result, seconds = _timed(schema, {"a": [0] * count})
+    result = _judge_with_backstop(schema, {"a": [0] * count})
 
-    assert seconds < 1
     if ready:
         assert isinstance(result, ss.Ready) and result.r1_steps == 200_000
     else:
         assert isinstance(result, ss.TooComplex) and result.stage == "r1"
+        assert result.r1_steps == 200_001
 
 
 def test_the_densest_instance_within_256_kib_is_under_the_step_limit() -> None:
@@ -1050,10 +1061,9 @@ def test_the_densest_instance_within_256_kib_is_under_the_step_limit() -> None:
     instance = {"a": [0] * 131_068}
     assert len(json.dumps(instance, separators=(",", ":"))) <= LIMIT
 
-    result, seconds = _timed(schema, instance)
+    result = _judge_with_backstop(schema, instance)
 
     assert isinstance(result, ss.Ready) and result.r1_steps == 131_070
-    assert seconds < 1
 
 
 def _fill(text: str) -> int:
@@ -1083,89 +1093,83 @@ def _worst_instance(last: int) -> dict[str, Any]:
     return instance
 
 
-def test_the_worst_schema_meets_a_256_kib_instance_within_a_second() -> None:
+def test_the_worst_schema_meets_a_256_kib_instance_in_one_step_per_node() -> None:
     schema = _worst_schema()
     metrics = structured_schema.measure_expansion(schema)
     assert (metrics.nodes, metrics.enum_values) == (1971, 5000)
     for last in (7, 500):
         text = json.dumps(_worst_instance(last), separators=(",", ":"))
         assert 250_000 < len(text.encode()) <= LIMIT
-    valid, seconds = _timed(schema, _worst_instance(7))
-    assert isinstance(valid, ss.Ready) and seconds < 1 and valid.r1_steps <= 200_000
+    valid = _judge_with_backstop(schema, _worst_instance(7))
+    assert isinstance(valid, ss.Ready)
+    assert valid.r1_steps == _nodes(_worst_instance(7))
+    assert valid.expansion_nodes == 6 * 111 + 3 * 11
 
-    invalid, seconds = _timed(schema, _worst_instance(500))
-    assert isinstance(invalid, ss.Err) and invalid.rule == "enum" and seconds < 1
+    invalid = _judge_with_backstop(schema, _worst_instance(500))
+    assert invalid == ss.Err(path=f"/xs/{_fill('499') - 1}", rule="enum")
 
 
 @pytest.mark.parametrize(
-    ("schema", "instance", "wanted"),
+    ("schema", "instance", "expected"),
     [
         (
             _obj({"xs": {"type": "array", "items": {"type": "integer"}}}),
             {"xs": list(range(1000))},
-            "Ready",
+            "one-step-per-node",
         ),
         (
             _obj({"xs": {"type": "array", "items": {"type": "integer"}}}),
             {"xs": ["x" * 100_000] * 3},
-            "Err",
+            ss.Err(path="/xs/0", rule="type"),
         ),
         (
             _obj({"xs": {"type": "array", "items": _obj({})}}),
             {"xs": [{f"k{i}": 1 for i in range(10_000)}]},
-            "Err",
+            ss.Err(path="/xs/0", rule="extra_property"),
         ),
     ],
     ids=["many-integers", "long-strings", "many-keys"],
 )
-def test_other_worst_instances_are_judged_within_a_second(
-    schema: dict[str, Any], instance: Any, wanted: str
+def test_other_worst_instances_stop_at_the_first_error_or_cost_one_step_per_node(
+    schema: dict[str, Any], instance: Any, expected: Any
 ) -> None:
-    result, seconds = _timed(schema, instance)
+    result = _judge_with_backstop(schema, instance)
 
-    assert isinstance(result, getattr(ss, wanted)) and seconds < 1
-    if wanted == "Ready":
-        assert result.r1_steps <= 200_000
+    if expected == "one-step-per-node":
+        assert isinstance(result, ss.Ready) and result.r1_steps == _nodes(instance)
+    else:
+        assert result == expected
 
 
-def test_a_256_kib_list_of_values_of_a_500_value_enum_is_judged_within_a_second() -> (
-    None
-):
+def test_a_256_kib_list_of_values_of_a_500_value_enum_costs_one_step_per_node() -> None:
     values = [f"{i:03d}-" + "v" * 8 for i in range(500)]
     schema = _obj(
         {"xs": {"type": "array", "items": {"type": "string", "enum": values}}}
     )
     count = (LIMIT - 20) // (len(values[-1]) + 3)
 
-    result, seconds = _timed(
-        schema, {"xs": [values[-1 - i % 500] for i in range(count)]}
-    )
+    instance = {"xs": [values[-1 - i % 500] for i in range(count)]}
 
-    assert isinstance(result, ss.Ready) and seconds < 1
-    assert result.r1_steps <= 200_000
+    result = _judge_with_backstop(schema, instance)
+
+    assert isinstance(result, ss.Ready)
+    assert result.r1_steps == _nodes(instance)
 
 
-def test_integers_with_one_hash_are_judged_as_fast_as_integers_with_many() -> None:
+def test_integers_with_one_hash_get_enum_keys_with_as_many_hashes() -> None:
     same_hash = [7 + i * (2**61 - 1) for i in range(500)]
     assert len({hash(v) for v in same_hash}) == 1
-    spread = [v + i for i, v in enumerate(same_hash)]
-    assert len({hash(v) for v in spread}) == 500
-    assert [len(str(v)) for v in same_hash] == [len(str(v)) for v in spread]
+    schema = _obj(
+        {"xs": {"type": "array", "items": {"type": "integer", "enum": same_hash}}}
+    )
+    compiled = _compile(schema)
+    items = _items(compiled, _child(compiled, _root(compiled), "xs"))
 
-    def median_seconds(values: list[int]) -> float:
-        schema = _obj(
-            {"xs": {"type": "array", "items": {"type": "integer", "enum": values}}}
-        )
-        compiled = _compile(schema)
-        instance = {"xs": values[-100:] * 8}
-        runs = []
-        for _ in range(9):
-            start = time.perf_counter()
-            assert isinstance(ss.judge_instance(compiled, instance), ss.Ready)
-            runs.append(time.perf_counter() - start)
-        return statistics.median(runs)
+    assert items.enum_keys is not None
+    assert len({hash(key) for key in items.enum_keys}) == 500
 
-    assert median_seconds(same_hash) < 2 * median_seconds(spread)
+    result = _judge_with_backstop(schema, {"xs": same_hash[-100:] * 8})
+    assert isinstance(result, ss.Ready) and result.r1_steps == 802
 
 
 # --- the size of the result ----------------------------------------------------------------

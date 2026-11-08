@@ -8,7 +8,7 @@ from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
 from ..cache_lifecycle import agent_cache_session
 from ..exceptions import LLMTimeoutError
-from ..routing_context import xinference_routing_key
+from ..routing_context import xinference_interactive, xinference_routing_key
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -17,6 +17,8 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 _MODEL_DISCOVERY_TIMEOUT_SECONDS = 30.0
+# Xinference schedules lower priority values first.
+_INTERACTIVE_PRIORITY_HINT = -1
 
 
 async def _await_with_timeout(
@@ -137,6 +139,7 @@ class XinferenceLLM(BaseLLM):
         self._model_handle: Optional[Any] = None
         self._supports_session_affinity = False
         self._supports_cache_lifecycle = False
+        self._supports_chat_priority = False
         self._client_lock = asyncio.Lock()
 
     @property
@@ -167,6 +170,11 @@ class XinferenceLLM(BaseLLM):
                 supports = getattr(client, "supports_agent_cache_lifecycle", None)
                 self._supports_cache_lifecycle = (
                     callable(supports) and supports(self._model_uid) is True
+                )
+                supports_priority = getattr(client, "supports_chat_priority", None)
+                self._supports_chat_priority = (
+                    callable(supports_priority)
+                    and supports_priority(self._model_uid) is True
                 )
 
             return self._model_handle
@@ -210,6 +218,14 @@ class XinferenceLLM(BaseLLM):
         key = xinference_routing_key.get()
         if self._supports_session_affinity and key is not None:
             config.setdefault("routing_key", key)
+
+    def _apply_chat_priority(self, config: dict[str, Any]) -> None:
+        if (
+            self._supports_chat_priority
+            and xinference_interactive.get()
+            and "priority" not in config
+        ):
+            config.setdefault("priority_hint", _INTERACTIVE_PRIORITY_HINT)
 
     def _apply_cache_lifecycle(self, config: dict[str, Any]) -> None:
         session = agent_cache_session.get()
@@ -287,6 +303,7 @@ class XinferenceLLM(BaseLLM):
             model_handle = await self._ensure_client()
             self._apply_session_affinity(generate_config)
             self._apply_cache_lifecycle(generate_config)
+            self._apply_chat_priority(generate_config)
             return await model_handle.chat(
                 messages=sanitized_messages,
                 tools=tools,
@@ -529,6 +546,7 @@ class XinferenceLLM(BaseLLM):
             )
             self._apply_session_affinity(generate_config)
             self._apply_cache_lifecycle(generate_config)
+            self._apply_chat_priority(generate_config)
             stream = await _await_before_deadline(
                 model_handle.chat(
                     messages=sanitized_messages,

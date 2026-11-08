@@ -106,6 +106,7 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
             "model_ability": ["chat"],
             "supports_chat_session_affinity": True,
             "supports_agent_cache_lifecycle": True,
+            "supports_chat_priority": True,
         }
     )
     monkeypatch.setattr(client, "describe_model", describe)
@@ -116,6 +117,7 @@ async def test_chat_discovery_keeps_public_connector_and_auth_headers(monkeypatc
             assert handle.auth_headers == {"Authorization": "Bearer test-key"}
             assert supports_affinity is True
             assert client.supports_agent_cache_lifecycle("model-id")
+            assert client.supports_chat_priority("model-id")
             describe.assert_awaited_once_with("model-id")
         finally:
             await handle.close()

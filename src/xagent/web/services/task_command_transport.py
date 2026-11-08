@@ -277,6 +277,7 @@ class ClaimedTaskCommand:
     failure_count: int = 0
     defer_count: int = 0
     admission_required: bool = False
+    dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
 
 
 @dataclass(frozen=True)
@@ -1276,6 +1277,7 @@ def claim_task_command(
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
         admission_required=admission_required,
+        dispatch_class=cast(DispatchClass, fresh.dispatch_class),
         failure_count=int(fresh.failure_count or 0),
         defer_count=int(fresh.defer_count or 0),
     )

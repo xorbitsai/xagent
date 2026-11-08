@@ -58,6 +58,7 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
         self._cluster_authed = api_key is not None
         self.timeout = aiohttp.ClientTimeout(total=1800)
         self._cache_lifecycle_support: dict[str, bool] = {}
+        self._chat_priority_support: dict[str, bool] = {}
         self.session = create_public_model_aiohttp_session(timeout=self.timeout)
 
     async def get_model(self, model_uid: str) -> Any:
@@ -65,10 +66,13 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
         return await self._guard_model_handle(handle)
 
     async def get_chat_model(self, model_uid: str) -> tuple[Any, bool]:
-        """Discover the chat handle and its routing support in one request."""
+        """Discover the chat handle and its capabilities in one request."""
         description = await self.describe_model(model_uid)
         self._cache_lifecycle_support[model_uid] = (
             description.get("supports_agent_cache_lifecycle") is True
+        )
+        self._chat_priority_support[model_uid] = (
+            description.get("supports_chat_priority") is True
         )
         if description.get("model_type") != "LLM" or "chat" not in description.get(
             "model_ability", []
@@ -84,6 +88,9 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
 
     def supports_agent_cache_lifecycle(self, model_uid: str) -> bool:
         return self._cache_lifecycle_support.get(model_uid, False)
+
+    def supports_chat_priority(self, model_uid: str) -> bool:
+        return self._chat_priority_support.get(model_uid, False)
 
     async def update_cache_session(
         self, model_uid: str, session: dict[str, Any]

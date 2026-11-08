@@ -60,7 +60,7 @@ async def wait_for_handoff(committed, execution):
 
 
 @pytest.fixture
-async def accepted(tmp_path, monkeypatch):
+async def accepted(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setattr(task_coordinator_runtime, "get_runner_id", lambda: "worker-1")
     init_db(db_url=f"sqlite:///{tmp_path / 'consumer.db'}")
@@ -71,7 +71,7 @@ async def accepted(tmp_path, monkeypatch):
         task = Task(
             user_id=user.id,
             title="Shared",
-            source="sdk",
+            source=getattr(request, "param", "sdk"),
             status=TaskStatus.PENDING,
             run_id=None,
             state_version=1,
@@ -100,6 +100,27 @@ async def accepted(tmp_path, monkeypatch):
     yield command
     await task_coordinator_runtime.close_task_coordinators()
     Base.metadata.drop_all(bind=get_engine())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "accepted,interactive", [("internal", True), ("sdk", False)], indirect=["accepted"]
+)
+async def test_start_handoff_keeps_claimed_inference_priority(
+    accepted, interactive, monkeypatch
+):
+    from xagent.core.model.chat.routing_context import xinference_interactive
+
+    observed = []
+
+    async def schedule(**kwargs):
+        observed.append(xinference_interactive.get())
+
+    monkeypatch.setattr(consumer, "_schedule_committed_turn", schedule)
+    assert accepted.dispatch_class == ("interactive" if interactive else "batch")
+    await execute_durable_task_command(accepted)
+    assert observed == [interactive]
+    assert not xinference_interactive.get()
 
 
 def test_handoff_commits_lease_and_completion_together(accepted):

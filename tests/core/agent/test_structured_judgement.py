@@ -481,12 +481,12 @@ def test_canonical_json_is_measured_in_bytes_not_characters() -> None:
     assert structured_schema.canonical_json_size("é") == 4
 
 
-def test_canonical_json_writes_compact_separators_and_keeps_key_order() -> None:
+def test_canonical_json_writes_compact_separators() -> None:
     value = {"b": [1, 2.5, True, None], "a": {"k": "v"}}
-    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-    assert structured_schema.canonical_json_size(value) == len(text)
-    assert text.startswith('{"b":')
+    assert structured_schema.canonical_json_size(value) == len(
+        '{"b":[1,2.5,true,null],"a":{"k":"v"}}'
+    )
 
 
 def test_canonical_json_writes_the_smallest_float_and_the_largest() -> None:

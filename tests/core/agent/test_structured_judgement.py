@@ -810,6 +810,7 @@ STORABLE = {"n": 1.5, "m": None, "s": "x", "e": "a", "xs": [1.0]}
         ({"s": "\ud800"}, "/s", "type"),
         ({"e": "a\u0000"}, "/e", "type"),
         ({"s": "\u0000" + MARKER}, "/s", "marker"),
+        ({"\u0000": 1}, "", "extra_property"),
     ],
     ids=[
         "nan",
@@ -820,6 +821,7 @@ STORABLE = {"n": 1.5, "m": None, "s": "x", "e": "a", "xs": [1.0]}
         "lone-surrogate",
         "nul-at-an-enum",
         "marker-is-checked-first",
+        "forbidden-character-in-a-key",
     ],
 )
 def test_values_a_json_column_cannot_store_are_type_errors(

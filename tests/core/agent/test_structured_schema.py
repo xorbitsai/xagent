@@ -562,6 +562,27 @@ def test_the_same_names_without_the_newline_are_accepted() -> None:
 BACKSTOP_SECONDS = 10.0
 
 
+def _limit_serialized_bytes(monkeypatch: pytest.MonkeyPatch, limit: int) -> list[int]:
+    """Spy on ``json.dumps``: record the UTF-8 size of every text it writes and
+    fail as soon as the total passes ``limit``, so a check whose cost has grown
+    fails here instead of running on."""
+    real_dumps = json.dumps
+    written: list[int] = []
+
+    def counting_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
+        text = real_dumps(value, *args, **kwargs)
+        written.append(len(text.encode("utf-8", "surrogatepass")))
+        assert sum(written) <= limit, f"serialized {sum(written)} bytes"
+        return text
+
+    monkeypatch.setattr(json, "dumps", counting_dumps)
+    return written
+
+
+def _size(schema: dict[str, Any]) -> int:
+    return len(json.dumps(schema, separators=(",", ":"), ensure_ascii=False).encode())
+
+
 def _nested_any_of(levels: int) -> dict[str, Any]:
     node: dict[str, Any] = STRING
     for _ in range(levels):
@@ -608,10 +629,15 @@ SCALE_ATTACKS = [
 
 
 @pytest.mark.parametrize(("schema", "rule"), SCALE_ATTACKS)
-def test_scale_attacks_are_rejected(schema: dict[str, Any], rule: str) -> None:
+def test_scale_attacks_are_rejected(
+    schema: dict[str, Any], rule: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each is refused before S11, so only S1 serializes the schema, once.
+    _limit_serialized_bytes(monkeypatch, _size(schema))
     start = time.perf_counter()
     found = check_schema_structure(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found is not None
     assert found.rule == rule
@@ -1015,24 +1041,15 @@ def test_a_500_value_enum_expanded_nine_times_is_refused_without_building_the_co
     schema = _layered_schema(9, {"type": "string", "enum": values})
     original = len(json.dumps(schema, separators=(",", ":")).encode())
     assert 8000 < original < 16384
-    real_dumps = json.dumps
-    written: list[int] = []
-
-    def counting_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
-        text = real_dumps(value, *args, **kwargs)
-        written.append(len(text.encode("utf-8", "surrogatepass")))
-        return text
-
-    monkeypatch.setattr(json, "dumps", counting_dumps)
+    # S11 refuses this schema because its copy is over MAX_EXPANDED_BYTES, so a
+    # check that serialized less than that in total never serialized the copy.
+    _limit_serialized_bytes(monkeypatch, structured_schema.MAX_EXPANDED_BYTES)
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
     monkeypatch.undo()
 
     assert found == ("S11", "")
-    # S11 refuses this schema because its copy is over MAX_EXPANDED_BYTES, so a
-    # check that serialized less than that in total never serialized the copy.
-    assert sum(written) <= structured_schema.MAX_EXPANDED_BYTES
     assert elapsed < BACKSTOP_SECONDS
 
 
@@ -1072,25 +1089,38 @@ def test_the_expanded_size_is_judged_before_the_enum_rules() -> None:
     assert _violation(schema) == ("S11", "")
 
 
-def test_a_500_layer_alias_chain_is_refused_quickly() -> None:
+def test_a_500_layer_alias_chain_is_refused_quickly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     defs: dict[str, Any] = {f"a{i}": _ref(f"a{i + 1}") for i in range(499)}
     defs["a499"] = STRING
     schema = _obj({"p": _ref("a0")}, **{"$defs": defs})
+    # S1 writes the schema once and S11 writes each node once with its children
+    # left out; a reference is never written, so the total stays near the
+    # size of the schema however long the chain is.
+    _limit_serialized_bytes(monkeypatch, 2 * _size(schema))
 
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found == ("S11", "")
     assert elapsed < BACKSTOP_SECONDS
 
 
-def test_a_100_layer_doubling_chain_is_refused_quickly() -> None:
+def test_a_100_layer_doubling_chain_is_refused_quickly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     schema = _obj({"p": _ref("d0")}, **{"$defs": _doubling_defs(100)})
+    # Each entry is written once however often it is referenced, so the total
+    # follows the size of the schema, not the 2**100 nodes of its expansion.
+    _limit_serialized_bytes(monkeypatch, 2 * _size(schema))
 
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found == ("S11", "")
     assert elapsed < BACKSTOP_SECONDS

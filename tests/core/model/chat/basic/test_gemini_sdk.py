@@ -154,6 +154,216 @@ class TestGeminiLLMSDK:
         print(f"Stream chat got {len(chunks)} chunks, usage received: {usage_received}")
 
     @pytest.mark.asyncio
+    async def test_stream_empty_candidate_chunk_aborts_and_closes(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+        mock_client = MagicMock()
+
+        class Stream:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            def __init__(self):
+                self.events = iter(
+                    [SimpleNamespace(candidates=None, usage_metadata=None)]
+                )
+
+            async def __anext__(self):
+                try:
+                    return next(self.events)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = Stream()
+
+        async def generate_content_stream(*args, **kwargs):
+            return stream
+
+        mock_client.aio.models.generate_content_stream = generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0].finish_reason == "no_progress"
+        assert chunks[0].raw["stream_aborted"] == "empty_deltas"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_unspecified_finish_reason_does_not_hide_empty_candidate(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+        mock_client = MagicMock()
+
+        class Stream:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            def __init__(self):
+                candidate = SimpleNamespace(finish_reason=0, content=None)
+                self.events = iter(
+                    [SimpleNamespace(candidates=[candidate], usage_metadata=None)]
+                )
+
+            async def __anext__(self):
+                try:
+                    return next(self.events)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+            async def aclose(self):
+                self.closed = True
+
+        stream = Stream()
+
+        async def generate_content_stream(*args, **kwargs):
+            return stream
+
+        mock_client.aio.models.generate_content_stream = generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0].finish_reason == "no_progress"
+        assert chunks[0].raw["stream_aborted"] == "empty_deltas"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_stream_thought_part_counts_as_reasoning_progress(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+        mock_client = MagicMock()
+
+        class Chunk(SimpleNamespace):
+            def model_dump(self):
+                return vars(self).copy()
+
+        def make_chunk(text: str, *, thought: bool):
+            part = SimpleNamespace(text=text, thought=thought, function_call=None)
+            candidate = SimpleNamespace(
+                content=SimpleNamespace(parts=[part]), finish_reason=None
+            )
+            return Chunk(candidates=[candidate], usage_metadata=None)
+
+        async def stream():
+            yield make_chunk("Reasoning", thought=True)
+            yield make_chunk("Answer", thought=False)
+
+        async def generate_content_stream(*args, **kwargs):
+            return stream()
+
+        mock_client.aio.models.generate_content_stream = generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        assert [chunk.delta for chunk in chunks if chunk.type is ChunkType.TOKEN] == [
+            "Answer"
+        ]
+        answer_chunk = next(chunk for chunk in chunks if chunk.type is ChunkType.TOKEN)
+        assert answer_chunk.raw["reasoning_content"] == "Reasoning"
+        assert answer_chunk.raw["reasoning"] == "Reasoning"
+        assert chunks[-1].finish_reason == "stop"
+        assert chunks[-1].raw["reasoning_content"] == "Reasoning"
+
+    @pytest.mark.asyncio
+    async def test_usage_only_chunk_keeps_prior_reasoning_on_raw(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "10")
+        mock_client = MagicMock()
+
+        class Chunk(SimpleNamespace):
+            def model_dump(self):
+                return vars(self).copy()
+
+        thought = Chunk(
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(
+                        parts=[
+                            SimpleNamespace(
+                                text="Reasoning", thought=True, function_call=None
+                            )
+                        ]
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage_metadata=None,
+        )
+        usage_only = Chunk(
+            candidates=None,
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=3,
+                candidates_token_count=1,
+                cached_content_token_count=0,
+            ),
+        )
+        answer = Chunk(
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(
+                        parts=[
+                            SimpleNamespace(
+                                text="Answer", thought=False, function_call=None
+                            )
+                        ]
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage_metadata=None,
+        )
+
+        async def stream():
+            yield thought
+            yield usage_only
+            yield answer
+
+        async def generate_content_stream(*args, **kwargs):
+            return stream()
+
+        mock_client.aio.models.generate_content_stream = generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "hello"}])
+        ]
+
+        usage_chunk = next(chunk for chunk in chunks if chunk.type is ChunkType.USAGE)
+        assert usage_chunk.raw["reasoning_content"] == "Reasoning"
+        assert usage_chunk.raw["reasoning"] == "Reasoning"
+        answer_chunk = next(chunk for chunk in chunks if chunk.type is ChunkType.TOKEN)
+        assert answer_chunk.delta == "Answer"
+        assert answer_chunk.raw["reasoning_content"] == "Reasoning"
+
+    @pytest.mark.asyncio
     async def test_stream_chat_tool_calls_keep_distinct_runtime_indices(
         self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
     ) -> None:

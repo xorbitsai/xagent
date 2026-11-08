@@ -23,6 +23,13 @@ from ..exceptions import (
     LLMTimeoutError,
 )
 from ..stream_deadline import await_before_deadline
+from ..stream_progress import (
+    StreamAbort,
+    StreamProgressConfig,
+    StreamProgressGuard,
+    attach_reasoning_content_to_raw,
+    no_progress_tail_chunk,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
@@ -895,6 +902,20 @@ class GeminiLLM(BaseLLM):
             emitted_tool_call = False
             last_candidate_finish_reason: Any = None
             tool_call_index = 0
+            accumulated_reasoning_content = ""
+            accumulated_tool_calls: Dict[str, Dict[str, Any]] = {}
+            progress_guard = StreamProgressGuard(
+                StreamProgressConfig.from_env(model_name=self._model_name)
+            )
+            stream_abort: Optional[StreamAbort] = None
+            last_chunk: Any = None
+
+            def reasoning_raw(raw: Any) -> Any:
+                return attach_reasoning_content_to_raw(
+                    raw,
+                    accumulated_reasoning_content,
+                    has_reasoning_content=bool(accumulated_reasoning_content),
+                )
 
             # Process streaming response (async iteration)
             chunks = aiter(response_stream)
@@ -920,6 +941,12 @@ class GeminiLLM(BaseLLM):
                 except LLMTimeoutError:
                     await _close_stream(response_stream)
                     raise
+                last_chunk = chunk
+                event_chunks: List[StreamChunk] = []
+                has_content = False
+                reasoning_texts: List[str] = []
+                has_finish_reason = False
+                has_usage = False
                 if first_chunk:
                     first_chunk = False
                     logger.debug(
@@ -941,6 +968,7 @@ class GeminiLLM(BaseLLM):
                         usage_metadata, "cached_content_token_count", 0
                     )
                     cached_tokens = raw_cached if isinstance(raw_cached, int) else 0
+                    has_usage = bool(input_tokens or output_tokens)
 
                     if input_tokens > 0 or output_tokens > 0:
                         usage_received = True
@@ -961,30 +989,72 @@ class GeminiLLM(BaseLLM):
                         }
                         if cached_tokens:
                             usage_payload["cached_input_tokens"] = cached_tokens
-                        yield StreamChunk(
-                            type=ChunkType.USAGE,
-                            usage=usage_payload,
-                            raw=chunk,
+                        event_chunks.append(
+                            StreamChunk(
+                                type=ChunkType.USAGE,
+                                usage=usage_payload,
+                                raw=chunk,
+                            )
                         )
+
+                def emit_event_chunks() -> List[StreamChunk]:
+                    decorated: List[StreamChunk] = []
+                    for output_chunk in event_chunks:
+                        output_chunk.raw = reasoning_raw(output_chunk.raw)
+                        decorated.append(output_chunk)
+                    return decorated
 
                 # Extract content
                 if not chunk.candidates or len(chunk.candidates) == 0:
+                    stream_abort = progress_guard.observe(
+                        has_usage=has_usage,
+                        accumulated_tool_calls=accumulated_tool_calls,
+                    )
+                    if stream_abort is not None:
+                        break
+                    for output_chunk in emit_event_chunks():
+                        yield output_chunk
                     continue
 
                 candidate = chunk.candidates[0]
                 last_candidate_finish_reason = getattr(candidate, "finish_reason", None)
+                finish_reason_name = getattr(last_candidate_finish_reason, "name", None)
+                has_finish_reason = (
+                    last_candidate_finish_reason is not None
+                    and last_candidate_finish_reason != 0
+                    and finish_reason_name
+                    not in {"UNSPECIFIED", "FINISH_REASON_UNSPECIFIED"}
+                )
                 diagnostics = _gemini_candidate_diagnostics(candidate)
                 if diagnostics:
                     candidate_diagnostics.append(diagnostics)
 
                 # Check if candidate.content exists
                 if not hasattr(candidate, "content") or candidate.content is None:
+                    stream_abort = progress_guard.observe(
+                        has_finish_reason=has_finish_reason,
+                        has_usage=has_usage,
+                        accumulated_tool_calls=accumulated_tool_calls,
+                    )
+                    if stream_abort is not None:
+                        break
+                    for output_chunk in emit_event_chunks():
+                        yield output_chunk
                     continue
 
                 content_parts = candidate.content.parts
 
                 # Check if content_parts is None
                 if content_parts is None:
+                    stream_abort = progress_guard.observe(
+                        has_finish_reason=has_finish_reason,
+                        has_usage=has_usage,
+                        accumulated_tool_calls=accumulated_tool_calls,
+                    )
+                    if stream_abort is not None:
+                        break
+                    for output_chunk in emit_event_chunks():
+                        yield output_chunk
                     continue
 
                 for part in content_parts:
@@ -1004,35 +1074,65 @@ class GeminiLLM(BaseLLM):
 
                         emitted_content_or_tool = True
                         emitted_tool_call = True
-                        yield StreamChunk(
-                            type=ChunkType.TOOL_CALL,
-                            tool_calls=[
-                                {
-                                    "index": tool_call_index,
-                                    "id": f"call_{uuid.uuid4().hex[:16]}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": func_name,
-                                        "arguments": json.dumps(func_args),
-                                    },
-                                }
-                            ],
-                            finish_reason="tool_calls",
-                            raw=chunk,
+                        tool_call_id = f"call_{uuid.uuid4().hex[:16]}"
+                        tool_call = {
+                            "index": tool_call_index,
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": func_name,
+                                "arguments": json.dumps(func_args),
+                            },
+                        }
+                        accumulated_tool_calls[tool_call_id] = tool_call
+                        event_chunks.append(
+                            StreamChunk(
+                                type=ChunkType.TOOL_CALL,
+                                tool_calls=[tool_call],
+                                finish_reason="tool_calls",
+                                raw=chunk,
+                            )
                         )
                         tool_call_index += 1
 
                     elif hasattr(part, "text") and part.text:
                         text = part.text
-                        current_content += text
                         emitted_content_or_tool = True
+                        if getattr(part, "thought", False) is True:
+                            reasoning_texts.append(text)
+                            accumulated_reasoning_content += text
+                        else:
+                            current_content += text
+                            has_content = True
+                            event_chunks.append(
+                                StreamChunk(
+                                    type=ChunkType.TOKEN,
+                                    content=current_content,
+                                    delta=text,
+                                    raw=chunk,
+                                )
+                            )
 
-                        yield StreamChunk(
-                            type=ChunkType.TOKEN,
-                            content=current_content,
-                            delta=text,
-                            raw=chunk,
-                        )
+                stream_abort = progress_guard.observe(
+                    has_content=has_content,
+                    reasoning_texts=reasoning_texts,
+                    has_finish_reason=has_finish_reason,
+                    has_usage=has_usage,
+                    accumulated_tool_calls=accumulated_tool_calls,
+                )
+                if stream_abort is not None:
+                    break
+                for output_chunk in emit_event_chunks():
+                    yield output_chunk
+
+            if stream_abort is not None:
+                await _close_stream(response_stream)
+                yield no_progress_tail_chunk(
+                    stream_abort,
+                    accumulated_tool_calls,
+                    reasoning_raw(last_chunk),
+                )
+                return
 
             if not emitted_content_or_tool and (
                 candidate_diagnostics or partial_call_diagnostics
@@ -1073,7 +1173,7 @@ class GeminiLLM(BaseLLM):
             yield StreamChunk(
                 type=ChunkType.END,
                 finish_reason=end_finish_reason,
-                raw=None,
+                raw=reasoning_raw(last_chunk),
             )
 
         except LLMTimeoutError:

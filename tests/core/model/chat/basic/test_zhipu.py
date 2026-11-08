@@ -246,6 +246,91 @@ class TestZhipuLLM:
         assert tool_chunks[-1].finish_reason == "tool_calls"
 
     @pytest.mark.asyncio
+    async def test_stream_empty_delta_aborts_with_shared_tail(
+        self, zhipu_llm, mock_zhipu_client, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+        mock_zhipu_client.chat.completions.create.return_value = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="unreachable", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+
+        chunks = [
+            chunk
+            async for chunk in zhipu_llm.stream_chat(
+                [{"role": "user", "content": "hello"}]
+            )
+        ]
+
+        assert len(chunks) == 1
+        assert chunks[0].type == ChunkType.END
+        assert chunks[0].finish_reason == "no_progress"
+        assert chunks[0].raw["stream_aborted"] == "empty_deltas"
+
+    @pytest.mark.asyncio
+    async def test_stream_reasoning_content_counts_as_progress(
+        self, zhipu_llm, mock_zhipu_client, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "1")
+        mock_zhipu_client.chat.completions.create.return_value = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            reasoning_content="Thinking",
+                            tool_calls=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="Answer", reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+
+        chunks = [
+            chunk
+            async for chunk in zhipu_llm.stream_chat(
+                [{"role": "user", "content": "hello"}]
+            )
+        ]
+
+        assert [chunk.delta for chunk in chunks if chunk.type is ChunkType.TOKEN] == [
+            "Answer"
+        ]
+        answer_chunk = next(chunk for chunk in chunks if chunk.type is ChunkType.TOKEN)
+        assert answer_chunk.raw["reasoning_content"] == "Thinking"
+        assert answer_chunk.raw["reasoning"] == "Thinking"
+        assert chunks[-1].finish_reason == "stop"
+
+    @pytest.mark.asyncio
     async def test_none_api_response(self, zhipu_llm, mock_zhipu_client):
         """Test handling of None API response."""
         mock_zhipu_client.chat.completions.create.return_value = None

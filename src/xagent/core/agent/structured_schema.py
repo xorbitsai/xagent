@@ -21,7 +21,7 @@ bool is never a number, ``0`` is never ``False``, and a tuple or a dict
 subclass is never an array or an object. Name rules always use
 ``re.fullmatch`` so that a trailing newline cannot slip through. All walks use
 an explicit stack; only the serialization in S1 and in
-:func:`canonical_json_bytes` relies on the interpreter's recursion limit, and
+:func:`canonical_json_size` relies on the interpreter's recursion limit, and
 S1 turns a ``RecursionError`` into a violation.
 """
 
@@ -856,8 +856,7 @@ def _own_size(own: dict[str, Any]) -> int:
     """The size of a node of the copy with every child replaced by a single
     byte, minus those bytes: the node's own contribution to the copy."""
     children = len(own.get("properties", ())) + ("items" in own)
-    text = json.dumps(own, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return len(text.encode("utf-8")) - children
+    return canonical_json_size(own) - children
 
 
 def _own_bytes(
@@ -874,9 +873,10 @@ def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
     One bottom-up pass over the nodes, each measured once however many times
     it is referenced: the node count, the depth and the enum values of a node
     follow from its children, and so does the size of its copy, because a
-    node's own bytes are known without building the copy. Nothing is copied or
-    rewritten, so a schema that expands to millions of nodes costs as much as
-    its original size.
+    node's own bytes are known without building the copy. Each node is
+    rewritten once, on its own and with its children left out, and no
+    reference is expanded, so a schema that expands to millions of nodes costs
+    as much as its original size.
     """
     defs = _defs_of(schema)
     order: list[dict[str, Any]] = []
@@ -988,7 +988,7 @@ class CompiledSchema:
     root: int
 
 
-def canonical_json_bytes(value: Any) -> int:
+def canonical_json_size(value: Any) -> int:
     """The size in bytes of the canonical JSON text of ``value``.
 
     The text is compact, keeps the key order, writes non-ASCII characters as
@@ -1017,10 +1017,6 @@ def _position_of(
     return node, None
 
 
-def _canonical_value_bytes(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
-
-
 def _compile_node(
     target: dict[str, Any], from_union: bool, kids: list[int], nodes: list[CompiledNode]
 ) -> CompiledNode:
@@ -1040,7 +1036,7 @@ def _compile_node(
             single = values[0]
             if kind == "integer" and type(single) is float:
                 single = int(single)
-            single_bytes = _canonical_value_bytes(single)
+            single_bytes = canonical_json_size(single)
 
     declared_properties = target.get("properties")
     names = list(declared_properties) if type(declared_properties) is dict else []
@@ -1260,14 +1256,10 @@ class _Val:
         self.value = value
 
 
-class _Obj:
-    __slots__ = ("kids",)
+class _Kids:
+    """An object or a list that is not empty: the reduced value of each
+    property, in the order of the node's properties, or of each item."""
 
-    def __init__(self, kids: list[Any]) -> None:
-        self.kids = kids
-
-
-class _Arr:
     __slots__ = ("kids",)
 
     def __init__(self, kids: list[Any]) -> None:
@@ -1370,7 +1362,7 @@ def _reduce(
         if all(r is _EMPTY for r in results) and (is_object or count):
             done = _EMPTY
         else:
-            done = _Obj(results) if is_object else _Arr(results)
+            done = _Kids(results)
         if stack:
             stack[-1][5].append(done)
     return done, steps, blanks
@@ -1386,7 +1378,7 @@ def _scalar_bytes(value: Any) -> int:
         return len(str(value))
     if type(value) is float:
         return len(repr(value))
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    return canonical_json_size(value)
 
 
 def _copy_template(compiled: CompiledSchema, index: int) -> dict[str, Any]:
@@ -1459,7 +1451,7 @@ def _decide(
             unexpressible_count += 1
             if len(unexpressible) < MAX_LISTED_FIELDS:
                 unexpressible.append(_pointer_of(link))
-        elif type(item) is _Obj:
+        elif type(item) is _Kids and node.kind == "object":
             out = dict.fromkeys(name for name, _, _ in node.properties)
             parent[key] = out
             output_bytes += 2 + max(len(out) - 1, 0)
@@ -1468,7 +1460,7 @@ def _decide(
                 list(zip(node.properties, item.kids))
             ):
                 work.append((child, kid, (name, link), out, name))
-        elif type(item) is _Arr:
+        elif type(item) is _Kids:
             assert node.items is not None
             items_out: list[Any] = [None] * len(item.kids)
             parent[key] = items_out

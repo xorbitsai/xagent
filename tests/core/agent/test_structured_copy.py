@@ -13,7 +13,7 @@ from jsonschema import Draft202012Validator
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import (
     allowed_values_suffix,
-    canonical_json_bytes,
+    canonical_json_size,
     check_schema_structure,
     measure_expansion,
 )
@@ -396,7 +396,7 @@ def test_the_copy_has_no_reference_no_definitions_and_stays_inside_the_limits() 
 
     assert not _keys_anywhere(result) & {"$ref", "$defs", "anyOf"}
     assert len(_walk_nodes(result)) <= measure_expansion(schema).nodes
-    assert canonical_json_bytes(result) <= 65536
+    assert canonical_json_size(result) <= 65536
 
 
 def test_a_schema_of_3_kb_whose_copy_is_290_kb_is_refused_at_request_time() -> None:
@@ -424,7 +424,7 @@ def test_a_copy_of_exactly_64_kib_of_chinese_text_is_accepted() -> None:
     assert check_schema_structure(schema) is None
     result = _copy_of(schema)
 
-    assert canonical_json_bytes(result) == 65536
+    assert canonical_json_size(result) == 65536
     ascii_size = len(json.dumps(result, separators=(",", ":")).encode("utf-8"))
     assert ascii_size > 65536 * 1.5
 

@@ -20,7 +20,7 @@ from xagent.core.agent.structured_schema import (
     SchemaViolation,
     allowed_values_suffix,
     canon,
-    canonical_json_bytes,
+    canonical_json_size,
     check_schema_structure,
     json_kind,
     measure_expansion,
@@ -836,7 +836,7 @@ def test_the_estimated_size_equals_the_size_of_the_copy_built_in_full(
 
     measured = measure_expansion(schema)
 
-    assert measured.rewritten_bytes == canonical_json_bytes(
+    assert measured.rewritten_bytes == canonical_json_size(
         structured_schema.model_facing_schema(structured_schema.compile_schema(schema))
     )
     assert measured.nodes == _count_nodes(schema)
@@ -853,7 +853,7 @@ def test_the_estimated_size_equals_the_copy_of_random_schemas() -> None:
 
         measured = measure_expansion(schema)
 
-        assert measured.rewritten_bytes == canonical_json_bytes(copy_), schema
+        assert measured.rewritten_bytes == canonical_json_size(copy_), schema
 
 
 def test_the_estimate_does_not_change_the_schema() -> None:

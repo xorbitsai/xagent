@@ -441,33 +441,33 @@ def test_compiling_does_not_change_the_schema() -> None:
 
 
 def test_canonical_json_is_measured_in_bytes_not_characters() -> None:
-    assert structured_schema.canonical_json_bytes("é中\U0001f600") == 2 + 2 + 3 + 4
-    assert structured_schema.canonical_json_bytes("é") == 4
+    assert structured_schema.canonical_json_size("é中\U0001f600") == 2 + 2 + 3 + 4
+    assert structured_schema.canonical_json_size("é") == 4
 
 
 def test_canonical_json_writes_compact_separators_and_keeps_key_order() -> None:
     value = {"b": [1, 2.5, True, None], "a": {"k": "v"}}
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-    assert structured_schema.canonical_json_bytes(value) == len(text)
+    assert structured_schema.canonical_json_size(value) == len(text)
     assert text.startswith('{"b":')
 
 
 def test_canonical_json_writes_the_smallest_float_and_the_largest() -> None:
-    assert structured_schema.canonical_json_bytes(5e-324) == len("5e-324")
-    assert structured_schema.canonical_json_bytes(1e308) == len("1e+308")
-    assert structured_schema.canonical_json_bytes(-0.0) == len("-0.0")
+    assert structured_schema.canonical_json_size(5e-324) == len("5e-324")
+    assert structured_schema.canonical_json_size(1e308) == len("1e+308")
+    assert structured_schema.canonical_json_size(-0.0) == len("-0.0")
 
 
 def test_canonical_json_escapes_quotes_backslashes_and_control_characters() -> None:
-    assert structured_schema.canonical_json_bytes('a"b\\c\n') == len('"a\\"b\\\\c\\n"')
+    assert structured_schema.canonical_json_size('a"b\\c\n') == len('"a\\"b\\\\c\\n"')
 
 
 def test_canonical_json_refuses_a_value_that_is_not_finite() -> None:
     with pytest.raises(ValueError):
-        structured_schema.canonical_json_bytes(float("nan"))
+        structured_schema.canonical_json_size(float("nan"))
     with pytest.raises(ValueError):
-        structured_schema.canonical_json_bytes([float("inf")])
+        structured_schema.canonical_json_size([float("inf")])
 
 
 # --- judging ---------------------------------------------------------------------------
@@ -1120,7 +1120,7 @@ def test_the_counted_bytes_equal_the_bytes_of_the_serialized_output(
     result = _judge(SPECIAL, instance)
 
     assert isinstance(result, ss.Ready)
-    assert result.output_bytes == ss.canonical_json_bytes(result.output)
+    assert result.output_bytes == ss.canonical_json_size(result.output)
 
 
 def test_the_counted_bytes_equal_the_serialized_bytes_of_random_results(
@@ -1133,7 +1133,7 @@ def test_the_counted_bytes_equal_the_serialized_bytes_of_random_results(
             result = ss.judge_instance(compiled, gen_instance(rng, rnode))
             if isinstance(result, ss.Ready):
                 ready += 1
-                assert result.output_bytes == ss.canonical_json_bytes(result.output)
+                assert result.output_bytes == ss.canonical_json_size(result.output)
     assert ready > 400
 
 
@@ -1143,7 +1143,7 @@ def test_the_judgement_does_not_serialize_the_output(
     def fail(_value: object) -> int:
         raise AssertionError("the output was serialized")
 
-    monkeypatch.setattr(ss, "canonical_json_bytes", fail)
+    monkeypatch.setattr(ss, "canonical_json_size", fail)
 
     assert isinstance(
         _judge(
@@ -1159,7 +1159,7 @@ def test_an_empty_answer_counts_the_bytes_of_its_output() -> None:
     )
 
     assert isinstance(result, ss.Ready)
-    assert result.output_bytes == ss.canonical_json_bytes(result.output)
+    assert result.output_bytes == ss.canonical_json_size(result.output)
 
 
 def test_a_small_result_is_counted_to_the_byte() -> None:
@@ -1182,7 +1182,7 @@ def test_a_list_of_big_empty_objects_is_counted_to_the_byte(count: int) -> None:
     assert (
         result.output_bytes
         == 17_924 * count + 11
-        == ss.canonical_json_bytes(result.output)
+        == ss.canonical_json_size(result.output)
     )
     if count > 1:
         first, second = result.output["items"][:2]

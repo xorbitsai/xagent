@@ -949,12 +949,13 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     the same value, and the stored URL is not read. When it is omitted, the
     stored URL is read.
 
-    The comparison is strict on purpose. A grant of a caller without an
-    association may only be created by a member authorization that requires
-    the protected resource to equal the connector URL when it starts, when it
-    stores its flow and at the callback, so this comparison does not drop
-    such a grant. On a server whose protected resource differs from its URL,
-    members cannot authorize.
+    The comparison is strict on purpose. No code path in this repository
+    creates a grant for a caller without an association today. A flow that
+    does so must require the protected resource to equal the connector URL
+    when it starts, when it stores its flow and at the callback; this
+    comparison then never drops such a grant, and on a server whose protected
+    resource differs from its URL that flow refuses the member before any
+    grant is stored.
     """
     from ..models.mcp import MCPServer, UserMCPServer
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant

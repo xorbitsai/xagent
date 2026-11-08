@@ -116,6 +116,10 @@ def test_stdout_carries_only_the_document(monkeypatch, capfd):
     _install_adapter(
         monkeypatch, FakeAdapter([ConnectorTarget("gmail")], {"gmail": noisy_session})
     )
+    # pytest's root logger has handlers, which would make basicConfig a no-op.
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", root.level)
 
     code = cli.main(["--user", "monitor"])
 
@@ -125,6 +129,7 @@ def test_stdout_carries_only_the_document(monkeypatch, capfd):
     _document(out)
     for line in ("print from a tool", "raw write to fd 1", "child process output"):
         assert line in err
+    assert "a log line" in err
     assert "a log line" not in out
     # Stdout is back on its own stream after the run.
     print("after the run")
@@ -259,6 +264,10 @@ def test_an_engine_that_raises_is_a_run_failure(monkeypatch, capfd, caplog):
         # Selectors only: a tool name or an argument is not an option.
         ["--user", "monitor", "--tool", "gmail_search_messages"],
         ["--user", "monitor", "--arguments", "{}"],
+        # A selector must name something.
+        ["--user", "monitor", "--connector", ""],
+        ["--user", "monitor", "--connector", ","],
+        ["--user", "monitor", "--check", ""],
     ],
 )
 def test_invalid_arguments_exit_2_with_nothing_on_stdout(monkeypatch, capfd, argv):
@@ -340,3 +349,27 @@ def test_the_module_runs_as_a_one_shot_command(
 
     assert completed.returncode == 1, completed.stderr
     assert _document(completed.stdout)["failure"] == failure
+
+
+def test_a_database_that_cannot_connect_is_setup_database(tmp_path):
+    """The engine connects lazily: an unreachable database must fail at
+    setup, not inside the enumeration. SQLite cannot open a directory."""
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+    env = {
+        **os.environ,
+        "DATABASE_URL": f"sqlite:///{directory}",
+        "XAGENT_CONNECTOR_PROBE_USERS": "monitor",
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "xagent.web.connector_checks", "--user", "monitor"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 1, completed.stderr
+    assert _document(completed.stdout)["failure"] == "setup:database"

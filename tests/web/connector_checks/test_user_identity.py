@@ -31,6 +31,7 @@ from xagent.web.connector_checks.identity import (
 )
 from xagent.web.connector_checks.user_identity import UserIdentityAdapter
 from xagent.web.models.mcp import MCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.services.mcp_connector_session import (
     ConnectorToolsOutcome,
     ConnectorToolsResult,
@@ -186,6 +187,20 @@ async def test_a_custom_row_stamped_with_a_catalog_app_id_is_not_a_target(
 
     assert result.failure == "enumeration:no_connectors"
     assert loader.calls == []
+
+
+def test_a_connected_app_hidden_from_the_catalog_is_not_a_target(db_users):
+    db, user, _ = db_users
+    _connect_github(db, user)
+    _connect_catalog_stripe(db, user)
+    adapter = UserIdentityAdapter(db, "monitor")
+    assert [t.connector for t in adapter.enumerate_targets()] == ["github", "stripe"]
+    db.query(PublicMCPApp).filter_by(app_id="stripe").update(
+        {"is_visible_in_connector": False}
+    )
+    db.commit()
+
+    assert [t.connector for t in adapter.enumerate_targets()] == ["github"]
 
 
 @pytest.mark.parametrize("command", ["node", "npx"])

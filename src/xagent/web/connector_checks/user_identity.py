@@ -14,13 +14,16 @@ The targets are the catalog apps the Connectors page shows the user as
 connected (``GET /api/mcp/apps``, the listing V1's L2/L3 smoke reads), each
 with the server row that page selects for it. As in V1, an app hidden from
 the catalog (``is_visible_in_connector`` false) is not a target even while
-connected. A selected row that is not the catalog's own
+connected. A catalog app that needs reconnecting (a builtin OAuth token that
+was cleared or expired with no refresh token, or an ``mcp_oauth`` association
+without an active grant) is not shown as connected either, so it is not a
+target and the run does not report it (#3635). A selected row that is not the catalog's own
 (``connector_probe.owns_catalog_identity``: a user-owned row under a catalog
 id, or a catalog row whose launch has drifted) is offered with the skip
 reason ``not_catalog_identity`` and never started, as the probe route
-answers ``not_declared`` for it. A custom server, stamped with a catalog app
-id or not, is not a catalog app the page shows as connected, so it is not a
-target.
+answers ``not_declared`` for it. A custom server whose name is not a catalog
+app id (stamped with an app id or not) is not a catalog app the page shows as
+connected, so it is not a target.
 
 Each connector starts as the user's own task would start it: no actor policy
 and no team (``mcp_connector_session.list_connector_tools``). No fixture has

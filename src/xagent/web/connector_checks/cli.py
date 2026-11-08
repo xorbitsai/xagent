@@ -97,13 +97,17 @@ async def _run(args: argparse.Namespace) -> RunResult:
 
 @contextlib.contextmanager
 def _database() -> Iterator[Any]:
-    """A session on the service's database. Bind only: container startup
-    owns migrations and seeding."""
+    """A session on the service's database, connected before it is yielded.
+    It never migrates or seeds: container startup owns that."""
     from ..models.database import configure_db, get_engine, get_session_local
 
     configure_db()
     engine = get_engine()
     try:
+        # The engine connects lazily: connect now, so an unreachable database
+        # is a setup failure and not an enumeration one.
+        with engine.connect():
+            pass
         with get_session_local()() as db:
             yield db
     finally:
@@ -170,7 +174,9 @@ def _parser() -> argparse.ArgumentParser:
         "--total-timeout",
         type=_seconds,
         default=DEFAULT_TOTAL_TIMEOUT_SECONDS,
-        help="the whole run's bound in seconds (default: %(default)g)",
+        help="the run's budget in seconds, counted from before the connectors "
+        "are enumerated; only connector sessions and tool calls are cut short "
+        "(default: %(default)g)",
     )
     return parser
 
@@ -183,7 +189,10 @@ def _flatten(values: Iterable[frozenset[str]] | None) -> frozenset[str] | None:
 
 
 def _selector_names(value: str) -> frozenset[str]:
-    return frozenset(item.strip() for item in value.split(",") if item.strip())
+    names = frozenset(item.strip() for item in value.split(",") if item.strip())
+    if not names:
+        raise argparse.ArgumentTypeError("must name at least one")
+    return names
 
 
 def _environment(value: str) -> str:

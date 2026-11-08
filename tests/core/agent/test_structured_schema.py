@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import json
+import random
 import time
 import tracemalloc
 from pathlib import Path
@@ -12,10 +14,11 @@ from typing import Any
 import pytest
 
 from tests.shared.structured_path_reference import reference_render
+from tests.shared.structured_schema_random import gen_schema
+from tests.shared.structured_schema_reference import copy_size, expanded_copy
 from xagent.core.agent import structured_schema
 from xagent.core.agent.structured_schema import (
     ERROR_PATH_MAX_CHARS,
-    NOT_EXPRESSIBLE_MARKER,
     SchemaViolation,
     allowed_values_suffix,
     canon,
@@ -554,6 +557,30 @@ def test_the_same_names_without_the_newline_are_accepted() -> None:
 
 # --- scale attacks are refused quickly -------------------------------------------
 
+# These checks are pinned by what they return and, for S11, by how much text
+# they serialize. This bound only catches a slowdown by an order of magnitude.
+BACKSTOP_SECONDS = 10.0
+
+
+def _limit_serialized_bytes(monkeypatch: pytest.MonkeyPatch, limit: int) -> list[int]:
+    """Spy on ``json.dumps``: record the UTF-8 size of every text it writes and
+    fail as soon as the total passes ``limit``."""
+    real_dumps = json.dumps
+    written: list[int] = []
+
+    def counting_dumps(value: Any, *args: Any, **kwargs: Any) -> str:
+        text = real_dumps(value, *args, **kwargs)
+        written.append(len(text.encode("utf-8", "surrogatepass")))
+        assert sum(written) <= limit, f"serialized {sum(written)} bytes"
+        return text
+
+    monkeypatch.setattr(json, "dumps", counting_dumps)
+    return written
+
+
+def _size(schema: dict[str, Any]) -> int:
+    return len(json.dumps(schema, separators=(",", ":"), ensure_ascii=False).encode())
+
 
 def _nested_any_of(levels: int) -> dict[str, Any]:
     node: dict[str, Any] = STRING
@@ -601,16 +628,19 @@ SCALE_ATTACKS = [
 
 
 @pytest.mark.parametrize(("schema", "rule"), SCALE_ATTACKS)
-def test_scale_attacks_are_rejected_within_a_second(
-    schema: dict[str, Any], rule: str
+def test_scale_attacks_are_rejected(
+    schema: dict[str, Any], rule: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Each is refused before S11, so only S1 serializes the schema, once.
+    _limit_serialized_bytes(monkeypatch, _size(schema))
     start = time.perf_counter()
     found = check_schema_structure(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found is not None
     assert found.rule == rule
-    assert elapsed < 1.0
+    assert elapsed < BACKSTOP_SECONDS
 
 
 def test_an_unreferenced_entry_is_reported_with_the_first_one_in_key_order() -> None:
@@ -669,73 +699,6 @@ def _ref(name: str) -> dict[str, Any]:
 
 def _nullable(node: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [node, {"type": "null"}]}
-
-
-def _compact_bytes(value: Any) -> int:
-    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return len(text.encode("utf-8"))
-
-
-def _allowed_values(values: list[Any]) -> str:
-    text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-    return " Allowed values: " + (text if len(text) <= 500 else text[:500] + "\u2026")
-
-
-def _expanded_copy(
-    node: dict[str, Any],
-    defs: dict[str, Any],
-    *,
-    root: bool = False,
-    any_of: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """The copy handed to the model, built the long way: every node except the
-    root is made nullable, references and nullable unions are expanded, and an
-    enum lists its values in the description."""
-    if "$ref" in node:
-        return _expanded_copy(defs[node["$ref"].removeprefix("#/$defs/")], defs)
-    if "anyOf" in node:
-        value_branch = next(b for b in node["anyOf"] if b != {"type": "null"})
-        target = value_branch
-        while "$ref" in target:
-            target = defs[target["$ref"].removeprefix("#/$defs/")]
-        return _expanded_copy(target, defs, any_of=node)
-    copy_: dict[str, Any] = {}
-    for key, value in node.items():
-        if key == "properties":
-            copy_[key] = {k: _expanded_copy(v, defs) for k, v in value.items()}
-        elif key == "items":
-            copy_[key] = _expanded_copy(value, defs)
-        elif key not in ("$defs", "const"):
-            copy_[key] = value
-    enum = [node["const"]] if "const" in node else node.get("enum")
-    if root:
-        if enum is not None:
-            copy_["enum"] = enum
-        return copy_
-    if any_of is not None:
-        if "title" in node or "title" in any_of:
-            copy_["title"] = node.get("title", any_of.get("title"))
-        descriptions = [d["description"] for d in (any_of, node) if "description" in d]
-        if descriptions:
-            copy_["description"] = " ".join(descriptions)
-    if isinstance(copy_["type"], str):
-        copy_["type"] = [copy_["type"], "null"]
-    if enum is not None:
-        values = list(enum)
-        if None not in values:
-            values.append(None)
-        node_type = node["type"]
-        if node_type == "string" or (
-            isinstance(node_type, list) and "string" in node_type
-        ):
-            values.append(NOT_EXPRESSIBLE_MARKER)
-        copy_["enum"] = values
-        copy_["description"] = copy_.get("description", "") + _allowed_values(values)
-    return copy_
-
-
-def _size_of_copy(schema: dict[str, Any]) -> int:
-    return _compact_bytes(_expanded_copy(schema, schema.get("$defs", {}), root=True))
 
 
 def _count_nodes(schema: dict[str, Any]) -> int:
@@ -851,25 +814,112 @@ SIZE_SCHEMAS = {
             }
         },
     ),
+    "alias-of-an-alias-of-an-object": _obj(
+        {"a": _ref("A")},
+        **{"$defs": {"A": _ref("B"), "B": _obj({"x": STRING})}},
+    ),
     "long-enum-with-truncated-suffix": _obj(
         {"a": {"type": "string", "enum": [f"value-{i:03d}" for i in range(120)]}}
     ),
     "surrogate-pair-and-escapes": _obj(
         {"a": {"type": "string", "enum": ["\U0001f600", 'q"\\', "tab\t"]}}
     ),
+    "target-that-is-a-nullable-union": _obj(
+        {"a": _ref("N"), "b": {"type": "array", "items": _ref("N")}},
+        **{
+            "$defs": {
+                "N": {
+                    "anyOf": [
+                        {"type": "string", "description": "x"},
+                        {"type": "null"},
+                    ],
+                    "description": "y",
+                    "title": "T",
+                }
+            }
+        },
+    ),
+    "title-conflict": _obj(
+        {
+            "a": {
+                "title": "Outer",
+                "anyOf": [{"type": "string", "title": "Inner"}, {"type": "null"}],
+            }
+        }
+    ),
+    "ninety-nullable-references-to-one-enum": _obj(
+        {f"f{i:03d}": _nullable(_ref("E")) for i in range(90)},
+        **{
+            "$defs": {"E": {"type": "string", "enum": [f"v{i:02d}" for i in range(40)]}}
+        },
+    ),
 }
 
 
 @pytest.mark.parametrize("schema", SIZE_SCHEMAS.values(), ids=SIZE_SCHEMAS.keys())
-def test_the_estimated_size_equals_the_size_of_the_copy_built_in_full(
+def test_the_estimate_and_the_copy_match_the_reference_copy(
     schema: dict[str, Any],
 ) -> None:
     assert check_schema_structure(schema) is None
 
     measured = measure_expansion(schema)
+    built = structured_schema.model_facing_schema(
+        structured_schema.compile_schema(schema)
+    )
 
-    assert measured.rewritten_bytes == _size_of_copy(schema)
+    assert measured.rewritten_bytes == copy_size(schema)
+    assert built == expanded_copy(schema)
     assert measured.nodes == _count_nodes(schema)
+
+
+def test_the_estimate_and_the_copy_of_random_schemas_match_the_reference_copy() -> None:
+    rng = random.Random(20261104)
+    for _ in range(400):
+        schema = gen_schema(rng)
+        assert check_schema_structure(schema) is None, schema
+        built = structured_schema.model_facing_schema(
+            structured_schema.compile_schema(schema)
+        )
+
+        assert measure_expansion(schema).rewritten_bytes == copy_size(schema), schema
+        assert built == expanded_copy(schema), schema
+
+
+def _count_shapes(node: Any, counts: collections.Counter[str]) -> None:
+    if isinstance(node, dict):
+        declared = node.get("type")
+        types = declared if isinstance(declared, list) else [declared]
+        if "anyOf" in node and node["anyOf"][0] == {"type": "null"}:
+            counts["null-first-union"] += 1
+        if isinstance(declared, list) and declared[0] == "null":
+            counts["null-first-type"] += 1
+        if "enum" in node and "number" in types:
+            counts["number-enum"] += 1
+        if "const" in node and declared == "number":
+            counts["number-const"] += 1
+        if "const" in node and declared == "integer":
+            counts["integer-const"] += 1
+        for value in node.values():
+            _count_shapes(value, counts)
+    elif isinstance(node, list):
+        for value in node:
+            _count_shapes(value, counts)
+
+
+def test_the_random_schemas_hold_every_shape_the_compiler_branches_on() -> None:
+    counts: collections.Counter[str] = collections.Counter()
+    rng = random.Random(20261104)
+    for _ in range(400):
+        _count_shapes(gen_schema(rng), counts)
+
+    shapes = (
+        "null-first-union",
+        "null-first-type",
+        "number-enum",
+        "number-const",
+        "integer-const",
+    )
+    assert all(counts[shape] >= 10 for shape in shapes), counts
 
 
 def test_the_estimate_does_not_change_the_schema() -> None:
@@ -983,18 +1033,23 @@ def test_a_small_schema_whose_copy_would_be_over_a_megabyte_is_refused() -> None
     assert _violation(schema) == ("S11", "")
 
 
-def test_a_500_value_enum_expanded_nine_times_is_refused_within_a_second() -> None:
+def test_a_500_value_enum_expanded_nine_times_is_refused_without_building_the_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     values = [f"{i:04d}-" + "v" * 14 for i in range(500)]
     schema = _layered_schema(9, {"type": "string", "enum": values})
     original = len(json.dumps(schema, separators=(",", ":")).encode())
     assert 8000 < original < 16384
-
+    # S11 refuses this schema because its copy is over MAX_EXPANDED_BYTES, so a
+    # check that serialized less than that in total never serialized the copy.
+    _limit_serialized_bytes(monkeypatch, structured_schema.MAX_EXPANDED_BYTES)
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found == ("S11", "")
-    assert elapsed < 1.0, f"took {elapsed * 1000:.1f} ms"
+    assert elapsed < BACKSTOP_SECONDS
 
 
 def test_an_unreferenced_entry_is_refused_before_any_expansion_is_measured(
@@ -1033,25 +1088,38 @@ def test_the_expanded_size_is_judged_before_the_enum_rules() -> None:
     assert _violation(schema) == ("S11", "")
 
 
-def test_a_500_layer_alias_chain_is_refused_quickly() -> None:
+def test_a_500_layer_alias_chain_is_refused_quickly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     defs: dict[str, Any] = {f"a{i}": _ref(f"a{i + 1}") for i in range(499)}
     defs["a499"] = STRING
     schema = _obj({"p": _ref("a0")}, **{"$defs": defs})
+    # S1 writes the schema once and S11 writes each node once with its children
+    # left out; a reference is never written, so the total stays near the
+    # size of the schema however long the chain is.
+    _limit_serialized_bytes(monkeypatch, 2 * _size(schema))
 
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found == ("S11", "")
-    assert elapsed < 1.0
+    assert elapsed < BACKSTOP_SECONDS
 
 
-def test_a_100_layer_doubling_chain_is_refused_quickly() -> None:
+def test_a_100_layer_doubling_chain_is_refused_quickly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     schema = _obj({"p": _ref("d0")}, **{"$defs": _doubling_defs(100)})
+    # Each entry is written once however often it is referenced, so the total
+    # follows the size of the schema, not the 2**100 nodes of its expansion.
+    _limit_serialized_bytes(monkeypatch, 2 * _size(schema))
 
     start = time.perf_counter()
     found = _violation(schema)
     elapsed = time.perf_counter() - start
+    monkeypatch.undo()
 
     assert found == ("S11", "")
-    assert elapsed < 1.0
+    assert elapsed < BACKSTOP_SECONDS

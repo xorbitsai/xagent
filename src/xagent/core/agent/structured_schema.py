@@ -1,26 +1,39 @@
-"""Structural checks for the JSON Schema subset accepted for structured output.
+"""The JSON Schema subset accepted for structured output: checking, compiling
+and judging.
 
-:func:`check_schema_structure` is the single entry point. It runs the schema
-rules S1 to S13 in a fixed order and returns the first violation as a
-:class:`SchemaViolation` (a rule id and the path of the offending value), or
-``None`` when the schema is acceptable. It never raises for any JSON value and
-never echoes a value of the schema: callers render the path with
-:func:`render_error_path`.
+:func:`check_schema_structure` runs the schema rules S1 to S13 in a fixed
+order and returns the first violation as a :class:`SchemaViolation` (a rule id
+and the path of the offending value), or ``None`` when the schema is
+acceptable. It never raises for any JSON value and never echoes a value of the
+schema: callers render the path with :func:`render_error_path`.
+
+:func:`compile_schema` turns a schema that passed those rules into the nodes
+used for judging, and :func:`model_facing_schema` writes the nullable copy
+of the schema that the model is shown. :func:`judge_instance` and
+:func:`judge_empty_answer` judge a value against the compiled schema and return
+the outcome as a value: :class:`Ready`, :class:`Incomplete`, :class:`Err` or
+:class:`TooComplex`. Compiling, copying and judging, like every other function
+here, are pure: they neither mutate their arguments nor read or write anything
+outside them.
 
 Every judgement about a JSON value goes through :func:`json_kind` first. A
 bool is never a number, ``0`` is never ``False``, and a tuple or a dict
 subclass is never an array or an object. Name rules always use
 ``re.fullmatch`` so that a trailing newline cannot slip through. All walks use
-an explicit stack; only the serialization in S1 relies on the interpreter's
-recursion limit, and it turns a ``RecursionError`` into a violation.
+an explicit stack. Only the serialization in S1 and in
+:func:`canonical_json_size`, and the copy of the schema that
+:func:`compile_schema` takes, rely on the interpreter's recursion limit: S1
+turns a ``RecursionError`` into a violation, and a schema reaches
+:func:`compile_schema` only after S2 has capped its nesting at 32 levels.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +50,13 @@ MAX_EXPANDED_DEPTH = 32
 MAX_EXPANDED_BYTES = 65536
 MAX_EXPANDED_ENUM_VALUES = 5000
 ALLOWED_VALUES_MAX_CHARS = 500
+# The most positions one judgement may count: the instance positions it visits
+# plus the positions that expanding empty required objects adds to the result.
+MAX_JUDGED_STEPS = 200_000
+# The most bytes of canonical JSON a judged result may take.
+MAX_RESULT_BYTES = 2_097_152
+# The most field paths a judgement lists for one reason.
+MAX_LISTED_FIELDS = 20
 
 # Rewritten schemas carry this marker as one more allowed value of a string
 # enum, so a caller's own enum value can never be the marker.
@@ -178,7 +198,7 @@ def normalized_enum(node: dict[str, Any]) -> list[Any] | None:
     return enum if type(enum) is list else None
 
 
-def conforms_to_type(value: object, types: list[str]) -> bool:
+def conforms_to_type(value: object, types: Collection[str]) -> bool:
     """Whether a value is accepted by a node whose ``type`` names ``types``."""
     kind = json_kind(value)
     if kind == "null":
@@ -772,56 +792,82 @@ def _expansion_dependencies(
     return _children_of(node)
 
 
-def _own_bytes(
-    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
-) -> int:
-    """The size of one node of the copy with every child replaced by a single
-    byte, minus those bytes: the node's own contribution to the copy.
+def make_nullable(
+    node: dict[str, Any], any_of: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The copy of ``node`` that also allows null; ``node`` is not changed.
 
-    Every node but the root is made nullable: a single type ``T`` becomes
-    ``[T, "null"]``, an enum gains ``null`` if it has none, and a string enum
-    gains the reserved marker. A node with an enum then lists its values at the
-    end of its description. A nullable union is merged into its value node
-    first: the union supplies the title unless the value node has one, and the
-    two descriptions are joined by a space.
+    A single type ``T`` becomes ``[T, "null"]`` and an enum that lacks ``null``
+    gains it, so a node that is nullable already comes back equal. A node must
+    list an enum as ``enum``, never as ``const`` (see :func:`normalized_enum`).
+    Given the ``anyOf`` node whose value branch ``node`` is, the union supplies
+    the title unless ``node`` has one, and the two descriptions are joined by a
+    space.
+    """
+    nullable = dict(node)
+    if any_of is not None:
+        if "title" not in node and "title" in any_of:
+            nullable["title"] = any_of["title"]
+        descriptions = [d["description"] for d in (any_of, node) if "description" in d]
+        if descriptions:
+            nullable["description"] = " ".join(descriptions)
+    if type(nullable["type"]) is str:
+        nullable["type"] = [nullable["type"], "null"]
+    if "enum" in nullable:
+        values = list(nullable["enum"])
+        if not any(v is None for v in values):
+            values.append(None)
+        nullable["enum"] = values
+    return nullable
+
+
+def _rewritten_node(
+    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """One node of the copy shown to the model, with every child replaced by
+    the placeholder ``0``.
+
+    Every node but the root is made nullable by :func:`make_nullable`. A string
+    enum then gains the reserved marker, and a node with an enum lists its
+    values at the end of its description. ``$defs`` is dropped and ``const``
+    is written as an enum.
     """
     own: dict[str, Any] = {}
-    children = 0
     for key, value in node.items():
         if key == "properties":
             own[key] = dict.fromkeys(value, 0)
-            children += len(value)
         elif key == "items":
             own[key] = 0
-            children += 1
         elif key not in ("$defs", "const"):
             own[key] = value
     enum = normalized_enum(node)
     if enum is not None:
         own["enum"] = enum
-    if not root:
-        if any_of is not None:
-            if "title" not in node and "title" in any_of:
-                own["title"] = any_of["title"]
-            descriptions = [
-                d["description"] for d in (any_of, node) if "description" in d
-            ]
-            if descriptions:
-                own["description"] = " ".join(descriptions)
-        if type(own["type"]) is str:
-            own["type"] = [own["type"], "null"]
-        if enum is not None:
-            values = list(enum)
-            if not any(v is None for v in values):
-                values.append(None)
-            if is_string_typed(node):
-                values.append(NOT_EXPRESSIBLE_MARKER)
-            own["enum"] = values
-            own["description"] = own.get("description", "") + allowed_values_suffix(
-                values
-            )
-    text = json.dumps(own, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return len(text.encode("utf-8")) - children
+    if root:
+        return own
+    own = make_nullable(own, any_of)
+    if enum is not None:
+        if is_string_typed(own):
+            own["enum"].append(NOT_EXPRESSIBLE_MARKER)
+        own["description"] = own.get("description", "") + allowed_values_suffix(
+            own["enum"]
+        )
+    return own
+
+
+def _own_size(own: dict[str, Any]) -> int:
+    """The size of a node of the copy with every child replaced by a single
+    byte, minus those bytes: the node's own contribution to the copy."""
+    children = len(own.get("properties", ())) + ("items" in own)
+    return canonical_json_size(own) - children
+
+
+def _own_bytes(
+    node: dict[str, Any], *, root: bool, any_of: dict[str, Any] | None = None
+) -> int:
+    """The node's own contribution to the size of the copy shown to the model,
+    which :func:`model_facing_schema` writes from the same rewritten node."""
+    return _own_size(_rewritten_node(node, root=root, any_of=any_of))
 
 
 def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
@@ -830,9 +876,10 @@ def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
     One bottom-up pass over the nodes, each measured once however many times
     it is referenced: the node count, the depth and the enum values of a node
     follow from its children, and so does the size of its copy, because a
-    node's own bytes are known without building the copy. Nothing is copied or
-    rewritten, so a schema that expands to millions of nodes costs as much as
-    its original size.
+    node's own bytes are known without building the copy. Each node is
+    rewritten once, on its own and with its children left out, and no
+    reference is expanded, so a schema that expands to millions of nodes costs
+    as much as its original size.
     """
     defs = _defs_of(schema)
     order: list[dict[str, Any]] = []
@@ -883,3 +930,631 @@ def measure_expansion(schema: dict[str, Any]) -> ExpansionMetrics:
     return ExpansionMetrics(
         nodes=nodes, depth=height, enum_values=enums, rewritten_bytes=size
     )
+
+
+# --- compiling ------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledNode:
+    """One position of the caller's schema, ready for judging.
+
+    ``$ref`` is resolved (an alias chain to its end) and a nullable union is
+    folded into its value node, so the same target used directly and inside a
+    union gives two nodes that share their children. ``types`` is the node's
+    ``type`` as written, as a tuple. ``enum_keys`` holds the canonical keys of
+    the non-null enum values. ``single`` is the only allowed value of a node
+    that is not nullable and lists exactly one non-null value (an integer node
+    stores an integral float as an int), and ``single_bytes`` its canonical
+    JSON size.
+
+    The remaining fields describe what the node stands for when its value is
+    empty. A nullable node is one null (1 node, 4 bytes) and a node with a
+    ``single`` is that value (1 node, ``single_bytes``); neither has a
+    ``template``. Otherwise ``missing_total`` counts the positions that stay
+    unfilled below the node and ``missing_paths`` holds the first
+    ``MAX_LISTED_FIELDS`` of them relative to the node, in document order. An
+    object with nothing missing has a ``template``: its node count, its
+    canonical JSON size and the entries that build it, ``(name, mode, value)``
+    where mode 0 is a null, mode 1 the only allowed value ``value`` and mode 2
+    the template of node number ``value``. Templates refer to each other by
+    node number, so their storage grows with the number of nodes, not with the
+    size of the expansion. Every field holds an immutable value.
+    """
+
+    kind: str
+    types: tuple[str, ...]
+    nullable: bool
+    enum_keys: frozenset[tuple[Any, ...]] | None
+    single: Any
+    single_bytes: int
+    properties: tuple[tuple[str, int, int], ...]
+    items: int | None
+    missing_total: int
+    missing_paths: tuple[str, ...]
+    template_nodes: int
+    template_bytes: int
+    template: tuple[tuple[str, int, Any], ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledSchema:
+    """A schema that passed the structural checks, compiled for judging.
+
+    ``schema`` is a deep copy of the caller's schema taken by
+    :func:`compile_schema` and kept for the copy shown to the model, so the copy
+    and the judgement always read the same schema; nothing here changes it.
+    ``nodes`` lists every compiled node with the children of a node before the
+    node, and ``root`` is the number of the root node.
+    """
+
+    schema: dict[str, Any]
+    nodes: tuple[CompiledNode, ...]
+    root: int
+
+
+def canonical_json_size(value: Any) -> int:
+    """The size in bytes of the canonical JSON text of ``value``.
+
+    The text is compact, keeps the key order, writes non-ASCII characters as
+    they are and is encoded as UTF-8. It raises ``ValueError`` for a NaN or an
+    infinity and ``UnicodeEncodeError`` for a string with a lone surrogate.
+    """
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return len(text.encode("utf-8"))
+
+
+def _pointer_segment(name: str) -> str:
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+def _position_of(
+    node: dict[str, Any], defs: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The node a schema position stands for and the nullable union that made
+    it nullable, if any: references and aliases are followed and a union is
+    read as its value node."""
+    node = resolve_alias(node, defs)
+    if "anyOf" in node:
+        branches = node["anyOf"]
+        value = branches[1] if _is_null_branch(branches[0]) else branches[0]
+        return resolve_alias(value, defs), node
+    return node, None
+
+
+def _compile_node(
+    target: dict[str, Any], from_union: bool, kids: list[int], nodes: list[CompiledNode]
+) -> CompiledNode:
+    declared = target["type"]
+    types = tuple(declared) if type(declared) is list else (declared,)
+    kind = next(t for t in types if t != "null")
+    nullable = from_union or "null" in types
+
+    enum_keys = None
+    single = None
+    single_bytes = 0
+    enum = normalized_enum(target)
+    if enum is not None:
+        values = [v for v in enum if v is not None]
+        enum_keys = frozenset(canon(v) for v in values)
+        if not nullable and len(values) == 1:
+            single = values[0]
+            if kind == "integer" and type(single) is float:
+                single = int(single)
+            single_bytes = canonical_json_size(single)
+
+    declared_properties = target.get("properties")
+    names = list(declared_properties) if type(declared_properties) is dict else []
+    properties = tuple((name, len(name) + 2, kids[i]) for i, name in enumerate(names))
+    items = kids[len(names)] if "items" in target else None
+
+    missing_total = 0
+    missing_paths: tuple[str, ...] = ()
+    template_nodes = 0
+    template_bytes = 0
+    template = None
+    if nullable:
+        template_nodes, template_bytes = 1, 4
+    elif kind == "object":
+        paths: list[str] = []
+        for name, _, index in properties:
+            child = nodes[index]
+            missing_total += child.missing_total
+            for relative in child.missing_paths:
+                if len(paths) < MAX_LISTED_FIELDS:
+                    paths.append("/" + _pointer_segment(name) + relative)
+        missing_paths = tuple(paths)
+        if missing_total == 0:
+            entries: list[tuple[str, int, Any]] = []
+            template_nodes = 1
+            template_bytes = 2 + max(len(properties) - 1, 0)
+            for name, key_bytes, index in properties:
+                child = nodes[index]
+                template_nodes += child.template_nodes
+                template_bytes += key_bytes + 1 + child.template_bytes
+                if child.nullable:
+                    entries.append((name, 0, None))
+                elif child.kind == "object":
+                    entries.append((name, 2, index))
+                else:
+                    entries.append((name, 1, child.single))
+            template = tuple(entries)
+    elif single is not None:
+        template_nodes, template_bytes = 1, single_bytes
+    else:
+        missing_total, missing_paths = 1, ("",)
+
+    return CompiledNode(
+        kind=kind,
+        types=types,
+        nullable=nullable,
+        enum_keys=enum_keys,
+        single=single,
+        single_bytes=single_bytes,
+        properties=properties,
+        items=items,
+        missing_total=missing_total,
+        missing_paths=missing_paths,
+        template_nodes=template_nodes,
+        template_bytes=template_bytes,
+        template=template,
+    )
+
+
+def compile_schema(schema: dict[str, Any]) -> CompiledSchema:
+    """Compile a schema that passed :func:`check_schema_structure`.
+
+    Every position the root reaches becomes one node, built bottom-up so that
+    a node is built once however often it is referenced. The schema is deep
+    copied first and only the copy is read and kept, so the caller's schema is
+    never changed and later changes to it reach neither the copy shown to the
+    model nor a judgement. A ``$defs`` entry that refers to itself, which S9
+    refuses, raises ``ValueError`` here instead of being followed forever.
+    """
+    schema = copy.deepcopy(schema)
+    if _check_no_recursion(schema) is not None:
+        raise ValueError("a $defs entry of the schema refers to itself")
+    defs = _defs_of(schema)
+
+    def kids_of(target: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:
+        positions = [_position_of(child, defs) for child in _children_of(target)]
+        return [(found, union is not None) for found, union in positions]
+
+    nodes: list[CompiledNode] = []
+    index_of: dict[tuple[int, bool], int] = {}
+    root_target, root_node = _position_of(schema, defs)
+    root_union = root_node is not None
+    stack: list[list[Any]] = [[root_target, root_union, kids_of(root_target), 0]]
+    while stack:
+        frame = stack[-1]
+        target, from_union, kids, position = frame
+        if position < len(kids):
+            frame[3] = position + 1
+            kid_target, kid_union = kids[position]
+            if (id(kid_target), kid_union) not in index_of:
+                stack.append([kid_target, kid_union, kids_of(kid_target), 0])
+            continue
+        stack.pop()
+        indexes = [index_of[(id(t), u)] for t, u in kids]
+        index_of[(id(target), from_union)] = len(nodes)
+        nodes.append(_compile_node(target, from_union, indexes, nodes))
+    return CompiledSchema(
+        schema=schema,
+        nodes=tuple(nodes),
+        root=index_of[(id(root_target), root_union)],
+    )
+
+
+# --- the copy shown to the model --------------------------------------------------
+
+
+def model_facing_schema(compiled: CompiledSchema) -> dict[str, Any]:
+    """The schema the model is shown: the caller's schema with every node but
+    the root made nullable.
+
+    The copy holds no ``$ref``, ``$defs`` or ``anyOf``; each reference is
+    expanded with its own copy of the target, so no two positions share a list
+    or a dict with each other or with the caller's schema, and a string enum
+    lists the reserved marker. It only tells the model what it may write; a
+    value is always judged against the caller's schema. The copy is built node
+    by node, and ``ValueError`` is raised as soon as it passes
+    ``MAX_EXPANDED_BYTES``, whatever the schema.
+    """
+    schema = compiled.schema
+    defs = _defs_of(schema)
+    limit = MAX_EXPANDED_BYTES
+    spent = 0
+    result: list[Any] = [None]
+    work: list[tuple[Any, Any, dict[str, Any], bool]] = [(result, 0, schema, True)]
+    while work:
+        holder, key, position, is_root = work.pop()
+        target, union = _position_of(position, defs)
+        node = _rewritten_node(target, root=is_root, any_of=union)
+        spent += _own_size(node)
+        if spent > limit:
+            raise ValueError("the copy of the schema is over the size limit")
+        for name, value in node.items():
+            if type(value) is list:
+                node[name] = list(value)
+        holder[key] = node
+        if "items" in target:
+            work.append((node, "items", target["items"], False))
+        properties = target.get("properties")
+        if type(properties) is dict:
+            for name in reversed(list(properties)):
+                work.append((node["properties"], name, properties[name], False))
+    copied: dict[str, Any] = result[0]
+    return copied
+
+
+# --- judging ------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Ready:
+    """A value that fills the caller's schema.
+
+    ``output`` is built from the value, the schema's only allowed values and
+    the templates of empty required objects; its keys follow the order of the
+    schema's properties. The counts hold what was seen on the way: the gaps
+    (always 0 here), the blank strings read as null, the instance positions
+    visited and the positions added by expanding empty required objects.
+    ``output_bytes`` is the size of ``output`` as canonical JSON, counted while
+    the output is built.
+    """
+
+    output: Any
+    missing_count: int
+    unexpressible_count: int
+    blank_as_null_count: int
+    r1_steps: int
+    expansion_nodes: int
+    output_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Incomplete:
+    """A value with gaps. ``missing_fields`` lists the positions with nothing
+    written and ``unexpressible_fields`` those marked as not writable, each at
+    most ``MAX_LISTED_FIELDS`` long and in document order, with the true totals
+    in the counts. No output is kept."""
+
+    missing_fields: list[str]
+    unexpressible_fields: list[str]
+    missing_count: int
+    unexpressible_count: int
+    blank_as_null_count: int
+    r1_steps: int
+    expansion_nodes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Err:
+    """A value that breaks the schema's shape: ``path`` is a JSON Pointer made
+    from the schema's property names and list indices, ``rule`` one of
+    ``type``, ``enum``, ``missing_property``, ``extra_property`` or ``marker``.
+    The value itself is never reported."""
+
+    path: str
+    rule: str
+
+
+@dataclass(frozen=True, slots=True)
+class TooComplex:
+    """A value too big to judge or to return. ``stage`` is ``"r1"`` when the
+    shape check passed the step limit and ``"r4"`` when a result that is
+    complete would pass ``MAX_JUDGED_STEPS`` positions or ``MAX_RESULT_BYTES``
+    of canonical JSON; ``output_bytes`` is 0 for ``"r1"``."""
+
+    stage: str
+    r1_steps: int
+    expansion_nodes: int
+    output_bytes: int
+
+
+class _Empty:
+    """Nothing is written at a position."""
+
+
+class _Unexpressible:
+    """The marker is written at a position."""
+
+
+class _Val:
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+class _Kids:
+    """An object or a list that is not empty: the reduced value of each
+    property, in the order of the node's properties, or of each item."""
+
+    __slots__ = ("kids",)
+
+    def __init__(self, kids: list[Any]) -> None:
+        self.kids = kids
+
+
+_EMPTY = _Empty()
+_UNEXPRESSIBLE = _Unexpressible()
+
+
+class _Stop(Exception):
+    """Ends the shape check with a verdict; it never leaves this module."""
+
+    def __init__(self, verdict: Err | TooComplex) -> None:
+        self.verdict = verdict
+
+
+def _pointer_of(link: Any) -> str:
+    """The JSON Pointer of a position kept as a chain of ``(segment, parent)``."""
+    return "".join(
+        "/" + (_pointer_segment(s) if type(s) is str else str(s)) for s in _unlink(link)
+    )
+
+
+def _reduce(
+    nodes: tuple[CompiledNode, ...], root: int, instance: Any
+) -> tuple[Any, int, int]:
+    """The shape check and the emptiness of every position in one walk.
+
+    Returns the reduced tree, the number of positions visited and the number of
+    blank strings read as null, or raises :class:`_Stop` at the first error in
+    document order. Each position reduces to ``_EMPTY``, ``_UNEXPRESSIBLE`` or a
+    value; an object whose properties all reduce to ``_EMPTY`` is ``_EMPTY``,
+    and so is a list with at least one item when every item is.
+    """
+    steps = 0
+    blanks = 0
+
+    def visit(index: int, value: Any, link: Any, is_root: bool) -> Any:
+        nonlocal steps, blanks
+        steps += 1
+        if steps > MAX_JUDGED_STEPS:
+            raise _Stop(TooComplex("r1", steps, 0, 0))
+        if value is None:
+            if is_root:
+                raise _Stop(Err(_pointer_of(link), "type"))
+            return _EMPTY
+        node = nodes[index]
+        if type(value) is str:
+            if value.strip() == "":
+                if is_root:
+                    raise _Stop(Err(_pointer_of(link), "type"))
+                blanks += 1
+                return _EMPTY
+            if NOT_EXPRESSIBLE_MARKER in value:
+                if (
+                    value == NOT_EXPRESSIBLE_MARKER
+                    and node.kind == "string"
+                    and not is_root
+                ):
+                    return _UNEXPRESSIBLE
+                raise _Stop(Err(_pointer_of(link), "marker"))
+        # Neither can be stored in a JSON column. The argument parser refuses
+        # both before judging; this keeps any other caller from getting them
+        # back in an output.
+        if (type(value) is float and not math.isfinite(value)) or (
+            type(value) is str and has_forbidden_char(value)
+        ):
+            raise _Stop(Err(_pointer_of(link), "type"))
+        if not conforms_to_type(value, node.types):
+            raise _Stop(Err(_pointer_of(link), "type"))
+        if node.enum_keys is not None and canon(value) not in node.enum_keys:
+            raise _Stop(Err(_pointer_of(link), "enum"))
+        if node.kind == "object":
+            for name, _, _ in node.properties:
+                if name not in value:
+                    raise _Stop(Err(_pointer_of((name, link)), "missing_property"))
+            if len(value) != len(node.properties):
+                raise _Stop(Err(_pointer_of(link), "extra_property"))
+            return [node, value, link, 0, len(node.properties), [], True]
+        if node.kind == "array":
+            return [node, value, link, 0, len(value), [], False]
+        return _Val(value)
+
+    first = visit(root, instance, None, True)
+    stack = [first]
+    done: Any = None
+    while stack:
+        frame = stack[-1]
+        node, value, link, position, count, results, is_object = frame
+        if position < count:
+            frame[3] = position + 1
+            if is_object:
+                name, _, child = node.properties[position]
+                reduced = visit(child, value[name], (name, link), False)
+            else:
+                child = node.items
+                reduced = visit(child, value[position], (position, link), False)
+            if type(reduced) is list:
+                stack.append(reduced)
+                continue
+            if is_object and type(reduced) is _Val and nodes[child].single is not None:
+                reduced = _EMPTY
+            results.append(reduced)
+            continue
+        stack.pop()
+        if all(r is _EMPTY for r in results) and (is_object or count):
+            done = _EMPTY
+        else:
+            done = _Kids(results)
+        if stack:
+            stack[-1][5].append(done)
+    return done, steps, blanks
+
+
+def _scalar_bytes(value: Any) -> int:
+    """The canonical JSON size of a scalar of an output."""
+    if value is None or value is True:
+        return 4
+    if value is False:
+        return 5
+    if type(value) is int:
+        return len(str(value))
+    if type(value) is float:
+        return len(repr(value))
+    return canonical_json_size(value)
+
+
+def _copy_template(compiled: CompiledSchema, index: int) -> dict[str, Any]:
+    """A fresh output for node ``index`` when it is empty, built from its
+    template without recursion."""
+    nodes = compiled.nodes
+    built: dict[str, Any] = {}
+    work = [(index, built)]
+    while work:
+        node_index, target = work.pop()
+        template = nodes[node_index].template
+        assert template is not None
+        for name, mode, value in template:
+            if mode == 2:
+                child: dict[str, Any] = {}
+                target[name] = child
+                work.append((value, child))
+            else:
+                target[name] = value
+    return built
+
+
+def _decide(
+    compiled: CompiledSchema, reduced: Any, steps: int, blanks: int
+) -> Ready | Incomplete | TooComplex:
+    """Turn a reduced tree into the output and the lists of gaps, then decide
+    the status. An empty position is null when its node is nullable, an object
+    of empty positions when it is an object, its only allowed value when it has
+    one, and a gap otherwise; a marker is a position that cannot be written.
+    The canonical JSON size of the output is added up position by position, a
+    template counting for its precomputed size, so the output is never
+    serialized."""
+    nodes = compiled.nodes
+    missing: list[str] = []
+    unexpressible: list[str] = []
+    missing_count = unexpressible_count = expansion_nodes = output_bytes = 0
+    holder: list[Any] = [None]
+    slots: list[tuple[Any, Any, int]] = []
+    work: list[tuple[int, Any, Any, Any, Any]] = [
+        (compiled.root, reduced, None, holder, 0)
+    ]
+    while work:
+        index, item, link, parent, key = work.pop()
+        node = nodes[index]
+        if item is _EMPTY:
+            if node.nullable:
+                output_bytes += 4
+                continue
+            if node.kind == "object":
+                if node.missing_total:
+                    missing_count += node.missing_total
+                    if len(missing) < MAX_LISTED_FIELDS:
+                        prefix = _pointer_of(link)
+                        room = MAX_LISTED_FIELDS - len(missing)
+                        missing.extend(
+                            prefix + rel for rel in node.missing_paths[:room]
+                        )
+                else:
+                    expansion_nodes += node.template_nodes
+                    output_bytes += node.template_bytes
+                    slots.append((parent, key, index))
+            elif node.single is not None:
+                parent[key] = node.single
+                output_bytes += node.single_bytes
+            else:
+                missing_count += 1
+                if len(missing) < MAX_LISTED_FIELDS:
+                    missing.append(_pointer_of(link))
+        elif item is _UNEXPRESSIBLE:
+            unexpressible_count += 1
+            if len(unexpressible) < MAX_LISTED_FIELDS:
+                unexpressible.append(_pointer_of(link))
+        elif type(item) is _Kids and node.kind == "object":
+            out = dict.fromkeys(name for name, _, _ in node.properties)
+            parent[key] = out
+            output_bytes += 2 + max(len(out) - 1, 0)
+            output_bytes += sum(key_bytes + 1 for _, key_bytes, _ in node.properties)
+            for (name, _, child), kid in reversed(
+                list(zip(node.properties, item.kids))
+            ):
+                work.append((child, kid, (name, link), out, name))
+        elif type(item) is _Kids:
+            assert node.items is not None
+            items_out: list[Any] = [None] * len(item.kids)
+            parent[key] = items_out
+            output_bytes += 2 + max(len(items_out) - 1, 0)
+            for position in reversed(range(len(item.kids))):
+                work.append(
+                    (
+                        node.items,
+                        item.kids[position],
+                        (position, link),
+                        items_out,
+                        position,
+                    )
+                )
+        else:
+            value = item.value
+            if node.kind == "integer" and type(value) is float:
+                value = int(value)
+            parent[key] = value
+            output_bytes += _scalar_bytes(value)
+    if missing_count or unexpressible_count:
+        return Incomplete(
+            missing_fields=missing,
+            unexpressible_fields=unexpressible,
+            missing_count=missing_count,
+            unexpressible_count=unexpressible_count,
+            blank_as_null_count=blanks,
+            r1_steps=steps,
+            expansion_nodes=expansion_nodes,
+        )
+    if steps + expansion_nodes > MAX_JUDGED_STEPS or output_bytes > MAX_RESULT_BYTES:
+        return TooComplex("r4", steps, expansion_nodes, output_bytes)
+    for target, key, index in slots:
+        target[key] = _copy_template(compiled, index)
+    return Ready(
+        output=holder[0],
+        missing_count=0,
+        unexpressible_count=0,
+        blank_as_null_count=blanks,
+        r1_steps=steps,
+        expansion_nodes=expansion_nodes,
+        output_bytes=output_bytes,
+    )
+
+
+def judge_instance(
+    compiled: CompiledSchema, instance: Any
+) -> Ready | Incomplete | Err | TooComplex:
+    """Judge the value a model wrote against the caller's schema.
+
+    The shape is checked first, in one walk, and the first error in document
+    order is returned as :class:`Err`. A position holding null or a blank
+    string counts as empty, an object is empty when every property is empty or
+    holds its only allowed value, and a list is empty when it has items and all
+    are empty. What each empty position stands for, and whether the result is
+    :class:`Ready`, :class:`Incomplete` or :class:`TooComplex`, follows from
+    the compiled nodes. A NaN, an infinity, or a string holding U+0000 or a
+    surrogate code point is an :class:`Err` with rule ``type`` as a value
+    anywhere in the instance, since none of them can be stored as JSON (unless
+    the string also holds the marker, which is reported as ``marker``); in an
+    object key such a character makes the key an extra property, reported as
+    ``extra_property``. The instance must hold
+    no integer too long for the interpreter to turn into text (``str`` raises
+    ``ValueError`` past the interpreter's digit limit, 4300 by default). An
+    integer decoded from JSON text under that limit never is, because the
+    decoder refuses a longer literal, so only an integer built in Python can
+    break this. The instance is read, never changed.
+    """
+    try:
+        reduced, steps, blanks = _reduce(compiled.nodes, compiled.root, instance)
+    except _Stop as stop:
+        return stop.verdict
+    return _decide(compiled, reduced, steps, blanks)
+
+
+def judge_empty_answer(compiled: CompiledSchema) -> Ready | Incomplete | TooComplex:
+    """Judge an answer that says nothing: the root is taken as empty, so the
+    outcome is that of the same object written one level down as null."""
+    return _decide(compiled, _EMPTY, 0, 0)

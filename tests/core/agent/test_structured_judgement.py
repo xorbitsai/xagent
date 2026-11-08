@@ -542,8 +542,9 @@ def _judge(schema: dict[str, Any], instance: Any) -> Any:
 
 
 def _same(a: Any, b: Any) -> bool:
-    """Equal as JSON, so ``1``, ``1.0`` and ``true`` differ."""
-    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    """Equal as JSON text, so ``1``, ``1.0`` and ``true`` differ, and so do the
+    same keys in another order."""
+    return json.dumps(a) == json.dumps(b)
 
 
 def _failed(result: Any) -> bool:

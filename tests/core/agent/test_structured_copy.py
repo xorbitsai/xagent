@@ -247,6 +247,29 @@ def test_the_copy_of_each_shape_is_the_hand_written_schema(
     assert _copy_of(schema) == expected
 
 
+def test_the_copy_lists_properties_in_the_callers_order() -> None:
+    schema = _obj(
+        {
+            "z": {"type": "array", "items": _obj({"k": STRING, "d": STRING})},
+            "a": _ref("A"),
+            "m": _union(_ref("M")),
+        },
+        **{
+            "$defs": {
+                "A": _obj({"y": STRING, "b": STRING}),
+                "M": _obj({"q": STRING, "c": STRING}),
+            }
+        },
+    )
+
+    copy_ = _copy_of(schema)
+
+    assert list(copy_["properties"]) == ["z", "a", "m"]
+    assert list(copy_["properties"]["z"]["items"]["properties"]) == ["k", "d"]
+    assert list(copy_["properties"]["a"]["properties"]) == ["y", "b"]
+    assert list(copy_["properties"]["m"]["properties"]) == ["q", "c"]
+
+
 def test_make_nullable_leaves_a_nullable_node_as_it_is() -> None:
     node = {"type": ["null", "string"], "enum": [None, "x"], "description": "d"}
 

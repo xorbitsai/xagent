@@ -550,15 +550,22 @@ async def run_structured_output_step(
         return _settled("failed", "model_error")
     name = getattr(llm, "model_name", None)
     stats.model = name if isinstance(name, str) else None
+    outcome: dict[str, Any] | None = None
     try:
         async with asyncio.timeout(EXTRACTION_TIMEOUT_SECONDS) as limit:
-            return await _extract(
+            outcome = await _extract(
                 fmt, answer, llm, task_id=task_id, run_id=run_id, stats=stats
             )
     except TimeoutError:
-        # A timeout the limit did not raise comes from the model's own client.
-        code = "extraction_timeout" if limit.expired() else "model_error"
-        return _settled("failed", code)
+        # Only the limit raises a TimeoutError out of ``_extract``: a model's
+        # own timeout is settled inside it as model_error.
+        if not limit.expired():
+            raise
+    if limit.expired() or outcome is None:
+        # The deadline fired: either the limit raised, or a client turned its
+        # cancellation into an error or a reply of its own.
+        return _settled("failed", "extraction_timeout")
+    return outcome
 
 
 async def _emit_extraction_event(

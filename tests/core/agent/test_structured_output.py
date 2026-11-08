@@ -1168,12 +1168,58 @@ async def test_a_timeout_raised_by_the_adapter_is_a_model_error():
     assert await _step(llm) == _failed("model_error")
 
 
-async def test_a_timeout_that_the_limit_did_not_raise_is_a_model_error(monkeypatch):
-    async def raising(*args: Any, **kwargs: Any) -> Any:
-        raise TimeoutError("not the limit")
+async def test_a_deadline_that_a_client_turns_into_its_own_error_is_a_timeout(
+    monkeypatch,
+):
+    monkeypatch.setattr(so, "EXTRACTION_TIMEOUT_SECONDS", 0.05)
 
-    monkeypatch.setattr(so, "_extract", raising)
-    assert await _step(ScriptedModel()) == _failed("model_error")
+    class Wrapping(ScriptedModel):
+        async def chat(self, **kwargs: Any) -> Any:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                raise RuntimeError("the client wrapped the cancellation")
+
+    assert await _step(Wrapping()) == _failed("extraction_timeout")
+
+
+async def test_a_reply_that_a_client_returns_after_the_deadline_is_a_timeout(
+    monkeypatch,
+):
+    monkeypatch.setattr(so, "EXTRACTION_TIMEOUT_SECONDS", 0.05)
+
+    class Swallowing(ScriptedModel):
+        async def chat(self, **kwargs: Any) -> Any:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                pass
+            return _args_reply(GOOD)
+
+    assert await _step(Swallowing()) == _failed("extraction_timeout")
+
+
+async def test_a_timeout_raised_while_preparing_is_a_model_error():
+    class Broken:
+        async def prepare_for_call(self, messages: Any) -> Any:
+            raise TimeoutError("prepare")
+
+    assert await _step(Broken()) == _failed("model_error")
+
+
+async def test_a_cancellation_from_outside_while_the_limit_is_armed_goes_through():
+    started = asyncio.Event()
+
+    class Waiting(ScriptedModel):
+        async def chat(self, **kwargs: Any) -> Any:
+            started.set()
+            await asyncio.sleep(5)
+
+    task = asyncio.ensure_future(_step(Waiting()))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_a_model_that_cannot_be_prepared_is_a_model_error():

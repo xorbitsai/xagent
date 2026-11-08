@@ -1372,3 +1372,23 @@ def test_the_byte_check_alone_turns_a_result_away_past_2_mib(
 
     assert isinstance(result, ss.Ready if ready else ss.TooComplex)
     assert result.output_bytes == 8 + size
+
+
+def test_a_tuple_in_the_instance_is_a_type_error() -> None:
+    schema = _obj({"xs": {"type": "array", "items": STRING}})
+
+    result = _judge(schema, {"xs": ("a\u0000",)})
+
+    assert result == ss.Err(path="/xs", rule="type")
+
+
+def test_an_extra_property_counts_the_keys_beyond_the_schema() -> None:
+    schema = _obj({"a": STRING, "o": _obj({"b": STRING})})
+    instance = {"a": "x", "o": {"b": "y", "p": 1, "q": 2, "r": 3}}
+
+    result = _judge(schema, instance)
+
+    assert result == ss.Err(path="/o", rule="extra_property")
+    assert result.extra_count == 3
+    assert _judge(schema, {**instance, "o": {"b": "y"}, "z": 1}).extra_count == 1
+    assert _judge(schema, {"a": 5, "o": None}).extra_count == 0

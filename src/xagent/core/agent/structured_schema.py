@@ -34,7 +34,7 @@ import json
 import math
 import re
 from collections.abc import Collection, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 ERROR_PATH_MAX_CHARS = 2560
@@ -1233,10 +1233,13 @@ class Err:
     """A value that breaks the schema's shape: ``path`` is a JSON Pointer made
     from the schema's property names and list indices, ``rule`` one of
     ``type``, ``enum``, ``missing_property``, ``extra_property`` or ``marker``.
-    The value itself is never reported."""
+    ``extra_count`` is how many more keys than properties an object has for
+    ``extra_property`` and 0 otherwise; it is left out of comparisons. The
+    value itself is never reported."""
 
     path: str
     rule: str
+    extra_count: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1349,7 +1352,13 @@ def _reduce(
                 if name not in value:
                     raise _Stop(Err(_pointer_of((name, link)), "missing_property"))
             if len(value) != len(node.properties):
-                raise _Stop(Err(_pointer_of(link), "extra_property"))
+                raise _Stop(
+                    Err(
+                        _pointer_of(link),
+                        "extra_property",
+                        len(value) - len(node.properties),
+                    )
+                )
             return [node, value, link, 0, len(node.properties), [], True]
         if node.kind == "array":
             return [node, value, link, 0, len(value), [], False]

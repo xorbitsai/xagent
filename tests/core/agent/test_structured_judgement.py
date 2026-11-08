@@ -509,6 +509,34 @@ def test_canonical_json_refuses_a_value_that_is_not_finite() -> None:
 # --- judging ---------------------------------------------------------------------------
 
 
+CYCLES = {
+    "property": _obj({"a": _ref("A")}, **{"$defs": {"A": _obj({"x": _ref("A")})}}),
+    "nullable-property": _obj(
+        {"a": _ref("A")},
+        **{"$defs": {"A": _obj({"x": _nullable(_ref("A"))})}},
+    ),
+    "list-item": _obj(
+        {"a": _ref("L")},
+        **{"$defs": {"L": {"type": "array", "items": _ref("L")}}},
+    ),
+    "alias-pair": _obj({"a": _ref("A")}, **{"$defs": {"A": _ref("B"), "B": _ref("A")}}),
+    "alias-to-itself": _obj({"a": _ref("A")}, **{"$defs": {"A": _ref("A")}}),
+    "union-of-itself": _obj({"a": _ref("A")}, **{"$defs": {"A": _nullable(_ref("A"))}}),
+}
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("schema", CYCLES.values(), ids=CYCLES.keys())
+def test_compiling_a_schema_that_refers_to_itself_raises(
+    schema: dict[str, Any],
+) -> None:
+    violation = check_schema_structure(schema)
+    assert violation is not None and violation.rule == "S9"
+
+    with pytest.raises(ValueError, match="refers to itself"):
+        structured_schema.compile_schema(schema)
+
+
 def _judge(schema: dict[str, Any], instance: Any) -> Any:
     return ss.judge_instance(_compile(schema), instance)
 

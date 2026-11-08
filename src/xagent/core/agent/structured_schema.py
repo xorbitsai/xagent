@@ -1108,9 +1108,12 @@ def compile_schema(schema: dict[str, Any]) -> CompiledSchema:
     a node is built once however often it is referenced. The schema is deep
     copied first and only the copy is read and kept, so the caller's schema is
     never changed and later changes to it reach neither the copy shown to the
-    model nor a judgement.
+    model nor a judgement. A ``$defs`` entry that refers to itself, which S9
+    refuses, raises ``ValueError`` here instead of being followed forever.
     """
     schema = copy.deepcopy(schema)
+    if _check_no_recursion(schema) is not None:
+        raise ValueError("a $defs entry of the schema refers to itself")
     defs = _defs_of(schema)
 
     def kids_of(target: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:

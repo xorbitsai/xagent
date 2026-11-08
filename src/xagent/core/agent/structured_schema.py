@@ -20,17 +20,20 @@ Every judgement about a JSON value goes through :func:`json_kind` first. A
 bool is never a number, ``0`` is never ``False``, and a tuple or a dict
 subclass is never an array or an object. Name rules always use
 ``re.fullmatch`` so that a trailing newline cannot slip through. All walks use
-an explicit stack; only the serialization in S1 and in
-:func:`canonical_json_size` relies on the interpreter's recursion limit, and
-S1 turns a ``RecursionError`` into a violation.
+an explicit stack. Only the serialization in S1 and in
+:func:`canonical_json_size`, and the copy of the schema that
+:func:`compile_schema` takes, rely on the interpreter's recursion limit: S1
+turns a ``RecursionError`` into a violation, and a schema reaches
+:func:`compile_schema` only after S2 has capped its nesting at 32 levels.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -195,7 +198,7 @@ def normalized_enum(node: dict[str, Any]) -> list[Any] | None:
     return enum if type(enum) is list else None
 
 
-def conforms_to_type(value: object, types: list[str]) -> bool:
+def conforms_to_type(value: object, types: Collection[str]) -> bool:
     """Whether a value is accepted by a node whose ``type`` names ``types``."""
     kind = json_kind(value)
     if kind == "null":
@@ -939,7 +942,7 @@ class CompiledNode:
     ``$ref`` is resolved (an alias chain to its end) and a nullable union is
     folded into its value node, so the same target used directly and inside a
     union gives two nodes that share their children. ``types`` is the node's
-    ``type`` as written, as a list. ``enum_keys`` holds the canonical keys of
+    ``type`` as written, as a tuple. ``enum_keys`` holds the canonical keys of
     the non-null enum values. ``single`` is the only allowed value of a node
     that is not nullable and lists exactly one non-null value (an integer node
     stores an integral float as an int), and ``single_bytes`` its canonical
@@ -956,11 +959,11 @@ class CompiledNode:
     where mode 0 is a null, mode 1 the only allowed value ``value`` and mode 2
     the template of node number ``value``. Templates refer to each other by
     node number, so their storage grows with the number of nodes, not with the
-    size of the expansion.
+    size of the expansion. Every field holds an immutable value.
     """
 
     kind: str
-    types: list[str]
+    types: tuple[str, ...]
     nullable: bool
     enum_keys: frozenset[tuple[Any, ...]] | None
     single: Any
@@ -978,9 +981,11 @@ class CompiledNode:
 class CompiledSchema:
     """A schema that passed the structural checks, compiled for judging.
 
-    ``schema`` is the caller's schema itself, kept for the copy shown to the
-    model; ``nodes`` lists every compiled node with the children of a node
-    before the node, and ``root`` is the number of the root node.
+    ``schema`` is a deep copy of the caller's schema taken by
+    :func:`compile_schema` and kept for the copy shown to the model, so the copy
+    and the judgement always read the same schema; nothing here changes it.
+    ``nodes`` lists every compiled node with the children of a node before the
+    node, and ``root`` is the number of the root node.
     """
 
     schema: dict[str, Any]
@@ -1021,7 +1026,7 @@ def _compile_node(
     target: dict[str, Any], from_union: bool, kids: list[int], nodes: list[CompiledNode]
 ) -> CompiledNode:
     declared = target["type"]
-    types = list(declared) if type(declared) is list else [declared]
+    types = tuple(declared) if type(declared) is list else (declared,)
     kind = next(t for t in types if t != "null")
     nullable = from_union or "null" in types
 
@@ -1100,9 +1105,12 @@ def compile_schema(schema: dict[str, Any]) -> CompiledSchema:
     """Compile a schema that passed :func:`check_schema_structure`.
 
     Every position the root reaches becomes one node, built bottom-up so that
-    a node is built once however often it is referenced. The schema is read,
-    never changed.
+    a node is built once however often it is referenced. The schema is deep
+    copied first and only the copy is read and kept, so the caller's schema is
+    never changed and later changes to it reach neither the copy shown to the
+    model nor a judgement.
     """
+    schema = copy.deepcopy(schema)
     defs = _defs_of(schema)
 
     def kids_of(target: dict[str, Any]) -> list[tuple[dict[str, Any], bool]]:

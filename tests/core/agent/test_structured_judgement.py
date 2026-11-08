@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import random
 import statistics
@@ -435,6 +436,41 @@ def test_compiling_does_not_change_the_schema() -> None:
 
     assert schema == before
     assert json.dumps(schema) == json.dumps(before)
+
+
+def test_changing_the_schema_after_compiling_reaches_neither_the_copy_nor_the_judgement() -> (
+    None
+):
+    schema = _obj({"a": {"type": "string", "enum": ["p", "q"]}})
+    compiled = _compile(schema)
+
+    schema["properties"]["a"]["enum"] = ["z"]
+    schema["properties"]["a"]["description"] = "changed"
+
+    copied = ss.model_facing_schema(compiled)
+    assert copied["properties"]["a"]["enum"] == ["p", "q", None, MARKER]
+    assert "changed" not in json.dumps(copied)
+    assert isinstance(ss.judge_instance(compiled, {"a": "p"}), ss.Ready)
+    assert ss.judge_instance(compiled, {"a": "z"}) == ss.Err(path="/a", rule="enum")
+
+
+def test_no_field_of_a_compiled_node_can_be_changed_in_place() -> None:
+    compiled = _compile(
+        _obj(
+            {
+                "a": _nullable(_ref("T")),
+                "b": {"type": "array", "items": {"type": ["string", "null"]}},
+                "c": {"type": "integer", "const": 1},
+                "o": _obj({"x": {"type": ["string", "null"]}}),
+            },
+            **{"$defs": {"T": _obj({"x": {"type": "string", "enum": ["p", "q"]}})}},
+        )
+    )
+
+    for node in compiled.nodes:
+        for field in dataclasses.fields(node):
+            value = getattr(node, field.name)
+            assert not isinstance(value, (list, dict, set)), field.name
 
 
 # --- the size of canonical JSON ----------------------------------------------------

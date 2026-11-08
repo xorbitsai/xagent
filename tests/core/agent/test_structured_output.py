@@ -14,6 +14,7 @@ import pytest
 from xagent.core.agent import structured_output as so
 from xagent.core.agent import structured_schema as ss
 from xagent.core.agent.trace import SYSTEM_INFO
+from xagent.core.model.chat.basic.call_boundary import ProviderCallError
 from xagent.core.model.chat.exceptions import LLMRetryableError, LLMToolProtocolError
 from xagent.core.model.chat.types import PROVIDER_STATE_METADATA_KEY
 
@@ -1251,6 +1252,10 @@ def test_the_failure_code_of_a_provider_error_names_the_rejection():
         pass
 
     assert so._failure_code(AuthenticationError("no")) == "credential_rejected"
+
+
+def test_the_failure_code_of_a_wrapped_provider_error_is_the_one_it_carries():
+    assert so._failure_code(ProviderCallError("rate_limited")) == "rate_limited"
 
 
 async def test_the_event_names_the_model_that_took_the_call():

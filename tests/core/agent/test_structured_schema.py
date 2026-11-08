@@ -564,8 +564,7 @@ BACKSTOP_SECONDS = 10.0
 
 def _limit_serialized_bytes(monkeypatch: pytest.MonkeyPatch, limit: int) -> list[int]:
     """Spy on ``json.dumps``: record the UTF-8 size of every text it writes and
-    fail as soon as the total passes ``limit``, so a check whose cost has grown
-    fails here instead of running on."""
+    fail as soon as the total passes ``limit``."""
     real_dumps = json.dumps
     written: list[int] = []
 

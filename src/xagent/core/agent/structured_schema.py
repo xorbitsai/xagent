@@ -1533,8 +1533,10 @@ def judge_instance(
     are empty. What each empty position stands for, and whether the result is
     :class:`Ready`, :class:`Incomplete` or :class:`TooComplex`, follows from
     the compiled nodes. A NaN, an infinity, or a string holding U+0000 or a
-    surrogate code point is an :class:`Err` with rule ``type`` wherever it
-    appears, since none of them can be stored as JSON. The instance must hold
+    surrogate code point is an :class:`Err` with rule ``type`` as a value
+    anywhere in the instance, since none of them can be stored as JSON; in an
+    object key such a character makes the key an extra property, reported as
+    ``extra_property``. The instance must hold
     no integer too long for the interpreter to turn into text (``str`` raises
     ``ValueError`` past the interpreter's digit limit, 4300 by default). An
     integer decoded from JSON text under that limit never is, because the

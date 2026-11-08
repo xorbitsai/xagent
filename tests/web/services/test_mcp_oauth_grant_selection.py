@@ -4,8 +4,9 @@ an association row for the server.
 A caller without an association is a team member who authorized a shared
 connector themselves. The selector returns nothing for that caller unless the
 call site passes ``allow_team_member_grants=True``, and even then only grants
-whose resource equals the server's current URL. A caller with an association
-is unaffected by the parameter and by the resource rule.
+whose resource equals the server's current URL, or the URL the call site says
+it sends the token to. A caller with an association is unaffected by the
+parameter and by the resource rule.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.user import User
 from xagent.web.services.mcp_oauth import select_mcp_oauth_grants
+from xagent.web.services.mcp_runtime import build_mcp_runtime_connection
 
 MCP_URL = "https://mcp.selection.test/mcp"
 ISSUER = "https://auth.selection.test"
@@ -67,24 +69,32 @@ def _add_server(db, *, url: str | None = MCP_URL) -> MCPServer:
 
 
 def _add_grant(
-    db, *, server: MCPServer, user: User, resource: str = MCP_URL
+    db,
+    *,
+    server: MCPServer,
+    user: User,
+    resource: str = MCP_URL,
+    oauth_client_id: int | None = None,
+    resource_owner_key: str | None = None,
 ) -> MCPOAuthGrant:
-    oauth_client = MCPOAuthClient(
-        mcp_server_id=server.id,
-        issuer=ISSUER,
-        authorization_endpoint=f"{ISSUER}/authorize",
-        token_endpoint=f"{ISSUER}/token",
-        client_id="selection-client",
-        token_endpoint_auth_method="none",
-        redirect_uri="https://api.selection.test/api/mcp/oauth/callback",
-    )
-    db.add(oauth_client)
-    db.flush()
+    if oauth_client_id is None:
+        oauth_client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer=ISSUER,
+            authorization_endpoint=f"{ISSUER}/authorize",
+            token_endpoint=f"{ISSUER}/token",
+            client_id="selection-client",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://api.selection.test/api/mcp/oauth/callback",
+        )
+        db.add(oauth_client)
+        db.flush()
+        oauth_client_id = oauth_client.id
     grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=user.id,
-        mcp_oauth_client_id=oauth_client.id,
-        resource_owner_key=f"xagent:user:{user.id}",
+        mcp_oauth_client_id=oauth_client_id,
+        resource_owner_key=resource_owner_key or f"xagent:user:{user.id}",
         issuer=ISSUER,
         resource=resource,
         scope="",
@@ -252,6 +262,16 @@ OTHER_URL = "https://other.selection.test/mcp"
             False,
             id="no_association_resource_mismatch",
         ),
+        # A protected resource that is the URL's origin is not the URL; such a
+        # grant is not one a member authorization may create.
+        pytest.param(
+            False,
+            True,
+            MCP_URL,
+            "https://mcp.selection.test",
+            False,
+            id="no_association_resource_is_url_origin",
+        ),
         pytest.param(
             False, True, None, MCP_URL, False, id="no_association_server_url_none"
         ),
@@ -338,3 +358,116 @@ def test_grant_selection_resource_rule_for_callers_without_association(
                 UserMCPServer.mcpserver_id == server.id,
             ).delete()
             db_session.commit()
+
+
+def test_grant_selection_without_owner_key_applies_the_url_rule_to_every_owner_key(
+    db_session,
+) -> None:
+    # No production caller omits the owner key; this pins what such a call
+    # returns for a caller without an association when the flag is set.
+    user = _add_user(db_session, "selection-member")
+    server = _add_server(db_session)
+    default_key = _add_grant(db_session, server=server, user=user)
+    client_id = default_key.mcp_oauth_client_id
+    other_key = _add_grant(
+        db_session,
+        server=server,
+        user=user,
+        oauth_client_id=client_id,
+        resource_owner_key="external:account:1",
+    )
+    other_resource = _add_grant(
+        db_session,
+        server=server,
+        user=user,
+        resource=OTHER_URL,
+        oauth_client_id=client_id,
+    )
+
+    selected = select_mcp_oauth_grants(
+        db_session,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=AUTH,
+        resource_owner_key=None,
+        allow_team_member_grants=True,
+    )
+
+    assert {g.id for g in selected} == {default_key.id, other_key.id}
+    assert other_resource.id not in {g.id for g in selected}
+
+
+@pytest.mark.parametrize(
+    ("stored_url", "endpoint_url", "expect_returned"),
+    [
+        pytest.param(MCP_URL, OTHER_URL, False, id="stored_matches_endpoint_differs"),
+        pytest.param(OTHER_URL, MCP_URL, True, id="stored_differs_endpoint_matches"),
+        pytest.param(MCP_URL, "", False, id="endpoint_empty"),
+    ],
+)
+def test_grant_selection_compares_the_endpoint_url_when_given(
+    db_session, stored_url: str, endpoint_url: str, expect_returned: bool
+) -> None:
+    user = _add_user(db_session, "selection-member")
+    server = _add_server(db_session, url=stored_url)
+    grant = _add_grant(db_session, server=server, user=user)
+    server_id, user_id, grant_id = server.id, user.id, grant.id
+
+    statements: list[str] = []
+
+    def _record(_conn, _cursor, statement, *_args) -> None:
+        statements.append(statement)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        selected = select_mcp_oauth_grants(
+            db_session,
+            server_id=server_id,
+            user_id=user_id,
+            auth_config=AUTH,
+            resource_owner_key=f"xagent:user:{user_id}",
+            allow_team_member_grants=True,
+            endpoint_url=endpoint_url,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert [g.id for g in selected] == ([grant_id] if expect_returned else [])
+    # The stored URL is not read when the call site passes the URL.
+    assert not any("FROM mcp_servers" in s for s in statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connection_url", "stored_url", "expect_token"),
+    [
+        pytest.param(MCP_URL, OTHER_URL, True, id="connection_url_matches"),
+        pytest.param(OTHER_URL, MCP_URL, False, id="connection_url_differs"),
+        pytest.param(None, MCP_URL, False, id="connection_url_missing"),
+    ],
+)
+async def test_runtime_connection_selects_against_the_url_it_sends_to(
+    db_session, connection_url: str | None, stored_url: str, expect_token: bool
+) -> None:
+    user = _add_user(db_session, "selection-member")
+    server = _add_server(db_session, url=stored_url)
+    _add_grant(db_session, server=server, user=user)
+    # The loaded row and the stored row disagree, as when the URL is edited
+    # after the runtime loaded the server. The session does not autoflush, so
+    # a read of the row still sees the stored URL.
+    server.url = connection_url
+
+    build = await build_mcp_runtime_connection(
+        db_session, server, user_id=user.id, allow_team_member_grants=True
+    )
+
+    if expect_token:
+        assert build.connection is not None
+        assert build.connection["url"] == connection_url
+        assert build.connection["headers"]["Authorization"] == (
+            "Bearer selection-access-token"
+        )
+    else:
+        assert build.connection is None
+        assert build.diagnostic is not None

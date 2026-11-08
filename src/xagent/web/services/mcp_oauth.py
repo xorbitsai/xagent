@@ -628,8 +628,13 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     issuer: str | None = None,
     client: httpx.AsyncClient | None = None,
     allow_team_member_grants: bool = False,
+    endpoint_url: str | None = None,
 ) -> MCPOAuthRuntimeAuth:
-    """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
+    """Resolve and refresh an MCP OAuth grant for one runtime MCP connection.
+
+    ``endpoint_url`` is the URL of the connection the returned token is added
+    to; it is forwarded to ``select_mcp_oauth_grants``.
+    """
     from ...core.utils.encryption import decrypt_value
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
@@ -658,6 +663,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             issuer=issuer,
             scope="",
             allow_team_member_grants=allow_team_member_grants,
+            endpoint_url=endpoint_url,
         )
         grant = _select_runtime_grant(candidate_grants, required_scopes)
         if not _grant_needs_refresh(grant.expires_at):
@@ -912,6 +918,7 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     issuer: str | None = None,
     scope: str | None = None,
     allow_team_member_grants: bool = False,
+    endpoint_url: str | None = None,
 ) -> list[Any]:
     """Return active MCP OAuth grants matching the current server auth config.
 
@@ -927,13 +934,27 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     The rule applies to grants held under the caller's own default owner key;
     grants selected under another owner key (an actor policy) are returned as
     before.
-    A missing owner key is treated as the caller's own default key.
+    A missing owner key is treated as the caller's own default key for this
+    rule, but the grants are then not filtered by owner key: for a caller
+    without an association, with ``allow_team_member_grants`` true, the
+    URL-matching grants of every owner key are returned. No production caller
+    omits the owner key.
 
     Under the same owner-key condition, and when ``allow_team_member_grants``
     is true, a caller who holds no association for the server gets only grants
     whose resource equals the server's current URL: their tokens are sent to
     that URL, and the URL is controlled by the server's owner, not by the
-    grant holder.
+    grant holder. ``endpoint_url`` is the URL the caller sends the selected
+    token to; when given, it is the URL compared, so the check and the use read
+    the same value, and the stored URL is not read. When it is omitted, the
+    stored URL is read.
+
+    The comparison is strict on purpose. A grant of a caller without an
+    association may only be created by a member authorization that requires
+    the protected resource to equal the connector URL when it starts, when it
+    stores its flow and at the callback, so this comparison does not drop
+    such a grant. On a server whose protected resource differs from its URL,
+    members cannot authorize.
     """
     from ..models.mcp import MCPServer, UserMCPServer
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
@@ -1002,7 +1023,11 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         return list(grants)
     if not allow_team_member_grants:
         return []
-    server_url = db.query(MCPServer.url).filter(MCPServer.id == server_id).scalar()
+    server_url = (
+        endpoint_url
+        if endpoint_url is not None
+        else db.query(MCPServer.url).filter(MCPServer.id == server_id).scalar()
+    )
     if not server_url:
         return []
     try:

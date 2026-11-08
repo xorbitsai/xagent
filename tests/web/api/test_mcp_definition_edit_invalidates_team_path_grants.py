@@ -1,16 +1,21 @@
 """Editing a connector's definition deletes the OAuth state of team members.
 
-A team member who authorized a shared connector holds a grant whose token is
-sent to the connector's URL, for the client the connector's auth configuration
-names. Both are controlled by the connector's owner. When the owner (or a
-platform admin) changes either, ``update_mcp_server`` deletes, in the same
-transaction, every OAuth flow and grant on that connector that belongs to a user
-without an association row and that was stored under the user's own default
-owner key. The owner's own grants are never touched.
+A team member who authorized a shared connector holds a grant whose access
+token is sent to the connector's URL and whose refresh token is sent to the
+token endpoint on the OAuth client row the grant was issued through. The
+owner's next connect rewrites that row from the authorization server that the
+auth keys ``issuer`` and ``resource_metadata_url`` select. All three are
+controlled by the connector's owner. When the owner (or a platform admin)
+changes the URL text or either key, ``update_mcp_server`` deletes, in the same
+transaction, every OAuth flow and grant on that connector that belongs to a
+user without an association row and that was stored under the user's own
+default owner key. Other auth edits, such as a client secret rotation, delete
+nothing. The owner's own grants are never touched.
 
-Two scans keep the rule complete: the keys the comparison uses must equal the
-auth keys the OAuth code reads, and every place under ``src/xagent`` that can
-write a connector's URL or auth must be accounted for.
+Two scans keep the rule complete: every auth key the OAuth code reads must be
+classified as bound or not bound, with a reason, and every place under
+``src/xagent`` that can write a connector's URL or auth must be listed, with a
+reason.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from __future__ import annotations
 import ast
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,7 +32,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import xagent.web.api.mcp as mcp_module
-from xagent.core.tools.core.mcp.model import MASKED_SECRET_VALUE
+from xagent.core.tools.core.mcp.model import (
+    MASKED_SECRET_VALUE,
+    SENSITIVE_AUTH_FIELDS,
+)
 from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.api.mcp import MCPServerUpdate, update_mcp_server
 from xagent.web.models.database import Base
@@ -37,6 +46,7 @@ from xagent.web.models.mcp_oauth import (
     MCPOAuthGrant,
 )
 from xagent.web.models.user import User
+from xagent.web.services.mcp_oauth import _validate_issuer, select_mcp_oauth_grants
 
 URL = "https://mcp.edit.test/mcp"
 ISSUER = "https://auth.edit.test"
@@ -294,7 +304,7 @@ class Fixture:
         self.db.commit()
 
 
-# (actor, payload kwargs, deleted); the stored client_secret is readable
+# (actor, payload kwargs, deleted)
 CASES: list[Any] = [
     pytest.param(
         "owner",
@@ -314,7 +324,7 @@ CASES: list[Any] = [
     pytest.param(
         "owner",
         {"config": {"auth": _submitted_auth(client_id="client-2")}},
-        True,
+        False,
         id="auth_client_id",
     ),
     pytest.param(
@@ -325,8 +335,18 @@ CASES: list[Any] = [
     ),
     pytest.param(
         "owner",
-        {"config": {"auth": _submitted_auth(resource="https://mcp.edit.test/v2")}},
+        {
+            "config": {
+                "auth": {k: v for k, v in _submitted_auth().items() if k != "issuer"}
+            }
+        },
         True,
+        id="auth_issuer_removed",
+    ),
+    pytest.param(
+        "owner",
+        {"config": {"auth": _submitted_auth(resource="https://mcp.edit.test/v2")}},
+        False,
         id="auth_resource",
     ),
     pytest.param(
@@ -350,19 +370,19 @@ CASES: list[Any] = [
                 )
             }
         },
-        True,
+        False,
         id="auth_token_endpoint_auth_method",
     ),
     pytest.param(
         "owner",
         {"config": {"auth": _submitted_auth(redirect_uri="https://app2.edit.test/cb")}},
-        True,
+        False,
         id="auth_redirect_uri",
     ),
     pytest.param(
         "owner",
         {"config": {"auth": _submitted_auth(client_secret="client-secret-2")}},
-        True,
+        False,
         id="auth_new_client_secret",
     ),
     pytest.param(
@@ -428,61 +448,105 @@ def test_definition_edit_deletes_team_path_state_only_when_binding_changes(
     _assert_team_path_state(fx, deleted)
 
 
-# (payload kwargs, deleted); the stored client_secret cannot be decrypted
-UNDECRYPTABLE_SECRET_CASES: list[Any] = [
-    pytest.param(
-        {"config": {"auth": _submitted_auth(scope="records.read records.write")}},
-        True,
-        id="auth_undecryptable",
-    ),
-    pytest.param(
-        {"description": "renamed records"},
-        True,
-        id="auth_undecryptable_description_only_edit",
-    ),
-    # Both sides of the comparison read the secret as unavailable and every
-    # other bound value is equal; only the decrypt-failure flag can delete.
-    pytest.param(
-        {
-            "config": {
-                "auth": {
-                    k: v for k, v in _submitted_auth().items() if k != "client_secret"
-                }
-            }
-        },
-        True,
-        id="auth_undecryptable_secret_removed",
-    ),
-]
-
-
-@pytest.mark.parametrize(("payload", "deleted"), UNDECRYPTABLE_SECRET_CASES)
-def test_definition_edit_with_undecryptable_stored_secret(
-    db, payload: dict[str, Any], deleted: bool
+@pytest.mark.parametrize("stored_secret", ["readable", "undecryptable"])
+def test_non_owner_update_with_unchanged_definition_deletes_nothing(
+    db, stored_secret: str
 ) -> None:
     fx = Fixture(db)
-    fx.break_stored_secret()
-
-    fx.put(fx.owner, **payload)
-
-    _assert_team_path_state(fx, deleted)
-
-
-def test_non_owner_update_with_unchanged_definition_deletes_nothing(db) -> None:
-    fx = Fixture(db)
+    if stored_secret == "undecryptable":
+        fx.break_stored_secret()
 
     fx.put(fx.other_member, config={"url": URL})
 
     assert fx.member_rows_present() == (True, True, True)
 
 
+def test_resource_metadata_url_edit_leaves_no_member_grant_on_the_rewritten_client(
+    db,
+) -> None:
+    """The edit deletes the grants an owner's connect could redirect.
+
+    The owner points ``resource_metadata_url`` at metadata naming another
+    authorization server, which claims the configured issuer. Issuer validation
+    accepts it, and the owner's connect then finds the client row the members'
+    grants were issued through (same issuer and client id) and rewrites its
+    token endpoint. A member grant left on that row would send its refresh
+    token there.
+    """
+    fx = Fixture(db)
+    redirected_token_endpoint = "https://other-auth.example/token"
+
+    fx.put(
+        fx.owner,
+        config={
+            "auth": _submitted_auth(
+                resource_metadata_url=(
+                    "https://other-auth.example/.well-known/oauth-protected-resource"
+                )
+            )
+        },
+    )
+    _validate_issuer(
+        selected_authorization_server="https://other-auth.example/as",
+        metadata=SimpleNamespace(issuer=ISSUER),
+        configured_issuer=ISSUER,
+    )
+    mcp_module._upsert_mcp_oauth_client(
+        db,
+        server_id=fx.server.id,
+        discovery=SimpleNamespace(
+            authorization_server=SimpleNamespace(
+                issuer=ISSUER,
+                authorization_endpoint="https://other-auth.example/authorize",
+                token_endpoint=redirected_token_endpoint,
+                raw={},
+            )
+        ),
+        client_id="client-1",
+        client_secret=SECRET,
+        token_endpoint_auth_method="client_secret_post",
+        redirect_uri="https://app.edit.test/api/mcp/oauth/callback",
+    )
+    db.commit()
+    db.expire_all()
+
+    rewritten = (
+        db.query(MCPOAuthClient)
+        .filter(
+            MCPOAuthClient.mcp_server_id == fx.server.id,
+            MCPOAuthClient.client_id == "client-1",
+        )
+        .one()
+    )
+    assert rewritten.token_endpoint == redirected_token_endpoint
+    assert fx.member_rows_present() == (False, False, False)
+    assert (
+        select_mcp_oauth_grants(
+            db,
+            server_id=fx.server.id,
+            user_id=fx.member.id,
+            auth_config={"type": "mcp_oauth"},
+            resource_owner_key=f"xagent:user:{fx.member.id}",
+            allow_team_member_grants=True,
+        )
+        == []
+    )
+
+
 def test_deletion_failure_rolls_back_the_definition_write(db, monkeypatch) -> None:
     fx = Fixture(db)
+    real_delete = mcp_module._delete_team_path_mcp_oauth_state
 
-    def boom(*_args: Any, **_kwargs: Any) -> None:
+    def delete_then_fail(session: Any, *, server_id: int) -> None:
+        # The URL update and the deletions reach the database before the
+        # failure, so only the route's rollback can undo them.
+        real_delete(session, server_id=server_id)
+        session.flush()
         raise RuntimeError("delete failed")
 
-    monkeypatch.setattr(mcp_module, "_delete_team_path_mcp_oauth_state", boom)
+    monkeypatch.setattr(
+        mcp_module, "_delete_team_path_mcp_oauth_state", delete_then_fail
+    )
 
     with pytest.raises(Exception) as exc:
         fx.put(fx.owner, config={"url": "https://mcp.edit.test/other"})
@@ -497,47 +561,68 @@ def test_deletion_failure_rolls_back_the_definition_write(db, monkeypatch) -> No
 
 SRC_ROOT = Path(mcp_module.__file__).resolve().parents[2]
 
-# (path under src/xagent, enclosing function, written target)
-WRITER_ALLOWLIST: set[tuple[str, str, str]] = {
+# (path under src/xagent, enclosing function, written target) -> why the write
+# cannot change where a team member's tokens go without the binding comparison
+WRITER_ALLOWLIST: dict[tuple[str, str, str], str] = {
     (
         "web/api/mcp.py",
         "_update_server_from_config",
         "setattr(server, db_field, value)",
+    ): (
+        "The generic definition writer; its only caller, update_mcp_server, "
+        "compares the binding before and after it."
     ),
-    ("web/api/mcp.py", "_ensure_catalog_mcp_oauth_server", "cast(Any, server).auth"),
+    (
+        "web/api/mcp.py",
+        "_ensure_catalog_mcp_oauth_server",
+        "cast(Any, server).auth",
+    ): (
+        "Writes a catalog connector row from the deployment's MCP app catalog, "
+        "not from a user's edit."
+    ),
     (
         "web/api/auth.py",
         "_ensure_user_mcp_server._ensure_server_matches_oauth_app",
         "cast(Any, server).auth",
+    ): (
+        "Writes built-in OAuth app metadata on a row whose transport is "
+        "'oauth', which never uses MCP OAuth grants."
     ),
-    ("web/mcp_apps.py", "_adopt_builtin_auth", "server.auth"),
+    ("web/mcp_apps.py", "_adopt_builtin_auth", "server.auth"): (
+        "Repairs a built-in catalog row's auth from the catalog definition, not "
+        "from a user's edit."
+    ),
     (
         "web/services/google_oauth_grants.py",
         "_copy_shared_google_credentials",
         "setattr(target, field, value)",
-    ),
+    ): "Writes Google OAuth account rows, not MCPServer rows.",
     (
         "web/tools/config.py",
         "WebToolConfig._resolve_factory_model_field",
         "setattr(self, cache_name, cached)",
-    ),
+    ): "Writes a cache attribute on the tool configuration object.",
     (
         "web/tools/config.py",
         "WebToolConfig._finish_legacy_oauth_access_token_resolution",
         "setattr(oauth_account, field, value)",
+    ): "Writes UserOAuth rows, not MCPServer rows.",
+    ("web/api/custom_api.py", "update_custom_api", "api.url"): (
+        "Writes a Custom API row, not an MCP connector."
     ),
-    ("web/api/custom_api.py", "update_custom_api", "api.url"),
-    ("core/model/rerank/dashscope.py", "DashscopeRerank.__init__", "self.url"),
+    ("core/model/rerank/dashscope.py", "DashscopeRerank.__init__", "self.url"): (
+        "Sets the endpoint of a rerank client object."
+    ),
     (
         "core/tools/adapters/vibe/a2a_agent_tool.py",
         "_PinnedA2ATransport.handle_async_request",
         "request.url",
-    ),
+    ): "Rewrites an outgoing HTTP request object.",
     (
         "web/services/mcp_oauth.py",
         "SafeOAuthAsyncHTTPTransport.handle_async_request",
         "request.url",
-    ),
+    ): "Rewrites an outgoing HTTP request object.",
 }
 
 
@@ -667,13 +752,15 @@ def _scan_tree(root: Path) -> set[tuple[str, str, str]]:
 
 def test_mcp_server_url_and_auth_writers_are_enumerated() -> None:
     found = _scan_tree(SRC_ROOT)
+    listed = set(WRITER_ALLOWLIST)
 
-    assert found - WRITER_ALLOWLIST == set(), (
+    assert found - listed == set(), (
         "A new write to a connector URL or auth is not accounted for. Route it "
         "through update_mcp_server's binding comparison, or add it to the "
         "allowlist with the reason it cannot affect team-member grants."
     )
-    assert WRITER_ALLOWLIST - found == set(), "Allowlist entry no longer matches code"
+    assert listed - found == set(), "Allowlist entry no longer matches code"
+    assert all(reason.strip() for reason in WRITER_ALLOWLIST.values())
 
 
 _SYNTHETIC_WRITERS = {
@@ -708,14 +795,67 @@ def test_writer_scanner_catches_each_node_class(tmp_path, name: str) -> None:
     assert len(hits) == 1, hits
 
 
-# --- The binding must cover every auth key the OAuth code reads --------------
+# --- Every auth key the OAuth code reads is classified ------------------------
 
 _OAUTH_SOURCES = (
     SRC_ROOT / "web/api/mcp.py",
     SRC_ROOT / "web/services/mcp_oauth.py",
     SRC_ROOT / "web/services/mcp_runtime.py",
 )
-_NOT_BOUND = {"scope", "required_scope"}
+# auth key -> (bound, reason). Bound keys are _MEMBER_GRANT_BINDING_AUTH_KEYS:
+# changing one deletes team-path state.
+AUTH_KEY_CLASSIFICATION: dict[str, tuple[bool, str]] = {
+    "issuer": (
+        True,
+        "Decides which authorization server metadata the owner's connect "
+        "accepts and writes into the client row members' grants refresh "
+        "through, including its token endpoint.",
+    ),
+    "resource_metadata_url": (
+        True,
+        "Decides where discovery reads the protected resource metadata that "
+        "names the authorization server, whose token endpoint the owner's "
+        "connect writes into the client row members' grants refresh through.",
+    ),
+    "type": (
+        False,
+        "Only says whether the connector uses MCP OAuth; tokens still go to "
+        "the URL and refreshes to the client row's token endpoint.",
+    ),
+    "resource": (
+        False,
+        "Only checked against the discovered protected resource and used to "
+        "filter grants; it does not choose where any token is sent.",
+    ),
+    "client_id": (
+        False,
+        "Names the OAuth client; the token endpoint a connect writes into any "
+        "client row comes from the discovery the URL, issuer and "
+        "resource_metadata_url select.",
+    ),
+    "client_secret": (
+        False,
+        "The owner's client credential; it changes neither where access tokens "
+        "nor where refresh tokens are sent.",
+    ),
+    "token_endpoint_auth_method": (
+        False,
+        "Only says how the client authenticates within the same token request.",
+    ),
+    "redirect_uri": (
+        False,
+        "Only says where a new authorization delivers its code; refresh "
+        "requests carry no redirect URI.",
+    ),
+    "scope": (
+        False,
+        "Grants missing a required scope are already excluded by grant selection.",
+    ),
+    "required_scope": (
+        False,
+        "Grants missing a required scope are already excluded by grant selection.",
+    ),
+}
 
 
 def _literal(node: ast.AST) -> str | None:
@@ -760,9 +900,19 @@ def _auth_keys_read(path: Path) -> set[str]:
     return keys
 
 
-def test_member_grant_binding_keys_cover_every_oauth_auth_read() -> None:
+def test_every_oauth_auth_key_read_is_classified() -> None:
     read: set[str] = set()
     for path in _OAUTH_SOURCES:
         read |= _auth_keys_read(path)
+    classified = set(AUTH_KEY_CLASSIFICATION)
+    bound = {key for key, (is_bound, _) in AUTH_KEY_CLASSIFICATION.items() if is_bound}
 
-    assert read - _NOT_BOUND == set(mcp_module._MEMBER_GRANT_BINDING_AUTH_KEYS)
+    assert read - classified == set(), (
+        "The OAuth code reads an auth key that is not classified. Add it to "
+        "AUTH_KEY_CLASSIFICATION as bound or not bound, with the reason."
+    )
+    assert classified - read == set(), "Classified key is no longer read"
+    assert all(reason.strip() for _, reason in AUTH_KEY_CLASSIFICATION.values())
+    assert bound == set(mcp_module._MEMBER_GRANT_BINDING_AUTH_KEYS)
+    # The binding compares stored values, which needs them unencrypted.
+    assert bound.isdisjoint(SENSITIVE_AUTH_FIELDS)

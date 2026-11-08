@@ -62,12 +62,7 @@ from ...core.tools.adapters.vibe.signed_upload import (
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
-from ...core.utils.encryption import (
-    EncryptionDecodeError,
-    decrypt_value,
-    decrypt_value_strict,
-    encrypt_value,
-)
+from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
@@ -2340,48 +2335,34 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
             setattr(server, db_field, value)
 
 
-# The auth keys that decide where a granted token is sent and which OAuth client
-# it was issued to. They are exactly the keys the OAuth code reads, apart from
-# ``scope`` and ``required_scope``: scope-insufficient grants are already
-# excluded by grant selection.
+# The auth keys that, with the connector URL, decide where a team member's
+# tokens go. The URL is where access tokens are sent. ``issuer`` and
+# ``resource_metadata_url`` choose the authorization server metadata that the
+# owner's next connect writes into the OAuth client row the members' grants
+# share, and that row holds the token endpoint refresh tokens are sent to.
+# Every other auth key the OAuth code reads is classified, with its reason, in
+# tests/web/api/test_mcp_definition_edit_invalidates_team_path_grants.py.
 _MEMBER_GRANT_BINDING_AUTH_KEYS: tuple[str, ...] = (
-    "type",
-    "resource",
-    "resource_metadata_url",
     "issuer",
-    "client_id",
-    "client_secret",
-    "token_endpoint_auth_method",
-    "redirect_uri",
+    "resource_metadata_url",
 )
 
 
-def _member_grant_binding(server: MCPServer) -> tuple[tuple[Any, ...], bool]:
+def _member_grant_binding(server: MCPServer) -> tuple[Any, ...]:
     """Return what a team member's grant on ``server`` is bound to.
 
-    The first element is the stored URL text (whitespace-stripped, not
-    normalized) followed by the values of ``_MEMBER_GRANT_BINDING_AUTH_KEYS``.
-    The second element is true when a sensitive value could not be decrypted.
-    Sensitive values are decrypted strictly: ``decrypt_value`` hands back the
-    ciphertext when it cannot open it, which would make two different secrets
-    look equal.
+    The stored URL text (whitespace-stripped, not normalized) followed by the
+    stored values of ``_MEMBER_GRANT_BINDING_AUTH_KEYS``. None of these keys
+    is encrypted at rest, so the stored values are compared as they are.
     """
     stored_auth: Any = server.auth
     auth: dict[str, Any] = stored_auth if isinstance(stored_auth, dict) else {}
-    decrypt_failed = False
-    values: list[Any] = []
-    for key in _MEMBER_GRANT_BINDING_AUTH_KEYS:
-        value = auth.get(key)
-        if key in SENSITIVE_AUTH_FIELDS and isinstance(value, str) and value:
-            try:
-                value = decrypt_value_strict(value)
-            except EncryptionDecodeError:
-                value = None
-                decrypt_failed = True
-        values.append(value)
     # ``strip()`` is defensive: the route already strips the URL before it is
     # written back, so stored values carry no surrounding whitespace.
-    return ((str(server.url or "").strip(), *values), decrypt_failed)
+    return (
+        str(server.url or "").strip(),
+        *(auth.get(key) for key in _MEMBER_GRANT_BINDING_AUTH_KEYS),
+    )
 
 
 def _delete_team_path_mcp_oauth_state(db: Session, *, server_id: int) -> None:
@@ -5210,7 +5191,7 @@ def update_mcp_server(
                 )
 
             # Update server fields (global config; no-op values for non-owners)
-            binding_before, decrypt_failed_before = _member_grant_binding(server)
+            binding_before = _member_grant_binding(server)
             try:
                 _update_server_from_config(server, config)
             except ValueError as exc:
@@ -5219,19 +5200,10 @@ def update_mcp_server(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid environment variables: {exc}",
                 ) from exc
-            binding_after, decrypt_failed_after = _member_grant_binding(server)
-            # Compared as written, not through a sentinel for "could not
-            # decrypt": a sentinel equals itself, so a secret that is
-            # unreadable both before and after would look unchanged. When
-            # either side cannot be read, the change cannot be ruled out and
-            # the team-path state is deleted. This runs in the transaction
-            # that holds the definition row lock; the route's commit below
-            # makes the write and the deletion one change.
-            if (
-                decrypt_failed_before
-                or decrypt_failed_after
-                or binding_before != binding_after
-            ):
+            # This runs in the transaction that holds the definition row
+            # lock; the route's commit below makes the write and the deletion
+            # one change.
+            if _member_grant_binding(server) != binding_before:
                 _delete_team_path_mcp_oauth_state(db, server_id=int(server.id))
             if can_edit_global:
                 orm_server = cast(Any, server)

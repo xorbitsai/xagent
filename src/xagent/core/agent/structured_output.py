@@ -13,6 +13,7 @@ to the core layer and imports nothing from the web layer.
 from __future__ import annotations
 
 import asyncio
+import enum
 import inspect
 import json
 import logging
@@ -116,18 +117,15 @@ StructuredOutputFormat.INVALID = StructuredOutputFormat("<invalid>", None, {})
 StructuredOutputFormat.READ_FAILED = StructuredOutputFormat("<read_failed>", None, {})
 
 
-class _Sentinel:
-    def __init__(self, name: str) -> None:
-        self._name = name
+class _Decision(enum.Enum):
+    # The run needs no structured result: no key is written.
+    SKIP = "SKIP"
+    # The run needs the model to write its structured result.
+    EXTRACT = "EXTRACT"
 
-    def __repr__(self) -> str:
-        return self._name
 
-
-# The run needs no structured result: no key is written.
-SKIP: Final = _Sentinel("SKIP")
-# The run needs the model to write its structured result.
-EXTRACT: Final = _Sentinel("EXTRACT")
+SKIP: Final = _Decision.SKIP
+EXTRACT: Final = _Decision.EXTRACT
 
 _NOT_FINISHED_STATUSES = frozenset({"waiting_for_user", "interrupted", "paused"})
 
@@ -191,7 +189,7 @@ def _settled_from_verdict(
 
 def structured_output_eligibility(
     result: dict[str, Any], fmt: StructuredOutputFormat | None
-) -> _Sentinel | dict[str, Any]:
+) -> _Decision | dict[str, Any]:
     """Decide what ``result`` needs: :data:`SKIP`, :data:`EXTRACT` or an
     outcome that is already settled without a model.
 

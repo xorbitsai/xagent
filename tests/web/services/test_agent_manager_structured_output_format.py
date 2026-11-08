@@ -66,6 +66,14 @@ def test_the_result_key_is_the_one_the_projection_reads() -> None:
     assert structured_output.STRUCTURED_OUTPUT_RESULT_KEY == projection._RESULT_KEY
 
 
+def test_the_reason_messages_state_the_limits_the_extraction_uses() -> None:
+    messages = projection.REASON_MESSAGES
+    attempts = structured_output.MAX_EXTRACTION_ATTEMPTS
+    seconds = structured_output.EXTRACTION_TIMEOUT_SECONDS
+    assert f"within {attempts} attempts." in messages["schema_mismatch"]
+    assert f"within {seconds} seconds." in messages["extraction_timeout"]
+
+
 OUTCOMES = [
     ("ready", None, {}, Model({"name": "a", "unit": "kg", "note": None})),
     (

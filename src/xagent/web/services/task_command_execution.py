@@ -5119,10 +5119,16 @@ async def execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None | SettledTaskCommand:
     from ...config import get_shared_task_execution_enabled
+    from ...core.model.chat.routing_context import xinference_interactive_requests
+    from .task_dispatch_cap import DISPATCH_CLASS_INTERACTIVE
     from .task_execution_host import claimed_command_execution
 
     async def execute() -> dict[str, Any] | None | SettledTaskCommand:
-        with claimed_command_execution():
+        interactive = (
+            command.dispatch_class == DISPATCH_CLASS_INTERACTIVE
+            and not command.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX)
+        )
+        with claimed_command_execution(), xinference_interactive_requests(interactive):
             if command.kind == TaskCommandKind.RESUME_INPUT:
                 from .task_resume_command import execute_resume_input
 

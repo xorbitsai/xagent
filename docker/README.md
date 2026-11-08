@@ -965,6 +965,19 @@ After v17 accepts writes the copy is stale, and copying it back discards everyth
 
 ## Troubleshooting
 
+### Reset the administrator password
+
+Run this command from the directory containing `docker-compose.yml`. Replace
+`admin` with your administrator's username and enter the new password when prompted.
+
+```bash
+docker compose exec backend python -m xagent.web.reset_admin_password --username admin
+```
+
+The reset revokes the administrator's existing sign-in sessions, file-stream
+tickets, and password-reset links. Sign in again with the new password. After a
+compromise, revoke independent API keys and provider grants separately.
+
 ### Container Won't Start
 
 ```bash

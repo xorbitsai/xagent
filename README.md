@@ -1,4 +1,4 @@
-![Xagent. Enterprise agent platform. Build and deploy AI teammates.](assets/xagent-banner.png)
+![Xagent. Enterprise agent platform. Build and deploy AI teammates.](assets/xagent-banner.webp)
 
 # Xagent
 
@@ -86,6 +86,8 @@ xagent
 3. Choose **Add a teammate**, then create or select a teammate and test it in the Builder.
 4. Publish the teammate, enable its share link, and open the link in a private browser window to try the visitor experience.
 
+Moving from OpenClaw or Hermes? Use `xagent migrate` to import agent configuration, skills, and supported schedules. Run `xagent migrate --dry-run` to preview the import.
+
 ### Run with Docker Compose
 
 ```bash
@@ -96,6 +98,8 @@ docker compose up -d
 ```
 
 Open [localhost](http://localhost/) and complete setup. Review the deployment settings in `.env` before running on a shared host. For production, serve Xagent over HTTPS and follow the [deployment guide](docker/README.md).
+
+Forgot the administrator password? See [how to reset it from the Docker host](docker/README.md#reset-the-administrator-password).
 
 ## Documentation and community
 

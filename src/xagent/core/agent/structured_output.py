@@ -595,8 +595,8 @@ async def run_structured_output_step(
     stats: _ExtractionStats | None = None,
 ) -> dict[str, Any]:
     """Write the structured result of ``answer`` with at most three calls of
-    ``llm`` that force one ``submit_result`` tool call, and return the settled
-    outcome.
+    ``llm`` that ask for one ``submit_result`` tool call, with the strongest
+    tool choice the model accepts, and return the settled outcome.
 
     The tool shows the model the nullable copy of the schema; the arguments are
     always judged against the caller's own schema. A result that is too large

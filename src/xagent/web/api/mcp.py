@@ -6688,21 +6688,16 @@ class _MCPOAuthConnectDiscovery:
 
 @dataclass(frozen=True)
 class _PreparedMCPOAuthConnect:
-    discovery: Any
-    redirect_uri: str
-    selected_issuer: str
+    discovered: _MCPOAuthConnectDiscovery
     client_id: str
     client_secret: str | None
     token_endpoint_auth_method: str
     registration_lookup_hash: str | None
     selected_scope: str
-    resource_owner_key: str
     selected_resource: str
 
 
-async def _discover_mcp_oauth_connect(
-    db: Session, server: MCPServer
-) -> _MCPOAuthConnectDiscovery:
+async def _discover_mcp_oauth_connect(server: MCPServer) -> _MCPOAuthConnectDiscovery:
     """Read the auth config and discover the provider; no registration request."""
     auth_config = _get_mcp_oauth_config(server)
     # A required scope that is not part of the requested scope is a
@@ -6731,10 +6726,16 @@ async def _resolve_mcp_oauth_connect_client(
     server: MCPServer,
     discovered: _MCPOAuthConnectDiscovery,
     *,
-    resource_owner_key: str,
     persistence: _OAuthPersistence,
 ) -> _PreparedMCPOAuthConnect:
-    """Pick the static, registered or newly registered client for a connect."""
+    """Pick the static, registered or newly registered client for a connect.
+
+    Side effect: when no static or registered client exists and
+    ``persistence`` is ``COMMIT``, this rolls the session back before the
+    registration request, so no transaction stays open across provider I/O.
+    That discards the caller's pending changes and expires its loaded
+    instances. With ``CALLER`` persistence it never rolls back.
+    """
     server_id = cast(int, server.id)
     auth_config = discovered.auth_config
     discovery = discovered.discovery
@@ -6801,25 +6802,17 @@ async def _resolve_mcp_oauth_connect_client(
             client_secret = None
             token_endpoint_auth_method = registration.token_endpoint_auth_method
     selected_scope = _scope_string(auth_config.get("scope") or discovery.scopes)
-    resource_owner_key = _bounded_mcp_oauth_value(
-        resource_owner_key,
-        field_name="resource_owner_key",
-        max_length=MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
-    )
     selected_resource = _bounded_mcp_oauth_value(
         str(discovery.resource), field_name="resource"
     )
 
     return _PreparedMCPOAuthConnect(
-        discovery=discovery,
-        redirect_uri=redirect_uri,
-        selected_issuer=selected_issuer,
+        discovered=discovered,
         client_id=client_id,
         client_secret=client_secret,
         token_endpoint_auth_method=token_endpoint_auth_method,
         registration_lookup_hash=registration_lookup_hash,
         selected_scope=selected_scope,
-        resource_owner_key=resource_owner_key,
         selected_resource=selected_resource,
     )
 
@@ -6827,17 +6820,21 @@ async def _resolve_mcp_oauth_connect_client(
 def _mcp_oauth_connect_response(
     prepared: _PreparedMCPOAuthConnect,
     *,
-    client_id: str,
+    persisted_client_id: str,
     state_value: str,
     code_verifier: str,
     accept: str | None,
 ) -> RedirectResponse | JSONResponse:
-    """Build the authorization redirect for a persisted flow."""
-    discovery = prepared.discovery
-    redirect_uri = prepared.redirect_uri
+    """Build the authorization redirect for a persisted flow.
+
+    ``persisted_client_id`` is the client the flow was stored with. It can
+    differ from ``prepared.client_id`` when a concurrently registered client
+    was adopted, so the redirect must use it.
+    """
+    discovery = prepared.discovered.discovery
+    redirect_uri = prepared.discovered.redirect_uri
     selected_resource = prepared.selected_resource
     selected_scope = prepared.selected_scope
-    persisted_client_id = client_id
     params = {
         "response_type": "code",
         "client_id": persisted_client_id,
@@ -6896,26 +6893,29 @@ async def _connect_mcp_oauth_for_owner(
         user_id=user_id,
         lifecycle_generation=association_generation,
     )
-    discovered = await _discover_mcp_oauth_connect(db, server)
+    discovered = await _discover_mcp_oauth_connect(server)
+    # With COMMIT persistence this may roll the session back before it
+    # registers a client.
     prepared = await _resolve_mcp_oauth_connect_client(
-        db,
-        server,
-        discovered,
-        resource_owner_key=resource_owner_key,
-        persistence=persistence,
+        db, server, discovered, persistence=persistence
+    )
+    resource_owner_key = _bounded_mcp_oauth_value(
+        resource_owner_key,
+        field_name="resource_owner_key",
+        max_length=MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     )
 
     persisted = _persist_mcp_oauth_connect_flow(
         db,
         association_identity=association_identity,
-        discovery=prepared.discovery,
+        discovery=discovered.discovery,
         client_id=prepared.client_id,
         client_secret=prepared.client_secret,
         token_endpoint_auth_method=prepared.token_endpoint_auth_method,
-        redirect_uri=prepared.redirect_uri,
+        redirect_uri=discovered.redirect_uri,
         registration_lookup_hash=prepared.registration_lookup_hash,
-        resource_owner_key=prepared.resource_owner_key,
-        selected_issuer=prepared.selected_issuer,
+        resource_owner_key=resource_owner_key,
+        selected_issuer=discovered.selected_issuer,
         selected_resource=prepared.selected_resource,
         selected_scope=prepared.selected_scope,
         redirect_after=request_data.redirect_after,
@@ -6951,7 +6951,7 @@ async def _connect_mcp_oauth_for_owner(
         return JSONResponse(result, headers=HEADERS)
     return _mcp_oauth_connect_response(
         prepared,
-        client_id=persisted_client_id,
+        persisted_client_id=persisted_client_id,
         state_value=state_value,
         code_verifier=code_verifier,
         accept=accept,

@@ -1273,6 +1273,18 @@ async def test_the_event_names_the_model_after_a_fallback_inside_the_call():
     assert stats.model == "vendor/fallback"
 
 
+async def test_a_model_that_cannot_be_forced_is_asked_with_auto():
+    llm = ScriptedModel([_args_reply(GOOD)], supports_forced_tool_choice=False)
+    await _step(llm)
+    assert llm.calls[0]["tool_choice"] == "auto"
+
+
+async def test_the_tool_choice_follows_the_model_that_was_prepared():
+    resolved = ScriptedModel([_args_reply(GOOD)], supports_forced_tool_choice=False)
+    await _step(RoutedModel(resolved))
+    assert resolved.calls[0]["tool_choice"] == "auto"
+
+
 async def test_a_model_that_cannot_be_prepared_is_a_model_error():
     class Broken:
         async def prepare_for_call(self, messages: Any) -> Any:

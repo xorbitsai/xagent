@@ -23,6 +23,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final
 
+from ..model.chat.basic.base import compatible_tool_choice_for_llm
 from ..model.chat.basic.call_boundary import (
     PROVIDER_ERROR,
     ProviderCallError,
@@ -472,6 +473,7 @@ async def _extract(
             )
             return _settled("failed", "model_error")
     max_tokens = _output_limit(llm, prepared)
+    tool_choice = compatible_tool_choice_for_llm(prepared, "required")
 
     corrected_system = False
     last = _LastFailure("no_submit_result")
@@ -483,7 +485,7 @@ async def _extract(
             response = await prepared.chat(
                 messages=messages,
                 tools=[tool],
-                tool_choice="required",
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
             )
         except LLMToolProtocolError:

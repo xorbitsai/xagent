@@ -1253,6 +1253,26 @@ def test_the_failure_code_of_a_provider_error_names_the_rejection():
     assert so._failure_code(AuthenticationError("no")) == "credential_rejected"
 
 
+async def test_the_event_names_the_model_that_took_the_call():
+    stats = so._ExtractionStats()
+    resolved = ScriptedModel([_args_reply(GOOD)], model_name="vendor/real")
+    await _step(RoutedModel(resolved, model_name="Auto"), stats=stats)
+    assert stats.model == "vendor/real"
+
+
+async def test_the_event_names_the_model_after_a_fallback_inside_the_call():
+    stats = so._ExtractionStats()
+
+    class FallsOver(ScriptedModel):
+        async def chat(self, **kwargs: Any) -> Any:
+            self.model_name = "vendor/fallback"
+            return await super().chat(**kwargs)
+
+    resolved = FallsOver([_args_reply(GOOD)], model_name="vendor/first")
+    await _step(RoutedModel(resolved, model_name="Auto"), stats=stats)
+    assert stats.model == "vendor/fallback"
+
+
 async def test_a_model_that_cannot_be_prepared_is_a_model_error():
     class Broken:
         async def prepare_for_call(self, messages: Any) -> Any:

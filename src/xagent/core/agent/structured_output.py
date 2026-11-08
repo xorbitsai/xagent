@@ -298,7 +298,7 @@ def _parse_arguments(arguments: Any) -> _ParsedArguments | _BadArguments:
 class _ExtractionStats:
     """What one extraction counted, for the trace event: the model calls, the
     counts of the last judgement that read the arguments, the replies that held
-    no tool call, and the name of the model."""
+    no tool call, and the name of the model that took the last call."""
 
     attempts: int = 0
     missing_count: int = 0
@@ -345,6 +345,15 @@ def _output_limit(llm: Any, prepared: Any) -> int:
     if type(window) is int and window > 0:
         return min(EXTRACTION_MAX_OUTPUT_TOKENS, max(1, window // 4))
     return EXTRACTION_MAX_OUTPUT_TOKENS
+
+
+def _record_model(stats: _ExtractionStats, model: Any) -> None:
+    """Record the name of the model that took the last call. A routing model
+    resolves to a concrete one in ``prepare_for_call`` and may move to a
+    fallback during a call, so the name is read after each call."""
+    name = getattr(model, "model_name", None)
+    if isinstance(name, str):
+        stats.model = name
 
 
 def _reply_parts(response: Any) -> tuple[str, list[Any]]:
@@ -480,6 +489,7 @@ async def _extract(
         except LLMToolProtocolError:
             protocol_failure = True
         except Exception as exc:
+            _record_model(stats, prepared)
             _log_model_error(
                 exc,
                 stage="chat",
@@ -488,6 +498,7 @@ async def _extract(
                 run_id=run_id,
             )
             return _settled("failed", "model_error")
+        _record_model(stats, prepared)
         if not protocol_failure:
             protocol_failure = get_tool_protocol_error(response) is not None
         if protocol_failure:

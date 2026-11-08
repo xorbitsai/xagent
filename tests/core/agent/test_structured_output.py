@@ -1222,6 +1222,37 @@ async def test_a_cancellation_from_outside_while_the_limit_is_armed_goes_through
         await task
 
 
+@pytest.mark.parametrize("where", ["prepare", "chat"])
+async def test_a_model_error_is_logged_by_type_and_failure_code_only(where, caplog):
+    secret = "sk-secret the answer text"
+
+    class Failing(ScriptedModel):
+        async def prepare_for_call(self, messages: Any) -> Any:
+            if where == "prepare":
+                raise PermissionError(secret)
+            return self
+
+        async def chat(self, **kwargs: Any) -> Any:
+            raise PermissionError(secret)
+
+    with caplog.at_level(logging.WARNING):
+        assert await _step(Failing()) == _failed("model_error")
+    (message,) = _warnings(caplog)
+    assert "task_id=t-1 run_id=r-1" in message
+    assert f"stage={where}" in message
+    assert "error=PermissionError" in message
+    assert "failure=" in message
+    assert secret not in message
+    assert all(r.exc_info is None for r in caplog.records)
+
+
+def test_the_failure_code_of_a_provider_error_names_the_rejection():
+    class AuthenticationError(Exception):
+        pass
+
+    assert so._failure_code(AuthenticationError("no")) == "credential_rejected"
+
+
 async def test_a_model_that_cannot_be_prepared_is_a_model_error():
     class Broken:
         async def prepare_for_call(self, messages: Any) -> Any:

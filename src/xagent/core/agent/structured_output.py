@@ -23,6 +23,11 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final
 
+from ..model.chat.basic.call_boundary import (
+    PROVIDER_ERROR,
+    ProviderCallError,
+    classify_provider_failure,
+)
 from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.tool_protocol import get_tool_protocol_error
 from ..model.chat.types import PROVIDER_STATE_METADATA_KEY
@@ -391,6 +396,37 @@ def _call_id(call: Any) -> Any:
     return call.get("id") if isinstance(call, dict) else None
 
 
+def _failure_code(exc: BaseException) -> str:
+    """The fixed failure code of a model error; the provider's text is never
+    returned."""
+    if isinstance(exc, ProviderCallError):
+        return exc.code
+    try:
+        return classify_provider_failure(exc)
+    except Exception:  # noqa: BLE001 - a log field must not fail the extraction
+        return PROVIDER_ERROR
+
+
+def _log_model_error(
+    exc: BaseException,
+    *,
+    stage: str,
+    attempt: int,
+    task_id: str | None,
+    run_id: str | None,
+) -> None:
+    logger.warning(
+        "Structured output model call failed. task_id=%s run_id=%s stage=%s "
+        "attempt=%d error=%s failure=%s",
+        task_id,
+        run_id,
+        stage,
+        attempt,
+        type(exc).__name__,
+        _failure_code(exc),
+    )
+
+
 async def _extract(
     fmt: StructuredOutputFormat,
     answer: str,
@@ -421,7 +457,10 @@ async def _extract(
             prepared = prepare([{"role": "user", "content": messages[1]["content"]}])
             if inspect.isawaitable(prepared):
                 prepared = await prepared
-        except Exception:
+        except Exception as exc:
+            _log_model_error(
+                exc, stage="prepare", attempt=0, task_id=task_id, run_id=run_id
+            )
             return _settled("failed", "model_error")
     max_tokens = _output_limit(llm, prepared)
 
@@ -440,7 +479,14 @@ async def _extract(
             )
         except LLMToolProtocolError:
             protocol_failure = True
-        except Exception:
+        except Exception as exc:
+            _log_model_error(
+                exc,
+                stage="chat",
+                attempt=stats.attempts,
+                task_id=task_id,
+                run_id=run_id,
+            )
             return _settled("failed", "model_error")
         if not protocol_failure:
             protocol_failure = get_tool_protocol_error(response) is not None

@@ -497,6 +497,9 @@ def test_canonical_json_writes_the_smallest_float_and_the_largest() -> None:
 
 def test_canonical_json_escapes_quotes_backslashes_and_control_characters() -> None:
     assert structured_schema.canonical_json_size('a"b\\c\n') == len('"a\\"b\\\\c\\n"')
+    assert structured_schema.canonical_json_size("\x00") == len('"\\u0000"')
+    with pytest.raises(UnicodeEncodeError):
+        structured_schema.canonical_json_size("\ud800")
 
 
 def test_canonical_json_refuses_a_value_that_is_not_finite() -> None:

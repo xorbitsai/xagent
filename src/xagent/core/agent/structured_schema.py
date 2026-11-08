@@ -998,7 +998,7 @@ def canonical_json_size(value: Any) -> int:
 
     The text is compact, keeps the key order, writes non-ASCII characters as
     they are and is encoded as UTF-8. It raises ``ValueError`` for a NaN or an
-    infinity; the value must also hold no NUL and no lone surrogate.
+    infinity and ``UnicodeEncodeError`` for a string with a lone surrogate.
     """
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     return len(text.encode("utf-8"))

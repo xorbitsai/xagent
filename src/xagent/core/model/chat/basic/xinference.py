@@ -17,6 +17,8 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 _MODEL_DISCOVERY_TIMEOUT_SECONDS = 30.0
+# Xinference schedules lower priority values first.
+_INTERACTIVE_PRIORITY_HINT = -1
 
 
 async def _await_with_timeout(
@@ -223,7 +225,7 @@ class XinferenceLLM(BaseLLM):
             and xinference_interactive.get()
             and "priority" not in config
         ):
-            config.setdefault("priority_hint", -1)
+            config.setdefault("priority_hint", _INTERACTIVE_PRIORITY_HINT)
 
     def _apply_cache_lifecycle(self, config: dict[str, Any]) -> None:
         session = agent_cache_session.get()

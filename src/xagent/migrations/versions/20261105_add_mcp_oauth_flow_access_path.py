@@ -24,7 +24,8 @@ Upgrade guards, in this order:
    only a table that already has the column but not the CHECK is rebuilt
    through a batch to add it.
 
-Downgrade drops the CHECK first and the column second. On SQLite the online
+Downgrade drops the CHECK before the column, except the SQLite ``--sql``
+downgrade, which emits only ``DROP COLUMN``. On SQLite the online
 downgrade rebuilds the table through a batch, which works wherever the CHECK
 sits; the ``--sql`` downgrade is a plain ``DROP COLUMN``, which SQLite accepts
 only while the CHECK is attached to the column, as the add-column path and

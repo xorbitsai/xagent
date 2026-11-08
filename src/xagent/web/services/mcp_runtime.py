@@ -523,6 +523,8 @@ async def build_mcp_runtime_connection(
 
     ``allow_team_member_grants`` is the task-source gate's verdict for the task
     this connection is built for; it is forwarded unchanged to grant selection.
+    Grant selection is also given the URL of the connection built here, which
+    is where the selected token is sent.
     """
     connection = server.to_connection_dict()
 
@@ -580,6 +582,9 @@ async def build_mcp_runtime_connection(
             scope=selection.get("scope"),
             issuer=selection.get("issuer"),
             allow_team_member_grants=allow_team_member_grants,
+            # The URL the token is added to below; grant selection compares
+            # this value rather than reading the row again.
+            endpoint_url=str(connection.get("url") or ""),
         )
     except MCPOAuthRuntimeError as exc:
         return MCPRuntimeConnectionBuild(

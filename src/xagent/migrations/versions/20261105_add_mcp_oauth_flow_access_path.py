@@ -5,9 +5,10 @@ default ``association``. ``association`` is a flow started by a user who holds a
 ``user_mcpservers`` row; ``team_member`` is a flow started by a team member who
 holds none and reaches the connector through the team overlay. A named CHECK
 admits ``team_member`` only when ``association_lifecycle_generation`` is NULL,
-because the flow row itself is the lifecycle anchor on that path. Existing rows
-all read ``association``; those with a NULL generation still fail closed in the
-callback, as before.
+because the flow row itself is the lifecycle anchor on that path, and only when
+``resource_owner_key`` is the starting user's own default,
+``xagent:user:{user_id}``. Existing rows all read ``association``; those with a
+NULL generation still fail closed in the callback, as before.
 
 Upgrade guards, in this order:
 
@@ -18,9 +19,17 @@ Upgrade guards, in this order:
 4. On PostgreSQL every statement runs through ``run_ddl_with_lock_retry`` and the
    CHECK is added ``NOT VALID``: every existing row is ``association`` and
    satisfies it, so no table scan is needed under the lock, and every later
-   write is checked. SQLite adds the column and the CHECK through one batch.
+   write is checked. SQLite adds the column with one ``ADD COLUMN`` whose
+   definition carries the named CHECK, online and in ``--sql`` output alike;
+   only a table that already has the column but not the CHECK is rebuilt
+   through a batch to add it.
 
-Downgrade drops the CHECK first and the column second.
+Downgrade drops the CHECK first and the column second. On SQLite the online
+downgrade rebuilds the table through a batch, which works wherever the CHECK
+sits; the ``--sql`` downgrade is a plain ``DROP COLUMN``, which SQLite accepts
+only while the CHECK is attached to the column, as the add-column path and
+``create_all`` both leave it. A table whose CHECK the batch path added needs the
+online downgrade.
 
 Revision ID: 20261105_mcp_oauth_flow_access_path
 Revises: 20261105_task_structured_output_record
@@ -48,7 +57,8 @@ COLUMN = "access_path"
 CONSTRAINT = "ck_mcp_oauth_flow_states_access_path"
 CHECK_CONDITION = (
     "(access_path = 'association') OR "
-    "(access_path = 'team_member' AND association_lifecycle_generation IS NULL)"
+    "(access_path = 'team_member' AND association_lifecycle_generation IS NULL "
+    "AND resource_owner_key = 'xagent:user:' || CAST(user_id AS VARCHAR))"
 )
 _LOCK_TIMEOUT = "5s"
 # Seconds to wait after the first and the second lock timeout.
@@ -64,6 +74,16 @@ _ADD_CHECK_SQL = (
 )
 _DROP_CHECK_SQL = f"ALTER TABLE {TABLE} DROP CONSTRAINT IF EXISTS {CONSTRAINT}"
 _DROP_COLUMN_SQL = f"ALTER TABLE {TABLE} DROP COLUMN {COLUMN}"
+
+
+def _column() -> sa.Column:
+    return sa.Column(
+        COLUMN,
+        sa.String(16),
+        sa.CheckConstraint(CHECK_CONDITION, name=CONSTRAINT),
+        nullable=False,
+        server_default="association",
+    )
 
 
 def _columns() -> set[str] | None:
@@ -99,15 +119,7 @@ def upgrade() -> None:
             for statement in (_ADD_COLUMN_SQL, _ADD_CHECK_SQL):
                 offline_ddl_with_lock_timeout(statement, lock_timeout=_LOCK_TIMEOUT)
         else:
-            op.add_column(
-                TABLE,
-                sa.Column(
-                    COLUMN,
-                    sa.String(16),
-                    nullable=False,
-                    server_default="association",
-                ),
-            )
+            op.add_column(TABLE, _column())
         return
 
     columns = _columns()
@@ -120,21 +132,11 @@ def upgrade() -> None:
             _apply(_ADD_CHECK_SQL)
         return
 
-    add_column = COLUMN not in columns
-    add_check = not _has_check()
-    if not (add_column or add_check):
-        return
-    with op.batch_alter_table(TABLE) as batch:
-        if add_column:
-            batch.add_column(
-                sa.Column(
-                    COLUMN,
-                    sa.String(16),
-                    nullable=False,
-                    server_default="association",
-                )
-            )
-        if add_check:
+    if COLUMN not in columns:
+        # The CHECK travels with the column definition.
+        op.add_column(TABLE, _column())
+    elif not _has_check():
+        with op.batch_alter_table(TABLE) as batch:
             batch.create_check_constraint(CONSTRAINT, CHECK_CONDITION)
 
 

@@ -261,23 +261,26 @@ class MCPOAuthFlowState(Base):  # type: ignore
     # (NULL there still means a pre-fence legacy row, which fails closed).
     # "team_member": the caller held no UserMCPServer row and reached the
     # server through the team overlay; association_lifecycle_generation is NULL
-    # and the flow row itself is the lifecycle anchor. The owner key of a
-    # "team_member" flow is always the caller's own default, xagent:user:{id}.
+    # and the flow row itself is the lifecycle anchor. The CHECK also requires
+    # the owner key of a "team_member" flow to be the caller's own default,
+    # xagent:user:{user_id}. It is attached to this column, so SQLite can drop
+    # the column together with it.
     access_path = Column(
-        String(16), nullable=False, default="association", server_default="association"
+        String(16),
+        CheckConstraint(
+            "(access_path = 'association') OR "
+            "(access_path = 'team_member' AND association_lifecycle_generation IS NULL "
+            "AND resource_owner_key = 'xagent:user:' || CAST(user_id AS VARCHAR))",
+            name="ck_mcp_oauth_flow_states_access_path",
+        ),
+        nullable=False,
+        default="association",
+        server_default="association",
     )
 
     mcp_server = relationship("MCPServer")
     oauth_client = relationship("MCPOAuthClient")
     user = relationship("User")
-
-    __table_args__ = (
-        CheckConstraint(
-            "(access_path = 'association') OR "
-            "(access_path = 'team_member' AND association_lifecycle_generation IS NULL)",
-            name="ck_mcp_oauth_flow_states_access_path",
-        ),
-    )
 
     def __repr__(self) -> str:
         return (

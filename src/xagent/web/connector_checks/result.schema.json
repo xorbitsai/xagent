@@ -126,7 +126,7 @@
               "row": { "const": "check" },
               "failure_class": { "type": "null" },
               "reason": {
-                "enum": ["covered_by_l2", "sandboxed", "execution_scoped", "needs_fixture"]
+                "enum": ["covered_by_l2", "sandboxed", "execution_scoped", "needs_fixture", "write_only"]
               }
             }
           }

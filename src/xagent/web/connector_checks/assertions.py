@@ -62,6 +62,8 @@ _KINDS: Mapping[type, str] = {
 }
 
 _MISSING = object()
+# What ``value_at`` returns where the result holds no value.
+MISSING: Any = _MISSING
 
 
 class _NoPayload(Exception):
@@ -116,6 +118,27 @@ def resolve_expected(
             )
         resolved.append(assertion)
     return tuple(resolved)
+
+
+def value_at(raw: Any, payload: PayloadSource, path: PayloadPath) -> Any:
+    """The value at ``path`` in ``raw``'s ``payload``, or ``MISSING``.
+
+    A write check reads its tenant id and a created object's id this way. A
+    result that is not a mapping, is flagged ``is_error`` or has no such
+    payload holds no value.
+    """
+    if not isinstance(raw, Mapping) or raw.get("is_error"):
+        return MISSING
+    try:
+        value = _payload(raw, payload)
+    except _NoPayload:
+        return MISSING
+    return _at(value, path)
+
+
+def json_equal(actual: Any, expected: Any) -> bool:
+    """Whether two values are equal as JSON compares them (``Equals``)."""
+    return _json_equal(actual, expected)
 
 
 def _judge_l3(raw: Any, assertion: L3Envelope) -> Judgement:

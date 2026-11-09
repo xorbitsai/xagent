@@ -184,6 +184,7 @@ _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
+CONNECTOR_SMOKE_WRITE_APPS = "XAGENT_CONNECTOR_SMOKE_WRITE_APPS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
 LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
 AUTO_PRIMARY_MAX_ATTEMPTS = "XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS"
@@ -3877,6 +3878,26 @@ def get_connector_probe_users() -> frozenset[str]:
         Frozenset of usernames and email addresses; empty when unset or blank.
     """
     return frozenset(_csv_env(CONNECTOR_PROBE_USERS))
+
+
+def get_connector_smoke_write_apps() -> frozenset[str]:
+    """Get the connectors whose smoke V2 write checks may run.
+
+    A write check creates, verifies and deletes a real object in a test
+    tenant (``web/connector_checks/writes.py``, #3564), so each connector's
+    write checks stay off until its app id is listed here, per environment.
+    The smoke V2 engine reads this once at the start of a run; neither the
+    CLI nor an identity adapter can turn writes on.
+
+    Priority:
+        1. XAGENT_CONNECTOR_SMOKE_WRITE_APPS environment variable
+           (comma-separated catalog app ids, such as ``jira,google-drive``)
+        2. empty (no write check runs)
+
+    Returns:
+        Frozenset of app ids; empty when unset or blank.
+    """
+    return frozenset(_csv_env(CONNECTOR_SMOKE_WRITE_APPS))
 
 
 def get_llm_retry_deadline_seconds() -> float:

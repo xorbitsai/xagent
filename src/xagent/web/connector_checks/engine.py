@@ -11,7 +11,11 @@ resolves, through the adapter, the fixtures of every selected read check on
 a target the adapter does not skip. A check whose key has no value is
 ``skip``/``fixture_missing`` and is never called. A resolver that raises fails
 the run as ``fixtures:exception``: a broken fixture store is a failure of the
-run, never a skipped check.
+run, never a skipped check. A write check of a connector whose writes are
+switched on (``XAGENT_CONNECTOR_SMOKE_WRITE_APPS``) is prepared the same way
+(``writes.prepare_writes``), with the run's id in its names and its write
+tools' verdicts from the adapter's write policy; a policy that raises fails
+the run as ``write_policy:exception``.
 Then, for each target in the adapter's order:
 
 1. A target the adapter skips is never started.
@@ -23,14 +27,14 @@ Then, for each target in the adapter's order:
    nor a write switch changes how a connector starts.
 3. The checks run in declaration order on the listed tools, each call under
    its own timeout. Each call still opens its own MCP session, so an in-repo
-   server spawns one process per check. Write checks never run: each is
-   ``skip``/``writes_disabled`` until the write-check safety rails land
-   (#3564).
+   server spawns one process per check. A write check runs through
+   ``writes.run_write`` when its connector's writes are switched on, and is
+   ``skip``/``writes_disabled`` otherwise.
 
-When a session does not pass, none of its checks runs: a read check is
-``skip``/``session_unavailable``, while an unprobeable check, a write check
-and an undeclared app's row keep their own outcome, which does not depend on
-the session.
+When a session does not pass, none of its checks runs: a read check, and a
+switched-on write check, is ``skip``/``session_unavailable``, while an
+unprobeable check, a switched-off write check and an undeclared app's row
+keep their own outcome, which does not depend on the session.
 
 Connectors run in sequence under one total timeout. The step it interrupts
 (a session or a call) fails as ``timed_out`` with reason ``run_deadline``.
@@ -59,6 +63,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ...config import get_connector_smoke_write_apps
 from ..services.connector_probe import find_tool, probe_call_timeout_seconds
 from ..services.mcp_connector_session import ConnectorToolsResult
 from .assertions import judge_result, resolve_expected
@@ -87,6 +92,14 @@ from .results import (
     RunResult,
     SessionRow,
     classify_session,
+)
+from .writes import (
+    PreparedWrite,
+    WritePolicyFailed,
+    new_run_id,
+    prepare_writes,
+    run_write,
+    unavailable_write_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +143,9 @@ class _ConnectorPlan:
     declaration: ConnectorChecks | None
     checks: tuple[_Check, ...]
     prepared: Mapping[str, _Prepared]
+    # Whether the connector's write checks run, and each one prepared.
+    writes_enabled: bool = False
+    writes: Mapping[str, PreparedWrite] = field(default_factory=dict)
 
     @property
     def connector(self) -> str:
@@ -215,6 +231,8 @@ async def run_checks(
         raise ValueError("invalid environment label")
     if check_timeout is None:
         check_timeout = float(probe_call_timeout_seconds())
+    write_apps = get_connector_smoke_write_apps()
+    run_id = new_run_id(started_at)
 
     def finish(rows: Sequence[SessionRow | CheckRow], failure: str | None) -> RunResult:
         return RunResult(
@@ -242,11 +260,24 @@ async def run_checks(
         return finish((), "enumeration:duplicate_connector")
 
     try:
-        plans = _plan(adapter, targets, declarations, connectors, checks)
+        plans = _plan(
+            adapter,
+            targets,
+            declarations,
+            connectors,
+            checks,
+            write_apps=write_apps,
+            run_id=run_id,
+        )
     except _ResolverFailed:
         return finish((), "fixtures:exception")
+    except WritePolicyFailed:
+        return finish((), "write_policy:exception")
     if not plans:
         return finish((), "selection:no_targets")
+    if any(plan.writes for plan in plans):
+        # The objects a run creates carry its id; the log ties them to it.
+        logger.info("Write checks run under run id %s", run_id)
 
     rows: list[SessionRow | CheckRow] = []
     for plan in plans:
@@ -264,6 +295,9 @@ def _plan(
     declarations: DeclarationLookup,
     connectors: Collection[str] | None,
     checks: Collection[str] | None,
+    *,
+    write_apps: Collection[str],
+    run_id: str,
 ) -> list[_ConnectorPlan]:
     """Every selected target's plan, built before any connector starts."""
     plans: list[_ConnectorPlan] = []
@@ -287,7 +321,15 @@ def _plan(
         )
         if not selected and checks is not None:
             continue
-        plans.append(_ConnectorPlan(target, declaration, selected, {}))
+        plans.append(
+            _ConnectorPlan(
+                target,
+                declaration,
+                selected,
+                {},
+                writes_enabled=target.app_id in write_apps,
+            )
+        )
     # Fixtures resolve only after every declaration has been validated, so an
     # invalid declaration raises whatever the order of the targets.
     return [
@@ -300,6 +342,11 @@ def _plan(
                 for check in plan.checks
                 if isinstance(check, ReadCheck)
             },
+            writes=prepare_writes(
+                plan.checks, plan.target, adapter, _SafeResolver(adapter), run_id
+            )
+            if plan.writes_enabled
+            else {},
         )
         for plan in plans
     ]
@@ -399,6 +446,16 @@ async def _run_connector(
                 await _run_read(
                     connector,
                     plan.prepared[check.id],
+                    tools,
+                    clock=clock,
+                    check_timeout=check_timeout,
+                )
+            )
+        elif isinstance(check, WriteCheck) and plan.writes_enabled:
+            rows.append(
+                await run_write(
+                    connector,
+                    plan.writes[check.id],
                     tools,
                     clock=clock,
                     check_timeout=check_timeout,
@@ -504,6 +561,8 @@ def _without_session(plan: _ConnectorPlan) -> list[CheckRow]:
     return [
         _read_row(plan.connector, check, Outcome.SKIP, FailureClass.SESSION_UNAVAILABLE)
         if isinstance(check, ReadCheck)
+        else unavailable_write_row(plan.connector, check)
+        if isinstance(check, WriteCheck) and plan.writes_enabled
         else _static_row(plan.connector, check)
         for check in plan.checks
     ]

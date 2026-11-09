@@ -2806,6 +2806,32 @@ class TestConnectorProbeUsersConfig:
         assert get_connector_probe_users() == frozenset()
 
 
+class TestConnectorSmokeWriteAppsConfig:
+    """#3564: the connectors whose smoke V2 write checks may run."""
+
+    def test_unset_runs_no_write_check(self, monkeypatch):
+        from xagent.config import get_connector_smoke_write_apps
+
+        monkeypatch.delenv("XAGENT_CONNECTOR_SMOKE_WRITE_APPS", raising=False)
+        result = get_connector_smoke_write_apps()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_parses_and_strips_app_ids(self, monkeypatch):
+        from xagent.config import get_connector_smoke_write_apps
+
+        monkeypatch.setenv(
+            "XAGENT_CONNECTOR_SMOKE_WRITE_APPS", " jira , google-drive,,  "
+        )
+        assert get_connector_smoke_write_apps() == {"jira", "google-drive"}
+
+    def test_blank_runs_no_write_check(self, monkeypatch):
+        from xagent.config import get_connector_smoke_write_apps
+
+        monkeypatch.setenv("XAGENT_CONNECTOR_SMOKE_WRITE_APPS", "  ,  ")
+        assert get_connector_smoke_write_apps() == frozenset()
+
+
 class TestLlmStreamProgressConfig:
     """#2785: knobs for aborting an OpenAI-compatible LLM stream that stops
     making progress."""

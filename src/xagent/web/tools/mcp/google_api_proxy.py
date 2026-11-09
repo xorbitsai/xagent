@@ -152,6 +152,9 @@ class GoogleApiProxyHttp:
 
     ``extra_headers`` names further request headers an API needs forwarded
     (for example a Drive resource key); every other header stays behind.
+
+    ``max_body_bytes`` overrides the shared JSON body limit for this API, when
+    a stage measurement shows its real limit differs.
     """
 
     def __init__(
@@ -160,6 +163,7 @@ class GoogleApiProxyHttp:
         allowed_hosts: Collection[str],
         extra_headers: Collection[str] = (),
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_body_bytes: int | None = None,
     ) -> None:
         if isinstance(allowed_hosts, str):
             raise TypeError(
@@ -170,6 +174,7 @@ class GoogleApiProxyHttp:
             header.lower() for header in extra_headers
         }
         self._timeout = timeout
+        self._max_body_bytes = max_body_bytes
 
     def _prepare(
         self,
@@ -235,6 +240,7 @@ class GoogleApiProxyHttp:
             headers=prepared.headers,
             body=prepared.body,
             timeout=self._timeout,
+            max_body_bytes=self._max_body_bytes,
         )
         content, content_type = _body_and_type(answer, timeout=self._timeout)
         response_headers = {
@@ -266,6 +272,7 @@ class GoogleApiProxyHttp:
             query=prepared.query,
             headers=prepared.headers,
             body=prepared.body,
+            max_body_bytes=self._max_body_bytes,
         )
 
     def close(self) -> None:

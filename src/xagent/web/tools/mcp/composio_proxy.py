@@ -26,6 +26,7 @@ Composio echoes back (a Gmail message's body and attachments travel in it).
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -64,12 +65,37 @@ _BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[^\s\"',;]+", re.IGNORECASE)
 _GOOGLE_ACCESS_TOKEN_RE = re.compile(r"\bya29\.[A-Za-z0-9._-]+")
 # A JSON body member that carries a message: the ``raw`` of a Gmail message
 # is base64, so a vendor echoing the request body leaks the body and the
-# attachments. Redacted by shape too, in case the echo re-encodes it.
-_RAW_MEMBER_RE = re.compile(r'"raw"\s*:\s*"(?:[^"\\]|\\.)*"')
+# attachments. Redacted by shape too, in case the echo re-encodes it. A
+# vendor that truncates the echo leaves the closing quote off, so the match
+# ends at the next quote or at the end of the text.
+_RAW_MEMBER_RE = re.compile(r'"raw"\s*:\s*"(?:[^"\\]|\\.)*(?:"|$)')
 # A request-body string at least this long is treated as content worth
 # redacting if the error text repeats it; ordinary words in an error are
 # shorter than this and survive.
 _MIN_ECHOED_BODY_CHARS = 32
+# Credentials a vendor error can name directly. Their values are not launch
+# variables we hold (a refresh token and a client secret are the grant's), so
+# they are matched by member name, in JSON and in form-encoded text.
+_SECRET_MEMBER_RE = re.compile(
+    r'(?i)"(refresh_token|client_secret|access_token|id_token|api_key)"'
+    r'\s*:\s*"(?:[^"\\]|\\.)*(?:"|$)'
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(refresh_token|client_secret|access_token|id_token|api_key)"
+    r"=([^\s&\"',;]+)"
+)
+# The mail a decoded ``raw`` carries: its body and the headers the caller
+# wrote. A vendor can echo the decoded message instead of the JSON body it
+# was sent, so these values are redacted too.
+_DECODED_HEADER_NAMES = frozenset({"subject", "to", "cc", "bcc"})
+_MIN_DECODED_CONTENT_CHARS = 8
+_MIN_BASE64_MESSAGE_CHARS = 64
+_MIME_MARKERS = (
+    b"Subject:",
+    b"MIME-Version:",
+    b"Content-Type:",
+    b"Content-Transfer-Encoding:",
+)
 # C0 control characters have no place in a query or header value; a bare
 # CR/LF there is what request splitting needs. Tab is the one C0 exception
 # HTTP allows in a header value.
@@ -88,9 +114,10 @@ class ProxyResponse:
 
     ``headers`` are the provider response headers Composio returns (a 3xx
     carries ``location`` there). A binary answer puts its bytes in
-    ``binary_data`` (``url``, ``content_type``, ``size``) and carries
-    ``data=None``: Composio stores the file and returns a signed URL, it
-    never relays the bytes in ``data``.
+    ``binary_data`` (``url``, ``content_type``, ``size``) and ``data`` is
+    null or absent: Composio stores the file and returns a signed URL, it
+    never relays the bytes in ``data``. ``data`` is optional in Composio's
+    schema, so ``None`` means no body, not a malformed answer.
     """
 
     status: int
@@ -153,14 +180,24 @@ def _redact_echoed_body(message: str, body: Any) -> str:
     A vendor error sometimes repeats the request it refused. A Gmail
     message's body and attachments travel base64-encoded in ``raw`` inside
     that body, so leaving the echo intact would put them in the tool result
-    and the server log. The body's long strings are replaced by value, and
-    any ``raw`` member by shape, before the message reaches an error.
+    and the server log. The body's long strings are replaced by value, any
+    ``raw`` member by shape (a truncated echo included), credential-shaped
+    members by name, and the content of a decoded message by value.
     """
-    if body is None:
-        return message
     for value in _long_strings(body):
         message = message.replace(value, _REDACTED)
-    return _RAW_MEMBER_RE.sub(f'"raw": "{_REDACTED}"', message)
+    message = _RAW_MEMBER_RE.sub(f'"raw": "{_REDACTED}"', message)
+    message = _SECRET_MEMBER_RE.sub(
+        lambda match: f'"{match.group(1)}": "{_REDACTED}"', message
+    )
+    message = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}={_REDACTED}", message
+    )
+    if body is None:
+        return message
+    for value in _decoded_mime_fragments(body):
+        message = message.replace(value, _REDACTED)
+    return message
 
 
 def _long_strings(value: Any) -> list[str]:
@@ -171,6 +208,55 @@ def _long_strings(value: Any) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [item for child in value for item in _long_strings(child)]
     return []
+
+
+def _decoded_mime_fragments(body: Any) -> list[str]:
+    """The decoded mail content a vendor would leak by echoing it decoded."""
+    fragments: list[str] = []
+    for value in _long_strings(body):
+        text = _decoded_message_text(value)
+        if text is not None:
+            fragments.extend(_message_text_fragments(text))
+    return fragments
+
+
+def _decoded_message_text(value: str) -> str | None:
+    """A base64 ``raw`` message decoded to text, or None for anything else."""
+    if len(value) < _MIN_BASE64_MESSAGE_CHARS:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except Exception:
+        return None
+    if b"\n" not in decoded or not any(marker in decoded for marker in _MIME_MARKERS):
+        return None
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _message_text_fragments(text: str) -> list[str]:
+    """A decoded message's body and the headers the caller wrote."""
+    head, separator, body = text.partition("\r\n\r\n")
+    if not separator:
+        head, _, body = text.partition("\n\n")
+    fragments: list[str] = []
+    for line in head.splitlines():
+        name, colon, value = line.partition(":")
+        if colon and name.strip().lower() in _DECODED_HEADER_NAMES:
+            value = value.strip()
+            if len(value) >= _MIN_DECODED_CONTENT_CHARS:
+                fragments.append(value)
+    body = body.strip()
+    if len(body) >= _MIN_DECODED_CONTENT_CHARS:
+        fragments.append(body)
+        fragments.extend(
+            line.strip()
+            for line in body.splitlines()
+            if len(line.strip()) >= _MIN_DECODED_CONTENT_CHARS
+        )
+    return fragments
 
 
 def _truncated(text: str) -> str:
@@ -369,18 +455,41 @@ def proxy_request(
             status=status,
         )
     provider_status = answer["status"]
-    if "data" not in answer and provider_status != 204:
+    # Composio's 200 schema only requires ``status``: ``data`` is optional and
+    # nullable, and a file answer carries ``binary_data`` instead. So only a
+    # real 2xx that has neither is an incomplete answer; a 3xx, 304, an
+    # upstream 4xx/5xx and a binary answer all go back to the caller with the
+    # provider's own status and headers.
+    answer_headers = answer.get("headers")
+    binary_data = answer.get("binary_data")
+    if answer_headers is not None and not isinstance(answer_headers, Mapping):
+        # Silently dropping them would lose a 3xx's Location.
+        raise ComposioProxyError(
+            "Composio proxy returned response headers in an unexpected shape",
+            status=status,
+        )
+    if binary_data is not None and not isinstance(binary_data, Mapping):
+        # Silently treating this as an empty body would turn a malformed file
+        # answer into a successful 0-byte download.
+        raise ComposioProxyError(
+            "Composio proxy returned a binary answer in an unexpected shape",
+            status=status,
+        )
+    if (
+        200 <= provider_status < 300
+        and provider_status != 204
+        and "data" not in answer
+        and not isinstance(binary_data, Mapping)
+    ):
         # A 2xx without a body is not a successful provider answer (R3: a
         # truncated answer used to reach a callback and fail opaquely there).
         raise ComposioProxyError(
             "Composio proxy returned an answer without the provider's data",
             status=status,
         )
-    answer_headers = answer.get("headers")
-    binary_data = answer.get("binary_data")
     return ProxyResponse(
         status=provider_status,
         data=answer.get("data"),
-        headers=answer_headers if isinstance(answer_headers, Mapping) else None,
-        binary_data=binary_data if isinstance(binary_data, Mapping) else None,
+        headers=answer_headers,
+        binary_data=binary_data,
     )

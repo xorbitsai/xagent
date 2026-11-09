@@ -180,7 +180,9 @@ def _execute_batch(batch: Any) -> None:
         batch.execute()
 
 
-def _check_composio_batch_budget(count: int, what: str) -> None:
+def _check_composio_batch_budget(
+    count: int, what: str, *, unit: str = "proxied requests"
+) -> None:
     """Refuse a Composio-backed tool call that would fan out past the cap.
 
     The batch fallback sends one proxy request per item; without this check a
@@ -190,7 +192,7 @@ def _check_composio_batch_budget(count: int, what: str) -> None:
     """
     if count > google_api_proxy.MAX_BATCH_REQUESTS:
         raise ValueError(
-            f"{what} would need {count} proxied requests, above the "
+            f"{what} would need up to {count} {unit}, above the "
             f"{google_api_proxy.MAX_BATCH_REQUESTS} request limit for one tool "
             "call; ask for fewer at a time"
         )
@@ -209,7 +211,11 @@ def gmail_search_messages(
     """
     try:
         if composio_proxy.serves_composio_grant():
-            _check_composio_batch_budget(max_results, "max_results")
+            _check_composio_batch_budget(
+                max_results,
+                "max_results",
+                unit="message requests (plus the list request)",
+            )
         service = get_gmail_service()
         kwargs = {"userId": "me", "maxResults": max_results}
         if query:
@@ -319,6 +325,154 @@ def gmail_read_threads(thread_ids: list[str]) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
+def _build_message(
+    msg_data: dict, attachments: list[tuple[str, bytes]]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """One message as the Gmail API's base64 ``raw`` body and its summary."""
+    message = EmailMessage()
+    message.set_content(msg_data.get("body", ""))
+    message["To"] = msg_data.get("to", "")
+    message["From"] = "me"
+    message["Subject"] = msg_data.get("subject", "")
+
+    if "cc" in msg_data:
+        message["Cc"] = msg_data["cc"]
+    if "bcc" in msg_data:
+        message["Bcc"] = msg_data["bcc"]
+
+    attached_summary: list[dict[str, Any]] = []
+    for filename, data in attachments:
+        guessed_type, _ = mimetypes.guess_type(filename)
+        maintype, _, subtype = (guessed_type or "application/octet-stream").partition(
+            "/"
+        )
+        # A text-maintype part with no charset parameter defaults to
+        # us-ascii per RFC 2045, mojibaking any non-ASCII UTF-8
+        # content (e.g. a .txt/.csv/.md attachment) — the message
+        # body gets utf-8 via set_content automatically, but
+        # add_attachment needs it spelled out explicitly.
+        params = {"charset": "utf-8"} if maintype == "text" else {}
+        message.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype or "octet-stream",
+            filename=filename,
+            params=params,
+        )
+        attached_summary.append({"filename": filename, "size": len(data)})
+
+    encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return {"raw": encoded_message}, attached_summary
+
+
+def _send_native(
+    messages: list[dict],
+    resolved_attachments: list[list[tuple[str, bytes]]],
+    action: str,
+) -> str:
+    """The send path a native grant has always had.
+
+    Each message is built and sent in turn. A failure returns the same bare
+    error it always did, and anything already sent stays sent.
+    """
+    service = get_gmail_service()
+    results = []
+    for msg_data, attachments in zip(messages, resolved_attachments):
+        create_message, attached_summary = _build_message(msg_data, attachments)
+        if action == "send":
+            sent_message = (
+                service.users().messages().send(userId="me", body=create_message)
+            ).execute()
+            results.append(
+                {
+                    "status": "sent",
+                    "id": sent_message["id"],
+                    "attachments": attached_summary,
+                }
+            )
+        else:
+            draft = (
+                service.users()
+                .drafts()
+                .create(userId="me", body={"message": create_message})
+            ).execute()
+            results.append(
+                {
+                    "status": "drafted",
+                    "id": draft["id"],
+                    "attachments": attached_summary,
+                }
+            )
+
+    return json.dumps({"status": "success", "results": results})
+
+
+def _send_through_proxy(
+    messages: list[dict],
+    resolved_attachments: list[list[tuple[str, bytes]]],
+    action: str,
+) -> str:
+    """Build and pre-check every message before sending the first.
+
+    Composio refuses a JSON body above its limit locally; sending message 1
+    first would leave the batch half-delivered when message 2 was too large.
+    A failure after some messages went out reports the ones already sent,
+    which cannot be taken back.
+    """
+    prepared = [
+        _build_message(msg_data, attachments)
+        for msg_data, attachments in zip(messages, resolved_attachments)
+    ]
+    service = get_gmail_service()
+    requests_per_message: list[tuple[Any, list[dict[str, Any]]]] = []
+    for create_message, attached_summary in prepared:
+        if action == "send":
+            request = service.users().messages().send(userId="me", body=create_message)
+        else:
+            request = (
+                service.users()
+                .drafts()
+                .create(userId="me", body={"message": create_message})
+            )
+        requests_per_message.append((request, attached_summary))
+
+    # Every request is checked against the proxy's body limit before the
+    # first one is sent.
+    for request, _attached_summary in requests_per_message:
+        google_api_proxy.check_request(request)
+
+    results: list[dict[str, Any]] = []
+    try:
+        for request, attached_summary in requests_per_message:
+            response = request.execute()
+            results.append(
+                {
+                    "status": "sent" if action == "send" else "drafted",
+                    "id": response["id"],
+                    "attachments": attached_summary,
+                }
+            )
+    except Exception as e:
+        if not results:
+            raise
+        # Messages already sent cannot be taken back: report them rather
+        # than making the caller guess whether the batch went out.
+        completed = "sent" if action == "send" else "drafted"
+        logger.error(f"Error sending/drafting messages: {e}")
+        return json.dumps(
+            {
+                "status": "error",
+                "message": (
+                    f"{len(results)} of {len(requests_per_message)} messages "
+                    f"were {completed} before this error: {e}"
+                ),
+                "results": results,
+            }
+        )
+
+    return json.dumps({"status": "success", "results": results})
+
+
 @mcp.tool()
 def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
     """
@@ -366,93 +520,11 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
         # Build every message before sending any too: Composio refuses a
         # JSON body above its limit locally, and sending message 1 first
         # would leave a batch half-delivered when message 2 was too large.
-        prepared: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-        for msg_data, attachments in zip(messages, resolved_attachments):
-            message = EmailMessage()
-            message.set_content(msg_data.get("body", ""))
-            message["To"] = msg_data.get("to", "")
-            message["From"] = "me"
-            message["Subject"] = msg_data.get("subject", "")
-
-            if "cc" in msg_data:
-                message["Cc"] = msg_data["cc"]
-            if "bcc" in msg_data:
-                message["Bcc"] = msg_data["bcc"]
-
-            attached_summary: list[dict[str, Any]] = []
-            for filename, data in attachments:
-                guessed_type, _ = mimetypes.guess_type(filename)
-                maintype, _, subtype = (
-                    guessed_type or "application/octet-stream"
-                ).partition("/")
-                # A text-maintype part with no charset parameter defaults to
-                # us-ascii per RFC 2045, mojibaking any non-ASCII UTF-8
-                # content (e.g. a .txt/.csv/.md attachment) — the message
-                # body gets utf-8 via set_content automatically, but
-                # add_attachment needs it spelled out explicitly.
-                params = {"charset": "utf-8"} if maintype == "text" else {}
-                message.add_attachment(
-                    data,
-                    maintype=maintype,
-                    subtype=subtype or "octet-stream",
-                    filename=filename,
-                    params=params,
-                )
-                attached_summary.append({"filename": filename, "size": len(data)})
-
-            encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-            prepared.append(({"raw": encoded_message}, attached_summary))
-
-        service = get_gmail_service()
-        requests_per_message: list[tuple[Any, list[dict[str, Any]]]] = []
-        for create_message, attached_summary in prepared:
-            if action == "send":
-                request = (
-                    service.users().messages().send(userId="me", body=create_message)
-                )
-            else:
-                request = (
-                    service.users()
-                    .drafts()
-                    .create(userId="me", body={"message": create_message})
-                )
-            requests_per_message.append((request, attached_summary))
-
-        # Every request is checked against the proxy's body limit before the
-        # first one is sent. On the native path this is a no-op.
-        for request, _attached_summary in requests_per_message:
-            google_api_proxy.check_request(request)
-
-        results: list[dict[str, Any]] = []
-        try:
-            for request, attached_summary in requests_per_message:
-                response = request.execute()
-                results.append(
-                    {
-                        "status": "sent" if action == "send" else "drafted",
-                        "id": response["id"],
-                        "attachments": attached_summary,
-                    }
-                )
-        except Exception as e:
-            if not results:
-                raise
-            # Messages already sent cannot be taken back: report them rather
-            # than making the caller guess whether the batch went out.
-            completed = "sent" if action == "send" else "drafted"
-            logger.error(f"Error sending/drafting messages: {e}")
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": (
-                        f"{len(results)} of {len(requests_per_message)} messages "
-                        f"were {completed} before this error: {e}"
-                    ),
-                    "results": results,
-                }
-            )
-
-        return json.dumps({"status": "success", "results": results})
+        # Only a Composio grant takes this path; a native grant keeps its
+        # build-and-send-each-in-turn behavior below.
+        if composio_proxy.serves_composio_grant():
+            return _send_through_proxy(messages, resolved_attachments, action)
+        return _send_native(messages, resolved_attachments, action)
     except Exception as e:
         logger.error(f"Error sending/drafting messages: {e}")
         return json.dumps({"status": "error", "message": str(e)})

@@ -115,6 +115,12 @@ MULTI_SCAN_PIXEL_LIMIT_CASES = pytest.mark.parametrize(
 )
 
 
+# A lossless (SOF3) 160x160 blue JPEG, made with cjpeg from libjpeg-turbo
+# 3.2.1 from Image.new("RGB", (160, 160), "blue") saved as PPM:
+#   cjpeg -lossless 1 -outfile lossless_160x160.jpg blue160.ppm
+LOSSLESS_JPEG = Path(__file__).parent / "fixtures" / "lossless_160x160.jpg"
+
+
 def write_small_image(path: Path) -> None:
     """A small valid image, in the format the file name's extension says."""
     image_format = "JPEG" if path.suffix == ".jpg" else "PNG"

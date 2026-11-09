@@ -315,54 +315,60 @@ def redeem_external_media_ticket(
 
 # SOFn markers carry the frame header; C4 (DHT), C8 (JPG) and CC (DAC) do not.
 _JPEG_FRAME_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+# Lossless frames: SOF3, and SOF7, SOF11 and SOF15, which libjpeg cannot decode.
+_JPEG_LOSSLESS_FRAME_MARKERS = frozenset({0xC3, 0xC7, 0xCB, 0xCF})
 # TEM and RST0-RST7 stand alone, with no length.
 _JPEG_MARKERS_WITHOUT_LENGTH = frozenset({0x01, *range(0xD0, 0xD8)})
 
 
-def _jpeg_first_scan_omits_components(stream: IO[bytes] | None) -> bool:
-    """Whether a JPEG's first scan codes fewer components than its frame.
+def _jpeg_markers(stream: IO[bytes] | None) -> tuple[int | None, bool]:
+    """A JPEG's frame marker, and whether its first scan omits components.
 
-    libjpeg then keeps coefficients for the whole image, as for a progressive
-    JPEG (``has_multiple_scans`` in its ``jdinput.c``). The markers are read up
-    to the first scan as libjpeg reads them: stray bytes, FF fill bytes and
+    A first scan that codes fewer components than the frame makes libjpeg
+    keep coefficients for the whole image, as for a progressive JPEG
+    (``has_multiple_scans`` in its ``jdinput.c``). The markers are read up to
+    the first scan as libjpeg reads them: stray bytes, FF fill bytes and
     stuffed FF00 pairs before a marker are skipped, and each segment by its
     length. Markers that cannot be read that far count as omitting components,
-    so they never earn the higher limit. The stream's position is kept.
+    so they never earn the higher limit; the frame marker is then the one read
+    so far, or None. The stream's position is kept.
     """
     if stream is None:
-        return True
+        return None, True
     position = stream.tell()
+    frame_marker = None
     try:
         stream.seek(0)
         if stream.read(2) != b"\xff\xd8":
-            return True
+            return None, True
         frame_components = None
         while True:
             byte = stream.read(1)
             if byte != b"\xff":
                 if not byte:
-                    return True
+                    return frame_marker, True
                 continue
             while byte == b"\xff":
                 byte = stream.read(1)
             if not byte or byte in (b"\xd8", b"\xd9"):
-                return True
+                return frame_marker, True
             marker = byte[0]
             if marker == 0 or marker in _JPEG_MARKERS_WITHOUT_LENGTH:
                 continue
             header = stream.read(2)
             length = int.from_bytes(header, "big") - 2
             if len(header) < 2 or length < 0:
-                return True
+                return frame_marker, True
             if marker == 0xDA:
                 scan = stream.read(1)
-                return (
+                return frame_marker, (
                     frame_components is None or not scan or scan[0] < frame_components
                 )
             if marker in _JPEG_FRAME_MARKERS:
+                frame_marker = marker
                 frame = stream.read(length)
                 if len(frame) < 6:
-                    return True
+                    return frame_marker, True
                 frame_components = frame[5]
             else:
                 stream.seek(length, os.SEEK_CUR)
@@ -379,17 +385,26 @@ def _validate_instagram_source(image: ImageFile.ImageFile) -> None:
     # sends, and a JPEG coded in one scan. With more than one (progressive, or
     # a first scan that codes only some components) libjpeg keeps coefficients
     # for the whole image whatever draft() asks for: about 370 MB at 100
-    # million pixels, and about 650 MB without chroma subsampling. Those JPEGs
-    # get the PNG limit.
+    # million pixels, and about 650 MB without chroma subsampling. A lossless
+    # JPEG is never drafted smaller (see instagram_jpeg_bytes). Those JPEGs
+    # get the PNG limit. Within it both limits pass, so the markers are read only
+    # above it.
+    pixels = image.width * image.height
     if image.format != "JPEG":
         pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, str(image.format)
     elif image.info.get("progressive"):
         pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "progressive JPEG"
-    elif _jpeg_first_scan_omits_components(image.fp):
-        pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "multi-scan JPEG"
+    elif pixels <= INSTAGRAM_MAX_SOURCE_PIXELS:
+        return
     else:
-        pixel_limit, kind = INSTAGRAM_MAX_JPEG_SOURCE_PIXELS, "single-scan JPEG"
-    if image.width * image.height > pixel_limit:
+        frame_marker, first_scan_omits_components = _jpeg_markers(image.fp)
+        if frame_marker in _JPEG_LOSSLESS_FRAME_MARKERS:
+            pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "lossless JPEG"
+        elif first_scan_omits_components:
+            pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "multi-scan JPEG"
+        else:
+            pixel_limit, kind = INSTAGRAM_MAX_JPEG_SOURCE_PIXELS, "single-scan JPEG"
+    if pixels > pixel_limit:
         raise ExternalMediaUnavailable(
             "Registered image exceeds the Instagram source pixel limit of "
             f"{pixel_limit:,} for {kind}; downscale it and try again"
@@ -703,16 +718,25 @@ def instagram_jpeg_bytes(source: BytesIO) -> bytes:
             if opened.format == "JPEG":
                 # libjpeg scales a single-scan JPEG down by up to 8 toward the
                 # draft target, so ask for the size it is sent at. A fixed
-                # target box left a long, narrow image at full size. libjpeg
-                # does not scale a lossless JPEG, so drafting one by 2 or more
-                # fails its decode; that refusal is accepted (#3596).
+                # target box left a long, narrow image at full size.
                 fitted_width, fitted_height = _instagram_fitted_size(*upright_size)
-                opened.draft(
-                    "RGB",
+                target = (
                     (fitted_height, fitted_width)
                     if turned
-                    else (fitted_width, fitted_height),
+                    else (fitted_width, fitted_height)
                 )
+                # libjpeg does not scale a lossless JPEG: drafting one by 2 or
+                # more breaks its decode, and with Pillow 12.3.0 can crash the
+                # process. It is decoded at full size instead, within the PNG
+                # limit. Its markers are read only when draft() would scale.
+                scaled = (
+                    opened.width // target[0] >= 2 and opened.height // target[1] >= 2
+                )
+                if (
+                    not scaled
+                    or _jpeg_markers(opened.fp)[0] not in _JPEG_LOSSLESS_FRAME_MARKERS
+                ):
+                    opened.draft("RGB", target)
             image = ImageOps.exif_transpose(opened)
             image.load()
 

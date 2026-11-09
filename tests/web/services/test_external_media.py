@@ -7,12 +7,13 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from tests.web.services.external_media_source_shared import (
+    LOSSLESS_JPEG,
     MULTI_SCAN_PIXEL_LIMIT_CASES,
     OVERSIZED,
     OVERSIZED_SOURCES,
@@ -813,6 +814,84 @@ def test_issue_instagram_holds_a_multi_scan_jpeg_to_the_png_pixel_limit(
             match=f"pixel limit of 159,999 for {refused_as}; downscale it",
         ):
             issue()
+
+
+@pytest.mark.parametrize(("slack", "refused"), [(-1, True), (0, False)])
+def test_issue_instagram_holds_a_lossless_jpeg_to_the_png_pixel_limit(
+    monkeypatch, tmp_path, slack, refused
+):
+    # Why: libjpeg does not scale a lossless JPEG, so draft() cannot keep its
+    # decode small; drafting one by 2 or more breaks its decode, and with
+    # Pillow 12.3.0 can crash the process. Conversion therefore decodes it at
+    # full size, and it gets the PNG limit like any image decoded in full.
+    # Issuance refuses it, before a URL is handed out, not Meta's fetch later.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(LOSSLESS_JPEG.read_bytes()),
+    )
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 160 * 160 + slack
+    )
+
+    if refused:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable,
+            match="pixel limit of 25,599 for lossless JPEG; downscale it",
+        ):
+            issue()
+    else:
+        assert issue().url.startswith("https://api.example.test/")
+
+
+def test_instagram_conversion_decodes_a_lossless_jpeg_without_drafting(monkeypatch):
+    # Why: drafting a lossless JPEG by 2 or more breaks its decode (see the
+    # pixel limit test above). It is decoded at full size and then resized.
+    # A maximum width of 64 makes the 160x160 fixture one draft() would scale
+    # by 2.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_WIDTH", 64)
+    drafted = []
+    monkeypatch.setattr(
+        JpegImagePlugin.JpegImageFile,
+        "draft",
+        lambda image, mode, size: drafted.append(size),
+    )
+
+    converted = external_media.instagram_jpeg_bytes(BytesIO(LOSSLESS_JPEG.read_bytes()))
+
+    assert drafted == []
+    with Image.open(BytesIO(converted)) as image:
+        assert image.format == "JPEG"
+        assert image.size == (320, 320)
+        assert image.getpixel((160, 160)) == pytest.approx((0, 0, 254), abs=2)
+
+
+def test_issue_instagram_reads_jpeg_markers_only_over_the_png_pixel_limit(
+    monkeypatch, tmp_path
+):
+    # Why: within the PNG limit both limits pass, so the scan layout cannot
+    # change the outcome; the byte-by-byte marker walk is skipped there.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(jpeg_400px("interleaved")),
+    )
+    walked = []
+    jpeg_markers = external_media._jpeg_markers
+    monkeypatch.setattr(
+        external_media,
+        "_jpeg_markers",
+        lambda stream: walked.append(True) or jpeg_markers(stream),
+    )
+
+    issue()
+    assert walked == []
+
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 - 1)
+    issue()
+    assert walked == [True]
 
 
 def _with_fill_bytes(jpeg: bytes) -> bytes:

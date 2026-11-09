@@ -2659,9 +2659,7 @@ def _format_kwargs(fmt: StructuredOutputFormat | None) -> dict[str, Any]:
     return {} if fmt is None else {"structured_output_format": fmt}
 
 
-def _read_resumed_task_response_format_sync(
-    task_id: int, run_id: str
-) -> tuple[bool, Any]:
+def _read_resumed_task_agent_config_sync(task_id: int, run_id: str) -> tuple[bool, Any]:
     """Read ``agent_config`` of the task row that still belongs to ``run_id``.
 
     Returns ``(found, agent_config)``; ``found`` is false when no row matches,
@@ -2857,9 +2855,7 @@ async def execute_task_background(
                     stored_agent_config[RESPONSE_FORMAT_CONFIG_KEY],
                     task_id=task_id,
                 )
-            prompt_context = prompt_context_from_agent_config(
-                getattr(snapshot.task, "agent_config", None)
-            )
+            prompt_context = prompt_context_from_agent_config(stored_agent_config)
             prompt_context_block = build_prompt_context_block(prompt_context)
             if output_format is None or output_format is StructuredOutputFormat.INVALID:
                 task_for_agent = append_prompt_context_block(
@@ -4530,7 +4526,7 @@ async def execute_resume_background(
         resumed_format: StructuredOutputFormat | None = None
         try:
             format_found, resumed_agent_config = await run_db_io_cancellation_safe(
-                lambda: _read_resumed_task_response_format_sync(task_id, format_run_id)
+                lambda: _read_resumed_task_agent_config_sync(task_id, format_run_id)
             )
         except Exception as read_error:
             if is_database_pool_timeout(read_error):

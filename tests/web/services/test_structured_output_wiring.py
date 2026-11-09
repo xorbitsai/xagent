@@ -461,7 +461,7 @@ def test_the_read_of_a_resumed_run_finds_nothing_for_another_run(db_session) -> 
     run_id = "run-a"
     db_session.query(Task).filter(Task.id == task_id).update({"run_id": run_id})
     db_session.commit()
-    read = task_execution_service._read_resumed_task_response_format_sync
+    read = task_execution_service._read_resumed_task_agent_config_sync
 
     assert read(task_id, run_id) == (True, _config(_stored()))
     assert read(task_id, "another-run") == (False, None)
@@ -472,7 +472,7 @@ async def test_a_resumed_run_that_is_no_longer_its_run_passes_no_keyword(
 ) -> None:
     monkeypatch.setattr(
         task_execution_service,
-        "_read_resumed_task_response_format_sync",
+        "_read_resumed_task_agent_config_sync",
         lambda task_id, run_id: (False, None),
     )
     llm = _good_model()
@@ -499,7 +499,7 @@ async def test_a_failed_read_of_a_resumed_run_is_treated_as_no_format(
         raise OperationalError("select", {}, Exception("connection lost"))
 
     monkeypatch.setattr(
-        task_execution_service, "_read_resumed_task_response_format_sync", fail
+        task_execution_service, "_read_resumed_task_agent_config_sync", fail
     )
     llm = _good_model()
 
@@ -537,7 +537,7 @@ async def test_a_pool_timeout_during_the_read_of_a_resumed_run_is_not_swallowed(
             raise RuntimeError("checkout failed") from cause
 
     monkeypatch.setattr(
-        task_execution_service, "_read_resumed_task_response_format_sync", exhausted
+        task_execution_service, "_read_resumed_task_agent_config_sync", exhausted
     )
     stub = AsyncMock(return_value={"success": True, "status": "completed"})
 

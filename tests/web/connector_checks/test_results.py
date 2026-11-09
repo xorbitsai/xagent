@@ -207,7 +207,7 @@ def test_the_document_carries_versions_and_rows() -> None:
     document = _sample_run().to_document()
 
     assert document["schema"] == "xagent.connector_smoke.result"
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["declaration_format_version"] == 2
     assert document["identity"] == "toby"
     assert document["environment"] == "production-au"

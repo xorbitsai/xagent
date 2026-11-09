@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xagent:connector-smoke:sweep:1",
+  "title": "Connector smoke V2 sweep",
+  "description": "One sweep of the connector smoke V2 write areas under one identity. Built by xagent.web.connector_checks.sweeper.SweepResult.to_document; carries codes, counts and timing only, never a name, an id or a value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "declaration_format_version", "identity",
+    "environment", "started_at", "finished_at", "complete", "failure",
+    "older_than_seconds", "max_deletes", "rows"
+  ],
+  "properties": {
+    "schema": { "const": "xagent.connector_smoke.sweep" },
+    "schema_version": { "const": 1 },
+    "declaration_format_version": { "type": "integer", "minimum": 1 },
+    "identity": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+    "environment": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "finished_at": { "$ref": "#/$defs/timestamp" },
+    "complete": { "type": "boolean" },
+    "failure": { "oneOf": [{ "$ref": "#/$defs/code" }, { "type": "null" }] },
+    "older_than_seconds": { "type": "integer", "minimum": 1 },
+    "max_deletes": { "type": "integer", "minimum": 1 },
+    "rows": { "type": "array", "items": { "$ref": "#/$defs/row" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "failure": { "type": "string" } }, "required": ["failure"] },
+      "then": { "properties": { "complete": { "const": false }, "rows": { "maxItems": 0 } } }
+    }
+  ],
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "code": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,79}$" },
+    "count": { "type": "integer", "minimum": 0 },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connector", "outcome", "failure_class", "reason",
+        "found", "deleted", "failed", "kept", "unparsed", "duration_ms"
+      ],
+      "properties": {
+        "connector": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "outcome": { "enum": ["pass", "fail", "skip"] },
+        "failure_class": {
+          "enum": [
+            "not_found", "not_connected", "client_rejected", "unsupported",
+            "failed_to_start", "no_tools", "timed_out", "not_reached",
+            "tool_missing", "call_failed", "assertion_failed",
+            "tenant_mismatch", "verdict_mismatch", "cleanup_failed",
+            "skipped_by_identity", "session_unavailable", "not_declared",
+            "fixture_missing", "read_only_hint_missing", "writes_disabled",
+            null
+          ]
+        },
+        "reason": { "oneOf": [{ "$ref": "#/$defs/code" }, { "type": "null" }] },
+        "found": { "$ref": "#/$defs/count" },
+        "deleted": { "$ref": "#/$defs/count" },
+        "failed": { "$ref": "#/$defs/count" },
+        "kept": { "$ref": "#/$defs/count" },
+        "unparsed": { "$ref": "#/$defs/count" },
+        "duration_ms": { "$ref": "#/$defs/count" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "outcome": { "const": "pass" } } },
+          "then": { "properties": { "failure_class": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "fail" } } },
+          "then": {
+            "properties": {
+              "failure_class": {
+                "enum": [
+                  "not_found", "not_connected", "client_rejected", "unsupported",
+                  "failed_to_start", "no_tools", "timed_out", "not_reached",
+                  "tool_missing", "call_failed", "assertion_failed",
+                  "tenant_mismatch", "verdict_mismatch", "cleanup_failed"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "skip" } } },
+          "then": {
+            "properties": {
+              "failure_class": {
+                "enum": [
+                  "skipped_by_identity", "session_unavailable", "not_declared",
+                  "fixture_missing", "read_only_hint_missing", "writes_disabled"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

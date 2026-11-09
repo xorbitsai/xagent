@@ -202,35 +202,43 @@ async def test_ark_rejects_not_waiting_before_submitting():
 
 _REFERENCE_VIDEO = "https://cdn.test/reference.mp4"
 
+# The third case is a caller-supplied content list that replaces a reference
+# video passed beside it, so only a flag computed from the submitted content
+# gets it right.
+_REQUEST_CASES = [
+    pytest.param(
+        {"prompt": "a fox", "reference_video_urls": [_REFERENCE_VIDEO]},
+        True,
+        id="reference-video",
+    ),
+    pytest.param(
+        {"prompt": "a fox", "reference_image_urls": ["https://cdn.test/fox.png"]},
+        False,
+        id="reference-image",
+    ),
+    pytest.param(
+        {
+            "content": [{"type": "text", "text": "a fox"}],
+            "reference_video_urls": [_REFERENCE_VIDEO],
+        },
+        False,
+        id="content-replaces-reference-video",
+    ),
+]
 
-async def test_ark_row_says_the_request_carried_a_reference_video():
+
+@pytest.mark.parametrize("request_kwargs,expected", _REQUEST_CASES)
+async def test_ark_row_says_whether_the_request_carried_a_video(
+    request_kwargs, expected
+):
     fake = _ArkFake([_succeeded()])
     model = _ark(fake)
 
     with TokenContextManager() as manager:
-        await model.generate_video(
-            prompt="a fox",
-            reference_video_urls=[_REFERENCE_VIDEO],
-            poll_interval=0,
-        )
+        await model.generate_video(**request_kwargs, poll_interval=0)
 
     [row] = _rows(manager)
-    assert row["input_has_video"] is True
-
-
-async def test_ark_row_says_a_text_and_image_request_carried_no_video():
-    fake = _ArkFake([_succeeded()])
-    model = _ark(fake)
-
-    with TokenContextManager() as manager:
-        await model.generate_video(
-            prompt="a fox",
-            reference_image_urls=["https://cdn.test/fox.png"],
-            poll_interval=0,
-        )
-
-    [row] = _rows(manager)
-    assert row["input_has_video"] is False
+    assert row["input_has_video"] is expected
 
 
 @pytest.mark.parametrize(
@@ -289,8 +297,9 @@ async def test_ark_row_follows_the_content_actually_submitted(
     ],
     ids=["terminal-failure", "deadline", "poll-errors", "missing-task-id"],
 )
-async def test_ark_every_unfinished_exit_keeps_the_video_input_mark(
-    polls, created, error, timeout
+@pytest.mark.parametrize("request_kwargs,expected", _REQUEST_CASES)
+async def test_ark_every_unfinished_exit_records_whether_a_video_was_sent(
+    polls, created, error, timeout, request_kwargs, expected
 ):
     fake = _ArkFake(polls, created=created)
     model = _ark(fake)
@@ -298,17 +307,17 @@ async def test_ark_every_unfinished_exit_keeps_the_video_input_mark(
     with TokenContextManager() as manager:
         with pytest.raises(error):
             await model.generate_video(
-                prompt="a fox",
-                reference_video_urls=[_REFERENCE_VIDEO],
-                poll_interval=0,
-                timeout=timeout,
+                **request_kwargs, poll_interval=0, timeout=timeout
             )
 
     [row] = _rows(manager)
-    assert row["input_has_video"] is True
+    assert row["input_has_video"] is expected
 
 
-async def test_ark_cancelled_wait_keeps_the_video_input_mark():
+@pytest.mark.parametrize("request_kwargs,expected", _REQUEST_CASES)
+async def test_ark_cancelled_wait_records_whether_a_video_was_sent(
+    request_kwargs, expected
+):
     entered = asyncio.Event()
     fake = _ArkFake([_succeeded()])
     model = _ark(fake)
@@ -320,18 +329,14 @@ async def test_ark_cancelled_wait_keeps_the_video_input_mark():
     model._inner.get_video_task = hanging_get
 
     with TokenContextManager() as manager:
-        task = asyncio.create_task(
-            model.generate_video(
-                prompt="a fox", reference_video_urls=[_REFERENCE_VIDEO]
-            )
-        )
+        task = asyncio.create_task(model.generate_video(**request_kwargs))
         await entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     [row] = _rows(manager)
-    assert row["input_has_video"] is True
+    assert row["input_has_video"] is expected
 
 
 def test_db_built_provider_carries_the_configured_id_on_the_inner_model():

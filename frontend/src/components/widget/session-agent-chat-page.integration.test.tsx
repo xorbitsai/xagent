@@ -73,6 +73,41 @@ vi.mock("@/components/task/task-conversation-panel", async () => {
   }
 })
 
+// The history list and view stand in for themselves unless a test sets `real`:
+// the stand-ins hand the page the same callbacks the real ones do.
+const historySurfaces = vi.hoisted(() => ({ real: false }))
+
+vi.mock("./widget-history-list", async () => {
+  const actual = await vi.importActual<typeof import("./widget-history-list")>("./widget-history-list")
+  return {
+    WidgetHistoryList: (props: React.ComponentProps<typeof actual.WidgetHistoryList>) => {
+      if (historySurfaces.real) return <actual.WidgetHistoryList {...props} />
+      return (
+        <div>
+          <button type="button" onClick={() => props.onOpen(41, "Earlier chat")}>pick-earlier</button>
+          <button type="button" onClick={props.onBack}>back-to-chat</button>
+        </div>
+      )
+    },
+  }
+})
+
+vi.mock("./widget-history-view", async () => {
+  const actual = await vi.importActual<typeof import("./widget-history-view")>("./widget-history-view")
+  return {
+    ...actual,
+    WidgetHistoryView: (props: React.ComponentProps<typeof actual.WidgetHistoryView>) => {
+      if (historySurfaces.real) return <actual.WidgetHistoryView {...props} />
+      return (
+        <div>
+          <button type="button" onClick={() => props.onContinue("Continue this", props.taskId)}>hand-over</button>
+          <button type="button" onClick={props.onBack}>back-to-list</button>
+        </div>
+      )
+    },
+  }
+})
+
 import { SessionAgentChatPage } from "./session-agent-chat-page"
 import { W_UNSUPPORTED } from "./use-session-open-message"
 
@@ -1862,5 +1897,468 @@ describe("SessionAgentChatPage sends the host page's initial message", () => {
 
     await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
     expect(sentFrames(socket)[0].message).toBe(INITIAL_MESSAGE)
+  })
+})
+
+describe("SessionAgentChatPage continues from an earlier conversation", () => {
+  const CONTINUE = "Continue this"
+  const HISTORY = { conversation_history: {} }
+  const fetchMock = vi.fn()
+  let warn = vi.fn()
+  let initialRequests = 0
+
+  const mountWithHistory = async (overrides: Record<string, unknown> = {}) => {
+    render(<SessionAgentChatPage />)
+    dispatchSession({ capabilities: HISTORY, ...overrides })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open("xagent-session-v1"))
+    receive(socket, ATTACH_CAPABILITIES)
+    return socket
+  }
+  // The visitor opens an earlier conversation from the menu and reaches the
+  // point where the view hands a message over.
+  const openEarlierConversation = () => {
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+    fireEvent.click(screen.getByRole("button", { name: "pick-earlier" }))
+  }
+  const handOver = () => fireEvent.click(screen.getByRole("button", { name: "hand-over" }))
+  const deliverOpenMessage = (value: string) => act(() => {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "open_message", id: "1", value },
+      source: EMBEDDED_PARENT as unknown as MessageEventSource,
+    }))
+  })
+  const chats = (socket: MockWebSocket) => sentFrames(socket).filter((frame) => frame.type === "chat")
+  const lastChatId = (socket: MockWebSocket) => chats(socket).at(-1)!.client_message_id as string
+  const accept = (socket: MockWebSocket, taskId: number) => {
+    receive(socket, taskInfo(taskId))
+    receive(socket, { type: "message_accepted", client_message_id: lastChatId(socket) })
+  }
+  const reject = (socket: MockWebSocket, fields: Record<string, unknown>) =>
+    receive(socket, { type: "message_rejected", client_message_id: lastChatId(socket), ...fields })
+  // Settles pending work, long enough for a frame that was going to be sent to be.
+  const letItRun = () => act(() => new Promise<void>((resolve) => setTimeout(resolve, 20)))
+  const asParent = () => {
+    const forward = EMBEDDED_PARENT.postMessage
+    vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation((...args) => {
+      const [data] = args as [Record<string, unknown>]
+      if (data?.type !== "initial_message_request") return forward(...args)
+      initialRequests += 1
+      setTimeout(() => {
+        window.dispatchEvent(new MessageEvent("message", {
+          data: { xagent: true, v: 1, type: "initial_message", value: "Hello from the host page" },
+          source: EMBEDDED_PARENT as unknown as MessageEventSource,
+        }))
+      }, 0)
+    })
+  }
+
+  beforeEach(() => {
+    MockWebSocket.instances = []
+    MockWebSocket.failConstruction = false
+    MockWebSocket.constructionCount = 0
+    historySurfaces.real = false
+    surfaces.real = false
+    fetchMock.mockReset()
+    fetchMock.mockImplementation(async () => new Response("{}", { status: 404 }))
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.stubGlobal("WebSocket", MockWebSocket)
+    vi.stubGlobal("fetch", fetchMock)
+    vi.spyOn(console, "log").mockImplementation(() => {})
+    warn = vi.fn()
+    vi.spyOn(console, "warn").mockImplementation(warn)
+    initialRequests = 0
+    Object.defineProperty(window, "parent", { configurable: true, value: EMBEDDED_PARENT })
+  })
+
+  afterEach(() => {
+    cleanup()
+    historySurfaces.real = false
+    surfaces.real = false
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    if (originalParentDescriptor) Object.defineProperty(window, "parent", originalParentDescriptor)
+  })
+
+  describe("the first message of the new conversation", () => {
+    it("is sent straight away, with the source, when no conversation is open", async () => {
+      const socket = await mountWithHistory()
+      receive(socket, ATTACHED)
+      openEarlierConversation()
+
+      handOver()
+
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+      expect(sentFrames(socket)[0]).toMatchObject({ message: CONTINUE, source_task_id: 41 })
+      expect(screen.queryByRole("button", { name: "hand-over" })).not.toBeInTheDocument()
+    })
+
+    it("is sent after a reset when a conversation is open", async () => {
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      openEarlierConversation()
+
+      handOver()
+
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+      receive(socket, { type: "conversation_reset" })
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation", "chat"]))
+      expect(sentFrames(socket)[1]).toMatchObject({ message: CONTINUE, source_task_id: 41 })
+    })
+
+    it("is sent without another reset when the visitor already started a new conversation", async () => {
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+      receive(socket, { type: "conversation_reset" })
+      await waitFor(() => expect(screen.queryByText("widgetSession.resetting")).not.toBeInTheDocument())
+      openEarlierConversation()
+
+      handOver()
+
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation", "chat"]))
+      expect(sentFrames(socket)[1]).toMatchObject({ message: CONTINUE, source_task_id: 41 })
+    })
+
+    it("waits until the socket has attached", async () => {
+      const socket = await mountWithHistory()
+      openEarlierConversation()
+
+      handOver()
+      await letItRun()
+      expect(sentTypes(socket)).toEqual([])
+      receive(socket, ATTACHED)
+
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+    })
+
+    it("is not sent, and the visitor is told, when the connection is lost while the new conversation starts", async () => {
+      vi.spyOn(window, "postMessage").mockImplementation(() => {})
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      openEarlierConversation()
+      handOver()
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+
+      act(() => socket.triggerClose())
+
+      expect(await screen.findByText("widgetSession.reloadRequired")).toBeInTheDocument()
+      await letItRun()
+      expect(sentTypes(socket)).toEqual(["new_conversation"])
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      expect(screen.queryByRole("menuitem", { name: "widgetSession.history.menuLabel" })).not.toBeInTheDocument()
+    })
+  })
+
+  describe("when the server refuses the message after the source was checked", () => {
+    const starts = ["unbound", "bound", "replacement_ready"] as const
+    type Start = (typeof starts)[number]
+    // Brings the page to the start phase, opens an earlier conversation and
+    // hands a message over; returns the socket once the chat frame is out.
+    const handOverFrom = async (start: Start) => {
+      const socket = await mountWithHistory()
+      if (start !== "unbound") replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      if (start === "replacement_ready") {
+        fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+        fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
+        await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+        receive(socket, { type: "conversation_reset" })
+        await waitFor(() => expect(screen.queryByText("widgetSession.resetting")).not.toBeInTheDocument())
+      }
+      openEarlierConversation()
+      handOver()
+      if (start === "bound") {
+        await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+        receive(socket, { type: "conversation_reset" })
+      }
+      await waitFor(() => expect(chats(socket)).toHaveLength(1))
+      return socket
+    }
+
+    it.each(starts.flatMap((start) => [
+      ["task_unavailable", "widgetSession.history.continueUnavailable"],
+      ["invalid_message", "clientErrors.invalidMessage"],
+      // A refusal whose code the page does not know keeps the line the page
+      // already shows for any refusal without a usable code.
+      ["not_a_code", "clientErrors.messageNotAccepted"],
+    ].map(([code, text]) => [start, code, text] as const)))(
+      "starting from %s, a refusal with %s shows the right line on the start screen",
+      async (start, code, text) => {
+        const socket = await handOverFrom(start)
+
+        reject(socket, { rejection_outcome: "not_accepted", error_code: code })
+
+        expect(await screen.findByRole("alert")).toHaveTextContent(text)
+        expect(screen.queryByRole("button", { name: "hand-over" })).not.toBeInTheDocument()
+        expect(screen.getByTestId("session-start")).toBeInTheDocument()
+        // The visitor's words are gone and nothing is sent again by itself.
+        await letItRun()
+        expect(chats(socket)).toHaveLength(1)
+      },
+    )
+
+    it.each(starts.map((start) => [start] as const))(
+      "starting from %s, a storage failure behind the source is shown as the right outcome",
+      async (start) => {
+        const socket = await handOverFrom(start)
+
+        reject(socket, { error_code: "message_processing_failed" })
+
+        if (start === "unbound") {
+          expect(await screen.findByRole("alert")).toHaveTextContent("clientErrors.messageProcessingFailed")
+        } else {
+          expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
+          expect(screen.queryByText("clientErrors.messageProcessingFailed")).not.toBeInTheDocument()
+        }
+      },
+    )
+  })
+
+  describe("with a host page message", () => {
+    // Where in the hand-over the host page's open message arrives.
+    const moments = [
+      ["the message is still waiting for the replay", "slot"],
+      ["the reset has been asked for", "reset"],
+      ["the reset is confirmed in the same render", "confirmed"],
+      ["the message has been sent", "sent"],
+    ] as const
+
+    it.each(moments)("sends the hand-over first and the host message after it when %s", async (_label, moment) => {
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      if (moment !== "slot") receive(socket, ATTACHED)
+      openEarlierConversation()
+      handOver()
+      if (moment === "slot") {
+        deliverOpenMessage("hi")
+        receive(socket, ATTACHED)
+      }
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+      if (moment === "reset") deliverOpenMessage("hi")
+      if (moment === "confirmed") {
+        act(() => {
+          socket.onmessage?.({ data: JSON.stringify({ type: "conversation_reset" }) } as MessageEvent)
+          window.dispatchEvent(new MessageEvent("message", {
+            data: { xagent: true, v: 1, type: "open_message", id: "1", value: "hi" },
+            source: EMBEDDED_PARENT as unknown as MessageEventSource,
+          }))
+        })
+      } else {
+        receive(socket, { type: "conversation_reset" })
+      }
+      await waitFor(() => expect(chats(socket)).toHaveLength(1))
+      if (moment === "sent") deliverOpenMessage("hi")
+      expect(sentTypes(socket)).toEqual(["new_conversation", "chat"])
+      expect(chats(socket)[0]).toMatchObject({ message: CONTINUE, source_task_id: 41 })
+
+      accept(socket, 42)
+
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation", "chat", "new_conversation"]))
+      receive(socket, { type: "conversation_reset" })
+      await waitFor(() => expect(chats(socket)).toHaveLength(2))
+      expect(chats(socket)[1].message).toBe("hi")
+      expect(chats(socket)[1]).not.toHaveProperty("source_task_id")
+      accept(socket, 43)
+      await letItRun()
+      // Both messages are done: no frame follows, and history can be opened again.
+      expect(sentTypes(socket)).toEqual(["new_conversation", "chat", "new_conversation", "chat"])
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      expect(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" })).toBeInTheDocument()
+      expect(warn.mock.calls.filter(([text]) => String(text).startsWith("Xagent Widget:"))).toEqual([])
+    })
+
+    it("lets neither driver send while both arrive in the same render", async () => {
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      openEarlierConversation()
+
+      act(() => {
+        handOver()
+        window.dispatchEvent(new MessageEvent("message", {
+          data: { xagent: true, v: 1, type: "open_message", id: "1", value: "hi" },
+          source: EMBEDDED_PARENT as unknown as MessageEventSource,
+        }))
+      })
+
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+      await letItRun()
+      expect(sentTypes(socket)).toEqual(["new_conversation"])
+    })
+
+    it("takes the visitor back to the chat when the message arrives", async () => {
+      const socket = await mountWithHistory()
+      receive(socket, ATTACHED)
+      openEarlierConversation()
+      expect(screen.getByRole("button", { name: "hand-over" })).toBeInTheDocument()
+
+      deliverOpenMessage("hi")
+
+      expect(screen.queryByRole("button", { name: "hand-over" })).not.toBeInTheDocument()
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+      expect(sentFrames(socket)[0]).toMatchObject({ message: "hi" })
+      expect(sentFrames(socket)[0]).not.toHaveProperty("source_task_id")
+    })
+  })
+
+  describe("with the host page's initial message", () => {
+    it.each([
+      ["accepted", true],
+      ["refused", false],
+    ] as const)("is never requested once a hand-over has begun, even when it is %s", async (_label, accepted) => {
+      asParent()
+      const socket = await mountWithHistory()
+      openEarlierConversation()
+      handOver()
+      expect(initialRequests).toBe(0)
+
+      receive(socket, ATTACHED)
+      await waitFor(() => expect(chats(socket)).toHaveLength(1))
+      if (accepted) accept(socket, 42)
+      else reject(socket, { rejection_outcome: "not_accepted", error_code: "task_unavailable" })
+      await letItRun()
+
+      expect(initialRequests).toBe(0)
+      expect(chats(socket)).toHaveLength(1)
+    })
+
+    it("takes the visitor back to the chat when it arrives", async () => {
+      asParent()
+      const socket = await mountWithHistory()
+      openEarlierConversation()
+
+      receive(socket, ATTACHED)
+
+      await waitFor(() => expect(sentFrames(socket).map((frame) => frame.message)).toEqual(["Hello from the host page"]))
+      expect(screen.queryByRole("button", { name: "hand-over" })).not.toBeInTheDocument()
+    })
+  })
+
+  describe("reading history beside the conversation", () => {
+    const json = (body: unknown) => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+
+    it("leaves the conversation, the connection and the token alone while the visitor reads", async () => {
+      historySurfaces.real = true
+      surfaces.real = true
+      const postMessage = vi.spyOn(window, "postMessage").mockImplementation(() => {})
+      fetchMock.mockImplementation(async (url: string) => {
+        if (String(url).includes("/conversations/40/messages")) {
+          return json({
+            messages: [{ id: 1, role: "user", content: "An old question", created_at: "2026-01-01T00:00:00Z", attachments: [] }],
+            next_cursor: null,
+          })
+        }
+        return json({
+          conversations: [
+            { task_id: 41, title: "Current chat", created_at: "2026-01-02T00:00:00Z" },
+            { task_id: 40, title: "Older chat", created_at: "2026-01-01T00:00:00Z" },
+          ],
+          next_cursor: null,
+        })
+      })
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      await screen.findByText("Earlier answer")
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      fireEvent.click(await screen.findByRole("button", { name: /Older chat/ }))
+      await screen.findByText("An old question")
+      fireEvent.click(screen.getByRole("button", { name: "widgetSession.history.back" }))
+      fireEvent.click(await screen.findByRole("button", { name: /Current chat/ }))
+
+      expect(await screen.findByText("Earlier answer")).toBeVisible()
+      const reads = fetchMock.mock.calls.filter(([url]) => String(url).includes("/v1/external/chat/sessions/conversations"))
+      expect(reads.length).toBeGreaterThanOrEqual(2)
+      for (const [url, init] of reads) {
+        expect((init as RequestInit).headers).toEqual({ Authorization: `Bearer ${SESSION_TOKEN}` })
+        expect((init as RequestInit).credentials).toBe("omit")
+        expect(String(url)).not.toContain(SESSION_TOKEN)
+      }
+      expect(sentFrames(socket)).toEqual([])
+      expect(MockWebSocket.instances).toHaveLength(1)
+      expect(socket.close).not.toHaveBeenCalled()
+      expect(postMessage.mock.calls.filter(([message]) => (message as { type?: string })?.type === "reconnect_request")).toEqual([])
+    })
+
+    it("keeps the draft in the same composer node across a visit to history", async () => {
+      surfaces.real = true
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument())
+      const composer = screen.getByRole("textbox")
+      act(() => { composer.textContent = "half typed"; fireEvent.input(composer) })
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+
+      expect(screen.getByRole("textbox", { hidden: true })).toBe(composer)
+      const layer = composer.closest("[aria-hidden='true']") as HTMLElement
+      expect(layer.style.visibility).toBe("hidden")
+      expect(layer).not.toBeVisible()
+      fireEvent.click(screen.getByRole("button", { name: "pick-earlier" }))
+      fireEvent.click(screen.getByRole("button", { name: "back-to-list" }))
+      fireEvent.click(screen.getByRole("button", { name: "back-to-chat" }))
+
+      expect(screen.getByRole("textbox")).toBe(composer)
+      expect(composer).toHaveTextContent("half typed")
+      expect(layer).toBeVisible()
+    })
+
+    it("keeps taking replies for the conversation while history is open", async () => {
+      surfaces.real = true
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      await screen.findByText("Earlier answer")
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+
+      receive(socket, {
+        type: "trace_event",
+        task_id: 41,
+        timestamp: "2026-10-28T00:00:05Z",
+        data: {
+          event_id: "late-answer",
+          event_type: "agent_message",
+          data: { message: "A late answer", content: "A late answer", role: "assistant" },
+        },
+      })
+      fireEvent.click(screen.getByRole("button", { name: "back-to-chat" }))
+
+      expect(await screen.findByText("A late answer")).toBeVisible()
+    })
+
+    it("does not move focus into a composer that appears while history is open, and focuses it on return", async () => {
+      surfaces.real = true
+      const socket = await mountWithHistory()
+      receive(socket, ATTACHED)
+      await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument())
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      act(() => (document.activeElement as HTMLElement | null)?.blur())
+
+      receive(socket, taskInfo(42))
+      await letItRun()
+      expect(screen.getByRole("textbox", { hidden: true })).not.toHaveFocus()
+
+      fireEvent.click(screen.getByRole("button", { name: "back-to-chat" }))
+
+      await waitFor(() => expect(screen.getByRole("textbox")).toHaveFocus())
+    })
   })
 })

@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
@@ -20,6 +20,7 @@ import {
   clientErrorTranslationKey,
   type ClientErrorCode,
 } from "@/lib/client-errors"
+import type { WidgetSessionHistoryAuth } from "@/lib/widget-session-history"
 import {
   toAttachments,
   useSessionAttachments,
@@ -31,7 +32,10 @@ import {
   type WidgetSessionAgent,
   type WidgetSessionStatus,
 } from "./use-widget-session"
+import { useHistoryContinue, type HistoryContinueRequest } from "./use-history-continue"
 import { useSessionOpenMessage } from "./use-session-open-message"
+import { WidgetHistoryList } from "./widget-history-list"
+import { WidgetHistoryView } from "./widget-history-view"
 
 const SESSION_PROTOCOL = "xagent-session-v1"
 // Asks the session server to send a connection_capabilities frame, then
@@ -60,6 +64,13 @@ const getSessionTerminalPresentation = (code: string | null): SessionTerminalPre
   code ? SESSION_TERMINAL_PRESENTATION[code] ?? "unavailable" : "unavailable"
 )
 
+// What the area below the header shows. The chat stays mounted underneath the
+// other two, so a half-typed message is still there on the way back.
+type HistoryViewState =
+  | { kind: "chat" }
+  | { kind: "history_list" }
+  | { kind: "history_view"; taskId: number; title: string }
+
 const isNotificationHandled = (error: unknown): boolean =>
   typeof error === "object" && error !== null
   && (error as { notificationHandled?: unknown }).notificationHandled === true
@@ -79,6 +90,10 @@ interface SessionConversationContentProps {
   // Present only while the session server advertises file uploads.
   attachments?: SessionAttachmentsConfig
   uploads: SessionUploadControls
+  // Whether the session server offers earlier conversations to this session.
+  historyAvailable: boolean
+  // The token of the session the page holds right now, or null while it has none.
+  readCurrentToken: () => string | null
 }
 
 function SessionConversationContent({
@@ -90,6 +105,8 @@ function SessionConversationContent({
   onExpandedChange,
   attachments,
   uploads,
+  historyAvailable,
+  readCurrentToken,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -130,8 +147,17 @@ function SessionConversationContent({
   // The failure is stored as a code, not as text, so the line is translated
   // at render time and follows a locale switch. It is only a note on the
   // start page; the toast raised by the composer is the failure signal.
+  // `continued` marks a failure of a send that carried an earlier conversation
+  // as its source.
   const [startMessageFailure, setStartMessageFailure] =
-    useState<{ code: ClientErrorCode | null } | null>(null)
+    useState<{ code: ClientErrorCode | null; continued?: true } | null>(null)
+  const [view, setView] = useState<HistoryViewState>({ kind: "chat" })
+  // The message a visitor wrote over an earlier conversation, waiting for the
+  // hand-over driver below to send it. A newer one replaces an older one
+  // still here.
+  const [continueRequest, setContinueRequest] = useState<HistoryContinueRequest | null>(null)
+  const continueSeqRef = useRef(0)
+  const [continueNotice, setContinueNotice] = useState<"not_sent" | null>(null)
 
   // The failure line belongs to the current start-page visit only: whenever
   // the conversation becomes established or returns to the start page, the
@@ -145,6 +171,7 @@ function SessionConversationContent({
   if (lastSeenConversationEstablished !== conversationEstablished) {
     setLastSeenConversationEstablished(conversationEstablished)
     setStartMessageFailure(null)
+    setContinueNotice(null)
   }
 
   const handleStartMessage = useCallback(async (
@@ -159,7 +186,10 @@ function SessionConversationContent({
       // An error that is already announced, or that the visitor caused, leaves
       // no failure line behind.
       if (!isNotificationHandled(error)) {
-        setStartMessageFailure({ code: readSendErrorCode(error) })
+        setStartMessageFailure({
+          code: readSendErrorCode(error),
+          ...(typeof config?.sourceTaskId === "number" ? { continued: true as const } : {}),
+        })
       }
       throw error
     }
@@ -186,6 +216,44 @@ function SessionConversationContent({
     }
   }, [startNewConversation])
 
+  const sendContinueMessage = useCallback(
+    (message: string, sourceTaskId: number) => handleStartMessage(message, [], { sourceTaskId }),
+    [handleStartMessage],
+  )
+  const takeContinue = useCallback((seq: number) => {
+    setContinueRequest((current) => (current?.seq === seq ? null : current))
+  }, [])
+  const handleContinue = useCallback((message: string, sourceTaskId: number) => {
+    continueSeqRef.current += 1
+    setView({ kind: "chat" })
+    setContinueNotice(null)
+    setContinueRequest({ seq: continueSeqRef.current, message, sourceTaskId })
+  }, [])
+
+  // The hooks below run in this order. The host page's open message waits for
+  // a hand-over (it is given `continueBusy`), the hand-over never waits for it,
+  // and the host page's initial message is spent by a hand-over; all three
+  // read `continueBusy` during render, so which effect runs first decides
+  // nothing.
+  const openMessage = useWidgetOpenMessage({ enabled: true })
+  const { busy: continueBusy } = useHistoryContinue({
+    request: continueRequest,
+    take: takeContinue,
+    status,
+    hasAgent: agent !== null,
+    sessionConversationAttachment,
+    sessionConversationState,
+    isMessageDeliveryPending,
+    isConversationResetPending,
+    isAttachmentBusy,
+    startNewConversation: startNewConversationForOpen,
+    sendContinueMessage,
+    onOutcome: (outcome) => {
+      if (outcome === "superseded" || outcome === "unsupported") setContinueNotice("not_sent")
+      else if (outcome === "sent") setContinueNotice(null)
+    },
+  })
+
   useWidgetInitialMessage({
     // An open socket does not yet tell whether the server is restoring a
     // conversation, because its replay arrives after the open. Attach
@@ -201,9 +269,15 @@ function SessionConversationContent({
     // Both "attached" and "unsupported" describe the current open socket only.
     ready: status === "active" && agent !== null
       && sessionConversationAttachment !== "pending",
-    // A first send queued during the initial connect has no task yet.
-    hasConversation: state.taskId !== null || isMessageDeliveryPending,
-    onMessage: (message) => handleStartMessage(message, []),
+    // A first send queued during the initial connect has no task yet. A
+    // message being handed over from an earlier conversation counts too: the
+    // visitor has already started their own conversation, so the host page's
+    // message is dropped for good, even if the hand-over then fails.
+    hasConversation: state.taskId !== null || isMessageDeliveryPending || continueBusy,
+    onMessage: (message) => {
+      setView({ kind: "chat" })
+      return handleStartMessage(message, [])
+    },
   })
 
   const sendStartMessageForOpen = useCallback(
@@ -211,7 +285,6 @@ function SessionConversationContent({
     [handleStartMessage],
   )
 
-  const openMessage = useWidgetOpenMessage({ enabled: true })
   useSessionOpenMessage({
     request: openMessage.request,
     take: openMessage.take,
@@ -219,12 +292,56 @@ function SessionConversationContent({
     hasAgent: agent !== null,
     sessionConversationAttachment,
     sessionConversationState,
-    isMessageDeliveryPending,
+    isMessageDeliveryPending: isMessageDeliveryPending || continueBusy,
     isConversationResetPending,
     isAttachmentBusy,
     startNewConversation: startNewConversationForOpen,
     sendStartMessage: sendStartMessageForOpen,
   })
+
+  // History reads use the token policy of the phase the conversation is in at
+  // the moment of each request: before a conversation is replaced, the token
+  // is refreshed when needed and retried once after a rejection; while one is
+  // being replaced, a refresh would rebuild the connection and cost the
+  // visitor the new conversation, so the current token is used as it is.
+  const phaseRef = useRef(sessionConversationState)
+  useEffect(() => {
+    phaseRef.current = sessionConversationState
+  }, [sessionConversationState])
+  const getHistoryAuth = useCallback((): WidgetSessionHistoryAuth => {
+    const phase = phaseRef.current
+    if (phase === "unbound" || phase === "bound") {
+      return {
+        getToken: () => uploads.ensureFreshSession().then((session) => session.token),
+        refreshToken: (rejectedToken) => (
+          uploads.refreshSession(rejectedToken).then((session) => session.token)
+        ),
+      }
+    }
+    return {
+      getToken: () => {
+        const token = readCurrentToken()
+        return token === null
+          ? Promise.reject(new Error("The session has no token"))
+          : Promise.resolve(token)
+      },
+    }
+  }, [uploads, readCurrentToken])
+
+  // Anything under way that sends or resets, or a host page message still
+  // waiting, takes the visitor back to the chat and keeps the history entry
+  // away. A reload-required session does the same: its notice only exists on
+  // the chat. The render in which an open message has been taken and its reset
+  // confirmed, but its send has not started, is the one render in which none of
+  // these is set; the send starts in that render's effect and the next render
+  // closes whatever was opened meanwhile.
+  const historyBlocked = openMessage.request !== null
+    || isConversationResetPending
+    || isMessageDeliveryPending
+    || continueBusy
+  if (view.kind !== "chat" && (isSessionInteractionLocked || historyBlocked)) {
+    setView({ kind: "chat" })
+  }
 
   if (status === "waiting" || (status === "refreshing" && !agent)) {
     return (
@@ -261,6 +378,7 @@ function SessionConversationContent({
   }
 
   const reloadRequired = isSessionInteractionLocked
+  const showHistoryEntry = historyAvailable && !reloadRequired && !historyBlocked
   const resetDisabled =
     reloadRequired
     || isConversationResetPending
@@ -299,9 +417,16 @@ function SessionConversationContent({
               label: isConversationResetPending
                 ? t("widgetSession.resetting")
                 : t("widgetSession.startNewConversation"),
-              onClick: () => void handleStartNewConversation(),
+              onClick: () => {
+                setView({ kind: "chat" })
+                void handleStartNewConversation()
+              },
               disabled: resetDisabled,
               pending: isConversationResetPending,
+            } : undefined}
+            history={showHistoryEntry ? {
+              label: t("widgetSession.history.menuLabel"),
+              onClick: () => setView({ kind: "history_list" }),
             } : undefined}
             expanded={isExpanded}
             onExpandedChange={onExpandedChange}
@@ -322,9 +447,16 @@ function SessionConversationContent({
         ) : null}
         {startMessageFailure && !reloadRequired && !conversationEstablished ? (
           <p className="mt-2 text-xs text-destructive" role="alert">
-            {startMessageFailure.code
-              ? t(clientErrorTranslationKey(startMessageFailure.code))
-              : t("widgetSession.startMessageFailed")}
+            {startMessageFailure.continued && startMessageFailure.code === "task_unavailable"
+              ? t("widgetSession.history.continueUnavailable")
+              : startMessageFailure.code
+                ? t(clientErrorTranslationKey(startMessageFailure.code))
+                : t("widgetSession.startMessageFailed")}
+          </p>
+        ) : null}
+        {continueNotice && !reloadRequired ? (
+          <p className="mt-2 text-xs text-destructive" role="alert">
+            {t("widgetSession.history.continueNotSent")}
           </p>
         ) : null}
         {reloadRequired ? (
@@ -334,58 +466,99 @@ function SessionConversationContent({
         ) : null}
       </header>
 
-      <div className="min-h-0 flex-1">
-        {conversationEstablished ? (
-          <TaskConversationPanel
-            mode="page"
-            showTaskActions={false}
-            showTokenUsage={false}
-            showDagPreview={false}
-            showTaskFiles={false}
-            hideFileUpload={!attachments}
-            hideConfig={true}
-            compactInput={true}
-            deferFileUpload={true}
-            onSend={attachments ? sendWithAttachments : undefined}
-            attachments={attachments}
-            attachmentStatuses={attachments ? attachmentStatuses : undefined}
-            onRetryAttachment={attachments ? retryAttachment : undefined}
-            attachmentsBusy={isAttachmentBusy}
-            attachmentFiles={attachments ? panelFiles : []}
-            onAttachmentFilesChange={attachments ? onPanelFilesChange : undefined}
-          />
-        ) : (
-          <div className="h-full overflow-y-auto">
-            <main className="container mx-auto max-w-4xl px-4 py-8">
-              <ChatStartScreen
-                title={agent.name}
-                description={agent.description}
-                prompts={agent.suggestedPrompts}
-                onSend={handleStartMessage}
-                sendPromptOnClick={true}
-                isSending={
-                  state.isProcessing
-                  || isConversationResetPending
-                  || isMessageDeliveryPending
-                  || reloadRequired
-                  || isAttachmentBusy
-                }
-                files={attachments ? startFiles : []}
-                onFilesChange={attachments ? onStartFilesChange : () => undefined}
-                attachments={attachments}
-                attachmentStatuses={attachments ? attachmentStatuses : undefined}
-                onRetryAttachment={attachments ? retryAttachment : undefined}
-                attachmentsBusy={isAttachmentBusy}
-                readOnlyConfig={true}
-                hideConfig={true}
-                compactInput={true}
-                deferFileUpload={true}
-                filesDisabled={filesDisabled}
-                voiceInputEnabled={voiceInputEnabled}
-                autoFocus={true}
-                inputMinHeightClass="min-h-[44px]"
+      <div className="relative min-h-0 flex-1">
+        {/* The chat stays mounted while history is open, only hidden: a message
+            being typed, a reply still streaming and the scroll position all
+            carry on underneath. visibility keeps the layout and takes the
+            hidden part out of focus and out of the accessibility tree. */}
+        <div
+          className="h-full"
+          style={view.kind === "chat" ? undefined : { visibility: "hidden" }}
+          aria-hidden={view.kind === "chat" ? undefined : true}
+        >
+          {conversationEstablished ? (
+            <TaskConversationPanel
+              mode="page"
+              showTaskActions={false}
+              showTokenUsage={false}
+              showDagPreview={false}
+              showTaskFiles={false}
+              hideFileUpload={!attachments}
+              hideConfig={true}
+              compactInput={true}
+              deferFileUpload={true}
+              autoFocusInput={view.kind === "chat"}
+              onSend={attachments ? sendWithAttachments : undefined}
+              attachments={attachments}
+              attachmentStatuses={attachments ? attachmentStatuses : undefined}
+              onRetryAttachment={attachments ? retryAttachment : undefined}
+              attachmentsBusy={isAttachmentBusy}
+              attachmentFiles={attachments ? panelFiles : []}
+              onAttachmentFilesChange={attachments ? onPanelFilesChange : undefined}
+            />
+          ) : (
+            <div className="h-full overflow-y-auto">
+              <main className="container mx-auto max-w-4xl px-4 py-8">
+                <ChatStartScreen
+                  title={agent.name}
+                  description={agent.description}
+                  prompts={agent.suggestedPrompts}
+                  onSend={handleStartMessage}
+                  sendPromptOnClick={true}
+                  isSending={
+                    state.isProcessing
+                    || isConversationResetPending
+                    || isMessageDeliveryPending
+                    || reloadRequired
+                    || isAttachmentBusy
+                    || continueBusy
+                  }
+                  files={attachments ? startFiles : []}
+                  onFilesChange={attachments ? onStartFilesChange : () => undefined}
+                  attachments={attachments}
+                  attachmentStatuses={attachments ? attachmentStatuses : undefined}
+                  onRetryAttachment={attachments ? retryAttachment : undefined}
+                  attachmentsBusy={isAttachmentBusy}
+                  readOnlyConfig={true}
+                  hideConfig={true}
+                  compactInput={true}
+                  deferFileUpload={true}
+                  filesDisabled={filesDisabled}
+                  voiceInputEnabled={voiceInputEnabled}
+                  autoFocus={view.kind === "chat"}
+                  inputMinHeightClass="min-h-[44px]"
+                />
+              </main>
+            </div>
+          )}
+        </div>
+        {view.kind === "chat" ? null : (
+          <div className="absolute inset-0 flex flex-col bg-background">
+            {view.kind === "history_list" ? (
+              <WidgetHistoryList
+                origin={window.location.origin}
+                getAuth={getHistoryAuth}
+                unauthorizedNotice={sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"}
+                currentTaskId={state.taskId}
+                onBack={() => setView({ kind: "chat" })}
+                onOpenCurrent={() => setView({ kind: "chat" })}
+                onOpen={(taskId, title) => setView({ kind: "history_view", taskId, title })}
               />
-            </main>
+            ) : (
+              <WidgetHistoryView
+                key={view.taskId}
+                origin={window.location.origin}
+                getAuth={getHistoryAuth}
+                unauthorizedNotice={sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"}
+                taskId={view.taskId}
+                title={view.title}
+                sessionPhase={sessionConversationState}
+                sessionAttachment={sessionConversationAttachment}
+                continueBusy={continueBusy}
+                onBack={() => setView({ kind: "history_list" })}
+                onContinue={handleContinue}
+              />
+            )}
           </div>
         )}
       </div>
@@ -409,6 +582,22 @@ export function SessionAgentChatPage() {
     ? advertisedUploads
     : bridge.status === "refreshing" ? heldUploads : undefined
   const attachments = useMemo(() => toAttachments(fileUploads), [fileUploads])
+
+  // Held across a token refresh in the same way, so the history entry does not
+  // flicker out and back while the bridge has no session.
+  const advertisedHistory = bridge.session?.capabilities?.conversationHistory === true
+  const [heldHistory, setHeldHistory] = useState(advertisedHistory)
+  if (bridge.session && heldHistory !== advertisedHistory) {
+    setHeldHistory(advertisedHistory)
+  }
+  const historyAvailable = bridge.session
+    ? advertisedHistory
+    : bridge.status === "refreshing" ? heldHistory : false
+  const sessionTokenRef = useRef<string | null>(null)
+  useEffect(() => {
+    sessionTokenRef.current = bridge.session?.token ?? null
+  }, [bridge.session])
+  const readCurrentToken = useCallback(() => sessionTokenRef.current, [])
   const uploads = useMemo<SessionUploadControls>(() => ({
     ensureFreshSession: bridge.ensureFreshSession,
     refreshSession: bridge.refreshSession,
@@ -479,6 +668,8 @@ export function SessionAgentChatPage() {
         onExpandedChange={setIsExpanded}
         attachments={attachments}
         uploads={uploads}
+        historyAvailable={historyAvailable}
+        readCurrentToken={readCurrentToken}
       />
     </AppProvider>
   )

@@ -488,6 +488,22 @@ describe("PublicAgentChatPage", () => {
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
   })
 
+  it("offers no conversation history in the menu", async () => {
+    const taskKey = "widget_task_17_guest-1"
+    localStorage.setItem(taskKey, "71")
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderWidgetPage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "widgetChat.newConversation",
+      "widgetChat.expandWindow",
+    ])
+  })
+
   it("ends the conversation and returns to the start screen", async () => {
     const taskKey = "widget_task_17_guest-1"
     localStorage.setItem(taskKey, "71")

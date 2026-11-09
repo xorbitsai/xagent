@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useRef, useState } from "react"
-import { Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
+import { History, Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { listenForWidgetHostMessage, postToParentWidget } from "@/lib/widget-parent-message"
 
@@ -29,6 +29,12 @@ interface WidgetChromeControlsProps {
     // visible with the menu closed.
     pending?: boolean
   }
+  // Undefined omits the history menu item. Only the Session page supplies it,
+  // and only while the session server offers conversation history.
+  history?: {
+    label: string
+    onClick: () => void
+  }
   // Expand/collapse state is owned here (uncontrolled) by default, which is
   // fine as long as this component's own mount lifetime matches the panel's.
   // Session mode's header can remount independently of the panel (its
@@ -41,6 +47,7 @@ interface WidgetChromeControlsProps {
 
 export function WidgetChromeControls({
   newConversation,
+  history,
   expanded: controlledExpanded,
   onExpandedChange,
 }: WidgetChromeControlsProps) {
@@ -120,6 +127,11 @@ export function WidgetChromeControls({
     newConversation?.onClick()
   }
 
+  const handleHistory = () => {
+    setIsMenuOpen(false)
+    history?.onClick()
+  }
+
   const handleToggleExpand = () => {
     setIsMenuOpen(false)
     // Optimistic: widget.js owns the actual panel size and can't confirm
@@ -176,6 +188,17 @@ export function WidgetChromeControls({
               >
                 <MessageSquarePlus className="w-4 h-4 shrink-0" />
                 {newConversation.label}
+              </button>
+            ) : null}
+            {history ? (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={handleHistory}
+                className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-2 text-left text-sm hover:bg-muted/50 transition-colors focus-visible:bg-muted/50 focus-visible:outline-none"
+              >
+                <History className="w-4 h-4 shrink-0" />
+                {history.label}
               </button>
             ) : null}
             <button

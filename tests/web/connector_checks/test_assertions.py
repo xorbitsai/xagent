@@ -9,6 +9,7 @@ import pytest
 
 from xagent.web.connector_checks.assertions import judge_result, resolve_expected
 from xagent.web.connector_checks.declarations import (
+    CreatedRef,
     EachHasKeys,
     Equals,
     HasKeys,
@@ -16,6 +17,7 @@ from xagent.web.connector_checks.declarations import (
     L3Envelope,
     Length,
     PayloadSource,
+    RunScopedName,
     StatusSuccess,
 )
 from xagent.web.connector_checks.fixtures import FixtureMissing, FixtureRef
@@ -244,12 +246,14 @@ def test_the_first_assertion_that_fails_is_reported() -> None:
     )
 
 
-def test_an_unresolved_fixture_never_reaches_the_evaluator() -> None:
+@pytest.mark.parametrize(
+    "value",
+    [FixtureRef("jira.site_id"), RunScopedName("site"), CreatedRef(("site", "id"))],
+)
+def test_an_unresolved_value_never_reaches_the_evaluator(value: Any) -> None:
     with pytest.raises(TypeError):
         judge_result(
-            json_result(_DOCUMENT),
-            "json_text",
-            (Equals(("site", "id"), FixtureRef("jira.site_id")),),
+            json_result(_DOCUMENT), "json_text", (Equals(("site", "id"), value),)
         )
 
 

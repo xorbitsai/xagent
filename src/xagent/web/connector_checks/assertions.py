@@ -27,6 +27,7 @@ from ..connector_probes import ConnectorProbe
 from ..services.connector_probe import ConnectorProbeOutcome, evaluate_probe_result
 from .declarations import (
     Assertion,
+    CreatedRef,
     EachHasKeys,
     Equals,
     HasKeys,
@@ -80,7 +81,7 @@ def judge_result(
     """
     for assertion in assertions:
         if isinstance(assertion, Equals) and isinstance(
-            assertion.value, (FixtureRef, RunScopedName)
+            assertion.value, (FixtureRef, RunScopedName, CreatedRef)
         ):
             raise TypeError("an expected value must be resolved before judging")
     if len(assertions) == 1 and isinstance(assertions[0], L3Envelope):

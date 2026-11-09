@@ -18,6 +18,7 @@ from xagent.web.services import task_start_consumer as consumer
 from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     SettledTaskCommand,
+    TaskCommandDeferred,
     TaskCommandRejected,
 )
 from xagent.web.services.task_existing_command import stage_existing_execution
@@ -154,16 +155,52 @@ def test_actor_marked_task_is_rejected_with_its_own_reason(combined):
     assert settled.result == {"rejection_reason": "actor_policy_required"}
 
 
-def test_start_waits_out_a_runner_still_registered_in_this_process(
-    combined, monkeypatch
-):
+def test_start_is_deferred_while_a_local_runner_is_registered(combined):
     task_id, owner_id = combined
     command = _stage_and_claim(task_id, owner_id)
-    monkeypatch.setattr(consumer, "_local_run_in_flight", lambda _task_id: True)
 
-    settled = consumer._commit_handoff(command, None)
+    with pytest.raises(TaskCommandDeferred) as deferred:
+        consumer._commit_handoff(command, None, local_run_in_flight=True)
 
-    assert settled.result == {"rejection_reason": "start_state_changed"}
+    # Nothing was applied, so the sender may safely retry.
+    assert deferred.value.resend_safe is True
+    (status, run_id, runner, _), (cmd_status, _, _) = _task_and_command(
+        task_id, command.id
+    )
+    assert (status, run_id, runner) == (TaskStatus.COMPLETED, "previous-run", None)
+    assert cmd_status == "processing"
+
+
+@pytest.mark.asyncio
+async def test_start_reads_runner_state_on_the_loop_and_defers(combined, monkeypatch):
+    import threading
+
+    from xagent.web.services.task_execution import background_task_manager
+
+    task_id, owner_id = combined
+    command = _stage_and_claim(task_id, owner_id)
+    loop_thread = threading.get_ident()
+    read_on: list[int] = []
+    real = consumer.bg_turn_inflight
+
+    def spy(tid):
+        read_on.append(threading.get_ident())
+        return real(tid)
+
+    monkeypatch.setattr(consumer, "bg_turn_inflight", spy)
+    running = asyncio.get_running_loop().create_future()
+    background_task_manager.running_tasks[task_id] = running
+    try:
+        with pytest.raises(TaskCommandDeferred):
+            await consumer.execute_task_start(command)
+    finally:
+        background_task_manager.running_tasks.pop(task_id, None)
+        running.cancel()
+
+    assert read_on == [loop_thread]
+    # Once the runner is gone the very same START goes through.
+    settled = await _start_with_scheduling_stubbed(command)
+    assert settled.result == {"run_id": command.target_run_id}
 
 
 def test_non_existing_start_is_not_consumed_without_a_coordinator(combined):
@@ -223,12 +260,167 @@ async def test_scheduling_failure_settles_the_committed_lease(combined, monkeypa
     )
     settle = Mock()
     monkeypatch.setattr(task_orchestrator, "settle_task_lease_isolated", settle)
+    monkeypatch.setattr(execution, "publish_task_event", AsyncMock())
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(consumer.PostCommitStartFailure, match="boom"):
         await consumer.execute_task_start(command)
 
     settle.assert_called_once()
     assert settle.call_args.args[0].run_id == command.target_run_id
+
+
+async def _start_with_scheduling_stubbed(command):
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(
+        task_orchestrator,
+        "_schedule_bg",
+        lambda **_kw: asyncio.get_running_loop().create_future(),
+    )
+    try:
+        return await consumer.execute_task_start(command)
+    finally:
+        patcher.undo()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_spent", [False, True])
+async def test_post_commit_scheduling_failure_reaches_the_client_once(
+    combined, monkeypatch, budget_spent
+):
+    task_id, owner_id = combined
+    command = _stage_and_claim(task_id, owner_id)
+    if budget_spent:
+        command = ClaimedTaskCommand(
+            **{**command.__dict__, "failure_count": execution.MAX_COMMAND_FAILURES - 1}
+        )
+    monkeypatch.setattr(
+        task_orchestrator, "_schedule_bg", Mock(side_effect=RuntimeError("boom"))
+    )
+    monkeypatch.setattr(task_orchestrator, "settle_task_lease_isolated", Mock())
+    publish = AsyncMock()
+    monkeypatch.setattr(execution, "publish_task_event", publish)
+
+    with pytest.raises(consumer.PostCommitStartFailure) as raised:
+        await execution._execute_and_report_local_start(
+            command, consumer.execute_task_start
+        )
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    publish.assert_awaited_once()
+    event = publish.await_args.args[0]
+    assert event["type"] == "agent_error"
+    assert event["message_code"] == "task_command_failed"
+
+
+@pytest.mark.asyncio
+async def test_post_commit_failure_is_not_reported_when_settlement_was_fenced(
+    combined, monkeypatch
+):
+    task_id, owner_id = combined
+    command = _stage_and_claim(task_id, owner_id)
+    monkeypatch.setattr(
+        task_orchestrator, "_schedule_bg", Mock(side_effect=RuntimeError("boom"))
+    )
+    # False: another writer already settled this run, so no contradicting frame.
+    monkeypatch.setattr(
+        task_orchestrator, "settle_task_lease_isolated", Mock(return_value=False)
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(execution, "publish_task_event", publish)
+
+    with pytest.raises(RuntimeError, match="boom") as raised:
+        await consumer.execute_task_start(command)
+
+    assert not isinstance(raised.value, consumer.PostCommitStartFailure)
+    publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_commit_failure_is_reported_even_if_settlement_raises(
+    combined, monkeypatch
+):
+    task_id, owner_id = combined
+    command = _stage_and_claim(task_id, owner_id)
+    monkeypatch.setattr(
+        task_orchestrator, "_schedule_bg", Mock(side_effect=RuntimeError("boom"))
+    )
+    monkeypatch.setattr(
+        task_orchestrator,
+        "settle_task_lease_isolated",
+        Mock(side_effect=ConnectionError("commit retries exhausted")),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(execution, "publish_task_event", publish)
+
+    with pytest.raises(consumer.PostCommitStartFailure):
+        await consumer.execute_task_start(command)
+
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_commit_cancellation_is_not_reported_as_a_failure(
+    combined, monkeypatch
+):
+    task_id, owner_id = combined
+    command = _stage_and_claim(task_id, owner_id)
+    monkeypatch.setattr(
+        task_orchestrator, "_schedule_bg", Mock(side_effect=asyncio.CancelledError())
+    )
+    monkeypatch.setattr(task_orchestrator, "settle_task_lease_isolated", Mock())
+    publish = AsyncMock()
+    monkeypatch.setattr(execution, "publish_task_event", publish)
+
+    with pytest.raises(asyncio.CancelledError):
+        await consumer.execute_task_start(command)
+
+    publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_spent", [False, True])
+async def test_local_start_deferral_is_reported_only_when_the_budget_is_spent(
+    monkeypatch, budget_spent
+):
+    finished = Mock()
+    monkeypatch.setattr(execution, "finish_task_command_delivery", finished)
+    publish = AsyncMock()
+    monkeypatch.setattr(execution, "publish_task_event", publish)
+    defer_count = transport.max_command_defers() - 1 if budget_spent else 0
+    command = ClaimedTaskCommand(**{**_command(0).__dict__, "defer_count": defer_count})
+
+    with pytest.raises(TaskCommandDeferred):
+        await execution._execute_and_report_local_start(
+            command,
+            AsyncMock(side_effect=TaskCommandDeferred("busy", resend_safe=True)),
+        )
+
+    assert finished.call_count == int(budget_spent)
+    if not budget_spent:
+        publish.assert_not_awaited()
+        return
+    event = publish.await_args.args[0]
+    assert event["message_code"] == "task_command_deferred"
+    assert event["resend_safe"] is True
+
+
+@pytest.mark.asyncio
+async def test_settled_refusal_broadcast_carries_the_staged_terminal_draft(
+    monkeypatch,
+):
+    monkeypatch.setattr(execution, "finish_task_command_delivery", Mock())
+    publish = AsyncMock()
+    monkeypatch.setattr(execution, "publish_task_event", publish)
+    settled = SettledTaskCommand({"rejection_reason": "start_state_changed"})
+
+    result = await execution._execute_and_report_local_start(
+        _command(0), AsyncMock(return_value=settled)
+    )
+
+    assert result is settled
+    event = publish.await_args.args[0]
+    assert event["message_code"] == "task_command_failed"
+    assert event["resend_safe"] is False
 
 
 def _reporting(monkeypatch):
@@ -311,7 +503,7 @@ async def test_lost_claim_is_not_broadcast(monkeypatch):
     broadcast.assert_not_awaited()
 
 
-def test_pause_settles_a_start_held_by_a_release_hold(combined):
+def test_settling_cap_held_commands_fails_a_held_start(combined):
     from xagent.web.services.task_execution_admission import (
         settle_cap_held_commands_no_commit,
     )

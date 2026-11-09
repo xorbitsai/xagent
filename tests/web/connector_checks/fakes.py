@@ -33,6 +33,8 @@ class FakeTool:
     write_hint: MCPWriteHint = MCPWriteHint.UNDECLARED
     delay: float = 0.0
     error: Exception | None = None
+    # Answers each call from its arguments instead of returning ``result``.
+    respond: Callable[[dict[str, Any]], Any] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -44,6 +46,8 @@ class FakeTool:
             await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
+        if self.respond is not None:
+            return self.respond(dict(args))
         return self.result
 
 
@@ -100,6 +104,31 @@ class FakeAdapter:
 
     def resolve_fixture(self, key: str) -> FixtureValue | None:
         return self.fixtures.get(key)
+
+
+class FakePolicyAdapter(FakeAdapter):
+    """A fake adapter whose identity has a write policy: ``verdicts`` maps a
+    tool to the verdict it gives a restricted actor."""
+
+    def __init__(
+        self,
+        targets: Sequence[ConnectorTarget],
+        sessions: Mapping[str, Session] | None = None,
+        *,
+        verdicts: Mapping[str, str | None],
+        policy_error: Exception | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(targets, sessions, **kwargs)
+        self.verdicts = dict(verdicts)
+        self.policy_error = policy_error
+        self.asked: list[tuple[str, str]] = []
+
+    def write_policy_verdict(self, target: ConnectorTarget, tool: str) -> Any:
+        self.asked.append((target.app_id, tool))
+        if self.policy_error is not None:
+            raise self.policy_error
+        return self.verdicts.get(tool)
 
 
 def targets(*app_ids: str) -> list[ConnectorTarget]:

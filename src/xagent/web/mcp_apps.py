@@ -145,6 +145,19 @@ _CATALOG_MCP_OAUTH_CREDENTIAL_PROVIDERS: dict[
 }
 
 
+def catalog_mcp_credential_provider_for_client_id(client_id: str) -> str | None:
+    """The catalog credential provider whose deployment client is ``client_id``.
+
+    Only the platform's own pre-registered client matches: a user's custom
+    server with its own static client never carries the deployment's id.
+    """
+    for provider, spec in _CATALOG_MCP_OAUTH_CREDENTIAL_PROVIDERS.items():
+        configured = spec[1]()
+        if configured and configured == client_id:
+            return provider
+    return None
+
+
 def get_catalog_mcp_oauth_credentials(
     app_id: str, credential_provider: object | None = None
 ) -> tuple[dict[str, str], tuple[str, ...]] | None:

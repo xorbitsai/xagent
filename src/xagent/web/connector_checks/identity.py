@@ -32,6 +32,11 @@ it with a skip reason (the ``user`` adapter's ``not_catalog_identity``).
 App ids are unique per enumeration. Where an identity has several rows of
 one app, the adapter offers the one its catalog resolution selects, the one
 a task of that identity would load.
+
+An identity whose deployment governs writes also implements ``WritePolicy``.
+A write check runs only under such an identity; under any other, a
+switched-on write check whose session passed fails as
+``verdict_mismatch``/``no_write_policy``.
 """
 
 from __future__ import annotations
@@ -39,9 +44,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .codes import connector_label, is_code
+from .declarations import ExpectedVerdict
 from .fixtures import FixtureValue
 
 if TYPE_CHECKING:
@@ -147,3 +153,25 @@ class IdentityAdapter(Protocol):
     def resolve_fixture(self, key: str) -> FixtureValue | None:
         """The fixture value for ``key`` in this environment and identity,
         from server-side configuration, or None."""
+
+
+@runtime_checkable
+class WritePolicy(Protocol):
+    """What an identity adds for write checks (#3564): the verdict its
+    deployment's write policy gives a restricted actor for a tool.
+
+    The engine asks for each write check's create and cleanup tools before
+    any connector starts, and compares the answers with the declared
+    ``expected_verdicts``; nothing is written unless both match. The probe
+    path bypasses the approval gate and the per-user tool overrides, so this
+    is where a check learns that its tool is still governed. Xagent SaaS's
+    Toby adapter answers ``deny`` for a tool withheld from a non-installer
+    member and ``allow`` otherwise. The ``user`` adapter has no write policy.
+    """
+
+    def write_policy_verdict(
+        self, target: ConnectorTarget, tool: str
+    ) -> ExpectedVerdict | None:
+        """The verdict for ``tool``, by its MCP wire name, on ``target``, or
+        None when the policy says nothing about it. A raise fails the run as
+        ``write_policy:exception``."""

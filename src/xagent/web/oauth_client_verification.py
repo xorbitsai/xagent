@@ -149,6 +149,22 @@ UNVERIFIABLE: dict[str, str] = {
 # (BAD_REFRESH_TOKEN), so it checks the token first too (measured 2026-11-09).
 MCP_UNVERIFIABLE: dict[str, str] = {"hubspot": _TOKEN_FIRST}
 
+# A real refresh carries a refresh token the vendor issued, so an answer that
+# rejects the client means the client, also for providers the verification
+# above cannot check. These are the refresh's own codes, not the probe RULES:
+# on a real refresh Google's unauthorized_client means the refresh token was
+# issued to another client (a grant from before a client switch), which is
+# that grant's problem, not the current client's. Slack's oauth.v2.access
+# names its own codes.
+_DEFAULT_CLIENT_REJECTED_CODES = frozenset({"invalid_client"})
+_REFRESH_CLIENT_REJECTED_CODES: dict[str, frozenset[str]] = {
+    "github": frozenset({"incorrect_client_credentials"}),
+    "salesforce": frozenset({"invalid_client_id", "invalid_client"}),
+    "slack": frozenset({"invalid_client", "invalid_client_id", "bad_client_secret"}),
+}
+# Vendors whose rejection is not a bare error code.
+_REFRESH_RULES: dict[str, Rule] = {"meta": _meta, "intercom": _intercom}
+
 
 class UnknownExclusionError(ValueError):
     """``--exclude`` names something that is neither a provider nor an MCP client."""
@@ -191,6 +207,38 @@ def vendor_answer(status: int, payload: object) -> VendorAnswer:
             error = _code(first.get("code"))
             description = str(first.get("message") or "")
     return VendorAnswer(status, error, description.lower()[:200])
+
+
+def is_client_rejected(provider: str, status: int, payload: object) -> bool:
+    """Whether a failed refresh's answer says the vendor rejected the client.
+
+    Used by the refresh paths (#3580): such a failure affects every user of
+    the provider's connectors, unlike a dead grant or a transient error.
+    """
+    answer = vendor_answer(status, payload)
+    if answer.status >= 500:
+        return False
+    name = provider.lower()
+    rule = _REFRESH_RULES.get(name)
+    if rule is not None:
+        return rule(answer) == "client_rejected"
+    return answer.error in _REFRESH_CLIENT_REJECTED_CODES.get(
+        name, _DEFAULT_CLIENT_REJECTED_CODES
+    )
+
+
+def client_rejected_reason(provider: str) -> str:
+    """The session reason for a rejected client: ``client_rejected:<provider>``,
+    or a bare ``client_rejected`` when the name is not a valid suffix (an
+    admin-created provider may be named ``my_crm``).
+    """
+    from ..core.tools.adapters.vibe.config import (
+        CLIENT_REJECTED_REASON,
+        is_client_rejected_reason,
+    )
+
+    reason = f"{CLIENT_REJECTED_REASON}:{provider.lower()}"
+    return reason if is_client_rejected_reason(reason) else CLIENT_REJECTED_REASON
 
 
 def _answer_detail(answer: VendorAnswer) -> str:

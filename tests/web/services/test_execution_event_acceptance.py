@@ -556,10 +556,10 @@ def test_existing_execution_rolls_back_input_if_command_staging_fails(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shared", [False, True])
-async def test_existing_execution_applies_current_input_once(
-    canonical, monkeypatch, shared
-):
+async def test_existing_execution_applies_current_input_once(canonical, monkeypatch):
+    # The START handoff owns the lease and the accepted fact in both modes
+    # (combined mode: ``test_combined_start_consumer``), so the run only reads.
+    shared = True
     from unittest.mock import AsyncMock
 
     from xagent.web.models.task_execution_event import TaskExecutionEvent
@@ -646,24 +646,15 @@ async def test_existing_execution_applies_current_input_once(
 
     monkeypatch.setattr(task_execution, "execute_task_background", execute)
     with forbid_legacy_content(factory.kw["bind"]):
-        if shared:
-            handle = task_orchestrator._schedule_bg(
-                task_id=tid,
-                task_owner_user_id=owner,
-                task_source=None,
-                task_lease=lease,
-                payload=payload,
-                force_fresh=False,
-                context={},
-            )
-        else:
-            handle = await task_orchestrator.TaskTurnOrchestrator.schedule_existing_task_execution(
-                task_id=tid,
-                task_owner_user_id=owner,
-                task_source=None,
-                payload=payload,
-                context={},
-            )
+        handle = task_orchestrator._schedule_bg(
+            task_id=tid,
+            task_owner_user_id=owner,
+            task_source=None,
+            task_lease=lease,
+            payload=payload,
+            force_fresh=False,
+            context={},
+        )
         await handle
     assert observed == [(["earlier"], ["current description"], payload.turn_id)]
 

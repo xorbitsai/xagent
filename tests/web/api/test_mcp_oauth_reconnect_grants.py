@@ -612,7 +612,7 @@ async def test_refresh_to_the_replaced_scope_does_not_collide(
     _expire(db, grant)
     refreshed_tokens: list[str] = []
 
-    async def fake_refresh(_client, *, refresh_token, resource, client=None):
+    async def fake_refresh(_client, *, refresh_token, resource, client=None, **_kwargs):
         refreshed_tokens.append(refresh_token)
         return {"access_token": "refreshed-access-token", "scope": FULL}
 
@@ -653,7 +653,7 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     refreshed_tokens: list[str] = []
 
     async def reconnect_during_refresh(
-        _client, *, refresh_token, resource, client=None
+        _client, *, refresh_token, resource, client=None, **_kwargs
     ):
         refreshed_tokens.append(refresh_token)
         response = await mcp_oauth_callback(

@@ -18,7 +18,6 @@ from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_orchestrator as orchestrator_module
 from xagent.web.services.task_orchestrator import (
-    TaskTurnOrchestrator,
     TaskTurnPayload,
 )
 
@@ -182,42 +181,3 @@ def test_websocket_task_info_exposes_persisted_runtime_extension_bindings(
         assert routing.task_info["runtime_extension_bindings"] == ["local_browser"]
     finally:
         db.close()
-
-
-@pytest.mark.asyncio
-async def test_existing_task_scheduler_reuses_shared_runtime_without_turn_claim(
-    _test_db: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The compatibility entry schedules runtime work without a new message."""
-
-    async def completed_execution() -> None:
-        return None
-
-    background_task = asyncio.create_task(completed_execution())
-    schedule = MagicMock(return_value=background_task)
-    monkeypatch.setattr(orchestrator_module, "_schedule_bg", schedule)
-
-    payload = TaskTurnPayload(
-        transcript_message="already stored description",
-        execution_message="already stored description",
-    )
-    returned = await TaskTurnOrchestrator.schedule_existing_task_execution(
-        task_id=23,
-        task_owner_user_id=9,
-        task_source="internal",
-        payload=payload,
-        context={"execution_mode": "balanced"},
-        actor_user_id=11,
-    )
-
-    assert returned is background_task
-    schedule.assert_called_once_with(
-        task_id=23,
-        task_owner_user_id=9,
-        task_source="internal",
-        payload=payload,
-        force_fresh=False,
-        context={"execution_mode": "balanced"},
-    )
-    await background_task

@@ -66,7 +66,9 @@ class ConnectorToolsResult:
 
 
 # Unavailable reasons from the task builder that mean the user's credential is
-# missing or unusable, as opposed to a broken server definition.
+# missing or unusable, as opposed to a broken server definition. A rejected
+# platform client (client_rejected[:<provider>], #3580) also leaves the
+# connection unusable and is reported the same way, with its own reason.
 _CREDENTIAL_REASONS = frozenset(
     {
         "authorization_required",
@@ -172,9 +174,11 @@ async def list_connector_tools(
         return result(ConnectorToolsOutcome.FAILED_TO_START, reason="invalid_config")
     if inner_config.get("unavailable"):
         reason = inner_config.get("reason")
+        from ...core.tools.adapters.vibe.config import is_client_rejected_reason
+
         return result(
             ConnectorToolsOutcome.NOT_CONNECTED
-            if reason in _CREDENTIAL_REASONS
+            if reason in _CREDENTIAL_REASONS or is_client_rejected_reason(reason)
             else ConnectorToolsOutcome.FAILED_TO_START,
             reason=reason,
             diagnostic=inner_config.get("diagnostic"),

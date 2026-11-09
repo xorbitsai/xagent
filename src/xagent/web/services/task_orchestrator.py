@@ -355,57 +355,6 @@ class TaskTurnOrchestrator:
     """
 
     @staticmethod
-    async def schedule_existing_task_execution(
-        *,
-        task_id: int,
-        task_owner_user_id: int,
-        task_source: Optional[str],
-        payload: TaskTurnPayload,
-        context: Optional[Dict[str, Any]] = None,
-        actor_user_id: Optional[int] = None,
-    ) -> "asyncio.Task[None]":
-        """Schedule the legacy ``execute_task`` command without a caller Session.
-
-        Unlike :meth:`begin_turn`, this compatibility entry does not persist a
-        new user message or reset terminal fields.  The legacy WebSocket command
-        executes the description already stored on ``Task``; changing it into a
-        new chat turn would duplicate that text in conversation history.
-
-        The shared scheduler still owns the runtime invariants: one local
-        in-flight coroutine, an exact task lease, worker-owned setup snapshot,
-        one off-loop execution-scope resolution, heartbeat, and fenced
-        settlement.  Cross-worker duplicates are rejected by lease acquisition.
-        """
-        async with task_execution_controller.command(task_id):
-            actor_marked = await run_db_io_cancellation_safe(
-                lambda: _task_requires_actor_policy_sync(
-                    task_id,
-                    task_owner_user_id,
-                )
-            )
-            if actor_marked:
-                raise MCPBuiltinOAuthActorPolicyRequiredError(
-                    f"Task {task_id} is actor-marked; legacy execution is unsupported"
-                )
-            _refuse_if_bg_inflight(task_id)
-            background_task = _schedule_bg(
-                task_id=task_id,
-                task_owner_user_id=task_owner_user_id,
-                task_source=task_source,
-                payload=payload,
-                force_fresh=False,
-                context=context,
-            )
-
-        logger.info(
-            "existing task execution scheduled: task=%s owner=%s actor=%s",
-            task_id,
-            task_owner_user_id,
-            actor_user_id if actor_user_id is not None else task_owner_user_id,
-        )
-        return background_task
-
-    @staticmethod
     async def begin_turn(
         *,
         task_id: int,
@@ -1879,6 +1828,18 @@ def commit_claimed_turn_or_reconcile(
         raise TaskTurnCommitOutcomeUnknown(task_id, payload.turn_id) from commit_error
 
 
+def bg_turn_inflight(task_id: int) -> bool:
+    """Whether this process still has a non-done bg runner for ``task_id``.
+
+    Reads loop-owned state (the manager's task handles): call it on the event
+    loop, never from a database worker thread.
+    """
+    from .task_execution import background_task_manager
+
+    existing = background_task_manager.running_tasks.get(task_id)
+    return existing is not None and not existing.done()
+
+
 def _refuse_if_bg_inflight(task_id: int) -> None:
     """Raise ``TaskTurnError`` if the manager already has a non-done
     bg coroutine registered for this task_id.
@@ -1897,10 +1858,7 @@ def _refuse_if_bg_inflight(task_id: int) -> None:
     works fine for the legitimate "previous task naturally completed"
     case).
     """
-    from .task_execution import background_task_manager
-
-    existing = background_task_manager.running_tasks.get(task_id)
-    if existing is not None and not existing.done():
+    if bg_turn_inflight(task_id):
         raise TaskTurnError("bg_inflight")
 
 
@@ -2649,8 +2607,8 @@ def _schedule_bg(
 
       - primary turn claims supply the exact lease committed with the turn
         state. Delayed execution validates that same run/runner fence before
-        doing local work. Legacy ``schedule_existing`` callers acquire at
-        ``_runner`` entry instead. If another worker already owns the task,
+        doing local work. A caller without a lease acquires at ``_runner``
+        entry instead. If another worker already owns the task,
         the scheduler returns without invoking ``execute_task_background`` or
         ``finish_turn``.
       - heartbeat alongside the run.

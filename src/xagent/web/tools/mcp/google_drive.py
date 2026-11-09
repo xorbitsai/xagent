@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import ParseResult, parse_qs, urlparse
@@ -123,6 +124,15 @@ _DRIVE_API_HOSTS = frozenset({"www.googleapis.com"})
 _DRIVE_RESOURCE_KEY_HEADER = "X-Goog-Drive-Resource-Keys"
 # The file fields both create paths return, matching the native requests.
 _CREATED_FILE_FIELDS = "id, name, webViewLink, mimeType"
+# The same read plus what a post-create integrity check needs. The extra
+# fields are used for the check and not added to the result, whose shape
+# stays the four fields above, as native.
+_CREATED_FILE_READ_FIELDS = f"{_CREATED_FILE_FIELDS}, md5Checksum, size"
+# How far before a Composio create's request its candidate file may have been
+# created and still count as that call's own. Covers clock skew between this
+# host and Google, not a long-running call: the file is created when the tool
+# runs, close to the call.
+_CREATED_FILE_CLOCK_TOLERANCE = timedelta(seconds=60)
 
 # "owner" is deliberately excluded: ownership transfer needs
 # transferOwnership=True, is not reversible the way a role change is, and is
@@ -870,6 +880,56 @@ def _download_media(request: Any) -> bytes:
     return fh.getvalue()
 
 
+def _download_metadata_fields(base: str) -> str:
+    """``base`` plus the fields a Composio download is checked against.
+
+    The native request is left exactly as it was; on a Composio grant the
+    checksum and size let the tool detect a relayed body that is not the
+    file's own bytes (a JSON body Composio parsed and re-serialized, for
+    example) before it is returned or written.
+    """
+    if composio_proxy.serves_composio_grant():
+        return f"{base}, size, md5Checksum"
+    return base
+
+
+def _downloaded_content_mismatch(file: dict[str, Any], data: bytes) -> str | None:
+    """Why ``data`` is not the file's own bytes, or ``None`` when it is.
+
+    Only what Google reports is checked: a file with no size and no checksum
+    (a Google Workspace export) has nothing to compare against.
+    """
+    expected_size = _as_int(file.get("size"))
+    if expected_size is not None and len(data) != expected_size:
+        return (
+            f"the downloaded body is {len(data)} bytes, not the "
+            f"{expected_size} bytes Google Drive reports"
+        )
+    expected_md5 = file.get("md5Checksum")
+    if isinstance(expected_md5, str) and expected_md5:
+        actual = hashlib.md5(data, usedforsecurity=False).hexdigest()
+        if actual != expected_md5.lower():
+            return "the downloaded body's checksum does not match Google Drive's"
+    return None
+
+
+def _download_fidelity_message(name: str, reason: str) -> str:
+    return (
+        f"The content of '{name}' could not be verified against Google Drive "
+        f"({reason}), so it was not returned as the file's content. This "
+        "happens when Composio relays a JSON body as parsed data instead of "
+        "the file's original bytes. Do not treat what you have as the file; "
+        "read it through a native Google Drive connection or another tool."
+    )
+
+
+def _without_download_checks(file: dict[str, Any]) -> dict[str, Any]:
+    """Drop the fields added only for the check, keeping the native shape."""
+    return {
+        key: value for key, value in file.items() if key not in ("size", "md5Checksum")
+    }
+
+
 def _unique_output_path(output_dir: Path, filename: str) -> Path:
     """Avoid silently overwriting a same-named file already in the output
     dir (e.g. downloading the same deck twice) by appending " (1)", " (2)",
@@ -1260,7 +1320,7 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         get_request = service.files().get(
             fileId=resolved_file_id,
             supportsAllDrives=True,
-            fields="id, name, mimeType",
+            fields=_download_metadata_fields("id, name, mimeType"),
         )
         _attach_resource_key(get_request, resolved_file_id, resource_key)
         file_metadata = get_request.execute()
@@ -1339,6 +1399,18 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
         _attach_resource_key(request, resolved_file_id, resource_key)
 
         raw_bytes = _download_media(request)
+        mismatch = _downloaded_content_mismatch(file_metadata, raw_bytes)
+        if mismatch is not None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": _download_fidelity_message(
+                        str(file_metadata.get("name") or resolved_file_id), mismatch
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        file_metadata = _without_download_checks(file_metadata)
         try:
             # A strict decode, not errors="replace": both branches above
             # now only ever reach here for content already validated as a
@@ -1410,7 +1482,7 @@ def google_drive_download_file(
         get_request = service.files().get(
             fileId=resolved_file_id,
             supportsAllDrives=True,
-            fields=(
+            fields=_download_metadata_fields(
                 "id, name, mimeType, modifiedTime, version, headRevisionId, "
                 "shared, driveId"
             ),
@@ -1446,6 +1518,16 @@ def google_drive_download_file(
         _attach_resource_key(request, resolved_file_id, resource_key)
 
         data = _download_media(request)
+        mismatch = _downloaded_content_mismatch(file_metadata, data)
+        if mismatch is not None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": _download_fidelity_message(drive_name, mismatch),
+                },
+                ensure_ascii=False,
+            )
+        file_metadata = _without_download_checks(file_metadata)
 
         # Ensure the export's extension is present regardless of whether
         # the name came from Drive's own file name or an explicit
@@ -1534,6 +1616,7 @@ def google_drive_upload_file(
                 name=resolved_name,
                 mime_type=resolved_mime_type,
                 parent_id=resolved_parent_id,
+                parent_resource_key=parent_resource_key,
             )
 
         service = get_drive_service()
@@ -1942,6 +2025,26 @@ def _read_exactly(fh: BinaryIO, length: int) -> bytes:
     return data
 
 
+def _file_mtime_ns(fh: BinaryIO) -> int | None:
+    """The open file's modification time, when the platform reports one."""
+    value = getattr(os.fstat(fh.fileno()), "st_mtime_ns", None)
+    return value if isinstance(value, int) else None
+
+
+def _file_changed_since(fh: BinaryIO, *, size: int, mtime_ns: int | None) -> bool:
+    """Whether the open file's size or mtime moved since it was hashed.
+
+    Used only on a deduplicated stage, which never reads the body. A file
+    system that reports no mtime is checked by size alone.
+    """
+    stat = os.fstat(fh.fileno())
+    if stat.st_size != size:
+        return True
+    if mtime_ns is None:
+        return False
+    return getattr(stat, "st_mtime_ns", mtime_ns) != mtime_ns
+
+
 def _hash_replacement_file(
     fh: BinaryIO, size: int, *, keep_bytes: bool
 ) -> tuple[str, bytes | None, list[bytes]]:
@@ -2170,10 +2273,14 @@ class _VerifiedStagedReader:
     """The hashed bytes of ``fh``, checked block by block while they upload.
 
     A staged upload reads the replacement file again after the hash pass.
-    Each read is aligned to the hash pass's blocks and compared with its
-    digest, so bytes that changed since then are never sent: the read raises
-    and the staging upload stops. Only a temporary object is being written,
-    so Drive is never touched by a stopped upload.
+    Each block is read at most once, checked against its digest, and then
+    served from a one-block cache, so a small read (``requests`` asks for
+    16 KiB at a time) does not re-read the whole 1 MiB block. A block is
+    never served before its digest matches, so the bytes that are sent are
+    the bytes that were hashed. If the file changes after a block was
+    checked, the cached copy keeps being sent and the next block stops the
+    upload. Only a temporary object is being written, so Drive is never
+    touched by a stopped upload.
     """
 
     def __init__(self, fh: BinaryIO, *, size: int, block_digests: list[bytes]) -> None:
@@ -2181,10 +2288,22 @@ class _VerifiedStagedReader:
         self._size = size
         self._block_digests = block_digests
         self._offset = 0
+        self._block_index = -1
+        self._block = b""
 
     def __len__(self) -> int:
         # What requests uses for Content-Length, so the body is not chunked.
         return self._size
+
+    def _read_block(self, index: int) -> None:
+        start = index * _HASH_BLOCK_BYTES
+        stop = min(start + _HASH_BLOCK_BYTES, self._size)
+        self._fh.seek(start)
+        block = _read_exactly(self._fh, stop - start)
+        if _block_digest(block) != self._block_digests[index]:
+            raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+        self._block_index = index
+        self._block = block
 
     def read(self, amount: int = -1) -> bytes:
         end = (
@@ -2194,28 +2313,27 @@ class _VerifiedStagedReader:
         )
         if self._offset >= end:
             return b""
-        first_block = self._offset // _HASH_BLOCK_BYTES
-        start = first_block * _HASH_BLOCK_BYTES
-        stop = min(-(-end // _HASH_BLOCK_BYTES) * _HASH_BLOCK_BYTES, self._size)
-        self._fh.seek(start)
-        data = _read_exactly(self._fh, stop - start)
-        for index, offset in enumerate(
-            range(0, len(data), _HASH_BLOCK_BYTES), first_block
-        ):
-            block = data[offset : offset + _HASH_BLOCK_BYTES]
-            if _block_digest(block) != self._block_digests[index]:
-                raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
-        beginning = self._offset
-        self._offset = end
-        return data[beginning - start : end - start]
+        parts: list[bytes] = []
+        while self._offset < end:
+            index = self._offset // _HASH_BLOCK_BYTES
+            if index != self._block_index:
+                self._read_block(index)
+            block_start = index * _HASH_BLOCK_BYTES
+            take = min(end, block_start + len(self._block)) - self._offset
+            beginning = self._offset - block_start
+            parts.append(self._block[beginning : beginning + take])
+            self._offset += take
+        return b"".join(parts)
 
 
 def _tool_file_object(data: Any) -> dict[str, Any]:
     """The file object in a Drive tool's answer, or an empty mapping.
 
-    Composio does not document the create tool's output shape. Only the id
-    is needed; a tool answer has been seen to carry it at the top level, and
-    an SDK-style answer wraps it in ``file`` or ``data``.
+    Composio does not document the create tool's output shape. A nested
+    ``file``/``data`` object is preferred over the top level: a top-level
+    ``id`` can be the tool execution's own id rather than the new file's.
+    Only an id with Drive's own id shape is accepted, so a blank or
+    execution-shaped value is not reported as the new file.
     """
     if isinstance(data, str):
         try:
@@ -2224,32 +2342,39 @@ def _tool_file_object(data: Any) -> dict[str, Any]:
             return {}
     if not isinstance(data, dict):
         return {}
-    for candidate in (data, data.get("file"), data.get("data")):
-        if (
-            isinstance(candidate, dict)
-            and isinstance(candidate.get("id"), str)
-            and candidate["id"]
-        ):
+    candidates: list[dict[str, Any]] = []
+    for key in ("file", "data"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    candidates.append(data)
+    for candidate in candidates:
+        file_id = candidate.get("id")
+        if isinstance(file_id, str) and _DRIVE_ID_CHARS.fullmatch(file_id):
             return candidate
     return {}
 
 
-def _created_file_metadata(file_id: str, tool_data: Any) -> dict[str, Any]:
+def _created_file_metadata(
+    service: Any, file_id: str, tool_data: Any
+) -> dict[str, Any]:
     """The new file's metadata, matching what the native create path returns.
 
     Read back through the proxy so the output shape does not depend on the
-    Composio tool's answer. If that read fails, the tool's answer (which at
-    least names the new id) is used instead of reporting a failure: the file
-    exists, and a retry would create a second one.
+    Composio tool's answer. The extra checksum and size fields are used by
+    the caller's integrity check and dropped from the result. If the read
+    fails, the tool's answer (which at least names the new id) is used
+    instead of reporting a failure: the file exists, and a retry would
+    create a second one. That fallback can carry as little as the id, so a
+    caller must not assume the name or link is present.
     """
     try:
-        service = get_drive_service()
         file = (
             service.files()
             .get(
                 fileId=file_id,
                 supportsAllDrives=True,
-                fields=_CREATED_FILE_FIELDS,
+                fields=_CREATED_FILE_READ_FIELDS,
             )
             .execute()
         )
@@ -2266,9 +2391,261 @@ def _created_file_metadata(file_id: str, tool_data: Any) -> dict[str, Any]:
     return fallback
 
 
+def _created_file_output(file: dict[str, Any]) -> dict[str, Any]:
+    """The four fields both native create paths return."""
+    return {
+        key: file[key]
+        for key in ("id", "name", "webViewLink", "mimeType")
+        if key in file
+    }
+
+
+def _created_content_mismatch(
+    file: dict[str, Any], *, md5: str, size: int
+) -> str | None:
+    """Why Drive's stored file is not the bytes that were uploaded, or None.
+
+    A Google Workspace file has no MD5 (its bytes are converted), so it is
+    not checked. A stored file with neither a checksum nor a size cannot be
+    checked either; that gap is covered by the post-upload read-back being
+    the only evidence available.
+    """
+    stored_md5 = file.get("md5Checksum")
+    if isinstance(stored_md5, str) and stored_md5:
+        if stored_md5.lower() != md5.lower():
+            return "Google Drive's checksum does not match the bytes that were uploaded"
+        stored_size = _as_int(file.get("size"))
+        if stored_size is not None and stored_size != size:
+            return f"Google Drive reports {stored_size} bytes, not {size}"
+        return None
+    if _is_google_workspace_mime_type(str(file.get("mimeType") or "")):
+        return None
+    stored_size = _as_int(file.get("size"))
+    if stored_size is not None and stored_size != size:
+        return f"Google Drive reports {stored_size} bytes, not {size}"
+    return None
+
+
+def _drive_query_literal(value: str) -> str:
+    """``value`` as a single-quoted Drive query string literal."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _parse_drive_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _created_during_call(file: dict[str, Any], started_at: datetime) -> bool:
+    created = _parse_drive_time(file.get("createdTime"))
+    return created is not None and (
+        created >= started_at - _CREATED_FILE_CLOCK_TOLERANCE
+    )
+
+
+def _find_created_file(
+    service: Any,
+    *,
+    name: str,
+    parent_id: str | None,
+    md5: str,
+    size: int,
+    started_at: datetime,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], Exception | None]:
+    """Look for the file a create tool may have made before its answer was
+    lost.
+
+    A Composio timeout can arrive after the tool created the file. The lookup
+    narrows the unknown: a same-name file whose checksum and size match the
+    bytes just uploaded is that file; with no checksum (a Google Workspace
+    conversion) a single file created during this call is the best evidence
+    available. Anything else stays a candidate for the caller to describe.
+    """
+    query = f"name = '{_drive_query_literal(name)}' and trashed = false"
+    if parent_id is None:
+        query += " and 'root' in parents"
+    else:
+        query += f" and '{_drive_query_literal(parent_id)}' in parents"
+    try:
+        answer = (
+            service.files()
+            .list(
+                q=query,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                pageSize=10,
+                orderBy="createdTime desc",
+                fields=(
+                    "files(id, name, mimeType, size, md5Checksum, "
+                    "webViewLink, createdTime)"
+                ),
+            )
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Could not look for the new file %r: %s", name, exc)
+        return None, [], exc
+    files = answer.get("files") if isinstance(answer, dict) else None
+    if not isinstance(files, list):
+        return None, [], RuntimeError("Drive returned an invalid file list")
+    candidates = [
+        file
+        for file in files
+        if isinstance(file, dict) and isinstance(file.get("id"), str) and file["id"]
+    ]
+    for candidate in candidates:
+        stored_md5 = candidate.get("md5Checksum")
+        stored_size = _as_int(candidate.get("size"))
+        if (
+            isinstance(stored_md5, str)
+            and stored_md5
+            and stored_md5.lower() == md5.lower()
+            and stored_size in (None, size)
+        ):
+            return candidate, candidates, None
+    recent = [
+        candidate
+        for candidate in candidates
+        if _created_during_call(candidate, started_at)
+    ]
+    if len(recent) == 1 and not isinstance(recent[0].get("md5Checksum"), str):
+        # A Google Workspace file has no checksum; a single file created
+        # during this call is the only evidence this lookup can offer.
+        return recent[0], candidates, None
+    return None, candidates, None
+
+
+def _unconfirmed_create_message(
+    *,
+    action: str,
+    name: str,
+    candidates: list[dict[str, Any]],
+    lookup_error: Exception | None,
+) -> str:
+    """What to tell a caller when a create tool's answer was lost.
+
+    ``action`` is "uploaded" or "created". The wording never claims a
+    definite failure while the file may exist, and never invites a blind
+    retry that would make a duplicate.
+    """
+    if lookup_error is not None:
+        return (
+            f"Composio did not confirm that the file was {action}, and Google "
+            "Drive could not be checked for it, so it is not known whether it "
+            f"exists. Do not retry blindly: check Google Drive for '{name}' "
+            "first; a retry could create a second file."
+        )
+    if candidates:
+        shown = ", ".join(f"'{candidate['id']}'" for candidate in candidates[:3])
+        if len(candidates) > 3:
+            shown += f" and {len(candidates) - 3} more"
+        return (
+            f"Composio did not confirm that the file was {action}, and Google "
+            f"Drive already has a file named '{name}' in that folder (id "
+            f"{shown}) whose content does not match the bytes that were "
+            "uploaded. It is not known whether this call created a file. Do "
+            "not retry blindly: check Google Drive first; a retry could create "
+            "a duplicate."
+        )
+    return (
+        f"Composio did not confirm that the file was {action}. A check of "
+        f"Google Drive found no file named '{name}' in that folder, so it was "
+        "not created under that name. If it could have been created under "
+        "another name, check Google Drive before retrying; a retry could "
+        "create a duplicate."
+    )
+
+
 def _composio_drive_error(message: str, **extra: Any) -> str:
     return json.dumps(
         {"status": "error", "message": message, **extra}, ensure_ascii=False
+    )
+
+
+def _composio_rejection_is_definite(exc: composio_tools.ComposioToolError) -> bool:
+    """Whether Composio's refusal proves the tool never ran.
+
+    A 4xx is Composio rejecting the call before execution (a 408 is a
+    timeout and can arrive after it ran). A 5xx or an unreachable Composio
+    leaves the result unknown.
+    """
+    status = exc.status
+    return status is not None and 400 <= status < 500 and status != 408
+
+
+def _created_file_result(
+    service: Any,
+    file_id: str,
+    tool_data: Any,
+    *,
+    md5: str,
+    size: int,
+    action: str,
+) -> str:
+    """The result for a create whose new id Drive returned.
+
+    The file is read back and its checksum checked against the bytes that
+    were staged, so a vendor that stored something else is not reported as a
+    success. The read-back fields beyond the native four are not returned.
+    """
+    metadata = _created_file_metadata(service, file_id, tool_data)
+    mismatch = _created_content_mismatch(metadata, md5=md5, size=size)
+    if mismatch is not None:
+        return _composio_drive_error(
+            f"Google Drive created a file with id '{file_id}', but the content "
+            f"it stored is not the file that was {action} ({mismatch}). Do not "
+            "upload it again before checking or removing that file: a retry "
+            "would create a duplicate."
+        )
+    return json.dumps(
+        {"status": "success", "file": _created_file_output(metadata)},
+        ensure_ascii=False,
+    )
+
+
+def _unconfirmed_create_result(
+    service: Any,
+    *,
+    action: str,
+    name: str,
+    parent_id: str | None,
+    md5: str,
+    size: int,
+    started_at: datetime,
+) -> str:
+    """Look for a file a create may have made, then report what is known.
+
+    A file that matches the uploaded bytes is returned as the success it
+    is. Otherwise the message says whether Drive could be checked at all;
+    it never claims a definite failure while the file may exist.
+    """
+    match, candidates, lookup_error = _find_created_file(
+        service,
+        name=name,
+        parent_id=parent_id,
+        md5=md5,
+        size=size,
+        started_at=started_at,
+    )
+    if match is not None:
+        return json.dumps(
+            {"status": "success", "file": _created_file_output(match)},
+            ensure_ascii=False,
+        )
+    return _composio_drive_error(
+        _unconfirmed_create_message(
+            action=action,
+            name=name,
+            candidates=candidates,
+            lookup_error=lookup_error,
+        )
     )
 
 
@@ -2279,14 +2656,26 @@ def _upload_file_via_composio(
     name: str,
     mime_type: str,
     parent_id: str | None,
+    parent_resource_key: str | None,
 ) -> str:
     """Upload a local file with Composio's create tool and the Files API.
 
     The proxy cannot carry a create's metadata and content in one request,
     so the bytes are staged and the tool names the staged object. Its answer
     is not trusted for the output shape; the file is read back through the
-    proxy instead.
+    proxy instead. Staging and execution are separate failures: a staging
+    failure leaves Drive untouched, while a lost tool answer can mean the
+    file exists, so the file is looked up by name and parent before anything
+    is reported as not created.
     """
+    if parent_resource_key is not None:
+        return _composio_drive_error(
+            "This Drive connection cannot create a file inside a folder that "
+            "requires a resource key (a link-shared folder created before "
+            "2021): the Composio Drive tool cannot carry the key. Move the "
+            "file to a folder shared with the connected Google account, or "
+            "use a native Google Drive connection. Nothing was uploaded."
+        )
     try:
         fh_ctx = local_path.open("rb")
     except OSError as exc:
@@ -2296,6 +2685,7 @@ def _upload_file_via_composio(
         size = os.fstat(fh.fileno()).st_size
         if size == 0:
             return _composio_drive_error(f"File is empty: {file_path}")
+        mtime_ns = _file_mtime_ns(fh)
         try:
             local_md5, local_bytes, block_digests = _hash_replacement_file(
                 fh, size, keep_bytes=size <= _STAGED_UPLOAD_IN_MEMORY_BYTES
@@ -2310,6 +2700,13 @@ def _upload_file_via_composio(
             if local_bytes is not None
             else _VerifiedStagedReader(fh, size=size, block_digests=block_digests)
         )
+
+        def _verify_unchanged_on_dedup() -> None:
+            # Deduplication does not read the body, so nothing else would
+            # notice a local change between the hash pass and the tool call.
+            if _file_changed_since(fh, size=size, mtime_ns=mtime_ns):
+                raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+
         try:
             staged = composio_tools.stage_file(
                 tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
@@ -2318,22 +2715,61 @@ def _upload_file_via_composio(
                 md5=local_md5,
                 data=body,
                 length=size,
+                on_dedup=(_verify_unchanged_on_dedup if local_bytes is None else None),
             )
-            arguments: dict[str, Any] = {
-                "name": name,
-                "mimeType": mime_type,
-                "file_to_upload": staged,
-            }
-            if parent_id is not None:
-                arguments["parents"] = [parent_id]
-            result = composio_tools.execute_tool(
-                composio_tools.GOOGLEDRIVE_CREATE_FILE, arguments
+        except _ReplacementChangedError:
+            return _composio_drive_error(
+                "The local file changed while it was being uploaded, so the "
+                "upload was stopped before it completed and Google Drive was "
+                f"not changed. {_LOCAL_FILE_CHANGED}"
             )
         except Exception as exc:
             logger.error(f"Error uploading file: {exc}")
             return _composio_drive_error(
-                "The file was not uploaded to Google Drive: Composio could "
-                f"not complete the upload. {exc}"
+                "The file was not uploaded to Google Drive: its bytes could "
+                f"not be staged in Composio's file storage. {exc}"
+            )
+
+        service = get_drive_service()
+        started_at = datetime.now(timezone.utc)
+        arguments: dict[str, Any] = {
+            "name": name,
+            "mimeType": mime_type,
+            "file_to_upload": staged,
+        }
+        if parent_id is not None:
+            arguments["parents"] = [parent_id]
+        try:
+            result = composio_tools.execute_tool(
+                composio_tools.GOOGLEDRIVE_CREATE_FILE, arguments
+            )
+        except composio_tools.ComposioToolError as exc:
+            if _composio_rejection_is_definite(exc):
+                logger.error(f"Error uploading file: {exc}")
+                return _composio_drive_error(
+                    "The file was not uploaded to Google Drive: Composio "
+                    f"rejected the request before running the upload. {exc}"
+                )
+            logger.error(f"Error uploading file: {exc}")
+            return _unconfirmed_create_result(
+                service,
+                action="uploaded",
+                name=name,
+                parent_id=parent_id,
+                md5=local_md5,
+                size=size,
+                started_at=started_at,
+            )
+        except Exception as exc:
+            logger.error(f"Error uploading file: {exc}")
+            return _unconfirmed_create_result(
+                service,
+                action="uploaded",
+                name=name,
+                parent_id=parent_id,
+                md5=local_md5,
+                size=size,
+                started_at=started_at,
             )
         if not result.successful:
             detail = f": {result.error}" if result.error else "."
@@ -2342,17 +2778,22 @@ def _upload_file_via_composio(
             )
         file_id = _tool_file_object(result.data).get("id")
         if not isinstance(file_id, str) or not file_id:
-            return _composio_drive_error(
-                "Composio reported that the upload succeeded but did not "
-                "return the new file's id, so it could not be confirmed. "
-                "Check Google Drive before uploading the file again."
+            return _unconfirmed_create_result(
+                service,
+                action="uploaded",
+                name=name,
+                parent_id=parent_id,
+                md5=local_md5,
+                size=size,
+                started_at=started_at,
             )
-        return json.dumps(
-            {
-                "status": "success",
-                "file": _created_file_metadata(file_id, result.data),
-            },
-            ensure_ascii=False,
+        return _created_file_result(
+            service,
+            file_id,
+            result.data,
+            md5=local_md5,
+            size=size,
+            action="uploaded",
         )
 
 
@@ -2363,13 +2804,24 @@ def _create_file_via_composio(
     mime_type: str,
     upload_mime_type: str,
     parent_id: str | None,
+    parent_resource_key: str | None,
 ) -> str:
     """Create a text-backed file with Composio's create tool.
 
     Google's conversion from text to a Google Doc happens inside the
     create's multipart request, so the staged upload's type is the source
     type (``upload_mime_type``) while the tool's ``mimeType`` is the target.
+    The failure split is the same as the upload path's: staging does not
+    touch Drive, while a lost tool answer sends the caller to a lookup.
     """
+    if parent_resource_key is not None:
+        return _composio_drive_error(
+            "This Drive connection cannot create a file inside a folder that "
+            "requires a resource key (a link-shared folder created before "
+            "2021): the Composio Drive tool cannot carry the key. Move the "
+            "file to a folder shared with the connected Google account, or "
+            "use a native Google Drive connection. Nothing was created."
+        )
     data = content.encode("utf-8")
     md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
     try:
@@ -2381,38 +2833,75 @@ def _create_file_via_composio(
             data=data,
             length=len(data),
         )
-        arguments: dict[str, Any] = {
-            "name": name,
-            "mimeType": mime_type,
-            "file_to_upload": staged,
-        }
-        if parent_id is not None:
-            arguments["parents"] = [parent_id]
-        result = composio_tools.execute_tool(
-            composio_tools.GOOGLEDRIVE_CREATE_FILE, arguments
-        )
     except Exception as exc:
         logger.error(f"Error creating file: {exc}")
         return _composio_drive_error(
-            "The file was not created in Google Drive: Composio could not "
-            f"complete the create. {exc}"
+            "The file was not created in Google Drive: its content could not "
+            f"be staged in Composio's file storage. {exc}"
+        )
+
+    service = get_drive_service()
+    started_at = datetime.now(timezone.utc)
+    arguments: dict[str, Any] = {
+        "name": name,
+        "mimeType": mime_type,
+        "file_to_upload": staged,
+    }
+    if parent_id is not None:
+        arguments["parents"] = [parent_id]
+    try:
+        result = composio_tools.execute_tool(
+            composio_tools.GOOGLEDRIVE_CREATE_FILE, arguments
+        )
+    except composio_tools.ComposioToolError as exc:
+        if _composio_rejection_is_definite(exc):
+            logger.error(f"Error creating file: {exc}")
+            return _composio_drive_error(
+                "The file was not created in Google Drive: Composio rejected "
+                f"the request before running the create. {exc}"
+            )
+        logger.error(f"Error creating file: {exc}")
+        return _unconfirmed_create_result(
+            service,
+            action="created",
+            name=name,
+            parent_id=parent_id,
+            md5=md5,
+            size=len(data),
+            started_at=started_at,
+        )
+    except Exception as exc:
+        logger.error(f"Error creating file: {exc}")
+        return _unconfirmed_create_result(
+            service,
+            action="created",
+            name=name,
+            parent_id=parent_id,
+            md5=md5,
+            size=len(data),
+            started_at=started_at,
         )
     if not result.successful:
         detail = f": {result.error}" if result.error else "."
         return _composio_drive_error(f"Google Drive did not create the file{detail}")
     file_id = _tool_file_object(result.data).get("id")
     if not isinstance(file_id, str) or not file_id:
-        return _composio_drive_error(
-            "Composio reported that the file was created but did not return "
-            "its id, so it could not be confirmed. Check Google Drive before "
-            "creating the file again."
+        return _unconfirmed_create_result(
+            service,
+            action="created",
+            name=name,
+            parent_id=parent_id,
+            md5=md5,
+            size=len(data),
+            started_at=started_at,
         )
-    return json.dumps(
-        {
-            "status": "success",
-            "file": _created_file_metadata(file_id, result.data),
-        },
-        ensure_ascii=False,
+    return _created_file_result(
+        service,
+        file_id,
+        result.data,
+        md5=md5,
+        size=len(data),
+        action="created",
     )
 
 
@@ -2550,7 +3039,7 @@ def _composio_update_failure(
     return _content_update_error(
         f"Google Drive did not accept the new content for '{name}'. Do not "
         f"report the file as updated. {_NOTHING_CHANGED} {reason}",
-        file=current_summary,
+        file=_content_summary(now),
     )
 
 
@@ -2567,6 +3056,7 @@ def _replace_content_via_composio(
     local_md5: str,
     local_bytes: bytes | None,
     block_digests: list[bytes],
+    mtime_ns: int | None,
     upload_mime_type: str,
     stored_mime_type: str,
 ) -> str:
@@ -2583,6 +3073,13 @@ def _replace_content_via_composio(
         if local_bytes is not None
         else _VerifiedStagedReader(fh, size=local_size, block_digests=block_digests)
     )
+
+    def _verify_unchanged_on_dedup() -> None:
+        # Deduplication does not read the body, so nothing else would notice
+        # a local change between the hash pass and the tool call.
+        if _file_changed_since(fh, size=local_size, mtime_ns=mtime_ns):
+            raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+
     try:
         staged = composio_tools.stage_file(
             tool_slug=composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
@@ -2591,6 +3088,7 @@ def _replace_content_via_composio(
             md5=local_md5,
             data=body,
             length=local_size,
+            on_dedup=(_verify_unchanged_on_dedup if local_bytes is None else None),
         )
     except _ReplacementChangedError:
         return _content_update_error(
@@ -3088,6 +3586,9 @@ def google_drive_update_file_content(
                     f"Google Drive limit). {_NOTHING_CHANGED}"
                 )
             simple_upload = local_size <= _SIMPLE_UPLOAD_MAX_BYTES
+            # Read before hashing so a deduplicated stage can still tell that
+            # the file changed while the request was in flight.
+            local_mtime_ns = _file_mtime_ns(fh)
             try:
                 # A simple upload sends the bytes in one request, so keep the
                 # exact bytes that were hashed; a resumable upload reads the
@@ -3181,7 +3682,10 @@ def google_drive_update_file_content(
             if composio_proxy.serves_composio_grant():
                 # The proxy cannot carry a multipart or resumable update. The
                 # same guarantees are kept by staging the bytes and reading
-                # the file back through the proxy before and after.
+                # the file back through the proxy before and after. From here
+                # on the tool may have run, so an unexpected exception must
+                # not be reported as "nothing changed".
+                update_sent = True
                 return _replace_content_via_composio(
                     service=service,
                     file_id=resolved_file_id,
@@ -3194,6 +3698,7 @@ def google_drive_update_file_content(
                     local_md5=local_md5,
                     local_bytes=local_bytes,
                     block_digests=block_digests,
+                    mtime_ns=local_mtime_ns,
                     upload_mime_type=upload_mime_type,
                     stored_mime_type=stored_mime_type,
                 )
@@ -3425,6 +3930,7 @@ def google_drive_create_file(
                 mime_type=mime_type,
                 upload_mime_type=upload_mime_type,
                 parent_id=resolved_parent_id,
+                parent_resource_key=parent_resource_key,
             )
 
         service = get_drive_service()
@@ -3544,10 +4050,14 @@ def _unavailable_move_source_message(exc: Exception) -> str:
             " If this connection uses per-file Drive access, it can only use "
             "files created through this app or explicitly granted to it;"
         )
+    # The native sentence continues the clause the per-file sentence opened
+    # ("... granted to it; ask the user ..."), while the Composio grant has
+    # no such clause and needs the sentence to start with a capital.
+    ask = "ask" if per_file else "Ask"
     return (
         "Google Drive could not open file_id: the file does not exist, or this "
         f"Drive connection cannot access it, so nothing was moved.{per_file} "
-        "Ask the user to move the file in Google Drive instead. Google API "
+        f"{ask} the user to move the file in Google Drive instead. Google API "
         f"response: {google_api_error_summary(exc)}"
     )
 

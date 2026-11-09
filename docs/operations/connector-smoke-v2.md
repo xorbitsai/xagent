@@ -24,7 +24,12 @@ ConnectorChecks(
             ),
         ),
     ),
-    exemptions=(ToolExemption("jira_transition_issue", "moves a real issue"),),
+    exemptions=(
+        ToolExemption(
+            "jira_transition_issue",
+            "write; whether it gets a write check under the rules of #3653 is decided in #3570",
+        ),
+    ),
 )
 ```
 
@@ -35,6 +40,12 @@ ConnectorChecks(
 - **Exemption.** A tool that has no check carries an exemption and a reason, keyed by its wire name. A tool cannot be both checked and exempted.
 
 - **Sweep.** A connector with a write check declares one `Sweep`, which removes the objects aborted runs left behind; a connector without write checks declares none.
+
+**Coverage (#3565).** A builtin connector is either in `CONNECTOR_CHECKS` or on `LEGACY_CONNECTORS` (`registry.py`), the connectors that have not adopted V2 yet. `tests/web/connector_checks/test_tool_coverage.py` holds these rules:
+
+- Every tool an in-repo (`python -m`) connector's server registers has a check or an exemption, and every tool a declaration names is registered. A remote (`url`) or `npx` connector is not held to per-tool coverage (see Today's L3 probes).
+- The legacy list only shrinks, and the test pins it. A connector leaves both `LEGACY_CONNECTORS` and the test's pinned list in the PR that adds its declaration; a new builtin connector ships with its declaration and cannot join it, and a name on it must still be a builtin connector.
+- An exemption's reason says why the tool has no check yet. A read or write whose check is still to come names the issue of its connector family that decides it (#3567 for the Google document connectors, #3569 for the Microsoft 365 ones; a write check also needs the rules of #3653). A write that creates an object no tool of the server deletes has its own reason, since a write check would have nothing to clean up with. When a check is added for a tool, its exemption goes in the same change: a tool cannot be both.
 
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`. A write check's steps can also use a `RunScopedName`, its `verify`, `cleanup` and `cleanup_guard` a `CreatedRef`, and a sweep's `delete` an `ItemRef`. None of them ever comes from the caller of the engine.
 

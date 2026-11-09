@@ -477,7 +477,6 @@ async def test_refresh_rejected_as_invalid_grant_is_permanent(zendesk_db, monkey
 @pytest.mark.parametrize(
     "status_code, data",
     [
-        (401, {"error": "invalid_client"}),
         (400, {"error": "invalid_request"}),
         (500, {"error": "invalid_grant"}),
         (400, {}),
@@ -493,6 +492,22 @@ async def test_other_refresh_failures_stay_transient(
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, grant, "zendesk") is False
     )
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_client_is_client_rejected_not_a_dead_grant(
+    zendesk_db, monkeypatch
+):
+    """#3580: invalid_client is the platform's client, so the grant is kept
+    (the assumption the invalid_grant rule above relies on)."""
+    db, user = zendesk_db
+    grant = _expired_grant(db, user)
+    _fake_token_endpoint(monkeypatch, {"error": "invalid_client"}, status_code=401)
+
+    with pytest.raises(tool_config._OAuthRefreshClientRejected):
+        await tool_config.refresh_oauth_token_if_needed(db, grant, "zendesk")
+
+    assert grant.refresh_token == "old-refresh"
 
 
 # ---------- concurrent rotation on the personal path -------------------------

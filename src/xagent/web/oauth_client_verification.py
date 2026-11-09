@@ -149,6 +149,14 @@ UNVERIFIABLE: dict[str, str] = {
 # (BAD_REFRESH_TOKEN), so it checks the token first too (measured 2026-11-09).
 MCP_UNVERIFIABLE: dict[str, str] = {"hubspot": _TOKEN_FIRST}
 
+# A real refresh carries a refresh token the vendor issued, so an answer that
+# rejects the client means the client, also for providers the verification
+# above cannot check. Slack's oauth.v2.access names its own codes.
+_DEFAULT_CLIENT_REJECTED_CODES = frozenset({"invalid_client"})
+_REFRESH_CLIENT_REJECTED_CODES: dict[str, frozenset[str]] = {
+    "slack": frozenset({"invalid_client", "invalid_client_id", "bad_client_secret"}),
+}
+
 
 class UnknownExclusionError(ValueError):
     """``--exclude`` names something that is neither a provider nor an MCP client."""
@@ -191,6 +199,24 @@ def vendor_answer(status: int, payload: object) -> VendorAnswer:
             error = _code(first.get("code"))
             description = str(first.get("message") or "")
     return VendorAnswer(status, error, description.lower()[:200])
+
+
+def is_client_rejected(provider: str, status: int, payload: object) -> bool:
+    """Whether a failed refresh's answer says the vendor rejected the client.
+
+    Used by the refresh paths (#3580): such a failure affects every user of
+    the provider's connectors, unlike a dead grant or a transient error.
+    """
+    answer = vendor_answer(status, payload)
+    if answer.status >= 500:
+        return False
+    name = provider.lower()
+    rule = RULES.get(name)
+    if rule is not None:
+        return rule(answer) == "client_rejected"
+    return answer.error in _REFRESH_CLIENT_REJECTED_CODES.get(
+        name, _DEFAULT_CLIENT_REJECTED_CODES
+    )
 
 
 def _answer_detail(answer: VendorAnswer) -> str:

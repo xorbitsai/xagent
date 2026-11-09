@@ -44,11 +44,13 @@ from ...core.agent.result import (
 )
 from ...core.tools.adapters.vibe.config import (
     ACTOR_STDIO_SHADOWED_REASON,
+    CLIENT_REJECTED_REASON,
     BaseToolConfig,
     MCPConfigLoadError,
     MCPFailurePolicy,
     MCPToolLoadSummary,
     ToolFactoryRuntimeSessionBoundaryError,
+    is_client_rejected_reason,
     normalize_tool_allowlist,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -138,8 +140,16 @@ MCP_UNAVAILABLE_REASONS = frozenset(
         OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
         "runtime_connection_failed",
         "token_refresh_failed",
+        CLIENT_REJECTED_REASON,
     }
 )
+
+
+def _is_mcp_unavailable_reason(reason: object) -> bool:
+    """A reason this boundary produces, including ``client_rejected:<provider>``."""
+    return type(reason) is str and (
+        reason in MCP_UNAVAILABLE_REASONS or is_client_rejected_reason(reason)
+    )
 
 
 @dataclass(frozen=True)
@@ -204,6 +214,8 @@ class ResolvedToken:
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    # The vendor rejected the platform's client on this refresh (#3580).
+    client_rejected_provider: str | None = None
     credential_present: bool = False
     # No accepted grant, but a provider-level one the app-scoped policy
     # rejected exists: reconnecting the app fixes it.
@@ -854,6 +866,17 @@ _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
 }
 
 
+class _OAuthRefreshClientRejected(Exception):
+    """The vendor rejected the platform's own OAuth client on a refresh
+    (#3580): every user of this provider's connectors is affected, and the
+    user's grant itself is not shown to be dead, so it is kept.
+    """
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(provider)
+        self.provider = provider
+
+
 class _OAuthRefreshPermanentlyInvalid(Exception):
     """The provider (or our own stored config) confirms this connection's
     refresh token is dead -- revoked, expired, or the token/config it needs
@@ -962,6 +985,19 @@ def _log_and_classify_failed_refresh(
     from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
 
     payload = _oauth_refresh_error_payload(response)
+    from ..oauth_client_verification import is_client_rejected
+
+    if is_client_rejected(provider_name, response.status_code, payload):
+        provider = provider_name.lower()
+        logger.error(
+            "OAuth client rejected (provider=%s classification=client_rejected)",
+            provider,
+            extra={
+                "oauth_provider": provider,
+                "oauth_classification": CLIENT_REJECTED_REASON,
+            },
+        )
+        raise _OAuthRefreshClientRejected(provider)
     error_code = (
         _oauth_refresh_error_code_from_payload(payload, provider_name)
         if payload
@@ -1395,7 +1431,7 @@ async def refresh_oauth_token_if_needed(
         # a 200 whose body still lacks access_token.
         _log_and_classify_failed_refresh(response=response, provider_name=provider_name)
 
-    except _OAuthRefreshPermanentlyInvalid:
+    except (_OAuthRefreshPermanentlyInvalid, _OAuthRefreshClientRejected):
         raise
     except Exception as e:
         logger.error(
@@ -4082,7 +4118,7 @@ class WebToolConfig(BaseToolConfig):
     ) -> Dict[str, Any]:
         safe_reason = (
             reason
-            if type(reason) is str and reason in MCP_UNAVAILABLE_REASONS
+            if _is_mcp_unavailable_reason(reason)
             else "runtime_connection_failed"
         )
         inner_config: Dict[str, Any] = {
@@ -4309,6 +4345,7 @@ class WebToolConfig(BaseToolConfig):
                 )
             }
         permanently_invalid = False
+        client_rejected_provider: str | None = None
         try:
             refresh_options = {"flush_changes": False} if shared_google_account else {}
             is_valid = await refresh_oauth_token_if_needed(
@@ -4320,6 +4357,19 @@ class WebToolConfig(BaseToolConfig):
         except _OAuthRefreshPermanentlyInvalid:
             is_valid = False
             permanently_invalid = True
+        except _OAuthRefreshClientRejected as rejected:
+            # Not this user's grant: kept, like a transient failure.
+            is_valid = False
+            client_rejected_provider = rejected.provider
+
+        if client_rejected_provider is not None:
+            oauth_db.rollback()
+            return _LegacyOAuthTokenResolution(
+                access_token=None,
+                refresh_failed=True,
+                credential_present=True,
+                client_rejected_provider=client_rejected_provider,
+            )
 
         if not is_valid and not permanently_invalid:
             # A transient failure (network error, timeout, provider outage)
@@ -5114,7 +5164,12 @@ class WebToolConfig(BaseToolConfig):
                 if legacy_token.refresh_failed:
                     return self._build_unavailable_mcp_config(
                         server=server,
-                        reason="oauth_token_refresh_failed",
+                        reason=(
+                            f"{CLIENT_REJECTED_REASON}:"
+                            f"{legacy_token.client_rejected_provider}"
+                            if legacy_token.client_rejected_provider
+                            else "oauth_token_refresh_failed"
+                        ),
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
                     )

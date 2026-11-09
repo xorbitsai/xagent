@@ -1648,6 +1648,48 @@ async def test_actor_slack_refresh_failure_never_uses_fallback(
 
 
 @pytest.mark.asyncio
+async def test_a_rejected_client_is_reported_as_client_rejected_and_keeps_the_grant(
+    db_session, monkeypatch
+) -> None:
+    """#3580: the vendor rejected the platform's client, not this grant."""
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    account = UserOAuth(
+        user_id=int(db_session.user.id),
+        provider="slack",
+        resource_owner_key=OWNER_A,
+        access_token="expired-actor-token",
+        refresh_token="refresh-token",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="slack-user",
+    )
+    db_session.db.add(account)
+    db_session.db.commit()
+
+    async def client_rejected(_db, _account, _provider):
+        raise web_tools_config._OAuthRefreshClientRejected("slack")
+
+    monkeypatch.setattr(
+        web_tools_config, "refresh_oauth_token_if_needed", client_rejected
+    )
+    set_slack_actor_runtime_grant_resolver(lambda _request: None)
+
+    configs = await _config(
+        db_session,
+        policy=_policy(),
+        execution_identity=_execution_identity(),
+    ).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "client_rejected:slack"
+    db_session.db.expire_all()
+    kept = db_session.db.get(UserOAuth, account.id)
+    assert (kept.access_token, kept.refresh_token) == (
+        "expired-actor-token",
+        "refresh-token",
+    )
+
+
+@pytest.mark.asyncio
 async def test_team_visible_canonical_builtin_uses_exact_actor_credential(
     db_session,
 ) -> None:

@@ -813,6 +813,9 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
             refresh_token=refresh_token,
             resource=refresh_resource,
             client=client,
+            classify_client_rejection=bool(
+                _runtime_config_value(None, auth_config, "client_id")
+            ),
         )
 
         with refresh_db.begin():
@@ -1344,7 +1347,15 @@ async def _refresh_mcp_oauth_grant(
     refresh_token: str,
     resource: str,
     client: httpx.AsyncClient | None = None,
+    classify_client_rejection: bool = False,
 ) -> dict[str, Any]:
+    """Refresh one grant.
+
+    ``classify_client_rejection`` is set for a pre-registered (platform-held)
+    client: a refresh the vendor rejects for that client then raises
+    ``client_rejected`` (#3580), since it affects every user of the server. A
+    per-user registered client keeps ``token_refresh_failed``.
+    """
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -1409,6 +1420,24 @@ async def _refresh_mcp_oauth_grant(
             "MCP OAuth refresh failed with token endpoint payload: %s",
             oauth_error_log_payload(payload),
         )
+        from ..oauth_client_verification import is_client_rejected
+
+        if classify_client_rejection and is_client_rejected(
+            "mcp", response.status_code, payload
+        ):
+            provider = urlsplit(str(oauth_client.token_endpoint)).hostname or "mcp"
+            logger.error(
+                "OAuth client rejected (provider=%s classification=client_rejected)",
+                provider,
+                extra={
+                    "oauth_provider": provider,
+                    "oauth_classification": "client_rejected",
+                },
+            )
+            raise MCPOAuthRuntimeError(
+                "client_rejected",
+                "The OAuth provider rejected the platform's client",
+            )
         raise MCPOAuthRuntimeError(
             "token_refresh_failed",
             oauth_error_message(payload, "MCP OAuth refresh failed"),

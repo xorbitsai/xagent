@@ -662,11 +662,15 @@ async def test_mcp_oauth_runtime_refreshes_discovered_grant_without_resource_sel
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
 
-    async def fake_refresh_grant(oauth_client, *, refresh_token, resource, client):
+    async def fake_refresh_grant(
+        oauth_client, *, refresh_token, resource, client, classify_client_rejection
+    ):
         assert oauth_client.client_id == "client-123"
         assert refresh_token == "refresh-token-123"
         assert resource == "https://mcp.example.com/mcp"
         assert client is None
+        # No configured client_id: a per-user registered client (#3580).
+        assert classify_client_rejection is False
         return {
             "access_token": "fresh-access-token",
             "refresh_token": "fresh-refresh-token",
@@ -688,6 +692,39 @@ async def test_mcp_oauth_runtime_refreshes_discovered_grant_without_resource_sel
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "fresh-access-token"
     assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_a_preregistered_client_rejected_on_refresh_is_client_rejected(
+    db_session, monkeypatch
+):
+    """#3580: a configured client_id is platform-held, so its rejection is
+    reported as client_rejected and the grant is kept."""
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    async def rejected(oauth_client, *, classify_client_rejection, **_kwargs):
+        assert classify_client_rejection is True
+        raise mcp_oauth_service.MCPOAuthRuntimeError(
+            "client_rejected", "The OAuth provider rejected the platform's client"
+        )
+
+    monkeypatch.setattr(mcp_oauth_service, "_refresh_mcp_oauth_grant", rejected)
+
+    configs, _ = await _load_configs(db, user)
+
+    assert configs[0]["config"]["reason"] == "client_rejected"
+    db.refresh(grant)
+    assert decrypt_value(grant.refresh_token) == "refresh-token-123"
 
 
 @pytest.mark.asyncio

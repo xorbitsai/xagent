@@ -867,6 +867,19 @@ def test_instagram_conversion_decodes_a_lossless_jpeg_without_drafting(monkeypat
         assert image.getpixel((160, 160)) == pytest.approx((0, 0, 254), abs=2)
 
 
+def test_instagram_converts_a_lossless_jpeg_that_otherwise_conforms(monkeypatch):
+    # Why: few decoders read a lossless JPEG, and Meta is not known to. One
+    # that meets every other condition would be sent as stored and fail only
+    # when Meta fetches it, so it is converted to a baseline JPEG first. A
+    # minimum width of 100 makes the 160x160 fixture otherwise conforming.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MIN_WIDTH", 100)
+    source = LOSSLESS_JPEG.read_bytes()
+
+    assert external_media.instagram_image_requires_normalization(BytesIO(source))
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source))
+    assert external_media._jpeg_markers(BytesIO(converted))[0] == 0xC0
+
+
 def test_issue_instagram_reads_jpeg_markers_only_over_the_png_pixel_limit(
     monkeypatch, tmp_path
 ):

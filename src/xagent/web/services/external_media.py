@@ -646,7 +646,12 @@ def instagram_image_requires_normalization(source: BytesIO) -> bool:
                 or not INSTAGRAM_MIN_WIDTH <= image.width <= INSTAGRAM_MAX_WIDTH
                 or not INSTAGRAM_MIN_ASPECT_RATIO <= ratio <= INSTAGRAM_MAX_ASPECT_RATIO
             )
-            if requires_normalization:
+            # Few decoders read a lossless JPEG, and Meta is not known to, so
+            # one is converted rather than sent as stored.
+            if (
+                requires_normalization
+                or _jpeg_markers(image.fp)[0] in _JPEG_LOSSLESS_FRAME_MARKERS
+            ):
                 return True
             image.load()
             return False

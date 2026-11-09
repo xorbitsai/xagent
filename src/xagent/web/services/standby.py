@@ -6,16 +6,13 @@ pools, skill and template catalogs), but it must not write the database, claim
 commands, recover leases or run any singleton loop while the old process still
 serves. ``XAGENT_STANDBY`` selects the mode; unset keeps today's behavior.
 
-Two pieces live here and nowhere else, so every host asks the same questions:
-
-- :func:`standby_requested` -- was this process asked to start in standby?
-- :data:`standby` -- the controller. Startup code registers each *deferred*
-  step (a write, a claim path, a singleton) with :meth:`StandbyController.defer`
-  instead of running it; :meth:`StandbyController.activate` runs them in
-  registration order, so activation reproduces the order of a normal start.
-
-The module imports only ``config`` (itself a leaf) because ``release_hold``
-imports it at import time.
+The controller lives here and nowhere else, so every host asks the same
+question: :data:`standby` is the ledger. Startup code registers each *deferred*
+step (a write, a claim path, a singleton) with :meth:`StandbyController.defer`
+instead of running it; :meth:`StandbyController.activate` runs them in
+registration order, so activation reproduces the order of a normal start.
+Whether a process was asked to start in standby is
+``config.get_standby_enabled()``.
 """
 
 from __future__ import annotations
@@ -26,14 +23,7 @@ import time
 from collections.abc import Awaitable, Callable
 from enum import Enum
 
-from ...config import get_standby_enabled
-
 logger = logging.getLogger(__name__)
-
-
-def standby_requested() -> bool:
-    """True when ``XAGENT_STANDBY`` asks for standby; a bad value is a startup error."""
-    return get_standby_enabled()
 
 
 class StandbyPhase(str, Enum):
@@ -134,6 +124,11 @@ class StandbyController:
             hooks = self._failure_hooks
             try:
                 for name, step in steps:
+                    if self._phase is not StandbyPhase.ACTIVATING:
+                        # A shutdown reset the ledger: stop before the next step
+                        # reopens or starts anything its teardown already ran past.
+                        logger.info("Standby activation stopped before %s", name)
+                        return
                     logger.info("Standby activation: %s", name)
                     await step()
             except BaseException:

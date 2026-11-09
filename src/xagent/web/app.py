@@ -138,7 +138,7 @@ from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
 )
-from .services.standby import standby, standby_requested
+from .services.standby import standby
 from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
@@ -2503,6 +2503,36 @@ async def _stop_runtime_loops() -> None:
                 await task
 
 
+async def _stop_chat_channels() -> None:
+    """Cancel the chat channel tasks and stop each channel; shared by shutdown and abort."""
+    try:
+        channel_tasks = [
+            task
+            for name in ("telegram_task", "feishu_task", "slack_task")
+            if (task := getattr(app.state, name, None)) is not None
+        ]
+        for task in channel_tasks:
+            task.cancel()
+        await asyncio.gather(*channel_tasks, return_exceptions=True)
+
+        from .channels.feishu.bot import get_feishu_channel
+        from .channels.slack.bot import get_slack_channel
+        from .channels.telegram.bot import get_telegram_channel
+
+        telegram_channel = get_telegram_channel()
+        if telegram_channel.enabled:
+            await telegram_channel.stop()
+            logger.info("Telegram channel stopped successfully")
+
+        feishu_channel = get_feishu_channel()
+        await feishu_channel.stop()
+
+        slack_channel = get_slack_channel()
+        await slack_channel.stop()
+    except Exception as e:
+        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+
+
 async def _abort_standby_activation() -> None:
     """A failed activation must not leave an open hold or running claim paths.
 
@@ -2512,14 +2542,14 @@ async def _abort_standby_activation() -> None:
     """
     release_hold.seal("standby activation failed")
     await _stop_runtime_loops()
-    channel_tasks = [
-        task
-        for name in ("telegram_task", "feishu_task", "slack_task")
-        if (task := getattr(app.state, name, None)) is not None
-    ]
-    for task in channel_tasks:
-        task.cancel()
-    await asyncio.gather(*channel_tasks, return_exceptions=True)
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
+    cleanup_task = getattr(app.state, "temp_file_cleanup_task", None)
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+    await _stop_chat_channels()
     if get_shared_task_execution_enabled():
         from .api.websocket import manager
         from .services.task_event_bridge import stop_task_event_bridge
@@ -2536,9 +2566,13 @@ async def _abort_standby_activation() -> None:
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
-    from ..config import get_task_execution_role, validate_task_execution_host_config
+    from ..config import (
+        get_standby_enabled,
+        get_task_execution_role,
+        validate_task_execution_host_config,
+    )
 
-    if standby_requested():
+    if get_standby_enabled():
         standby.begin()
         standby.on_failure(_abort_standby_activation)
         release_hold.seal("standby")
@@ -2693,32 +2727,7 @@ async def shutdown_event() -> None:
     await _stop_runtime_loops()
 
     # Shutdown chat channels before draining task finalizers.
-    try:
-        channel_tasks = [
-            task
-            for name in ("telegram_task", "feishu_task", "slack_task")
-            if (task := getattr(app.state, name, None)) is not None
-        ]
-        for task in channel_tasks:
-            task.cancel()
-        await asyncio.gather(*channel_tasks, return_exceptions=True)
-
-        from .channels.feishu.bot import get_feishu_channel
-        from .channels.slack.bot import get_slack_channel
-        from .channels.telegram.bot import get_telegram_channel
-
-        telegram_channel = get_telegram_channel()
-        if telegram_channel.enabled:
-            await telegram_channel.stop()
-            logger.info("Telegram channel stopped successfully")
-
-        feishu_channel = get_feishu_channel()
-        await feishu_channel.stop()
-
-        slack_channel = get_slack_channel()
-        await slack_channel.stop()
-    except Exception as e:
-        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+    await _stop_chat_channels()
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

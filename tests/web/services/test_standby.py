@@ -282,6 +282,15 @@ def test_enum_drift_tolerates_missing_labels_only_for_standby(
 
 
 @pytest.mark.asyncio
+async def test_core_worker_refuses_standby(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xagent.web.worker import run_worker
+
+    monkeypatch.setenv(STANDBY_ENV, "1")
+    with pytest.raises(ValueError, match="XAGENT_STANDBY is not supported"):
+        await run_worker()
+
+
+@pytest.mark.asyncio
 async def test_failure_hooks_run_after_a_step_fails_late() -> None:
     controller = StandbyController()
     events: list[str] = []
@@ -305,7 +314,7 @@ async def test_failure_hooks_run_after_a_step_fails_late() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reset_during_activation_is_not_overwritten_by_it() -> None:
+async def test_reset_during_activation_stops_before_the_next_step() -> None:
     controller = StandbyController()
     reached = asyncio.Event()
     proceed = asyncio.Event()
@@ -327,6 +336,6 @@ async def test_reset_during_activation_is_not_overwritten_by_it() -> None:
     controller.reset()
     proceed.set()
     await task
-    # The steps already snapshotted still finish, but the reset owns the phase.
-    assert ran == ["first", "second"]
+    # The step in flight finishes; none starts after the reset, which owns the phase.
+    assert ran == ["first"]
     assert controller.phase is StandbyPhase.NORMAL

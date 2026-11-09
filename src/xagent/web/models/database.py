@@ -388,7 +388,7 @@ def complete_standby_db_init() -> None:
     """Run the deferred half of :func:`init_db` on the standby's bound engine.
 
     Strict from here on: the migration has run, so the schema must now be this
-    release's. Reuses the engine standby already bound instead of replacing it.
+    release's. Rebinds the same URL writable and disposes the read-only engine.
     """
     from ..services.encryption_key_rotation import validate_stored_encryption_keys
 

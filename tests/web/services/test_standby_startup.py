@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -18,9 +19,11 @@ from unittest.mock import AsyncMock
 import pytest
 import sqlalchemy as sa
 
+from tests.integration.test_auto_migration_startup import (  # noqa: F401
+    unregister_startup_task_extensions,
+)
 from tests.integration.test_auto_migration_startup import (
     _patch_channel_modules_disabled,
-    unregister_startup_task_extensions,  # noqa: F401
 )
 from xagent.config import STANDBY as STANDBY_ENV
 from xagent.web.models import database as database_module
@@ -201,9 +204,6 @@ async def test_late_activation_failure_reseals_and_stops_started_loops(
 
     monkeypatch.setattr(app_module, "_stop_runtime_loops", stop_loops)
 
-    async def boom() -> None:
-        raise RuntimeError("memory admission failed")
-
     monkeypatch.setattr(
         "xagent.web.dynamic_memory_store.admit_memory_storage_at_startup",
         lambda: (_ for _ in ()).throw(RuntimeError("memory admission failed")),
@@ -304,6 +304,10 @@ async def test_abort_stops_channels_and_the_shared_event_bridge(
     channel = asyncio.create_task(asyncio.sleep(60))
     monkeypatch.setattr(app_module.app.state, "slack_task", channel, raising=False)
     monkeypatch.setattr(app_module, "_stop_runtime_loops", AsyncMock())
+    cleanup_stop = threading.Event()
+    monkeypatch.setattr(
+        app_module.app.state, "temp_file_cleanup_stop", cleanup_stop, raising=False
+    )
     monkeypatch.setattr(app_module, "get_shared_task_execution_enabled", lambda: True)
     reconciliation = AsyncMock()
     bridge = AsyncMock()
@@ -317,6 +321,7 @@ async def test_abort_stops_channels_and_the_shared_event_bridge(
     await app_module._abort_standby_activation()
 
     assert channel.cancelled()
+    assert cleanup_stop.is_set()
     reconciliation.assert_awaited_once()
     bridge.assert_awaited_once()
     assert release_hold.sealed

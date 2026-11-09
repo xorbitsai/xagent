@@ -3597,7 +3597,12 @@ def start_builtin_oauth_for_resource_owner(
         from urllib.parse import parse_qs, urlsplit
 
         state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
-        callback_url = composio_auth.shared_callback_url(db, provider, db_provider)
+        callback_url = composio_auth.shared_callback_url(
+            db,
+            db_provider
+            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+            else None,
+        )
         response = RedirectResponse(composio_auth.begin_location(callback_url, state))
         cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
     else:
@@ -3998,7 +4003,9 @@ def _generic_oauth_login(
         )
 
     client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
-    if not client_id:
+    # A Composio start keeps only this start's state: Composio's own app
+    # authorizes, so our client id is never sent (composio_auth).
+    if not client_id and auth_backend is None:
         return _oauth_provider_config_error(
             provider, [_oauth_env_name(provider, "CLIENT_ID")]
         )
@@ -4527,8 +4534,9 @@ def generic_oauth_callback(
     from .. import composio_auth
 
     if (
-        step := composio_auth.callback_step(provider, request.query_params)
-    ) is not None:
+        provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+        and (step := composio_auth.callback_step(request.query_params)) is not None
+    ):
         return composio_auth.handle_callback(step, request, db, db_provider)
     if (
         provider.lower() == "microsoft"
@@ -6511,6 +6519,17 @@ def start_oauth_authorization(
         {"authorization_url": path, "callback_origin": callback_origin},
         headers=private_headers,
     )
+
+
+@auth_router.get("/composio/callback")
+def composio_oauth_callback(request: Request, db: Session = Depends(get_db)) -> Any:
+    """Composio-backed connects' trips (#3645); needs no OAuthProvider row.
+
+    Registered before ``/{provider}/callback`` so it matches first.
+    """
+    from .. import composio_auth
+
+    return composio_auth.handle_dedicated_callback(request, db)
 
 
 @auth_router.get("/{provider}/callback")

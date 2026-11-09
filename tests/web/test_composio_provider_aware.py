@@ -425,3 +425,219 @@ def test_a_return_no_flow_claims_names_no_app(linear):
     assert "The connection service could not" in body
     assert "Facebook" not in body and "Linear" not in body
     assert composio.calls == []
+
+
+# --- The dedicated Composio callback (XAGENT_COMPOSIO_CALLBACK_URL) --------------
+
+DEDICATED_URL = "https://app.example.com/api/auth/composio/callback"
+DEDICATED_PATH = "/api/auth/composio/callback"
+
+
+class RoutedBrowser(Browser):
+    """A browser whose requests reach whichever callback route they name."""
+
+    def get(self, db: Session, url: str) -> Any:
+        parts = urlsplit(url)
+        if parts.path == CALLBACK_PATH:
+            return super().get(db, url)
+        assert parts.path == DEDICATED_PATH, parts.path
+        query = {name: values[0] for name, values in parse_qs(parts.query).items()}
+        request = SimpleNamespace(query_params=query, cookies=self.for_path(parts.path))
+        response = auth_api.composio_oauth_callback(request, db)
+        self.receive(response)
+        return response
+
+
+@pytest.fixture
+def dedicated(linear, monkeypatch):
+    monkeypatch.setenv("XAGENT_COMPOSIO_CALLBACK_URL", DEDICATED_URL)
+    return linear
+
+
+def _cookie_path(response: Any, prefix: str) -> str:
+    jar = SimpleCookie()
+    for header in response.headers.getlist("set-cookie"):
+        jar.load(header)
+    (path,) = [m["path"] for name, m in jar.items() if name.startswith(prefix)]
+    return path
+
+
+@pytest.mark.parametrize("app_id", ["facebook", "linear"])
+def test_with_the_setting_every_app_uses_the_dedicated_callback(dedicated, app_id):
+    db, user, composio = dedicated
+    browser = RoutedBrowser()
+    start = (_start if app_id == "facebook" else _start_linear)(db, user, browser)
+
+    assert start.headers["location"].startswith(f"{DEDICATED_URL}?state=")
+    assert _cookie_path(start, "xagent_actor_oauth") == DEDICATED_PATH
+
+    begin = browser.get(db, start.headers["location"])
+    assert begin.status_code == 302, begin.body
+    (link,) = [body for _, path, body in composio.calls if path.endswith("/link")]
+    assert link["callback_url"] == DEDICATED_URL
+    assert _cookie_path(begin, composio_auth.FLOW_COOKIE_PREFIX) == DEDICATED_PATH
+
+    verify = browser.get(
+        db, f"{DEDICATED_URL}?session_uri={_verify_url(composio).split('=', 1)[1]}"
+    )
+
+    assert verify.status_code == 200, verify.body
+    (grant,) = _grants(db)
+    assert grant.provider == app_id
+    assert _flow_cookies(browser) == []
+
+
+def test_with_the_setting_no_meta_provider_row_is_needed(dedicated):
+    db, user, composio = dedicated
+    db.query(OAuthProvider).filter(OAuthProvider.provider_name == "meta").delete()
+    db.commit()
+    browser = RoutedBrowser()
+    start = _start_linear(db, user, browser)
+    browser.get(db, start.headers["location"])
+
+    verify = browser.get(
+        db, f"{DEDICATED_URL}?session_uri={_verify_url(composio).split('=', 1)[1]}"
+    )
+
+    assert verify.status_code == 200, verify.body
+    assert [grant.provider for grant in _grants(db)] == ["linear"]
+
+
+def test_a_denied_return_on_the_dedicated_callback_ends_its_flow(dedicated):
+    db, user, composio = dedicated
+    browser = RoutedBrowser()
+    browser.get(db, _start_linear(db, user, browser).headers["location"])
+
+    response = browser.get(
+        db,
+        f"{DEDICATED_URL}?status=failed&error=access_denied"
+        f"&connected_account_id={composio.created[0]}",
+    )
+
+    assert response.status_code == 400
+    assert "Permission was not granted" in response.body.decode()
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert _flow_cookies(browser) == []
+
+
+@pytest.mark.parametrize(
+    "query", ["code=abc&state=xyz", "error=access_denied", ""], ids=str
+)
+def test_the_dedicated_callback_takes_only_composio_trips(dedicated, query, caplog):
+    db, _user, composio = dedicated
+    caplog.set_level(logging.WARNING)
+
+    response = RoutedBrowser().get(db, f"{DEDICATED_URL}?{query}")
+
+    assert response.status_code == 400
+    assert "reason=not_a_composio_trip" in caplog.text
+    assert composio.calls == []
+
+
+def test_the_dedicated_route_matches_before_the_provider_route(db_session):
+    """Without its own route, /composio/callback would be an unknown provider."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from xagent.web.models.database import get_db
+
+    db, _user = db_session
+    app = FastAPI()
+    app.include_router(auth_api.auth_router)
+    app.dependency_overrides[get_db] = lambda: db
+
+    response = TestClient(app).get(f"{DEDICATED_PATH}?code=abc&state=xyz")
+
+    assert response.status_code == 400
+    assert "Unsupported provider" not in response.text
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not a url",
+        "ftp://app.example.com/api/auth/composio/callback",
+        "https://app.example.com/api/auth/composio/callback?x=1",
+        "https://user:pass@app.example.com/api/auth/composio/callback",
+    ],
+    ids=["text", "ftp", "query", "credentials"],
+)
+def test_an_invalid_setting_refuses_the_start_and_the_trips(linear, monkeypatch, value):
+    db, user, composio = linear
+    monkeypatch.setenv("XAGENT_COMPOSIO_CALLBACK_URL", value)
+
+    start = _start_linear(db, user, Browser())
+
+    assert start.status_code == 503
+    assert "set-cookie" not in start.headers
+    assert db.query(ActorOAuthFlowState).count() == 0
+
+    trip = Browser().get(db, _verify_url(composio, "ca_any"))
+    assert trip.status_code == 503
+    assert composio.calls == []
+
+
+# --- Our own client id is not needed for a Composio start -------------------------
+
+
+def _linear_provider_without_client_id() -> SimpleNamespace:
+    row = _linear_provider()
+    row.client_id = ""
+    return row
+
+
+def test_a_composio_start_needs_no_client_id_of_ours(linear, monkeypatch):
+    db, user, composio = linear
+    monkeypatch.delenv("LINEAR_CLIENT_ID", raising=False)
+
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="linear",
+        app_id="linear",
+        user=user,
+        resource_owner_key=OWNER,
+        db=db,
+        db_provider=_linear_provider_without_client_id(),
+    )
+
+    assert response.status_code in (302, 307)
+    assert urlsplit(response.headers["location"]).path == CALLBACK_PATH
+
+
+def test_a_native_start_still_needs_our_client_id(linear, monkeypatch):
+    db, user, composio = linear
+    monkeypatch.delenv("LINEAR_CLIENT_ID", raising=False)
+    monkeypatch.setenv(LINEAR_APP.backend_env, "native")
+
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="linear",
+        app_id="linear",
+        user=user,
+        resource_owner_key=OWNER,
+        db=db,
+        db_provider=_linear_provider_without_client_id(),
+    )
+
+    assert response.status_code == 500
+    assert "LINEAR_CLIENT_ID" in response.body.decode()
+
+
+def test_another_providers_own_callback_is_never_a_composio_trip(linear):
+    """Only the Meta callback and the dedicated one take Composio trips."""
+    db, user, composio = linear
+    browser = Browser()
+    browser.get(db, _start_linear(db, user, browser).headers["location"])
+
+    response = auth_api.generic_oauth_callback(
+        "linear",
+        SimpleNamespace(
+            query_params={"session_uri": "https://backend.composio.dev/verify/x"},
+            cookies={},
+        ),
+        db,
+        _linear_provider(),
+    )
+
+    # The provider's own native handling answers, not the Composio flow.
+    assert response.status_code == 400
+    assert "Missing code or state" in response.body.decode()
+    assert not [path for _, path, _ in composio.calls if "complete_auth" in path]

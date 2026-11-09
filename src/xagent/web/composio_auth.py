@@ -8,11 +8,13 @@ for its new connects only; Meta Ads and WhatsApp share the ``meta`` provider
 and stay native. Each app reads its identity its own way; Composio's Instagram
 toolkit uses Instagram Login, so its identity comes from ``graph.instagram.com``.
 
-The browser makes three trips, all on one shared callback path
-(``CALLBACK_PROVIDER``'s, the Meta one) whatever the app's provider: Composio's
-OAuth user verification is a single URL per project, and the flow and actor
-proof cookies are scoped to the path they come back to. A state is still
-minted for, and only accepted under, its app's own provider:
+The browser makes three trips, all to one shared callback URL whatever the
+app's provider (``shared_callback_url``: ``XAGENT_COMPOSIO_CALLBACK_URL``, or
+the Meta callback URL while that is unset): Composio's OAuth user verification
+is a single URL per project, and the flow and actor proof cookies are scoped
+to the path they come back to. The dedicated ``/api/auth/composio/callback``
+route and the Meta callback both accept the trips. A state is still minted
+for, and only accepted under, its app's own provider:
 
 1. **Start** (server side, called by xagent-saas): the usual signed ``state``,
    single-use flow row and actor proof cookie, but ``Location`` points back to
@@ -100,6 +102,7 @@ COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
 # The verification trip carries no ``state``, so it cannot be routed that way
 # (tracked in xorbitsai/xagent-saas#2461); the start refuses while it is on.
 CONNECTOR_OAUTH_ROUTE_ENV = "XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED"
+COMPOSIO_CALLBACK_URL_ENV = "XAGENT_COMPOSIO_CALLBACK_URL"
 
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 GRAPH_ME_URL = "https://graph.facebook.com/v25.0/me"
@@ -111,11 +114,16 @@ INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v25.0/me"
 INSTAGRAM_APP_ID = "instagram"
 INSTAGRAM_TOOLKIT_SLUG = "instagram"
 META_PROVIDER = "meta"
-# Every Composio app's trips (begin, verification, denial) land on this one
-# provider's callback path, whatever the app's own provider: Composio's OAuth
-# user verification is a single URL per project, and the flow and actor proof
-# cookies are scoped to the path they come back to.
-CALLBACK_PROVIDER = META_PROVIDER
+# Every Composio app's trips (begin, verification, denial) land on one shared
+# callback URL, whatever the app's own provider: Composio's OAuth user
+# verification is a single URL per project, and the flow and actor proof
+# cookies are scoped to the path they come back to. XAGENT_COMPOSIO_CALLBACK_URL
+# sets it (normally to COMPOSIO_CALLBACK_PATH); unset, it is the Meta callback
+# URL, where these trips have always been accepted.
+COMPOSIO_CALLBACK_PATH = "/api/auth/composio/callback"
+DEFAULT_CALLBACK_PROVIDER = META_PROVIDER
+# Logged as the provider of a trip whose app is not known yet.
+UNKNOWN_APP_PROVIDER = "composio"
 
 
 class ComposioApp(NamedTuple):
@@ -347,6 +355,17 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
             ),
             status_code=503,
         )
+    try:
+        from ..config import get_composio_callback_url
+
+        get_composio_callback_url()
+    except ValueError:
+        logger.error(
+            "Composio %s connect refused: %s is not a valid callback URL",
+            label,
+            COMPOSIO_CALLBACK_URL_ENV,
+        )
+        return _unavailable_page(app_id)
     missing = _missing_config_names(app_id)
     if missing:
         logger.error(
@@ -358,23 +377,28 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
     return None
 
 
-def shared_callback_url(db: Session, provider: str, db_provider: Any) -> str:
-    """The shared callback URL, for a start under any app's provider.
+def shared_callback_url(db: Session, meta_row: Any = None) -> str:
+    """The callback URL every Composio trip returns to.
 
-    ``db_provider`` is the started provider's row; it is the shared path's own
-    row only when that provider is the callback provider.
+    ``XAGENT_COMPOSIO_CALLBACK_URL`` when set (``ValueError`` when invalid);
+    otherwise the Meta callback URL, read from ``meta_row`` when the caller
+    already holds the Meta provider row and from the database otherwise.
     """
+    from ..config import get_composio_callback_url
     from .api.auth import _resolve_oauth_redirect_uri
 
-    if provider.lower() != CALLBACK_PROVIDER:
+    configured = get_composio_callback_url()
+    if configured is not None:
+        return configured
+    if meta_row is None:
         from .models.oauth_provider import OAuthProvider
 
-        db_provider = (
+        meta_row = (
             db.query(OAuthProvider)
-            .filter(OAuthProvider.provider_name == CALLBACK_PROVIDER)
+            .filter(OAuthProvider.provider_name == DEFAULT_CALLBACK_PROVIDER)
             .first()
         )
-    return _resolve_oauth_redirect_uri(CALLBACK_PROVIDER, db_provider)
+    return _resolve_oauth_redirect_uri(DEFAULT_CALLBACK_PROVIDER, meta_row)
 
 
 def begin_location(redirect_uri: str, state: str) -> str:
@@ -383,16 +407,14 @@ def begin_location(redirect_uri: str, state: str) -> str:
     return f"{redirect_uri}{separator}{urlencode({'state': state})}"
 
 
-def callback_step(provider: str, query: Mapping[str, Any]) -> Step | None:
-    """Which Composio trip a request on the shared callback path is, if any.
+def callback_step(query: Mapping[str, Any]) -> Step | None:
+    """Which Composio trip a callback request is, if any.
 
-    Native callbacks on that path keep their own handling: a begin needs a
-    state that carries the Composio marker, and a denial is only taken while
-    an app connects through Composio. A ``session_uri`` is never part of a
-    native callback.
+    Asked on the dedicated Composio callback and on the Meta one, where native
+    callbacks keep their own handling: a begin needs a state that carries the
+    Composio marker, and a denial is only taken while an app connects through
+    Composio. A ``session_uri`` is never part of a native callback.
     """
-    if provider.lower() != CALLBACK_PROVIDER:
-        return None
 
     def has(name: str) -> bool:
         return query.get(name) is not None
@@ -994,7 +1016,7 @@ def _reject(reason: str) -> _Rejected:
 def _provider_of(app_id: str | None) -> str:
     """The app's own provider; the callback's while the app is unknown."""
     app = COMPOSIO_APPS.get(app_id) if isinstance(app_id, str) else None
-    return app.provider if app is not None else CALLBACK_PROVIDER
+    return app.provider if app is not None else UNKNOWN_APP_PROVIDER
 
 
 def _log_rejection(reason: str, app_id: str | None = None) -> None:
@@ -1083,10 +1105,10 @@ def _flow_row_query(db: Session, nonce: str) -> Any:
     )
 
 
-def _cookie_scope(db_provider: Any) -> tuple[bool, str]:
-    from .api.auth import _actor_oauth_cookie_scope
+def _cookie_scope(callback: str) -> tuple[bool, str]:
+    from .api.auth import _oauth_cookie_scope_for
 
-    return _actor_oauth_cookie_scope(CALLBACK_PROVIDER, db_provider)
+    return _oauth_cookie_scope_for(callback)
 
 
 def _flow_cookie_name(nonce: str) -> str:
@@ -1173,9 +1195,9 @@ def _open_flows(request: Any, db: Session) -> _BrowserFlows:
 
 
 def _clear_flow_cookies(
-    response: Response, db_provider: Any, names: Iterable[str]
+    response: Response, callback: str, names: Iterable[str]
 ) -> Response:
-    secure, path = _cookie_scope(db_provider)
+    secure, path = _cookie_scope(callback)
     for name in dict.fromkeys(names):
         response.delete_cookie(
             name, path=path, secure=secure, httponly=True, samesite="lax"
@@ -1184,13 +1206,30 @@ def _clear_flow_cookies(
 
 
 def handle_callback(
-    step: Step, request: Any, db: Session, db_provider: Any
+    step: Step, request: Any, db: Session, meta_row: Any = None
 ) -> Response:
+    """Handle one Composio trip; ``meta_row`` is the Meta provider row when the
+    trip arrived on the Meta callback."""
+    try:
+        callback = shared_callback_url(db, meta_row)
+    except ValueError:
+        logger.error("%s is not a valid callback URL", COMPOSIO_CALLBACK_URL_ENV)
+        _log_rejection("callback_url_invalid")
+        return _unavailable_page()
     if step == "begin":
-        return _handle_begin(request, db, db_provider)
+        return _handle_begin(request, db, callback)
     if step == "denied":
-        return _handle_denied(request, db, db_provider)
-    return _handle_verify(request, db, db_provider)
+        return _handle_denied(request, db, callback)
+    return _handle_verify(request, db, callback)
+
+
+def handle_dedicated_callback(request: Any, db: Session) -> Response:
+    """``/api/auth/composio/callback``: only Composio trips are accepted."""
+    step = callback_step(request.query_params)
+    if step is None:
+        _log_rejection("not_a_composio_trip")
+        return _reject("claims_invalid").response
+    return handle_callback(step, request, db)
 
 
 def _too_many_flows_page(app_id: str) -> HTMLResponse:
@@ -1205,7 +1244,7 @@ def _too_many_flows_page(app_id: str) -> HTMLResponse:
     )
 
 
-def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
+def _handle_begin(request: Any, db: Session, callback: str) -> Response:
     state = request.query_params.get("state")
     try:
         flow = _verified_flow(state, request, db)
@@ -1232,23 +1271,19 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     kept = [open_flow for open_flow in existing if open_flow.cookie_name not in stale]
     if len(kept) >= _MAX_OPEN_FLOWS:
         _log_rejection("too_many_open_flows", flow.app_id)
-        return _clear_flow_cookies(
-            _too_many_flows_page(flow.app_id), db_provider, stale
-        )
+        return _clear_flow_cookies(_too_many_flows_page(flow.app_id), callback, stale)
 
     config = load_config(flow.app_id)
     if config is None:
         _log_rejection("composio_not_configured", flow.app_id)
         return _unavailable_page(flow.app_id)
-    from .api.auth import _resolve_oauth_redirect_uri
-
     try:
         redirect_url, account_id = create_link(
             config,
             user_id=composio_user_id(
                 config, user_id=flow.user_id, owner_key=flow.owner_key
             ),
-            callback_url=_resolve_oauth_redirect_uri(CALLBACK_PROVIDER, db_provider),
+            callback_url=callback,
         )
     except ComposioError as exc:
         _log_rejection(exc.reason, flow.app_id)
@@ -1261,8 +1296,8 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     # Our URL carries the state; Composio's page must not receive it.
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
-    _clear_flow_cookies(response, db_provider, stale)
-    secure, path = _cookie_scope(db_provider)
+    _clear_flow_cookies(response, callback, stale)
+    secure, path = _cookie_scope(callback)
     response.set_cookie(
         _flow_cookie_name(flow.nonce),
         _encode_flow_cookie(flow.state, account_id),
@@ -1275,7 +1310,7 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     return response
 
 
-def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
+def _handle_denied(request: Any, db: Session, callback: str) -> Response:
     """Say what to do after Composio returns a denied or failed authorization.
 
     The returned id is trusted only to find the open flow whose encrypted
@@ -1308,7 +1343,7 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
             "project's OAuth user verification to this callback URL"
         )
         _log_rejection("verification_not_configured", log_app)
-        return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
+        return _clear_flow_cookies(_unavailable_page(*app_ids), callback, dead)
     provider = _provider_of(log_app)
     provider_error = _oauth_callback_provider_error(
         provider, query.get("error") or "access_denied", None
@@ -1323,7 +1358,7 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     )
     return _clear_flow_cookies(
         _actor_oauth_provider_error_response(provider, provider_error),
-        db_provider,
+        callback,
         dead,
     )
 
@@ -1340,7 +1375,7 @@ def _spend(db: Session, open_flow: _OpenFlow) -> bool:
     return True
 
 
-def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
+def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     query = request.query_params
     session_uri = query.get("session_uri")
     if (
@@ -1361,14 +1396,12 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         reasons = browser_flows.reasons
         reason = reasons[-1] if reasons else "cookie_missing"
         _log_rejection(reason)
-        return _clear_flow_cookies(_reject(reason).response, db_provider, dead)
+        return _clear_flow_cookies(_reject(reason).response, callback, dead)
     actors = {open_flow.actor for open_flow in open_flows}
     if len(actors) != 1:
         # begin keeps one actor per browser; anything else is not completed.
         _log_rejection("claims_invalid")
-        return _clear_flow_cookies(
-            _reject("claims_invalid").response, db_provider, dead
-        )
+        return _clear_flow_cookies(_reject("claims_invalid").response, callback, dead)
 
     # A browser can hold flows of several apps for the same actor at once
     # (Facebook and Instagram, say). They share the project's API key and the
@@ -1381,7 +1414,7 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
     configs = _configured_apps()
     if not configs:
         _log_rejection("composio_not_configured", log_app)
-        return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
+        return _clear_flow_cookies(_unavailable_page(*app_ids), callback, dead)
     shared = next(iter(configs.values()))
     user_id, owner_key = actors.pop()
     composio_user = composio_user_id(shared, user_id=user_id, owner_key=owner_key)
@@ -1394,12 +1427,12 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         if exc.rejected:
             # Nothing was activated, so every open flow stays usable.
             return _clear_flow_cookies(
-                _reject("composio_rejected").response, db_provider, dead
+                _reject("composio_rejected").response, callback, dead
             )
         # Composio may have activated an account before the answer was lost;
         # which one cannot be told here. Nothing is spent or deleted: an
         # account that ends up unbound is removed by the reconciler.
-        return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
+        return _clear_flow_cookies(_unavailable_page(*app_ids), callback, dead)
 
     matches = [
         open_flow for open_flow in open_flows if open_flow.account_id == account_id
@@ -1411,7 +1444,7 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         logger.warning("Composio completed a connection no open flow created")
         _log_rejection("account_invalid", log_app)
         return _clear_flow_cookies(
-            _reject("composio_rejected").response, db_provider, dead
+            _reject("composio_rejected").response, callback, dead
         )
     match = matches[0]
     app_id = match.flow.app_id
@@ -1421,7 +1454,7 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         # reconciler then removes the unbound account). Never delete here.
         _log_rejection("flow_used_or_expired", app_id)
         return _clear_flow_cookies(
-            _reject("flow_used_or_expired").response, db_provider, dead
+            _reject("flow_used_or_expired").response, callback, dead
         )
     # This request spent the flow that created the account, so the account is
     # its own: if it cannot be bound, it is deleted rather than left unbound.
@@ -1430,7 +1463,7 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
         # This app's config went away after its flow began.
         _log_rejection("composio_not_configured", app_id)
         delete_account(shared.api_key, account_id)
-        return _clear_flow_cookies(_unavailable_page(app_id), db_provider, dead)
+        return _clear_flow_cookies(_unavailable_page(app_id), callback, dead)
     try:
         verify_account(
             config,
@@ -1456,11 +1489,11 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             if exc.rejected
             else _unavailable_page(app_id)
         )
-        return _clear_flow_cookies(response, db_provider, dead)
+        return _clear_flow_cookies(response, callback, dead)
     except _Rejected as rejected:
         _log_rejection(rejected.reason, app_id)
         delete_account(config.api_key, account_id)
-        return _clear_flow_cookies(rejected.response, db_provider, dead)
+        return _clear_flow_cookies(rejected.response, callback, dead)
     except Exception as exc:
         db.rollback()
         logger.warning(
@@ -1478,10 +1511,10 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
                 ),
                 status_code=500,
             ),
-            db_provider,
+            callback,
             dead,
         )
-    return _clear_flow_cookies(stored, db_provider, dead)
+    return _clear_flow_cookies(stored, callback, dead)
 
 
 def _store_grant(

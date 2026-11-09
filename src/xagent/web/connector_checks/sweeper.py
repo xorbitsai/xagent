@@ -30,12 +30,12 @@ counted and never deleted. An item listed twice is swept once. One sweep
 deletes at most ``MAX_DELETES`` items of a connector
 (``cleanup_failed``/``cap_reached``), and leaves the rest for the next.
 After a failed delete, ``find`` lists the area once more: an item missing
-from a non-empty listing counts as deleted, as when another environment's
-sweeper took it first. A delete that still failed is
+from a listing that shows at least one id counts as deleted, as when another
+environment's sweeper took it first. A delete that still failed is
 ``cleanup_failed``/``delete:<detail>``.
 
-The pin, ``find`` and each delete start only when a call timeout of the
-sweep's total timeout is left; otherwise the connector is
+The pin, ``find``, each delete and the second listing start only when a
+call timeout of the sweep's total timeout is left; otherwise the connector is
 ``not_reached``/``time_budget``, what was due stays for the next sweep, and
 the sweep is not ``complete``.
 
@@ -601,8 +601,9 @@ async def _sweep_connector(
         else:
             failures.append((item, fault[1]))
 
-    if failures and deadline.remaining() >= timeout:
-        # A delete that failed because the item is already gone is done.
+    # A delete that failed because the item is already gone is done. With
+    # no time left to list again, the failures stand and the sweep is cut.
+    if failures and not out_of_time():
         again = await call_step(found[_FIND], steps[_FIND], timeout)
         raise_if_cancelled()
         listed_again = (
@@ -610,9 +611,14 @@ async def _sweep_connector(
             if step_fault(again, steps[_FIND], where, _FIND) is None
             else None
         )
-        # An empty listing proves nothing: search may lag behind a delete.
-        if isinstance(listed_again, list) and listed_again:
-            present = {_item_id(steps[_DELETE], item) for item in listed_again}
+        present = (
+            {_item_id(steps[_DELETE], item) for item in listed_again} - {None}
+            if isinstance(listed_again, list)
+            else set()
+        )
+        # A listing with no readable id proves nothing; nor does an empty
+        # one, since search may lag behind a delete.
+        if present:
             still = [
                 (item, detail)
                 for item, detail in failures

@@ -296,8 +296,8 @@ def test_sweep_prints_the_sweep_document(monkeypatch, capfd):
     jsonschema.validate(document, load_sweep_schema())
     assert document["schema"] == "xagent.connector_smoke.sweep"
     assert document["environment"] == "stage"
-    # No connector declares a sweep yet, so nothing starts.
-    assert document["rows"] == [] and document["complete"] is True
+    # Writes are off, so whatever the registry declares, nothing starts.
+    assert document["complete"] is True
     assert code == 0
     assert names == ["monitor"]
     assert adapter.opened == []

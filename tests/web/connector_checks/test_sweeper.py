@@ -645,6 +645,9 @@ async def test_an_item_listed_twice_is_swept_once() -> None:
         result({"status": "error"}, is_error=True),
         # The same item, its id now a number: still listed.
         result({"status": "success", "issues": [{"key": 1, "summary": "seeded"}]}),
+        result({"status": "success", "issues": [{"key": 1.0, "summary": "seeded"}]}),
+        # No item has an id at the ItemRef path.
+        result({"status": "success", "issues": [{"summary": "seeded"}]}),
     ],
 )
 async def test_a_second_listing_that_proves_nothing_leaves_the_delete_failed(
@@ -753,3 +756,68 @@ async def test_invalid_arguments_raise_before_any_connector(
 def test_the_user_identity_has_no_write_policy() -> None:
     # So the CLI's sweep refuses every switched-on connector it is given.
     assert not isinstance(UserIdentityAdapter(None, "monitor"), WritePolicy)
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_no_time_to_list_again_leaves_the_failures_and_cuts_the_sweep() -> None:
+    tenant = Tenant(leftover(OLD), leftover(OLD, "other"))
+    tools = tenant.tools(
+        jira_delete_issue=FakeTool(
+            "jira_delete_issue",
+            result=result({"status": "error"}, is_error=True),
+            delay=0.7,
+        )
+    )
+
+    # Two failing deletes of 0.7 s leave 0.6 s of 2 s: too little for 0.8.
+    result_ = await sweep(adapter(tools), call_timeout=0.8, total_timeout=2.0)
+
+    item = row(result_)
+    assert verdict(item) == ("fail", "cleanup_failed", "delete:tool_error")
+    assert counts(item) == (2, 0, 2, 0, 0)
+    assert len(tools["jira_search_issues"].calls) == 1
+    assert not result_.complete
+
+
+class _Blocking(FakeTool):
+    """Blocks until the sweep is cancelled; with ``swallow``, it then
+    returns success as if nothing happened."""
+
+    swallow: bool = False
+    started: asyncio.Event
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.started = asyncio.Event()
+
+    async def run_json_async(self, args: Any) -> Any:
+        self.calls.append(dict(args))
+        self.started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            if not self.swallow:
+                raise
+        return result({"status": "success"})
+
+
+@pytest.mark.usefixtures("writes_on")
+@pytest.mark.parametrize("swallow", [False, True])
+async def test_cancelling_the_sweep_stops_it_at_the_delete_in_flight(
+    swallow: bool,
+) -> None:
+    tenant = Tenant(leftover(OLD), leftover(OLD, "other"))
+    blocking = _Blocking("jira_delete_issue")
+    blocking.swallow = swallow
+    tools = tenant.tools(jira_delete_issue=blocking)
+    task = asyncio.create_task(
+        sweep(adapter(tools), call_timeout=30.0, total_timeout=600.0)
+    )
+
+    await asyncio.wait_for(blocking.started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Even a tool that swallowed the cancellation gets no second delete.
+    assert blocking.calls == [{"issue_key": "SMOKE-1"}]

@@ -21,7 +21,8 @@ switched-on connector: it shows the wiring, while a runner whose identity
 governs writes (Xagent SaaS's Toby module) calls ``run_sweep`` itself.
 
 Stdout carries exactly one JSON document, the run result
-(``result.schema.json``), and logs go to stderr. During the run, file
+(``result.schema.json``), or with ``--sweep`` the sweep document
+(``sweep.schema.json``), and logs go to stderr. During the run, file
 descriptor 1 and ``sys.stdout`` point at stderr, so nothing a connector, a
 tool, a library or a child process writes can reach the document's stream.
 A run that cannot be set up still prints its document, with a ``failure``:
@@ -155,7 +156,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m xagent.web.connector_checks",
         description="Run the smoke V2 checks of a local user's connected catalog "
-        "connectors and print the run result as one JSON document.",
+        "connectors and print the run result as one JSON document, or with "
+        "--sweep sweep their write areas and print the sweep document.",
         allow_abbrev=False,
     )
     parser.add_argument(

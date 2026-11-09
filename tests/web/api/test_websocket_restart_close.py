@@ -425,22 +425,60 @@ async def test_end_restart_drain_during_the_wait_sends_no_further_1012(manager):
 
 
 @pytest.mark.asyncio
-async def test_end_restart_drain_cancels_scheduled_closes(manager, monkeypatch):
+async def test_end_restart_drain_lets_a_started_close_finish(manager, monkeypatch):
     monkeypatch.setattr(ws_module, "RESTART_CLOSE_TIMEOUT_SECONDS", 0.1)
     await manager.close_for_restart()
     late = FakeSocket(hang_close=True)
     manager.register_connection(late, 1)
     await asyncio.sleep(0.02)  # the scheduled close is now inside close()
     manager.end_restart_drain()
-    await asyncio.sleep(0.3)  # past its timeout: an uncancelled close drops it
+    await asyncio.sleep(0.3)  # past its timeout: the started close unregisters
 
     assert manager._restart_closes == set()
-    assert manager.connection_count() == 1
+    assert manager.connection_count() == 0
 
     fresh = FakeSocket()
     manager.register_connection(fresh, 1)
     await asyncio.sleep(0.05)
     assert fresh.closed == []
+    assert manager.connection_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_end_restart_drain_stops_a_scheduled_close_that_has_not_started(
+    manager,
+):
+    await manager.close_for_restart()
+    late = FakeSocket()
+    manager.register_connection(late, 1)  # schedules the close, not yet run
+    manager.end_restart_drain()
+    await asyncio.sleep(0.05)
+
+    assert late.closed == []
+    assert manager._restart_closes == set()
+    assert manager.connection_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_between_the_generation_check_and_close_sends_no_1012(
+    manager, monkeypatch
+):
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+    real_wait_for = asyncio.wait_for
+
+    async def abort_in_the_gap(awaitable, timeout):
+        # ``wait_for`` has not started the close yet: the abort lands exactly
+        # between the generation check and the transport ``close()``.
+        manager.end_restart_drain()
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(ws_module.asyncio, "wait_for", abort_in_the_gap)
+
+    await manager.close_for_restart()
+
+    assert ws.closed == []
+    assert manager.connection_count() == 1
 
 
 @pytest.mark.asyncio

@@ -1610,14 +1610,13 @@ class ConnectionManager:
     def end_restart_drain(self) -> None:
         """Stop closing: the release was aborted.
 
-        New registrations are kept again, and closes already scheduled or
-        waiting inside ``close_for_restart`` send no further 1012.
+        New registrations are kept again, and closes that have not yet called
+        ``close()``, scheduled or waiting inside ``close_for_restart``, send
+        no 1012: each re-checks the generation at that moment. A close that
+        already started finishes and unregisters its socket.
         """
         self._restart_draining = False
         self._restart_drain_generation += 1
-        for task in list(self._restart_closes):
-            task.cancel()
-        self._restart_closes.clear()
 
     async def close_for_restart(
         self,
@@ -1707,20 +1706,31 @@ class ConnectionManager:
     ) -> None:
         if self._restart_drain_generation != generation:
             return
-        try:
-            await asyncio.wait_for(
-                websocket.close(
-                    code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
-                ),
-                timeout=timeout,
+        started = False
+
+        async def start_close() -> None:
+            # ``wait_for`` runs this in its own task, so an abort can land
+            # between the check above and here. Checking at the moment
+            # ``close()`` is invoked leaves no gap: after this point the 1012
+            # is going out and the close is allowed to finish.
+            nonlocal started
+            if self._restart_drain_generation != generation:
+                return
+            started = True
+            await websocket.close(
+                code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
             )
+
+        try:
+            await asyncio.wait_for(start_close(), timeout=timeout)
         except asyncio.CancelledError:
-            # The drain was aborted mid-close: the socket stays registered.
+            # The caller was cancelled mid-close: the socket stays registered.
             raise
         except Exception:
             # Already closed, or the peer is gone; either way it is leaving.
             pass
-        self.disconnect(websocket)
+        if started:
+            self.disconnect(websocket)
 
     def was_closed_by_server(self, websocket: Any, exc: BaseException) -> bool:
         """Whether ``exc`` is just the receive that follows our own close.

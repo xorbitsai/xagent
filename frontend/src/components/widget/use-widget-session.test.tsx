@@ -843,6 +843,71 @@ describe("useWidgetSession capabilities", () => {
   })
 })
 
+describe("useWidgetSession capability parsing is per capability", () => {
+  const uploads = {
+    allowed_extensions: [".pdf"],
+    max_file_bytes: 4096,
+    max_files_per_message: 3,
+  }
+  const parsedUploads = {
+    allowedExtensions: [".pdf"],
+    maxFileBytes: 4096,
+    maxFilesPerMessage: 3,
+  }
+  const brokenUploads = { ...uploads, max_file_bytes: 0 }
+
+  const capabilitiesFor = (capabilities: unknown) => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ capabilities }))
+    expect(result.current.status).toBe("active")
+    return result.current.session?.capabilities
+  }
+
+  it.each([
+    ["both capabilities", { file_uploads: uploads, conversation_history: {} },
+      { fileUploads: parsedUploads, conversationHistory: true }],
+    ["only conversation history", { conversation_history: {} },
+      { conversationHistory: true }],
+    ["only file uploads", { file_uploads: uploads },
+      { fileUploads: parsedUploads }],
+    ["broken file uploads next to conversation history",
+      { file_uploads: brokenUploads, conversation_history: {} },
+      { conversationHistory: true }],
+    ["file uploads that are not an object next to conversation history",
+      { file_uploads: "yes", conversation_history: {} },
+      { conversationHistory: true }],
+    ["conversation history that is not an object next to valid file uploads",
+      { file_uploads: uploads, conversation_history: true },
+      { fileUploads: parsedUploads }],
+    ["conversation history that is an array next to valid file uploads",
+      { file_uploads: uploads, conversation_history: [] },
+      { fileUploads: parsedUploads }],
+    ["conversation history that is null next to valid file uploads",
+      { file_uploads: uploads, conversation_history: null },
+      { fileUploads: parsedUploads }],
+    ["conversation history that is a string next to valid file uploads",
+      { file_uploads: uploads, conversation_history: "x" },
+      { fileUploads: parsedUploads }],
+    ["conversation history with extra members",
+      { conversation_history: { later: 1 } },
+      { conversationHistory: true }],
+  ])("reads %s", (_label, capabilities, expected) => {
+    expect(capabilitiesFor(capabilities)).toStrictEqual(expected)
+  })
+
+  it.each([
+    ["neither capability present", { voice: {} }],
+    ["broken file uploads alone", { file_uploads: brokenUploads }],
+    ["conversation history that is not an object alone", { conversation_history: true }],
+    ["both capabilities broken", { file_uploads: brokenUploads, conversation_history: null }],
+    ["capabilities that are not an object", "conversation_history"],
+    ["capabilities that are an array", [{ conversation_history: {} }]],
+    ["capabilities that are null", null],
+  ])("reads %s as no capabilities", (_label, capabilities) => {
+    expect(capabilitiesFor(capabilities)).toBeUndefined()
+  })
+})
+
 describe("useWidgetSession upload coordination", () => {
   // Hooks rendered by earlier tests stay mounted and would answer the parent
   // messages dispatched here, so unmount them before and after each test.

@@ -4532,7 +4532,10 @@ async def execute_resume_background(
             if is_database_pool_timeout(read_error):
                 raise
             # A format that cannot be read is treated as no format: the run
-            # carries on and gets no structured result.
+            # carries on and stores no structured result. While the task has
+            # a format, GET and SSE then report this run as ``incomplete`` /
+            # ``not_produced``, the same as any run without a record; the
+            # cause is only in this WARNING.
             logger.warning(
                 "task_id=%s run_id=%s could not read the stored response_format "
                 "(%s); continuing without one",

@@ -81,7 +81,7 @@ class StandbyController:
 
     @property
     def activated_at(self) -> float | None:
-        """Wall-clock time (``time.time()``) activation finished, if it did."""
+        """Wall-clock time (``time.time()``) activation began; ``None`` before it."""
         return self._activated_at
 
     def begin(self) -> None:
@@ -122,16 +122,20 @@ class StandbyController:
                     f"cannot activate while the phase is {self._phase.value}"
                 )
             self._phase = StandbyPhase.ACTIVATING
+            # Taken before the first step: singletons started by a step
+            # (schedule cutoffs, "process started at" bounds) must see the
+            # activation instant, never the earlier import time.
+            self._activated_at = time.time()
             try:
                 for name, step in self._steps:
                     logger.info("Standby activation: %s", name)
                     await step()
             except BaseException:
+                self._activated_at = None
                 self._phase = StandbyPhase.FAILED
                 logger.exception("Standby activation failed; staying closed")
                 raise
             self._steps.clear()
-            self._activated_at = time.time()
             self._phase = StandbyPhase.ACTIVE
             logger.info("Standby activation complete")
 

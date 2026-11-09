@@ -72,10 +72,12 @@ def test_hold_is_closed_and_sealed_from_import_in_standby(
 async def test_controller_runs_deferred_steps_in_order_once() -> None:
     controller = StandbyController()
     ran: list[str] = []
+    seen_at: list[float | None] = []
 
     def step(name: str):
         async def run() -> None:
             ran.append(name)
+            seen_at.append(controller.activated_at)
 
         return run
 
@@ -88,6 +90,8 @@ async def test_controller_runs_deferred_steps_in_order_once() -> None:
     assert ran == ["a", "b"]
     assert controller.phase is StandbyPhase.ACTIVE and not controller.standby
     assert controller.activated_at is not None
+    # Steps already see the activation instant (singletons key cutoffs on it).
+    assert all(value == controller.activated_at for value in seen_at)
 
 
 @pytest.mark.asyncio

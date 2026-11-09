@@ -24,6 +24,7 @@ from .....web.tools.config import WebToolConfig
 from ....agent.checkpoint import ExecutionEventPersistenceError
 from ....agent.result import NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER
 from ....agent.voice_policy import apply_output_voice
+from ....guardrails.output import bind_output_review_agent
 from ....task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
@@ -1753,7 +1754,8 @@ def _child_never_answered(result: dict[str, Any]) -> bool:
     if result.get("empty_final_answer") is True:
         return True
     # ``AgentExecutionAdapter._normalize_result`` keeps the pattern's own result
-    # under ``agent_result``; the marker only survives there once normalized.
+    # under ``agent_result`` and lifts this marker to the top level; a raw
+    # pattern result carries it at the top level too.
     agent_result = result.get("agent_result")
     return isinstance(agent_result, dict) and (
         agent_result.get("empty_final_answer") is True
@@ -2737,7 +2739,11 @@ class AgentTool(AbstractBaseTool):
                     if self._execution_scope is not None
                     else nullcontext()
                 )
-                with UserContext(self._user_id), scope_context:
+                with (
+                    UserContext(self._user_id),
+                    scope_context,
+                    bind_output_review_agent(self._agent_id),
+                ):
                     result = await agent_service.execute_task(
                         task=args["task"],
                         context=execution_context if execution_context else None,

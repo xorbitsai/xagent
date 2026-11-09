@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -511,12 +511,7 @@ async def test_the_shared_channel_leaf_settles_through_the_witness_driver(
         calls.append(kwargs)
         return True
 
-    monkeypatch.setattr(managed, "finalize_managed_task_lease_result_sync", witnessed)
-    run_db_io = AsyncMock(return_value=True)
-    await drive_channel_background(Mock(), "normal", monkeypatch, run_db_io=run_db_io)
-    # The leaf's last off-loop call is its settlement.
-    finalize = run_db_io.await_args_list[-1].args[0]
-    assert finalize()
+    await drive_channel_background(Mock(), "normal", monkeypatch, finalize=witnessed)
     (kwargs,) = calls
     assert kwargs["completion"] == (1, {})
     assert kwargs["settle_interruption"] is True

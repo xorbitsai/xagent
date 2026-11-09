@@ -34,6 +34,7 @@ from .context.execution import (
 )
 from .context.memory_retrieval import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
 from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
+from .structured_output import StructuredOutputFormat, _attach_structured_output
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 
@@ -297,6 +298,8 @@ class AgentService:
         task: str,
         context: dict[str, Any] | None = None,
         task_id: str | None = None,
+        *,
+        structured_output_format: StructuredOutputFormat | None = None,
     ) -> dict[str, Any]:
         has_files = bool(
             context and (context.get("uploaded_files") or context.get("file_info"))
@@ -306,9 +309,19 @@ class AgentService:
                 raise ValueError("Task cannot be empty or whitespace-only")
         await self._ensure_tools_initialized()
         result = await self._execute_agent_task(task, context, task_id)
+        # Hosts control publication of these workspace files separately from
+        # text output review.
         file_outputs = self.get_output_files()
         if file_outputs:
             result["file_outputs"] = file_outputs
+        await _attach_structured_output(
+            result,
+            structured_output_format,
+            llm=self.llm,
+            task_id=task_id or self._current_task_id,
+            run_id=(context or {}).get("run_id"),
+            tracer=self.tracer,
+        )
         return result
 
     async def pause_execution(self) -> bool:
@@ -399,6 +412,8 @@ class AgentService:
     async def resume_execution_by_id(
         self,
         execution_id: str,
+        *,
+        structured_output_format: StructuredOutputFormat | None = None,
         **kwargs: Any,
     ) -> dict[str, Any] | None:
         await self._ensure_tools_initialized()
@@ -406,9 +421,27 @@ class AgentService:
             self._execution_adapter = self._build_execution_adapter()
         else:
             self._execution_adapter.config.tools = self.tools
-        return cast(
+        adapter = self._execution_adapter
+        llm = None
+        if structured_output_format is not None:
+            # A run that finishes in the resume is unregistered before it
+            # returns, so the model of the live handle is taken first.
+            handle = adapter.registry.get(execution_id)
+            runner = getattr(handle, "runner", None)
+            llm = getattr(getattr(runner, "agent", None), "llm", None)
+            if llm is None:
+                llm = adapter.config.llm
+        result = cast(
             dict[str, Any] | None,
-            await self._execution_adapter.resume(execution_id, **kwargs),
+            await adapter.resume(execution_id, **kwargs),
+        )
+        return await _attach_structured_output(
+            result,
+            structured_output_format,
+            llm=llm,
+            task_id=execution_id,
+            run_id=(kwargs.get("metadata") or {}).get("run_id"),
+            tracer=self.tracer,
         )
 
     def pause_execution_by_id(

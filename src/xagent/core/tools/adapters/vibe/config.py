@@ -85,6 +85,7 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
         "authorization_required",
         "catalog_app_not_found",
         "config_load_failed",
+        "grant_not_allowed_for_task_source",
         "initialize",
         "insufficient_scope",
         "invalid_config",

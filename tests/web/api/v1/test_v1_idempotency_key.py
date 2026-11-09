@@ -554,3 +554,144 @@ def test_a_retry_that_only_changes_metadata_replays_the_original() -> None:
     assert retry.headers["Idempotent-Replayed"] == "true"
     assert retry.json() == first.json()
     assert _task_count() == 1
+
+
+# Bodies Pydantic accepts but cannot write back as JSON. ``prompt_context``
+# values are ``Any`` until the route checks them, so a list nested past the
+# serializer's depth limit (255), or an object key holding a lone surrogate,
+# reaches the fingerprint. 400 levels stay below the depth at which
+# ``json.loads`` itself fails on Python 3.11, so the body is still parsed.
+_UNENCODABLE_VALUES = pytest.mark.parametrize(
+    "value",
+    ["[" * 400 + "]" * 400, '{"\\ud800": 1}'],
+    ids=["deep_nesting", "lone_surrogate_key"],
+)
+_ROUTE_CHECK_MESSAGE = "prompt_context values must be strings, numbers, or booleans."
+_UNENCODABLE_MESSAGE = (
+    "The request body cannot be encoded as JSON, so it cannot be matched "
+    "against an Idempotency-Key."
+)
+
+
+def _post_raw(
+    path: str,
+    full_key: str,
+    body: str,
+    idempotency_key: str | None = None,
+) -> Any:
+    return client.post(
+        path,
+        headers={
+            **_headers(full_key, idempotency_key),
+            "Content-Type": "application/json",
+        },
+        content=body,
+    )
+
+
+def _prompt_context_body(agent_id: int, prompt_context_value: str) -> str:
+    return (
+        f'{{"agent_id": {agent_id}, '
+        '"message": {"role": "user", "content": "x"}, '
+        f'"prompt_context": {{"k": {prompt_context_value}}}}}'
+    )
+
+
+def _idempotency_row_count() -> int:
+    db = _direct_db_session()
+    try:
+        return db.query(ApiIdempotencyKey).count()
+    finally:
+        db.close()
+
+
+@_UNENCODABLE_VALUES
+def test_without_header_an_unencodable_create_reaches_the_route_checks(
+    value: str,
+) -> None:
+    agent_id, key = _create_agent_with_key()
+
+    response = _post_raw("/v1/chat/tasks", key, _prompt_context_body(agent_id, value))
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["message"] == _ROUTE_CHECK_MESSAGE
+    assert _task_count() == 0
+
+
+@_UNENCODABLE_VALUES
+def test_with_header_an_unencodable_create_is_422_and_reserves_nothing(
+    value: str,
+) -> None:
+    agent_id, key = _create_agent_with_key()
+
+    response = _post_raw(
+        "/v1/chat/tasks", key, _prompt_context_body(agent_id, value), "retry-15"
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == {
+        "code": "invalid_input",
+        "message": _UNENCODABLE_MESSAGE,
+    }
+    assert _task_count() == 0
+    assert _idempotency_row_count() == 0
+    # The same key still works for a body that can be encoded.
+    assert _create(key, agent_id, "retry-15").status_code == 202
+
+
+@_UNENCODABLE_VALUES
+def test_without_header_an_unencodable_append_reaches_the_route_checks(
+    value: str,
+) -> None:
+    agent_id, key = _create_agent_with_key()
+    task_id = _create(key, agent_id).json()["task_id"]
+    _set_status(task_id, TaskStatus.COMPLETED)
+
+    response = _post_raw(
+        f"/v1/chat/tasks/{task_id}/messages", key, _prompt_context_body(agent_id, value)
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["message"] == _ROUTE_CHECK_MESSAGE
+    assert _user_message_count(task_id) == 1
+
+
+@_UNENCODABLE_VALUES
+def test_with_header_an_unencodable_append_is_422_and_reserves_nothing(
+    value: str,
+) -> None:
+    agent_id, key = _create_agent_with_key()
+    task_id = _create(key, agent_id).json()["task_id"]
+    _set_status(task_id, TaskStatus.COMPLETED)
+
+    response = _post_raw(
+        f"/v1/chat/tasks/{task_id}/messages",
+        key,
+        _prompt_context_body(agent_id, value),
+        "retry-16",
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"] == {
+        "code": "invalid_input",
+        "message": _UNENCODABLE_MESSAGE,
+    }
+    assert _user_message_count(task_id) == 1
+    assert _idempotency_row_count() == 0
+    # The same key still works for a body that can be encoded.
+    _set_status(task_id, TaskStatus.COMPLETED)
+    assert _append(key, agent_id, task_id, "retry-16").status_code == 202
+
+
+@_UNENCODABLE_VALUES
+def test_a_malformed_key_is_rejected_before_the_body_is_encoded(value: str) -> None:
+    agent_id, key = _create_agent_with_key()
+
+    response = _post_raw(
+        "/v1/chat/tasks", key, _prompt_context_body(agent_id, value), "bad key"
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "idempotency_key_invalid"
+    assert _task_count() == 0
+    assert _idempotency_row_count() == 0

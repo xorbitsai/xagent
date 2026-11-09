@@ -1,7 +1,7 @@
 """Opt-in PostgreSQL shared-worker SDK benchmark.
 
 Run from the repository containing these scripts:
-  python -m scripts.shared_worker_benchmark --repo /absolute/path/to/xagent
+  python -m scripts.benchmarks.shared_worker_benchmark --repo /absolute/path/to/xagent
     --server-env /absolute/path/to/private-benchmark.env --model-id 1
     --output /absolute/path/to/new-results --confirm-test-environment
 Join the lines into one command. --case shared-1 or shared-4 selects one layout;
@@ -71,10 +71,10 @@ from pathlib import Path
 
 import httpx
 
-from scripts.shared_worker_report import compare_cases, read_case
-from scripts.shared_worker_workload import PROMPT, TERMINAL
+from scripts.benchmarks.shared_worker_report import compare_cases, read_case
+from scripts.benchmarks.shared_worker_workload import PROMPT, TERMINAL
 
-HARNESS = Path(__file__).resolve().parents[1]
+HARNESS = Path(__file__).resolve().parents[2]
 
 
 def rows(path):
@@ -283,7 +283,7 @@ def workload_command(args, background, probes, spacing=0):
     return [
         sys.executable,
         "-m",
-        "scripts.shared_worker_workload",
+        "scripts.benchmarks.shared_worker_workload",
         "--base-url",
         f"http://127.0.0.1:{args.port}",
         "--model-id",
@@ -371,7 +371,9 @@ def run_case(args, base, workers):
         ).hexdigest(),
         "harness_sha256": {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted((HARNESS / "scripts").glob("shared_worker_*.py"))
+            for path in sorted(
+                (HARNESS / "scripts" / "benchmarks").glob("shared_worker_*.py")
+            )
         },
         "prompt_sha256": hashlib.sha256(PROMPT.encode()).hexdigest(),
         "logical_cpus": os.cpu_count(),
@@ -468,7 +470,7 @@ def run_case(args, base, workers):
             command = [
                 sys.executable,
                 "-m",
-                "scripts.shared_worker_observer",
+                "scripts.benchmarks.shared_worker_observer",
                 "xagent.web.worker" if role == "worker" else "xagent.web",
                 str(output),
             ]
@@ -480,17 +482,21 @@ def run_case(args, base, workers):
             manifest["hosts"].append({"name": name, "pid": process.pid, "role": role})
             if role == "worker":
                 wait_for(
-                    lambda: "Shared task worker ready"
-                    in (output / (name + ".log")).read_text(),
+                    lambda: (
+                        "Shared task worker ready"
+                        in (output / (name + ".log")).read_text()
+                    ),
                     hosts,
                     name,
                 )
             else:
                 wait_for(
-                    lambda: httpx.get(
-                        f"http://127.0.0.1:{args.port}/openapi.json", timeout=2
-                    ).status_code
-                    == 200,
+                    lambda: (
+                        httpx.get(
+                            f"http://127.0.0.1:{args.port}/openapi.json", timeout=2
+                        ).status_code
+                        == 200
+                    ),
                     hosts,
                     name,
                 )

@@ -1402,6 +1402,132 @@ class TestTaskTracker:
         assert mock_warning.called
         assert "already active" in mock_warning.call_args.args[0]
 
+    @pytest.mark.asyncio
+    async def test_turn_usage_reports_this_run_over_the_seed(self, db_session):
+        """``turn_usage`` subtracts every seeded counter and groups this run's
+        detail rows by model id, keeping two ids that share a name apart."""
+        from xagent.core.model.chat.token_context import (
+            add_tool_call_usage,
+            add_tool_error_usage,
+        )
+        from xagent.web.tracking.task_tracker import _TaskTrackingSeed
+
+        tracker = TaskTracker(task_id=123, db_session=db_session)
+        # A prior turn left every counter non-zero, including tool errors the
+        # database row has no column for.
+        tracker._seed = _TaskTrackingSeed(
+            user_id=None,
+            usage=TokenUsage(
+                input_tokens=100,
+                output_tokens=50,
+                llm_calls=4,
+                tool_calls=6,
+                tool_errors=2,
+                details=[
+                    {"type": "input", "tokens": 100, "model": "m", "model_id": "1"},
+                    {"type": "output", "tokens": 50, "model": "m", "model_id": "1"},
+                ],
+            ),
+        )
+        await tracker.start_tracking()
+        add_token_usage(
+            input_tokens=10,
+            output_tokens=5,
+            model="shared-name",
+            model_id="a",
+            call_type="chat",
+        )
+        add_token_usage(
+            input_tokens=7,
+            output_tokens=3,
+            model="shared-name",
+            model_id="b",
+            call_type="chat",
+        )
+        add_tool_call_usage(3)
+        add_tool_error_usage(1)
+        usage = await tracker.complete_tracking()
+
+        turn = tracker.turn_usage(usage)
+
+        assert turn.input_tokens == 17
+        assert turn.output_tokens == 8
+        assert turn.llm_calls == 2
+        assert turn.tool_calls == 3
+        assert turn.tool_errors == 1
+        assert [
+            (m.model_id, m.model_name, m.input_tokens, m.output_tokens)
+            for m in turn.by_model
+        ] == [("a", "shared-name", 10, 5), ("b", "shared-name", 7, 3)]
+        # Without an argument it reads the current context's usage.
+        assert tracker.turn_usage() == turn
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("persisted", [True, False])
+    async def test_turn_usage_sink_receives_usage_once_per_completion(
+        self, db_session, monkeypatch, persisted
+    ):
+        """The sink runs whether or not the final write was persisted, and a
+        failing sink never changes what completion returns."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        monkeypatch.setattr(
+            tracker_module,
+            "_complete_task_usage_sync",
+            lambda *_args, **_kwargs: persisted,
+        )
+        received = []
+        tracker = TaskTracker(
+            task_id=123, db_session=db_session, turn_usage_sink=received.append
+        )
+        await tracker.start_tracking()
+        add_token_usage(input_tokens=4, output_tokens=2, model="m", call_type="chat")
+
+        usage = await tracker.complete_tracking()
+
+        assert len(received) == 1
+        assert received[0] == tracker.turn_usage(usage)
+        assert (received[0].input_tokens, received[0].output_tokens) == (4, 2)
+
+    @pytest.mark.asyncio
+    async def test_turn_usage_sink_runs_when_the_final_write_raises(
+        self, db_session, monkeypatch
+    ):
+        """A final write that raises something other than pool exhaustion is
+        only logged: the usage was still observed, so the sink receives it."""
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        def failing_write(*_args, **_kwargs):
+            raise RuntimeError("db unavailable")
+
+        monkeypatch.setattr(tracker_module, "_complete_task_usage_sync", failing_write)
+        received = []
+        tracker = TaskTracker(
+            task_id=123, db_session=db_session, turn_usage_sink=received.append
+        )
+        await tracker.start_tracking()
+        add_token_usage(input_tokens=4, output_tokens=2, model="m", call_type="chat")
+
+        usage = await tracker.complete_tracking()
+
+        assert len(received) == 1
+        assert received[0] == tracker.turn_usage(usage)
+
+    @pytest.mark.asyncio
+    async def test_failing_turn_usage_sink_is_only_logged(self, db_session):
+        def sink(_usage):
+            raise RuntimeError("sink broke")
+
+        tracker = TaskTracker(task_id=123, db_session=db_session, turn_usage_sink=sink)
+        await tracker.start_tracking()
+        add_token_usage(input_tokens=4, output_tokens=2, model="m", call_type="chat")
+
+        with patch("xagent.web.tracking.task_tracker.logger.warning") as warning:
+            usage = await tracker.complete_tracking()
+
+        assert usage.input_tokens == 4
+        assert warning.call_count == 1
+
 
 class TestTaskTrackerManager:
     """Test cases for TaskTrackerManager."""

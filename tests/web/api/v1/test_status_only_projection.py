@@ -67,6 +67,7 @@ from ..conftest import (
     client,
 )
 from .test_events_stream import (
+    NULL_STRUCTURED_OUTPUT_FIELDS,
     _bearer,
     _create_agent_with_key,
     _create_task,
@@ -318,6 +319,7 @@ EXCLUDE = {
     ("GET", "/v1/chat/tasks/{task_id}/files"),
     ("GET", "/v1/chat/tasks/{task_id}/steps"),
     ("GET", "/v1/me"),
+    ("GET", "/v1/features"),
     ("GET", "/v1/templates"),
     ("GET", "/v1/templates/{template_id}"),
     ("GET", "/v1/agents"),
@@ -488,7 +490,12 @@ async def test_stream_terminal_on_view(api_db, monkeypatch, path, row):
         assert ("task.status", {"status": "paused"}) not in seen
     completed = [data for event, data in seen if event == "task.completed"]
     assert completed == [
-        {"status": "failed", "output": None, "error": _STOP_TEXTS[row]}
+        {
+            "status": "failed",
+            "output": None,
+            "error": _STOP_TEXTS[row],
+            **NULL_STRUCTURED_OUTPUT_FIELDS,
+        }
     ]
     assert es.count_task_sinks(task_id) == 0
 
@@ -524,7 +531,12 @@ async def test_routes_read_through_the_view(api_db, monkeypatch):
     finally:
         await response.body_iterator.aclose()
     assert [data for event, data in seen if event == "task.completed"] == [
-        {"status": "failed", "output": None, "error": "sentinel text"}
+        {
+            "status": "failed",
+            "output": None,
+            "error": "sentinel text",
+            **NULL_STRUCTURED_OUTPUT_FIELDS,
+        }
     ]
 
 

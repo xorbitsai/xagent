@@ -16,6 +16,14 @@ from xagent.core.tools.core.sound_effect_tool import SoundEffectToolCore
 from xagent.core.workspace import TaskWorkspace
 
 
+class ProviderUnavailable(RuntimeError):
+    """A provider SDK error: its own message plus the HTTP status behind it."""
+
+    def __init__(self, message: str, status_code: int = 503) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class FakeSoundEffectModel(BaseSoundEffectModel):
     provider_name = "fake-sound"
 
@@ -60,7 +68,7 @@ class FailingSoundEffectModel(FakeSoundEffectModel):
         loop: bool = False,
         output_format: str = "mp3_44100_128",
     ) -> SoundEffectResult:
-        raise RuntimeError("sound effect provider failed")
+        raise ProviderUnavailable("sound effect provider failed")
 
 
 class EmptySoundEffectModel(FakeSoundEffectModel):
@@ -150,7 +158,10 @@ async def test_generate_sound_effect_returns_provider_failure() -> None:
     result = await tool.generate_sound_effect(text="Rain")
 
     assert result["success"] is False
-    assert result["error"] == "sound effect provider failed"
+    # The provider's own message stays in the log; what reaches the model is a
+    # stable category and a sentence that names nothing internal.
+    assert result["error_category"] == "provider_unavailable"
+    assert "sound effect provider failed" not in result["error"]
 
 
 async def test_generate_sound_effect_rejects_empty_audio() -> None:

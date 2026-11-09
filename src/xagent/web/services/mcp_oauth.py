@@ -627,8 +627,20 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     scope: str | None = None,
     issuer: str | None = None,
     client: httpx.AsyncClient | None = None,
+    allow_team_member_grants: bool = False,
+    endpoint_url: str | None = None,
 ) -> MCPOAuthRuntimeAuth:
-    """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
+    """Resolve and refresh an MCP OAuth grant for one runtime MCP connection.
+
+    ``endpoint_url`` is the URL of the connection the returned token is added
+    to; it is forwarded to ``select_mcp_oauth_grants``.
+
+    When ``allow_team_member_grants`` is false and no grant is selected, but a
+    grant would be selected with it true, this fails with
+    ``grant_not_allowed_for_task_source`` rather than
+    ``authorization_required``: authorizing again cannot help, because the
+    task's source is what withholds the grant.
+    """
     from ...core.utils.encryption import decrypt_value
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
@@ -656,7 +668,29 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             resource=resource,
             issuer=issuer,
             scope="",
+            allow_team_member_grants=allow_team_member_grants,
+            endpoint_url=endpoint_url,
         )
+        if not candidate_grants and not allow_team_member_grants:
+            # Select again with team-member grants allowed. A grant whose
+            # resource does not match ``endpoint_url`` is still not selected,
+            # so that case keeps ``authorization_required``.
+            if select_mcp_oauth_grants(
+                db,
+                server_id=server_id,
+                user_id=user_id,
+                auth_config=auth_config,
+                resource_owner_key=resource_owner_key,
+                resource=resource,
+                issuer=issuer,
+                scope="",
+                allow_team_member_grants=True,
+                endpoint_url=endpoint_url,
+            ):
+                raise MCPOAuthRuntimeError(
+                    "grant_not_allowed_for_task_source",
+                    "MCP OAuth grant cannot be used by tasks from this source",
+                )
         grant = _select_runtime_grant(candidate_grants, required_scopes)
         if not _grant_needs_refresh(grant.expires_at):
             access_token = decrypt_value(str(grant.access_token))
@@ -909,13 +943,47 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     resource: str | None = None,
     issuer: str | None = None,
     scope: str | None = None,
+    allow_team_member_grants: bool = False,
+    endpoint_url: str | None = None,
 ) -> list[Any]:
     """Return active MCP OAuth grants matching the current server auth config.
 
     This selector is intentionally side-effect free: it does not decrypt tokens,
     refresh grants, or mutate persistence. Runtime code can build on the selected
     grants when it needs bearer material.
+
+    A caller that holds no association row for the server (in any ``is_active``
+    state) is a team member who authorized the shared connector themselves.
+    For that caller nothing is returned unless ``allow_team_member_grants`` is
+    true, so the caller must opt in explicitly. A caller that holds an
+    association gets the grants matched below, unchanged.
+    The rule applies to grants held under the caller's own default owner key;
+    grants selected under another owner key (an actor policy) are returned as
+    before.
+    A missing owner key is treated as the caller's own default key for this
+    rule, but the grants are then not filtered by owner key: for a caller
+    without an association, with ``allow_team_member_grants`` true, the
+    URL-matching grants of every owner key are returned. No production caller
+    omits the owner key.
+
+    Under the same owner-key condition, and when ``allow_team_member_grants``
+    is true, a caller who holds no association for the server gets only grants
+    whose resource equals the server's current URL: their tokens are sent to
+    that URL, and the URL is controlled by the server's owner, not by the
+    grant holder. ``endpoint_url`` is the URL the caller sends the selected
+    token to; when given, it is the URL compared, so the check and the use read
+    the same value, and the stored URL is not read. When it is omitted, the
+    stored URL is read.
+
+    The comparison is strict on purpose. The team member OAuth connect route
+    and its callback create grants for callers without an association. That
+    flow requires the protected resource to equal the connector URL when it
+    starts, when it stores its flow and at the callback; this comparison then
+    never drops such a grant, and on a server whose protected resource
+    differs from its URL that flow refuses the member before any grant is
+    stored.
     """
+    from ..models.mcp import MCPServer, UserMCPServer
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
@@ -957,11 +1025,44 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
 
     grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
     required_scopes = _scope_set(selected_scope)
-    if not required_scopes:
+    if required_scopes:
+        grants = [
+            grant
+            for grant in grants
+            if required_scopes.issubset(_scope_set(grant.scope))
+        ]
+    # The association lookup below only matters for grants under the caller's
+    # own default owner key; an empty match or another owner key is returned
+    # without it.
+    member_path_owner = resource_owner_key in (None, f"xagent:user:{user_id}")
+    if not grants or not member_path_owner:
         return list(grants)
-    return [
-        grant for grant in grants if required_scopes.issubset(_scope_set(grant.scope))
-    ]
+    holds_association = (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .first()
+        is not None
+    )
+    if holds_association:
+        return list(grants)
+    if not allow_team_member_grants:
+        return []
+    server_url = (
+        endpoint_url
+        if endpoint_url is not None
+        else db.query(MCPServer.url).filter(MCPServer.id == server_id).scalar()
+    )
+    if not server_url:
+        return []
+    try:
+        current_resource = _canonical_resource(str(server_url))
+    except ValueError:
+        # A URL that cannot be parsed matches no stored resource.
+        return []
+    return [grant for grant in grants if grant.resource == current_resource]
 
 
 async def _discover_with_client(  # noqa: PLR0913

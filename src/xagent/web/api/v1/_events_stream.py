@@ -118,16 +118,18 @@ values it deliberately leaves unbounded, in one place:
     ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
     attach, before any sink exists.
   - Deliberately uncapped: ``task.completed``'s ``output`` and
-    ``task.input_required``'s ``prompt`` (full argument in the comment
-    above ``completed_frame``). Both are the payload of a conclusion
-    frame, both are sent once per stream as that frame, and neither has
-    an equivalent on ``GET .../steps`` -- their recovery channel is
-    ``GET /v1/chat/tasks/{task_id}``. Neither ever meets the queue's
-    byte budget: on the live path (the watchdog closing an already-open
-    stream) they reach the client only as a budget-exempt close frame
-    via ``enqueue_close``; on the two attach-time fast paths (terminal,
-    waiting-for-user) they are ``yield``ed straight from the generator
-    before any sink or queue exists for this connection at all.
+    ``structured_output`` and ``task.input_required``'s ``prompt`` (full
+    argument in the comment above ``completed_frame``). Each is the
+    payload of a conclusion frame, each is sent once per stream as that
+    frame, and none has an equivalent on ``GET .../steps`` -- their
+    recovery channel is ``GET /v1/chat/tasks/{task_id}``. Bounding the
+    size of ``structured_output`` is the job of the step that produces it,
+    not of this module. None ever meets the queue's byte budget: on the
+    live path (the watchdog closing an already-open stream) they reach
+    the client only as a budget-exempt close frame via ``enqueue_close``;
+    on the two attach-time fast paths (terminal, waiting-for-user) they
+    are ``yield``ed straight from the generator before any sink or queue
+    exists for this connection at all.
   - Uncapped and bounded only by the frame they arrive in: a step's
     ``id`` and a ``message.*`` frame's ``message_id``. Neither has a
     cap of its own -- ``PublicStep.id`` is a plain ``str`` -- and an id
@@ -169,6 +171,7 @@ from ...services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
 )
+from ...services.structured_output_projection import project_structured_output
 from ...services.task_event_trace_handler import serialize_trace_data
 from ...services.task_execution_controller import TaskControlState
 from ..websocket import _is_versioned_task_event, manager
@@ -373,18 +376,24 @@ def status_frame(status: str) -> str:
     return _sse_frame("task.status", {"status": status})
 
 
-# ``completed_frame``'s ``output`` and ``input_required_frame``'s
-# ``prompt`` are the two content-bearing fields on this stream with no
-# size cap. Both are the payload of a conclusion frame, taken from the
-# caller's own authoritative task-row read, and neither has an
-# equivalent on ``GET .../steps``: that endpoint returns projected
-# steps, not the task row's ``output`` column and not its pending
-# question. Truncating either one would leave a client with no way to
-# recover the full value from this stream or from ``steps()``.
+# ``completed_frame``'s ``output`` and ``structured_output`` and
+# ``input_required_frame``'s ``prompt`` are the content-bearing fields on
+# this stream with no size cap. Each is the payload of a conclusion
+# frame, taken from the caller's own authoritative task-row read, and
+# none has an equivalent on ``GET .../steps``: that endpoint returns
+# projected steps, not the task row's ``output`` column, not its
+# structured result and not its pending question. Truncating any of them
+# would leave a client with no way to recover the full value from this
+# stream or from ``steps()``. ``structured_output`` is not capped here:
+# bounding a structured result is the job of the step that produces it.
+# The frame writes it with ``ensure_ascii``, so a non-ASCII character
+# takes six bytes on the wire, or twelve when it lies outside the Basic
+# Multilingual Plane.
 # ``step.*``/``message.*`` content is capped precisely because it does
 # have that channel -- ``steps()`` always returns a step's full,
-# untruncated ``data``. The recovery channel for these two is
-# ``GET /v1/chat/tasks/{task_id}``: ``TaskInfoResponse.output`` and
+# untruncated ``data``. The recovery channel for these fields is
+# ``GET /v1/chat/tasks/{task_id}``: ``TaskInfoResponse.output``,
+# ``TaskInfoResponse.structured_output`` and
 # ``TaskInfoResponse.pending_interaction.question``. Cost of the
 # exemption is bounded by construction: each is sent exactly once per
 # stream, as that stream's conclusion frame -- ``enqueue_close`` on the
@@ -404,6 +413,9 @@ def completed_frame(
     status: str,
     output: str | None,
     error: str | None,
+    structured_output: dict[str, Any] | None = None,
+    structured_output_status: str | None = None,
+    structured_output_reason: dict[str, Any] | None = None,
     snapshot_total_steps: int | None = None,
 ) -> str:
     return _sse_frame(
@@ -412,16 +424,31 @@ def completed_frame(
             "status": status,
             "output": output,
             "error": error,
+            "structured_output": structured_output,
+            "structured_output_status": structured_output_status,
+            "structured_output_reason": structured_output_reason,
             **_snapshot_marker_fields(snapshot_total_steps),
         },
     )
+
+
+def _structured_output_fields(snapshot: "_TaskInfoSnapshot") -> dict[str, Any]:
+    """The structured output fields of a conclusion frame, from the same
+    effective snapshot that supplies its status, and by the same projection
+    as ``GET /v1/chat/tasks/{task_id}``."""
+    return project_structured_output(
+        status=snapshot.status,
+        run_id=snapshot.run_id,
+        record=snapshot.structured_output_record,
+        format_configured=snapshot.format_configured,
+    ).as_dict()
 
 
 def input_required_frame(
     task_id: int, prompt: str | None, *, snapshot_total_steps: int | None = None
 ) -> str:
     # ``prompt`` is uncapped for the reason stated above
-    # ``completed_frame``, which covers both conclusion-frame fields.
+    # ``completed_frame``, which covers the uncapped conclusion-frame fields.
     # ``prompt`` comes straight from ``_TaskInfoSnapshot.pending_question``
     # (``tasks.py``'s ``_load_task_info_snapshot``, itself backed by
     # ``task_interaction_read.get_pending_interaction_question`` -- see the
@@ -824,13 +851,8 @@ def _feed_trace_event(
          otherwise fall through to the catch-all "not a known step
          family" drop below.
       3. ``is_audit_only_trace_data``: server-only RCA payloads that must
-         never reach a client.
-         ``steps()`` applies no equivalent filter on its own read. No
-         audit-only row reaches a public step there today because the
-         event types that carry audit-only data are not in the
-         projector's exposed set, but that equivalence is a coincidence
-         of the current producer rather than something either surface
-         enforces (#1405).
+         never reach a client. The shared projector also applies this
+         filter when replaying persisted events for ``steps()``.
 
     An ``ai_message`` event carrying ``data["stream_message_id"]`` --
     the trace-event mirror of a final answer already delivered
@@ -1119,8 +1141,9 @@ class V1EventStreamSink:
         self._queued_bytes = 0
         # Deliberately not routed through the byte budget: this is the one
         # frame that must always fit. ``task.completed``'s ``output`` and
-        # ``task.input_required``'s ``prompt`` are uncapped by design (see
-        # the comment above ``completed_frame``); on the live path they
+        # ``structured_output`` and ``task.input_required``'s ``prompt`` are
+        # uncapped by design (see the comment above ``completed_frame``); on
+        # the live path they
         # only ever reach the client as a budget-exempt close frame via
         # this method, and on the attach-time fast paths there is no sink
         # and no queue at all -- refusing one here on a budget while the
@@ -1479,6 +1502,7 @@ async def watchdog_check_once(
                 status=status.value,
                 output=snapshot.output,
                 error=snapshot.error,
+                **_structured_output_fields(snapshot),
             )
         )
     if close_reason == "input_required":
@@ -2120,6 +2144,7 @@ def _terminal_snapshot_stream(
             status=snapshot.status.value,
             output=snapshot.output,
             error=snapshot.error,
+            **_structured_output_fields(snapshot),
             snapshot_total_steps=snapshot_total_steps,
         )
 

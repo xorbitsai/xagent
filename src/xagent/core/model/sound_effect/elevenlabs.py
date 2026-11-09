@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from inspect import isawaitable
 from typing import Any, Optional
 
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ...utils.security import redact_sensitive_text
 from ..chat.token_context import MediaCallType
 from ..media_metering import (
@@ -169,7 +170,7 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             logger.warning(
                 "ElevenLabs key lacks user_read; generation access cannot be "
                 "validated without a billed request: %s",
-                safe_error,
+                redact_provider_detail(exc),
             )
 
     async def _record_usage(
@@ -209,14 +210,32 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         output_format: str = ELEVENLABS_DEFAULT_SOUND_EFFECT_OUTPUT_FORMAT,
     ) -> SoundEffectResult:
         prompt = text.strip()
+        # Same rule as the music and speech adapters: a parameter the caller
+        # supplied is reported with its name and its real range, not left to
+        # look like an unexplained provider failure.
         if not prompt:
-            raise ValueError("Sound effect text must not be empty")
+            raise MediaParameterError(
+                "Sound effect text must not be empty",
+                field="text",
+            )
         if duration_seconds is not None and not 0.5 <= duration_seconds <= 30:
-            raise ValueError("duration_seconds must be between 0.5 and 30")
+            raise MediaParameterError(
+                "duration_seconds must be between 0.5 and 30",
+                field="duration_seconds",
+                allowed_values={"duration_seconds": "0.5-30"},
+            )
         if not 0 <= prompt_influence <= 1:
-            raise ValueError("prompt_influence must be between 0 and 1")
+            raise MediaParameterError(
+                "prompt_influence must be between 0 and 1",
+                field="prompt_influence",
+                allowed_values={"prompt_influence": "0-1"},
+            )
         if loop and self.model_name != ELEVENLABS_DEFAULT_SOUND_EFFECT_MODEL:
-            raise ValueError("loop is only supported by eleven_text_to_sound_v2")
+            raise MediaParameterError(
+                "loop is only supported by eleven_text_to_sound_v2",
+                field="loop",
+                allowed_values={"loop": False},
+            )
 
         request_kwargs: dict[str, Any] = {
             "text": prompt,
@@ -245,7 +264,8 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
             logger.error(
-                "ElevenLabs sound effect generation failed: %s", redacted_error
+                "ElevenLabs sound effect generation failed: %s",
+                redact_provider_detail(exc),
             )
             raise RuntimeError(
                 f"ElevenLabs sound effect generation failed: {redacted_error}"
@@ -297,7 +317,7 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
                 logger.warning(
                     "Could not list ElevenLabs sound effect models because the API "
                     "key lacks user_read; using the documented catalog: %s",
-                    safe_error,
+                    redact_provider_detail(exc),
                 )
         finally:
             await model.aclose()

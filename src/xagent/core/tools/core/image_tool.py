@@ -24,6 +24,7 @@ from ...utils.media_download import (
     resolve_workspace_media_path,
 )
 from ...workspace import ExternalUploadStagingError, TaskWorkspace
+from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +796,20 @@ Images are automatically saved to workspace.
             generate_params.update(kwargs)
 
             # Generate the image
-            result = await image_model.generate_image(**generate_params)
+            try:
+                result = await image_model.generate_image(**generate_params)
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Image generation failed",
+                        model=image_model,
+                    ),
+                    "image_path": None,
+                    "model_used": self._resolve_model_label(image_model, model_id),
+                }
 
             # Determine the actual model used
             actual_model_id = self._resolve_model_label(image_model, model_id)
@@ -958,7 +972,20 @@ Images are automatically saved to workspace.
             edit_params.update(kwargs)
 
             # Edit the image
-            result = await image_model.edit_image(**edit_params)
+            try:
+                result = await image_model.edit_image(**edit_params)
+            except Exception as e:
+                return {
+                    "success": False,
+                    **media_failure_fields(
+                        e,
+                        logger=logger,
+                        action="Image editing failed",
+                        model=image_model,
+                    ),
+                    "image_path": None,
+                    "model_used": self._resolve_model_label(image_model, model_id),
+                }
 
             # Determine the actual model used
             actual_model_id = self._resolve_model_label(image_model, model_id)
@@ -1077,10 +1104,13 @@ Images are automatically saved to workspace.
             }
 
         except Exception as e:
-            logger.error(f"Failed to list available models: {e}")
             return {
                 "success": False,
-                "error": str(e),
+                **media_failure_fields(
+                    e,
+                    logger=logger,
+                    action="Failed to list available image models",
+                ),
                 "models": [],
                 "count": 0,
             }

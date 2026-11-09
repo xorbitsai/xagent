@@ -355,20 +355,13 @@ def _compact_storage_if_needed(embedding_model_id: Optional[str]) -> None:
     pipeline, hence the blanket except.
     """
     try:
-        from ..LanceDB.model_tag_utils import embeddings_table_name, to_model_tag
+        from ..LanceDB.model_tag_utils import embeddings_table_candidates
         from ..storage.factory import StorageFactory
 
         tables = list(_INGEST_TABLES)
         if embedding_model_id:
-            # The write path applies to_model_tag twice (CollectionHandle, then
-            # upsert_embeddings) and it is not idempotent for vendor-prefixed
-            # ids, so probe both spellings — the same compatibility trick as
-            # CollectionHandle._embedding_table_names. Missing tables are a
-            # cheap no-op in should_compact.
-            tables += [
-                embeddings_table_name(embedding_model_id),
-                embeddings_table_name(to_model_tag(embedding_model_id)),
-            ]
+            # The write path tags the model twice, so probe every candidate spelling.
+            tables += embeddings_table_candidates(embedding_model_id)
         store = StorageFactory.get_factory().get_vector_index_store()
         compacted = store.compact_tables(list(dict.fromkeys(tables)))
         if compacted:

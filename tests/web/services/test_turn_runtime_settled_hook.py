@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -34,6 +35,7 @@ from xagent.web.services.task_execution_context_service import (
 )
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_settlement_report import SettlementReport
+from xagent.web.services.turn_settlement import TurnFacts
 
 HOOK_WARNING = "Settling the cached runtime for task"
 OK_RESULT = {"success": True, "output": "ok", "status": "completed"}
@@ -98,7 +100,7 @@ async def drive_channel_background(
     monkeypatch: pytest.MonkeyPatch,
     *,
     fail_before_execute: str | None = None,
-    run_db_io: AsyncMock | None = None,
+    finalize: Callable[..., bool] | None = None,
 ) -> None:
     outcome = agent_outcome(path)
     tracer = SimpleNamespace(add_handler=Mock(), remove_handler=Mock())
@@ -165,9 +167,14 @@ async def drive_channel_background(
         shared_channel_execution, "channel_durable_result", lambda *_a: {}
     )
     monkeypatch.setattr(
+        "xagent.web.services.managed_task_lease."
+        "finalize_managed_task_lease_result_sync",
+        finalize or Mock(return_value=True),
+    )
+    monkeypatch.setattr(
         shared_channel_execution,
         "run_db_io_cancellation_safe",
-        run_db_io or AsyncMock(return_value=True),
+        AsyncMock(return_value=True),
     )
 
     snapshot = SimpleNamespace(
@@ -186,6 +193,7 @@ async def drive_channel_background(
         payload=SimpleNamespace(
             for_agent="hello", transcript_message="hello", attachments=[], file_ids=()
         ),
+        turn_facts=TurnFacts(started_at=datetime.now(timezone.utc)),
     )
 
 

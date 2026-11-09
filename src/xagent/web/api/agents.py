@@ -4,6 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -49,6 +50,7 @@ from ..services.agent_access import (
     list_accessible_agents,
     query_accessible_agents,
 )
+from ..services.agent_host_settings import stage_agent_host_settings
 from ..services.agent_management import (
     AgentManagementRuntime,
     AgentManagementService,
@@ -121,6 +123,9 @@ class AgentCreateRequest(BaseModel):
         None, description="Logo image as base64 data URL"
     )
     visibility: Optional[Literal["team", "admins"]] = None
+    host_settings: dict[str, Any] | None = Field(
+        None, description="Non-empty settings require a registered host writer."
+    )
 
 
 class AgentUpdateRequest(BaseModel):
@@ -147,6 +152,9 @@ class AgentUpdateRequest(BaseModel):
     allowed_domains: Optional[List[WidgetAllowedDomain]] = None
     visibility: Optional[Literal["team", "admins"]] = Field(
         None, description="Team visibility: 'team' or 'admins' (team admins only)"
+    )
+    host_settings: dict[str, Any] | None = Field(
+        None, description="Non-empty settings require a registered host writer."
     )
 
 
@@ -766,6 +774,8 @@ async def create_agent(
         # truth: uq_agents_user_id_name_active is what actually prevents a
         # concurrent-request race, so the insert itself can still raise
         # IntegrityError here.
+        host_settings = agent_data.host_settings
+
         try:
             agent = store.create_agent(
                 user_id=user_id,
@@ -783,6 +793,16 @@ async def create_agent(
                     for declaration in agent_data.prompt_context_fields
                 ],
                 visibility=agent_data.visibility,
+                before_commit=(
+                    partial(
+                        stage_agent_host_settings,
+                        db,
+                        user=current_user,
+                        settings=host_settings,
+                    )
+                    if host_settings
+                    else None
+                ),
             )
         except IntegrityError as exc:
             db.rollback()
@@ -807,6 +827,7 @@ async def create_agent(
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
+        db.rollback()
         raise
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -1198,6 +1219,9 @@ async def update_agent(
         if agent_data.visibility is not None:
             updates["visibility"] = agent_data.visibility
 
+        if agent_data.host_settings:
+            stage_agent_host_settings(db, agent, current_user, agent_data.host_settings)
+
         # Handle logo
         if agent_data.logo_base64 is not None:
             # Delete old logo
@@ -1208,7 +1232,7 @@ async def update_agent(
             logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
             updates["logo_url"] = logo_url
 
-        if updates:
+        if updates or agent_data.host_settings:
             # agent_name_exists above is a fast-path pre-check, not the source
             # of truth: uq_agents_user_id_name_active is what actually
             # prevents a concurrent-rename race, so the write itself can
@@ -1237,6 +1261,7 @@ async def update_agent(
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
+        db.rollback()
         raise
     except (UnsharedConnectorsError, UnsharedKnowledgeBasesError) as e:
         db.rollback()

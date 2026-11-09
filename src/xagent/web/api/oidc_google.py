@@ -29,6 +29,7 @@ from ...config import (
     get_oidc_exchange_ttl_seconds,
     get_oidc_login_ttl_seconds,
     get_session_secret,
+    public_entries_configured,
 )
 from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from ..auth_sessions import (
@@ -40,6 +41,12 @@ from ..models.database import get_db
 from ..models.oidc_consumed_token import OidcConsumedToken
 from ..models.user import User
 from ..models.user_identity import UserIdentity
+from ..public_entries import (
+    entry_url,
+    google_state_entry,
+    request_public_entry,
+    validate_exchange_entry,
+)
 from .auth import (
     create_access_token,
     create_refresh_token,
@@ -62,6 +69,7 @@ class OidcExchangeTransaction:
     user_id: int
     token_id: str
     session_epoch: str | None
+    entry_origin: str | None = None
 
 
 class OidcExchangeRequest(BaseModel):
@@ -117,7 +125,7 @@ def _google_oauth_client() -> Any:
 
 
 async def start_google_oidc_authorization(request: Request) -> RedirectResponse:
-    redirect_uri = get_google_oidc_redirect_uri()
+    redirect_uri = request_public_entry(request).google_oidc_redirect_uri
     if not redirect_uri:
         raise RuntimeError("Google OIDC is not configured")
     response = await _google_oauth_client().authorize_redirect(
@@ -135,20 +143,30 @@ async def start_google_oidc_authorization(request: Request) -> RedirectResponse:
 async def complete_google_oidc_authorization(
     request: Request, *, redirect_uri: str
 ) -> dict[str, Any]:
-    token = await _google_oauth_client().authorize_access_token(request)
+    google = _google_oauth_client()
+    # With explicit entries, the callback URI saved in Authlib state must match
+    # the entry completing the flow. Legacy deployments have a single callback.
+    if public_entries_configured():
+        entry = await google_state_entry(request, google)
+        if redirect_uri != entry.google_oidc_redirect_uri:
+            raise ValueError("invalid_entry")
+    token = await google.authorize_access_token(request)
     userinfo = token.get("userinfo")
     if userinfo is None:
         raise ValueError("invalid_id_token")
     return dict(userinfo)
 
 
-def _create_exchange_code(user_id: int, session_epoch: str | None) -> str:
+def _create_exchange_code(
+    user_id: int, session_epoch: str | None, entry_origin: str | None = None
+) -> str:
     return str(
         _exchange_serializer().dumps(
             {
                 "user_id": user_id,
                 "jti": secrets.token_urlsafe(32),
                 "session_epoch": session_epoch,
+                "entry_origin": entry_origin,
             }
         )
     )
@@ -173,8 +191,11 @@ def _decode_exchange_code(code: str) -> OidcExchangeTransaction | None:
     epoch = data.get("session_epoch")
     if epoch is not None and not isinstance(epoch, str):
         return None
+    origin = data.get("entry_origin")
+    if origin is not None and not isinstance(origin, str):
+        return None
     return OidcExchangeTransaction(
-        user_id=user_id, token_id=token_id, session_epoch=epoch
+        user_id=user_id, token_id=token_id, session_epoch=epoch, entry_origin=origin
     )
 
 
@@ -365,18 +386,28 @@ async def google_oidc_callback(
     request: Request,
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    error = request.query_params.get("error")
-    if error:
-        return _login_error_redirect("provider_error")
-
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    if not code or not state:
+    # Explicit entries resolve the completing entry from the saved Authlib state
+    # before anything else. Legacy deployments keep their single entry and the
+    # original error mapping (no state lookup, no client construction here).
+    try:
+        entry = (
+            await google_state_entry(request, _google_oauth_client())
+            if public_entries_configured()
+            else request_public_entry(request)
+        )
+    except (ValueError, RuntimeError, HTTPException):
         return _login_error_redirect("invalid_callback")
 
-    redirect_uri = get_google_oidc_redirect_uri()
+    def failure(code: str) -> RedirectResponse:
+        return RedirectResponse(entry_url(entry, "/login", {"oidc_error": code}))
+
+    if request.query_params.get("error"):
+        return failure("provider_error")
+    if not request.query_params.get("code") or not request.query_params.get("state"):
+        return failure("invalid_callback")
+    redirect_uri = entry.google_oidc_redirect_uri
     if not redirect_uri:
-        return _login_error_redirect("not_configured")
+        return failure("not_configured")
 
     try:
         claims = await complete_google_oidc_authorization(
@@ -385,21 +416,22 @@ async def google_oidc_callback(
         )
         user = _get_or_create_google_user(db, claims)
         exchange_code = _create_exchange_code(
-            int(user.id), cast(str | None, user.session_epoch)
+            int(user.id), cast(str | None, user.session_epoch), entry.origin
         )
     except OAuthError as exc:
         logger.info("Google OIDC authorization failed: %s", exc.error)
-        return _login_error_redirect("authorization_failed")
+        return failure("authorization_failed")
     except ValueError as exc:
         error_code = str(exc) or "verification_failed"
         logger.info("Google OIDC login rejected: %s", error_code)
-        return _login_error_redirect(error_code)
+        return failure(error_code)
     except Exception:
         logger.exception("Google OIDC callback failed")
-        return _login_error_redirect("callback_failed")
+        return failure("callback_failed")
 
     return RedirectResponse(
-        _frontend_url(
+        entry_url(
+            entry,
             "/auth/oidc/callback",
             {"provider": GOOGLE_PROVIDER, "code": exchange_code},
         )
@@ -409,8 +441,12 @@ async def google_oidc_callback(
 @router.post("/exchange")
 def google_oidc_exchange(
     payload: OidcExchangeRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    decoded = _decode_exchange_code(payload.code)
+    if decoded is None or not validate_exchange_entry(request, decoded.entry_origin):
+        raise HTTPException(400, "Invalid or expired OIDC exchange code")
     transaction = _consume_exchange_code(db, payload.code)
     if transaction is None:
         raise HTTPException(

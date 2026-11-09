@@ -2513,3 +2513,54 @@ def test_execution_adapter_does_not_forward_invalid_interruption_reason(
     )
     assert "interruption_reason" not in result
     assert "interruption_reason" not in result["metadata"]
+
+
+@pytest.mark.parametrize(
+    "agent_result",
+    [
+        {"success": True, "output": "ok", "finish_reason": 123},
+        {"success": True, "output": "ok", "finish_reason": "  "},
+        {"success": False, "error": "x", "empty_final_answer": "true"},
+        {"success": False, "error": "x", "empty_final_answer": 1},
+        {"success": True, "output": "ok", "metadata": {"first_answer_delta_at": 5}},
+        {"success": True, "output": "ok", "metadata": "not a dict"},
+        {"success": True, "output": "ok"},
+    ],
+)
+def test_normalize_result_lifts_only_well_typed_classification(
+    agent_result: dict[str, Any],
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+
+    normalized = adapter._normalize_result(
+        result=agent_result, execution_type="agent_react", execution_id="1"
+    )
+
+    for key in ("finish_reason", "empty_final_answer", "first_answer_delta_at"):
+        assert key not in normalized
+
+
+@pytest.mark.parametrize(
+    ("agent_result", "expected"),
+    [
+        ({"success": True, "output": ""}, True),
+        ({"success": True}, True),
+        ({"success": True, "output": "ok"}, False),
+    ],
+)
+def test_normalize_result_flags_a_missing_output(
+    agent_result: dict[str, Any], expected: bool
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+
+    normalized = adapter._normalize_result(
+        result=agent_result, execution_type="agent_react", execution_id="1"
+    )
+
+    assert normalized.get("output_missing", False) is expected
+    if expected:
+        assert normalized["output"] == NO_OUTPUT_PLACEHOLDER

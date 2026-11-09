@@ -130,7 +130,11 @@ async def test_application_shutdown_stops_the_sweeper_before_lease_recovery(
     )
     monkeypatch.setattr(
         "xagent.web.services.task_execution.background_task_manager.shutdown",
-        lambda: record("other"),
+        lambda: record("task_drain"),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.turn_settlement.drain_turn_settlement_hooks",
+        lambda: record("settlement_drain"),
     )
     monkeypatch.setattr(
         "xagent.web.services.task_lease_service.wait_for_heartbeat_manager_idle",
@@ -155,5 +159,11 @@ async def test_application_shutdown_stops_the_sweeper_before_lease_recovery(
 
     await app_module.shutdown_event()
 
-    stops = [name for name in order if name != "other"]
+    stops = [
+        name
+        for name in order
+        if name not in {"other", "task_drain", "settlement_drain"}
+    ]
     assert stops == ["auto_resume", "lease_recovery"]
+    # Deliveries are drained after the runs that produce them have drained.
+    assert order.index("task_drain") < order.index("settlement_drain")

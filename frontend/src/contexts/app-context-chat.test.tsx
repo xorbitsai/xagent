@@ -6329,6 +6329,184 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  describe("a conversation source on a send", () => {
+    const SOURCES = [
+      ["no source", undefined],
+      ["a number", 101],
+      ["a numeric string", "5"],
+      ["null", null],
+    ] as const
+    const TRANSPORTS = ["session", "task"] as const
+    const CASES = SOURCES.flatMap(([label, source]) => TRANSPORTS.map((transport) => [label, transport, source] as const))
+
+    const mount = (transport: "session" | "task") => {
+      render(transport === "session"
+        ? <AppProvider token="token" transport={makeSessionTransport()}><SessionControlsProbe /></AppProvider>
+        : <AppProvider token="token"><SeedRunningTask /><SessionControlsProbe /></AppProvider>)
+      act(() => webSocketOptions.current?.onConnect?.())
+    }
+
+    it.each(CASES)("handles %s on the %s transport", async (_label, transport, source) => {
+      mount(transport)
+      const config = source === undefined
+        ? { clientMessageId: "with-source" }
+        : { clientMessageId: "with-source", sourceTaskId: source }
+
+      const outcome = await act(async () => getSessionControls()
+        .sendMessage("continue", config)
+        .then(() => "ok", (error: unknown) => error))
+
+      if (source === undefined) {
+        expect(outcome).toBe("ok")
+        // The same arguments a send made without a source has always passed.
+        expect(sendChatMessageMock.mock.calls).toEqual([
+          ["continue", undefined, undefined, "with-source", undefined],
+        ])
+        expect(sendChatMessageMock.mock.calls[0]).toHaveLength(5)
+        return
+      }
+      if (transport === "session" && typeof source === "number") {
+        expect(outcome).toBe("ok")
+        expect(sendChatMessageMock.mock.calls).toEqual([
+          ["continue", undefined, undefined, "with-source", undefined, undefined, source],
+        ])
+        return
+      }
+      expect(outcome).toBeInstanceOf(MessageDeliveryError)
+      expect(outcome).toMatchObject({
+        message: typeof source === "number"
+          ? "A conversation source is not supported for this connection."
+          : "Message not sent: the conversation source is not valid.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("refuses a source while a conversation is bound and sends nothing", async () => {
+      mount("session")
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(150)))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+
+      const outcome = await act(async () => getSessionControls()
+        .sendMessage("continue", { clientMessageId: "bound-source", sourceTaskId: 101 })
+        .then(() => "ok", (error: unknown) => error))
+
+      expect(outcome).toBeInstanceOf(MessageDeliveryError)
+      expect(outcome).toMatchObject({
+        message: "Message not sent: a conversation source can only start a new conversation.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+    })
+
+    it("carries a source on the message that starts the replacement conversation", async () => {
+      mount("session")
+      const onMessage = webSocketOptions.current?.onMessage
+      act(() => onMessage?.(taskInfoMessage(150)))
+      const reset = getSessionControls().startNewConversation()
+      await act(async () => {
+        onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+        await reset
+      })
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_ready")
+
+      void getSessionControls().sendMessage("continue", { clientMessageId: "replacement-source", sourceTaskId: 101 })
+      await act(async () => {})
+
+      expect(sendChatMessageMock.mock.calls).toEqual([
+        ["continue", undefined, undefined, "replacement-source", undefined, undefined, 101],
+      ])
+    })
+
+    it("passes the uploaded file ids and the source together", async () => {
+      const transport = makeSessionTransport()
+      const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
+      render(
+        <AppProvider
+          token="token"
+          transport={{ ...transport, session: { ...transport.session, attachments: { accept: ".pdf", maxFiles: 3, maxFileBytes: 1024 } } }}
+        >
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await act(async () => {
+        await getSessionControls().sendMessage(
+          "continue",
+          { clientMessageId: "both", sourceTaskId: 101 },
+          [],
+          { uploadedFiles: [{ kind: "uploaded", fileId, name: "a.pdf", size: 1, type: "application/pdf" }] },
+        )
+      })
+
+      expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+        "continue", [], undefined, "both", undefined, { fileIds: [fileId], maxFileIds: 3 }, 101,
+      )
+    })
+
+    it("resends a send with a source once on the new connection with the same id and source", async () => {
+      sendChatMessageMock.mockRejectedValueOnce(
+        new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true }),
+      )
+      const sessionTree = (identity: string) => (
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      const { rerender } = render(sessionTree("session-one"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("unbound")
+      const outcome = getSessionControls()
+        .sendMessage("continue", { clientMessageId: "resent-source", sourceTaskId: 101 })
+        .then(() => "ok", (error: Error) => error)
+      await act(async () => {})
+
+      rerender(sessionTree("session-two"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      await act(async () => { expect(await outcome).toBe("ok") })
+
+      expect(sendChatMessageMock.mock.calls.map((call) => [call[3], call[6]])).toEqual([
+        ["resent-source", 101],
+        ["resent-source", 101],
+      ])
+    })
+  })
+
+  it("refuses a second send from the same call stack while the first one starts the replacement conversation", async () => {
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(150)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_ready")
+
+    const { sendMessage } = getSessionControls()
+    const first = sendMessage("first", { clientMessageId: "same-stack-1" })
+    const second = sendMessage("second", { clientMessageId: "same-stack-2", sourceTaskId: 101 })
+
+    await expect(second).rejects.toThrow("The replacement conversation is already starting.")
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+    expect(sendChatMessageMock.mock.calls[0][0]).toBe("first")
+    await waitFor(() => {
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_sending")
+    })
+    await act(async () => {
+      acknowledgement.resolve({ client_message_id: "same-stack-1", turn_id: "same-stack-1" })
+      await first
+    })
+  })
+
   it("forwards taskless Session files so unsupported delivery rejects instead of sending text alone", async () => {
     const transport = makeSessionTransport()
     // Exercise the branch-level contract independently from today's

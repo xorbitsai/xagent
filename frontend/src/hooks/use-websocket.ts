@@ -223,6 +223,10 @@ export const resolveReportedTimezone = (): string | undefined => {
   }
 }
 
+// The largest task id a chat frame's conversation source may carry (a signed
+// 32-bit integer).
+const MAX_SOURCE_TASK_ID = 2147483647
+
 const deliveryError = (
   message: string,
   disposition: MessageDeliveryDisposition,
@@ -1657,6 +1661,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     requestedClientMessageId?: string,
     requestId?: string,
     attachments?: ChatMessageFileIds,
+    // The earlier conversation a new one continues from; the same on every
+    // attempt of one send.
+    sourceTaskId?: number,
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
     const owner = socketOwnerRef.current
@@ -1698,6 +1705,24 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
       if (!fileIds.every(isCanonicalUuid)) {
         throw deliveryError("Message not sent: an attached file id is not valid.", "not_sent")
+      }
+    }
+    // The server closes the connection on a frame whose conversation source is
+    // malformed or arrives together with a request id, so those frames are
+    // refused here first.
+    if (sourceTaskId !== undefined) {
+      if (connection.chatTaskIdMode !== "omit") {
+        throw deliveryError("A conversation source is not supported for this connection.", "not_sent")
+      }
+      if (requestId) {
+        throw deliveryError("A conversation source cannot accompany an answer to a request.", "not_sent")
+      }
+      if (
+        !Number.isInteger(sourceTaskId)
+        || sourceTaskId < 1
+        || sourceTaskId > MAX_SOURCE_TASK_ID
+      ) {
+        throw deliveryError("Message not sent: the conversation source is not valid.", "not_sent")
       }
     }
 
@@ -1767,6 +1792,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         client_message_id: clientMessageId,
         ...(requestId ? { request_id: requestId } : {}),
         ...(fileIds ? { file_ids: [...fileIds] } : {}),
+        ...(sourceTaskId !== undefined ? { source_task_id: sourceTaskId } : {}),
         ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }

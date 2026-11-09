@@ -17,6 +17,9 @@ from xagent.core.workspace import TaskWorkspace
 
 
 class FakeASR(BaseASR):
+    def __init__(self, *, model_id: Optional[str] = None) -> None:
+        self.model_id = model_id
+
     async def transcribe(
         self,
         audio: Union[str, bytes],
@@ -59,10 +62,12 @@ class FakeTTS(BaseTTS):
         provider_name: str = "fake",
         abilities: Optional[list[str]] = None,
         voices: Optional[list[dict[str, Any]]] = None,
+        model_id: Optional[str] = None,
     ) -> None:
         self._provider_name = provider_name
         self._abilities = abilities or ["tts", "text_to_speech"]
         self._voices = voices or []
+        self.model_id = model_id
         self.calls: list[dict[str, Any]] = []
         self.clone_calls: list[dict[str, Any]] = []
         self.delete_calls: list[str] = []
@@ -988,3 +993,219 @@ async def test_synthesize_speech_json_rejects_non_object_json() -> None:
         "failed": 0,
         "errors": ["JSON data must be an object"],
     }
+
+
+def _transcription_input(tmp_path) -> tuple[TaskWorkspace, str]:
+    workspace = TaskWorkspace("audio_model_id", base_dir=str(tmp_path))
+    audio_path = workspace.output_dir / "voice.mp3"
+    audio_path.write_bytes(b"audio")
+    return workspace, workspace.register_file(str(audio_path))
+
+
+async def test_synthesize_speech_reports_the_default_model_it_actually_used() -> None:
+    configured = FakeTTS(model_id="platform/other-tts")
+    default_tts = FakeTTS(model_id="platform/eleven-v3")
+    tool = AudioToolCore(
+        tts_models={"other-tts": configured},
+        default_tts_model=default_tts,
+    )
+
+    result = await tool.synthesize_speech(text="Hello")
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/eleven-v3"
+    assert default_tts.calls[0]["text"] == "Hello"
+    assert configured.calls == []
+
+
+async def test_synthesize_speech_reports_the_selected_model_it_actually_used() -> None:
+    selected = FakeTTS(model_id="platform/eleven-v3")
+    other = FakeTTS(model_id="platform/other-tts")
+    tool = AudioToolCore(tts_models={"eleven_v3": selected, "other-tts": other})
+
+    result = await tool.synthesize_speech(text="Hello", model_id="eleven_v3")
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/eleven-v3"
+    assert selected.calls[0]["text"] == "Hello"
+    assert other.calls == []
+
+
+@pytest.mark.parametrize("requested_model_id", ["unconfigured-tts", "default"])
+async def test_synthesize_speech_reports_the_fallback_model_the_provider_used(
+    requested_model_id: str,
+) -> None:
+    default_tts = FakeTTS(model_id="platform/eleven-v3")
+    tool = AudioToolCore(
+        tts_models={"eleven_v3": FakeTTS(model_id="platform/other-tts")},
+        default_tts_model=default_tts,
+    )
+
+    result = await tool.synthesize_speech(text="Hello", model_id=requested_model_id)
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/eleven-v3"
+    assert result["model_used"] != requested_model_id
+    assert len(default_tts.calls) == 1
+
+
+async def test_synthesize_speech_omits_model_used_when_no_configured_id_is_known() -> (
+    None
+):
+    tool = AudioToolCore(default_tts_model=FakeTTS())
+
+    result = await tool.synthesize_speech(text="Hello")
+
+    assert result["success"] is True
+    assert "model_used" not in result
+
+
+async def test_batch_speech_reports_the_default_model_at_each_level() -> None:
+    default_tts = FakeTTS(model_id="platform/eleven-v3")
+    tool = AudioToolCore(default_tts_model=default_tts)
+
+    result = await tool.synthesize_speech_json(
+        json_data={"segments": [{"text": "First"}, {"text": "Second"}]}
+    )
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/eleven-v3"
+    assert [item["model_used"] for item in result["results"]] == [
+        "platform/eleven-v3",
+        "platform/eleven-v3",
+    ]
+    assert len(default_tts.calls) == 2
+
+
+async def test_batch_speech_reports_the_selected_model_at_each_level() -> None:
+    selected = FakeTTS(model_id="platform/eleven-v3")
+    tool = AudioToolCore(tts_models={"eleven_v3": selected})
+
+    result = await tool.synthesize_speech_json(
+        json_data={"segments": [{"text": "First"}]},
+        model_id="eleven_v3",
+    )
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/eleven-v3"
+    assert result["results"][0]["model_used"] == "platform/eleven-v3"
+    assert len(selected.calls) == 1
+
+
+@pytest.mark.parametrize("requested_model_id", ["unconfigured-tts", "default"])
+async def test_batch_speech_reports_the_fallback_model_at_each_level(
+    requested_model_id: str,
+) -> None:
+    default_tts = FakeTTS(model_id="platform/eleven-v3")
+    tool = AudioToolCore(
+        tts_models={"eleven_v3": FakeTTS(model_id="platform/other-tts")},
+        default_tts_model=default_tts,
+    )
+
+    result = await tool.synthesize_speech_json(
+        json_data={"segments": [{"text": "First"}, {"text": "Second"}]},
+        model_id=requested_model_id,
+    )
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/eleven-v3"
+    assert [item["model_used"] for item in result["results"]] == [
+        "platform/eleven-v3",
+        "platform/eleven-v3",
+    ]
+    assert len(default_tts.calls) == 2
+
+
+async def test_batch_speech_omits_model_used_when_no_configured_id_is_known() -> None:
+    tool = AudioToolCore(default_tts_model=FakeTTS())
+
+    result = await tool.synthesize_speech_json(
+        json_data={"segments": [{"text": "First"}]}
+    )
+
+    assert result["success"] is True
+    assert "model_used" not in result
+    assert "model_used" not in result["results"][0]
+
+
+async def test_batch_speech_keeps_the_failure_shape_when_a_segment_fails() -> None:
+    tool = AudioToolCore(
+        tts_models={"eleven_v3": FakeTTS(model_id="platform/eleven-v3")}
+    )
+
+    result = await tool.synthesize_speech_json(
+        json_data={"segments": [{}, {"text": "Second"}]}
+    )
+
+    assert result["success"] is False
+    assert "model_used" not in result
+    assert result["results"][0] == {
+        "success": False,
+        "error": "Segment 0: No text found in field 'text'",
+        "index": 0,
+    }
+    assert result["results"][1]["model_used"] == "platform/eleven-v3"
+
+
+async def test_transcribe_audio_reports_the_default_model_it_actually_used(
+    tmp_path,
+) -> None:
+    workspace, file_id = _transcription_input(tmp_path)
+    default_asr = FakeASR(model_id="platform/scribe-v2")
+    tool = AudioToolCore(
+        asr_models={"other-asr": FakeASR(model_id="platform/other-asr")},
+        default_asr_model=default_asr,
+        workspace=workspace,
+    )
+
+    result = await tool.transcribe_audio(file_id)
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/scribe-v2"
+    assert result["saved_to_workspace"] is True
+    with open(result["transcription_path"], encoding="utf-8") as f:
+        assert json.load(f)["model"] == "platform/scribe-v2"
+
+
+async def test_transcribe_audio_reports_the_selected_model_it_actually_used(
+    tmp_path,
+) -> None:
+    workspace, file_id = _transcription_input(tmp_path)
+    selected = FakeASR(model_id="platform/scribe-v2")
+    tool = AudioToolCore(asr_models={"scribe_v2": selected}, workspace=workspace)
+
+    result = await tool.transcribe_audio(file_id, model_id="scribe_v2")
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/scribe-v2"
+
+
+@pytest.mark.parametrize("requested_model_id", ["unconfigured-asr", "default"])
+async def test_transcribe_audio_reports_the_fallback_model_the_provider_used(
+    tmp_path, requested_model_id: str
+) -> None:
+    workspace, file_id = _transcription_input(tmp_path)
+    default_asr = FakeASR(model_id="platform/scribe-v2")
+    tool = AudioToolCore(
+        asr_models={"other-asr": FakeASR(model_id="platform/other-asr")},
+        default_asr_model=default_asr,
+        workspace=workspace,
+    )
+
+    result = await tool.transcribe_audio(file_id, model_id=requested_model_id)
+
+    assert result["success"] is True
+    assert result["model_used"] == "platform/scribe-v2"
+    assert result["model_used"] != requested_model_id
+
+
+async def test_transcribe_audio_omits_model_used_when_no_configured_id_is_known(
+    tmp_path,
+) -> None:
+    workspace, file_id = _transcription_input(tmp_path)
+    tool = AudioToolCore(default_asr_model=FakeASR(), workspace=workspace)
+
+    result = await tool.transcribe_audio(file_id)
+
+    assert result["success"] is True
+    assert "model_used" not in result

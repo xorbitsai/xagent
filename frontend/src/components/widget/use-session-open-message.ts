@@ -14,7 +14,7 @@ export const W_SESSION_ENDED = "Xagent Widget: the chat session has ended; the m
 // What a ready driver does with an open message in each phase: send it as the
 // first message of a conversation, start a new conversation first, wait for
 // the phase to move on, or drop it.
-const PHASE_ROUTE: Readonly<Record<SessionConversationPhase, "send" | "reset" | "wait" | "discard">> = {
+export const PHASE_ROUTE: Readonly<Record<SessionConversationPhase, "send" | "reset" | "wait" | "discard">> = {
   unbound: "send",
   bound: "reset",
   reset_requested: "wait",

@@ -107,9 +107,19 @@ async def test_ark_success_records_reported_seconds_tokens_and_identity():
 
 
 @pytest.mark.parametrize("status", ["failed", "cancelled", "expired"])
-async def test_ark_terminal_failure_records_once_and_is_not_retried(status):
+async def test_ark_terminal_failure_records_once_without_tokens_and_is_not_retried(
+    status, caplog
+):
+    # Ark bills only a video it generated successfully, so a task that ended
+    # without one records no tokens, even if the task query reported some.
     fake = _ArkFake(
-        [_succeeded(status=status, duration=5, usage={"completion_tokens": 0})]
+        [
+            _succeeded(
+                status=status,
+                duration=5,
+                usage={"completion_tokens": 108900, "total_tokens": 108900},
+            )
+        ]
     )
     model = _ark(fake)
 
@@ -121,10 +131,21 @@ async def test_ark_terminal_failure_records_once_and_is_not_retried(status):
     [row] = _rows(manager)
     assert row["quantity"] == 0.0
     assert row["provider_output_tokens"] == 0
+    assert any(
+        record.name == "xagent.core.model.video.ark"
+        and record.levelname == "WARNING"
+        and f"status {status} but reported 108900 completion tokens"
+        in record.getMessage()
+        for record in caplog.records
+    )
 
 
-async def test_ark_deadline_records_once_and_is_not_retried():
-    fake = _ArkFake([{"id": "task-1", "status": "running"}])
+async def test_ark_deadline_records_once_with_reported_tokens_and_is_not_retried():
+    # A task still running at the deadline keeps running, and Ark bills it if
+    # it succeeds, so whatever tokens Ark already reported are kept.
+    fake = _ArkFake(
+        [{"id": "task-1", "status": "running", "usage": {"completion_tokens": 7}}]
+    )
     model = _ark(fake)
 
     with TokenContextManager() as manager:
@@ -135,6 +156,7 @@ async def test_ark_deadline_records_once_and_is_not_retried():
     assert fake.creates == 1
     [row] = _rows(manager)
     assert row["quantity"] == 0.0
+    assert row["provider_output_tokens"] == 7
 
 
 async def test_ark_persistent_poll_network_errors_do_not_resubmit_the_task():

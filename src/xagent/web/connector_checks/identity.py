@@ -22,11 +22,12 @@ The adapter is responsible for the identity being one that may be probed;
 the engine trusts it as given. When the identity or its connectors cannot be
 resolved, ``enumerate_targets`` raises ``IdentitySetupError``.
 
-An adapter offers a target only for a connection that is the catalog's own.
+An adapter starts a target only for a connection that is the catalog's own.
 For a server row that is the probe route's catalog-identity rule
-(``_owns_catalog_identity`` in ``services/connector_probe.py``); an actor
+(``owns_catalog_identity`` in ``services/connector_probe.py``); an actor
 stdio connection is synthesized from the catalog. A lookalike or custom row
-never gets a builtin app's checks.
+never gets a builtin app's checks run: the adapter leaves it out, or offers
+it with a skip reason (the ``user`` adapter's ``not_catalog_identity``).
 
 App ids are unique per enumeration. Where an identity has several rows of
 one app, the adapter offers the one its catalog resolution selects, the one

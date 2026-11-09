@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import re
 import threading
 import time
 from datetime import timedelta
@@ -5500,3 +5502,109 @@ def test_app_teardown_serializes_later_sqlite_replacement(
     assert not teardown_thread.is_alive() and not mutation_thread.is_alive()
     expected_index = 0 if replaced == "catalog" else 1
     assert replacement_generation[0] != generations[expected_index]
+
+
+@pytest.mark.asyncio
+async def test_regional_bootstrap_moves_proof_without_changing_flow_client(
+    db_session, monkeypatch
+):
+    import json
+
+    from fastapi import FastAPI
+
+    from xagent.web.oauth_handoff import OAuthHandoffContext, redeem_handoff
+
+    db, user, _ = db_session
+    old = "https://xagent.example.com"
+    new = "https://new.example.com"
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", old)
+    monkeypatch.setenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", "true")
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": o,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": o + "/api/auth/oidc/google/callback",
+                }
+                for o in [old, new]
+            ]
+        ),
+    )
+    server = _add_mcp_oauth_server(db, user)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    class Adapter:
+        def context(self, request):
+            return OAuthHandoffContext("xagent", "prod", "au", old)
+
+        def set_route_cookie(self, response, *, state, kind, provider):
+            assert kind == "mcp" and provider is None
+            response.set_cookie("scoped-mcp", "au")
+
+    app = FastAPI()
+    app.state.oauth_handoff_adapter = Adapter()
+    req = _request(
+        "/api/mcp/1/oauth/connect",
+        headers=[
+            (b"host", b"new.example.com"),
+            (b"x-xagent-oauth-launch-version", b"2"),
+        ],
+    )
+    req.scope["app"] = app
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/tools"),
+        user,
+        db,
+        request=req,
+    )
+    assert "set-cookie" not in response.headers
+    data = json.loads(response.body)
+    assert data["launch_mode"] == "regional_bootstrap"
+    flow = db.query(MCPOAuthFlowState).one()
+    original_client = db.query(MCPOAuthClient).one()
+    assert flow.redirect_after == "/auth/mcp-complete"
+    assert original_client.redirect_uri == old + "/api/mcp/oauth/callback"
+    bootstrap = _request(
+        data["authorization_url"], headers=[(b"host", b"xagent.example.com")]
+    )
+    bootstrap.scope["app"] = app
+    # Step one only renders the confirmation page: no proof cookie, no consume.
+    page = redeem_handoff("au", bootstrap, db)
+    assert page.status_code == 200
+    assert not any(
+        "mcp_oauth_state" in cookie or "scoped-mcp" in cookie
+        for cookie in page.headers.getlist("set-cookie")
+    )
+    href = html.unescape(re.search(r'href="([^"]+)"', page.body.decode())[1])
+    confirm_cookie = page.headers["set-cookie"].split(";", 1)[0]
+    bootstrap = _request(
+        data["authorization_url"].split("?", 1)[0] + href,
+        headers=[
+            (b"host", b"xagent.example.com"),
+            (b"cookie", confirm_cookie.encode()),
+        ],
+    )
+    bootstrap.scope["app"] = app
+    released = redeem_handoff("au", bootstrap, db)
+    assert released.status_code == 303
+    cookies = released.headers.getlist("set-cookie")
+    assert any("Path=/api/mcp" in cookie for cookie in cookies)
+    assert any("scoped-mcp" in cookie for cookie in cookies)
+    assert not any("selected_region" in cookie for cookie in cookies)
+    query = _redirect_query(released)
+    assert query["redirect_uri"] == [original_client.redirect_uri]
+    assert query["client_id"] == [original_client.client_id]
+    assert query["code_challenge"] == [
+        mcp_api._pkce_code_challenge(decrypt_value(flow.code_verifier))
+    ]
+    assert db.query(MCPOAuthClient).count() == 1
+    with pytest.raises(HTTPException) as exc:
+        redeem_handoff("au", bootstrap, db)
+    assert exc.value.status_code == 401

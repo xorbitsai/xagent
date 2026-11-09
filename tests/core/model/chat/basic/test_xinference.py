@@ -7,12 +7,69 @@ import pytest
 from xagent.core.model.chat.basic.xinference import XinferenceLLM, _create_async_client
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMTimeoutError
-from xagent.core.model.chat.routing_context import xinference_routing_key
+from xagent.core.model.chat.routing_context import (
+    xinference_interactive_requests,
+    xinference_routing_key,
+)
 from xagent.core.model.chat.timeout_config import TimeoutConfig
 from xagent.core.model.chat.types import ChunkType
 
 
 class TestXinferenceLLM:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("supports_priority", [False, True])
+    async def test_only_interactive_requests_get_supported_chat_priority(
+        self, monkeypatch, stream, supports_priority
+    ):
+        description = {"model_type": "LLM", "model_ability": ["chat"]}
+        if supports_priority:
+            description["supports_chat_priority"] = True
+        describe = AsyncMock(return_value=description)
+        monkeypatch.setattr(
+            "xagent.core.model.public_xinference.PublicAsyncXinferenceClient.describe_model",
+            describe,
+        )
+        requests = []
+
+        async def chat(self, **kwargs):
+            requests.append(kwargs["generate_config"].copy())
+            if stream:
+
+                async def result():
+                    yield {"choices": [{"delta": {"content": "OK"}}]}
+
+                return result()
+            return {"content": "OK"}
+
+        monkeypatch.setattr(
+            "xagent.core.model.public_xinference.AsyncRESTfulChatModelHandle.chat",
+            chat,
+        )
+        llm = XinferenceLLM(model_name="model", base_url="https://xinference.example")
+
+        async def call(**kwargs):
+            messages = [{"role": "user", "content": "Reply OK"}]
+            if stream:
+                assert [
+                    c.delta async for c in llm.stream_chat(messages=messages, **kwargs)
+                ] == ["OK"]
+            else:
+                await llm.chat(messages=messages, **kwargs)
+
+        try:
+            with xinference_interactive_requests(True):
+                await call()
+                await call(priority=0)
+            await call()
+        finally:
+            await llm.close()
+        describe.assert_awaited_once_with("model")
+        assert requests[0].get("priority_hint") == (-1 if supports_priority else None)
+        assert requests[1]["priority"] == 0
+        assert "priority_hint" not in requests[1]
+        assert "priority_hint" not in requests[2]
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("supports_affinity", [False, True])
     async def test_chat_uses_discovered_session_affinity(

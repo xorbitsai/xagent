@@ -106,6 +106,7 @@ from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
+from .oauth_handoff import router as oauth_handoff_router
 from .runtime_telemetry import (
     start_process_runtime_telemetry,
     stop_process_runtime_telemetry,
@@ -1740,6 +1741,8 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 
 # API routers
 app.include_router(auth_router)
+
+app.include_router(oauth_handoff_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
 app.include_router(computer_router)
@@ -2589,12 +2592,14 @@ async def shutdown_event() -> None:
     from .services.task_coordinator_runtime import close_task_coordinators
     from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
+    from .services.turn_settlement import drain_turn_settlement_hooks
 
     # The diagnostics line keeps reporting while execution drains, and is
     # stopped even when a shutdown step below fails.
     try:
         await close_task_coordinators()
         await background_task_manager.shutdown()
+        await drain_turn_settlement_hooks()
         await wait_for_heartbeat_manager_idle()
         from .api.websocket import manager
 

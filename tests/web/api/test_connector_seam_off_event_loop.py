@@ -60,6 +60,14 @@ _SEAM_REACHING_FUNCTIONS = {
     "xagent.web.api.custom_api.update_custom_api",
     "xagent.web.api.custom_api.delete_custom_api",
     "xagent.web.api.mcp._local_mcp_can_attach",
+    # The member OAuth routes are coroutines, so they reach these plain-def
+    # helpers only through ``asyncio.to_thread`` (an argument, not a call):
+    # the hook runs in a worker thread.
+    "xagent.web.api.mcp._mcp_oauth_route_access_or_404",
+    "xagent.web.api.mcp._persist_team_member_mcp_oauth_connect_flow",
+    "xagent.web.api.mcp._mcp_oauth_team_flow_state_error",
+    "xagent.web.api.mcp._lock_team_member_mcp_oauth_lifecycle",
+    "xagent.web.api.mcp._store_team_member_mcp_oauth_grant",
     # The coroutine that owns app-scoped teardown, ``teardown_mcp_app_server``,
     # is absent on purpose: it hands this helper to ``asyncio.to_thread``
     # instead of calling it, so the seam runs in a worker thread and the

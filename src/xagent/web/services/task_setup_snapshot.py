@@ -29,6 +29,7 @@ Out of scope:
 
 from __future__ import annotations
 
+import enum
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -53,6 +54,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _NotLoaded(enum.Enum):
+    """Type of the marker for a task column the constructor never filled in.
+
+    An enum member stays the same object through copying and pickling, so the
+    identity comparison callers rely on survives a copied ``_TaskFields``.
+    """
+
+    TASK_FIELD_NOT_LOADED = 0
+
+
+# Compared by identity only. A field holding this marker was not read from the
+# task row, which is different from a column that was read and is NULL.
+TASK_FIELD_NOT_LOADED = _NotLoaded.TASK_FIELD_NOT_LOADED
+
+
 @dataclass(frozen=True)
 class _TaskFields:
     """Primitive subset of the ``Task`` row needed past the snapshot."""
@@ -71,6 +87,14 @@ class _TaskFields:
     state_version: int = 0
     control_state: str | None = None
     conversation_storage_version: int = 1
+    # The defaults below are the not-loaded marker, never None: for
+    # ``channel_id`` None means "web chat task", which is the permissive
+    # reading, so a construction site that forgets to fill these in must fail
+    # closed instead of looking like a web chat task.
+    channel_id: int | None | _NotLoaded = TASK_FIELD_NOT_LOADED
+    channel_name: str | None | _NotLoaded = TASK_FIELD_NOT_LOADED
+    telegram_user_id: str | None | _NotLoaded = TASK_FIELD_NOT_LOADED
+    sdk_credential_kind: str | None | _NotLoaded = TASK_FIELD_NOT_LOADED
 
 
 @dataclass(frozen=True)
@@ -528,6 +552,24 @@ def load_task_setup_snapshot_sync(
             user_id=int(task_row.user_id),
             status=task_row.status,
             source=str(task_row.source) if task_row.source is not None else None,
+            channel_id=(
+                int(task_row.channel_id) if task_row.channel_id is not None else None
+            ),
+            channel_name=(
+                str(task_row.channel_name)
+                if task_row.channel_name is not None
+                else None
+            ),
+            telegram_user_id=(
+                str(task_row.telegram_user_id)
+                if task_row.telegram_user_id is not None
+                else None
+            ),
+            sdk_credential_kind=(
+                str(task_row.sdk_credential_kind)
+                if task_row.sdk_credential_kind is not None
+                else None
+            ),
             agent_id=int(task_row.agent_id) if task_row.agent_id is not None else None,
             agent_config=(
                 dict(task_row.agent_config)

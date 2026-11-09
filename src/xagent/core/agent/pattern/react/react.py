@@ -76,6 +76,7 @@ from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
 )
+from ....guardrails.output import ProtectedInteractionError
 from ....model.chat.basic.base import compatible_tool_choice_for_llm
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
@@ -109,6 +110,7 @@ from ....tools.user_interaction import (
 )
 from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
+from ...context import ExecutionContext
 from ...context.components import LoadedToolsComponent
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
@@ -897,13 +899,9 @@ class ReActPattern(AgentPattern):
                 runtime=runtime,
                 tools=tools,
             )
-        except CheckpointPersistenceError as exc:
-            # This runs before the main try/except below, so without this
-            # handler a durability failure while checkpointing the received
-            # user response (see ``_resume_waiting_for_user_if_needed``'s
-            # ``"tool_interaction_response_received"`` checkpoint) would
-            # propagate straight past ``on_pattern_error``: no terminal
-            # ``trace_error`` would be recorded, even though the run aborts.
+        except (CheckpointPersistenceError, ProtectedInteractionError) as exc:
+            # The resume path runs before the main try/except. Record a
+            # terminal trace for rejected questions and checkpoint failures.
             await runtime.on_pattern_error(context=context, pattern=self, error=exc)
             raise
         if waiting_result is not None:
@@ -983,6 +981,8 @@ class ReActPattern(AgentPattern):
                 raise
             result = interrupted
         except Exception as exc:
+            if isinstance(exc, ProtectedInteractionError):
+                await self._checkpoint_rejected_question(context, runtime)
             await runtime.on_pattern_error(context=context, pattern=self, error=exc)
             raise
 
@@ -3146,13 +3146,7 @@ class ReActPattern(AgentPattern):
             self.waiting_for_user_request.get("message_count", 0)
         )
         if len(getattr(context, "messages", [])) <= waiting_message_count:
-            await runtime.checkpoint(
-                "waiting_for_user",
-                context=context,
-                pattern=self,
-                metadata={"waiting_for_user_request": self.waiting_for_user_request},
-            )
-            return {
+            result = {
                 "success": False,
                 "status": "waiting_for_user",
                 "message": self.waiting_for_user_request.get("message", ""),
@@ -3167,6 +3161,16 @@ class ReActPattern(AgentPattern):
                     step_id=None,
                 ),
             }
+            if not await runtime.approve_waiting_result(result):
+                await self._checkpoint_rejected_question(context, runtime)
+                raise ProtectedInteractionError()
+            await runtime.checkpoint(
+                "waiting_for_user",
+                context=context,
+                pattern=self,
+                metadata={"waiting_for_user_request": self.waiting_for_user_request},
+            )
+            return result
 
         response = self._mark_latest_user_message_as_waiting_response(
             context=context,
@@ -5306,6 +5310,18 @@ class ReActPattern(AgentPattern):
             ),
         )
         self._forget_tool_call_content(tool_call)
+
+    async def _checkpoint_rejected_question(
+        self, context: ExecutionContext, runtime: PatternRuntime
+    ) -> None:
+        self._discard_pending_tool_plan_after_pause(
+            context, reason="The question was rejected by output review."
+        )
+        self.waiting_for_user_request = None
+        self.status = "failed"
+        await runtime.checkpoint(
+            "output_review_rejected_question", context=context, pattern=self
+        )
 
     def _discard_pending_tool_plan_after_pause(
         self, context: Any, *, reason: str | None = None

@@ -502,6 +502,10 @@ function mcpMutationValues(
   if (isStringRecord(config.env) && isStringRecord(baselineConfigEnv)) {
     config.env = preserveBlankMaskedValues(config.env, baselineConfigEnv)
   }
+  const baselineConfigHeaders = baseline?.config.headers
+  if (isStringRecord(config.headers) && isStringRecord(baselineConfigHeaders)) {
+    config.headers = preserveBlankMaskedValues(config.headers, baselineConfigHeaders)
+  }
   const userEnv = preserveBlankMaskedValues(userEnvValue, baseline?.user_env)
 
   return {
@@ -645,6 +649,7 @@ export function buildMcpServerPayload(
 
 export interface McpOAuthConnectResponse {
   authorization_url: string
+  launch_mode?: string
 }
 
 /** Extract a human-readable message from an MCP OAuth endpoint error body.

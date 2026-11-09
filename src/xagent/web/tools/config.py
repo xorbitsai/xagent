@@ -129,6 +129,7 @@ MCP_UNAVAILABLE_REASONS = frozenset(
         ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
+        "grant_not_allowed_for_task_source",
         "insufficient_scope",
         "invalid_configuration",
         "invalid_launch_config",
@@ -1944,6 +1945,9 @@ class WebToolConfig(BaseToolConfig):
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
         knowledge_base_team_id: Optional[int] = None,
         excluded_model_ids: frozenset[str] = frozenset(),
+        # Closed by default; the task builder passes the task-source gate's
+        # verdict for the task this config serves.
+        mcp_team_member_grants_allowed: bool = False,
     ):
         # Media model ids this task excludes; the getters drop them from the
         # kind's dict and re-pick an excluded default (see the filter helper).
@@ -1973,6 +1977,10 @@ class WebToolConfig(BaseToolConfig):
         # empty declaration (a workforce allowlist hop whose runner can no
         # longer run the agent fails before any config is built).
         self._knowledge_base_team_id = knowledge_base_team_id
+        # Whether the task this config serves may use MCP OAuth grants that a
+        # team member obtained without holding an association to the shared
+        # connector. Decided once by the task builder; closed by default.
+        self._mcp_team_member_grants_allowed = mcp_team_member_grants_allowed
         # The governing agent's creator -- always the same agent as
         # ``_knowledge_base_team_id`` above, populated by the same caller.
         # Used by the knowledge-base resolution path to tell the agent's
@@ -5408,6 +5416,7 @@ class WebToolConfig(BaseToolConfig):
                             server,
                             user_id=self._user_id,
                             mcp_auth_context=auth_context,
+                            allow_team_member_grants=self._mcp_team_member_grants_allowed,
                         )
                     except ConnectorRuntimeError:
                         raise

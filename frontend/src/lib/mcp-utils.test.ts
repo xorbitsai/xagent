@@ -419,6 +419,59 @@ describe("MCP edit contract", () => {
     ).toEqual({})
   })
 
+  it("preserves transient blank masked header values", () => {
+    const detail = parseMcpServerDetail({
+      ...mcpDetailPayload,
+      config: {
+        ...mcpDetailPayload.config,
+        headers: { "X-Proxy-Client-Id": "********", "X-Proxy-Client-Secret": "********" },
+      },
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(
+      buildMcpServerPayload(
+        {
+          ...formData,
+          config: {
+            ...formData.config,
+            headers: { "X-Proxy-Client-Id": "", "X-Proxy-Client-Secret": "   " },
+          },
+        },
+        detail,
+      ),
+    ).toEqual({})
+  })
+
+  it("restores only header values the baseline returned masked", () => {
+    const detail = parseMcpServerDetail({
+      ...mcpDetailPayload,
+      config: {
+        ...mcpDetailPayload.config,
+        headers: { "X-Proxy-Client-Secret": "********", "X-Proxy-Trace": "" },
+      },
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(
+      buildMcpServerPayload(
+        {
+          ...formData,
+          config: {
+            ...formData.config,
+            headers: { "X-Proxy-Client-Secret": "", "X-Proxy-Trace": "", "X-New": "" },
+          },
+        },
+        detail,
+      ),
+    ).toEqual({
+      config: {
+        ...mcpDetailPayload.config,
+        headers: { "X-Proxy-Client-Secret": "********", "X-Proxy-Trace": "", "X-New": "" },
+      },
+    })
+  })
+
   it("whitelists the complete create contract", () => {
     expect(
       buildMcpServerPayload({

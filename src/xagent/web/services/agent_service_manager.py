@@ -23,6 +23,7 @@ from ...core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.structured_output import StructuredOutputFormat
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -99,6 +100,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
+    team_member_mcp_grants_allowed_for_task,
 )
 from .memory_availability import (
     GENERIC_MEMORY_AVAILABILITY_REASON as GENERIC_MEMORY_AVAILABILITY_REASON,
@@ -174,6 +176,7 @@ from .task_workspace_cleanup import (
     capture_workspace_cleanup_target,
     remove_task_workspace,
 )
+from .turn_settlement import TurnUsage
 from .workforce_runtime import (
     WorkforceTaskRuntime,
     release_task_lease_with_workforce_sync,
@@ -851,6 +854,7 @@ async def create_default_tools(
     agent_creator_user_id: Optional[int] = None,
     declared_knowledge_bases: Optional[List[str]] = None,
     excluded_model_ids: frozenset[str] = frozenset(),
+    mcp_team_member_grants_allowed: bool = False,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -884,6 +888,10 @@ async def create_default_tools(
     place ``allowed_collections`` already is (the agent's own configuration)
     and is never the model-supplied value on a search request -- the two stay
     distinct all the way to the resolution point.
+
+    ``mcp_team_member_grants_allowed`` is the task-source gate's verdict (see
+    :func:`team_member_mcp_grants_allowed_for_task`). It defaults to ``False``;
+    only the two task builders pass it, so every other caller is closed.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -967,6 +975,7 @@ async def create_default_tools(
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
         excluded_model_ids=excluded_model_ids,
+        mcp_team_member_grants_allowed=mcp_team_member_grants_allowed,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -2371,6 +2380,9 @@ class AgentServiceManager:
             if agent_config
             else None,
             excluded_model_ids=excluded_model_ids,
+            mcp_team_member_grants_allowed=team_member_mcp_grants_allowed_for_task(
+                task
+            ),
         )
 
     @agent_setup.measure()
@@ -3227,6 +3239,9 @@ class AgentServiceManager:
                     if agent_config
                     else None,
                     excluded_model_ids=excluded_model_ids,
+                    mcp_team_member_grants_allowed=(
+                        team_member_mcp_grants_allowed_for_task(task)
+                    ),
                 )
 
                 with UserContext(runtime_user_id):
@@ -4071,6 +4086,8 @@ class AgentServiceManager:
         task_lease_heartbeat_task: (
             asyncio.Task[TaskLeaseHeartbeatOutcome] | None
         ) = None,
+        turn_usage_sink: Callable[[TurnUsage], None] | None = None,
+        structured_output_format: StructuredOutputFormat | None = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
@@ -4103,6 +4120,16 @@ class AgentServiceManager:
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
+            turn_usage_sink: Handed to the run's tracker, which passes it this
+                run's usage whenever tracking completion returns, including
+                when the final write was not persisted because the database
+                ownership check failed. Not called when tracking is off, when
+                completion raises (a pool timeout), or when this method has
+                already seen lease ownership lost and only stops the tracker.
+                Its own failure is logged and never changes the run's result.
+            structured_output_format: The result shape to extract from the
+                final answer. It is handed to ``agent_service.execute_task``
+                only when it is not None.
 
         Returns:
             Execution result dictionary
@@ -4344,6 +4371,9 @@ class AgentServiceManager:
                             else None
                         ),
                     )
+                    # The tracker hands this run's usage to the sink each
+                    # time its completion returns.
+                    tracker.turn_usage_sink = turn_usage_sink
                     await tracker.start_tracking()
                     # Enforce quota mid-run: the pattern loop polls this every step
                     # (each LLM reply / tool call) and stops the run once its live
@@ -4388,18 +4418,26 @@ class AgentServiceManager:
             # reused service observes the exact current run.
             execution_lease = lease or task_lease
 
+            format_kwargs: Dict[str, Any] = (
+                {}
+                if structured_output_format is None
+                else {"structured_output_format": structured_output_format}
+            )
+
             async def execute_agent_task() -> Dict[str, Any]:
                 if execution_lease is None:
                     return await agent_service.execute_task(
                         task=task,
                         context=context,
                         task_id=task_id,
+                        **format_kwargs,
                     )
                 with bind_task_lease_context(execution_lease):
                     return await agent_service.execute_task(
                         task=task,
                         context=context,
                         task_id=task_id,
+                        **format_kwargs,
                     )
 
             async def execute_owned_turn() -> Dict[str, Any]:

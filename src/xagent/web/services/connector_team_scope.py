@@ -54,6 +54,10 @@ that declares it is checked; one that does not is not.
 | ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
 | ``custom_api._resolve_custom_api_for_request`` | nothing -- this resolution runs before either of its two routes takes any lock | no | ``False`` |
 | ``mcp.get_mcp_server`` | nothing -- this read takes no lock | no | ``False`` |
+| ``mcp._mcp_oauth_route_access_or_404`` | nothing -- the member OAuth preflight takes no lock | no | ``False`` |
+| ``mcp._persist_team_member_mcp_oauth_connect_flow`` | two row locks: ``mcp_servers`` ``FOR UPDATE`` and ``users`` ``FOR SHARE`` | no | ``True`` |
+| ``mcp._mcp_oauth_team_flow_state_error`` | nothing -- the callback preflight takes no lock | no | ``False`` |
+| ``mcp._lock_team_member_mcp_oauth_lifecycle`` | three row locks: ``mcp_servers``, ``users`` and ``mcp_oauth_flow_states`` | yes, the callback committed its flow claim | ``True`` |
 
 ``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
 route decorator, and its only caller in this repository outside tests is the
@@ -74,14 +78,19 @@ hook's work local to the database: blocking on an external network call there
 holds that queue open for as long as the call takes. xagent has no way to
 check this at run time, so it is stated here rather than enforced.
 
-The remaining slots declare nothing. Every ``visibility`` and
-``team_visibility`` call site is lock-free, and one of the ``team_visibility``
-paths runs on a lazily created session that may not be in a transaction at
-all. A caller that adds a new ``access`` call site while holding a lock owes
-this table a row and owes the call ``caller_holds_lock=True``. One shape must
-never declare it: a call site that has already committed its own work before
-asking, because refusing there reports a failure for an operation that fully
-succeeded.
+The remaining slots declare nothing. The ``visibility`` and
+``team_visibility`` call sites are all lock-free, except that
+``team_member_oauth_scope``, which reads the same ``visibility`` hook, runs
+with locks held at the two call sites the table above registers as ``True``.
+One of the ``team_visibility`` paths runs on a lazily created session that may
+not be in a transaction at all. A caller that adds a new ``access`` call site
+while holding a lock owes this table a row and owes the call
+``caller_holds_lock=True``. One shape must never declare it: a call site whose
+own operation has already fully succeeded before asking, because refusing there
+reports a failure for an operation that fully succeeded. A call site that
+committed an intermediate step of an operation that has not yet succeeded (the
+MCP OAuth callback commits its flow claim before it writes the grant) may
+declare it: refusing there fails the operation, which is the truth.
 
 What the check is not
 ---------------------
@@ -262,8 +271,12 @@ class TeamConnectorVisibilityHook(Protocol):
     that team's agents, not only members: for stdio and other static-auth
     MCP transports, a team-owned server with no personal link for the
     running user executes using the shared definition row's own stored
-    credentials, not the runner's. (OAuth transports fail closed instead,
-    for lack of a token to resolve.) For stdio specifically, **once an
+    credentials, not the runner's. (OAuth transports use only the running
+    user's own grant; a runner who holds none fails closed. A runner obtains one
+    only through the member OAuth routes, which admit callers through
+    ``team_member_oauth_scope`` -- only for servers the embedder opens to member
+    authorization, only with this deployment's own OAuth callback, and only for
+    a protected resource equal to the server's current URL.) For stdio specifically, **once an
     application has also installed the separate, credential-side hook**
     (``mcp_runtime.set_mcp_team_env_hook`` -- a different socket from this
     one, installed independently), the shared env layer a team-owned
@@ -341,6 +354,11 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     that can see its own link table; xagent cannot verify that and does
     not try.
 
+    The member OAuth routes read the same hook answer through
+    ``team_member_oauth_scope``, because an embedder may install no access
+    hook; the answer must be derived from the same link query as the
+    runtime's team_visibility answer.
+
     When the two answers disagree, xagent does not reconcile them: each
     question is answered from the hook that owns it, and whatever that
     hook said is what the caller gets. A connector one hook reports and
@@ -351,6 +369,108 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
         return {"mcp": set(), "custom_api": set()}
     return _call_connector_hook_gate(
         db, _connector_visibility_hook, db, int(user_id), slot="visibility"
+    )
+
+
+TEAM_MEMBER_OAUTH_MCP_KEY = "member_oauth_mcp"
+
+
+@dataclass(frozen=True)
+class TeamMemberOAuthScope:
+    visible_mcp_ids: frozenset[int]
+    member_oauth_mcp_ids: frozenset[int]  # always a subset of visible_mcp_ids
+
+
+def _validate_member_oauth_answer(answer: Any) -> dict[str, set[int]]:
+    """Validate the visibility hook's answer for member OAuth.
+
+    Returns ``{"mcp": ..., "member_oauth_mcp": ...}`` as copies. A missing
+    ``member_oauth_mcp`` key means no server is open; a malformed value is an
+    error, never an empty set.
+    """
+    if not isinstance(answer, dict):
+        raise ValueError(
+            "visibility hook returned a malformed answer: expected a dict, "
+            f"got {type(answer).__name__}"
+        )
+    mcp_ids = _validate_id_set(answer.get("mcp", None), "mcp", present="mcp" in answer)
+    if TEAM_MEMBER_OAUTH_MCP_KEY not in answer:
+        return {"mcp": mcp_ids, TEAM_MEMBER_OAUTH_MCP_KEY: set()}
+    open_ids = _validate_id_set(
+        answer[TEAM_MEMBER_OAUTH_MCP_KEY], TEAM_MEMBER_OAUTH_MCP_KEY, present=True
+    )
+    if not open_ids <= mcp_ids:
+        raise ValueError(
+            "visibility hook returned a malformed answer: key "
+            f"{TEAM_MEMBER_OAUTH_MCP_KEY!r} is not a subset of 'mcp'"
+        )
+    return {"mcp": mcp_ids, TEAM_MEMBER_OAUTH_MCP_KEY: open_ids}
+
+
+def _validate_id_set(value: Any, key: str, *, present: bool) -> set[int]:
+    if not present:
+        raise ValueError(
+            f"visibility hook returned a malformed answer: missing key {key!r}"
+        )
+    if not isinstance(value, set):
+        raise ValueError(
+            "visibility hook returned a malformed answer: key "
+            f"{key!r} must be a set, got {type(value).__name__}"
+        )
+    for member in value:
+        if isinstance(member, bool) or not isinstance(member, int):
+            raise ValueError(
+                "visibility hook returned a malformed answer: key "
+                f"{key!r} contains a member {member!r} that is not a "
+                "connector id (must be int, not bool)"
+            )
+    return set(value)
+
+
+def team_member_oauth_scope(
+    db: Any, user_id: int, *, caller_holds_lock: bool = False
+) -> TeamMemberOAuthScope:
+    """The team-overlay MCP servers this user sees, and those open to member OAuth.
+
+    Both sets come from one call of the installed user-keyed visibility hook.
+    ``member_oauth_mcp_ids`` is read from the optional ``member_oauth_mcp`` key;
+    a missing key means "none": an embedder must name the servers it opens to
+    member authorization, so a hook that predates the key, or omits it by
+    mistake, opens nothing.
+
+    Opening a server here obliges the embedder to delete the member's
+    team-path grants and flows in the same transaction that removes the
+    member's team access; the runtime does not re-check membership.
+
+    The OAuth callback locks the ``mcp_servers`` row ``FOR UPDATE``, then the
+    member's ``users`` row ``FOR SHARE``, then the flow row ``FOR UPDATE``, and
+    asks this hook last, in its own READ COMMITTED snapshot, before it writes
+    the grant. A deletion therefore has to serialize against that callback
+    before it reads the grants it deletes. Any one of these is enough:
+
+    * hold the connector's ``mcp_servers`` row ``FOR UPDATE``;
+    * lock the member's ``users`` row ``FOR NO KEY UPDATE`` or stronger;
+    * first delete every flow of that member on that connector, claimed and
+      expired ones included, then delete the grants. Deleting only unclaimed
+      flows does not wait for a callback that has already claimed its flow.
+
+    Deleting grants first, without one of these, can miss a grant the callback
+    commits right after, and the removed member keeps a usable grant.
+    """
+    if _connector_visibility_hook is None:
+        return TeamMemberOAuthScope(frozenset(), frozenset())
+    answer = _call_connector_hook_gate(
+        db,
+        _connector_visibility_hook,
+        db,
+        int(user_id),
+        slot="visibility",
+        validate=_validate_member_oauth_answer,
+        session_boundary_checked=caller_holds_lock,
+    )
+    return TeamMemberOAuthScope(
+        visible_mcp_ids=frozenset(answer["mcp"]),
+        member_oauth_mcp_ids=frozenset(answer[TEAM_MEMBER_OAUTH_MCP_KEY]),
     )
 
 
@@ -820,9 +940,12 @@ def _call_connector_hook_gate(
     ``session_boundary_checked`` says whether to compare at all, and it
     is off by default. Session boundary checking is declared per call
     site, not inherited by every slot: a call site holding a row lock
-    across a hook call declares it, and a call site that has already
-    committed its own work before asking must not, because refusing there
-    would report a failure for an operation that already succeeded.
+    across a hook call declares it, and a call site whose own operation has
+    already fully succeeded before asking must not, because refusing there
+    would report a failure for an operation that already succeeded. A call
+    site that committed an intermediate step of an operation that has not yet
+    succeeded may declare it: refusing there fails the operation, which is the
+    truth.
     Which call sites declare it, and why, is the table in this module's
     docstring. The cost of that default is stated there too: a new
     lock-holding call site that forgets to declare is not checked.

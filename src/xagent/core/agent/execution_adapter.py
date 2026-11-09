@@ -449,7 +449,7 @@ class AgentExecutionAdapter:
             output = INTERRUPTED_USER_MESSAGE
         else:
             output = result.get("output", result.get("response", result.get("error")))
-            if not output:
+            if not output and not result.get("_output_guardrail_applied"):
                 # This backfill and the raw ``agent_result`` preserved below
                 # must stay distinguishable: the delegated-child classifier
                 # in ``agent_tool.py`` reads the pre-backfill answer from
@@ -490,6 +490,11 @@ class AgentExecutionAdapter:
             "agent_result": result,
             "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
+        if not output:
+            # ``output`` above now holds the placeholder, which a reader cannot
+            # tell from a real answer; this key is the supported way to know
+            # the run produced none.
+            normalized["output_missing"] = True
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome
@@ -517,6 +522,19 @@ class AgentExecutionAdapter:
         failure_code = normalize_tool_failure_code(result.get("failure_code"))
         if failure_code is not None:
             normalized["failure_code"] = failure_code
+        # Run classification for whatever reports the settled run. Each value
+        # crosses this boundary only in its expected type; ``metadata`` above
+        # stays config-only because the resume path sends it to the browser.
+        finish_reason = result.get("finish_reason")
+        if type(finish_reason) is str and finish_reason.strip():
+            normalized["finish_reason"] = finish_reason
+        if result.get("empty_final_answer") is True:
+            normalized["empty_final_answer"] = True
+        raw_metadata = result.get("metadata")
+        if isinstance(raw_metadata, dict):
+            first_delta_at = raw_metadata.get("first_answer_delta_at")
+            if type(first_delta_at) is str:
+                normalized["first_answer_delta_at"] = first_delta_at
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

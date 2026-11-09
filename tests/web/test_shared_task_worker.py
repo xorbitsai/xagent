@@ -57,6 +57,11 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
     monkeypatch.setattr(worker, "background_task_manager", manager)
     monkeypatch.setattr(
         worker,
+        "drain_turn_settlement_hooks",
+        AsyncMock(side_effect=lambda: order.append("settlement_drain")),
+    )
+    monkeypatch.setattr(
+        worker,
         "close_task_coordinators",
         AsyncMock(side_effect=lambda: order.append("coordinator_drain")),
     )
@@ -172,6 +177,7 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         order.index("stop_claims")
         < order.index("coordinator_drain")
         < order.index("drain")
+        < order.index("settlement_drain")
         < order.index("heartbeat_idle")
         < order.index("stop_bridge")
         < order.index("chrome_drain")

@@ -40,7 +40,6 @@ from starlette.responses import JSONResponse
 
 from ...builtin_identity import owned_catalog_marker
 from ...config import (
-    get_app_base_url,
     get_auth_login_account_limit,
     get_auth_login_ip_limit,
     get_auth_login_pair_limit,
@@ -54,6 +53,7 @@ from ...config import (
     get_google_restricted_scopes,
     get_google_shared_oauth_grants_enabled,
     get_password_reset_expire_minutes,
+    get_primary_public_site_url,
 )
 from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
 from ...core.runtime_performance import (
@@ -1814,7 +1814,7 @@ def get_app_name() -> str:
 
 
 def build_password_reset_url(token: str) -> str:
-    base_url = get_app_base_url()
+    base_url = get_primary_public_site_url()
     if not base_url:
         raise RuntimeError(
             "XAGENT_APP_BASE_URL must be configured for password reset emails"
@@ -6460,6 +6460,33 @@ def start_oauth_authorization(
             400, "Invalid OAuth callback configuration", headers=private_headers
         )
     callback_origin = f"{callback.scheme}://{callback.netloc}"
+    from ..oauth_handoff import (
+        issue_handoff,
+        regional_launch_requested,
+        validate_builtin_resource,
+    )
+
+    if regional_launch_requested(request):
+        from ...config import get_oauth_callback_origin_map, normalize_public_origin
+        from ..public_entries import request_public_entry
+
+        validate_builtin_resource(db, provider, payload.app_id)
+        payload.redirect = request_public_entry(request).origin
+        result = issue_handoff(
+            request,
+            user,
+            kind="builtin",
+            resource={
+                "provider": provider,
+                "options": payload.model_dump(),
+            },
+        )
+        # Map keys are normalized origins; normalize before the alias lookup.
+        result["callback_origin"] = get_oauth_callback_origin_map().get(
+            normalize_public_origin(callback_origin), callback_origin
+        )
+        return JSONResponse(result, headers=private_headers)
+
     from urllib.parse import quote, urlencode
 
     ticket = create_access_token(

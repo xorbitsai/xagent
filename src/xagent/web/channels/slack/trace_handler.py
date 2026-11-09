@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from slack_sdk.web.async_client import AsyncWebClient
 
 from ....core.agent.trace import TraceAction, TraceCategory, TraceEvent, TraceHandler
+from ...services.public_trace_events import is_audit_only_trace_data
 from .utils import markdown_to_slack, strip_slack_file_refs
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ class SlackTraceHandler(TraceHandler):
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:
+            if is_audit_only_trace_data(event.data):
+                return
             if event.task_id is not None and str(event.task_id) != str(self.task_id):
                 return
 

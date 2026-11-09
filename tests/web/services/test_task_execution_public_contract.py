@@ -106,6 +106,10 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     # delivery it claimed itself, so a claim refused for an ended run
     # withdraws the never-injected row instead of settling it unknown.
     ("delivery_claimed_fresh", False),
+    # Appended for the same reason: the facts bag this resume fills and
+    # reports its own settlement from; None makes the resume create one. The
+    # default keeps every other caller unchanged.
+    ("turn_facts", None),
 ]
 
 EXPECTED_EXECUTE_PARAMETERS: list[tuple[str, Any]] = [
@@ -121,6 +125,9 @@ EXPECTED_EXECUTE_PARAMETERS: list[tuple[str, Any]] = [
     ("task_lease", None),
     ("resolved_execution_scope", EXECUTION_SCOPE_NOT_PROVIDED),
     ("mcp_runtime_authorization_policy", None),
+    # Appended: the facts bag the scheduler reports the run's settlement
+    # from. Defaulted, so existing callers bind unchanged.
+    ("turn_facts", None),
 ]
 
 # ``BackgroundTaskManager`` methods the downstream calls, as

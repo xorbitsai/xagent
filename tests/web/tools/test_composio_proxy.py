@@ -457,16 +457,35 @@ def test_an_error_that_echoes_a_provider_token_is_redacted(proxy):
     assert "Bearer [redacted]" in text
 
 
+def test_a_multiline_query_value_is_passed_through(proxy):
+    """M2: a Salesforce SOQL/SOSL query or a Gmail ``q`` can be multi-line.
+    The value is Composio's to encode, so it must not be refused here; only
+    names, headers and the endpoint are checked for control characters."""
+    soql = "SELECT Id, Name\nFROM Account\nWHERE Name = 'Acme'"
+
+    response = composio_proxy.proxy_request(
+        "GET",
+        "/services/data/v62.0/query",
+        allowed_hosts=(),
+        query=[("q", soql)],
+    )
+
+    assert response.status == 200
+    (call,) = proxy.calls
+    assert call["json"]["parameters"] == [{"name": "q", "value": soql, "type": "query"}]
+
+
 @pytest.mark.parametrize(
     "query, headers",
     [
-        ([("q", "a\r\nX-Injected: 1")], None),
+        ([("q\nX-Injected", "1")], None),
         (None, {"accept": "application/json\nX-Injected: 1"}),
         (None, {"accept": "application/json\rX-Injected: 1"}),
+        (None, {"accept": "application/json\r\nX-Injected: 1"}),
     ],
-    ids=["query-crlf", "header-lf", "header-cr"],
+    ids=["query-name-lf", "header-lf", "header-cr", "header-crlf"],
 )
-def test_a_control_character_in_a_parameter_is_refused_before_sending(
+def test_a_control_character_in_a_query_name_or_header_is_refused_before_sending(
     proxy, query, headers
 ):
     with pytest.raises(ValueError, match="control character"):

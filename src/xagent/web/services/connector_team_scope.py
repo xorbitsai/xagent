@@ -354,9 +354,10 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     that can see its own link table; xagent cannot verify that and does
     not try.
 
-    The member OAuth routes also admit by this answer, because an embedder
-    may install no access hook; the answer must be derived from the same
-    link query as the runtime's team_visibility answer.
+    The member OAuth routes read the same hook answer through
+    ``team_member_oauth_scope``, because an embedder may install no access
+    hook; the answer must be derived from the same link query as the
+    runtime's team_visibility answer.
 
     When the two answers disagree, xagent does not reconcile them: each
     question is answered from the hook that owns it, and whatever that
@@ -440,6 +441,21 @@ def team_member_oauth_scope(
     Opening a server here obliges the embedder to delete the member's
     team-path grants and flows in the same transaction that removes the
     member's team access; the runtime does not re-check membership.
+
+    The OAuth callback locks the ``mcp_servers`` row ``FOR UPDATE``, then the
+    member's ``users`` row ``FOR SHARE``, then the flow row ``FOR UPDATE``, and
+    asks this hook last, in its own READ COMMITTED snapshot, before it writes
+    the grant. A deletion therefore has to serialize against that callback
+    before it reads the grants it deletes. Any one of these is enough:
+
+    * hold the connector's ``mcp_servers`` row ``FOR UPDATE``;
+    * lock the member's ``users`` row ``FOR NO KEY UPDATE`` or stronger;
+    * first delete every flow of that member on that connector, claimed and
+      expired ones included, then delete the grants. Deleting only unclaimed
+      flows does not wait for a callback that has already claimed its flow.
+
+    Deleting grants first, without one of these, can miss a grant the callback
+    commits right after, and the removed member keeps a usable grant.
     """
     if _connector_visibility_hook is None:
         return TeamMemberOAuthScope(frozenset(), frozenset())

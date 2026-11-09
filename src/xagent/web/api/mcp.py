@@ -49,6 +49,8 @@ from ...config import (
     get_mcp_tool_init_timeout_seconds,
     get_public_api_base_url,
     get_session_secret,
+    normalize_public_origin,
+    public_entries_configured,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
     ConnectorRef,
@@ -93,10 +95,7 @@ from ..services.connector_name_policy import (
     folds_to_catalog_app_name,
     has_folded_connector_name_conflict,
 )
-from ..services.connector_team_scope import (
-    TeamMemberOAuthScope,
-    team_member_oauth_scope,
-)
+from ..services.connector_team_scope import team_member_oauth_scope
 from ..services.google_picker import get_google_picker_config
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -977,8 +976,6 @@ class _MCPOAuthRouteAccess:
     server: MCPServer
     # None means the caller reaches the server only through the team overlay.
     association: UserMCPServer | None
-    # Set only when association is None.
-    scope: TeamMemberOAuthScope | None = None
 
 
 def _mcp_oauth_route_access_or_404(
@@ -986,15 +983,16 @@ def _mcp_oauth_route_access_or_404(
     *,
     user_id: int,
     server_id: int,
-    require_active: bool,
     require_member_oauth: bool,
 ) -> _MCPOAuthRouteAccess:
     """Decide how ``user_id`` reaches ``server_id`` on the OAuth routes.
 
-    A caller with an association row always takes the association path, active
-    or not. Otherwise the caller needs the team overlay to show them the server
-    and, when ``require_member_oauth`` is set, the embedder to have opened it to
-    member authorization. Unknown and invisible servers are indistinguishable.
+    A caller with an association row always takes the association path; an
+    inactive row is a 404. Otherwise the caller needs the team overlay to show
+    them the server and, when ``require_member_oauth`` is set, the embedder to
+    have opened it to member authorization. Unknown and invisible servers are
+    indistinguishable, also while the hook is failing: both get 503, because
+    the hook is asked before the server row is looked up.
     """
     association = (
         db.query(UserMCPServer)
@@ -1004,17 +1002,13 @@ def _mcp_oauth_route_access_or_404(
         )
         .first()
     )
-    server = db.get(MCPServer, server_id)
     if association is not None:
-        if (require_active and not association.is_active) or server is None:
+        server = db.get(MCPServer, server_id)
+        if not association.is_active or server is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
             )
         return _MCPOAuthRouteAccess(server=server, association=association)
-    if server is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
-        )
     try:
         scope = team_member_oauth_scope(db, user_id)
     except Exception:
@@ -1039,7 +1033,12 @@ def _mcp_oauth_route_access_or_404(
                 "message": "This connector is not open to member authorization",
             },
         )
-    return _MCPOAuthRouteAccess(server=server, association=None, scope=scope)
+    server = db.get(MCPServer, server_id)
+    if server is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+        )
+    return _MCPOAuthRouteAccess(server=server, association=None)
 
 
 def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
@@ -1364,6 +1363,19 @@ def _lock_active_mcp_oauth_lifecycle(
     return server, association, flow_state
 
 
+def _caller_holds_association(db: Session, *, user_id: int, server_id: int) -> bool:
+    """Whether ``user_id`` has a link row for ``server_id``, active or not."""
+    return (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .first()
+        is not None
+    )
+
+
 def _lock_team_member_mcp_oauth_lifecycle(
     db: Session,
     *,
@@ -1398,14 +1410,8 @@ def _lock_team_member_mcp_oauth_lifecycle(
     )
     if user is None:
         return None
-    if (
-        db.query(UserMCPServer.id)
-        .filter(
-            UserMCPServer.user_id == flow_identity.user_id,
-            UserMCPServer.mcpserver_id == flow_identity.server_id,
-        )
-        .first()
-        is not None
+    if _caller_holds_association(
+        db, user_id=flow_identity.user_id, server_id=flow_identity.server_id
     ):
         return None
     flow_state = (
@@ -1663,15 +1669,7 @@ def _persist_team_member_mcp_oauth_connect_flow(
         if user is None:
             db.rollback()
             return None
-        if (
-            db.query(UserMCPServer.id)
-            .filter(
-                UserMCPServer.user_id == user_id,
-                UserMCPServer.mcpserver_id == server_id,
-            )
-            .first()
-            is not None
-        ):
+        if _caller_holds_association(db, user_id=user_id, server_id=server_id):
             db.rollback()
             return None
         try:
@@ -1824,15 +1822,7 @@ def _mcp_oauth_team_flow_state_error(
         "invalid_state",
         "OAuth state is no longer associated with MCP server access",
     )
-    if (
-        db.query(UserMCPServer.id)
-        .filter(
-            UserMCPServer.user_id == user_id,
-            UserMCPServer.mcpserver_id == server_id,
-        )
-        .first()
-        is not None
-    ):
+    if _caller_holds_association(db, user_id=user_id, server_id=server_id):
         return access_lost
     try:
         scope = team_member_oauth_scope(db, user_id)
@@ -7004,7 +6994,6 @@ async def mcp_oauth_callback(
             flow_id=flow_identity.id,
             token_data=token_data,
         )
-        failure_stage = "lock_lifecycle"
         if isinstance(flow_identity, _MCPOAuthTeamFlowIdentity):
             # Lock, write and commit all happen inside the one worker call.
             failure_stage = "store_team_member_grant"
@@ -7015,14 +7004,8 @@ async def mcp_oauth_callback(
                 resource=resource,
                 token_data=token_data,
             )
-            if not stored:
-                await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
-                return _mcp_oauth_callback_error_redirect_for_path(
-                    callback_redirect_after,
-                    error_code="invalid_state",
-                    message="MCP server connection changed during OAuth authorization",
-                )
         else:
+            failure_stage = "lock_lifecycle"
             lifecycle = _lock_active_mcp_oauth_lifecycle(
                 db,
                 association_identity=_MCPOAuthAssociationIdentity(
@@ -7032,26 +7015,30 @@ async def mcp_oauth_callback(
                 ),
                 flow_identity=flow_identity,
             )
-            if lifecycle is None:
-                await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
-                return _mcp_oauth_callback_error_redirect_for_path(
-                    callback_redirect_after,
-                    error_code="invalid_state",
-                    message="MCP server connection changed during OAuth authorization",
+            stored = lifecycle is not None
+            if lifecycle is not None:
+                locked_flow_state = lifecycle[2]
+                if locked_flow_state is None:
+                    raise RuntimeError(
+                        "MCP OAuth lifecycle lock did not return the flow"
+                    )
+                failure_stage = "persist_grant"
+                _upsert_mcp_oauth_grant(
+                    db,
+                    flow_state=locked_flow_state,
+                    token_data=token_data,
+                    required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
+                    selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
                 )
-            locked_flow_state = lifecycle[2]
-            if locked_flow_state is None:
-                raise RuntimeError("MCP OAuth lifecycle lock did not return the flow")
-            failure_stage = "persist_grant"
-            _upsert_mcp_oauth_grant(
-                db,
-                flow_state=locked_flow_state,
-                token_data=token_data,
-                required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
-                selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
+                failure_stage = "commit_grant"
+                db.commit()
+        if not stored:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+            return _mcp_oauth_callback_error_redirect_for_path(
+                callback_redirect_after,
+                error_code="invalid_state",
+                message="MCP server connection changed during OAuth authorization",
             )
-            failure_stage = "commit_grant"
-            db.commit()
     except HTTPException as exc:
         if issued_token is not None:
             await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
@@ -7116,6 +7103,21 @@ async def discover_mcp_oauth(
     return _mcp_oauth_discovery_response(discovery)
 
 
+def _initiated_on_mcp_oauth_callback_site(request: Request) -> bool:
+    """Whether ``request`` reached this deployment on the OAuth callback's site.
+
+    Only a deployment with several public entries has more than one site; with
+    a single entry every request is on the callback's site.
+    """
+    from ..public_entries import request_public_entry
+
+    if not public_entries_configured():
+        return True
+    callback = urlsplit(_default_mcp_oauth_redirect_uri())
+    callback_origin = normalize_public_origin(f"{callback.scheme}://{callback.netloc}")
+    return request_public_entry(request).origin == callback_origin
+
+
 @mcp_router.post("/{server_id}/oauth/connect", response_model=None)
 async def connect_mcp_oauth(
     server_id: int,
@@ -7145,7 +7147,6 @@ async def connect_mcp_oauth(
         db,
         user_id=user_id,
         server_id=server_id,
-        require_active=True,
         require_member_oauth=True,
     )
     if access.association is not None:
@@ -7160,7 +7161,22 @@ async def connect_mcp_oauth(
             regional_request=regional_request,
         )
     # The member path does not take part in the regional OAuth hand-off; it
-    # returns the plain authorization URL.
+    # returns the plain authorization URL. That URL only works from the site
+    # that receives the callback, because the state cookie is set on the
+    # initiating site: refuse any other site before contacting the provider.
+    if regional_request is not None and not _initiated_on_mcp_oauth_callback_site(
+        regional_request
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "member_regional_oauth_unsupported",
+                "message": (
+                    "Team members must authorize this connector from the site "
+                    "that receives the OAuth callback"
+                ),
+            },
+        )
     return await _connect_team_member_mcp_oauth(
         access.server, request_data, current_user, db, accept=accept
     )

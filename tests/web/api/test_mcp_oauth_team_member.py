@@ -9,12 +9,14 @@ exchange.
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
@@ -238,13 +240,20 @@ class Env:
             row.auth = auth
             other_db.commit()
 
-    async def connect(self, user: User | None = None, *, server_id: int | None = None):
+    async def connect(
+        self,
+        user: User | None = None,
+        *,
+        server_id: int | None = None,
+        request: Request | None = None,
+    ):
         self.db.expire_all()  # a request starts on a fresh session
         return await connect_mcp_oauth(
             server_id if server_id is not None else self.server.id,
             MCPOAuthConnectRequest(redirect_after="/tools"),
             user or self.member,
             self.db,
+            request=request,
         )
 
     async def connect_state(self, user: User | None = None) -> str:
@@ -367,13 +376,20 @@ async def test_association_holder_never_takes_team_path(
         "not_visible",
         "no_hook",
         "hook_raises_precheck",
+        "missing_server",
+        "hook_raises_missing_server",
         "visible_stdio",
         "visible_builtin_oauth",
     ],
 )
 async def test_team_member_connect_admission(env, case):
     server_id = int(env.server.id)
-    if case == "visible_not_open":
+    if case == "missing_server":
+        server_id += 1000
+    elif case == "hook_raises_missing_server":
+        server_id += 1000
+        env.hook.fail_from_call = 1
+    elif case == "visible_not_open":
         env.hook.open = set()
     elif case == "not_visible":
         env.hook.visible = set()
@@ -415,6 +431,8 @@ async def test_team_member_connect_admission(env, case):
         "not_visible": 404,
         "no_hook": 404,
         "hook_raises_precheck": 503,
+        "missing_server": 404,
+        "hook_raises_missing_server": 503,
         "visible_stdio": 400,
         "visible_builtin_oauth": 400,
     }[case]
@@ -434,7 +452,8 @@ async def test_team_member_connect_admission(env, case):
             "code": "member_authorization_not_enabled",
             "message": "This connector is not open to member authorization",
         }
-    if case == "hook_raises_precheck":
+    if case in ("hook_raises_precheck", "hook_raises_missing_server"):
+        # A missing id and an existing id answer alike while the hook fails.
         assert detail == "Connector team scope is unavailable."
     assert env.db.query(MCPOAuthFlowState).count() == 0
     assert env.discovery_calls == 0
@@ -626,7 +645,6 @@ def _other_path_callback() -> str:
         "redirect_uri_unconfigured",
         "association_holder_configured_redirect_uri_other_host",
         "prm_resource_equals_url",
-        "prm_resource_trailing_slash",
         "prm_resource_other_host",
         "prm_resource_other_path",
         "url_changed_before_persist",
@@ -653,8 +671,6 @@ async def test_team_member_connect_requires_resource_equal_to_url(
     elif case == "association_holder_configured_redirect_uri_other_host":
         env.edit_auth(redirect_uri=_OTHER_HOST_CALLBACK)
         user = env.creator
-    elif case == "prm_resource_trailing_slash":
-        env.discovery_resource = URL + "/"
     elif case == "prm_resource_other_host":
         env.discovery_resource = "https://other.example.org/mcp"
         expect_status, expect_code = 400, "resource_mismatch"
@@ -738,8 +754,7 @@ async def test_team_member_connect_hook_failure_under_lock_is_503(env, case):
 @pytest.mark.parametrize(
     "case",
     [
-        "owner_demoted",
-        "owner_left_team",
+        "embedder_closes_member_authorization",
         "owner_deleted_association",
         "former_owner_edits_url",
     ],
@@ -764,7 +779,9 @@ async def test_owner_changes_close_new_logins_but_keep_existing_grants(env, case
             UserMCPServer.user_id == env.creator.id
         ).delete()
         env.db.commit()
-    # The embedder stops opening the connector; the member still sees it.
+    # The embedder derives the open set from its own team roles, so an owner
+    # demotion and an owner leaving the team both reach this repository as the
+    # connector leaving the open set. The member still sees the connector.
     env.hook.open = set()
 
     with pytest.raises(HTTPException) as excinfo:
@@ -899,3 +916,112 @@ async def test_team_member_callback_requires_the_exact_flow_row(env, change):
     env.db.expire_all()
     assert env.db.query(MCPOAuthGrant).count() == 0
     assert len(env.revoked) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flow_state", ["claimed", "expired"])
+async def test_team_member_callback_rejects_claimed_or_expired_flow(env, flow_state):
+    state = await env.connect_state()
+    flow = env.db.query(MCPOAuthFlowState).one()
+    if flow_state == "claimed":
+        flow.consumed_at = datetime.now(timezone.utc)
+    else:
+        flow.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    env.db.commit()
+    exchanged: list[bool] = []
+    env.on_exchange = lambda: exchanged.append(True)
+    hook_calls = env.hook.calls
+
+    response = await env.callback(state)
+
+    assert _error_code(response) == (
+        "state_already_consumed" if flow_state == "claimed" else "expired_state"
+    )
+    # The flow check comes before the team scope hook is asked.
+    assert env.hook.calls == hook_calls
+    assert exchanged == []
+    assert env.revoked == []
+    env.db.expire_all()
+    assert env.db.query(MCPOAuthGrant).count() == 0
+
+
+def _regional_request(host: str) -> Request:
+    from xagent.web.oauth_handoff import OAuthHandoffContext
+
+    app = FastAPI()
+
+    class Adapter:
+        def context(self, request):
+            return OAuthHandoffContext(
+                "xagent", "prod", "au", "https://callback.example.com"
+            )
+
+        def set_route_cookie(self, response, *, state, kind, provider):
+            raise AssertionError("the member path sets no routing cookie")
+
+    app.state.oauth_handoff_adapter = Adapter()
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/mcp/1/oauth/connect",
+            "query_string": b"",
+            "headers": [
+                (b"host", host.encode()),
+                (b"x-xagent-oauth-launch-version", b"2"),
+            ],
+            "app": app,
+        }
+    )
+    return request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["other.example.com", "callback.example.com"])
+async def test_team_member_regional_request_must_start_on_the_callback_site(
+    env, monkeypatch, host
+):
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://callback.example.com")
+    monkeypatch.setenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", "true")
+    monkeypatch.setenv(
+        "XAGENT_PUBLIC_ENTRIES_JSON",
+        json.dumps(
+            [
+                {
+                    "origin": origin,
+                    "region_cookie_domain": None,
+                    "google_oidc_redirect_uri": (
+                        origin + "/api/auth/oidc/google/callback"
+                    ),
+                }
+                for origin in (
+                    "https://callback.example.com",
+                    "https://other.example.com",
+                )
+            ]
+        ),
+    )
+
+    if host == "callback.example.com":
+        response = await env.connect(request=_regional_request(host))
+        assert response.status_code == 303
+        assert response.headers["location"].startswith(f"{ISSUER}/authorize")
+        assert env.db.query(MCPOAuthFlowState).one().access_path == "team_member"
+        return
+
+    with pytest.raises(HTTPException) as excinfo:
+        await env.connect(request=_regional_request(host))
+    assert _http_error(excinfo) == (
+        400,
+        {
+            "code": "member_regional_oauth_unsupported",
+            "message": (
+                "Team members must authorize this connector from the site "
+                "that receives the OAuth callback"
+            ),
+        },
+    )
+    assert env.discovery_calls == 0
+    assert env.register_calls == 0
+    assert env.db.query(MCPOAuthFlowState).count() == 0
+    assert env.db.query(MCPOAuthClient).count() == 0

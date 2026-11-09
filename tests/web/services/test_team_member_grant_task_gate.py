@@ -290,7 +290,6 @@ _REGISTERED_CALLS = frozenset(
         ("web/tools/config.py", "WebToolConfig._build_mcp_server_config"),
         ("web/services/mcp_runtime.py", "build_mcp_runtime_connection"),
         ("web/services/mcp_oauth.py", "resolve_mcp_oauth_runtime_auth"),
-        ("web/services/mcp_oauth.py", "_team_member_grants_withheld"),
     }
 )
 

@@ -4856,3 +4856,43 @@ def test_platform_git_roots_follow_relative_alternates_without_looping(
     assert (checkout / ".git").resolve() in roots
     assert objects.resolve() in roots
     assert pool.resolve() in roots
+
+
+class TestComposioCallbackUrlConfig:
+    """XAGENT_COMPOSIO_CALLBACK_URL: the one callback of every Composio connect."""
+
+    def test_constant(self):
+        assert config.COMPOSIO_CALLBACK_URL == "XAGENT_COMPOSIO_CALLBACK_URL"
+
+    def test_unset_or_blank_keeps_the_meta_callback(self, monkeypatch):
+        monkeypatch.delenv(config.COMPOSIO_CALLBACK_URL, raising=False)
+        assert config.get_composio_callback_url() is None
+
+        monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, "   ")
+        assert config.get_composio_callback_url() is None
+
+    def test_strips_whitespace_and_a_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(
+            config.COMPOSIO_CALLBACK_URL,
+            " https://app.example.com/api/auth/composio/callback/ ",
+        )
+        assert (
+            config.get_composio_callback_url()
+            == "https://app.example.com/api/auth/composio/callback"
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "app.example.com/api/auth/composio/callback",
+            "ftp://app.example.com/api/auth/composio/callback",
+            "https://app.example.com/api/auth/composio/callback?x=1",
+            "https://app.example.com/api/auth/composio/callback#x",
+            "https://user:pass@app.example.com/api/auth/composio/callback",
+        ],
+        ids=["no-scheme", "ftp", "query", "fragment", "credentials"],
+    )
+    def test_rejects_an_unusable_url(self, monkeypatch, value):
+        monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, value)
+        with pytest.raises(ValueError, match="XAGENT_COMPOSIO_CALLBACK_URL"):
+            config.get_composio_callback_url()

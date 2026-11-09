@@ -189,6 +189,8 @@ def composio_env(monkeypatch):
     )
     monkeypatch.setenv(composio_auth.COMPOSIO_USER_ID_SECRET_ENV, USER_ID_SECRET)
     monkeypatch.delenv(composio_auth.CONNECTOR_OAUTH_ROUTE_ENV, raising=False)
+    # The Meta callback, unless a test points the shared callback elsewhere.
+    monkeypatch.delenv("XAGENT_COMPOSIO_CALLBACK_URL", raising=False)
     # Instagram stays off unless a test switches it on.
     monkeypatch.delenv("XAGENT_INSTAGRAM_AUTH_BACKEND", raising=False)
     monkeypatch.delenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID", raising=False)

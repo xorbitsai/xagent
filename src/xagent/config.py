@@ -304,6 +304,7 @@ GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
 EMAIL_CONFIRMATION_EXPIRE_MINUTES = "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
+COMPOSIO_CALLBACK_URL = "XAGENT_COMPOSIO_CALLBACK_URL"
 SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
 SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
 SLACK_APP_TOKEN = "XAGENT_SLACK_APP_TOKEN"
@@ -912,6 +913,21 @@ def get_email_confirmation_expire_minutes() -> int:
 def get_app_base_url() -> str | None:
     """Return the trusted frontend base URL used in email links."""
     return _normalized_env_url(APP_BASE_URL)
+
+
+def get_composio_callback_url() -> str | None:
+    """Return the full callback URL every Composio-backed connect returns to.
+
+    Composio's OAuth user verification is one URL per Composio project, so all
+    apps connected through Composio share this one callback. Unset keeps the
+    Meta callback URL. Point it at ``/api/auth/composio/callback`` together
+    with the project's verifier URL. Raises ``ValueError`` for a value that is
+    not an absolute http(s) URL, or that carries a query, fragment or
+    credentials.
+    """
+    return _reject_url_userinfo(
+        COMPOSIO_CALLBACK_URL, _normalized_http_env_url(COMPOSIO_CALLBACK_URL)
+    )
 
 
 def get_sql_worker_url() -> str | None:

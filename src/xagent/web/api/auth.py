@@ -3101,12 +3101,12 @@ def is_actor_oauth_cookie_header(value: str) -> bool:
     )
 
 
-def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
-    """Match the browser cookie to the configured callback URL."""
+def _oauth_cookie_scope_for(callback_url: str) -> tuple[bool, str]:
+    """``(secure, path)`` of a cookie the browser sends back to ``callback_url``."""
     from urllib.parse import urlparse
 
-    redirect_uri = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
-    return redirect_uri.scheme.lower() == "https", redirect_uri.path or "/"
+    parsed = urlparse(callback_url)
+    return parsed.scheme.lower() == "https", parsed.path or "/"
 
 
 def _encrypt_actor_owner_claim(owner_key: str) -> str:
@@ -3586,18 +3586,25 @@ def start_builtin_oauth_for_resource_owner(
     if not isinstance(response, RedirectResponse):
         return response
     if via_composio:
-        # Same state, flow row and proof cookie; the browser comes back to our
-        # callback path first, which sends it on to Composio (composio_auth).
+        # Same state, flow row and proof cookie; the browser comes back to the
+        # shared Composio callback path first, which sends it on to Composio
+        # (composio_auth). The proof cookie is scoped to that path.
         from urllib.parse import parse_qs, urlsplit
 
         state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
-        response = RedirectResponse(
-            composio_auth.begin_location(
-                _resolve_oauth_redirect_uri(provider, db_provider), state
-            )
+        callback_url = composio_auth.shared_callback_url(
+            db,
+            db_provider
+            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+            else None,
+        )
+        response = RedirectResponse(composio_auth.begin_location(callback_url, state))
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
+    else:
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(
+            _resolve_oauth_redirect_uri(provider, db_provider)
         )
     db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
-    cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
     response.set_cookie(
         _actor_oauth_cookie_name(nonce_digest),
         browser_nonce,
@@ -3993,7 +4000,11 @@ def _generic_oauth_login(
         )
 
     client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
-    if not client_id:
+    # A Composio start keeps only this start's state: Composio's own app
+    # authorizes, so our client id is never sent (composio_auth). The one
+    # later reader, Google shared-grant mode below, never takes a Composio
+    # start (#3649).
+    if not client_id and auth_backend is None:
         return _oauth_provider_config_error(
             provider, [_oauth_env_name(provider, "CLIENT_ID")]
         )
@@ -4522,8 +4533,9 @@ def generic_oauth_callback(
     from .. import composio_auth
 
     if (
-        step := composio_auth.callback_step(provider, request.query_params)
-    ) is not None:
+        provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+        and (step := composio_auth.callback_step(request.query_params)) is not None
+    ):
         return composio_auth.handle_callback(step, request, db, db_provider)
     if (
         provider.lower() == "microsoft"
@@ -6506,6 +6518,17 @@ def start_oauth_authorization(
         {"authorization_url": path, "callback_origin": callback_origin},
         headers=private_headers,
     )
+
+
+@auth_router.get("/composio/callback")
+def composio_oauth_callback(request: Request, db: Session = Depends(get_db)) -> Any:
+    """Composio-backed connects' trips (#3645); needs no OAuthProvider row.
+
+    Registered before ``/{provider}/callback`` so it matches first.
+    """
+    from .. import composio_auth
+
+    return composio_auth.handle_dedicated_callback(request, db)
 
 
 @auth_router.get("/{provider}/callback")

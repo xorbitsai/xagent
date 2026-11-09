@@ -154,6 +154,34 @@ def test_billed_units_aggregate_only_when_every_row_reports_them():
     assert "provider_billed_units" not in group
 
 
+# --- input_has_video on the row -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reported", "stored"),
+    [(True, True), (False, False), ("true", None), (1, None), (None, None)],
+)
+def test_input_has_video_row_field_keeps_only_a_real_bool(reported, stored):
+    with TokenContextManager() as manager:
+        record_provider_usage(
+            SimpleNamespace(), MediaCallType.VIDEO, 5, input_has_video=reported
+        )
+
+    [row] = _rows(manager)
+    if stored is None:
+        assert "input_has_video" not in row
+    else:
+        assert row["input_has_video"] is stored
+
+
+def test_a_producer_that_does_not_report_input_has_video_leaves_it_off():
+    with TokenContextManager() as manager:
+        record_provider_usage(SimpleNamespace(), MediaCallType.VIDEO, 5)
+
+    [row] = _rows(manager)
+    assert "input_has_video" not in row
+
+
 # --- measuring audio ----------------------------------------------------------
 
 

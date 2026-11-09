@@ -484,6 +484,8 @@ def test_with_the_setting_every_app_uses_the_dedicated_callback(dedicated, app_i
     assert verify.status_code == 200, verify.body
     (grant,) = _grants(db)
     assert grant.provider == app_id
+    # Cleared on the path it was set on, or a real browser would keep it.
+    assert _cookie_path(verify, composio_auth.FLOW_COOKIE_PREFIX) == DEDICATED_PATH
     assert _flow_cookies(browser) == []
 
 
@@ -559,8 +561,9 @@ def test_the_dedicated_route_matches_before_the_provider_route(db_session):
         "ftp://app.example.com/api/auth/composio/callback",
         "https://app.example.com/api/auth/composio/callback?x=1",
         "https://user:pass@app.example.com/api/auth/composio/callback",
+        "https://app.example.com/api/auth/linear/callback",
     ],
-    ids=["text", "ftp", "query", "credentials"],
+    ids=["text", "ftp", "query", "credentials", "not-a-composio-route"],
 )
 def test_an_invalid_setting_refuses_the_start_and_the_trips(linear, monkeypatch, value):
     db, user, composio = linear
@@ -641,3 +644,18 @@ def test_another_providers_own_callback_is_never_a_composio_trip(linear):
     assert response.status_code == 400
     assert "Missing code or state" in response.body.decode()
     assert not [path for _, path, _ in composio.calls if "complete_auth" in path]
+
+
+def test_the_setting_may_name_the_meta_callback_behind_a_prefix(linear, monkeypatch):
+    """A reverse proxy may mount the backend under a prefix."""
+    db, user, composio = linear
+    monkeypatch.setenv(
+        "XAGENT_COMPOSIO_CALLBACK_URL",
+        "https://app.example.com/x/api/auth/meta/callback",
+    )
+
+    start = _start_linear(db, user, Browser())
+
+    assert start.headers["location"].startswith(
+        "https://app.example.com/x/api/auth/meta/callback?state="
+    )

@@ -83,6 +83,8 @@ from cryptography.fernet import InvalidToken
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import event
 
+from ..config import COMPOSIO_CALLBACK_URL as COMPOSIO_CALLBACK_URL_ENV
+from ..config import get_composio_callback_url
 from ..core.utils import public_requests as requests
 
 if TYPE_CHECKING:
@@ -102,7 +104,6 @@ COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
 # The verification trip carries no ``state``, so it cannot be routed that way
 # (tracked in xorbitsai/xagent-saas#2461); the start refuses while it is on.
 CONNECTOR_OAUTH_ROUTE_ENV = "XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED"
-COMPOSIO_CALLBACK_URL_ENV = "XAGENT_COMPOSIO_CALLBACK_URL"
 
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 GRAPH_ME_URL = "https://graph.facebook.com/v25.0/me"
@@ -118,10 +119,12 @@ META_PROVIDER = "meta"
 # callback URL, whatever the app's own provider: Composio's OAuth user
 # verification is a single URL per project, and the flow and actor proof
 # cookies are scoped to the path they come back to. XAGENT_COMPOSIO_CALLBACK_URL
-# sets it (normally to COMPOSIO_CALLBACK_PATH); unset, it is the Meta callback
+# sets it (to COMPOSIO_CALLBACK_PATH after the cutover); unset, it is the Meta callback
 # URL, where these trips have always been accepted.
 COMPOSIO_CALLBACK_PATH = "/api/auth/composio/callback"
 DEFAULT_CALLBACK_PROVIDER = META_PROVIDER
+# The two routes that accept the trips; the setting must name one of them.
+_CALLBACK_PATHS = (COMPOSIO_CALLBACK_PATH, "/api/auth/meta/callback")
 # Logged as the provider of a trip whose app is not known yet.
 UNKNOWN_APP_PROVIDER = "composio"
 
@@ -356,14 +359,14 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
             status_code=503,
         )
     try:
-        from ..config import get_composio_callback_url
-
-        get_composio_callback_url()
+        _configured_callback_url()
     except ValueError:
         logger.error(
-            "Composio %s connect refused: %s is not a valid callback URL",
+            "Composio %s connect refused: %s is not a valid callback URL; it "
+            "must end with %s or %s",
             label,
             COMPOSIO_CALLBACK_URL_ENV,
+            *_CALLBACK_PATHS,
         )
         return _unavailable_page(app_id)
     missing = _missing_config_names(app_id)
@@ -377,6 +380,18 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
     return None
 
 
+def _configured_callback_url() -> str | None:
+    """``XAGENT_COMPOSIO_CALLBACK_URL``; ``ValueError`` unless it is a usable
+    URL ending with one of the routes that accept Composio trips (a reverse
+    proxy may put a prefix before it)."""
+    configured = get_composio_callback_url()
+    if configured is not None and not urlsplit(configured).path.endswith(
+        _CALLBACK_PATHS
+    ):
+        raise ValueError(f"{COMPOSIO_CALLBACK_URL_ENV} names no Composio callback")
+    return configured
+
+
 def shared_callback_url(db: Session, meta_row: Any = None) -> str:
     """The callback URL every Composio trip returns to.
 
@@ -384,10 +399,9 @@ def shared_callback_url(db: Session, meta_row: Any = None) -> str:
     otherwise the Meta callback URL, read from ``meta_row`` when the caller
     already holds the Meta provider row and from the database otherwise.
     """
-    from ..config import get_composio_callback_url
     from .api.auth import _resolve_oauth_redirect_uri
 
-    configured = get_composio_callback_url()
+    configured = _configured_callback_url()
     if configured is not None:
         return configured
     if meta_row is None:
@@ -1213,7 +1227,11 @@ def handle_callback(
     try:
         callback = shared_callback_url(db, meta_row)
     except ValueError:
-        logger.error("%s is not a valid callback URL", COMPOSIO_CALLBACK_URL_ENV)
+        logger.error(
+            "%s is not a valid callback URL; it must end with %s or %s",
+            COMPOSIO_CALLBACK_URL_ENV,
+            *_CALLBACK_PATHS,
+        )
         _log_rejection("callback_url_invalid")
         return _unavailable_page()
     if step == "begin":

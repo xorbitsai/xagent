@@ -4004,7 +4004,9 @@ def _generic_oauth_login(
 
     client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
     # A Composio start keeps only this start's state: Composio's own app
-    # authorizes, so our client id is never sent (composio_auth).
+    # authorizes, so our client id is never sent (composio_auth). The one
+    # later reader, Google shared-grant mode below, never takes a Composio
+    # start (#3649).
     if not client_id and auth_backend is None:
         return _oauth_provider_config_error(
             provider, [_oauth_env_name(provider, "CLIENT_ID")]

@@ -60,19 +60,11 @@ def _settled(status: str, code: str | None = None, **extra: Any) -> dict[str, An
     return {"status": status, "output": None, "reason": reason}
 
 
-# --- the format and its two sentinels ----------------------------------------
+# --- the format and its sentinel ---------------------------------------------
 
 
-def test_the_invalid_and_read_failed_sentinels_are_formats_told_apart_by_identity():
-    for sentinel in (
-        so.StructuredOutputFormat.INVALID,
-        so.StructuredOutputFormat.READ_FAILED,
-    ):
-        assert isinstance(sentinel, so.StructuredOutputFormat)
-    assert (
-        so.StructuredOutputFormat.INVALID is not so.StructuredOutputFormat.READ_FAILED
-    )
-    assert so.StructuredOutputFormat.INVALID != so.StructuredOutputFormat.READ_FAILED
+def test_the_invalid_sentinel_is_a_format_told_apart_by_identity():
+    assert isinstance(so.StructuredOutputFormat.INVALID, so.StructuredOutputFormat)
     assert so.StructuredOutputFormat.INVALID is not _fmt()
 
 
@@ -126,12 +118,6 @@ def test_an_invalid_stored_format_fails_without_a_model():
     ) == _settled("failed", "invalid_stored_format")
 
 
-def test_a_failed_read_of_the_format_is_an_internal_error():
-    assert so.structured_output_eligibility(
-        _result(), so.StructuredOutputFormat.READ_FAILED
-    ) == _settled("failed", "internal_error")
-
-
 def test_a_partial_run_is_incomplete_without_a_model():
     assert so.structured_output_eligibility(
         _result(completion_outcome="partial"), _fmt()
@@ -158,13 +144,9 @@ def test_a_dict_answer_is_extracted():
 
 def test_the_rows_are_taken_from_the_top():
     invalid = so.StructuredOutputFormat.INVALID
-    read_failed = so.StructuredOutputFormat.READ_FAILED
     assert so.structured_output_eligibility(
         _result(completion_outcome="partial"), invalid
     ) == _settled("failed", "invalid_stored_format")
-    assert so.structured_output_eligibility(
-        _result(completion_outcome="blocked"), read_failed
-    ) == _settled("failed", "internal_error")
     assert so.structured_output_eligibility(_result(success=False), invalid) is so.SKIP
     assert so.structured_output_eligibility(
         _result(completion_outcome="partial", output=""), _fmt()

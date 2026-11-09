@@ -25,6 +25,9 @@ an explicit stack. Only the serialization in S1 and in
 :func:`compile_schema` takes, rely on the interpreter's recursion limit: S1
 turns a ``RecursionError`` into a violation, and a schema reaches
 :func:`compile_schema` only after S2 has capped its nesting at 32 levels.
+
+:func:`schema_field_list` describes the fields of a schema that passed those
+rules for the model, one line per field, from the caller's own schema.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import copy
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -1567,3 +1571,142 @@ def judge_empty_answer(compiled: CompiledSchema) -> Ready | Incomplete | TooComp
     """Judge an answer that says nothing: the root is taken as empty, so the
     outcome is that of the same object written one level down as null."""
     return _decide(compiled, _EMPTY, 0, 0)
+
+
+# --- the field list --------------------------------------------------------------
+
+FIELD_LIST_MAX_BYTES = 4096
+FIELD_DESCRIPTION_MAX_CHARS = 120
+FIELD_ENUM_TEXT_MAX_CHARS = 200
+
+_INT = r"(?:0|[1-9][0-9]*)"
+_NUM = r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+_JSTR = r'"(?:[^"\\]|\\.)*"'
+_FRAG = (
+    r"(?: Format: [a-z0-9-]+\."
+    rf"| Min length: {_INT}\.| Max length: {_INT}\."
+    rf"| Minimum: {_NUM}\.| Maximum: {_NUM}\."
+    rf"| Greater than: {_NUM}\.| Less than: {_NUM}\."
+    rf"| Multiple of: {_NUM}\."
+    rf"| Min items: {_INT}\.| Max items: {_INT}\."
+    r"| Unique items\."
+    rf"| Pattern: {_JSTR}\.)"
+)
+# The constraint suffix of a description: one or more of the fixed fragments a
+# client writes for keywords the schema subset does not support, in any order,
+# running to the end of the text. ``search`` finds the longest such tail.
+SUFFIX_RE = re.compile(rf"(?:{_FRAG})+\Z")
+
+
+def _single_line_text(text: str) -> str:
+    """``text`` with every space-like, control and format character other than
+    U+0020 replaced by one space, and every backtick by a single quote, so
+    that a caller's text stays on one line and cannot open a code fence.
+    Replacement is one character for one character."""
+    return "".join(
+        "'"
+        if ch == "`"
+        else " "
+        if ch != " " and (ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf"))
+        else ch
+        for ch in text
+    )
+
+
+def _field_description(text: str) -> str:
+    """The description part of a field line: ``""`` or ``": "`` and the text.
+
+    A text over 120 characters keeps its constraint suffix and is cut in front
+    of it with an ellipsis, so a format or range stays in view. A suffix of
+    120 characters or more is itself cut to its first 120 characters, with no
+    ellipsis and none of the text in front of it. Leading spaces are dropped.
+    """
+    text = _single_line_text(text)
+    if len(text) > FIELD_DESCRIPTION_MAX_CHARS:
+        found = SUFFIX_RE.search(text)
+        suffix = found.group(0) if found else ""
+        if len(suffix) >= FIELD_DESCRIPTION_MAX_CHARS:
+            text = suffix[:FIELD_DESCRIPTION_MAX_CHARS]
+        else:
+            body = text[: len(text) - len(suffix)]
+            text = body[: FIELD_DESCRIPTION_MAX_CHARS - 1 - len(suffix)] + "…" + suffix
+    text = text.lstrip(" ")
+    return f": {text}" if text else ""
+
+
+def _field_line(path: str, target: dict[str, Any], union: dict[str, Any] | None) -> str:
+    declared = target.get("type")
+    names = declared if type(declared) is list else [declared]
+    type_name = next((n for n in names if n != "null"), "")
+    nullable = union is not None or "null" in names
+    line = f"- {path} ({type_name}{', nullable' if nullable else ''})"
+    values = normalized_enum(target)
+    if values is not None:
+        shown = _single_line_text(
+            json.dumps(
+                values, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            )
+        )
+        if len(shown) > FIELD_ENUM_TEXT_MAX_CHARS:
+            shown = shown[:FIELD_ENUM_TEXT_MAX_CHARS] + "…"
+        line += f" one of {shown}"
+    descriptions = [
+        d["description"]
+        for d in (union, target)
+        if d is not None and type(d.get("description")) is str
+    ]
+    return line + (_field_description(" ".join(descriptions)) if descriptions else "")
+
+
+def schema_field_list(schema: dict[str, Any]) -> str:
+    """One line per field of ``schema``, for the model to read.
+
+    A line is ``- <JSON Pointer> (<type>[, nullable])[ one of <enum>][: <text>]``
+    and describes the caller's own schema: references and nullable unions are
+    followed, but nothing the nullable copy adds is shown. The elements of an
+    array get a line of their own unless they are objects, whose properties are
+    listed instead; the description and nullability of such an element are not
+    shown. Lines run in document order. When the list is over
+    ``FIELD_LIST_MAX_BYTES`` bytes of UTF-8 it keeps the longest run of first
+    lines that leaves room for a last line counting the rest.
+    """
+    defs = _defs_of(schema)
+    rows: list[str] = []
+    # Items are (path, node, is_element); children go on the stack in reverse.
+    stack: list[tuple[str, dict[str, Any], bool]] = [
+        (f"/{_pointer_segment(name)}", node, False)
+        for name, node in reversed(list(schema["properties"].items()))
+    ]
+    while stack:
+        path, node, is_element = stack.pop()
+        target, union = _position_of(node, defs)
+        declared = target.get("type")
+        is_object = declared == "object" or (
+            type(declared) is list and "object" in declared
+        )
+        if not (is_element and is_object):
+            rows.append(_field_line(path, target, union))
+        if is_object:
+            stack.extend(
+                (f"{path}/{_pointer_segment(name)}", child, False)
+                for name, child in reversed(list(target["properties"].items()))
+            )
+        elif "items" in target:
+            stack.append((f"{path}/-", target["items"], True))
+    return _cut_field_list(rows)
+
+
+def _cut_field_list(rows: list[str]) -> str:
+    sizes = [len(row.encode()) for row in rows]
+    if sum(sizes) + max(len(rows) - 1, 0) <= FIELD_LIST_MAX_BYTES:
+        return "\n".join(rows)
+    best = 0
+    used = 0
+    for kept in range(len(rows)):
+        # ``used`` is the size of the first ``kept`` lines with their newlines.
+        tail = f"- …({len(rows) - kept} more fields)"
+        if used + len(tail.encode()) <= FIELD_LIST_MAX_BYTES:
+            best = kept
+        used += sizes[kept] + 1
+    tail = f"- …({len(rows) - best} more fields)"
+    return "\n".join([*rows[:best], tail])

@@ -1,5 +1,6 @@
-"""The ``response_format`` of a task: checking a request value, storing it, and
-the ``(type, name)`` pair a response echoes.
+"""The ``response_format`` of a task: checking a request value, storing it,
+checking the stored value again before a run, and the ``(type, name)`` pair a
+response echoes.
 
 ``tasks.agent_config["response_format"]`` holds the format of a task. This
 module is the only writer of that key. A request value goes through
@@ -17,11 +18,13 @@ the path.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ...core.agent.structured_output import StructuredOutputFormat
 from ...core.agent.structured_schema import (
     MAX_TEXT_CHARS,
     NAME_PATTERN,
@@ -31,6 +34,8 @@ from ...core.agent.structured_schema import (
     json_kind,
     render_error_path,
 )
+
+logger = logging.getLogger(__name__)
 
 # The key of ``tasks.agent_config`` that holds the format of a task.
 RESPONSE_FORMAT_CONFIG_KEY = "response_format"
@@ -255,6 +260,86 @@ def store_response_format(
             "description": change.description,
         }
     return new_agent_config
+
+
+# The order in which a missing key is reported.
+_STORED_KEY_ORDER = ("type", "name", "schema", "description")
+_STORED_KEYS = frozenset(_STORED_KEY_ORDER)
+
+
+def _stored_violation(value: Any) -> tuple[str, list[PathSegment]] | None:
+    """The first rule the stored ``value`` breaks and where, or ``None``.
+
+    The steps run in order and a failed step ends the check. The path is rooted
+    at the stored value for the shape and ``N`` rules and at the schema for the
+    ``S`` rules.
+    """
+    if json_kind(value) != "object":
+        return "stored_shape", []
+    extra = [key for key in value if key not in _STORED_KEYS]
+    if extra:
+        return "stored_shape", [extra[0]]
+    for key in _STORED_KEY_ORDER:
+        if key not in value:
+            return "stored_shape", [key]
+    stored_type = value["type"]
+    if json_kind(stored_type) != "string" or stored_type != "json_schema":
+        return "stored_shape", ["type"]
+    name = value["name"]
+    if json_kind(name) != "string" or NAME_PATTERN.fullmatch(name) is None:
+        return "N5", ["name"]
+    description = value["description"]
+    if description is not None and (
+        json_kind(description) != "string"
+        or len(description) > MAX_TEXT_CHARS
+        or has_forbidden_char(description)
+    ):
+        return "N6", ["description"]
+    violation = check_schema_structure(value["schema"])
+    if violation is not None:
+        return violation.rule, list(violation.path)
+    return None
+
+
+def parse_stored_response_format(
+    value: Any, *, task_id: object
+) -> StructuredOutputFormat:
+    """Check the format stored on a task again and return it for a run.
+
+    ``value`` is what :func:`store_response_format` wrote:
+    ``{"type": "json_schema", "name", "schema", "description"}``. The shape of
+    those four keys is checked first, then ``name`` and ``description`` as
+    rules N5 and N6, then the schema as rules S1 to S13. The first failed step
+    logs one WARNING with ``task_id``, the rule and the rendered path (only the
+    keys and list indices that lead to the fault), never the name, the
+    description or any string or number from the value, and returns
+    :data:`StructuredOutputFormat.INVALID`. A
+    value that passes is returned as a :class:`StructuredOutputFormat` that
+    holds the stored objects themselves, uncopied.
+
+    The request rules N1 to N4, N7 and N8 are not run: they describe the outer
+    form of a request, which a stored value no longer has.
+
+    Pure CPU work, so an async caller runs it in a worker thread.
+    """
+    found = _stored_violation(value)
+    if found is None:
+        return StructuredOutputFormat(
+            name=value["name"],
+            description=value["description"],
+            schema=value["schema"],
+        )
+    rule, path = found
+    where = render_error_path(path) or (
+        "the schema root" if rule.startswith("S") else "response_format"
+    )
+    logger.warning(
+        "task_id=%s stored response_format is not valid: rule=%s at %s",
+        task_id,
+        rule,
+        where,
+    )
+    return StructuredOutputFormat.INVALID
 
 
 def echo_for_change(change: ResponseFormatChange) -> tuple[str, str]:

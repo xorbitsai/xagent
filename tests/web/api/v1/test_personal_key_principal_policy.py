@@ -129,9 +129,9 @@ def test_personal_key_policy_runs_only_after_the_key_verifies() -> None:
 @pytest.mark.usefixtures("_template_manager")
 def test_personal_key_policy_applies_to_every_personal_key_route() -> None:
     routes = _personal_key_routes()
-    # The 15 management routes (me, agents, templates, skills) and the 11
-    # /v1/chat task routes.
-    assert len(routes) == 26, routes
+    # The 15 management routes (me, agents, templates, skills), the 11
+    # /v1/chat task routes and the features route.
+    assert len(routes) == 27, routes
     headers = _bearer(_create_personal_key()[0])
 
     for method, template in routes:

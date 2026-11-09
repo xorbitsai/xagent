@@ -6,6 +6,7 @@ import ast
 import copy
 import hashlib
 import json
+import logging
 import tracemalloc
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 import pytest
 
 from tests.shared.structured_path_reference import reference_render
+from xagent.core.agent.structured_output import StructuredOutputFormat
 from xagent.web.services import response_format
 from xagent.web.services.response_format import (
     CLEAR,
@@ -40,7 +42,7 @@ CORPUS_PATH = (
 CORPUS = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
 
 # Changing the corpus means changing this digest in the same commit.
-CORPUS_SHA256 = "38a1c2e9c256b0408201f0974143de762219aa2ef6505b28650980026c10fbc7"
+CORPUS_SHA256 = "5f8ef162f956483be8d2d5e32a40c9ae0765b61bdee3ea5dff1748201cbdbe9d"
 
 SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -537,3 +539,236 @@ def test_a_client_cannot_send_the_key_through_the_sanitizer() -> None:
     )
 
     assert sanitized == {"keep": 1}
+
+
+# --- the format stored on a task ---------------------------------------------
+
+INVALID = StructuredOutputFormat.INVALID
+STORED_WARNING = "stored response_format is not valid"
+
+
+def parse_stored_response_format(
+    value: Any, *, task_id: object = None
+) -> StructuredOutputFormat:
+    return response_format.parse_stored_response_format(value, task_id=task_id)
+
+
+def _stored(**changes: Any) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "type": "json_schema",
+        "name": "result",
+        "schema": copy.deepcopy(SCHEMA),
+        "description": "A result.",
+    }
+    value.update(changes)
+    return value
+
+
+def _stored_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if STORED_WARNING in r.getMessage()]
+
+
+def _parse_invalid(
+    value: Any, caplog: pytest.LogCaptureFixture, task_id: object = 7
+) -> str:
+    """Parse ``value``, assert it is refused with one WARNING, return its text."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=response_format.__name__):
+        result = parse_stored_response_format(value, task_id=task_id)
+
+    assert result is INVALID
+    records = _stored_warnings(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    return records[0].getMessage()
+
+
+def test_a_format_written_by_store_is_read_back_as_it_was_stored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    change = normalize_response_format(_format(description="A result."))
+    stored = store_response_format({}, change)[RESPONSE_FORMAT_CONFIG_KEY]
+
+    with caplog.at_level(logging.WARNING, logger=response_format.__name__):
+        fmt = parse_stored_response_format(stored, task_id=1)
+
+    assert fmt is not INVALID
+    assert isinstance(fmt, StructuredOutputFormat)
+    assert (fmt.name, fmt.description, fmt.schema) == (
+        stored["name"],
+        stored["description"],
+        stored["schema"],
+    )
+    assert fmt.schema is stored["schema"]
+    assert _stored_warnings(caplog) == []
+
+
+def test_a_stored_format_without_a_description_is_accepted() -> None:
+    fmt = parse_stored_response_format(_stored(description=None))
+
+    assert fmt is not INVALID
+    assert fmt.description is None
+
+
+@pytest.mark.parametrize("value", ["x", [], 1], ids=["str", "list", "int"])
+def test_a_stored_value_that_is_not_an_object_is_refused(
+    value: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    message = _parse_invalid(value, caplog)
+
+    assert message == (
+        "task_id=7 stored response_format is not valid: "
+        "rule=stored_shape at response_format"
+    )
+
+
+def test_an_extra_key_is_refused_and_named(caplog: pytest.LogCaptureFixture) -> None:
+    message = _parse_invalid(_stored(strict=True), caplog)
+
+    assert message.endswith("rule=stored_shape at /strict")
+
+
+def test_a_missing_key_is_refused_and_named(caplog: pytest.LogCaptureFixture) -> None:
+    value = _stored()
+    del value["description"]
+
+    assert _parse_invalid(value, caplog).endswith("rule=stored_shape at /description")
+
+
+def test_the_first_missing_key_in_the_fixed_order_is_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    value = _stored()
+    del value["description"]
+    del value["name"]
+
+    assert _parse_invalid(value, caplog).endswith("rule=stored_shape at /name")
+
+
+@pytest.mark.parametrize("bad_type", ["text", 1, True], ids=["text", "int", "bool"])
+def test_a_stored_type_other_than_json_schema_is_refused(
+    bad_type: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    message = _parse_invalid(_stored(type=bad_type), caplog)
+
+    assert message.endswith("rule=stored_shape at /type")
+
+
+@pytest.mark.parametrize(
+    "name", [1, "a\n", "a" * 65], ids=["int", "newline", "65-chars"]
+)
+def test_a_stored_name_is_checked_by_rule_n5(
+    name: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert _parse_invalid(_stored(name=name), caplog).endswith("rule=N5 at /name")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [1, "d" * 1025, "a\u0000b"],
+    ids=["int", "1025-chars", "nul"],
+)
+def test_a_stored_description_is_checked_by_rule_n6(
+    description: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    message = _parse_invalid(_stored(description=description), caplog)
+
+    assert message.endswith("rule=N6 at /description")
+
+
+def test_a_stored_schema_that_is_not_an_object_breaks_rule_s6(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    message = _parse_invalid(_stored(schema="x"), caplog)
+
+    assert message.endswith("rule=S6 at the schema root")
+
+
+def test_a_stored_schema_violation_names_the_path_of_the_violation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    schema = copy.deepcopy(SCHEMA)
+    schema["properties"]["a"]["minLength"] = 1
+
+    message = _parse_invalid(_stored(schema=schema), caplog)
+
+    assert message.endswith("rule=S3 at /properties/a/minLength")
+
+
+def test_the_checks_stop_at_the_first_step_that_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    value = _stored(type="text", name=1, description=1, schema="x")
+    value["strict"] = True
+
+    message = _parse_invalid(value, caplog)
+
+    assert message.endswith("rule=stored_shape at /strict")
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [e for e in CORPUS["reject"] if e["rule"].startswith("S")],
+    ids=lambda e: e["id"],
+)
+def test_every_corpus_schema_rejection_is_refused_when_stored(
+    entry: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    schema = copy.deepcopy(entry["response_format"]["json_schema"]["schema"])
+
+    message = _parse_invalid(_stored(schema=schema), caplog)
+
+    assert f"rule={entry['rule']} at " in message
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [e for e in CORPUS["accept"] if e["response_format"]["type"] == "json_schema"],
+    ids=lambda e: e["id"],
+)
+def test_every_corpus_acceptance_is_accepted_once_stored(
+    entry: dict[str, Any],
+) -> None:
+    change = normalize_response_format(copy.deepcopy(entry["response_format"]))
+    stored = store_response_format({}, change)[RESPONSE_FORMAT_CONFIG_KEY]
+
+    fmt = parse_stored_response_format(stored)
+
+    assert fmt is not INVALID
+    assert fmt.schema is stored["schema"]
+
+
+def test_the_warning_carries_neither_the_name_nor_the_description(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=response_format.__name__):
+        for value in (
+            _stored(name="SECRET\nX"),
+            _stored(description="SECRET" * 300),
+        ):
+            assert parse_stored_response_format(value, task_id=3) is INVALID
+
+    assert len(_stored_warnings(caplog)) == 2
+    assert "SECRET" not in caplog.text
+
+
+def test_reading_a_stored_format_does_not_go_through_normalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(raw: Any) -> None:
+        raise AssertionError("normalize_response_format must not be called")
+
+    monkeypatch.setattr(response_format, "normalize_response_format", boom)
+
+    assert parse_stored_response_format(_stored()) is not INVALID
+
+
+def test_reading_a_stored_format_does_not_modify_it() -> None:
+    value = _stored()
+    before = copy.deepcopy(value)
+
+    parse_stored_response_format(value)
+    parse_stored_response_format(_stored(strict=True))
+
+    assert value == before

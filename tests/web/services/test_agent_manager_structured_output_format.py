@@ -134,10 +134,8 @@ async def test_every_outcome_reads_back_as_the_same_status_and_code(
         assert fields.structured_output_reason["code"] == code
 
 
-@pytest.mark.parametrize(
-    "fmt", [StructuredOutputFormat.INVALID, StructuredOutputFormat.READ_FAILED]
-)
-async def test_a_format_that_could_not_be_used_reads_back_as_a_failure(fmt) -> None:
+async def test_a_format_that_could_not_be_used_reads_back_as_a_failure() -> None:
+    fmt = StructuredOutputFormat.INVALID
     run = {"status": "completed", "output": "x", "success": True}
 
     await structured_output._attach_structured_output(
@@ -150,13 +148,8 @@ async def test_a_format_that_could_not_be_used_reads_back_as_a_failure(fmt) -> N
         record=projection.build_record("r1", run["structured_output"]),
         format_configured=True,
     )
-    expected = (
-        "invalid_stored_format"
-        if fmt is StructuredOutputFormat.INVALID
-        else "internal_error"
-    )
     assert fields.structured_output_status == "failed"
-    assert fields.structured_output_reason["code"] == expected
+    assert fields.structured_output_reason["code"] == "invalid_stored_format"
 
 
 class RecordingAgentService:

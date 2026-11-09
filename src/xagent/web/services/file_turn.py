@@ -560,6 +560,21 @@ def append_prompt_context_block(message: str, value: Any) -> str:
     return f"{message.rstrip()}\n\n{block}"
 
 
+def insert_before_prompt_context_block(message: str, extra: str, value: Any) -> str:
+    """``message`` and ``extra`` followed by the prompt context block of
+    ``value``, so that the block stays the last thing in the message.
+
+    A message that already ends with that block has it taken off first and put
+    back after ``extra``; a message that ends with a different block keeps it.
+    With no block for ``value`` the result is ``message`` and ``extra``.
+    """
+    block = build_prompt_context_block(value)
+    body = message.rstrip()
+    if block is not None and body.endswith(block):
+        body = body[: -len(block)].rstrip()
+    return append_prompt_context_block(f"{body}\n\n{extra}", value)
+
+
 def prompt_context_from_agent_config(agent_config: Any) -> Any:
     if not isinstance(agent_config, Mapping):
         return None

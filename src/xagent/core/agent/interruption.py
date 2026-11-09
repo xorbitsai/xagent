@@ -70,7 +70,8 @@ class InterruptionReason(str, Enum):
     # The model kept producing an unusable response (invalid tool protocol,
     # empty or unparsable content) after in-run repair.
     MODEL_OUTPUT_INVALID = "model_output_invalid"
-    # Reserved for graceful shutdown hand-off; nothing produces it yet.
+    # A planned hand-off: a draining host paused the run at a safe point
+    # (``release_handover``) so its successor resumes it.
     SHUTDOWN = "shutdown"
     # The user paused the task, or it was PAUSE_REQUESTED when the run died.
     USER_PAUSE = "user_pause"

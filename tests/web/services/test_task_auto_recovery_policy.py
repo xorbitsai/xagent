@@ -133,7 +133,6 @@ def test_backoff_overflow_safe(reason) -> None:
 @pytest.mark.parametrize(
     "reason",
     [
-        R.SHUTDOWN,
         R.USER_PAUSE,
         R.UNKNOWN_TOOL_EFFECT,
         R.NOT_RECOVERABLE,
@@ -143,6 +142,15 @@ def test_backoff_overflow_safe(reason) -> None:
 def test_never_reasons(reason) -> None:
     assert auto_resume_policy(reason) is None
     assert _plan(reason=reason).outcome is AutoResumeOutcome.NEVER
+
+
+def test_shutdown_handoff_resumes_at_once_without_a_progress_budget() -> None:
+    policy = _policy(R.SHUTDOWN)
+    assert [backoff_seconds(policy, n) for n in range(4)] == [0, 0, 0, 0]
+    assert policy.max_no_progress is None
+    assert policy.max_elapsed_seconds is None
+    assert policy.jitter_cap_seconds == 3
+    assert _plan(reason=R.SHUTDOWN).outcome is AutoResumeOutcome.SCHEDULED
 
 
 def test_policy_reads_env_at_call_time(monkeypatch) -> None:

@@ -419,7 +419,10 @@ def execute_batch(
                 if raw_response.status >= 300:
                     raise HttpError(raw_response, content, uri=request.uri)
                 response = request.postproc(raw_response, content)
-            except HttpError as exc:
+            except Exception as exc:
+                # A response that cannot be turned into a result (an empty
+                # body is not JSON, for one) fails that request alone; the
+                # other callbacks have not run yet and must still run.
                 exception = exc
         callback = batch._callbacks[request_id]
         if callback is not None:

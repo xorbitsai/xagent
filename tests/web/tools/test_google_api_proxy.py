@@ -464,6 +464,76 @@ def test_one_composio_failure_does_not_lose_the_other_requests(proxy):
     assert _secrets_in(str(seen[1][2])) == []
 
 
+def test_a_200_with_a_null_body_fails_only_its_request(proxy):
+    """Composio answers ``{"status": 200, "data": null}`` for an empty 2xx
+    body. That is no body at all, not a 0-byte JSON document: it must reach
+    its own callback as a Composio error, not escape and lose the batch."""
+    proxy.answer("/messages/m1", 200, {"id": "m1"})
+    proxy.answer("/messages/m2", 200, None)
+    proxy.answer("/messages/m3", 200, {"id": "m3"})
+    seen: list[tuple[str, Any, Any]] = []
+
+    def callback(request_id, response, exception):
+        seen.append((request_id, response, exception))
+
+    google_api_proxy.execute_batch(
+        _added_batch(_gmail_service(), ["m1", "m2", "m3"], callback)
+    )
+
+    assert [item[0] for item in seen] == ["1", "2", "3"]
+    assert seen[0][1] == {"id": "m1"}
+    assert seen[1][1] is None
+    assert isinstance(seen[1][2], composio_proxy.ComposioProxyError)
+    assert "without the provider's data" in str(seen[1][2])
+    assert seen[2][1] == {"id": "m3"}
+
+
+def test_a_postproc_error_fails_only_its_request(proxy):
+    """``postproc`` runs after every request has been sent. An error there
+    used to escape and leave the remaining callbacks uncalled."""
+    proxy.answer("/messages/m1", 200, {"id": "m1"})
+    proxy.answer("/messages/m3", 200, {"id": "m3"})
+    seen: list[tuple[str, Any, Any]] = []
+
+    def callback(request_id, response, exception):
+        seen.append((request_id, response, exception))
+
+    def postproc(resp, content):
+        raise ValueError("not a result")
+
+    batch = _added_batch(_gmail_service(), ["m1", "m2", "m3"], callback)
+    batch._requests["2"].postproc = postproc
+
+    google_api_proxy.execute_batch(batch)
+
+    assert [item[0] for item in seen] == ["1", "2", "3"]
+    assert seen[0][1] == {"id": "m1"}
+    assert seen[1][1] is None
+    assert isinstance(seen[1][2], ValueError)
+    assert seen[2][1] == {"id": "m3"}
+
+
+def test_a_callback_that_raises_mid_batch_is_not_swallowed(proxy):
+    """A native batch lets a callback's exception propagate; the fallback
+    does the same instead of hiding a connector's own bug and silently
+    dropping that request."""
+    proxy.answer("/messages/m1", 200, {"id": "m1"})
+    proxy.answer("/messages/m3", 200, {"id": "m3"})
+    seen: list[str] = []
+
+    def callback(request_id, response, exception):
+        seen.append(request_id)
+        if request_id == "2":
+            raise RuntimeError("the callback itself failed")
+
+    with pytest.raises(RuntimeError, match="the callback itself failed"):
+        google_api_proxy.execute_batch(
+            _added_batch(_gmail_service(), ["m1", "m2", "m3"], callback)
+        )
+
+    assert seen == ["1", "2"]
+
+
 def test_a_batch_with_no_requests_sends_nothing(proxy):
     service = _gmail_service()
 

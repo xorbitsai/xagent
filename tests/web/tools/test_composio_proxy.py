@@ -527,10 +527,18 @@ def test_a_per_call_body_limit_overrides_the_shared_default(proxy):
     assert proxy.calls == []
 
 
-def test_a_successful_answer_without_data_or_binary_data_is_a_composio_error(proxy):
+@pytest.mark.parametrize(
+    "answer",
+    [{"status": 200}, {"status": 200, "data": None}],
+    ids=["absent", "null"],
+)
+def test_a_successful_answer_without_data_or_binary_data_is_a_composio_error(
+    proxy, answer
+):
     """A truncated 2xx used to reach a callback and fail opaquely there; with
-    neither a body nor a file there is nothing to return."""
-    proxy.response = _Response(200, {"status": 200})
+    neither a body nor a file there is nothing to return. An explicit null is
+    no body either, not a 0-byte JSON document."""
+    proxy.response = _Response(200, answer)
 
     with pytest.raises(composio_proxy.ComposioProxyError) as raised:
         composio_proxy.proxy_request(

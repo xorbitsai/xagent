@@ -119,8 +119,9 @@ class ProxyResponse:
     carries ``location`` there). A binary answer puts its bytes in
     ``binary_data`` (``url``, ``content_type``, ``size``) and ``data`` is
     null or absent: Composio stores the file and returns a signed URL, it
-    never relays the bytes in ``data``. ``data`` is optional in Composio's
-    schema, so ``None`` means no body, not a malformed answer.
+    never relays the bytes in ``data``. ``data`` is optional and nullable in
+    Composio's schema, so ``None`` means no body; a 2xx other than 204 with
+    neither a body nor a file is refused as an incomplete answer.
     """
 
     status: int
@@ -484,12 +485,12 @@ def proxy_request(
     if (
         200 <= provider_status < 300
         and provider_status != 204
-        and "data" not in answer
+        and answer.get("data") is None
         and not isinstance(binary_data, Mapping)
     ):
         # A 2xx without a body is not a successful provider answer: a
         # truncated answer would otherwise reach a callback and fail opaquely
-        # there.
+        # there. An explicit null counts as no body, like an absent key.
         raise ComposioProxyError(
             "Composio proxy returned an answer without the provider's data",
             status=status,

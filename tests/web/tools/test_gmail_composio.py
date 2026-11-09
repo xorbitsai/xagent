@@ -390,6 +390,65 @@ def test_a_message_too_large_for_the_proxy_is_refused_clearly(
     assert proxy.calls == []
 
 
+def test_the_real_body_limit_binds_at_about_2_5_mb_of_attachments(
+    proxy, monkeypatch, tmp_path
+):
+    """M1: an attachment is base64 inside the MIME part and the whole message
+    is base64 again as ``raw``, so the JSON body is about 1.8 times the file,
+    not 4/3. Against the real 4.5 MB limit a 2.4 MB attachment passes and a
+    2.6 MB one is refused before sending; the measured boundary is 2,497,809
+    bytes, about 2.5 MB (a 3.3 MB attachment is 5.9 MB of JSON)."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+    proxy.answer("/messages/send", 200, {"id": "sent-1"})
+    limit = composio_proxy.MAX_JSON_BODY_BYTES
+
+    accepted = tmp_path / "under.bin"
+    accepted.write_bytes(b"\x00" * 2_400_000)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "Under",
+                    "body": "B",
+                    "attachments": [str(accepted)],
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "success"
+    (call,) = proxy.calls
+    body_bytes = len(json.dumps(call))
+    assert body_bytes <= limit
+    assert 1.79 < body_bytes / 2_400_000 < 1.81
+
+    refused = tmp_path / "over.bin"
+    refused.write_bytes(b"\x00" * 2_600_000)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "Over",
+                    "body": "B",
+                    "attachments": [str(refused)],
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "too large to send through Composio" in result["message"]
+    assert f"{limit} byte limit" in result["message"]
+    assert len(proxy.calls) == 1, "the refused message must not be sent"
+
+
 def test_an_upstream_error_reaches_the_tool_as_googles_message(proxy, monkeypatch):
     proxy.answer("/labels/missing", 404, _NOT_FOUND)
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())

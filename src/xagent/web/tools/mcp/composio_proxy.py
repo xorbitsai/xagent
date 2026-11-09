@@ -96,9 +96,12 @@ _MIME_MARKERS = (
     b"Content-Type:",
     b"Content-Transfer-Encoding:",
 )
-# C0 control characters have no place in a query or header value; a bare
-# CR/LF there is what request splitting needs. Tab is the one C0 exception
-# HTTP allows in a header value.
+# C0 control characters have no place in a query parameter's name, a
+# header's name or value, or an endpoint; a bare CR/LF there is what request
+# splitting needs. A query *value* may legitimately carry newlines (a
+# multi-line SOQL or Gmail search query), so it is passed through for
+# Composio to encode. Tab is the one C0 exception HTTP allows in a header
+# value.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 # A path Composio resolves against the account's own host: one leading "/",
 # no backslash, whitespace or control character, so no URL parser on the
@@ -295,7 +298,8 @@ def _checked_endpoint(endpoint: str, allowed_hosts: Collection[str]) -> str:
 
 
 def _checked_parameter(value: Any, kind: str) -> str:
-    """One parameter as text, refusing a control character in it."""
+    """A query name or header name/value as text, refusing a control
+    character in it. Query values are deliberately not checked here."""
     text = str(value)
     if _CONTROL_CHARS_RE.search(text):
         raise ValueError(f"a {kind} contains a control character")
@@ -318,7 +322,9 @@ def _proxy_payload(
     parameters = [
         {
             "name": _checked_parameter(name, "query parameter name"),
-            "value": _checked_parameter(value, "query parameter value"),
+            # A query value is passed through as given: Composio encodes it,
+            # and a multi-line SOQL or search query is valid there.
+            "value": str(value),
             "type": "query",
         }
         for name, value in pairs

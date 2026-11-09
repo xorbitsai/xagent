@@ -328,20 +328,25 @@ jobs:
         run: python3 -m uv run python -m pytest tests/test_ci_summary_contract.py tests/test_e2e_ci_shards_contract.py -q
 
   pytest-fast:
-    name: Pytest Fast (${{ matrix.name }})
+    name: Pytest Fast (${{ matrix.name }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     runs-on: ubuntu-latest
-    # The web leg's test step alone takes about 35 minutes on a healthy run,
-    # and slow runners pushed it past a 40-minute limit near the end. Hung
-    # tests are cut by pytest-timeout (300 s per test), not by this limit.
-    timeout-minutes: 60
+    # Unsharded, the web leg's test step took 35-40 minutes and set the length
+    # of the whole run, so it is split six ways by `--shard` (whole files,
+    # balanced on test count; see tests/shared/ci_shard_plugin.py). Hung tests
+    # are cut by pytest-timeout (300 s per test), not by this limit.
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: web
-            paths: tests/web tests/architecture
+          - {name: web, shard: 1/6, paths: tests/web tests/architecture}
+          - {name: web, shard: 2/6, paths: tests/web tests/architecture}
+          - {name: web, shard: 3/6, paths: tests/web tests/architecture}
+          - {name: web, shard: 4/6, paths: tests/web tests/architecture}
+          - {name: web, shard: 5/6, paths: tests/web tests/architecture}
+          - {name: web, shard: 6/6, paths: tests/web tests/architecture}
           - name: integration
             paths: tests/integration
 
@@ -441,8 +446,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v --durations=30
+          python3 -m uv run python -m pytest ${{ matrix.paths }} ${{ matrix.shard && format('--shard={0}', matrix.shard) || '' }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v --durations=30
 
+      # On every web shard: two tests, seconds each, and keyed on the leg name
+      # so the CI contract can check the guard against a declared leg.
       - name: Run privileged writable sandbox tests
         if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
         shell: bash
@@ -454,7 +461,7 @@ jobs:
             -q
 
   pytest-fast-deepdoc:
-    name: Pytest Fast Deepdoc (${{ matrix.name }})
+    name: Pytest Fast Deepdoc (${{ matrix.name }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     # Keep the command-policy, CSV and sandbox regressions on the validated
     # toolchain. ubuntu-latest now rolls to 26.04 with different coreutils and
     # Python behavior; migrate that environment separately from feature PRs.
@@ -465,9 +472,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The two core legs list the same paths; `--shard` splits them.
         include:
           - name: core
+            shard: 1/2
             paths: >-
+              tests/test_ci_shard_plugin.py
+              tests/test_ci_summary_contract.py
+              tests/test_docker_workflow_versions.py
+              tests/test_runtime_baseline.py
+              tests/test_shared_worker_benchmark.py
+              tests/agent
+              tests/alembic
+              tests/core
+              tests/migration
+              tests/migrations
+              tests/providers
+              tests/sandbox
+              tests/skills
+              tests/templates
+              tests/utils
+          - name: core
+            shard: 2/2
+            paths: >-
+              tests/test_ci_shard_plugin.py
               tests/test_ci_summary_contract.py
               tests/test_docker_workflow_versions.py
               tests/test_runtime_baseline.py
@@ -626,7 +654,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+          python3 -m uv run python -m pytest ${{ matrix.paths }} ${{ matrix.shard && format('--shard={0}', matrix.shard) || '' }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
 
   pytest-slow:
     runs-on: ubuntu-latest
@@ -768,11 +796,38 @@ jobs:
           python3 -m uv run python -m pytest -m "slow and not postgresql" -v
 
   pytest-milvus:
-    name: Pytest Milvus
+    name: Pytest Milvus (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
+    strategy:
+      fail-fast: false
+      # Run serially against one server the suite took 25 minutes, so it is
+      # split by file, balanced on recorded file durations, and every shard
+      # gets its own Milvus. `rest` picks up any file not named elsewhere;
+      # tests/test_e2e_ci_shards_contract.py checks each file runs exactly once.
+      matrix:
+        include:
+          - shard: kb-handles
+            paths: >-
+              tests/core/tools/core/RAG_tools/kb/test_collection_handle_contract.py
+              tests/core/tools/core/RAG_tools/kb/test_milvus_analyzer.py
+              tests/core/tools/core/RAG_tools/kb/test_milvus_storage.py
+          - shard: kb-writes
+            paths: >-
+              tests/core/tools/core/RAG_tools/kb/test_milvus_commit.py
+              tests/core/tools/core/RAG_tools/kb/test_milvus_delete.py
+              tests/web/api/test_kb_milvus_rollback.py
+          - shard: rest
+            paths: >-
+              tests/core/tools/core/RAG_tools
+              tests/web_integration
+              --ignore=tests/core/tools/core/RAG_tools/kb/test_collection_handle_contract.py
+              --ignore=tests/core/tools/core/RAG_tools/kb/test_milvus_analyzer.py
+              --ignore=tests/core/tools/core/RAG_tools/kb/test_milvus_storage.py
+              --ignore=tests/core/tools/core/RAG_tools/kb/test_milvus_commit.py
+              --ignore=tests/core/tools/core/RAG_tools/kb/test_milvus_delete.py
     env:
       MILVUS_URI: http://localhost:19530
       XAGENT_REQUIRE_MILVUS: "1"
@@ -831,7 +886,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests/core/tools/core/RAG_tools tests/web/api/test_kb_milvus_rollback.py tests/web_integration -m milvus -v
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m milvus -v
 
       - name: Show Milvus logs
         if: needs.changes.outputs.code == 'true' && failure()
@@ -862,13 +917,18 @@ jobs:
           - shard: auto-resume
             paths: >-
               tests/e2e/test_shared_auto_resume.py
+              tests/e2e/test_shared_sdk_auto_resume.py
+          - shard: outage
+            paths: >-
               tests/e2e/test_shared_channel_auto_resume.py
               tests/e2e/test_shared_provider_outage.py
               tests/e2e/test_shared_database_outage.py
-              tests/e2e/test_shared_sdk_auto_resume.py
+          - shard: shared-channels
+            paths: tests/e2e/test_shared_channels.py
           - shard: rest
             paths: >-
               tests/e2e
+              --ignore=tests/e2e/test_shared_channels.py
               --ignore=tests/e2e/test_shared_execution.py
               --ignore=tests/e2e/test_shared_happy_paths.py
               --ignore=tests/e2e/test_shared_gmail.py

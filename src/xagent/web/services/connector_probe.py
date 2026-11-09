@@ -312,7 +312,7 @@ async def _run(
     if (
         app is None
         or not isinstance(app_id, str)
-        or not _owns_catalog_identity(db, server, app)
+        or not owns_catalog_identity(db, server, app)
     ):
         return ConnectorProbeResult(ConnectorProbeOutcome.NOT_DECLARED, server_id)
 
@@ -478,7 +478,7 @@ def find_tool(tools: Any, name: str) -> Any | None:
     return None
 
 
-def _owns_catalog_identity(db: Any, server: Any, app: Mapping[str, Any]) -> bool:
+def owns_catalog_identity(db: Any, server: Any, app: Mapping[str, Any]) -> bool:
     """Whether ``server`` is the catalog's row for ``app``, not a lookalike.
 
     OAuth-transport rows are written by the platform, so their resolution is

@@ -2,7 +2,7 @@
 
 Smoke V2 (xorbitsai/xagent-saas#2532) runs many checks per connector, under more than one identity, and writes a result that a later job compares across runs. This page documents the two interfaces the rest of V2 builds on: the **declaration format**, which says what a connector's checks are, and the **result document**, which says what a run found. It also documents the **engine** that runs the checks under an identity and produces the result. All three live in `src/xagent/web/connector_checks/`, and the two interfaces are versioned.
 
-The engine is a library call (`engine.run_checks`). Its CLI and a local `user` identity adapter come in a follow-up to #3563; until then the engine runs under an adapter its caller supplies, such as the Toby adapter (xorbitsai/xagent-saas#2534).
+The engine is a library call (`engine.run_checks`). A `python -m` CLI runs it as a local user (see [CLI and the `user` identity](#cli-and-the-user-identity)), and Xagent SaaS wraps the same call with its Toby adapter (xorbitsai/xagent-saas#2534).
 
 V1 is unchanged: L1 to L3 still run from `scripts/connector_smoke`, and the probe route still serves L3 (`scripts/connector_smoke/README.md`).
 
@@ -87,7 +87,7 @@ The engine runs as an identity through an `IdentityAdapter` (`identity.py`):
 - `open_session(target, purpose=...)`: starts the connector as a task of that identity would and returns its `ConnectorToolsResult`. A failure is reported through the listing's outcome, not raised. The engine finds a check's tool by its MCP wire name, so the listing's name prefix is the adapter's choice;
 - `resolve_fixture(key)`: the fixture value, or None.
 
-An adapter offers a target only for a connection that is the catalog's own: for a server row, the probe route's catalog-identity rule (`_owns_catalog_identity` in `services/connector_probe.py`); an actor stdio connection is synthesized from the catalog. A lookalike or custom row never gets a builtin app's checks. App ids are unique per enumeration: where an identity has several rows of one app, the adapter offers the one its catalog resolution selects, the one a task of that identity would load.
+An adapter starts a target only for a connection that is the catalog's own: for a server row, the probe route's catalog-identity rule (`owns_catalog_identity` in `services/connector_probe.py`); an actor stdio connection is synthesized from the catalog. A lookalike or custom row never gets a builtin app's checks run: the adapter leaves it out, or offers it with a skip reason, as the `user` adapter does with `not_catalog_identity`. App ids are unique per enumeration: where an identity has several rows of one app, the adapter offers the one its catalog resolution selects, the one a task of that identity would load.
 
 `SessionPurpose.CALL_TOOLS` refuses a sandboxed (`npx`/`uvx`) connection, because the listing's lease is released before any call. `SessionPurpose.LIST_ONLY`, for a connector where no check will call a tool (each is unprobeable, or the app has no declaration), lets such a connection list through a lease, as V1's Toby probe does. This is the one departure from "sandboxed connections stay refused": no tool is called after the lease is released.
 
@@ -115,6 +115,32 @@ Connectors run in sequence under the total timeout. The step it interrupts, a se
 A run with no rows carries a `failure`. It is the adapter's `IdentitySetupError` code, or one of the engine's codes: `enumeration:exception` (the enumeration raised something else), `enumeration:no_connectors`, `enumeration:duplicate_connector` (two targets with one label), `fixtures:exception` (the fixture resolver raised) or `selection:no_targets` (the selectors matched nothing).
 
 Today's L3 probes run as their derived `<app_id>.l3_probe` checks with the probe route's verdicts: `tests/web/connector_checks/test_l3_parity.py` feeds the same listing and tool behaviour to the route's call path and to the engine, and compares them. A probe outcome maps to a check row as `ok` → `pass`, `probe_failed` → `call_failed`, `probe_assertion_failed` → `assertion_failed`, `probe_tool_missing` → `tool_missing` and `timed_out` → `timed_out`, with the same reasons except the call's own bound (`probe_call` there, `check_call` here). A listing outcome is the session row's class.
+
+## CLI and the `user` identity
+
+`python -m xagent.web.connector_checks` runs the engine as a local user, to verify it locally and on stage. The V2 workflow does not schedule it: the web identity's scheduled coverage stays V1's HTTP L2/L3. Run it in the backend container with the service's environment, the same way as `oauth_readiness`:
+
+```bash
+docker compose exec -T backend /opt/xagent/deploy/entrypoint.sh \
+    python -m xagent.web.connector_checks --user monitor
+```
+
+The options are selectors and bounds, never a tool name or an argument:
+
+- `--user` (required): a username, or an email address compared case-insensitively;
+- `--connector LABEL` and `--check CHECK_ID`, each repeatable or comma-separated: the engine's selectors;
+- `--environment LABEL`: the result's environment label;
+- `--check-timeout SECONDS` and `--total-timeout SECONDS`: the engine's bounds, finite and above 0.
+
+Stdout carries exactly one JSON document, the run result, and logs go to stderr. While the run lasts, file descriptor 1 and `sys.stdout` point at stderr, so nothing a connector, a tool, a library or a child process writes can reach the document's stream. A run that cannot be set up still prints its document, with a `failure`: the adapter's or the engine's code, `setup:database` when the database cannot be opened, or `run:exception` when the engine raises (the log names the exception class only). Invalid arguments exit 2 with the usage on stderr and nothing on stdout. Otherwise the exit status is 0 when the run is `complete` and no row is `fail`, and 1 when it is not; a `skip` or `unprobeable` row does not fail the run.
+
+The `user` adapter (`user_identity.py`):
+
+- refuses a name no account has (`identity:user_not_found`) and a user outside `XAGENT_CONNECTOR_PROBE_USERS` (`identity:user_not_allowed`) before any connector starts. The user is matched by `is_connector_probe_user`, the probe route's rule, so `is_admin` grants nothing;
+- offers the catalog apps the Connectors page shows the user as connected (`GET /api/mcp/apps`, the listing V1's L2/L3 smoke reads), in app id order, each with the server row that page selects for it. As in V1, an app hidden from the catalog (`is_visible_in_connector` false) is not a target even while connected. A catalog app that needs reconnecting (a builtin OAuth token that was cleared or expired with no refresh token, or an `mcp_oauth` association without an active grant) is not shown as connected either, so it is not a target and the run does not report it (#3635);
+- offers a selected row that is not the catalog's own (`owns_catalog_identity`: a user-owned row under a catalog id, or a catalog row whose launch has drifted) with the skip reason `not_catalog_identity`. Such a row is never started, as the probe route answers `not_declared` for it. A custom server whose name is not a catalog app id (stamped with an app id or not) is not a catalog app the page shows as connected, so it is not a target;
+- starts each connector as the user's own task would start it, with no actor policy and no team (`list_connector_tools`);
+- resolves no fixture yet. The server-side source comes with #3284, so until then a check that needs a value is `skip`/`fixture_missing`.
 
 ## Result document
 

@@ -354,7 +354,12 @@ function SessionConversationContent({
     || isMessageDeliveryPending
     || isAttachmentBusy
     || continueBusy
-  if (view.kind !== "chat" && (isSessionInteractionLocked || historyBlocked)) {
+  // An active session that no longer offers history closes the list or the
+  // view too. A session that is refreshing keeps its last offer, and one that
+  // is down shows no chat at all, so neither closes what is open: it is shown
+  // again once the session is back.
+  const historyWithdrawn = status === "active" && !historyAvailable
+  if (view.kind !== "chat" && (isSessionInteractionLocked || historyBlocked || historyWithdrawn)) {
     setView({ kind: "chat" })
   }
 

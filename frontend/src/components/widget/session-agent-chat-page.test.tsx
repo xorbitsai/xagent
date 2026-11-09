@@ -1462,6 +1462,19 @@ describe("SessionAgentChatPage", () => {
         expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
       })
 
+      it.each(["list", "view"] as const)("leaves the %s when the session stops offering history", (where) => {
+        const { rerender } = mountWithHistory()
+        if (where === "list") goToList()
+        else goToView()
+
+        setBridge("active", activeSession())
+        rerender(<SessionAgentChatPage />)
+
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        expect(screen.getByRole("button", { name: "start:Support Agent" })).toBeVisible()
+      })
+
       it.each(["list", "view"] as const)("leaves the %s when a host page message arrives", (where) => {
         mountWithHistory({ sessionConversationAttachment: "pending" })
         if (where === "list") goToList()

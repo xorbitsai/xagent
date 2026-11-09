@@ -289,7 +289,7 @@ describe("WidgetHistoryList", () => {
   })
 
   describe("responses that arrive out of order", () => {
-    it("writes only the response of the latest request when retries cross", async () => {
+    it("cancels the earlier request when the visitor retries", async () => {
       const first = deferred<ReturnType<typeof page>>()
       const second = deferred<ReturnType<typeof page>>()
       const third = deferred<ReturnType<typeof page>>()
@@ -310,6 +310,36 @@ describe("WidgetHistoryList", () => {
       // The request a newer one replaced is cancelled.
       expect((history.list.mock.calls[1][3] as AbortSignal).aborted).toBe(true)
       expect((history.list.mock.calls[2][3] as AbortSignal).aborted).toBe(false)
+    })
+
+    it("does not report a cancelled request as a failure when the list mounts twice", async () => {
+      const second = deferred<ReturnType<typeof page>>()
+      history.list
+        .mockImplementationOnce(
+          (_origin: string, _auth: unknown, _page: unknown, signal: AbortSignal) =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+            }),
+        )
+        .mockReturnValueOnce(second.promise)
+      render(
+        <React.StrictMode>
+          <WidgetHistoryList
+            origin={ORIGIN}
+            getAuth={() => AUTH}
+            unauthorizedNotice="tryLater"
+            currentTaskId={null}
+            {...handlers()}
+          />
+        </React.StrictMode>,
+      )
+
+      await act(async () => undefined)
+      expect(history.list).toHaveBeenCalledTimes(2)
+      expect(screen.queryByText("widgetSession.history.loadFailed")).not.toBeInTheDocument()
+      await act(async () => second.resolve(page([7])))
+      await screen.findByText("Conversation 7")
+      expect(screen.queryByText("widgetSession.history.loadFailed")).not.toBeInTheDocument()
     })
 
     it("neither writes nor complains when a response arrives after it closed", async () => {

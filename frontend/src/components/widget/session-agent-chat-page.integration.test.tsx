@@ -2208,9 +2208,54 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       expect(sentFrames(socket)[0]).toMatchObject({ message: "hi" })
       expect(sentFrames(socket)[0]).not.toHaveProperty("source_task_id")
     })
+
+    it("takes a visitor reading an earlier conversation back to the chat and starts a new conversation when the message arrives", async () => {
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      openEarlierConversation()
+      expect(screen.getByRole("button", { name: "hand-over" })).toBeInTheDocument()
+
+      deliverOpenMessage("hi")
+
+      expect(screen.queryByRole("button", { name: "hand-over" })).not.toBeInTheDocument()
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+      receive(socket, { type: "conversation_reset" })
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation", "chat"]))
+      expect(sentFrames(socket)[1]).toMatchObject({ message: "hi" })
+      expect(sentFrames(socket)[1]).not.toHaveProperty("source_task_id")
+      expect(screen.queryByRole("button", { name: "hand-over" })).not.toBeInTheDocument()
+      expect(screen.getByTestId("session-start")).toBeInTheDocument()
+    })
+
+    it("takes a visitor looking at the list of earlier conversations back to the chat when the message arrives", async () => {
+      const socket = await mountWithHistory()
+      receive(socket, ATTACHED)
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      expect(screen.getByRole("button", { name: "pick-earlier" })).toBeInTheDocument()
+
+      deliverOpenMessage("hi")
+
+      expect(screen.queryByRole("button", { name: "pick-earlier" })).not.toBeInTheDocument()
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["chat"]))
+      expect(sentFrames(socket)[0]).toMatchObject({ message: "hi" })
+    })
   })
 
   describe("with the host page's initial message", () => {
+    it("takes a visitor looking at the list of earlier conversations back to the chat when it arrives", async () => {
+      asParent()
+      const socket = await mountWithHistory()
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      expect(screen.getByRole("button", { name: "pick-earlier" })).toBeInTheDocument()
+
+      receive(socket, ATTACHED)
+
+      await waitFor(() => expect(sentFrames(socket).map((frame) => frame.message)).toEqual(["Hello from the host page"]))
+      expect(screen.queryByRole("button", { name: "pick-earlier" })).not.toBeInTheDocument()
+    })
     it.each([
       ["accepted", true],
       ["refused", false],
@@ -2362,6 +2407,49 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       expect(screen.getByRole("textbox")).toBe(composer)
       expect(composer).toHaveTextContent("half typed")
       expect(layer).toBeVisible()
+    })
+
+    it("keeps the draft on the start page across a visit to history", async () => {
+      surfaces.real = true
+      const socket = await mountWithHistory()
+      receive(socket, ATTACHED)
+      await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument())
+      const composer = screen.getByRole("textbox")
+      act(() => { composer.textContent = "half typed"; fireEvent.input(composer) })
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      fireEvent.click(screen.getByRole("button", { name: "back-to-chat" }))
+
+      expect(screen.getByRole("textbox")).toBe(composer)
+      expect(composer).toHaveTextContent("half typed")
+    })
+
+    it("keeps a file picked on the start page selected across a visit to history", async () => {
+      surfaces.real = true
+      const socket = await mountWithHistory({
+        capabilities: {
+          ...HISTORY,
+          file_uploads: { allowed_extensions: [".pdf"], max_file_bytes: 1000, max_files_per_message: 3 },
+        },
+      })
+      receive(socket, ATTACHED)
+      await waitFor(() => expect(screen.getByRole("textbox")).toBeInTheDocument())
+      const input = document.querySelector('input[type="file"]') as HTMLInputElement
+      const file = new File(["abc"], "a.pdf", { type: "application/pdf" })
+      act(() => { fireEvent.change(input, { target: { files: [file] } }) })
+      const selected = () => {
+        const form = document.querySelector("form")
+        return !!form && Array.from(form.querySelectorAll("*"))
+          .some((element) => element.children.length === 0 && element.textContent === "a.pdf")
+      }
+      expect(selected()).toBe(true)
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      fireEvent.click(screen.getByRole("button", { name: "back-to-chat" }))
+
+      expect(selected()).toBe(true)
     })
 
     it("keeps taking replies for the conversation while history is open", async () => {

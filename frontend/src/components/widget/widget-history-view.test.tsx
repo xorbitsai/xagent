@@ -306,6 +306,32 @@ describe("WidgetHistoryView", () => {
     })
   })
 
+  describe("a request cancelled by a second mount", () => {
+    it("does not report the cancelled request as a failure", async () => {
+      const second = deferred<ReturnType<typeof messagePage>>()
+      history.read
+        .mockImplementationOnce(
+          (_o: string, _a: unknown, _t: number, _p: unknown, signal: AbortSignal) =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+            }),
+        )
+        .mockReturnValueOnce(second.promise)
+      render(
+        <React.StrictMode>
+          <WidgetHistoryView {...defaults()} />
+        </React.StrictMode>,
+      )
+
+      await act(async () => undefined)
+      expect(history.read).toHaveBeenCalledTimes(2)
+      expect(screen.queryByText("widgetSession.history.loadFailed")).not.toBeInTheDocument()
+      await act(async () => second.resolve(messagePage()))
+      await screen.findByText("Where is my order?")
+      expect(screen.queryByText("widgetSession.history.loadFailed")).not.toBeInTheDocument()
+    })
+  })
+
   describe("a response that arrives after the view closed", () => {
     it.each([
       ["a page", (first: ReturnType<typeof deferred<ReturnType<typeof messagePage>>>) => first.resolve(messagePage())],

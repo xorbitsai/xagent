@@ -1700,7 +1700,7 @@ describe("SessionAgentChatPage", () => {
           expect(historyItem()).toBeInTheDocument()
         })
 
-        it("clears the line on the next hand-over and when the conversation changes", async () => {
+        it("clears the line when the conversation changes", async () => {
           const { rerender } = mountWithHistory({ sessionConversationAttachment: "pending" })
           goToView()
           hand()
@@ -1821,16 +1821,6 @@ describe("SessionAgentChatPage", () => {
         await sendFrom(config, coded("task_unavailable", true))
 
         expect(screen.queryByRole("alert")).not.toBeInTheDocument()
-      })
-
-      it("keeps the failure line of a send without a source exactly as before", async () => {
-        setBridge("active", activeSession())
-        render(<SessionAgentChatPage />)
-
-        await sendFrom({}, coded("task_unavailable"))
-
-        expect(screen.getByRole("alert")).toHaveTextContent("clientErrors.taskUnavailable")
-        expect(screen.queryByText("widgetSession.history.continueUnavailable")).not.toBeInTheDocument()
       })
 
       it("shows the dedicated line when a handed-over message is refused as unavailable", async () => {

@@ -3539,9 +3539,9 @@ def _mcp_oauth_server_is_actually_connected(
     the user ever completes consent (see connect_mcp_oauth_app), so its mere
     presence isn't proof of a working connection. Require an active
     MCPOAuthGrant too, mirroring the check applied in list_mcp_apps' default
-    branch — shared so every code path that reports connection state for an
-    mcp_oauth server (including the location=local/all branch, which used to
-    bypass this check entirely) agrees (F1)."""
+    branch (F1). The location=local/all branch applies the same active-grant
+    test to a row the caller holds an association for, and asks the runtime
+    grant selector for a team-owned row, which has no association."""
     if not _is_mcp_oauth_server(server):
         return True
     return cast(int, server.id) in active_grant_server_ids
@@ -3552,7 +3552,7 @@ def _local_mcp_can_attach(
     user_mcp: Optional[UserMCPServer],
     *,
     team_mcp_ids: Collection[int],
-    active_grant_server_ids: set[int],
+    has_active_grant: bool,
     token_resolver_installed: bool,
 ) -> bool:
     """Whether a local entry may be selected into an agent (#1347).
@@ -3567,13 +3567,14 @@ def _local_mcp_can_attach(
     (may say yes where the runtime later says no, never no where it would have
     succeeded):
 
-    - Any active ``MCPOAuthGrant`` counts, while the runtime's
-      ``select_mcp_oauth_grants`` also matches resource, issuer,
+    - ``has_active_grant`` is decided by the caller. For a row the caller holds
+      an association for, any active ``MCPOAuthGrant`` counts, while the
+      runtime's ``select_mcp_oauth_grants`` also matches resource, issuer,
       ``resource_owner_key``, ``client_id`` and a scope subset. Auth-config
       edits do not reconcile grants (#1388); narrowing belongs there, not in a
-      fourth copy of that predicate here. (Grants of users who hold no
-      association are the exception: a definition edit that changes where
-      tokens go deletes them in ``update_mcp_server``.)
+      fourth copy of that predicate here. For a team-owned row (no
+      association) the caller asks that selector itself, so the answer is the
+      runtime's.
     - The resolver hook is probed for presence, not for this provider and
       user -- see ``oauth_token_resolver_installed``.
     """
@@ -3587,36 +3588,47 @@ def _local_mcp_can_attach(
         return False
     if not _is_mcp_oauth_server(server):
         return True
-    return cast(int, server.id) in active_grant_server_ids or token_resolver_installed
+    return has_active_grant or token_resolver_installed
 
 
-def _local_mcp_consent_association_ok(
-    server: MCPServer, user_mcp: Optional[UserMCPServer]
+def _local_mcp_consent_route_ok(
+    server: MCPServer,
+    user_mcp: Optional[UserMCPServer],
+    *,
+    member_oauth_mcp_ids: Collection[int],
 ) -> bool:
-    """Whether ``POST /api/mcp/{server_id}/oauth/connect`` would resolve.
+    """Whether POST /api/mcp/{server_id}/oauth/connect would admit this caller.
 
-    The endpoint calls ``_get_user_mcp_server_or_404(..., require_active=True)``
-    on the mcp_oauth shape, so all three terms are the endpoint's own
-    preconditions for a caller holding an association. Deliberately *not* the
-    visibility rule above: the route also admits a member of a team that can
-    see and has opened the connector (``user_mcp is None``), but this field
-    stays True only for a caller holding an active association row.
+    Mirrors _mcp_oauth_route_access_or_404 with require_member_oauth=True on
+    the mcp_oauth shape. A caller holding an association row, active or not,
+    takes the association path and needs that row active. A caller holding
+    none needs the team overlay to show the server and open it to member
+    authorization; ``member_oauth_mcp_ids`` is always a subset of the ids the
+    overlay shows, so membership in it answers both. The route also refuses a
+    member who starts the flow from a regional site other than the callback's.
+    That depends on the request, which a listing does not see, so it is not
+    part of this answer.
 
-    Shared by ``can_authorize`` and the ``auth_type`` hint below, which is the
-    same condition plus, respectively, the resolver term and nothing -- they
-    used to be two textual copies that could drift apart silently.
+    Deliberately *not* the visibility rule used for attachability: a team-owned
+    row (``user_mcp is None``) is visible and attachable even when the overlay
+    has not opened it to member authorization, and then consent is refused.
+
+    Shared by ``can_authorize`` and the ``auth_type`` hint in the listing,
+    which is the same condition plus, respectively, the resolver term and
+    nothing, so the two cannot drift apart.
     """
-    return (
-        user_mcp is not None
-        and bool(user_mcp.is_active)
-        and _is_mcp_oauth_server(server)
-    )
+    if not _is_mcp_oauth_server(server):
+        return False
+    if user_mcp is not None:
+        return bool(user_mcp.is_active)
+    return int(cast(int, server.id)) in member_oauth_mcp_ids
 
 
 def _local_mcp_can_authorize(
     server: MCPServer,
     user_mcp: Optional[UserMCPServer],
     *,
+    member_oauth_mcp_ids: Collection[int],
     token_resolver_installed: bool,
 ) -> bool:
     """Whether starting the per-server MCP OAuth flow is meaningful (#1347).
@@ -3628,9 +3640,10 @@ def _local_mcp_can_authorize(
     here rather than having this field restate that dispatch.
 
     False in three cases: the endpoint's own preconditions fail (see
-    ``_local_mcp_consent_association_ok`` -- not the mcp_oauth shape, no
-    personal association, or a deactivated one, which needs re-enabling rather
-    than re-authorization); or a resolver hook supplies this deployment's
+    ``_local_mcp_consent_route_ok`` -- not the mcp_oauth shape, a deactivated
+    association, which needs re-enabling rather than re-authorization, or the
+    caller holds no association and the team overlay does not open the
+    server to member authorization); or a resolver hook supplies this deployment's
     tokens out of band, where there is no interactive consent and no identity
     the editor could sign in as, so the trigger would assert "needs
     authorization" against a connector that has no authorization step at all
@@ -3642,7 +3655,9 @@ def _local_mcp_can_authorize(
     """
     if token_resolver_installed:
         return False
-    return _local_mcp_consent_association_ok(server, user_mcp)
+    return _local_mcp_consent_route_ok(
+        server, user_mcp, member_oauth_mcp_ids=member_oauth_mcp_ids
+    )
 
 
 def _local_mcp_can_configure(
@@ -3898,6 +3913,10 @@ def list_mcp_apps(
         )
 
         team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
+        # Read once for the whole listing, like team_ids above.
+        member_oauth_mcp_ids = team_member_oauth_scope(
+            db, cast(int, current_user.id)
+        ).member_oauth_mcp_ids
 
         # (server, user_mcp) for a personal row; (server, None) for a
         # team-owned connector the user holds no association for. Excluding the
@@ -3957,6 +3976,39 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
+            # A team-owned mcp_oauth row (no association) is connected exactly
+            # when the runtime would find a grant for this caller, so it asks
+            # the same selector; a row the caller holds an association for
+            # keeps reading the active-grant set.
+            if user_mcp is None and _is_mcp_oauth_server(server):
+                try:
+                    has_active_grant = bool(
+                        select_mcp_oauth_grants(
+                            db,
+                            server_id=cast(int, server.id),
+                            user_id=cast(int, current_user.id),
+                            auth_config=server._decrypt_auth_config(server.auth),
+                            resource_owner_key=_default_resource_owner_key(
+                                cast(int, current_user.id)
+                            ),
+                            allow_team_member_grants=True,
+                        )
+                    )
+                except ValueError as exc:
+                    # The selector raises ValueError for an OAuth resource or
+                    # issuer that does not parse. One misconfigured connector
+                    # must not fail the whole listing, so this row is listed
+                    # as not connected.
+                    logger.warning(
+                        "Listing team MCP OAuth connector as not connected, "
+                        "grant selection failed: server_id=%s error=%s",
+                        server.id,
+                        type(exc).__name__,
+                    )
+                    has_active_grant = False
+            else:
+                has_active_grant = cast(int, server.id) in active_grant_server_ids
+
             entry = {
                 "id": server.name,
                 "name": server.name,
@@ -3968,8 +4020,8 @@ def list_mcp_apps(
                 # doesn't gate on a real grant, so a custom mcp_oauth
                 # server the user abandoned mid-consent must not be
                 # reported connected just because the row exists.
-                "is_connected": _mcp_oauth_server_is_actually_connected(
-                    server, active_grant_server_ids
+                "is_connected": (
+                    has_active_grant if _is_mcp_oauth_server(server) else True
                 ),
                 "provider": "custom",
                 "category": "Local",
@@ -3980,12 +4032,13 @@ def list_mcp_apps(
                     server,
                     user_mcp,
                     team_mcp_ids=team_ids["mcp"],
-                    active_grant_server_ids=active_grant_server_ids,
+                    has_active_grant=has_active_grant,
                     token_resolver_installed=token_resolver_installed,
                 ),
                 "can_authorize": _local_mcp_can_authorize(
                     server,
                     user_mcp,
+                    member_oauth_mcp_ids=member_oauth_mcp_ids,
                     token_resolver_installed=token_resolver_installed,
                 ),
                 "can_configure": _local_mcp_can_configure(user_mcp),
@@ -3999,22 +4052,47 @@ def list_mcp_apps(
             # custom shape is reported connected unconditionally (so its
             # Connect button never renders), while tagging those rows with a
             # catalog classification would repoint the settings dialog's
-            # Configure button away from the custom edit form. Inactive
-            # associations are excluded because the per-server OAuth endpoints
-            # require an active one — a deactivated server needs re-enabling,
-            # not re-authorization. The connect route also admits a member of a
-            # team that can see and has opened the connector, but this field
-            # is still returned only to a caller holding an active association
-            # row (user_mcp is not None).
+            # Configure button away from the custom edit form. The condition is
+            # the one POST /{server_id}/oauth/connect applies to the caller
+            # (_local_mcp_consent_route_ok): an inactive association is
+            # excluded because that route requires an active one -- the server
+            # needs re-enabling, not re-authorization -- and a team-owned
+            # server is included only when the team overlay opens it to member
+            # authorization, since otherwise the route refuses the member and
+            # the advertised flow would dead-end in a failed popup.
             #
-            # can_authorize above repeats those last two exclusions on purpose:
-            # this field still answers "which Connect flow does the settings
-            # dialog dispatch", while can_authorize answers "may the picker
-            # advertise consent" and additionally goes false when a resolver
-            # hook supplies the tokens. Keeping them separate is what let the
-            # picker stop reading auth_type as an attachability hint (#1347).
-            if _local_mcp_consent_association_ok(server, user_mcp):
+            # can_authorize above repeats that condition on purpose: this field
+            # still answers "which Connect flow does the settings dialog
+            # dispatch", while can_authorize answers "may the picker advertise
+            # consent" and additionally goes false when a resolver hook
+            # supplies the tokens. Keeping them separate is what let the picker
+            # stop reading auth_type as an attachability hint (#1347).
+            if _local_mcp_consent_route_ok(
+                server, user_mcp, member_oauth_mcp_ids=member_oauth_mcp_ids
+            ):
                 entry["auth_type"] = "mcp_oauth"
+
+            # Shown by the settings dialog next to Connect so a member can see
+            # where their token will be sent. Only for team-owned rows: a
+            # personal connector is the caller's own URL.
+            if user_mcp is None and server.url:
+                # Host with any non-default port, as `new URL(url).host` shows
+                # it; the user-info part is dropped. A stored URL that does not
+                # parse leaves the key out instead of failing the whole listing.
+                try:
+                    url_parts = urlsplit(str(server.url))
+                    url_host = url_parts.netloc.rsplit("@", 1)[-1].lower()
+                    default_port = {"http": 80, "ws": 80, "https": 443, "wss": 443}.get(
+                        url_parts.scheme.lower()
+                    )
+                    if url_host.endswith(":"):
+                        url_host = url_host[:-1]
+                    elif default_port is not None and url_parts.port == default_port:
+                        url_host = url_host.rsplit(":", 1)[0]
+                except ValueError:
+                    url_host = ""
+                if url_host:
+                    entry["url_host"] = url_host
 
             results.append(entry)
 

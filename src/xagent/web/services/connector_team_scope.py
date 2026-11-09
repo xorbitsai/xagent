@@ -58,6 +58,7 @@ that declares it is checked; one that does not is not.
 | ``mcp._persist_team_member_mcp_oauth_connect_flow`` | two row locks: ``mcp_servers`` ``FOR UPDATE`` and ``users`` ``FOR SHARE`` | no | ``True`` |
 | ``mcp._mcp_oauth_team_flow_state_error`` | nothing -- the callback preflight takes no lock | no | ``False`` |
 | ``mcp._lock_team_member_mcp_oauth_lifecycle`` | three row locks: ``mcp_servers``, ``users`` and ``mcp_oauth_flow_states`` | yes, the callback committed its flow claim | ``True`` |
+| ``mcp.list_mcp_apps`` | nothing -- the listing takes no lock | no | ``False`` |
 
 ``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
 route decorator, and its only caller in this repository outside tests is the

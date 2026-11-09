@@ -11,8 +11,9 @@ and `can_configure` directly, so changing any of those rules fails here
 instead of silently mis-gating the picker.
 
 The three fields answer different questions and diverge on real populations:
-a team-owned mcp_oauth connector is attachable but has no consent flow the
-member could start; a hook-resolved connector is attachable with no consent
+a team-owned mcp_oauth connector the team has not opened to member
+authorization is attachable but has no consent flow the member could start; a
+hook-resolved connector is attachable with no consent
 flow existing at all; and `can_configure` answers whether the entry's edit
 route would resolve for the caller -- a personal association row for a local
 entry, or an existing connection for a catalog entry -- which is independent
@@ -21,14 +22,20 @@ of both.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
-from xagent.web.api.mcp import list_mcp_apps
+from xagent.web.api import mcp as mcp_module
+from xagent.web.api.mcp import list_mcp_apps, mcp_router
+from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
-from xagent.web.models.database import Base
+from xagent.web.models.database import Base, get_db
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -86,7 +93,10 @@ def _install_visibility(mapping: dict[int, dict[str, set[int]]]) -> None:
         answer = mapping.get(int(user_id))
         if answer is None:
             return {"mcp": set(), "custom_api": set()}
-        return {"mcp": set(answer["mcp"]), "custom_api": set(answer["custom_api"])}
+        result = {"mcp": set(answer["mcp"]), "custom_api": set(answer["custom_api"])}
+        if "member_oauth_mcp" in answer:
+            result["member_oauth_mcp"] = set(answer["member_oauth_mcp"])
+        return result
 
     connector_team_scope.set_connector_team_hooks(visibility=visibility)
 
@@ -158,7 +168,14 @@ def _add_stdio_server(
     return server
 
 
-def _grant(db, server: MCPServer, user: User, *, status: str = "active") -> None:
+def _grant(
+    db,
+    server: MCPServer,
+    user: User,
+    *,
+    status: str = "active",
+    resource_owner_key: str | None = None,
+) -> None:
     client = MCPOAuthClient(
         mcp_server_id=server.id,
         issuer="https://auth.example.com",
@@ -175,7 +192,7 @@ def _grant(db, server: MCPServer, user: User, *, status: str = "active") -> None
             mcp_server_id=server.id,
             user_id=user.id,
             mcp_oauth_client_id=client.id,
-            resource_owner_key=f"xagent:user:{user.id}",
+            resource_owner_key=resource_owner_key or f"xagent:user:{user.id}",
             issuer="https://auth.example.com",
             resource="https://mcp.example.com/mcp",
             scope="records.read",
@@ -469,11 +486,11 @@ def test_a_resolver_hook_does_not_relax_the_association_gate(db_session):
 def test_a_team_owned_mcp_oauth_connector_is_attachable_but_not_authorizable(
     db_session,
 ):
-    """The case the two fields exist to separate. The member holds no personal
-    association, so /{server_id}/oauth/connect would 404 — but the overlay
-    listed the connector precisely so members could attach it, and the runtime
-    overlays the same team ids. Withholding auth_type was the only way to say
-    "not authorizable", and it said "not attachable" too."""
+    """The case the two fields exist to separate. The team has not opened the
+    connector to member authorization, so /{server_id}/oauth/connect refuses
+    the member -- but the overlay listed the connector precisely so members
+    could attach it, and the runtime overlays the same team ids. Withholding
+    auth_type is how the listing says "not authorizable"."""
     db, _owner, member = db_session
     server = _add_oauth_server(db, None)
     _install_visibility(
@@ -500,20 +517,26 @@ def test_a_team_owned_mcp_oauth_connector_needs_credentials_like_any_other(db_se
     assert _entry(db, member, "records")["can_attach"] is False
 
 
-def test_a_team_owned_connector_is_never_authorizable_even_holding_a_grant(
+def test_a_team_owned_connector_not_open_to_members_is_not_authorizable_even_holding_a_grant(
     db_session,
 ):
     """The association half of can_authorize, pinned without a resolver
     installed so the resolver short-circuit cannot carry the assertion. A grant
     outlives the association row it was created under, so credentials can
     resolve for a connector the member now reaches only through the team link
-    — and /{server_id}/oauth/connect would still 404 on the missing
-    association."""
+    — but with the team not opening it to member authorization, the connect
+    route refuses the member."""
     db, _owner, member = db_session
     server = _add_oauth_server(db, None)
     _grant(db, server, member)
     _install_visibility(
-        {int(member.id): {"mcp": {int(server.id)}, "custom_api": set()}}
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": set(),
+            }
+        }
     )
 
     entry = _entry(db, member, "records")
@@ -858,3 +881,281 @@ def test_every_listed_entry_carries_all_three_decisions(db_session):
         assert isinstance(entry.get("can_attach"), bool), entry["id"]
         assert isinstance(entry.get("can_authorize"), bool), entry["id"]
         assert isinstance(entry.get("can_configure"), bool), entry["id"]
+
+
+# --- AC: consent route and connected state for team-owned rows ---------------
+
+
+def _matrix_server(db, owner, member, association: str, shape: str):
+    name = "records" if shape == "mcp_oauth" else "files"
+    adder = _add_oauth_server if shape == "mcp_oauth" else _add_stdio_server
+    if association in ("active", "inactive"):
+        server = adder(db, member, name, is_active=association == "active")
+        team_ids: set[int] = set()
+        open_ids: set[int] = set()
+    else:
+        server = adder(db, owner, name)
+        # The member holds no association; only the team overlay can show it.
+        team_ids = set()
+        open_ids = set()
+        if association in ("none_visible_open", "none_visible_not_open"):
+            team_ids = {int(server.id)}
+        if association == "none_visible_open":
+            open_ids = {int(server.id)}
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": team_ids,
+                "custom_api": set(),
+                "member_oauth_mcp": open_ids,
+            }
+        }
+    )
+    return name
+
+
+@pytest.mark.parametrize("shape", ["mcp_oauth", "stdio"])
+@pytest.mark.parametrize(
+    "association",
+    [
+        "active",
+        "inactive",
+        "none_visible_open",
+        "none_visible_not_open",
+        "none_not_visible",
+    ],
+)
+@pytest.mark.parametrize("hook", ["none", "installed"])
+def test_local_mcp_consent_and_authorize_matrix(db_session, hook, association, shape):
+    db, owner, member = db_session
+    name = _matrix_server(db, owner, member, association, shape)
+    if hook == "installed":
+        _install_token_resolver()
+
+    entries = [
+        a
+        for a in list_mcp_apps(location="local", current_user=member, db=db)
+        if a["id"] == name
+    ]
+    if association == "none_not_visible":
+        assert entries == []
+        return
+    (entry,) = entries
+
+    route_admits = shape == "mcp_oauth" and association in (
+        "active",
+        "none_visible_open",
+    )
+    assert ("auth_type" in entry) is route_admits
+    if route_admits:
+        assert entry["auth_type"] == "mcp_oauth"
+    # The #1332 hook term is unchanged: nobody can authorize on a card when a
+    # resolver hook supplies the tokens.
+    assert entry["can_authorize"] is (route_admits and hook == "none")
+    if association.startswith("none"):
+        assert entry["can_configure"] is False
+
+
+def test_a_team_row_is_connected_only_when_the_runtime_selector_finds_a_grant(
+    db_session,
+):
+    db, owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": {int(server.id)},
+            }
+        }
+    )
+    assert _entry(db, member, "records")["is_connected"] is False
+
+    _grant(db, server, member)
+    entry = _entry(db, member, "records")
+    assert entry["is_connected"] is True
+    assert entry["can_attach"] is True
+
+
+def test_a_team_row_ignores_a_member_grant_under_another_owner_key(db_session):
+    """The web-chat runtime selects a member's grants under their default owner
+    key, so a grant the member holds under any other key does not connect a
+    team row they hold no association for."""
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _grant(db, server, member, resource_owner_key="external:account:1")
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": {int(server.id)},
+            }
+        }
+    )
+
+    entry = _entry(db, member, "records")
+    assert entry["is_connected"] is False
+    assert entry["can_attach"] is False
+
+
+def test_none_visible_resource_mismatch(db_session):
+    """A member grant issued for a URL the connector no longer has is not one
+    the runtime would use, so the row is not connected and Connect returns."""
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _grant(db, server, member)
+    server.url = "https://moved.example.com/mcp"
+    server.auth = {**server.auth, "resource": "https://moved.example.com/mcp"}
+    db.commit()
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": {int(server.id)},
+            }
+        }
+    )
+
+    entry = _entry(db, member, "records")
+    assert entry["is_connected"] is False
+    assert entry["auth_type"] == "mcp_oauth"
+
+
+def test_none_visible_url_host(db_session):
+    db, owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": {int(server.id)},
+            }
+        }
+    )
+    assert _entry(db, member, "records")["url_host"] == "mcp.example.com"
+
+    server.url = "https://user:pw@MCP.example.com:8443/mcp"
+    db.commit()
+    assert _entry(db, member, "records")["url_host"] == "mcp.example.com:8443"
+
+    server.url = "http://[::1]:9000/mcp"
+    db.commit()
+    assert _entry(db, member, "records")["url_host"] == "[::1]:9000"
+
+    for url, host in (
+        ("wss://mcp.example.com:443/mcp", "mcp.example.com"),
+        ("ws://mcp.example.com:80/mcp", "mcp.example.com"),
+        ("https://mcp.example.com:/mcp", "mcp.example.com"),
+        ("https://mcp.example.com:443/mcp", "mcp.example.com"),
+        ("http://mcp.example.com:80/mcp", "mcp.example.com"),
+        ("https://mcp.example.com:80/mcp", "mcp.example.com:80"),
+        ("https://[::1]:443/mcp", "[::1]"),
+    ):
+        server.url = url
+        db.commit()
+        assert _entry(db, member, "records")["url_host"] == host
+
+    # A connector the caller holds an association for is their own URL.
+    _add_oauth_server(db, member, "mine")
+    assert "url_host" not in _entry(db, member, "mine")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["server_url", "auth_resource", "auth_issuer", "url_and_resource"],
+)
+def test_a_team_row_with_unparsable_auth_values_does_not_break_the_list(
+    db_session, bad, caplog
+):
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _add_stdio_server(db, member, "files")
+    auth = dict(server.auth)
+    if bad in ("server_url", "url_and_resource"):
+        server.url = "http://[bad/mcp"
+    if bad in ("auth_resource", "url_and_resource"):
+        auth["resource"] = "http://[bad/mcp"
+    if bad == "auth_issuer":
+        auth["issuer"] = "http://[bad"
+    server.auth = auth
+    db.commit()
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": {int(server.id)},
+            }
+        }
+    )
+
+    app = FastAPI()
+    app.include_router(mcp_router)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: member
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.mcp"):
+        response = TestClient(app, raise_server_exceptions=False).get(
+            "/api/mcp/apps?location=local"
+        )
+    assert response.status_code == 200
+    listed = response.json()
+    entry = next(a for a in listed if a["id"] == "records")
+    files = next(a for a in listed if a["id"] == "files")
+    assert entry["is_connected"] is False
+    assert entry["can_attach"] is False
+    assert files["is_connected"] is True
+    assert files["can_attach"] is True
+    if bad in ("server_url", "url_and_resource"):
+        assert "url_host" not in entry
+    else:
+        assert entry["url_host"] == "mcp.example.com"
+
+    # The selector itself raises only for an unparsable resource or issuer;
+    # an unparsable server URL matches no grant without raising.
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "grant selection failed" in r.message
+    ]
+    if bad == "server_url":
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert f"server_id={server.id}" in warnings[0].message
+        assert "error=ValueError" in warnings[0].message
+        assert "[bad" not in warnings[0].message
+
+
+def test_a_team_row_grant_selection_failure_other_than_value_error_fails_the_list(
+    db_session, monkeypatch
+):
+    # Only an unparsable resource or issuer (ValueError) is listed as not
+    # connected; any other selection failure still fails the request.
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {int(server.id)},
+                "custom_api": set(),
+                "member_oauth_mcp": {int(server.id)},
+            }
+        }
+    )
+
+    def _selection_breaks(*args, **kwargs):
+        raise RuntimeError("grant table unavailable")
+
+    monkeypatch.setattr(mcp_module, "select_mcp_oauth_grants", _selection_breaks)
+    app = FastAPI()
+    app.include_router(mcp_router)
+    app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_current_user] = lambda: member
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/api/mcp/apps?location=local"
+    )
+    assert response.status_code == 500

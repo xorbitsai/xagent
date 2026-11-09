@@ -1375,6 +1375,9 @@ const zh = {
         invalidBadge: "上传设置无效",
         invalidBadgeDescription: "上传设置无效，该连接器当前不可用。",
       },
+      memberOAuth: {
+        destination: "登录后，你的账号令牌会发往 {host}",
+      },
       // Account identifier step before a builtin OAuth popup, for providers
       // hosted on the customer's own account (oauth-account-dialog.tsx).
       accountStep: {

@@ -328,6 +328,15 @@ export function OfficialMcpSettingsDialog({
                 onPickerOpenChange={onPickerOpenChange}
               />
             )}
+            {!isGloballyConnected &&
+              app.is_custom &&
+              app.auth_type === "mcp_oauth" &&
+              isNonOwnedTeamTool &&
+              app.url_host && (
+                <p className="text-sm text-slate-500 max-w-sm">
+                  {t('tools.mcp.memberOAuth.destination', { host: app.url_host })}
+                </p>
+              )}
             {!isGloballyConnected && (
               <Button
                 className="w-full max-w-[200px] rounded-full h-11 font-medium bg-blue-600 text-white hover:bg-blue-700"

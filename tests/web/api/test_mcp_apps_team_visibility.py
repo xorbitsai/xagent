@@ -302,11 +302,12 @@ def test_a_team_owned_server_named_like_a_catalog_app_is_skipped(db_session):
 
 
 def test_a_team_owned_mcp_oauth_server_carries_no_auth_type(db_session):
-    """`auth_type` tells the picker to POST `/{server_id}/oauth/connect`, which
-    requires an *active personal association* and 404s without one. A team
-    member holds no association at all, so advertising the flow would trade a
-    missing entry for a failed popup — the same reasoning that already excludes
-    deactivated associations."""
+    """`auth_type` tells the picker to POST `/{server_id}/oauth/connect`. That
+    route admits a member who holds no association only when the team shows
+    the connector and opens it to member authorization. The visibility answer
+    here has no `member_oauth_mcp` key, so the connector is not open and the
+    route refuses the member; advertising the flow would trade a missing entry
+    for a failed popup."""
     db, creator, member = db_session
     server = _add_oauth_server(db, creator)
     _install_visibility(
@@ -395,24 +396,17 @@ def test_an_inactive_personal_row_plus_a_team_link_lists_one_entry(db_session):
     assert _local_ids(db, creator).count("records") == 1
 
 
-def test_a_hook_answering_string_ids_is_not_silently_resolved(db_session):
-    """Regression pin for a fail-open path: SQLite's numeric affinity makes
-    `id IN ('1')` match an INTEGER primary key, so a hook answering string ids
-    would list a connector the dedup index (int-keyed) considered missing.
-
-    Element types are the hook's contract (`dict[str, set[int]]`). This pins
-    today's behavior so a future validator in `connector_team_scope` — which
-    must check element types, not just the container shape — has a test that
-    changes when the behavior does."""
+def test_a_hook_answering_string_ids_is_refused(db_session):
+    """SQLite's numeric affinity makes `id IN ('1')` match an INTEGER primary
+    key, so a hook answering string ids used to list a connector the dedup
+    index (int-keyed) considered missing. The listing now reads the hook's
+    answer through the member-authorization scope, which checks element types:
+    a malformed answer fails the listing instead of resolving."""
     db, creator, member = db_session
     server = _add_server(db, creator)
     _install_visibility(
         {int(member.id): {"mcp": {str(server.id)}, "custom_api": set()}}  # type: ignore[dict-item]
     )
 
-    listed = _local_ids(db, member)
-    # Documents the current fail-open outcome rather than asserting it is
-    # correct: a string id resolves through the IN clause and reaches the
-    # picker. A validator rejecting non-int members would turn this into a
-    # raised error, and this assertion is where that change surfaces.
-    assert listed == ["records"]
+    with pytest.raises(ValueError, match="not a connector id"):
+        _local_ids(db, member)

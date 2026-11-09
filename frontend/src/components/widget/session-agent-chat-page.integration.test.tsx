@@ -2280,9 +2280,9 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
     // that every message is delivered. When the host page's reply lands in the
     // very render in which the hand-over is placed, both frames go out in
     // order; the second carries a source while the first has already opened a
-    // conversation, so the session server refuses it as invalid and the
-    // visitor's follow-up is lost without a notice.
-    it("loses the hand-over, quietly, when the host page's reply lands in the render that places it", async () => {
+    // conversation, so the session server refuses it as invalid. The visitor
+    // is told their message was not sent.
+    it("tells the visitor when the hand-over is lost to the host page's reply landing in the render that places it", async () => {
       let answer: (() => void) | null = null
       vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation((...args) => {
         const [data] = args as [Record<string, unknown>]
@@ -2316,7 +2316,7 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       })
       await letItRun()
 
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+      expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.history.continueNotSent")
       expect(chats(socket)).toHaveLength(2)
       expect(sentTypes(socket)).toEqual(["chat", "chat"])
     })

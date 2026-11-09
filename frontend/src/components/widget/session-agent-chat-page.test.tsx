@@ -1782,6 +1782,38 @@ describe("SessionAgentChatPage", () => {
           expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
         })
 
+        it("says the message was not sent when it is refused after a conversation opened", async () => {
+          let refuse!: (reason: unknown) => void
+          app.sendMessage.mockReturnValueOnce(new Promise((_resolve, reject) => { refuse = reject }))
+          const { rerender } = mountWithHistory()
+          goToView()
+          hand()
+          await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+
+          // Another message opened a conversation before the refusal came back,
+          // so the start screen and its failure line are gone.
+          app.state.taskId = 42
+          rerender(<SessionAgentChatPage />)
+          await act(async () => {
+            refuse(Object.assign(new Error("refused"), { errorCode: "invalid_message" }))
+          })
+
+          expect(await screen.findByText(noticeText)).toBeInTheDocument()
+          expect(screen.getByRole("alert")).toHaveTextContent(noticeText)
+          expect(screen.queryByText("clientErrors.invalidMessage")).not.toBeInTheDocument()
+        })
+
+        it("leaves a refusal on the start page to the failure line there", async () => {
+          app.sendMessage.mockRejectedValueOnce(Object.assign(new Error("refused"), { errorCode: "invalid_message" }))
+          mountWithHistory()
+          goToView()
+
+          hand()
+
+          expect(await screen.findByText("clientErrors.invalidMessage")).toBeInTheDocument()
+          expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
+        })
+
         it("shows the reset failure line when the new conversation cannot be started", async () => {
           app.startNewConversation.mockRejectedValue(new Error("reset refused"))
           app.state.taskId = 61

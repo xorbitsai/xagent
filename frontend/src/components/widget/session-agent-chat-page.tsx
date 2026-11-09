@@ -236,9 +236,11 @@ function SessionConversationContent({
   // read `continueBusy` during render, so which effect runs first decides
   // nothing. What this guarantees is that no message enters the wrong
   // conversation, not that none is lost: if the host page's initial message
-  // arrives in the very render that places a hand-over, both frames go out,
-  // the second one is refused by the session server, and the visitor's
-  // follow-up is dropped without a notice.
+  // arrives in the very render that places a hand-over, both frames go out and
+  // the session server refuses the second one. A refused hand-over always
+  // tells the visitor: on the start page through the failure line there, and
+  // once a conversation is open, where that line is not shown, through the
+  // "not sent" line.
   const openMessage = useWidgetOpenMessage({ enabled: true })
   const { busy: continueBusy } = useHistoryContinue({
     request: continueRequest,
@@ -253,8 +255,15 @@ function SessionConversationContent({
     startNewConversation: startNewConversationForOpen,
     sendContinueMessage,
     onOutcome: (outcome) => {
-      if (outcome === "superseded" || outcome === "unsupported") setContinueNotice("not_sent")
-      else if (outcome === "sent") setContinueNotice(null)
+      if (
+        outcome === "superseded"
+        || outcome === "unsupported"
+        || (outcome === "send_failed" && conversationEstablished)
+      ) {
+        setContinueNotice("not_sent")
+      } else if (outcome === "sent") {
+        setContinueNotice(null)
+      }
     },
   })
 

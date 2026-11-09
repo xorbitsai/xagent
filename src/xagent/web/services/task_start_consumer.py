@@ -466,15 +466,45 @@ def _handoff_was_committed(command_id: int, lease: TaskLease) -> bool:
         )
 
 
-async def _report_post_commit_failure(
-    command: ClaimedTaskCommand, error: BaseException
+async def _settle_failed_schedule(
+    command: ClaimedTaskCommand,
+    handoff: _StartHandoff,
+    error: BaseException,
+    error_message: str,
 ) -> None:
-    """Tell the client a START it saw begin did not run, then stop retries.
+    """Settle the committed lease of a START whose scheduling failed.
 
-    Cancellation passes through untouched. Any other error becomes a
-    ``PostCommitStartFailure`` once the client has been notified.
+    Then tell the client, which saw the run begin, that it did not run. The
+    notice follows the settlement the way the runner path does: a settlement
+    that reports ``False`` was fenced or reconciled by someone else, whose
+    outcome the client must not see contradicted. A settlement that raised
+    leaves the lease to TTL recovery, which fails the run, so it still
+    notifies. Cancellation passes through; any other error becomes a
+    ``PostCommitStartFailure`` once notified.
     """
-    if not isinstance(error, Exception):
+    from .task_orchestrator import settle_task_lease_isolated
+
+    settled = False
+    try:
+        settled = bool(
+            await run_db_io_cancellation_safe(
+                lambda: settle_task_lease_isolated(
+                    handoff.claimed.task_lease,
+                    error_message=error_message,
+                    turn_id=handoff.start.turn_id,
+                )
+            )
+        )
+    except Exception:
+        logger.warning(
+            "task %s START %s: settling the lease after a scheduling failure "
+            "failed; leaving it to TTL recovery",
+            command.task_id,
+            command.command_id,
+            exc_info=True,
+        )
+        settled = True
+    if not settled or not isinstance(error, Exception):
         return
     from .task_command_execution import report_post_commit_start_failure
 
@@ -519,7 +549,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
             if key in config:
                 context[key] = config[key]
         if start.kind == "channel":
-            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+            from .task_orchestrator import _schedule_bg
 
             try:
                 _schedule_bg(
@@ -540,18 +570,13 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     channel_command=command,
                 )
             except BaseException as exc:
-                await run_db_io_cancellation_safe(
-                    lambda: settle_task_lease_isolated(
-                        handoff.claimed.task_lease,
-                        error_message="Channel execution scheduling failed",
-                        turn_id=start.turn_id,
-                    )
+                await _settle_failed_schedule(
+                    command, handoff, exc, "Channel execution scheduling failed"
                 )
-                await _report_post_commit_failure(command, exc)
                 raise
             return SettledTaskCommand({"run_id": start.run_id})
         if start.kind == "existing":
-            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+            from .task_orchestrator import _schedule_bg
 
             assert start.existing_context is not None
             try:
@@ -570,14 +595,9 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     context=start.existing_context.model_dump(exclude_none=True),
                 )
             except BaseException as exc:
-                await run_db_io_cancellation_safe(
-                    lambda: settle_task_lease_isolated(
-                        handoff.claimed.task_lease,
-                        error_message="Existing execution scheduling failed",
-                        turn_id=start.turn_id,
-                    )
+                await _settle_failed_schedule(
+                    command, handoff, exc, "Existing execution scheduling failed"
                 )
-                await _report_post_commit_failure(command, exc)
                 raise
             return SettledTaskCommand({"run_id": start.run_id})
         # This returns after local scheduling, not after Agent execution. The

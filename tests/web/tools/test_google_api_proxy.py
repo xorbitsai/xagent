@@ -14,61 +14,14 @@ import pytest
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from tests.web.tools.conftest import (
+    ACCOUNT_ID,
+    API_KEY,
+    COMPOSIO_USER,
+    GMAIL_HOSTS,
+    _Response,
+)
 from xagent.web.tools.mcp import composio_proxy, google_api_proxy
-
-API_KEY = "test-composio-api-key-value"
-ACCOUNT_ID = "ca_gmail_account_1"
-COMPOSIO_USER = "xagent-0123456789abcdef"
-GMAIL_HOSTS = ("gmail.googleapis.com",)
-
-
-class _Response:
-    def __init__(self, status_code: int, payload: Any = None) -> None:
-        self.status_code = status_code
-        self._payload = payload
-
-    def json(self) -> Any:
-        if self._payload is None:
-            raise ValueError("no JSON body")
-        return self._payload
-
-
-class FakeProxy:
-    """Answers by endpoint substring; records every proxy payload."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-        self.by_endpoint: list[tuple[str, _Response]] = []
-        self.default = _Response(200, {"status": 200, "data": {}})
-        self.lock = threading.Lock()
-
-    def answer(self, needle: str, status: int, data: Any = None) -> None:
-        self.by_endpoint.append(
-            (needle, _Response(200, {"status": status, "data": data}))
-        )
-
-    def answer_with(self, status_code: int, payload: Any) -> None:
-        self.default = _Response(status_code, payload)
-
-    def request(self, **kwargs: Any) -> _Response:
-        assert kwargs["url"] == composio_proxy.COMPOSIO_PROXY_URL
-        payload = kwargs["json"]
-        with self.lock:
-            self.calls.append(payload)
-        for needle, response in self.by_endpoint:
-            if needle in payload["endpoint"]:
-                return response
-        return self.default
-
-
-@pytest.fixture
-def proxy(monkeypatch) -> FakeProxy:
-    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
-    fake = FakeProxy()
-    monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
-    return fake
 
 
 def _http() -> google_api_proxy.GoogleApiProxyHttp:
@@ -124,6 +77,23 @@ def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
     assert "body" not in call
     assert {"name": "q", "value": long_query, "type": "query"} in call["parameters"]
     assert all(item["name"] != "content-type" for item in call["parameters"])
+
+
+def test_a_long_get_keeps_its_repeated_parameters(proxy):
+    """The form body googleapiclient moves a long GET's query into keeps a
+    repeated parameter as its pairs; restoring the GET must not collapse them
+    into one."""
+    _gmail_service().users().messages().list(
+        userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]
+    ).execute()
+
+    (call,) = proxy.calls
+    assert call["method"] == "GET"
+    assert "body" not in call
+    assert [item for item in call["parameters"] if item["name"] == "labelIds"] == [
+        {"name": "labelIds", "value": "INBOX", "type": "query"},
+        {"name": "labelIds", "value": "STARRED", "type": "query"},
+    ]
 
 
 def test_only_headers_that_change_the_answer_are_forwarded(proxy):

@@ -20,12 +20,14 @@ import httplib2
 import pytest
 from googleapiclient.discovery import build
 
+from tests.web.tools.conftest import (
+    ACCOUNT_ID,
+    API_KEY,
+    COMPOSIO_USER,
+    _Response,
+)
 from xagent.web.tools import config as tools_config
 from xagent.web.tools.mcp import composio_proxy, gmail, google_api_proxy
-
-API_KEY = "test-composio-api-key-value"
-ACCOUNT_ID = "ca_gmail_account_1"
-COMPOSIO_USER = "xagent-0123456789abcdef"
 
 _MESSAGE = {
     "id": "m1",
@@ -46,59 +48,6 @@ _NOT_FOUND = {
     }
 }
 _BATCH_BOUNDARY = "gmail-tools-batch"
-
-
-class _Response:
-    def __init__(self, status_code: int, payload: Any = None) -> None:
-        self.status_code = status_code
-        self._payload = payload
-
-    def json(self) -> Any:
-        if self._payload is None:
-            raise ValueError("no JSON body")
-        return self._payload
-
-
-class FakeProxy:
-    """Answers by endpoint substring, checked in insertion order."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-        self.by_endpoint: list[tuple[str, _Response]] = []
-        self.default = _Response(200, {"status": 200, "data": {}})
-
-    def answer(self, needle: str, status: int, data: Any = None) -> None:
-        self.by_endpoint.append(
-            (needle, _Response(200, {"status": status, "data": data}))
-        )
-
-    def request(self, **kwargs: Any) -> _Response:
-        assert kwargs["url"] == composio_proxy.COMPOSIO_PROXY_URL
-        payload = kwargs["json"]
-        self.calls.append(payload)
-        for needle, response in self.by_endpoint:
-            if needle in payload["endpoint"]:
-                return response
-        return self.default
-
-
-@pytest.fixture
-def composio_env(monkeypatch) -> None:
-    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
-    # A Composio grant launches without these.
-    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("GOOGLE_REFRESH_TOKEN", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
-
-
-@pytest.fixture
-def proxy(monkeypatch, composio_env) -> FakeProxy:
-    fake = FakeProxy()
-    monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
-    return fake
 
 
 def _proxy_service() -> Any:
